@@ -168,7 +168,7 @@ mod pg_tests {
     use wyrd_runtime::{PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_spec::reference::CardRefScope;
+    use wyrd_spec::ids::CardUid;
 
     use super::AuthenticatedPrincipal;
 
@@ -208,14 +208,13 @@ mod pg_tests {
         let state = test_state(tenant).await;
         let principal_id = PrincipalId::new(uuid::Uuid::now_v7());
         let stored = AuthenticatedPrincipal::from_verified(Arc::new(VerifiedToken {
-            principal: wyrd_runtime::Principal {
-                id: principal_id,
-                kind: PrincipalKind::User,
-                tenant_id: tenant,
-                roles: Vec::new(),
-                effective_permissions: PermissionSet::default(),
-                credential_id: None,
-            },
+            principal: wyrd_runtime::Principal::new(
+                principal_id,
+                PrincipalKind::User,
+                tenant,
+                Vec::new(),
+                PermissionSet::default(),
+            ),
             delegation_chain: Vec::new(),
             exp: chrono::Utc::now() + chrono::Duration::minutes(5),
         }));
@@ -331,8 +330,6 @@ mod pg_tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         };
         state
             .auth
@@ -344,6 +341,8 @@ mod pg_tests {
                     principal,
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
+                    card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
+                    workload_uid: None,
                     credential_id: None,
                     act: None,
                     audience: wyrd_spec::auth::TokenAudience::Wyrd,
@@ -353,8 +352,9 @@ mod pg_tests {
             .expect("test jwt mints")
     }
 
-    /// Mint an access token whose outer `act` names `initiator` as the sole
-    /// actor working for `subject`, the token's principal.
+    /// Mint an access token whose outer `act` names the Service `initiator`,
+    /// running under its own root, as the sole actor working for `subject`;
+    /// the delegated Card access is the empty exact intersection.
     ///
     /// # Panics
     /// Panics when `state` has no issuing key or the token fails to mint.
@@ -368,11 +368,12 @@ mod pg_tests {
             sub: initiator.to_string(),
             principal: TokenPrincipalRef {
                 id: initiator,
-                kind: PrincipalKindTag::User,
+                kind: PrincipalKindTag::Service,
                 tenant_id: tenant,
-                card_ref: None,
-                card_ref_scope: CardRefScope::default(),
             },
+            workload_uid: CardUid::new(uuid::Uuid::now_v7().to_string())
+                .expect("generated UUIDv7 is a valid CardUid"),
+            cid: None,
             act: None,
         };
         state
@@ -386,11 +387,11 @@ mod pg_tests {
                         id: subject,
                         kind: PrincipalKindTag::User,
                         tenant_id: tenant,
-                        card_ref: None,
-                        card_ref_scope: CardRefScope::default(),
                     },
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
+                    card_access: wyrd_spec::auth::CardAccess::Scoped { cards: Vec::new() },
+                    workload_uid: None,
                     credential_id: None,
                     act: Some(Box::new(actor)),
                     audience: wyrd_spec::auth::TokenAudience::Wyrd,

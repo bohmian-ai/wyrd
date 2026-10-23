@@ -5388,9 +5388,8 @@ minimum_slots = 2
             issuer = "https://idp.example.com"
             subject = "system:serviceaccount:default/my-sa"
             audience = "my-audience"
-            kind = "service"
-            name = "my-model"
-            version = "1.0.0"
+            principal_id = "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
+            workload_uid = "01890f28-7c4a-7000-98e7-4f4a3c2d1b03"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         assert_eq!(cfg.workload_bindings.len(), 1);
@@ -5398,9 +5397,17 @@ minimum_slots = 2
         assert_eq!(binding.issuer, "https://idp.example.com");
         assert_eq!(binding.subject, "system:serviceaccount:default/my-sa");
         assert_eq!(binding.audience.as_deref(), Some("my-audience"));
-        assert_eq!(binding.kind, "service");
-        assert_eq!(binding.name, "my-model");
-        assert_eq!(binding.version, "1.0.0");
+        assert_eq!(
+            binding.principal_id.to_string(),
+            "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
+        );
+        assert_eq!(
+            binding
+                .workload_uid
+                .as_ref()
+                .map(wyrd_spec::ids::CardUid::as_str),
+            Some("01890f28-7c4a-7000-98e7-4f4a3c2d1b03")
+        );
     }
 
     // ── 20. Unknown field in issuer entry rejected ────────────────────────────
@@ -5430,9 +5437,7 @@ minimum_slots = 2
             [[workload_bindings]]
             issuer = "https://idp.example.com"
             subject = "system:serviceaccount:ns/sa"
-            kind = "model"
-            name = "my-model"
-            version = "1.0.0"
+            principal_id = "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
             extra_field = "bad"
         "#;
         let err = from_toml_str_with_dev_oracle_opt_in(toml).expect_err("unknown field must fail");
@@ -5575,9 +5580,7 @@ minimum_slots = 2
             [[workload_bindings]]
             issuer = ""
             subject = "system:serviceaccount:default/my-sa"
-            kind = "model"
-            name = "my-model"
-            version = "1.0.0"
+            principal_id = "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("empty binding issuer must fail");
@@ -5595,9 +5598,7 @@ minimum_slots = 2
             [[workload_bindings]]
             issuer = "https://idp.example.com"
             subject = ""
-            kind = "model"
-            name = "my-model"
-            version = "1.0.0"
+            principal_id = "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("empty subject must fail");
@@ -5607,23 +5608,21 @@ minimum_slots = 2
         );
     }
 
-    // ── 30. Empty card-target field in workload binding → Invalid ─────────────
+    // ── 30. Malformed principal id in workload binding → ParseToml ────────────
 
     #[test]
-    fn binding_entry_empty_version_invalid() {
+    fn binding_entry_malformed_principal_id_rejected() {
         let toml = r#"
             [[workload_bindings]]
             issuer = "https://idp.example.com"
             subject = "system:serviceaccount:default/my-sa"
-            kind = "model"
-            name = "my-model"
-            version = ""
+            principal_id = "not-a-principal"
         "#;
-        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
-        let err = cfg.validate().expect_err("empty version must fail");
+        let err = from_toml_str_with_dev_oracle_opt_in(toml)
+            .expect_err("a malformed principal id must fail");
         assert!(
-            matches!(err, ConfigError::Invalid { ref message } if message.contains("version")),
-            "expected Invalid(version), got {err:?}"
+            matches!(err, ConfigError::ParseToml { .. }),
+            "expected ParseToml, got {err:?}"
         );
     }
 
@@ -5673,9 +5672,7 @@ minimum_slots = 2
             [[workload_bindings]]
             issuer = "https://idp.example.com"
             subject = "system:serviceaccount:default/my-sa"
-            kind = "model"
-            name = "my-model"
-            version = "1.0.0"
+            principal_id = "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("missing tenant_slug must fail");

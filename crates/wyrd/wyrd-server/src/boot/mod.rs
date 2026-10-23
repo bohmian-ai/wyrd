@@ -2106,7 +2106,7 @@ fn decode_sealing_key(encoded: &SecretString, label: &str) -> Result<SecretKey, 
 ///
 /// # Errors
 /// Returns [`ServerBootError::InvalidWorkloadBinding`] when an entry's issuer URL
-/// or card target cannot be parsed into the domain types.
+/// is not a valid https issuer.
 pub fn build_workload_bindings(
     entries: &[WorkloadBindingEntry],
     tenant_id: DataTenantId,
@@ -2463,11 +2463,10 @@ mod tests {
             issuer: "https://idp.example.com".to_owned(),
             subject: "system:serviceaccount:default/my-sa".to_owned(),
             audience: Some("my-audience".to_owned()),
-            // Lowercase mirrors the canonical config example; the boot parse is
-            // case-insensitive against the kind wire name.
-            kind: "service".to_owned(),
-            name: "my-model".to_owned(),
-            version: "1.0.0".to_owned(),
+            principal_id: "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
+                .parse()
+                .expect("static principal id is valid"),
+            workload_uid: None,
         }
     }
 
@@ -2484,13 +2483,13 @@ mod tests {
     }
 
     #[test]
-    fn workload_binding_rejects_non_service_or_agent_kind() {
+    fn workload_binding_rejects_a_non_https_issuer() {
         let tenant = implicit_tenant();
         let mut entry = sample_binding_entry();
-        entry.kind = "model".to_owned();
+        entry.issuer = "http://idp.example.com".to_owned();
 
         let error = build_workload_bindings(&[entry], tenant)
-            .expect_err("a model-kind binding must be rejected at boot");
+            .expect_err("a non-https issuer binding must be rejected at boot");
 
         assert!(
             matches!(error, ServerBootError::InvalidWorkloadBinding { .. }),

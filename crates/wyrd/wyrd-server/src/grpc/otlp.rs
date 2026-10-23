@@ -279,7 +279,7 @@ impl OtlpGrpcAuthentication {
             metadata
                 .get_all(WYRD_WORKLOAD_UID_HEADER.as_str())
                 .iter()
-                .map(|value| value.as_bytes()),
+                .map(wyrd_tonic::tonic::metadata::MetadataValue::as_bytes),
         )
         .map_err(status)?;
         let api_key = match metadata.get(WYRD_API_KEY_HEADER.as_str()) {

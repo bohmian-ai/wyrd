@@ -316,12 +316,13 @@ mod tests {
         cache.insert(entry("wyrd_sk_a"), secret("jwt-a"), hour, start);
         assert_eq!(cached(&cache, "wyrd_sk_a", start).as_deref(), Some("jwt-a"));
         let root = CardUid::new("01890a5d-ac96-774b-bcce-b302099a8057").expect("static uid");
-        assert_eq!(
-            cache.get(
-                GatewayApiKeys::entry(&secret("wyrd_sk_a"), Some(&root)),
-                start
-            ),
-            None,
+        assert!(
+            cache
+                .get(
+                    GatewayApiKeys::entry(&secret("wyrd_sk_a"), Some(&root)),
+                    start
+                )
+                .is_none(),
             "a root's entry is not the rootless entry of the same key"
         );
         assert_eq!(cached(&cache, "wyrd_sk_b", start), None);

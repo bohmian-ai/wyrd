@@ -536,10 +536,6 @@ mod error_mapper_tests {
                 "WYRD_AUTH_401_INVALID_TOKEN",
             ),
             (
-                auth_error_to_wyrd(AuthError::InvalidCardRef),
-                "WYRD_AUTH_401_INVALID_CARD_REF",
-            ),
-            (
                 auth_error_to_wyrd(AuthError::DelegationDepthExceeded),
                 "WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED",
             ),

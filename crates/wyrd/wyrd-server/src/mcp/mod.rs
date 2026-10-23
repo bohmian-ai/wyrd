@@ -225,6 +225,7 @@ impl ServerHandler for WyrdMcpHandler {
         Self::catalog()
             .into_iter()
             .chain(principals::write_descriptors())
+            .chain(principals::admin_descriptors())
             .chain(verification::write_descriptors())
             .chain(operators::write_descriptors())
             .chain(gateway::descriptors())
@@ -250,6 +251,9 @@ impl ServerHandler for WyrdMcpHandler {
         if let Ok(caller) = Self::caller(&context) {
             if principals::may_administer(&caller) {
                 catalog.extend(principals::write_descriptors());
+            }
+            if principals::may_administer_tenant(&caller) {
+                catalog.extend(principals::admin_descriptors());
             }
             if verification::may_run_verifiers(&caller) {
                 catalog.extend(verification::write_descriptors());
@@ -379,6 +383,14 @@ impl WyrdMcpHandler {
                 // it would refuse identically while auditing nothing, so it
                 // would only be a place for the two to drift apart.
                 self.mcp_revoke_credential(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            principals::SET_WORKLOAD_RESTRICTION => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                // As above: the operation authorizes and audits tenant
+                // administration itself.
+                self.mcp_set_workload_restriction(caller, request.arguments)
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
@@ -527,6 +539,7 @@ mod tests {
         let catalog: Vec<_> = WyrdMcpHandler::catalog()
             .into_iter()
             .chain(principals::write_descriptors())
+            .chain(principals::admin_descriptors())
             .chain(verification::write_descriptors())
             .chain(operators::write_descriptors())
             .chain(gateway::descriptors())

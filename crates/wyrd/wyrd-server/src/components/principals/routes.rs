@@ -884,29 +884,52 @@ async fn set_principal_workload_restriction(
     Json(restriction): Json<WorkloadRestriction>,
 ) -> Result<Json<PrincipalSummary>, WyrdErrorResponse> {
     let Path(principal_id) = target.map_err(|rejection| path_rejection(&rejection))?;
-    audit::authorize(
-        &state,
-        &caller,
-        &Permission::wildcard(),
-        "auth.principal.workload_restriction.set",
-        &format!("principal:{principal_id}"),
-    )?;
-    let mut conn = tenant_conn(&state, &caller).await?;
-    let (_, kind) = require_assignable(&mut conn, principal_id).await?;
-    if kind != PrincipalKindTag::Service {
-        return Err(invalid(
-            "only a Service account carries a workload restriction",
-            serde_json::json!({ "principal_id": principal_id.to_string() }),
-        ));
-    }
-    let family = restriction.family();
-    set_workload_restriction(&mut conn, principal_id, family)
+    set_workload_restriction_for(&state, &caller, principal_id, &restriction)
         .await
-        .map_err(|error| restriction_write_error(error, family))?;
-    let (row, _) = require_assignable(&mut conn, principal_id).await?;
-    let summary = summary(row)?;
-    conn.commit().await.map_err(internal)?;
-    Ok(Json(summary))
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+/// Replace one Service account's workload restriction.
+///
+/// The operation behind both the HTTP route and the MCP tool. See the route
+/// documentation above for authorization, idempotency, and conflict.
+///
+/// # Errors
+/// Returns the errors documented on the route.
+pub(crate) async fn set_workload_restriction_for(
+    state: &AppState,
+    caller: &Caller,
+    principal_id: Uuid,
+    restriction: &WorkloadRestriction,
+) -> Result<PrincipalSummary, WyrdError> {
+    async {
+        audit::authorize(
+            state,
+            caller,
+            &Permission::wildcard(),
+            "auth.principal.workload_restriction.set",
+            &format!("principal:{principal_id}"),
+        )?;
+        let mut conn = tenant_conn(state, caller).await?;
+        let (_, kind) = require_assignable(&mut conn, principal_id).await?;
+        if kind != PrincipalKindTag::Service {
+            return Err(invalid(
+                "only a Service account carries a workload restriction",
+                serde_json::json!({ "principal_id": principal_id.to_string() }),
+            ));
+        }
+        let family = restriction.family();
+        set_workload_restriction(&mut conn, principal_id, family)
+            .await
+            .map_err(|error| restriction_write_error(error, family))?;
+        let (row, _) = require_assignable(&mut conn, principal_id).await?;
+        let summary = summary(row)?;
+        conn.commit().await.map_err(internal)?;
+        Ok(summary)
+    }
+    .await
+    .map_err(WyrdError::from)
 }
 
 /// Map an account write that may acquire `family` onto its stable refusal.

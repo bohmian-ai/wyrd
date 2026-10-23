@@ -230,7 +230,6 @@ async fn authenticate_on(
 #[cfg(test)]
 mod pg_tests {
     use std::collections::HashMap;
-    use wyrd_spec::reference::CardRefScope;
 
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
@@ -408,8 +407,6 @@ mod pg_tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         };
         state
             .auth
@@ -421,6 +418,8 @@ mod pg_tests {
                     principal,
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
+                    card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
+                    workload_uid: None,
                     credential_id: None,
                     act: None,
                     audience: wyrd_spec::auth::TokenAudience::Wyrd,

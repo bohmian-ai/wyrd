@@ -5,6 +5,7 @@
 | Task | TASK-027 |
 | Spec | `SPEC-wyrd-ui-main-integration` revision 12 (approved) |
 | Obligations | REQ-036, AC-015; REQ-030 view-document format as revised |
+| Status | Complete — accepted by the caller on 2026-10-23 |
 | Depends on | TASK-003 (view schema, `WyrdView`, catalog generator, gallery, AppBridge artifact), including its `version`/`catalogId` correction |
 
 ## Outcome and Value

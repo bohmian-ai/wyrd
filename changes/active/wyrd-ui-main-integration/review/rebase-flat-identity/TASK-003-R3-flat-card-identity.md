@@ -95,3 +95,21 @@ Diagnosis of the four-host failure (outside this remediation's identity scope):
 - **Fix site:** not changed here. Either the AppBridge harness (`appBridgeView`, which already supplies the
   jsdom-missing `ResizeObserver`) or `wyrdProblem`. Both are outside this task's write set and the lead
   restricted test-file edits to `space` lines; routed to the lead.
+
+### Four-host harness fix
+
+Lead decision: fix at the harness, leave `wyrdProblem` unchanged, because every real host provides
+`structuredClone`. `appBridgeView` now passes the outer realm's `structuredClone` into the iframe window,
+next to the existing `ResizeObserver` shim (`src/lib/ui-library.integration.test.ts`).
+
+Independent diagnostician report: it confirmed the cause. `WyrdView` `start()` maps panels through
+`validatePanel` → `inputProblem` → `wyrdProblem`, and the `structuredClone` throw inside that map leaves
+`panels` unset, so no panel renders. The diagnostician preferred a source fix in `contract.ts:42`, a shallow
+copy plus a `details` copy, so that hosts without `structuredClone` also work. That was not taken: Safari 15.4
+and Chrome 98 are the support floor. It noted that every local-problem caller in `loaders.ts`,
+`WyrdView.svelte`, `view.ts` and `mcp.ts` routes through `wyrdProblem`; server uses run in Node.
+
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts'` — PASS (2/2).
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` — PASS. The app-level `svelte-check --tsconfig ./tsconfig.json` also reports 0 errors across 702 files.
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test` — PASS (40/40).
+- `git diff --check` — PASS.

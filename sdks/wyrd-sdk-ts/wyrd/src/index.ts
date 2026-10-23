@@ -1,5 +1,6 @@
 import type { Span as OtelSpan } from "@opentelemetry/api";
 import { DataType, Table, tableFromIPC, tableToIPC, type Field, type RecordBatch, type Schema } from "apache-arrow";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
@@ -2203,6 +2204,24 @@ function activeTraceContext(producerTable?: string | null): { traceparent: strin
 
 nativeBinding.setTraceSource(activeTraceContext);
 
+/** One entered {@link Run.scope}: the state it was opened on and its subject and Run. */
+interface ScopedRun {
+  readonly state: WyrdState | undefined;
+  readonly cardUid: string;
+  readonly runId: string;
+}
+
+/** Every entered {@link Run.scope}, innermost last, across awaits. */
+const STATE_RUNS = new AsyncLocalStorage<readonly ScopedRun[]>();
+
+/** Identity headers a state-bound `httpAuth` owns; an explicit differing value conflicts. */
+const CONTEXT_HEADERS = [
+  "x-wyrd-workload-uid",
+  "wyrd-card-uid",
+  "wyrd-run-id",
+  "x-wyrd-deployment-environment",
+] as const;
+
 /** The application's `@opentelemetry/api`, or `null` when it is not installed. */
 function otel(): typeof import("@opentelemetry/api") | null {
   if (otelApi === undefined) {
@@ -2524,14 +2543,17 @@ export class Observe {
  */
 export class Run {
   readonly #native: NativeRun;
+  /** The state this view was opened on, so only its `httpAuth` adopts the view. */
+  readonly #state: WyrdState | undefined;
 
-  private constructor(native: NativeRun) {
+  private constructor(native: NativeRun, state: WyrdState | undefined) {
     this.#native = native;
+    this.#state = state;
   }
 
-  /** @internal Unwrap one closed native open result. */
-  static fromOpen(open: NativeRunOpen): Run {
-    return new Run(nativeHandle(open.run, open.error));
+  /** @internal Unwrap one closed native open result of `state`. */
+  static fromOpen(open: NativeRunOpen, state?: WyrdState): Run {
+    return new Run(nativeHandle(open.run, open.error), state);
   }
 
   /** The UUIDv7 invocation identity this run and every view of it share. */
@@ -2561,26 +2583,30 @@ export class Run {
    * network IO occurs.
    */
   forCard(alias: string): Run {
-    return Run.fromOpen(this.#native.forCard(alias));
+    return Run.fromOpen(this.#native.forCard(alias), this.#state);
   }
 
   /**
    * Run `fn` inside this view's scope: spans started in it, across awaits,
    * carry this run and Card once {@link WyrdState.startTelemetry} installed
-   * telemetry. Without `@opentelemetry/api` it only calls `fn`.
+   * telemetry, and requests through the state's {@link WyrdState.httpAuth}
+   * carry this run and Card. Without `@opentelemetry/api` spans are untouched.
    *
    * @param fn - The work to scope.
    * @returns What `fn` returns.
    */
   scope<T>(fn: () => T): T {
-    const api = otel();
-    if (api === null) {
-      return fn();
-    }
-    const scoped = api.context
-      .active()
-      .setValue(api.createContextKey("wyrd.run_scope"), [this.#native.subjectUid, this.#native.runId]);
-    return api.context.with(scoped, fn);
+    const entry: ScopedRun = { state: this.#state, cardUid: this.#native.subjectUid, runId: this.#native.runId };
+    return STATE_RUNS.run([...(STATE_RUNS.getStore() ?? []), entry], () => {
+      const api = otel();
+      if (api === null) {
+        return fn();
+      }
+      const scoped = api.context
+        .active()
+        .setValue(api.createContextKey("wyrd.run_scope"), [this.#native.subjectUid, this.#native.runId]);
+      return api.context.with(scoped, fn);
+    });
   }
 }
 
@@ -3144,7 +3170,7 @@ export class WyrdState {
    * @throws {@link WyrdError} when `alias` is not registered in this bundle.
    */
   run(alias?: string): Run {
-    return Run.fromOpen(this.#native.run(alias));
+    return Run.fromOpen(this.#native.run(alias), this);
   }
 
   /**
@@ -3176,6 +3202,65 @@ export class WyrdState {
   /** The configured deployment environment, or `undefined` when unknown; reading it fixes defaults. */
   get deploymentEnvironment(): string | undefined {
     return lifecycleValue<string | null>(this.#native.deploymentEnvironment()) ?? undefined;
+  }
+
+  /**
+   * A `fetch` that authenticates every request to Wyrd as this state's client,
+   * in this state's context.
+   *
+   * Hand it to provider clients created once:
+   * `new OpenAI({ baseURL, apiKey: "wyrd", fetch: state.httpAuth })`. Each
+   * request carries what {@link WyrdClient.httpAuth} sends, plus the Service as
+   * `x-wyrd-workload-uid`, the configured `x-wyrd-deployment-environment`, this
+   * state's innermost {@link Run.scope} as `wyrd-card-uid` and `wyrd-run-id`
+   * (the Service and no Run outside one), and the active W3C trace context
+   * unless the request names its own `traceparent`. The context is read when
+   * the request starts, before any token refresh. Reading it fixes defaults
+   * and resolves the client without network IO.
+   *
+   * @returns The authenticating `fetch`; a request rejects with
+   * `WYRD_CLIENT_400_CONFIG_INVALID`, before it is sent, when an explicit
+   * identity header differs from that context, else as
+   * {@link WyrdClient.httpAuth} does.
+   * @throws {@link WyrdError} the credential error when the state's client
+   * cannot resolve.
+   */
+  get httpAuth(): typeof fetch {
+    const native = this.#native.client();
+    const auth = WyrdClient.fromNative(nativeHandle(native.client, native.error)).httpAuth;
+    const service = this.rootRef.uid ?? undefined;
+    const environment = this.deploymentEnvironment ?? undefined;
+    return async (input, init) => {
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      const run = STATE_RUNS.getStore()?.findLast((entry) => entry.state === this);
+      const context: Partial<Record<(typeof CONTEXT_HEADERS)[number], string>> = {
+        "x-wyrd-workload-uid": service,
+        "wyrd-card-uid": run?.cardUid ?? service,
+        "wyrd-run-id": run?.runId,
+        "x-wyrd-deployment-environment": environment,
+      };
+      for (const name of CONTEXT_HEADERS) {
+        const explicit = headers.get(name);
+        if (explicit !== null && explicit !== context[name]) {
+          throw new WyrdError(
+            "WYRD_CLIENT_400_CONFIG_INVALID",
+            400,
+            "Client configuration is invalid",
+            `${name} ${JSON.stringify(explicit)} conflicts with the state-bound context; select the intended state or Run instead`,
+            "Correct the client configuration field named in details and rebuild the client.",
+            { header: name },
+          );
+        }
+        const value = context[name];
+        if (value !== undefined) headers.set(name, value);
+      }
+      const trace = headers.has("traceparent") ? null : activeTraceContext();
+      if (trace !== null) {
+        headers.set("traceparent", trace.traceparent);
+        if (trace.tracestate !== undefined) headers.set("tracestate", trace.tracestate);
+      }
+      return auth(input, { ...init, headers });
+    };
   }
 
   /**

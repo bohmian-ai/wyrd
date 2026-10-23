@@ -90,13 +90,23 @@ impl ExistingScribeBatchCommit {
     #[must_use]
     fn matches(&self, commit: &ScribeBatchCommit) -> bool {
         self.matches_logical(commit)
-            && self.wal_node_id == commit.wal_node_id
+            && self.at_coordinates(commit)
+            && self.request_id == commit.request_id
+    }
+
+    /// Returns whether `commit` is the WAL attempt this row accepted: the
+    /// same stream, shard, terminal segment, and slice-to-COMMIT range.
+    ///
+    /// The fence's coordinates are immutable, so they select the one
+    /// canonical attempt among every complete attempt at a batch id.
+    #[must_use]
+    fn at_coordinates(&self, commit: &ScribeBatchCommit) -> bool {
+        self.wal_node_id == commit.wal_node_id
             && self.wal_writer_epoch == commit.wal_writer_epoch
             && self.wal_shard_id == commit.wal_shard_id
             && self.wal_segment_sequence == commit.wal_segment_sequence
             && self.wal_lsn_min == commit.wal_lsn_min
             && self.wal_lsn_max == commit.wal_lsn_max
-            && self.request_id == commit.request_id
     }
 
     /// Returns whether this row holds the same logical batch as `commit`.
@@ -179,23 +189,30 @@ pub enum ScribeBatchCommitResolution {
 /// Durable replay decision for one tenant/table/batch identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeBatchReplayResolution {
-    /// No durable fence exists, or this is the canonical WAL location to restore.
+    /// No durable fence exists: a complete commit interrupted before its
+    /// fence, recovered under its recorded version.
+    Unfenced,
+    /// This is the canonical WAL attempt the durable fence accepted.
     Restore,
-    /// The logical batch already committed from another WAL location.
+    /// The batch id is spent by another WAL attempt; this one owns no
+    /// accepted rows, whether it is an exact retry or a provisional attempt
+    /// the fence refused.
     Suppress,
 }
 
-/// Resolves whether one replayed WAL commit is canonical or a later exact retry.
+/// Resolves whether one replayed WAL commit is the canonical attempt at its
+/// batch id.
 ///
-/// The durable row remains authoritative. Matching table version and logical
-/// digest/count at the original WAL coordinates restores; matching logical identity at different
-/// coordinates suppresses duplicate restoration. Any logical mismatch fails.
+/// The durable row remains authoritative and its immutable WAL coordinates
+/// select the attempt: the attempt at those coordinates restores when its
+/// version, digest, count, and request match, and any attempt elsewhere is
+/// suppressed. No row means the commit was never fenced.
 ///
 /// # Errors
 ///
 /// Returns [`SqlError`] when the tenant differs from `conn`, PostgreSQL is
-/// unavailable, or an existing tenant/table/batch row contradicts version,
-/// digest, or count.
+/// unavailable, or the attempt at the fence's coordinates contradicts its
+/// version, digest, count, or request.
 pub async fn resolve_replay(
     conn: &mut TenantConn<'_>,
     commit: &ScribeBatchCommit,
@@ -207,15 +224,21 @@ pub async fn resolve_replay(
     }
     let existing = load(conn, std::iter::once(commit)).await?;
     let Some(existing) = find(&existing, commit) else {
-        return Ok(ScribeBatchReplayResolution::Restore);
+        return Ok(ScribeBatchReplayResolution::Unfenced);
     };
-    if !existing.matches_logical(commit) {
-        return Err(invariant("scribe batch replay identity mismatch"));
+    if !existing.at_coordinates(commit) {
+        return Ok(ScribeBatchReplayResolution::Suppress);
     }
     if existing.matches(commit) {
         Ok(ScribeBatchReplayResolution::Restore)
     } else {
-        Ok(ScribeBatchReplayResolution::Suppress)
+        tracing::warn!(
+            logical_table = %commit.logical_table_fqn,
+            batch_id = %commit.batch_id,
+            divergent = ?existing.divergent_fields(commit),
+            "Scribe replay contradicts its durable fence at the fence's coordinates"
+        );
+        Err(invariant("scribe batch replay identity mismatch"))
     }
 }
 

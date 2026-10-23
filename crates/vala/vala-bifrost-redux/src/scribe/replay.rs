@@ -76,6 +76,21 @@ pub struct ReplayedCommitIdentity {
     pub wal_lsn_max: WalLsn,
     /// Request correlation persisted with the fence.
     pub request_id: uuid::Uuid,
+    /// Whether an earlier complete COMMIT in this stream closed different
+    /// rows under the same batch id. Only the durable fence decides which
+    /// attempt owns the id, so a contested attempt with no fence fails closed.
+    pub contested: bool,
+}
+
+impl ReplayedCommitIdentity {
+    /// Whether `other` is this same complete WAL attempt: one batch id closed
+    /// over one slice-to-COMMIT range. Distinct attempts at one id stay
+    /// distinct so the durable fence can judge each.
+    fn same_attempt(&self, other: &Self) -> bool {
+        self.batch_id == other.batch_id
+            && self.wal_lsn_min == other.wal_lsn_min
+            && self.wal_lsn_max == other.wal_lsn_max
+    }
 }
 
 /// A bounded group of replayed WAL state sent from the WAL lane to recovery.
@@ -635,17 +650,15 @@ impl<'a> ReplayAccumulator<'a> {
     /// cannot be decoded into replay state.
     fn commit(&mut self, segment_path: &Path, record: &WalRecord) -> Result<(), ScribeError> {
         let identity = record.commit_identity()?;
-        if let Some(committed) = self
+        let earlier = self
             .committed_batches
             .iter()
             .find(|committed| committed.batch_id == record.batch_id)
-        {
-            let retained = committed.identity.clone();
-            if !retained.matches_frame(record) || !retained.matches_rows(&identity.logical_digest) {
-                return Err(ScribeError::Internal {
-                    detail: "WAL v7 batch has a contradictory duplicate COMMIT".to_owned(),
-                });
-            }
+            .map(|committed| committed.identity.clone());
+        let contested = earlier.as_ref().is_some_and(|retained| {
+            !retained.matches_frame(record) || !retained.matches_rows(&identity.logical_digest)
+        });
+        if earlier.is_some() && !contested {
             if let Some(pending) = self.pending_batches.remove(&record.batch_id) {
                 validate_pending_batch(&pending, record, &identity)?;
                 let bytes = pending.memory_bytes()?;
@@ -668,8 +681,12 @@ impl<'a> ReplayAccumulator<'a> {
         validate_pending_batch(&pending, record, &identity)?;
         let pending_bytes = pending.memory_bytes()?;
         self.transfer_pending_to_completed(pending_bytes)?;
-        let commit =
+        let mut commit =
             replayed_commit_identity(segment_path, &pending, identity.logical_digest, record)?;
+        // A differing complete attempt is released for the durable fence to
+        // judge rather than refused here: a provisional attempt the fence
+        // never accepted must not block recovery of the one it did.
+        commit.contested = contested;
         for slice in pending.slices.into_values() {
             if self
                 .sealed_lsn_map
@@ -788,7 +805,7 @@ impl<'a> ReplayAccumulator<'a> {
         if !state
             .commits
             .iter()
-            .any(|existing| existing.batch_id == commit.batch_id)
+            .any(|existing| existing.same_attempt(&commit))
         {
             state.commits.push(commit);
         }
@@ -1060,6 +1077,7 @@ fn replayed_commit_identity(
         wal_lsn_min: first.record.lsn,
         wal_lsn_max: commit.lsn,
         request_id,
+        contested: false,
     })
 }
 
@@ -1163,7 +1181,7 @@ fn merge_replayed_state(
         if !existing
             .commits
             .iter()
-            .any(|candidate| candidate.batch_id == commit.batch_id)
+            .any(|candidate| candidate.same_attempt(&commit))
         {
             existing.commits.push(commit);
         }
@@ -1795,9 +1813,11 @@ mod tests {
         assert_eq!(state.data_records.len(), 5, "all records replayed cleanly");
     }
 
-    /// Proves a repeated batch identity cannot authorize different payload facts.
+    /// Proves a second complete attempt that closes different rows under one
+    /// batch id is handed to the durable fence, marked contested, instead of
+    /// failing replay; the fence's coordinates decide which attempt owns it.
     #[test]
-    fn wal_replay_rejects_contradictory_duplicate_batch() {
+    fn wal_replay_hands_a_contested_duplicate_batch_to_the_fence() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
         let tenant_id = crate::test_support::tenant();
@@ -1812,24 +1832,23 @@ mod tests {
         let seal_key = replay_key(tenant_id);
 
         let shared_batch_id = [42u8; 16];
-
-        // Write first append with batch_id=42
-
         wal.append_and_commit_for_replay_test(&seal_key, shared_batch_id, b"data-1")
             .expect("append 1");
-
-        // Write second append with same batch_id=42 (duplicate)
-
         wal.append_and_commit_for_replay_test(&seal_key, shared_batch_id, b"data-2")
             .expect("append 2");
 
-        let error = replay_wal_directory(temp_dir.path())
-            .expect_err("contradictory duplicate batch must fail replay");
-        assert!(matches!(
-            error,
-            ScribeError::Internal { detail }
-                if detail == "WAL v7 batch has a contradictory duplicate COMMIT"
-        ));
+        let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+        let state = replayed.values().next().expect("state");
+        assert_eq!(
+            state
+                .commits
+                .iter()
+                .map(|commit| (commit.batch_id, commit.contested))
+                .collect::<Vec<_>>(),
+            [(shared_batch_id, false), (shared_batch_id, true)],
+            "both complete attempts reach the fence; only the later is contested"
+        );
+        assert_eq!(state.data_records.len(), 2);
     }
 
     /// Proves two same-ordinal SLICE records must match every logical payload fact.

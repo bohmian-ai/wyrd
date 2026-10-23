@@ -124,22 +124,32 @@ fn replay_binding(
     )
 }
 
-/// Removes exact-retry batches from one replay group while preserving append order.
+/// Removes suppressed WAL attempts from one replay group while preserving
+/// append order.
+///
+/// An attempt is a batch id plus the inclusive WAL range from its first slice
+/// to its COMMIT, so suppressing one attempt keeps every other attempt at the
+/// same id, including the canonical one the fence accepted.
 fn retain_replayed_batches(
     replayed: &mut crate::scribe::replay::ReplayedSealKey,
-    suppressed: &HashSet<[u8; 16]>,
+    suppressed: &[([u8; 16], std::ops::RangeInclusive<u64>)],
 ) {
+    let is_suppressed = |batch_id: &[u8; 16], lsn: u64| {
+        suppressed
+            .iter()
+            .any(|(id, range)| id == batch_id && range.contains(&lsn))
+    };
     let metas = std::mem::take(&mut replayed.append_metas);
     let data = std::mem::take(&mut replayed.data_records);
     for (meta, payload) in metas.into_iter().zip(data) {
-        if !suppressed.contains(&meta.batch_id) {
+        if !is_suppressed(&meta.batch_id, meta.wal_lsn.as_u64()) {
             replayed.append_metas.push(meta);
             replayed.data_records.push(payload);
         }
     }
     replayed
         .commits
-        .retain(|commit| !suppressed.contains(&commit.batch_id));
+        .retain(|commit| !is_suppressed(&commit.batch_id, commit.wal_lsn_max.as_u64()));
 }
 
 /// Durable artifact-range projection used to suppress already-published replay input.
@@ -1823,15 +1833,34 @@ impl ShardOwner {
             });
         }
         let commits = replayed.commits.clone();
-        let mut suppressed = HashSet::new();
+        let mut suppressed = Vec::new();
         for commit in &commits {
-            if self.resolve_replayed_commit(replayed, commit).await?
-                == vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress
-            {
-                suppressed.insert(commit.batch_id);
+            match self.resolve_replayed_commit(replayed, commit).await? {
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress => {
+                    suppressed.push((
+                        commit.batch_id,
+                        commit.wal_lsn_min.as_u64()..=commit.wal_lsn_max.as_u64(),
+                    ));
+                }
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
+                    if commit.contested =>
+                {
+                    return Err(ScribeError::Internal {
+                        detail: "WAL replay holds differing attempts at an unfenced batch id"
+                            .to_owned(),
+                    });
+                }
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
+                | vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Restore => {
+                }
             }
         }
-        suppressed.extend(self.resolve_published_replay_batches(replayed).await?);
+        suppressed.extend(
+            self.resolve_published_replay_batches(replayed)
+                .await?
+                .into_iter()
+                .map(|batch_id| (batch_id, 0..=u64::MAX)),
+        );
         if suppressed.is_empty() {
             return Ok(None);
         }
@@ -6114,20 +6143,23 @@ mod tests {
         )
     }
 
-    /// Exact retries are removed batch-wise without dropping canonical siblings.
+    /// Suppressed attempts are removed by batch id and WAL range, so a
+    /// refused attempt at a spent id never drops the canonical attempt or a
+    /// sibling batch in the same seal.
     #[test]
     fn replay_fence_filters_only_suppressed_batches_in_same_seal() {
         let key = owner_key();
         let canonical = [1_u8; 16];
         let retry = [2_u8; 16];
-        let commit = |batch_id| crate::scribe::replay::ReplayedCommitIdentity {
+        let commit = |batch_id, lsn: u64| crate::scribe::replay::ReplayedCommitIdentity {
             batch_id,
             slice_set_digest: [3; 32],
             slice_count: 1,
             segment_sequence: 1,
-            wal_lsn_min: WalLsn::new(1),
-            wal_lsn_max: WalLsn::new(2),
+            wal_lsn_min: WalLsn::new(lsn),
+            wal_lsn_max: WalLsn::new(lsn + 1),
             request_id: uuid::Uuid::now_v7(),
+            contested: false,
         };
         let meta = |batch_id, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id,
@@ -6150,13 +6182,13 @@ mod tests {
             ),
             seal_key: key.clone(),
             shard_id: 0,
-            data_records: vec![vec![1], vec![2]],
-            append_metas: vec![meta(canonical, 1), meta(retry, 3)],
+            data_records: vec![vec![1], vec![2], vec![3]],
+            append_metas: vec![meta(canonical, 1), meta(retry, 3), meta(canonical, 5)],
             wal_segments: Vec::new(),
-            commits: vec![commit(canonical), commit(retry)],
+            commits: vec![commit(canonical, 1), commit(retry, 3), commit(canonical, 5)],
         };
 
-        retain_replayed_batches(&mut replayed, &HashSet::from([retry]));
+        retain_replayed_batches(&mut replayed, &[(retry, 3..=4), (canonical, 5..=6)]);
 
         assert_eq!(replayed.append_metas.len(), 1);
         assert_eq!(replayed.append_metas[0].batch_id, canonical);

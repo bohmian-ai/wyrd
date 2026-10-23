@@ -1426,7 +1426,10 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
 /// written under the new one; a retry at its original table version across
 /// the revision, warm and after restart, is acknowledged without a duplicate
 /// row, a new batch at the superseded version is a typed version conflict,
-/// and a changed payload under the same id is refused.
+/// and a changed payload under the same id is refused. The accepted id sent
+/// under the current version writes a provisional WAL attempt the fence
+/// refuses; replay after restart suppresses it and the original retry still
+/// acknowledges.
 ///
 /// # Panics
 ///
@@ -1547,7 +1550,28 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
         .is_err(),
         "a changed payload under an accepted batch id is refused"
     );
-    assert_eq!(read_all(client).await, all, "the refusal stores nothing");
+    assert_eq!(read_all(client.clone()).await, all, "the refusal stores nothing");
+
+    let current = original.next().expect("the revision is version 2");
+    assert!(
+        super::support::append_batch_at(&client, &table, current, accepted, &composite_batch())
+            .await
+            .is_err(),
+        "the accepted id under another version is refused after its provisional WAL attempt"
+    );
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("replay suppresses the provisional attempt the fence never accepted");
+    let client = tenant_client(&server, tenant).await;
+    assert_eq!(
+        read_all(client.clone()).await,
+        all,
+        "the provisional attempt restores no rows"
+    );
+    super::support::append_batch_at(&client, &table, original, accepted, &composite_batch())
+        .await
+        .expect("the original retry is still acknowledged");
+    assert_eq!(read_all(client).await, all, "and still stores nothing new");
 }
 
 /// Rows written under two partition specs and read after an ID-preserving

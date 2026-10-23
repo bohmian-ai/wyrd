@@ -11,7 +11,6 @@ use crate::error::WyrdCliError;
 pub enum PrincipalKindCli {
     User,
     Service,
-    Agent,
 }
 
 impl From<PrincipalKindCli> for PrincipalKindTag {
@@ -19,7 +18,6 @@ impl From<PrincipalKindCli> for PrincipalKindTag {
         match value {
             PrincipalKindCli::User => Self::User,
             PrincipalKindCli::Service => Self::Service,
-            PrincipalKindCli::Agent => Self::Agent,
         }
     }
 }

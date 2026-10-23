@@ -484,7 +484,7 @@ async fn schedule_next_due(
 ) -> Option<ScheduleTick> {
     let due = queue.claim_due(conn).await.expect("due binding claims")?;
     let authority = match due.owner() {
-        Some(owner) => Some(background(conn, owner).await),
+        Some((owner, _root)) => Some(background(conn, owner).await),
         None => None,
     };
     Some(

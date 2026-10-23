@@ -515,7 +515,9 @@ spec:
 
 `response_format: verdict` (or `{kind: verdict}`) compiles the closed
 Verdict schema generated from Wyrd's canonical `Verdict` type; `data` adds a
-required custom object with that schema. The card keeps and hashes the
+required custom object with that schema. A `data` schema is JSON Schema
+2020-12 (no other `$schema`) without a root `$id`; it is embedded as its own
+resource so its local references resolve as they do standalone. The card keeps and hashes the
 authored form, never the expanded provider settings. On a native body the
 named format is lowered into that protocol's structured-output settings; a
 body that also sets its own response settings, or a `system_one` body, is

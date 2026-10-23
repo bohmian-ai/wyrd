@@ -23,7 +23,6 @@ use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
-    upsert_service_account_from_card,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::verification::{
@@ -130,8 +129,8 @@ impl VerificationFixture {
         self.system_principal
     }
 
-    /// Register one active Service Card named `name` and project its
-    /// principal; returns the Card UID and the owner principal.
+    /// Register one active Service Card named `name` and seed its family's
+    /// runtime account; returns the Card UID and that owner account.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when a write fails.
@@ -142,16 +141,16 @@ impl VerificationFixture {
         let card = card("Service", name, &serde_json::json!({}))?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let uid = self.insert(&mut conn, &card).await?;
-        let principal = upsert_service_account_from_card(
+        let principal = crate::server::family_account(
             &mut conn,
-            &uid,
-            &card,
-            Attribution::direct(self.actor.id),
+            &card.kind,
+            &card.metadata.name,
+            self.actor.id.as_uuid(),
         )
         .await
         .map_err(|error| VerificationFixtureError::Card(error.to_string()))?;
         conn.commit().await?;
-        Ok((uid, principal))
+        Ok((uid, PrincipalId::new(principal)))
     }
 
     /// Register one active Custom Drift Verifier Card named `name` whose
@@ -349,14 +348,19 @@ impl VerificationFixture {
             .ok_or_else(|| VerificationFixtureError::Card("no binding projected".to_owned()))
     }
 
-    /// Record a qualifying machine authentication of `owner`, which activates
-    /// its bindings and arms their schedule cursors at database time.
+    /// Record a qualifying machine authentication of `owner` at `root`, which
+    /// activates the root's bindings and arms their schedule cursors at
+    /// database time.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when the write fails.
-    pub async fn activate(&self, owner: PrincipalId) -> Result<(), VerificationFixtureError> {
+    pub async fn activate(
+        &self,
+        owner: PrincipalId,
+        root: &CardUid,
+    ) -> Result<(), VerificationFixtureError> {
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
-        record_machine_authentication(&mut conn, owner).await?;
+        record_machine_authentication(&mut conn, owner, root).await?;
         conn.commit().await?;
         Ok(())
     }

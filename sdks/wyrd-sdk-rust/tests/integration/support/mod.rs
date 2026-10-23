@@ -544,7 +544,7 @@ pub fn ancestry<'a>(timeline: &'a [SpanRecord], span: &'a SpanRecord) -> Vec<&'a
 /// one more credential afterwards.
 ///
 /// # Panics
-/// Panics when `card` is not a Service or Agent, or a principal call fails.
+/// Panics when `card` is not a Service, or a principal call fails.
 pub async fn runtime_account(admin: &WyrdClient, card: &CardRef) -> (PrincipalId, String) {
     let principals = Principals::connect_with(admin)
         .await

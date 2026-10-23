@@ -495,8 +495,8 @@ struct CallAttribution {
 
 /// Every direct call records its caller as both subject and actor plus whichever of `wyrd-run-id` and
 /// `wyrd-card-uid` it carried: neither, the Card alone, the Run alone, or
-/// both, each absent one as null. The caller holds `ask-agent`'s own
-/// card-scoped key, whose scope admits that Card.
+/// both, each absent one as null. The caller is the owning Service's runtime
+/// account run at that Service, whose scope admits its `ask-agent` component.
 ///
 /// # Panics
 /// Panics when a call, flush, or read fails or a row's attribution differs.
@@ -504,11 +504,21 @@ struct CallAttribution {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn gateway_call_records_whichever_attribution_it_carries() {
     let inference = Inference::start().await;
-    let agent = declared(&inference.ask, "ask-agent");
-    let (id, key) = runtime_account(&inference.deployment.admin(), &agent).await;
-    let uid = agent.uid.expect("a registered Card has a UID");
-    let caller = inference.deployment.client(&key).for_workload(uid.clone());
-    let card = uid.to_string();
+    let service = declare(
+        &inference.deployment.cards().await,
+        "cards/gateway_inference/ask-service.yaml",
+    )
+    .await
+    .root;
+    let (id, key) = runtime_account(&inference.deployment.admin(), &service).await;
+    let caller = inference
+        .deployment
+        .client(&key)
+        .for_workload(service.uid.expect("a registered Card has a UID"));
+    let card = declared(&inference.ask, "ask-agent")
+        .uid
+        .expect("a registered Card has a UID")
+        .to_string();
 
     for headers in [
         vec![],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
 from collections.abc import Sequence
@@ -301,3 +302,17 @@ class Watch:
     binding_id: str
     hooks: Receiver
     verifier: str
+
+
+def stale_bundle(bundle: Path, cards: Cards, tmp_path: Path) -> Path:
+    """A copy of ``bundle`` whose ``model`` names a registered Card outside the Service's graph."""
+    model = hydrated(bundle).card_ref("model").uid
+    foreign = declare(cards, "cards/observe_a_run/configured-service.yaml")[
+        "configured-service"
+    ].uid
+    assert model is not None and foreign is not None
+    stale = tmp_path / "stale"
+    shutil.copytree(bundle, stale)
+    for path in stale.rglob("*.yaml"):
+        path.write_text(path.read_text().replace(model, foreign))
+    return stale

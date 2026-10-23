@@ -24,6 +24,7 @@ from .support import (
     pull,
     scheduled_result,
     service_key,
+    stale_bundle,
 )
 
 pytestmark = pytest.mark.integration
@@ -86,15 +87,17 @@ def test_run_view_exposes_its_alias(observed: WyrdState) -> None:
     assert agent_run.run_id != run.run_id
 
 
-def test_card_scoped_key_cannot_write_another_cards_observations(observed_bundle: Path) -> None:
-    agent = hydrated(observed_bundle, WyrdClient())
-    agent.start_bifrost()
+def test_stale_bundle_cannot_write_outside_its_service_graph(
+    observed_bundle: Path, cards: Cards, tmp_path: Path
+) -> None:
+    stale = hydrated(stale_bundle(observed_bundle, cards, tmp_path), WyrdClient())
+    stale.start_bifrost()
 
-    agent.run("model").observe.submit("observed-drift", {"latency": 12.5})
+    stale.run("model").observe.submit("observed-drift", {"latency": 12.5})
 
     with pytest.raises(WyrdError) as refused:
-        agent.flush()
-    agent.shutdown()
+        stale.flush()
+    stale.shutdown()
     assert refused.value.code == "WYRD_VALA_403_BIFROST_CARD_SCOPE"
 
 

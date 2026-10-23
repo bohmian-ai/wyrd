@@ -216,15 +216,31 @@ async fn run_view_exposes_its_alias() {
     deployment.shutdown().await;
 }
 
-/// A key whose Card scope does not cover the Model cannot write the Model's
-/// samples; the refusal surfaces when the submission drains.
+/// A stale bundle whose `model` names a registered Card outside the Service's
+/// graph cannot write that Card's samples; the refusal surfaces when the
+/// submission drains.
 ///
 /// # Panics
-/// Panics when the drain succeeds or is refused with another code.
+/// Panics when the bundle cannot be rewritten, or the drain succeeds or is
+/// refused with another code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn card_scoped_key_cannot_write_another_cards_observations() {
+async fn stale_bundle_cannot_write_outside_its_service_graph() {
     let (deployment, dir) = observed().await;
+    let foreign = declare(
+        &deployment.cards().await,
+        "cards/observe_a_run/configured-service.yaml",
+    )
+    .await
+    .root
+    .uid
+    .expect("a registered Card has a UID");
+    let model = state(&dir)
+        .run_for_card("model")
+        .expect("model run opens")
+        .subject_uid()
+        .clone();
+    replace_in_tree(&dir.path().join("bundle"), model.as_str(), foreign.as_str());
     let state = state_as(&dir, deployment.admin());
     state.start_bifrost().await.expect("Bifrost starts");
 
@@ -337,4 +353,23 @@ async fn configured_service_context_reaches_both_verification_subjects() {
         );
     }
     deployment.shutdown().await;
+}
+
+/// Replace every `from` with `to` in each YAML file under `dir`.
+///
+/// # Panics
+/// Panics when a directory or file cannot be read or written.
+fn replace_in_tree(dir: &std::path::Path, from: &str, to: &str) {
+    for entry in std::fs::read_dir(dir).expect("bundle directory reads") {
+        let path = entry.expect("bundle entry reads").path();
+        if path.is_dir() {
+            replace_in_tree(&path, from, to);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "yaml")
+        {
+            let text = std::fs::read_to_string(&path).expect("bundle file reads");
+            std::fs::write(&path, text.replace(from, to)).expect("bundle file writes");
+        }
+    }
 }

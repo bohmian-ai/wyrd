@@ -1502,8 +1502,9 @@ async fn declare_verifier(
 }
 
 /// Unknown format names, invalid or non-object data schemas, Prompts that
-/// cannot produce a Verdict, and native bodies that set their own response
-/// format are refused with a structured validation error naming the field,
+/// cannot produce a Verdict (including a composed handwritten schema whose
+/// data is optional), and native bodies that set their own response format
+/// are refused with a structured validation error naming the field,
 /// and the refused Verifier does not exist afterwards; the valid code and
 /// Agent declarations register.
 ///
@@ -1516,6 +1517,13 @@ async fn verdict_declarations_validate_before_persistence() {
         .expect("test server starts");
     let (_, jwt) = user(&server, "vr-declarer", &["editor"]).await;
     let plain = json!({ "outcome": "passed" });
+    let mut optional_data = Value::Object(
+        wyrd_spec::verification::execution::Verdict::response_format(
+            &serde_json::from_value(json!("verdict")).expect("plain format"),
+        )
+        .expect("the plain format resolves"),
+    );
+    optional_data["properties"]["data"] = json!({ "type": "object" });
     let refused = [
         ("vr-unknown-name", scored(&json!("score"), &plain)),
         (
@@ -1541,6 +1549,13 @@ async fn verdict_declarations_validate_before_persistence() {
             ),
         ),
         ("vr-native-conflict", judged(&json!("verdict"), true)),
+        (
+            "vr-composed-optional-data",
+            judged(
+                &json!({ "type": "object", "allOf": [optional_data] }),
+                false,
+            ),
+        ),
     ];
     for (name, spec) in refused {
         let (status, problem) = declare_verifier(&server, &jwt, name, &spec).await;

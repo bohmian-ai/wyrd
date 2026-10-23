@@ -4,7 +4,7 @@ import type { CardHeaderInput, ChartInput, Range } from 'wyrd-ai-ui/loaders';
 export const range: Range = { last: '24h' };
 
 export const service: CardHeaderInput = {
-  cardRef: { kind: 'Service', name: 'support-desk', version: '1.0.0', space: 'default' }
+  cardRef: { kind: 'Service', name: 'support-desk', version: '1.0.0' }
 };
 
 export const spans: ChartInput = {

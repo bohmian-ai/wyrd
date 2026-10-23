@@ -187,7 +187,7 @@ export function compareVersions(left: string, right: string): number {
 /**
  * Load one exact Card, then the exact versions sharing its resolved identity.
  *
- * The version listing depends on the Card read's resolved space, so a denied or
+ * The version listing depends on the Card read's resolved name, so a denied or
  * failed Card read issues no listing. A failed listing keeps the Card visible
  * with its own versions state.
  */
@@ -204,7 +204,6 @@ export async function loadCardHeader(input: CardHeaderInput, context: LoadContex
       op: 'cards.list',
       kind: card.kind,
       name: card.metadata.name,
-      space: card.metadata.space ?? input.cardRef.space ?? null,
       include_prerelease: true,
       limit: VERSION_PAGE,
       cursor

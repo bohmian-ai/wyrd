@@ -47,7 +47,7 @@ export function fmtInstant(ms: number): string {
   return `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 }
 
-/** An exact Card identity → "space/name@1.4.2", or "name@1.4.2" without a space. */
-export function fmtCardRef(ref: { name: string; version: string; space?: string | null }): string {
-  return `${ref.space ? `${ref.space}/` : ''}${ref.name}@${ref.version}`;
+/** An exact Card identity → "name@1.4.2". */
+export function fmtCardRef(ref: { name: string; version: string }): string {
+  return `${ref.name}@${ref.version}`;
 }

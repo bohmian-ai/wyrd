@@ -146,7 +146,7 @@ test('TASK-003: Identical authorized reads', async ({ server, seeded }) => {
   try {
     const reads: WireRequest[] = [
       { op: 'cards.get_by_ref', card_ref: seeded.model },
-      { op: 'cards.list', kind: 'Model', name: 'support-model', space: 'default', include_prerelease: true, limit: 10, cursor: null },
+      { op: 'cards.list', kind: 'Model', name: 'support-model', include_prerelease: true, limit: 10, cursor: null },
       { op: 'bifrost.query', sql: LATENCY_CHART.sql, params: [RANGE.from, RANGE.to] },
       { op: 'bifrost.list_tables' },
       { op: 'bifrost.describe_table', ...LATENCY }
@@ -278,7 +278,7 @@ test('TASK-003: Actual four-host foundation proof', async ({ server, seeded }) =
     status: 200,
     body: { result: { state: 'populated', data: { terminal: { row_count: 3 } } } }
   });
-  expect(await bff({ component: 'CardHeader', input: { cardRef: { kind: own.kind, name: own.name, version: own.version, space: own.space } }, range: RANGE })).toMatchObject({
+  expect(await bff({ component: 'CardHeader', input: { cardRef: { kind: own.kind, name: own.name, version: own.version } }, range: RANGE })).toMatchObject({
     status: 200,
     body: { result: { state: 'populated', data: { card: { metadata: { uid: own.uid } } } } }
   });

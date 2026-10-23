@@ -282,3 +282,112 @@ mise run check:tenant-isolation
 Add exact per-language version-handshake journey commands, SQL `pg_tests` selectors, shard batching/reconciliation tests and catalog-fork selectors to implementation evidence after confirming their current owning runners. Regenerate changed contracts from their source and run `mise run codegen:check` plus narrow affected Rust/Python/TypeScript/MCP/HTTP binding checks; public version transport is not covered by private Rust tests alone. Do not hand-edit generated declarations; Python stubs remain authored.
 
 Do not require `gate`, broad redux aggregates or full language/journey suites solely for this task. Full integrated suites run once at change review. Record exact commands/results, closed-finding regression checks, immutable dependency commits, physical/query measurements and remaining limits. Later `$wyrd-task-review` audits the original base-to-remediated-candidate range, original verdict, this replacement task and all seven finding dispositions. No code, migration, commit or benchmark is changed by writing this task.
+
+## Implementation evidence
+
+Candidate commits after `c4dd61029`, oldest first: `8088d790c` `d7dae503b` `b100cbe38` `627608d65` `2c9ef1d66` `a3200c4f8` `a1a27d7ce` `2a9135567` `6d8f48f48` `85293685c` `68ed31bf2`. The Iceberg fork is `bohmian-ai/iceberg-rust`, local branch `wyrd-table-version` at `a34f3885c`, with `0ceeb5005` and `cd3a721cd` beneath it, on top of the pinned `486273c9e`. It is **not pushed**. `Cargo.toml:250-253` and `Cargo.lock` still pin `486273c9e`. Every run below patches the three fork crates in through cargo `--config patch` or an equivalent scratch `CARGO_HOME` `[patch]`. Repinning waits on authorization to push the fork.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| One version identifies the complete definition (FIND-1) | `catalog/layout.rs` `TABLE_VERSION_PROPERTY`; `TableDefinition::of_metadata`; the fork publishes `iceberg_table_versions` with the pointer swap (`0ceeb5005`) and refuses non-advancing definition edits (`cd3a721cd`) | fork `cargo test -p iceberg-catalog-sql --lib`: 44 passed | PASS |
+| Every carrier keyed by the version | `627608d65` (SealKey, WAL, staging, promotion) | redux `--lib`: 853 passed; R2 lib selector: 38 passed | PASS |
+| Describe/register return one coherent version + layout | `2c9ef1d66`; `85293685c` `BifrostCatalog::describe_table` now reads the version and layout from one metadata document (before, a Bloom-only edit was described as version 2 with version 1's Bloom list) | `distributed::bloom_policy_versions_answer_exactly_through_compaction` (RED: "file 1 must be written at TableVersion(2) with Bloom [\"request\"], describe reports TableVersion(2) with [service, environment, request]") | PASS |
+| Stale new batch refused with typed 409, no residue | `a3200c4f8` | `scribe_persistence_path::pg_tests::stale_table_version_is_refused_without_residue`; the Bloom journey's stale writer gets `TableVersionConflict` | PASS |
+| Accepted retries keep the original version; warm mirror without SQL | `a1a27d7ce` (`GroupWalState.fenced` captures the version at fence time; Postgres `is_accepted` runs only on a stale-version miss) | `write_read::accepted_batch_revision_survives_alteration_and_restart`; `ambiguous_retry::ambiguous_deadline_retains_then_deduplicates_one_batch` | PASS |
+| Provisional WAL attempt at a spent id is suppressed on replay | `6d8f48f48`: `resolve_replay` selects the attempt by the fence's immutable coordinates; replay dedups commits per attempt; `retain_replayed_batches` suppresses by `(batch_id, LSN range)`; differing attempts at an unfenced id fail closed | RED: live "scribe batch commit identity mismatch", then replay "scribe batch replay identity mismatch" left Scribe unready. GREEN: the journey above; `replay::tests::wal_replay_hands_a_contested_duplicate_batch_to_the_fence`; `shards::tests::replay_fence_filters_only_suppressed_batches_in_same_seal` | PASS |
+| Fence batching: one INSERT per tenant group | `d7dae503b` | `pg_scribe_batch_commits` statement-count tests; vala-sql nextest: 85 passed | PASS |
+| Retained definitions survive Forge expiry/orphan GC | `2a9135567` + fork `a34f3885c` `list_table_version_locations` | `forge::expire::tests::retained_definitions_are_never_expiry_candidates` (RED verified); redux `--test integration`: 71 passed | PASS |
+| FIND-2..6 closed evidence preserved | unchanged owners | R2 selectors: scribe 3/3, forge `scribe_promotion::mixed_specifications_preserve_partition_and_sort_truth`, integration `forge::promotion::scribe_promotion_integration_rejects_physical_datafile_mismatch_before_catalog_io`, oracle `distributed::iceberg_filtering_mechanisms_cover_all_table_kinds`; full `--test scribe --test forge`: 59 passed | PASS |
+| FIND-7 physical/query evidence | `85293685c` new journey and `WyrdTestServer::commit_bloom_revision` (a Bloom-only commit through the versioned catalog seam) | journey passes; measurements below | PASS |
+| SDK projections | Rust `wyrd-client` carries the version on every frame; Python `TableDescription.table_version` (`68ed31bf2`); TS generated `BifrostTableDescription.table_version` | Python `tests/integration/bifrost/test_table_time_column.py` 2 passed; TS `tests/integration/table-time-column.test.ts` 2 passed; `py:typecheck`, `py:lints`, `ts:typecheck`, `ts:lints` pass | PASS (version 1 only; see limits) |
+| Boundaries and codegen | — | `fmt`, `lints`, `check:deps`, `check:tenant-isolation`, `codegen:check` pass with the fork patched | PASS |
+| Throughput within 5% | — | not run: another worktree (`guided-setup`) had pytest integration runs alive for about 32 h | UNMEASURED |
+
+### FIND-TASK-004-7 measurements
+
+Fixture: two datasets with identical rows. Each has four files of 45,000 rows, one 15-minute slice per file, sorted by `key_id`. The columns are `service` (`svc-0/2/4/6` by row within the file), `environment` (staging on every third row), and `request` (`req-NNNNN`, null on every seventh row). Writer constants are unchanged. Every hot and promoted file holds 1 row group, with at least 3 pages on `key_id`. Each rewrite produces one output of 180,000 rows in 1 row group, with at least 10 `key_id` pages.
+
+Bloom versions per file:
+- The table ending complete: complete, `[request]`, empty, reordered complete.
+- The table ending empty: complete, reordered, `[request]`, empty.
+
+Each hot and promoted object carries exactly its own version's filters, which means older files lack filters a later version selects. The rewrite outputs carry exactly the compaction-time list: all three filters on the complete table and none on the empty table.
+
+Object sizes:
+- Hot and promoted: 283,675 B (complete), 265,158 B (`[request]`), about 199,595 B (empty), and about 265,260 B (reordered).
+- Rewritten: 847,700 B (complete) and 782,034 B (empty).
+
+Every query returns exactly the row identities the rule derives, on every cut. Since the rule depends only on the row's position within its file, that one exact answer also proves that every Bloom version answers alike. Bloom exclusion of an absent in-bounds value equals the number of row groups carrying that column's filter. The remaining groups are scanned and still answer exactly. No numeric threshold or speedup is asserted.
+
+Per-query telemetry is the Oracle delta: files, row groups scanned/pruned (Bloom), physical bytes scanned, and `Oracle.*` profile steps. `physical_bytes` is the `oracle_query_bytes_scanned_total` family; no transport bytes are used.
+
+| Table (final policy) | Cut | Case | Rows | Files | Row groups scanned | Pruned (Bloom) | Bytes scanned | cut_read ms | planning ms | scan_sizing ms | admission ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| complete | Hot | same-Service selective equality | 15000 | 4 | 4 | 0 (0) | 442185 | 4.69 | 8.41 | 3.41 | 0.11 |
+| complete | Hot | cross-Service environment equality | 60000 | 4 | 4 | 0 (0) | 441359 | 0.06 | 6.88 | 1.72 | 0.11 |
+| complete | Hot | finite IN with an absent member | 90000 | 4 | 4 | 0 (0) | 441355 | 0.06 | 8.86 | 2.43 | 0.12 |
+| complete | Hot | null request | 25716 | 4 | 4 | 0 (0) | 788597 | 0.06 | 6.76 | 1.49 | 0.12 |
+| complete | Hot | present request | 4 | 4 | 4 | 0 (0) | 734443 | 0.06 | 7.86 | 2.45 | 0.13 |
+| complete | Hot | absent Service | 0 | 4 | 2 | 2 (2) | 460 | 0.06 | 6.66 | 1.72 | 0.11 |
+| complete | Hot | absent request | 0 | 4 | 1 | 3 (3) | 255625 | 0.06 | 6.77 | 1.87 | 0.11 |
+| empty | Hot | same-Service selective equality | 15000 | 4 | 4 | 0 (0) | 442185 | 5.94 | 12.19 | 3.60 | 0.15 |
+| empty | Hot | cross-Service environment equality | 60000 | 4 | 4 | 0 (0) | 441359 | 0.07 | 7.58 | 1.93 | 0.14 |
+| empty | Hot | finite IN with an absent member | 90000 | 4 | 4 | 0 (0) | 441355 | 0.06 | 8.40 | 2.52 | 0.12 |
+| empty | Hot | null request | 25716 | 4 | 4 | 0 (0) | 788597 | 0.06 | 5.75 | 1.35 | 0.12 |
+| empty | Hot | present request | 4 | 4 | 4 | 0 (0) | 734443 | 0.06 | 6.94 | 1.90 | 0.12 |
+| empty | Hot | absent Service | 0 | 4 | 2 | 2 (2) | 460 | 0.05 | 6.63 | 1.73 | 0.12 |
+| empty | Hot | absent request | 0 | 4 | 1 | 3 (3) | 255625 | 0.06 | 6.99 | 1.92 | 0.13 |
+| complete | Promoted | same-Service selective equality | 15000 | 4 | 4 | 0 (0) | 442185 | 1.92 | 8.54 | 2.90 | 0.14 |
+| complete | Promoted | cross-Service environment equality | 60000 | 4 | 4 | 0 (0) | 441359 | 0.05 | 7.48 | 2.14 | 0.12 |
+| complete | Promoted | finite IN with an absent member | 90000 | 4 | 4 | 0 (0) | 441355 | 0.05 | 9.41 | 2.94 | 0.12 |
+| complete | Promoted | null request | 25716 | 4 | 4 | 0 (0) | 788597 | 0.05 | 7.29 | 1.76 | 0.12 |
+| complete | Promoted | present request | 4 | 4 | 4 | 0 (0) | 734443 | 0.05 | 8.14 | 3.12 | 0.15 |
+| complete | Promoted | absent Service | 0 | 4 | 2 | 2 (2) | 460 | 0.05 | 8.72 | 2.36 | 0.14 |
+| complete | Promoted | absent request | 0 | 4 | 1 | 3 (3) | 255625 | 0.05 | 7.21 | 2.28 | 0.11 |
+| empty | Promoted | same-Service selective equality | 15000 | 4 | 4 | 0 (0) | 442185 | 1.73 | 9.09 | 2.67 | 0.12 |
+| empty | Promoted | cross-Service environment equality | 60000 | 4 | 4 | 0 (0) | 441359 | 0.05 | 7.55 | 2.72 | 0.13 |
+| empty | Promoted | finite IN with an absent member | 90000 | 4 | 4 | 0 (0) | 441355 | 0.05 | 9.84 | 3.06 | 0.17 |
+| empty | Promoted | null request | 25716 | 4 | 4 | 0 (0) | 788597 | 0.06 | 6.22 | 1.76 | 0.12 |
+| empty | Promoted | present request | 4 | 4 | 4 | 0 (0) | 734443 | 0.06 | 7.35 | 2.64 | 0.12 |
+| empty | Promoted | absent Service | 0 | 4 | 2 | 2 (2) | 460 | 0.05 | 7.38 | 2.29 | 0.13 |
+| empty | Promoted | absent request | 0 | 4 | 1 | 3 (3) | 255625 | 0.05 | 8.34 | 2.81 | 0.14 |
+| complete | Rewritten | same-Service selective equality | 15000 | 1 | 1 | 0 (0) | 262555 | 2.14 | 7.89 | 2.91 | 0.13 |
+| complete | Rewritten | cross-Service environment equality | 60000 | 1 | 1 | 0 (0) | 262042 | 0.06 | 7.27 | 1.77 | 0.12 |
+| complete | Rewritten | finite IN with an absent member | 90000 | 1 | 1 | 0 (0) | 262032 | 0.06 | 8.32 | 2.20 | 0.12 |
+| complete | Rewritten | null request | 25716 | 1 | 1 | 0 (0) | 503724 | 0.05 | 6.57 | 1.60 | 0.12 |
+| complete | Rewritten | present request | 4 | 1 | 1 | 0 (0) | 346583 | 0.05 | 7.78 | 2.24 | 0.14 |
+| complete | Rewritten | absent Service | 0 | 1 | 0 | 1 (1) | 47 | 0.07 | 7.54 | 2.13 | 0.12 |
+| complete | Rewritten | absent request | 0 | 1 | 0 | 1 (1) | 65553 | 0.05 | 7.55 | 1.80 | 0.12 |
+| empty | Rewritten | same-Service selective equality | 15000 | 1 | 1 | 0 (0) | 262461 | 2.52 | 8.68 | 3.09 | 0.16 |
+| empty | Rewritten | cross-Service environment equality | 60000 | 1 | 1 | 0 (0) | 261995 | 0.05 | 7.09 | 1.95 | 0.16 |
+| empty | Rewritten | finite IN with an absent member | 90000 | 1 | 1 | 0 (0) | 261985 | 0.06 | 8.59 | 2.48 | 0.14 |
+| empty | Rewritten | null request | 25716 | 1 | 1 | 0 (0) | 503724 | 0.06 | 6.52 | 1.81 | 0.12 |
+| empty | Rewritten | present request | 4 | 1 | 1 | 0 (0) | 281030 | 0.05 | 7.30 | 1.96 | 0.12 |
+| empty | Rewritten | absent Service | 0 | 1 | 1 | 0 (0) | 466 | 0.04 | 7.28 | 1.98 | 0.13 |
+| empty | Rewritten | absent request | 0 | 1 | 1 | 0 (0) | 129138 | 0.04 | 6.66 | 2.03 | 0.13 |
+
+### Diagnosis: `published::time_column_range_prunes_published_files`
+
+This test is outside the R2 write set and was already failing at `c4dd61029`.
+
+- **Symptom:** `Registration(InvalidPhysicalLayout { field: TimeColumn, violation: UnsupportedColumn, column: "event_time" })` at `oracle/published.rs:1559`. It was the only failure in the full serial `--test oracle` run, which passed 59 of 60.
+- **Evidence:** the test registers naive `Timestamp(_, None)` time columns (`published.rs:1592,1594`). `canonical_time_column` (`catalog/layout.rs:1226-1229`) refuses them; the refusal was added in `3bd495ce7`, an ancestor of `c4dd61029`.
+- **Cause:** a contract contradiction. `architecture/bifrost-design.md:79-80` allows a time column "with or without a zone". TASK-004 (`:41`) and TASK-005 (`:56,120`) require refusing a naive time axis, and the validator follows the tasks.
+- **Fix site:** `bifrost-design.md:79-80` plus the test (if refusal stands), or `layout.rs` plus `scribe/describe.rs:409` plus both tasks (if naive is allowed).
+- **Independent diagnostician:** reached the same cause and fix sites. It recommends a maintainer decision and judges that the task intent looks deliberate.
+
+Nothing was changed for this.
+
+### Limits
+
+- The live path still refuses an accepted batch id resent at another version as an internal invariant error, not the typed 409. Replay now recovers from it.
+- The canonical (`None`) cold retry that re-prepares under the fence's version is proven only at version 1. Built-in versions do not change until TASK-005 PATCH.
+- A same-name table recreation cannot be distinguished without the table UID on the wire.
+- Client describe-cache eviction after a conflict is not implemented. A caller recreates its writer (`85293685c` journey).
+- Re-registration still compares against the SQL layout projection written at registration (`bifrost_catalog.rs:1120`). After an edit, re-registering the original declaration is TASK-005's.
+- `set_table_property` (oracle `support.rs:874`) remains a pre-existing direct property write for the Forge row-group size. The new journey does not use it.
+- Python and TypeScript journeys prove only describe version 1 after a write. A stale-version journey per language needs the public PATCH (TASK-005).
+- Every version is retained with no pruning (ponytail note in `forge/compact.rs`) until a retry horizon exists.
+- Throughput is unmeasured.
+
+**Verdict:** `IMPLEMENTED` pending the fork push and repin, with throughput unmeasured.

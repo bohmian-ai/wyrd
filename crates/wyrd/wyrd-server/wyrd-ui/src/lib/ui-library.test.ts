@@ -370,6 +370,30 @@ test('TASK-003: Validated portable rendering', async () => {
   expect(validateView({ version: 'wyrd.view/v1', range: RANGE, panels })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
   expect(validatePanel('CardHeader', { cardRef: { ...card, space: 'search' } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION', detail: expect.stringContaining('space') });
   expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels })).not.toHaveProperty('code');
+
+  // A relative range no instant can represent is a field error: no read, siblings still load, before or after a valid document.
+  const unresolvable = { last: '1000000000000d' };
+  const ranged = recording(() => ({ ok: true, value: series }));
+  const outOfRange = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: unresolvable, panels };
+  const invalidRoot = render(WyrdView, { doc: outOfRange, executor: ranged.executor });
+  expect(invalidRoot.container).toHaveTextContent('View input.range');
+  expect(invalidRoot.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+  await invalidRoot.rerender({ doc: { ...outOfRange, range: RANGE }, executor: ranged.executor });
+  await waitFor(() => expect(ranged.calls).toHaveLength(1));
+  await invalidRoot.rerender({ doc: outOfRange, executor: ranged.executor });
+  expect(invalidRoot.container).toHaveTextContent('View input.range');
+  expect(ranged.calls).toHaveLength(1);
+  invalidRoot.unmount();
+  const invalidPanel = render(WyrdView, {
+    doc: { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'far', component: 'Chart', input: { ...timeseries, range: unresolvable } }, { id: 'near', component: 'Chart', input: timeseries }] },
+    executor: ranged.executor
+  });
+  await waitFor(() => expect(invalidPanel.container.querySelector('[data-panel="near"] .legend')).not.toBeNull());
+  expect(invalidPanel.container.querySelector('[data-panel="far"]')).toHaveTextContent('Chart input.range');
+  expect(invalidPanel.container.querySelector('[data-panel="far"]')).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+  expect(ranged.calls).toHaveLength(2);
+  invalidPanel.unmount();
+  expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last: '100000000d' }, panels })).not.toHaveProperty('code');
 });
 
 test('TASK-003: Dependent loads and safe actions', async () => {
@@ -631,6 +655,17 @@ test('Canonical UI problem projections', async () => {
     expect(response.headers.get('content-type')).toBe('application/problem+json');
     expect(await response.json()).toEqual({ ...validation, detail: expect.stringMatching(/^Panel input/) });
   }
+  // A valid inherited range does not admit a Chart's own unresolvable range: each endpoint refuses it without a read.
+  const unread = vi.spyOn(Bifrost, 'connect');
+  for (const POST of [bffLoad, exampleLoad]) {
+    const body = JSON.stringify({ component: 'Chart', input: { ...timeseries, range: { last: '1000000000000d' } }, range: RANGE });
+    const response = await POST({ locals: { browserSession: { client: () => ({}) } }, request: new Request('http://ui/load', { method: 'POST', body }) } as never);
+    expect(response.status).toBe(400);
+    expect(response.headers.get('content-type')).toBe('application/problem+json');
+    expect(await response.json()).toEqual({ ...validation, detail: expect.stringMatching(/^Chart input\.range/) });
+  }
+  expect(unread).not.toHaveBeenCalled();
+  unread.mockRestore();
 
   // Browser exports load no native SDK at runtime.
   const browser = import.meta.glob('/packages/ui/src/lib/{index,contract,loaders,view,plot,format,schemas,layout,mcp}.ts', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;

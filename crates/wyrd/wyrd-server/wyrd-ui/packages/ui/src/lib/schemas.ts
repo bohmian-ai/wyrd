@@ -52,9 +52,25 @@ export const AbsoluteRangeSchema = z
     path: ['to']
   });
 
-/** A range relative to when the view loads, such as `{"last": "6h"}`. */
+const UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000 } as const;
+
+/** The milliseconds a relative range's `last` spans. */
+function span(last: string): number {
+  return Number(last.slice(0, -1)) * UNIT_MS[last.slice(-1) as keyof typeof UNIT_MS];
+}
+
+/**
+ * A range relative to when the view loads, such as `{"last": "6h"}`. Its span
+ * must reach back from 1970 to an instant a `Date` can hold, so it resolves
+ * against any current clock.
+ */
 export const RelativeRangeSchema = z
-  .object({ last: z.string().regex(/^[1-9]\d*[mhd]$/, 'minutes, hours, or days, such as 6h') })
+  .object({
+    last: z
+      .string()
+      .regex(/^[1-9]\d*[mhd]$/, 'minutes, hours, or days, such as 6h')
+      .refine((last) => !Number.isNaN(new Date(-span(last)).getTime()), 'a span a date can represent, such as 6h')
+  })
   .strict();
 
 /** A view or panel time range. */
@@ -174,6 +190,15 @@ export type CardHeaderInput = z.infer<typeof CardHeaderInputSchema>;
 export type Range = z.infer<typeof RangeSchema>;
 /** An absolute range with RFC 3339 bounds. */
 export type AbsoluteRange = z.infer<typeof AbsoluteRangeSchema>;
+
+/**
+ * Resolve `range` against `now`; a view resolves its relative range once per
+ * load so every panel reads the same bounds.
+ */
+export function resolveRange(range: Range, now: number = Date.now()): AbsoluteRange {
+  if ('from' in range) return range;
+  return { from: new Date(now - span(range.last)).toISOString(), to: new Date(now).toISOString() };
+}
 
 /**
  * A panel's place on the view's 12-column grid of 40px rows, in whole units.

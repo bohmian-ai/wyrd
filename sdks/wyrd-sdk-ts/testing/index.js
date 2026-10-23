@@ -46,9 +46,6 @@ export const cli = {
   async pull(selector, outputDir, options = {}) {
     return value(await native.cliPull(selector, outputDir, options.metadataOnly, await connection(options)));
   },
-  async issueKey(card, options = {}) {
-    return value(await native.cliIssueKey(card, await connection(options)));
-  },
   async putProviderCredential(write, options = {}) {
     return value(await native.cliPutProviderCredential(write, await connection(options)));
   },

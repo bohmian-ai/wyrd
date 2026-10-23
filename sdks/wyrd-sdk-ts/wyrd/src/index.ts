@@ -234,6 +234,10 @@ export type {
   VerificationStatus,
   VerificationVerdict,
   VerifierSpec,
+  WorkloadKind,
+  WorkloadRestriction,
+  WorkloadRestrictionFamily,
+  WorkloadRestrictionUnrestricted,
 } from "./card-types.js";
 /** The JSON custom `data` a requirement carries when read without a type. */
 export type VerdictData = NonNullable<WireRequirementResult["data"]>;
@@ -1936,9 +1940,11 @@ export class Principals {
   }
 
   /**
-   * Create an unbound Service principal; requires `service_accounts:write`.
+   * Create a Service account; requires `service_accounts:write`, and a
+   * family `workload_restriction` also requires tenant administration.
    *
-   * @param request - The principal's name, Roles, and optional description.
+   * @param request - The account's name, Roles, optional description, and
+   * optional workload restriction (omitted means unrestricted).
    * @returns The principal id and its first credential.
    * @throws {@link WyrdError} for a malformed request or a transport or authorization failure.
    */
@@ -1949,7 +1955,7 @@ export class Principals {
   /**
    * Issue one more credential; requires `service_accounts:write`.
    *
-   * @param principalId - The Service or Agent principal.
+   * @param principalId - The Service account.
    * @returns The credential and its plaintext secret.
    * @throws {@link WyrdError} for an unknown principal or a transport or authorization failure.
    */

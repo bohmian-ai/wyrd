@@ -1018,9 +1018,12 @@ export declare class NativeWyrdState {
  * Omitted arguments resolve through `client_from_options`: the environment,
  * then the saved `wyrd auth login` for this server (the one for
  * `WYRD_TENANT` when set, otherwise the newest), then
- * `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
- * metadata, including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server
- * has saved logins but none for `WYRD_TENANT`.
+ * `~/.config/wyrd/credentials.toml`. A `workload_uid` runs the client as
+ * that exact root, as [`NativeWyrdClient::for_workload`] does; omitted,
+ * `WYRD_WORKLOAD_UID` is read. Failures are returned as catalog metadata,
+ * including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server has saved
+ * logins but none for `WYRD_TENANT` and `WYRD_SPEC_400_VALIDATION` for a
+ * `workload_uid` that is not a UUIDv7.
  */
 export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, workloadUid?: string | undefined | null): NativeWyrdClientResult
 

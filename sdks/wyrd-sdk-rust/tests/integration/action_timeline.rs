@@ -177,7 +177,8 @@ async fn service_action_timeline_is_one_connected_tree() {
     let state = assistant.state().await;
     let service = assistant
         .deployment
-        .client(&assistant.deployment.service_key(&assistant.service).await);
+        .service_client(&assistant.service)
+        .await;
     let writer = Bifrost::connect_with(&service, BifrostOptions::default())
         .await
         .expect("Bifrost connects");

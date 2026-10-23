@@ -890,10 +890,11 @@ export interface CreateOperatorConnectionRequestSlack {
 }
 
 /**
- * Request to create a tenant-scoped machine principal.
+ * Request to create a stable tenant Service account.
  *
- * The principal binds no Card: it is tenant automation — a CI runner, a
- * deployment agent — rather than a deployed workload with an emit scope.
+ * The account outlives every release: it is never a Card version. The exact
+ * Service or Agent version a request runs as is selected per token or
+ * request as workload context, within `workload_restriction`.
  */
 export interface CreateServicePrincipalRequest {
   /**
@@ -909,6 +910,12 @@ export interface CreateServicePrincipalRequest {
    * needs the tenant administrative credential.
    */
   readonly roles: readonly string[];
+  /**
+   * Workload-family limit; omitted means unrestricted. A family restriction
+   * is that family's unique scheduled runtime account and additionally
+   * requires tenant-administrative wildcard permission.
+   */
+  readonly workload_restriction?: WorkloadRestriction | null;
 }
 
 /**
@@ -3726,14 +3733,14 @@ export interface PortableSettings {
 export type PrincipalId = string;
 
 /**
- * Principal-kind discriminator without a bound card.
+ * Principal-kind discriminator.
  *
  * Serializes as a bare snake_case string (`"global_admin"`, `"tenant_admin"`,
- * `"user"`, `"service"`, `"agent"`, `"system"`); this is a stable wire
+ * `"user"`, `"service"`, `"system"`); this is a stable wire
  * contract for the revoke request body, token claims, and the durable
  * `principal_kind` columns.
  */
-export type PrincipalKindTag = "global_admin" | "tenant_admin" | "user" | "service" | "agent" | "system";
+export type PrincipalKindTag = "global_admin" | "tenant_admin" | "user" | "service" | "system";
 
 /**
  * Response of `GET /v1/principals`.
@@ -3762,7 +3769,7 @@ export interface PrincipalQuery {
    */
   readonly email?: string | null;
   /**
-   * `user`, `service`, or `agent`; omitted lists all three.
+   * `user` or `service`; omitted lists both.
    */
   readonly kind?: PrincipalKindTag | null;
   /**
@@ -3770,7 +3777,7 @@ export interface PrincipalQuery {
    */
   readonly limit?: number | null;
   /**
-   * Exact principal name; matches services and agents only.
+   * Exact account name; matches services only.
    */
   readonly name?: string | null;
 }
@@ -3782,8 +3789,7 @@ export interface PrincipalQuery {
  */
 export interface PrincipalRoles {
   /**
-   * Principal kind the server resolved from the id: `user`, `service`, or
-   * `agent`.
+   * Principal kind the server resolved from the id: `user` or `service`.
    */
   readonly kind: PrincipalKindTag;
   /**
@@ -3807,19 +3813,15 @@ export type PrincipalStatus = "active" | "suspended";
  */
 export interface PrincipalSummary {
   /**
-   * Bound Card, for Card-bound services and agents.
-   */
-  readonly card_ref: CardRef | null;
-  /**
    * Email, for users.
    */
   readonly email: string | null;
   /**
-   * `user`, `service`, or `agent`.
+   * `user` or `service`.
    */
   readonly kind: PrincipalKindTag;
   /**
-   * Principal name, for services and agents.
+   * Account name, for services.
    */
   readonly name: string | null;
   /**
@@ -3830,6 +3832,11 @@ export interface PrincipalSummary {
    * Lifecycle status.
    */
   readonly status: PrincipalStatus;
+  /**
+   * The account's workload restriction: explicit for a Service, null for a
+   * User.
+   */
+  readonly workload_restriction: WorkloadRestriction | null;
 }
 
 /**
@@ -5005,7 +5012,7 @@ export type RoleName = string;
  *
  * A user's assignments are owned per source: federated login replaces only
  * `idp` rows on every sign-in, and a tenant administrator grants and revokes
- * only `direct` rows. Service and Agent assignments are always `direct`.
+ * only `direct` rows. Service assignments are always `direct`.
  */
 export type RoleSource = "idp" | "direct";
 
@@ -6369,6 +6376,43 @@ export type VersionSpec = string;
  * Google Cloud project or location segment used by the Vertex adapter.
  */
 export type VertexLocation = string;
+
+/**
+ * Card kind a workload family or root may name.
+ */
+export type WorkloadKind = "Service" | "Agent";
+
+/**
+ * A Service account's durable workload restriction.
+ *
+ * `unrestricted` adds no workload-family limit; it is not an operation grant
+ * and never crosses tenants. `family` limits Card-attributed emission and
+ * verification to roots of one family and is that family's unique scheduled
+ * runtime account.
+ */
+export type WorkloadRestriction = WorkloadRestrictionUnrestricted | WorkloadRestrictionFamily;
+
+/**
+ * Limited to roots of exactly one family.
+ */
+export interface WorkloadRestrictionFamily {
+  /**
+   * Family Card kind.
+   */
+  readonly kind: WorkloadKind;
+  readonly mode: "family";
+  /**
+   * Family Card name, resolved in the account's tenant.
+   */
+  readonly name: CardName;
+}
+
+/**
+ * No workload-family limit.
+ */
+export interface WorkloadRestrictionUnrestricted {
+  readonly mode: "unrestricted";
+}
 
 /**
  * RFC 9457 problem value emitted by every public Wyrd error boundary.

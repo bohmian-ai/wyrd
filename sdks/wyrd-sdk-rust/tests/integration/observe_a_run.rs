@@ -63,14 +63,14 @@ fn state_as(dir: &TempDir, client: WyrdClient) -> WyrdState {
     WyrdState::from_path_with(dir.path().join("bundle"), client).expect("bundle loads offline")
 }
 
-/// The observed Service's own client, from a key the `issue_key` CLI
-/// function issues for the Service registered in `dir`'s bundle.
+/// The observed Service's own client: its family runtime account, run as the
+/// Service registered in `dir`'s bundle.
 ///
 /// # Panics
-/// Panics when the bundle does not load or the key is not issued.
+/// Panics when the bundle does not load or the account is not provisioned.
 async fn service_client(deployment: &Deployment, dir: &TempDir) -> WyrdClient {
     let service = state(dir).root_ref().clone();
-    deployment.client(&deployment.service_key(&service).await)
+    deployment.service_client(&service).await
 }
 
 /// Samples submitted for the `observed-drift` Verifier bound to the run's

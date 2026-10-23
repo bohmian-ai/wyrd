@@ -82,6 +82,7 @@ impl Tenant {
                     name: format!("bench-caller-{index}"),
                     roles: vec![INVOKER_ROLE.to_owned()],
                     description: None,
+                    workload_restriction: None,
                 })
                 .await?;
             issued.push(SecretString::from(created.credential.expose().to_owned()));

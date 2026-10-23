@@ -2,7 +2,6 @@ import { expect, vi } from "vitest";
 import { z } from "zod";
 
 import { Cards, WyrdClient, WyrdState } from "wyrd-ai";
-import { cli } from "@wyrd/testing";
 
 import { observedService } from "../support/observed-service.js";
 import { binding, scheduledResult } from "../support/server.js";
@@ -77,8 +76,7 @@ test("run view exposes its alias", ({ state }) => {
 });
 
 test("card scoped key cannot write another cards observations", async ({ bundle }) => {
-  const agentKey = await cli.issueKey({ kind: "Agent", name: "observed-agent", version: "1.0.0" });
-  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: agentKey.key }) });
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect() });
   await state.startBifrost();
 
   expect(await state.run().forCard("model").observe.submit("observed-drift", { latency: 12.5 })).toEqual({

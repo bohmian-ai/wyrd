@@ -5,7 +5,6 @@ mod attribution;
 mod browser;
 mod device;
 mod human_connection;
-mod issue_key;
 mod oidc;
 mod permission_scope;
 mod platform_identity;
@@ -33,7 +32,6 @@ pub use human_connection::{
     HUMAN_SUBJECT_CLAIM, HumanClientAuth, HumanConnectionState, HumanConnectionView,
     HumanConnectionsResponse, refuse_human_trusted_issuer,
 };
-pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{
     AbsoluteUrl, CallbackQuery, ConnectionTester, IssuerUrl, LoginInitResponse, LoginInitiation,
     ProviderResponse, Sha256Hex, Sha256HexError, UrlParseError,

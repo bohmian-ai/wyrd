@@ -24,7 +24,7 @@ use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
     Bifrost, CallProvenance, Citation, ExecutionId, Gateway, GroupId, Locator, RequirementOutcome,
-    SpanRecord, VerificationVerdict, WyrdClient, WyrdError, cli,
+    SpanRecord, VerificationVerdict, WyrdClient, WyrdError,
 };
 use wyrd_spec::auth::{PrincipalKindTag, RevokePrincipalRequest};
 use wyrd_spec::ids::BindingId;
@@ -34,7 +34,7 @@ use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 use crate::action_timeline::service_telemetry;
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, ancestry, coordinates, declare, declared, fixture, pull};
+use crate::support::{Deployment, ancestry, declare, declared, fixture, pull, runtime_account};
 use crate::verifier_building_blocks::{completion, requirement, tool_call};
 
 /// How long a test waits for a queued execution or a scheduled result.
@@ -145,8 +145,8 @@ impl Assistant {
     /// The hydrated assistant, created with the Service's own client and
     /// started with Bifrost.
     ///
-    /// The Service's key comes from the `issue_key` CLI function with no Role
-    /// granted beyond its default `workload`, so Bifrost startup, every
+    /// The Service's family runtime account holds only `workload`, so
+    /// Bifrost startup, every
     /// verify, and every judge's gateway call run with exactly what a newly
     /// registered Service holds.
     ///
@@ -154,8 +154,7 @@ impl Assistant {
     /// Panics when the key is not issued, the bundle does not load, or
     /// Bifrost does not start.
     pub(crate) async fn state(&self) -> WyrdState {
-        let key = self.deployment.service_key(&self.service).await;
-        let state = self.state_as(self.deployment.client(&key));
+        let state = self.state_as(self.deployment.service_client(&self.service).await);
         state.start_bifrost().await.expect("Bifrost starts");
         state
     }
@@ -176,15 +175,10 @@ impl Assistant {
         declare(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
         let assistant = declare(&cards, "cards/verify_in_real_time/assistant.yaml").await;
         let bundle = pull(&cards, &assistant.root).await;
-        let [kind, name, version] = coordinates(&assistant.root);
-        let key = cli::issue_key(&kind, &name, &version, None, None, Some(admin))
-            .await
-            .expect("the CLI issues the Service key");
-        let state = WyrdState::from_path_with(
-            bundle.path().join("bundle"),
-            self.deployment.client(key.key.expose()),
-        )
-        .expect("bundle loads offline");
+        let (_, key) = runtime_account(&admin, &assistant.root).await;
+        let state =
+            WyrdState::from_path_with(bundle.path().join("bundle"), self.deployment.client(&key))
+                .expect("bundle loads offline");
         state.start_bifrost().await.expect("Bifrost starts");
         (state, bundle)
     }
@@ -227,21 +221,12 @@ impl Assistant {
     /// judgment is requested as.
     ///
     /// # Panics
-    /// Panics when the CLI refuses to issue the Service key.
+    /// Panics when the runtime account cannot be provisioned.
     async fn principal(&self, service: &CardRef) -> String {
-        let [kind, name, version] = coordinates(service);
-        cli::issue_key(
-            &kind,
-            &name,
-            &version,
-            None,
-            None,
-            Some(self.deployment.admin()),
-        )
-        .await
-        .expect("the CLI issues the Service key")
-        .principal_id
-        .to_string()
+        runtime_account(&self.deployment.admin(), service)
+            .await
+            .0
+            .to_string()
     }
 
     /// Publish every captured row, then read each `vala.gateway.calls` row's
@@ -299,10 +284,10 @@ impl Assistant {
     /// # Panics
     /// Panics when no token mints or the judgment is refused.
     async fn verify_over_http(&self, traceparent: &str) -> String {
-        let key = self.deployment.service_key(&self.service).await;
         let token = self
             .deployment
-            .client(&key)
+            .service_client(&self.service)
+            .await
             .access_token()
             .await
             .expect("access token mints");
@@ -843,8 +828,11 @@ async fn submitted_answer_is_judged_in_the_background_and_resumes_by_id() {
         panic!("Run evidence queues an execution");
     };
     let waited = execution.wait(WAIT).await.expect("the execution settles");
-    let key = assistant.deployment.service_key(&assistant.service).await;
-    let resumed = Execution::connect_with(*execution.id(), &assistant.deployment.client(&key))
+    let service = assistant
+        .deployment
+        .service_client(&assistant.service)
+        .await;
+    let resumed = Execution::connect_with(*execution.id(), &service)
         .await
         .expect("the handle rebuilds from its ID")
         .wait(WAIT)
@@ -938,10 +926,9 @@ async fn unfitted_baseline_is_skipped_on_schedule() {
     let cards = assistant.deployment.cards().await;
     let unfitted = declare(&cards, "cards/verify_in_real_time/unfitted-assistant.yaml").await;
     let bundle = pull(&cards, &unfitted.root).await;
-    let key = assistant.deployment.service_key(&unfitted.root).await;
     let state = WyrdState::from_path_with(
         bundle.path().join("bundle"),
-        assistant.deployment.client(&key),
+        assistant.deployment.service_client(&unfitted.root).await,
     )
     .expect("bundle loads");
     state.start_bifrost().await.expect("Bifrost starts");
@@ -1203,8 +1190,8 @@ struct Grouped {
     receipt: DeclarationReceipt,
     /// The hydrated bundle the Service state and any other caller load.
     bundle: TempDir,
-    /// The Service's API key.
-    key: String,
+    /// The Service's family runtime account client, run as the Service.
+    client: WyrdClient,
     /// The Service's state, started with Bifrost.
     state: WyrdState,
     /// The Service's `group_end` binding.
@@ -1223,10 +1210,9 @@ impl Assistant {
         let cards = self.deployment.cards().await;
         let receipt = declare(&cards, relative).await;
         let bundle = pull(&cards, &receipt.root).await;
-        let key = self.deployment.service_key(&receipt.root).await;
-        let state =
-            WyrdState::from_path_with(bundle.path().join("bundle"), self.deployment.client(&key))
-                .expect("bundle loads");
+        let client = self.deployment.service_client(&receipt.root).await;
+        let state = WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
+            .expect("bundle loads");
         state.start_bifrost().await.expect("Bifrost starts");
         let ids = cards
             .get(CardSelector::exact(receipt.root.clone()))
@@ -1251,7 +1237,7 @@ impl Assistant {
         Grouped {
             receipt,
             bundle,
-            key,
+            client,
             state,
             binding: binding.expect("the Service binds a group_end Verifier"),
         }
@@ -1287,8 +1273,8 @@ impl Grouped {
         idempotency_key: &str,
         body: &serde_json::Value,
     ) -> ExecutionId {
-        let token = deployment
-            .client(&self.key)
+        let token = self
+            .client
             .access_token()
             .await
             .expect("access token mints");
@@ -1552,18 +1538,15 @@ async fn grouped_support_resumes() {
     // latest execution is an errored group execution naming the group and
     // the reason, with no snapshot or result.
     let lapsed = GroupId::new("conv-2").expect("group id");
-    WyrdState::from_path_with(
-        support.bundle.path().join("bundle"),
-        deployment.client(&support.key),
-    )
-    .expect("bundle loads")
-    .run_for_card("agent")
-    .expect("agent run opens")
-    .observe()
-    .group_id(lapsed.clone())
-    .verify("turn-check", turns[0].clone())
-    .await
-    .expect("the turn is judged");
+    WyrdState::from_path_with(support.bundle.path().join("bundle"), support.client.clone())
+        .expect("bundle loads")
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .group_id(lapsed.clone())
+        .verify("turn-check", turns[0].clone())
+        .await
+        .expect("the turn is judged");
     let owner = assistant
         .principal(&support.receipt.root)
         .await
@@ -1954,7 +1937,7 @@ async fn grouped_coding_uses_declared_sources() {
         .await
         .expect("the Service may read spans live");
     let group = GroupId::new("session-1").expect("group id");
-    let (dispatch, provider) = service_telemetry(&deployment.client(&coding.key));
+    let (dispatch, provider) = service_telemetry(&coding.client);
     let session = tracing::dispatcher::with_default(&dispatch, || {
         let session = tracing::info_span!("session", otel.name = "coding-session");
         tracing::info_span!(parent: &session, "edit", otel.name = "edit-file").in_scope(|| ());
@@ -2407,7 +2390,7 @@ async fn grouped_sampled_frames_use_visible_outcomes() {
     let other_bundle = pull(&cards, &other.root).await;
     let other_state = WyrdState::from_path_with(
         other_bundle.path().join("bundle"),
-        deployment.client(&deployment.service_key(&other.root).await),
+        deployment.service_client(&other.root).await,
     )
     .expect("bundle loads");
     other_state.start_bifrost().await.expect("Bifrost starts");
@@ -2782,16 +2765,10 @@ async fn grouped_conversations_coexist_with_drift() {
         .expect("handle connects");
     let b_support = declare(&b_cards, "cards/verify_in_real_time/support.yaml").await;
     let b_bundle = pull(&b_cards, &b_support.root).await;
-    let [kind, name, version] = coordinates(&b_support.root);
-    let b_key = cli::issue_key(&kind, &name, &version, None, None, Some(tenant_b))
-        .await
-        .expect("the CLI issues tenant B's Service key")
-        .key;
-    let b_state = WyrdState::from_path_with(
-        b_bundle.path().join("bundle"),
-        deployment.client(b_key.expose()),
-    )
-    .expect("bundle loads");
+    let (_, b_key) = runtime_account(&tenant_b, &b_support.root).await;
+    let b_state =
+        WyrdState::from_path_with(b_bundle.path().join("bundle"), deployment.client(&b_key))
+            .expect("bundle loads");
     b_state.start_bifrost().await.expect("Bifrost starts");
     b_state
         .run_for_card("agent")

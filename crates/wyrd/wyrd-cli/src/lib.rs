@@ -43,7 +43,6 @@ pub use cli::{Cli, Command};
 /// identity, `WYRD_API_KEY`, or `credentials.toml`) exactly as the executable
 /// does. No credential is ever a string argument.
 pub mod commands {
-    pub use crate::auth::issue_key::issue_key;
     pub use crate::card::{
         CheckCard, CheckReport, SelectorArgs, declare, declare_check, get, pull,
     };

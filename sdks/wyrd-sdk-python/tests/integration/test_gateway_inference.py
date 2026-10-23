@@ -27,6 +27,7 @@ from .support import (
     client_of,
     declare,
     pull,
+    runtime_account,
     timeline,
 )
 
@@ -136,8 +137,8 @@ def test_malformed_traceparent_is_ignored_by_the_gateway(
 
 def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: WyrdClient) -> None:
     card_uid = str(declare(Cards(admin), "cards/gateway_inference/ask-agent.yaml")["ask-agent"].uid)
-    issued = cli.issue_key(kind="Agent", name="ask-agent", version="1.0.0", client=admin)
-    agent = openai_client(client_of(server, issued.key))
+    principal_id, key = runtime_account("ask-agent", "Agent", admin)
+    agent = openai_client(client_of(server, key, card_uid))
 
     for headers in ({"wyrd-run-id": "run-alone"}, {"wyrd-card-uid": card_uid}):
         completion = agent.chat.completions.create(
@@ -150,7 +151,7 @@ def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: 
     server.flush_bifrost()
     calls = Bifrost(client=admin).sql(
         "SELECT run_id, card_uid FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id",
-        [str(issued.principal_id)],
+        [principal_id],
     )
     assert calls.to_arrow().to_pylist() == [
         {"run_id": "run-alone", "card_uid": None},
@@ -171,10 +172,7 @@ def test_caller_without_gateway_invoke_is_refused(
     assert model_calls(upstream) == 0
 
 
-def test_cli_issues_a_card_scoped_key_and_writes_a_provider_credential(
-    admin: WyrdClient, ask: CardRef
-) -> None:
-    issued = cli.issue_key(kind="Agent", name="ask-agent", version="1.0.0", client=admin)
+def test_cli_writes_a_provider_credential(admin: WyrdClient, ask: CardRef) -> None:
     view = cli.put_provider_credential(
         {
             "name": "managed-openai-key",
@@ -184,8 +182,6 @@ def test_cli_issues_a_card_scoped_key_and_writes_a_provider_credential(
         client=admin,
     )
 
-    assert str(issued.card_ref) == "Agent/ask-agent@1.0.0"
-    assert issued.key.startswith(issued.prefix)
     assert (view["name"], view["provider"], view["state"]) == (
         "managed-openai-key",
         "openai",
@@ -201,9 +197,9 @@ def test_agent_prompt_routes(
     deploy(server, "openai", name="openai-granted", access="granted")
     declare(Cards(admin), "cards/gateway_inference/ask-service.yaml")
     bundle = pull(Cards(admin), "ask-service", tmp_path)
-    key = cli.issue_key(kind="Service", name="ask-service", version="1.0.0", client=admin)
-    caller = client_of(server, key.key)
-    state = WyrdState.from_path(bundle, caller)
+    principal_id, key = runtime_account("ask-service", client=admin)
+    state = WyrdState.from_path(bundle, client_of(server, key))
+    caller = client_of(server, key, str(state.root_ref.uid))
 
     expected = []
     for alias in ("agent", "body-agent"):
@@ -216,7 +212,7 @@ def test_agent_prompt_routes(
                 {
                     "run_id": run.run_id,
                     "card_uid": str(state.card_ref(alias).uid),
-                    "sub_principal_id": key.principal_id,
+                    "sub_principal_id": principal_id,
                     "deployment": deployment,
                 }
             )
@@ -227,7 +223,7 @@ def test_agent_prompt_routes(
     assert (
         calls(
             server,
-            f"sub_principal_id = '{key.principal_id}'",
+            f"sub_principal_id = '{principal_id}'",
             "run_id, card_uid, sub_principal_id, requested_model.deployment AS deployment",
         )
         == expected

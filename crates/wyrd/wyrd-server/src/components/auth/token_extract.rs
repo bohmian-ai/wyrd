@@ -138,7 +138,7 @@ pub(crate) fn auth_not_configured() -> WyrdErrorResponse {
 ///
 /// This is the single verify pipeline shared by the `/v1` default-deny
 /// middlewares and `AuthenticatedPrincipal::from_request_parts` (the extractor fallback for
-/// off-nest routes such as `/auth/issue-key`). Every call site produces identical
+/// off-nest routes). Every call site produces identical
 /// `400`/`401`/`503` error responses because they share this function.
 ///
 /// # Errors

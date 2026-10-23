@@ -4,19 +4,20 @@
 //! Verifier of four checks over one 2 KiB `context` slot, a Model, and a
 //! Service binding the Verifier to the Model, once per closed-loop client.
 //! Each client is its own application: it loads its pulled Service bundle
-//! with that Service's Card-bound key, so every `verify` and `submit` carries
-//! its own authenticated owner, exactly as `WyrdState` does in production
+//! with its Service family runtime account's key, run as that Service root,
+//! so every `verify` and `submit` carries its own authenticated owner, exactly as `WyrdState` does in production
 //! when many applications share a tenant.
 
 use std::path::Path;
 
-use reqwest::Method;
 use secrecy::{ExposeSecret as _, SecretString};
 use wyrd_client::cards::{BundleMode, CardGraphPuller, CardSelector, Cards};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::state::WyrdState;
-use wyrd_client::{GlobalConfig, WyrdClient};
-use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse};
+use wyrd_client::{GlobalConfig, Principals, WyrdClient};
+use wyrd_spec::auth::{
+    CreateServicePrincipalRequest, WorkloadFamily, WorkloadKind, WorkloadRestriction,
+};
 use wyrd_testing::release_server::{SERVER_URL, SetupTenant};
 
 use crate::verification::Result;
@@ -84,8 +85,8 @@ impl Tenant {
 
     /// Declares Service `bench-service-<index>` beside the shared Verifier
     /// and Model in `directory` (an identical redeclaration of those two
-    /// reuses them), issues it its Card-bound key, pulls its bundle, and
-    /// loads it.
+    /// reuses them), creates its family runtime account holding `workload`,
+    /// pulls its bundle, and loads it; the state runs as the Service root.
     ///
     /// # Errors
     ///
@@ -100,18 +101,19 @@ impl Tenant {
         let name = format!("name: bench-service-{index}\n");
         std::fs::write(&file, SERVICE.replacen("name: bench-service\n", &name, 1))?;
         let service = Box::pin(cards.declare_from_path(&file)).await?;
-        let issued: IssueKeyResponse = admin
-            .request_json(
-                Method::POST,
-                "/auth/issue-key",
-                Some(&IssueKeyRequest {
-                    card_ref: service.root.clone(),
-                    label: Some("bench".to_owned()),
-                    expires_in_seconds: None,
-                }),
-            )
+        let issued = Principals::connect_with(admin)
+            .await?
+            .create_service_principal(&CreateServicePrincipalRequest {
+                name: format!("bench-service-{index}-runtime"),
+                roles: vec!["workload".to_owned()],
+                description: None,
+                workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
+                    kind: WorkloadKind::Service,
+                    name: service.root.name.clone(),
+                })),
+            })
             .await
-            .map_err(|error| format!("issuing the Service key: {error}"))?;
+            .map_err(|error| format!("creating the Service account: {error}"))?;
         let bundle = directory.join(format!("bundle-{index}"));
         Box::pin(CardGraphPuller::new(cards.registry_context()).pull(
             &CardSelector::exact(service.root.clone()),
@@ -120,7 +122,7 @@ impl Tenant {
         ))
         .await
         .map_err(|error| format!("pulling the Service bundle: {error}"))?;
-        let key = SecretString::from(issued.key.expose().to_owned());
+        let key = SecretString::from(issued.credential.expose().to_owned());
         Ok(WyrdState::from_path_with(&bundle, connect(&key)?)?)
     }
 }

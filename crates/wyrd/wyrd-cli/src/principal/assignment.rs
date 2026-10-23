@@ -234,7 +234,7 @@ mod tests {
     /// Discovery accepts only assignable kinds.
     #[test]
     fn list_accepts_only_assignable_kinds() {
-        for kind in ["user", "service", "agent"] {
+        for kind in ["user", "service"] {
             assert!(
                 ListCli::try_parse_from([
                     "wyrd",
@@ -247,15 +247,18 @@ mod tests {
                 "{kind} parses"
             );
         }
-        assert!(
-            ListCli::try_parse_from([
-                "wyrd",
-                "--kind",
-                "tenant_admin",
-                "--server",
-                "https://wyrd.example"
-            ])
-            .is_err()
-        );
+        for kind in ["agent", "tenant_admin"] {
+            assert!(
+                ListCli::try_parse_from([
+                    "wyrd",
+                    "--kind",
+                    kind,
+                    "--server",
+                    "https://wyrd.example"
+                ])
+                .is_err(),
+                "{kind} is refused"
+            );
+        }
     }
 }

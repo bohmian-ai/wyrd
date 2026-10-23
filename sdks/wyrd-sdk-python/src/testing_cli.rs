@@ -13,16 +13,13 @@
 use std::future::Future;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use wyrd_cards::card_ref::CardRefPy;
 use wyrd_cli::commands::{
     self, CheckCard, CheckReport, McpHostReport, McpInstallReport, SelectorArgs,
 };
 use wyrd_cli::{Diagnostic, Severity};
 use wyrd_client::WyrdClient;
-use wyrd_spec::auth::IssueKeyResponse;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::ProviderCredentialWrite;
 use wyrd_utils::py::WyrdPyResult;
@@ -147,59 +144,6 @@ impl PyCheckReport {
                 .map(|inner| Py::new(py, PyCheckDiagnostic { inner }))
                 .collect::<PyResult<_>>()?,
         })
-    }
-}
-
-/// A Card-scoped API key returned by `issue_key`, exactly once.
-#[pyclass(module = "wyrd.testing.cli", name = "IssueKeyResponse", frozen)]
-pub struct PyIssueKeyResponse {
-    /// Response from the shared issue-key command.
-    inner: IssueKeyResponse,
-}
-
-#[pymethods]
-impl PyIssueKeyResponse {
-    /// Credential id of the issued key.
-    #[getter]
-    fn key_id(&self) -> String {
-        self.inner.key_id.to_string()
-    }
-
-    /// Principal the key authenticates: the Card's Service or Agent
-    /// principal, the id its Role assignments are addressed by.
-    #[getter]
-    fn principal_id(&self) -> String {
-        self.inner.principal_id.to_string()
-    }
-
-    /// Plaintext API key.
-    #[getter]
-    fn key(&self) -> &str {
-        self.inner.key.expose()
-    }
-
-    /// Log-safe key prefix.
-    #[getter]
-    fn prefix(&self) -> &str {
-        &self.inner.prefix
-    }
-
-    /// The Card the key is bound to.
-    #[getter]
-    fn card_ref(&self) -> CardRefPy {
-        CardRefPy(self.inner.card_ref.clone())
-    }
-
-    /// When the key was issued.
-    #[getter]
-    const fn created_at(&self) -> DateTime<Utc> {
-        self.inner.created_at
-    }
-
-    /// When the key expires.
-    #[getter]
-    const fn expires_at(&self) -> DateTime<Utc> {
-        self.inner.expires_at
     }
 }
 
@@ -357,39 +301,6 @@ fn pull(
     Ok(PyPullSummary::from(inner))
 }
 
-/// Issue an API key bound to one exact Card (`wyrd auth issue-key`).
-///
-/// `card` is `(kind, name, version)`.
-///
-/// # Errors
-///
-/// Raises `WyrdError` for invalid coordinates, a missing credential or bad
-/// endpoint, or the server's refusal.
-#[pyfunction]
-#[pyo3(signature = (card, label, expires_in_seconds, client))]
-fn issue_key(
-    py: Python<'_>,
-    card: (String, String, String),
-    label: Option<String>,
-    expires_in_seconds: Option<u32>,
-    client: Option<&Bound<'_, PyWyrdClient>>,
-) -> WyrdPyResult<PyIssueKeyResponse> {
-    let (kind, name, version) = card;
-    let client = rust_client(client);
-    let inner = block_on(
-        py,
-        commands::issue_key(
-            &kind,
-            &name,
-            &version,
-            label.as_deref(),
-            expires_in_seconds,
-            client,
-        ),
-    )?;
-    Ok(PyIssueKeyResponse { inner })
-}
-
 /// Create or rotate one provider credential (`wyrd gateway credential put`).
 ///
 /// `write` may carry a provider key; a decode failure never quotes it, and
@@ -480,14 +391,12 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCheckCard>()?;
     module.add_class::<PyCheckDiagnostic>()?;
     module.add_class::<PyCheckReport>()?;
-    module.add_class::<PyIssueKeyResponse>()?;
     module.add_class::<PyMcpHostReport>()?;
     module.add_class::<PyMcpInstallReport>()?;
     module.add_function(wrap_pyfunction!(declare_check, module)?)?;
     module.add_function(wrap_pyfunction!(declare, module)?)?;
     module.add_function(wrap_pyfunction!(get, module)?)?;
     module.add_function(wrap_pyfunction!(pull, module)?)?;
-    module.add_function(wrap_pyfunction!(issue_key, module)?)?;
     module.add_function(wrap_pyfunction!(mcp_install, module)?)?;
     module.add_function(wrap_pyfunction!(put_provider_credential, module)?)?;
     module.add_function(wrap_pyfunction!(revoke_provider_credential, module)?)?;

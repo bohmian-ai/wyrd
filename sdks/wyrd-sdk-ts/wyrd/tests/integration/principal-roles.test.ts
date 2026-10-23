@@ -1,10 +1,9 @@
-// A tenant administrator discovers a Service's principal and grants it Roles.
-// A new Service key holds direct `workload`: it queries but cannot author
+// A tenant administrator discovers a Service account and grants it Roles.
+// A new Service account holds direct `workload`: it queries but cannot author
 // until `editor` is granted, and each change reaches the key's next token.
 import { expect, vi } from "vitest";
 
-import { Bifrost, type CardRef, Cards, Principals, WyrdClient } from "wyrd-ai";
-import { cli } from "@wyrd/testing";
+import { Bifrost, Cards, Principals, WyrdClient } from "wyrd-ai";
 
 import { observedServiceTest as test } from "../support/observed-service.js";
 import { fixture } from "../support/server.js";
@@ -19,10 +18,10 @@ const AUTHORED = fixture("cards/gateway_inference/ask-prompt.yaml");
 
 const DENIED = { code: "WYRD_PERMISSION_403_DENIED_RBAC" };
 
-/** Issue the observed Service's own key; its principal id and key. */
-async function issue(): Promise<{ principal: string; key: string }> {
-  const issued = await cli.issueKey({ kind: "Service", name: "observed-service", version: "1.0.0" });
-  return { principal: issued.principal_id, key: issued.key };
+/** Create the unrestricted Service account `name` holding only `workload`; its principal id and key. */
+async function issue(name: string): Promise<{ principal: string; key: string }> {
+  const created = await (await Principals.connect()).createServicePrincipal({ name, roles: ["workload"] });
+  return { principal: created.principal_id, key: created.credential };
 }
 
 /** Register `AUTHORED` through a fresh client, so it carries the key's next token. */
@@ -31,14 +30,12 @@ async function author(key: string): Promise<unknown> {
 }
 
 test("granted editor reaches the next token until revoked", async ({ bundle: _ }) => {
-  const { principal, key } = await issue();
+  const { principal, key } = await issue("granted-editor");
   const principals = await Principals.connect();
 
-  const [found] = (await principals.list({ kind: "service", name: "observed-service" })).principals;
-  const bound: CardRef | null | undefined = found?.card_ref;
+  const [found] = (await principals.list({ kind: "service", name: "granted-editor" })).principals;
   expect(found?.principal_id).toBe(principal);
-  expect([bound?.kind, bound?.name, bound?.version]).toEqual(["Service", "observed-service", "1.0.0"]);
-  expect(bound?.uid).toEqual(expect.any(String));
+  expect(found?.workload_restriction).toEqual({ mode: "unrestricted" });
   expect((await principals.roles(principal)).roles).toEqual([{ role: "workload", source: "direct" }]);
   const reader = await Bifrost.connect({ client: WyrdClient.connect({ credential: key }) });
   expect((await reader.sql(TENANT_WIDE)).numRows).toBe(1);
@@ -59,7 +56,7 @@ test("granted editor reaches the next token until revoked", async ({ bundle: _ }
 });
 
 test("only a tenant admin assigns roles", async ({ bundle: _ }) => {
-  const { principal, key } = await issue();
+  const { principal, key } = await issue("own-roles");
   const own = await Principals.connect({ client: WyrdClient.connect({ credential: key }) });
 
   await expect(own.grantRole(principal, "editor")).rejects.toMatchObject(DENIED);
@@ -73,7 +70,7 @@ test("direct and idp user assignments coexist", async ({ server }) => {
   const page = await principals.list({ email: "pr-person@test.wyrd" });
   expect(page.principals.map((found) => [found.principal_id, found.kind])).toEqual([[user, "user"]]);
   expect(page.next).toBeNull();
-  expect(page.principals[0]?.card_ref).toBeNull();
+  expect(page.principals[0]?.workload_restriction).toBeNull();
 
   const granted = await principals.grantRole(user, "viewer");
   expect(granted.changed).toBe(true);

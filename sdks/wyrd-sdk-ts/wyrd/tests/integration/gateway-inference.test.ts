@@ -23,7 +23,7 @@ import {
 } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { ancestry, columnValues, fixture, declared, serverTest, timeline } from "../support/server.js";
+import { ancestry, columnValues, fixture, declared, runtimeAccount, serverTest, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -297,10 +297,10 @@ test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
 });
 
 test("gateway call records a lone run or card", async ({ server, ask }) => {
-  const issued = await cli.issueKey({ kind: "Agent", name: "ask-agent", version: "1.0.0" });
-  const caller = WyrdClient.connect({ credential: issued.key });
-  const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: caller.httpAuth });
   const cardUid = declared(ask, "ask-agent").uid;
+  const issued = await runtimeAccount({ kind: "Agent", name: "ask-agent" });
+  const caller = WyrdClient.connect({ credential: issued.key }).forWorkload(cardUid);
+  const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: caller.httpAuth });
 
   for (const headers of [{ "wyrd-run-id": "run-alone" }, { "wyrd-card-uid": cardUid }]) {
     const reply = await client.chat.completions.create(ASK, { headers });
@@ -312,7 +312,7 @@ test("gateway call records a lone run or card", async ({ server, ask }) => {
     await (
       await Bifrost.connect()
     ).sql("SELECT run_id, card_uid FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id", [
-      issued.principal_id,
+      issued.principalId,
     ])
   ).toArrow();
   expect(columnValues(calls.getChild("run_id"))).toEqual(["run-alone", null]);
@@ -369,17 +369,13 @@ test("caller without gateway invoke cannot run an agents sdk agent", async ({ se
   expect(provider.received.slice(before)).toEqual([]);
 });
 
-test("cli issues a card scoped key and writes a provider credential", async ({ ask: _ }) => {
-  const agent = { kind: "Agent", name: "ask-agent", version: "1.0.0" } as const;
-  const issued = await cli.issueKey(agent);
+test("cli writes a provider credential", async ({ ask: _ }) => {
   const view = await cli.putProviderCredential({
     name: "managed-openai-key",
     provider: "openai",
     source: { managed_secret: { secret: "sk-managed" } },
   });
 
-  expect(issued.card_ref).toEqual(agent);
-  expect(issued.key.startsWith(issued.prefix)).toBe(true);
   expect(view).toMatchObject({ name: "managed-openai-key", provider: "openai", state: "active" });
   expect(JSON.stringify(view)).not.toContain("sk-managed");
 });
@@ -430,9 +426,9 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   const receipt = await cards.declareFromPath(fixture("cards/gateway_inference/ask-service.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-ask-"));
   await cards.pull(receipt.root, bundle);
-  const issued = await cli.issueKey({ kind: "Service", name: "ask-service", version: "1.0.0" });
-  const caller = WyrdClient.connect({ credential: issued.key });
-  const state = WyrdState.fromPath(bundle, { client: caller });
+  const issued = await runtimeAccount({ kind: "Service", name: "ask-service" });
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: issued.key }) });
+  const caller = WyrdClient.connect({ credential: issued.key }).forWorkload(declared(receipt).uid);
   const before = provider.received.length;
 
   const asked: string[] = [];
@@ -457,7 +453,7 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
       await Bifrost.connect()
     ).sql(
       "SELECT requested_model.deployment AS deployment FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at",
-      [issued.principal_id],
+      [issued.principalId],
     )
   ).toArrow();
   expect(columnValues(calls.getChild("deployment"))).toEqual(["openai", "openai-backup", "openai", "openai-backup"]);

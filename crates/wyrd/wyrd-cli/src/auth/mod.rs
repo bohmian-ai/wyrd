@@ -1,14 +1,12 @@
 /// `wyrd auth access-token`: print the ambient client's current access token.
 pub mod access_token;
-/// `wyrd auth issue-key`: mint an API key bound to a Card.
-pub mod issue_key;
 /// `wyrd auth login`, `logout`, and `status`: the saved human user login.
 pub mod login;
 /// `wyrd auth refresh`: rotate a Wyrd refresh token.
 pub mod refresh;
 /// `wyrd auth trusted-issuer`: administer the tenant's trusted OIDC issuers.
 pub mod trusted_issuer;
-/// `wyrd auth workload-binding`: administer issuer-subject to Card bindings.
+/// `wyrd auth workload-binding`: administer issuer-subject to Service account bindings.
 pub mod workload_binding;
 
 use std::process::ExitCode;
@@ -23,8 +21,6 @@ pub enum AuthCommand {
     /// Print the current Wyrd access token and a newline, nothing else, for
     /// `apiKeyHelper`-style tools and shells.
     AccessToken(access_token::AccessTokenArgs),
-    /// Issue an API key bound to a card ref (POST /auth/issue-key).
-    IssueKey(issue_key::IssueKeyArgs),
     /// Sign in to a tenant through the browser and save the Wyrd user login
     /// every local SDK uses; no token is printed.
     Login(login::LoginArgs),
@@ -51,7 +47,6 @@ pub enum AuthCommand {
 pub async fn dispatch(command: AuthCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
         AuthCommand::AccessToken(args) => access_token::dispatch(args).await,
-        AuthCommand::IssueKey(args) => issue_key::dispatch(args).await,
         AuthCommand::Login(args) => login::login(args).await,
         AuthCommand::Logout(args) => login::logout(args).await,
         AuthCommand::Status => login::status().await,

@@ -14,7 +14,7 @@ from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer, cli
+from wyrd.testing import WyrdTestServer
 
 from .support import BASELINE_TIMEOUT_SECONDS, binding_ids, hydrated, scheduled_result
 
@@ -79,8 +79,7 @@ def test_run_view_exposes_its_alias(observed: WyrdState) -> None:
 
 
 def test_card_scoped_key_cannot_write_another_cards_observations(observed_bundle: Path) -> None:
-    agent_key = cli.issue_key(kind="Agent", name="observed-agent", version="1.0.0")
-    agent = hydrated(observed_bundle, WyrdClient(credential=agent_key.key))
+    agent = hydrated(observed_bundle, WyrdClient())
     agent.start_bifrost()
 
     agent.run("model").observe.submit("observed-drift", {"latency": 12.5})

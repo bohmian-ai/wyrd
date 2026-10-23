@@ -27,7 +27,7 @@ from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer, cli
+from wyrd.testing import WyrdTestServer
 
 from .conftest import registered_assistant, serving
 from .support import (
@@ -47,6 +47,7 @@ from .support import (
     group_execution,
     hydrated,
     pull,
+    runtime_account,
     service_key,
     timeline,
 )
@@ -70,7 +71,7 @@ def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
 
 def principal(service: str = "assistant") -> str:
     """The ``service`` principal id; ``assistant``'s is the one most judgments here are requested as."""
-    return cli.issue_key(kind="Service", name=service, version="1.0.0").principal_id
+    return runtime_account(service)[0]
 
 
 def result_with_its_judge_calls(
@@ -116,7 +117,9 @@ def verify_over_http(server: WyrdTestServer, cards: Cards, traceparent: str) -> 
     Returns the result's ``execution_id``.
     """
     registered = declare(cards, "cards/verify_in_real_time/assistant.yaml")
-    token = WyrdClient(credential=service_key("assistant")).access_token()
+    token = WyrdClient(
+        credential=service_key("assistant"), workload_uid=str(registered["assistant"].uid)
+    ).access_token()
     response = httpx.post(
         f"{server.base_url}/v1/verification/execute",
         headers={"x-wyrd-access-token": f"Bearer {token}", "traceparent": traceparent},
@@ -308,9 +311,8 @@ def test_submitted_answer_is_judged_in_the_background_and_resumes_by_id(
     execution = run.observe.submit("answer-check", "no")
     assert isinstance(execution, verify.Execution)
     waited = execution.wait(WAIT_SECONDS)
-    resumed = verify.Execution.connect(execution.id, WyrdClient(credential=assistant_key)).wait(
-        WAIT_SECONDS
-    )
+    service = WyrdClient(credential=assistant_key, workload_uid=str(assistant.root_ref.uid))
+    resumed = verify.Execution.connect(execution.id, service).wait(WAIT_SECONDS)
 
     assert waited.verdict == "failed"
     assert waited.execution_id == execution.id
@@ -942,7 +944,7 @@ def test_grouped_conversations_coexist_with_drift(
     )
     b_cards = Cards(tenant_b)
     declare(b_cards, "cards/verify_in_real_time/support.yaml")
-    b_key = cli.issue_key(kind="Service", name="support", version="1.0.0", client=tenant_b).key
+    b_key = service_key("support", tenant_b)
     b_state = WyrdState.from_path(
         pull(b_cards, "support", tmp_path / "b"), WyrdClient(credential=b_key)
     )

@@ -45,11 +45,10 @@ use utoipa_axum::routes;
 /// (`POST /auth/device_authorization`) and its verification page
 /// (`GET`/`POST /auth/device`), the common OIDC provider callback
 /// (`GET /auth/callback`), the token endpoint (`POST /auth/token`), token
-/// revocation (`POST /auth/revoke`), authorization server metadata, the
-/// browser-session operations under `/auth/browser`, and API key issuance
-/// (`POST /auth/issue-key`). Device user-code attempts are
-/// limited per client address at the gateway (RFC 8628 §5.1), which sees the
-/// real client and one budget across replicas; the token endpoint enforces
+/// revocation (`POST /auth/revoke`), authorization server metadata, and the
+/// browser-session operations under `/auth/browser`. Device user-code
+/// attempts are limited per client address at the gateway (RFC 8628 §5.1),
+/// which sees the real client and one budget across replicas; the token endpoint enforces
 /// the device polling interval with `slow_down`.
 pub fn auth_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()

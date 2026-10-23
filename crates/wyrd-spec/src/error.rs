@@ -709,7 +709,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_401_API_KEY_INVALID",
         status = 401,
         title = "API key not found, revoked, or hash mismatch",
-        remediation = "Re-issue a key with `wyrd auth issue-key <card_ref>` and update the deployment secret."
+        remediation = "Issue a new credential with `wyrd principal credential issue --principal <id>` and update the deployment secret."
     )]
     ApiKeyInvalid {
         /// Human-readable error message.
@@ -4488,7 +4488,7 @@ mod tests {
     }
 
     #[test]
-    fn api_key_invalid_remediation_names_issue_key() {
+    fn api_key_invalid_remediation_names_credential_issue() {
         let error = WyrdError::ApiKeyInvalid {
             message: "api key rejected".to_owned(),
             details: serde_json::json!({}),
@@ -4500,7 +4500,7 @@ mod tests {
             problem["remediation"]
                 .as_str()
                 .expect("remediation is string")
-                .contains("wyrd auth issue-key")
+                .contains("wyrd principal credential issue")
         );
     }
 

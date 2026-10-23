@@ -830,15 +830,15 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 agent = root / "fixtures/cards/gateway_inference/ask-agent.yaml"
                 assert wyrd("declare", str(agent)).returncode == 0
                 issued = wyrd(
-                    *("auth", "issue-key", "--kind", "Agent", "--name", "ask-agent"),
-                    *("--version", "1.0.0"),
+                    *("principal", "credential", "create-principal"),
+                    *("--name", "ask-agent-runtime", "--role", "workload"),
                     *("--server", f"http://{env['WYRD_SERVER_BIND']}"),
                 )
                 assert issued.returncode == 0, issued.stderr
                 key = next(
                     line.split()[1]
                     for line in issued.stdout.splitlines()
-                    if line.startswith("key:")
+                    if line.startswith("credential:")
                 )
                 under_granted = {**env, "WYRD_API_KEY": key}
                 denied = wyrd(

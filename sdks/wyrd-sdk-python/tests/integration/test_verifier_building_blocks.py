@@ -473,7 +473,10 @@ def test_submitted_review_is_judged_in_the_background(
     )
     assert isinstance(execution, verify.Execution)
 
-    resumed = verify.Execution.connect(execution.id, WyrdClient(credential=policy_desk_key))
+    resumed = verify.Execution.connect(
+        execution.id,
+        WyrdClient(credential=policy_desk_key, workload_uid=str(desk.root_ref.uid)),
+    )
     result = resumed.wait(WAIT_SECONDS)
     status = resumed.status()
 

@@ -324,10 +324,11 @@ against this checklist:
 - [ ] **Public surfaces only.** Public SDK modules, the in-process CLI
   functions, the narrowly scoped test controls (`wait_for_baseline` and
   `make_binding_due`), and the server's credential
-  fixtures for principals that are not Card keys. A Service or Agent key
-  comes from the CLI `issue_key` and holds `workload`; a Role beyond it is
-  assigned through the public `Principals` surface and takes effect for a
-  client built from the key after the assignment. No private or extension import,
+  fixtures for principals that are not Service accounts. A Service or Agent
+  runtime key comes from its family's Service account, created through the
+  public `Principals` surface holding `workload`, and its client selects the
+  workload root; a Role beyond it is assigned through `Principals` and takes
+  effect for a client built from the key after the assignment. No private or extension import,
   subprocess, raw HTTP, SQL against server tables, digest computation, YAML or
   JSON parsing of results, sleep, or polling loop.
 - [ ] **Readable without repository archaeology.** The test body shows the

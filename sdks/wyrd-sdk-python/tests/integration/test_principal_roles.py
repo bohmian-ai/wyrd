@@ -1,6 +1,6 @@
-"""A tenant administrator discovers a Service's principal and grants it Roles.
+"""A tenant administrator discovers a Service account and grants it Roles.
 
-A new Service key holds direct ``workload``: it queries but cannot author until
+A new Service account holds direct ``workload``: it queries but cannot author until
 ``editor`` is granted, and each change reaches the key's next token.
 """
 
@@ -12,10 +12,10 @@ import pytest
 from wyrd import WyrdError
 from wyrd.auth import Principals
 from wyrd.bifrost import Bifrost
-from wyrd.cards import CardRef, Cards
-from wyrd.testing import WyrdTestServer, cli
+from wyrd.cards import Cards
+from wyrd.testing import WyrdTestServer
 
-from .support import FIXTURES, Count, client_of, declare
+from .support import FIXTURES, Count, client_of
 
 pytestmark = pytest.mark.integration
 
@@ -35,23 +35,15 @@ def server(wyrd_server: WyrdTestServer) -> Iterator[WyrdTestServer]:
         yield server
 
 
-@pytest.fixture
-def service(server: WyrdTestServer) -> CardRef:
-    """The observed Service, registered with its Model through the SDK."""
-    cards = Cards(client_of(server))
-    declare(cards, "cards/observe_a_run/observed-model.yaml")
-    return declare(cards, "cards/observe_a_run/observed-service.yaml")["observed-service"]
+ACCOUNT = "observed-service-runtime"
 
 
-def issue(server: WyrdTestServer, service: CardRef) -> tuple[str, str]:
-    """Issue ``service``'s own key; return its principal id and key."""
-    issued = cli.issue_key(
-        kind="Service",
-        name=service.name,
-        version="1.0.0",
-        client=client_of(server),
+def issue(server: WyrdTestServer) -> tuple[str, str]:
+    """Create the unrestricted ``ACCOUNT`` holding only ``workload``; return its principal id and key."""
+    created = Principals(client_of(server)).create_service_principal(
+        {"name": ACCOUNT, "roles": ["workload"]}
     )
-    return issued.principal_id, issued.key
+    return created["principal_id"], created["credential"]
 
 
 def author(server: WyrdTestServer, key: str) -> None:
@@ -59,18 +51,13 @@ def author(server: WyrdTestServer, key: str) -> None:
     Cards(client_of(server, key)).declare_from_path(AUTHORED)
 
 
-def test_granted_editor_reaches_the_next_token_until_revoked(
-    server: WyrdTestServer, service: CardRef
-) -> None:
-    principal, key = issue(server, service)
+def test_granted_editor_reaches_the_next_token_until_revoked(server: WyrdTestServer) -> None:
+    principal, key = issue(server)
     principals = Principals(client_of(server))
 
-    (found,) = principals.list(kind="service", name=service.name)["principals"]
-    bound = found["card_ref"]
+    (found,) = principals.list(kind="service", name=ACCOUNT)["principals"]
     assert found["principal_id"] == principal
-    assert bound is not None
-    assert (bound["kind"], bound["name"], bound["version"]) == ("Service", service.name, "1.0.0")
-    assert bound.get("uid") == str(service.uid)
+    assert found["workload_restriction"] == {"mode": "unrestricted"}
     assert principals.roles(principal)["roles"] == [{"role": "workload", "source": "direct"}]
     assert len(Bifrost(client=client_of(server, key)).sql(TENANT_WIDE, model=Count)) == 1
     with pytest.raises(WyrdError) as refused:
@@ -93,8 +80,8 @@ def test_granted_editor_reaches_the_next_token_until_revoked(
     assert refused.value.code == DENIED
 
 
-def test_only_a_tenant_admin_assigns_roles(server: WyrdTestServer, service: CardRef) -> None:
-    principal, key = issue(server, service)
+def test_only_a_tenant_admin_assigns_roles(server: WyrdTestServer) -> None:
+    principal, key = issue(server)
     own = Principals(client_of(server, key))
 
     with pytest.raises(WyrdError) as granted:
@@ -114,7 +101,7 @@ def test_direct_and_idp_user_assignments_coexist(server: WyrdTestServer) -> None
     assert [(found["principal_id"], found["kind"]) for found in page["principals"]] == [
         (user, "user")
     ]
-    assert page["principals"][0]["card_ref"] is None
+    assert page["principals"][0]["workload_restriction"] is None
     assert page["next"] is None
 
     granted = principals.grant_role(user, "viewer")

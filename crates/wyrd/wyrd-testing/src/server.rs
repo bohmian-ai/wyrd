@@ -88,11 +88,10 @@ use wyrd_spec::ids::{BindingId, CardName, CardUid};
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    family_account_id, grant_role_to_service_account, grant_role_to_user, insert_api_key,
-    insert_service_account, insert_user, provision_system_principal,
-    revoke_role_from_service_account, revoke_role_from_user, role_by_name,
-    TrustedIssuerWrite, insert_trusted_issuer, tenant_admin_principal_id, trusted_issuer_by_url,
-    workload_binding_by_subject,
+    TrustedIssuerWrite, family_account_id, grant_role_to_service_account, grant_role_to_user,
+    insert_api_key, insert_service_account, insert_trusted_issuer, insert_user,
+    provision_system_principal, revoke_role_from_service_account, revoke_role_from_user,
+    role_by_name, tenant_admin_principal_id, trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};

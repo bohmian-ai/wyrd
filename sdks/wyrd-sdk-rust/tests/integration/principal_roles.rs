@@ -3,15 +3,15 @@
 
 use serde::Deserialize;
 use wyrd_ai::auth::{
-    PrincipalId, PrincipalKindTag, PrincipalQuery, Principals, RoleAssignment, RoleSource,
+    CreateServicePrincipalRequest, PrincipalId, PrincipalKindTag, PrincipalQuery, Principals,
+    RoleAssignment, RoleSource,
 };
 use wyrd_ai::bifrost::BifrostOptions;
-use wyrd_ai::cards::{CardRef, Cards};
-use wyrd_ai::cli;
+use wyrd_ai::cards::Cards;
 use wyrd_ai::{Bifrost, WyrdError};
 use wyrd_testing::Bootstrap;
 
-use crate::support::{Deployment, coordinates, declare, fixture};
+use crate::support::{Deployment, fixture};
 
 /// A tenant-wide query over a built-in table, which `workload` permits.
 const TENANT_WIDE: &str = "SELECT COUNT(*) AS n FROM vala.drift.observations";
@@ -34,24 +34,26 @@ fn assignment(role: &str, source: RoleSource) -> RoleAssignment {
     }
 }
 
-/// A deployment with the observed Service registered, and the principal and
-/// key the `issue_key` CLI function issues for it.
+/// A deployment with a new Service account holding only `workload`, its
+/// principal id, and its first key.
 ///
 /// # Panics
-/// Panics when registration or issuance fails.
+/// Panics when the account cannot be created.
 async fn service_principal() -> (Deployment, PrincipalId, String) {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards().await;
-    declare(&cards, "cards/observe_a_run/observed-model.yaml").await;
-    let service: CardRef = declare(&cards, "cards/observe_a_run/observed-service.yaml")
+    let created = Principals::connect_with(&deployment.admin())
         .await
-        .root;
-    let [kind, name, version] = coordinates(&service);
-    let issued = cli::issue_key(&kind, &name, &version, None, None, Some(deployment.admin()))
+        .expect("handle connects")
+        .create_service_principal(&CreateServicePrincipalRequest {
+            name: "observed-service-runtime".to_owned(),
+            roles: vec!["workload".to_owned()],
+            description: None,
+            workload_restriction: None,
+        })
         .await
-        .expect("the CLI issues the Service key");
-    let key = issued.key.expose().to_owned();
-    (deployment, issued.principal_id, key)
+        .expect("the Service account is created");
+    let key = created.credential.expose().to_owned();
+    (deployment, created.principal_id, key)
 }
 
 /// Register [`AUTHORED`] as the principal holding `key`, through a fresh

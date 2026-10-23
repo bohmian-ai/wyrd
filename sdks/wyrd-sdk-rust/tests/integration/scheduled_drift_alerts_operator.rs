@@ -120,9 +120,7 @@ impl Watch {
     async fn record(&self, samples: impl IntoIterator<Item = Inputs>) {
         let cards = self.deployment.cards().await;
         let bundle = pull(&cards, &self.service.root).await;
-        let watcher = self
-            .deployment
-            .client(&self.deployment.service_key(&self.service.root).await);
+        let watcher = self.deployment.service_client(&self.service.root).await;
         let state =
             WyrdState::from_path_with(bundle.path().join("bundle"), watcher).expect("bundle loads");
         state.start_bifrost().await.expect("Bifrost starts");

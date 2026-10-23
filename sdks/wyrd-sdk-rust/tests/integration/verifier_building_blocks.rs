@@ -351,7 +351,7 @@ impl PolicyDesk {
         let cards = deployment.cards().await;
         let desk = declare(&cards, "cards/verifier_building_blocks/policy-desk.yaml").await;
         let bundle = pull(&cards, &desk.root).await;
-        let client = deployment.client(&deployment.service_key(&desk.root).await);
+        let client = deployment.service_client(&desk.root).await;
         let state = WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
             .expect("bundle loads offline");
         state.start_bifrost().await.expect("Bifrost starts");

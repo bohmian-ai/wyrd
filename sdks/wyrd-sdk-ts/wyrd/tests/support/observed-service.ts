@@ -3,15 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Bifrost, Cards, WyrdClient, WyrdState } from "wyrd-ai";
-import { cli } from "@wyrd/testing";
-
-import { fixture, type ServerOptions, serverTest } from "./server.js";
+import { fixture, runtimeAccount, type ServerOptions, serverTest } from "./server.js";
 
 /**
  * `test` on a server started with `options`, with the `observed-service`
- * graph declared and hydrated once, the Service's own Card-scoped key, a
+ * graph declared and hydrated once, a key of the Service's runtime account, a
  * Bifrost reader, and a fresh state per test that acts as that Service. Only
- * the Service key's Card scope covers the Agent and Model a run observes.
+ * the Service's Card scope covers the Agent and Model a run observes.
  */
 export const observedService = (options: ServerOptions = {}) =>
   serverTest(options).extend<{
@@ -33,12 +31,8 @@ export const observedService = (options: ServerOptions = {}) =>
     ],
     serviceKey: [
       async ({ bundle: _ }, use) => {
-        const issued = await cli.issueKey({
-          kind: "Service",
-          name: "observed-service",
-          version: "1.0.0",
-        });
-        await use(issued.key);
+        const { key } = await runtimeAccount({ kind: "Service", name: "observed-service" });
+        await use(key);
       },
       { scope: "file" },
     ],

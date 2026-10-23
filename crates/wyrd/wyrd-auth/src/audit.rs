@@ -1,6 +1,6 @@
 //! Authentication audit events on the process audit stage.
 //!
-//! Token grants, API-key issuance, refresh-family revocation, and card-scope
+//! Token grants, refresh-family revocation, and card-scope
 //! mints are each recorded as one [`AuditEvent`] staged on the process
 //! [`wyrd_runtime::audit::AuditStage`], which the server backs with its one
 //! Scribe outbox into retained audit history. A grant never waits for, or
@@ -16,8 +16,6 @@ use wyrd_spec::vala::audit_detail::AuditErrorCode;
 /// Operation for every issued access token: authorization code, API key, JWT
 /// bearer, delegation, and refresh rotation.
 pub const TOKEN_EXCHANGE_OPERATION: &str = "auth.token.exchange";
-/// Operation for a minted API key; matches the issuing route's decision row.
-pub const API_KEY_ISSUE_OPERATION: &str = "auth.api_key.issue";
 /// Operation for a refresh-token family revoked after reuse was detected.
 pub const REFRESH_FAMILY_REVOKE_OPERATION: &str = "auth.refresh.revoke_family";
 /// Operation for a card-ref scope minted into (or refused from) a token.

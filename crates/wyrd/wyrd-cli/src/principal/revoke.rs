@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn revoke_parses_all_kinds() {
-        for kind in ["user", "service", "agent"] {
+        for kind in ["user", "service"] {
             let parsed = Cli::try_parse_from([
                 "wyrd",
                 "p-id-123",

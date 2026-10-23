@@ -577,7 +577,6 @@ module.exports.cliDeclare = nativeBinding.cliDeclare
 module.exports.cliDeclareCheck = nativeBinding.cliDeclareCheck
 module.exports.cliDeleteProviderCredential = nativeBinding.cliDeleteProviderCredential
 module.exports.cliGet = nativeBinding.cliGet
-module.exports.cliIssueKey = nativeBinding.cliIssueKey
 module.exports.cliMcpInstall = nativeBinding.cliMcpInstall
 module.exports.cliPull = nativeBinding.cliPull
 module.exports.cliPutProviderCredential = nativeBinding.cliPutProviderCredential

@@ -39,7 +39,7 @@ from wyrd.client import WyrdClient
 from wyrd.integrations.asgi import RUN_SCOPE_KEY, WyrdMiddleware
 from wyrd.otel import _EXPORTER_EXTRA, install_run_correlation, span_exporter
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer, cli
+from wyrd.testing import WyrdTestServer
 
 from .support import hydrated, timeline
 
@@ -252,8 +252,7 @@ def test_asgi_lifespan(
     assert events == ["startup"] and closed(state)
 
     # A failed drain is logged with its code and reported as shutdown failure.
-    agent_key = cli.issue_key(kind="Agent", name="observed-agent", version="1.0.0")
-    agent = hydrated(observed_bundle, WyrdClient(credential=agent_key.key))
+    agent = hydrated(observed_bundle, WyrdClient())
     events = []
     with caplog.at_level(logging.ERROR, logger="wyrd.integrations.asgi"):
         replies = cycle(app(agent, events, telemetry=False))
@@ -274,7 +273,7 @@ def test_asgi_lifespan(
 
     # A failed drain then is logged, and the application's error stays primary.
     caplog.clear()
-    agent, events = hydrated(observed_bundle, WyrdClient(credential=agent_key.key)), []
+    agent, events = hydrated(observed_bundle, WyrdClient()), []
     with caplog.at_level(logging.ERROR, logger="wyrd.integrations.asgi"):
         replies = cycle(raw(agent, events, RuntimeError("primary")))
     assert str(replies[1]["error"]) == "primary"

@@ -398,14 +398,14 @@ impl WyrdTestServer {
         Ok(bootstrap.id().to_string())
     }
 
-    /// Issue an API key for the principal projected by a registered Service Card.
+    /// Issue an API key for a registered Service Card's family runtime account.
     ///
-    /// A credential fixture: `roles` are granted to the Service's existing
-    /// principal, standing in for the operator who grants Roles in a
-    /// deployment. A key without added Roles comes from `wyrd.testing.cli.issue_key`.
+    /// A credential fixture: the account restricted to the Card's family is
+    /// reused or created and granted `roles`, standing in for the operator
+    /// who provisions accounts in a deployment.
     ///
     /// # Errors
-    /// Raises a harness error for an invalid Card identity or a missing principal.
+    /// Raises a harness error for an invalid Card identity or a failed write.
     fn credential_registered_service(
         &self,
         card_ref: &str,

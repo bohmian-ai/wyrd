@@ -2,7 +2,7 @@ from typing import Literal, TypeAlias, TypedDict
 
 from ..client import WyrdClient
 
-PrincipalKind: TypeAlias = Literal["user", "service", "agent"]
+PrincipalKind: TypeAlias = Literal["user", "service"]
 """The kind of an assignable principal."""
 
 RoleSource: TypeAlias = Literal["idp", "direct"]
@@ -35,33 +35,35 @@ class RoleAssignmentChange(TypedDict):
     changed: bool
     roles: list[RoleAssignment]
 
-class _PrincipalCardRefOptional(TypedDict, total=False):
-    """Optional fields of ``PrincipalCardRef``."""
+class Unrestricted(TypedDict):
+    """No workload-family limit."""
 
-    uid: str
+    mode: Literal["unrestricted"]
 
-class PrincipalCardRef(_PrincipalCardRefOptional):
-    """The Card a Card-bound Service or Agent principal is bound to.
+class FamilyRestriction(TypedDict):
+    """Limited to roots of the one Service or Agent family ``kind``/``name``.
 
-    The same reference shape Card operations accept; ``uid`` is
-    omitted when the server reports none.
+    The account is that family's unique scheduled runtime account.
     """
 
-    kind: str
+    mode: Literal["family"]
+    kind: Literal["Service", "Agent"]
     name: str
-    version: str
+
+WorkloadRestriction: TypeAlias = Unrestricted | FamilyRestriction
+"""A Service account's workload restriction."""
 
 class PrincipalSummary(TypedDict):
-    """One assignable principal; ``email`` is set for users, ``name`` for
-    Services and Agents, and ``card_ref`` for Card-bound Services and Agents.
-    ``card_ref`` is ``None`` for users and unbound Services."""
+    """One assignable principal; ``email`` is set for users and ``name`` for
+    Service accounts. ``workload_restriction`` is the Service account's
+    restriction, and ``None`` for users."""
 
     principal_id: str
     kind: PrincipalKind
     status: Literal["active", "suspended"]
     email: str | None
     name: str | None
-    card_ref: PrincipalCardRef | None
+    workload_restriction: WorkloadRestriction | None
 
 class PrincipalPage(TypedDict):
     """One page of principals; ``next`` is the ``after`` of the following
@@ -74,9 +76,11 @@ class _CreateServicePrincipalOptional(TypedDict, total=False):
     """Optional fields of ``CreateServicePrincipalRequest``."""
 
     description: str | None
+    workload_restriction: WorkloadRestriction | None
 
 class CreateServicePrincipalRequest(_CreateServicePrincipalOptional):
-    """Create an unbound Service principal holding ``roles``."""
+    """Create a Service account holding ``roles``; omitting
+    ``workload_restriction`` makes it unrestricted."""
 
     name: str
     roles: list[str]
@@ -160,22 +164,24 @@ class Principals:
     def create_service_principal(
         self, request: CreateServicePrincipalRequest
     ) -> CreateServicePrincipalResponse:
-        """Create an unbound Service principal and its first credential.
+        """Create a Service account and its first credential.
 
         Args:
-            request: the principal ``name``, its ``roles``, and an optional
-                ``description``.
+            request: the account ``name``, its ``roles``, an optional
+                ``description``, and an optional ``workload_restriction``.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an off-contract
                 request; ``WYRD_PERMISSION_403_DENIED_RBAC`` without
-                ``service_accounts:write``.
+                ``service_accounts:write``, or without tenant administration
+                for a family restriction; ``WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT``
+                when another live account already holds the family.
 
         """
         ...
 
     def issue_credential(self, principal_id: str) -> IssuedCredential:
-        """Issue one more credential for a Service or Agent principal.
+        """Issue one more credential for a Service account.
 
         Args:
             principal_id: the principal to issue for.
@@ -247,7 +253,7 @@ class Principals:
         Args:
             kind: only principals of this kind.
             email: only the user with this exact email.
-            name: only Services or Agents with this exact name.
+            name: only the Service account with this exact name.
             limit: page size from 1 to 200; omitted, 100.
             after: the previous page's ``next``.
 

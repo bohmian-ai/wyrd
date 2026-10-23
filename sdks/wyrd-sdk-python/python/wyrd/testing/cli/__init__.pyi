@@ -10,16 +10,15 @@ credential resolve from the ambient chain (``WYRD_SERVER_URL``, then
 ``credentials.toml``) exactly as the executable does.
 """
 
-import datetime
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
 from typing import Any, Literal
 
-from ...cards import CardRef, DeclarationReceipt
+from ...cards import DeclarationReceipt
 from ...client import WyrdClient
 from ...gateway import ProviderCredentialView
-from ._commands import get, issue_key, pull
+from ._commands import get, pull
 
 class CheckCard:
     """One Card a check would declare, identified as authored."""
@@ -71,38 +70,6 @@ class CheckReport:
     @property
     def diagnostics(self) -> list[CheckDiagnostic]:
         """Non-fatal loader diagnostics."""
-        ...
-
-class IssueKeyResponse:
-    """A Card-scoped API key returned by ``issue_key``, exactly once."""
-
-    @property
-    def key_id(self) -> str:
-        """Credential id of the issued key."""
-        ...
-    @property
-    def principal_id(self) -> str:
-        """Principal the key authenticates as."""
-        ...
-    @property
-    def key(self) -> str:
-        """Plaintext API key."""
-        ...
-    @property
-    def prefix(self) -> str:
-        """Log-safe key prefix."""
-        ...
-    @property
-    def card_ref(self) -> CardRef:
-        """The Card the key is bound to."""
-        ...
-    @property
-    def created_at(self) -> datetime.datetime:
-        """When the key was issued."""
-        ...
-    @property
-    def expires_at(self) -> datetime.datetime:
-        """When the key expires."""
         ...
 
 class McpHostReport:
@@ -252,14 +219,12 @@ __all__ = [
     "CheckCard",
     "CheckDiagnostic",
     "CheckReport",
-    "IssueKeyResponse",
     "McpHostReport",
     "McpInstallReport",
     "declare",
     "declare_check",
     "delete_provider_credential",
     "get",
-    "issue_key",
     "mcp_install",
     "pull",
     "put_provider_credential",

@@ -70,7 +70,7 @@ test("service action timeline is one connected tree", async ({ server, assistant
   const admin = await Bifrost.connect({ table: TableConfig.fromJsonSchema(actions, z.object({ action: z.string() })) });
   await admin.register();
   await admin.shutdown();
-  const service = WyrdClient.connect({ credential: assistant.key });
+  const service = WyrdClient.connect({ credential: assistant.key }).forWorkload(assistant.service.uid);
   const writer = await Bifrost.connect({ client: service });
   await writer.useTableByName(actions);
   const tracer = trace.getTracer("journey.service");

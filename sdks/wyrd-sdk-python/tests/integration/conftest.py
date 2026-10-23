@@ -24,7 +24,7 @@ from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer, cli
+from wyrd.testing import WyrdTestServer
 
 from .gateway.support import PROVIDER_KEY, Upstream
 from .support import (
@@ -379,7 +379,7 @@ def registered_assistant(
 
 @pytest.fixture(scope="session")
 def assistant_key(wyrd_server: WyrdTestServer, assistant_bundle: Path) -> str:
-    """The ``assistant`` Service's own key, issued with ``wyrd auth issue-key`` and no added Role."""
+    """A key for the ``assistant`` Service's runtime account, holding only ``workload``."""
     return service_key("assistant")
 
 
@@ -429,7 +429,7 @@ def watching(
         if fitted:
             server.wait_for_baseline(str(registered[verifier].uid), BASELINE_TIMEOUT_SECONDS)
         root = registered[service]
-        key = cli.issue_key(kind="Service", name=service, version="1.0.0", client=admin).key
+        key = service_key(service, admin)
         state = WyrdState.from_path(pull(cards, service, tmp_path), client_of(server, key))
         state.start_bifrost()
         [binding_id] = binding_ids(cards, root)
@@ -472,7 +472,7 @@ def observed_bundle(
 
 @pytest.fixture(scope="session")
 def observed_key(observed_bundle: Path) -> str:
-    """A key bound to the ``observed-service`` Card, issued with ``wyrd auth issue-key``."""
+    """A key for the ``observed-service`` runtime account, holding only ``workload``."""
     return service_key("observed-service")
 
 

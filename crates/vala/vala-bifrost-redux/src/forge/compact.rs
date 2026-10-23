@@ -468,6 +468,36 @@ impl Forge {
         })?
         .map_err(ForgeError::Catalog)
     }
+
+    /// Lists the metadata document every committed table version of `table`
+    /// retains, under Forge's bounded catalog timeout.
+    ///
+    /// Each one roots a definition accepted work may still be written or
+    /// retried under, so cleanup protects it after it leaves the native
+    /// metadata log. ponytail: every version is retained; prune a noncurrent
+    /// one once a retry-retention horizon is defined.
+    ///
+    /// # Errors
+    ///
+    /// Returns timeout or catalog errors, including a catalog that keeps no
+    /// version references; cleanup then fails closed.
+    pub(super) async fn retained_definitions(
+        &self,
+        table: &iceberg::table::Table,
+    ) -> Result<Vec<String>, ForgeError> {
+        tokio::time::timeout(
+            self.core.config.catalog_request_timeout,
+            self.core.catalog.list_table_version_locations(
+                table.identifier(),
+                &table.metadata().uuid().to_string(),
+            ),
+        )
+        .await
+        .map_err(|_| ForgeError::Timeout {
+            operation: "catalog table version listing",
+        })?
+        .map_err(ForgeError::Catalog)
+    }
 }
 
 #[cfg(test)]

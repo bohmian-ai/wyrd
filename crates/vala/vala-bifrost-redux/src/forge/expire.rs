@@ -1331,10 +1331,12 @@ impl Forge {
             binding.table_ref.name.as_str(),
         )
         .map_err(ForgeError::Sql)?;
+        let retained = self.retained_definitions(&committed).await?;
         let mut evidence = self.committed_evidence(binding, &committed).await?;
         evidence.cleanup_candidates = expiry_cleanup_candidates(
             committed.metadata().location(),
             expired_files,
+            &retained,
             binding,
             &self.core.warehouse,
             &identity,
@@ -1567,7 +1569,9 @@ fn terminal_expiry_detail(detail: &AuditDetail, phase: ForgeSnapshotExpirePhase)
 /// Converts expired fork categories into sorted, table-bound cleanup evidence.
 ///
 /// This is the complete handoff to separate cleanup: settlement stores these
-/// exact names in task evidence and the expiration owner deletes nothing.
+/// exact names in task evidence and the expiration owner deletes nothing. An
+/// expired metadata-log entry that a retained table version still names is
+/// never a candidate.
 ///
 /// # Errors
 ///
@@ -1575,6 +1579,7 @@ fn terminal_expiry_detail(detail: &AuditDetail, phase: ForgeSnapshotExpirePhase)
 fn expiry_cleanup_candidates(
     table_location: &str,
     expired: &ExpiredFileSet,
+    retained_definitions: &[String],
     binding: &TenantTableBinding,
     warehouse: &str,
     identity: &ForgeTaskTableIdentity,
@@ -1590,6 +1595,7 @@ fn expiry_cleanup_candidates(
     let mut candidates = categories
         .into_iter()
         .flat_map(|(category, paths)| paths.iter().map(move |path| (category, path)))
+        .filter(|(_, path)| !retained_definitions.contains(*path))
         .map(|(category, path)| {
             let key =
                 super::path::catalog_path_to_object_key(table_location, binding, warehouse, path)?;
@@ -1902,5 +1908,56 @@ mod tests {
         let error = validate_watermarks(&snapshots, Some(2), &[], &[], 1)
             .expect_err("ancestry beyond the bound must fail");
         assert!(error.to_string().contains("traversal bound"));
+    }
+
+    /// An expired metadata-log entry that a retained table version names
+    /// stays out of cleanup, while an unrooted one is still handed over.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rooted definition becomes a candidate or the unrooted
+    /// entry does not.
+    #[test]
+    fn retained_definitions_are_never_expiry_candidates() {
+        let binding = TenantTableBinding::resolve((
+            DataTenantId::new_v7(),
+            TableRef::new(crate::namespaces::BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("test binding resolves");
+        let location = format!("s3://tables/{}", binding.object_prefix);
+        let rooted = format!("{location}/metadata/00000-a.metadata.json");
+        let unrooted = format!("{location}/metadata/00001-b.metadata.json");
+        let expired = ExpiredFileSet {
+            metadata_logs: [rooted.clone(), unrooted].into_iter().collect(),
+            ..ExpiredFileSet::default()
+        };
+        let identity = ForgeTaskTableIdentity::new(
+            BIFROST_CATALOG_NAME,
+            binding.table_ref.namespace.as_str(),
+            binding.table_ref.name.as_str(),
+        )
+        .expect("table identity");
+
+        let candidates = expiry_cleanup_candidates(
+            &location,
+            &expired,
+            &[rooted],
+            &binding,
+            "s3://tables",
+            &identity,
+        )
+        .expect("candidates");
+
+        let paths: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [format!(
+                "{}/metadata/00001-b.metadata.json",
+                binding.object_prefix
+            )]
+        );
     }
 }

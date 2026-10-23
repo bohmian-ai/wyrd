@@ -1286,6 +1286,7 @@ impl Forge {
                 ),
             });
         }
+        let retained = self.retained_definitions(&table).await?;
         let mut live = ProtectedLiveSet::default();
         let table_location = table.metadata().location().to_owned();
         let mut add = |path: &str| self.add_path(&mut live, binding, &table_location, path);
@@ -1294,6 +1295,9 @@ impl Forge {
             .map_err(ForgeError::Catalog)?)?;
         for metadata_log in table.metadata().metadata_log() {
             add(&metadata_log.metadata_file)?;
+        }
+        for definition in retained {
+            add(&definition)?;
         }
         for snapshot in table.metadata().snapshots() {
             add(snapshot.manifest_list())?;

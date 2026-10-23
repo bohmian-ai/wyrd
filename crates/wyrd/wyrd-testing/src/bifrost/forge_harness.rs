@@ -629,6 +629,16 @@ impl Catalog for CommitUncertaintyCatalog {
         self.inner.table_exists(table).await
     }
 
+    async fn list_table_version_locations(
+        &self,
+        table: &TableIdent,
+        table_uuid: &str,
+    ) -> iceberg::Result<Vec<String>> {
+        self.inner
+            .list_table_version_locations(table, table_uuid)
+            .await
+    }
+
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
         self.inner.rename_table(src, dest).await
     }

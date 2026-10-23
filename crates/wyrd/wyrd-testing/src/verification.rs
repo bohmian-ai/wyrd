@@ -138,7 +138,21 @@ impl VerificationFixture {
         &self,
         name: &str,
     ) -> Result<(CardUid, PrincipalId), VerificationFixtureError> {
-        let card = card("Service", name, &serde_json::json!({}))?;
+        self.release(name, "1.0.0").await
+    }
+
+    /// Register one active `version` of the Service Card named `name` and
+    /// seed or reuse its family's runtime account, so releases of one family
+    /// share that account; returns the Card UID and the account.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when a write fails.
+    pub async fn release(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<(CardUid, PrincipalId), VerificationFixtureError> {
+        let card = card("Service", name, version, &serde_json::json!({}))?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let uid = self.insert(&mut conn, &card).await?;
         let principal = crate::server::family_account(
@@ -218,7 +232,7 @@ impl VerificationFixture {
         name: &str,
         spec: &Value,
     ) -> Result<CardUid, VerificationFixtureError> {
-        let card = card("Verifier", name, spec)?;
+        let card = card("Verifier", name, "1.0.0", spec)?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let uid = self.insert(&mut conn, &card).await?;
         conn.commit().await?;
@@ -253,6 +267,7 @@ impl VerificationFixture {
         let data = card(
             "Data",
             &format!("{name}-baseline"),
+            "1.0.0",
             &serde_json::json!({
                 "interface": { "kind": "Pandas",
                                "meta": { "framework_version": "2.2.2", "compression": "Snappy" } },
@@ -292,7 +307,7 @@ impl VerificationFixture {
         name: &str,
         spec: &Value,
     ) -> Result<CardUid, VerificationFixtureError> {
-        let card = card("Operator", name, spec)?;
+        let card = card("Operator", name, "1.0.0", spec)?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let uid = self.insert(&mut conn, &card).await?;
         conn.commit().await?;
@@ -623,16 +638,21 @@ impl VerificationFixture {
     }
 }
 
-/// Build one `kind` Card named `name` at version 1.0.0 with `spec`.
+/// Build one `kind` Card named `name` at `version` with `spec`.
 ///
 /// # Errors
 /// Returns [`VerificationFixtureError::Card`] when the fixture JSON does not
 /// deserialize as a Card.
-fn card(kind: &str, name: &str, spec: &Value) -> Result<Card, VerificationFixtureError> {
+fn card(
+    kind: &str,
+    name: &str,
+    version: &str,
+    spec: &Value,
+) -> Result<Card, VerificationFixtureError> {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": kind,
-        "metadata": { "name": name, "version": "1.0.0" },
+        "metadata": { "name": name, "version": version },
         "spec": spec,
         "relationships": { "outbound": [], "inbound": [] }
     }))

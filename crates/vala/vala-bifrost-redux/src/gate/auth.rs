@@ -161,7 +161,7 @@ pub fn authenticate(
         metadata
             .get_all(WORKLOAD_UID_HEADER)
             .iter()
-            .map(|value| value.as_bytes()),
+            .map(wyrd_tonic::tonic::metadata::MetadataValue::as_bytes),
     )
     .map_err(IngestError::WorkloadSelector)?;
     if let Some(root) = selector

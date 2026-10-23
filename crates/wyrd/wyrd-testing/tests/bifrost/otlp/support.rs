@@ -921,23 +921,39 @@ impl OtlpJourney {
         name: &str,
         permissions: &[wyrd_runtime::Permission],
     ) -> String {
-        self.server
-            .seed_role(name, permissions)
-            .await
-            .expect("the fixture role is seeded");
-        let bootstrap = self
-            .server
-            .bootstrap_service(name, &[name])
-            .await
-            .expect("the fixture service is bootstrapped onto its role");
-        let api_key = bootstrap
-            .api_key()
-            .expect("the bootstrapped service carries an API key")
-            .clone();
+        let api_key = self.api_key_with_permissions(name, permissions).await;
         self.server
             .exchange_api_key(&api_key)
             .await
             .expect("the fixture exchanges its API key for a bearer")
+    }
+
+    /// Bootstraps Service `name` onto a seeded role holding exactly
+    /// `permissions` and returns its API key.
+    ///
+    /// The key form exists for journeys that exchange the same account both
+    /// rootless and under its own Card as the workload root.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the role cannot be seeded or the service cannot be
+    /// bootstrapped.
+    pub(super) async fn api_key_with_permissions(
+        &self,
+        name: &str,
+        permissions: &[wyrd_runtime::Permission],
+    ) -> secrecy::SecretString {
+        self.server
+            .seed_role(name, permissions)
+            .await
+            .expect("the fixture role is seeded");
+        self.server
+            .bootstrap_service(name, &[name])
+            .await
+            .expect("the fixture service is bootstrapped onto its role")
+            .api_key()
+            .expect("the bootstrapped service carries an API key")
+            .clone()
     }
 
     /// The running harness, for the cases that inject a durable fault.

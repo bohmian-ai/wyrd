@@ -4511,6 +4511,13 @@ mod tests {
         assert_eq!(problem["details"]["required"]["action"], "write");
     }
 
+    /// An invalid API key's problem document carries its stable 401 code and a
+    /// remediation that points the caller at `wyrd principal credential issue`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the code differs or the remediation is missing, not a
+    /// string, or does not name the credential-issue command.
     #[test]
     fn api_key_invalid_remediation_names_credential_issue() {
         let error = WyrdError::ApiKeyInvalid {

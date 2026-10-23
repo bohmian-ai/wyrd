@@ -89,8 +89,12 @@ fn keycloak_workload_issuer() -> IssuerEntry {
     )
 }
 
-/// Build the server-owned `CardRef` a `[[workload_bindings]]` entry resolves to:
-/// the same `uid = None` ref boot's `build_workload_bindings` produces.
+/// Build an exact `CardRef` of `kind` and `name` at version `1.0.0` under a
+/// fresh UUIDv7 Card UID, for a `[[workload_bindings]]` entry to name.
+///
+/// # Panics
+/// Panics when `name` is not a valid Card name or the fresh UUIDv7 is not
+/// accepted as a Card UID.
 fn binding_card_ref(kind: CardKind, name: &str) -> CardRef {
     CardRef {
         kind,
@@ -498,8 +502,13 @@ async fn workload_jwt_bearer_journey_keycloak() {
     assert_v1_delegated_write_ok(&srv, wyrd_token, "workload").await;
 }
 
-/// An unbound subject (issuer trusted, no matching binding) returns
-/// `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` from the jwt-bearer route.
+/// An unbound subject (issuer trusted, no matching binding) is refused by
+/// the jwt-bearer route as `400 invalid_grant` without a token.
+///
+/// # Panics
+/// Panics when the Keycloak workload token cannot be obtained, the base server
+/// does not start, the other-subject account does not bootstrap, or the
+/// exchange is not refused as `400 invalid_grant` without a token.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn workload_jwt_bearer_unbound_subject_returns_404_keycloak() {

@@ -33,6 +33,12 @@ mod tests {
 
     use super::require_service_accounts_write;
 
+    /// A `viewer` user principal holding exactly `permissions`, used to probe
+    /// the `service_accounts:write` guard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the static `viewer` role name is rejected.
     fn principal_with_permissions(permissions: impl IntoIterator<Item = Permission>) -> Principal {
         Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),

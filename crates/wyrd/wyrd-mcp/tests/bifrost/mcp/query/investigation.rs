@@ -367,6 +367,12 @@ impl EvidenceInvestigation {
     ///
     /// # Errors
     /// Returns principal, MCP, or unexpected-success failures.
+    ///
+    /// # Panics
+    /// Panics when a `max_rows` or `max_bytes` refusal does not carry
+    /// `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE`, when the restricted reader's
+    /// `vala.gateway.calls` read is not refused with status 403, or when any
+    /// refusal includes `rows`.
     pub(super) async fn refuse_unauthorized_or_oversized_reads(
         &self,
     ) -> Result<(), McpJourneyError> {

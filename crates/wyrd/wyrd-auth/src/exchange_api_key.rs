@@ -716,6 +716,10 @@ pub(crate) mod pg_tests {
     }
 
     /// A fresh UUIDv7 Card UID that names no registered Card.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fresh UUIDv7 is not accepted as a Card UID.
     fn unregistered_uid() -> CardUid {
         CardUid::from_uuid(Uuid::now_v7()).expect("v7 uuid is a Card UID")
     }
@@ -1064,6 +1068,12 @@ pub(crate) mod pg_tests {
     /// would be a second one an operator cannot see or revoke. Both halves are
     /// asserted: the absent token in the response and the absent row in
     /// `wyrd.auth_refresh_tokens`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture or key seed fails, the live key does not
+    /// exchange, the response carries a refresh token, or a refresh row exists
+    /// for the account.
     #[tokio::test]
     async fn api_key_exchange_issues_no_refresh_token_or_row() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1182,6 +1192,10 @@ pub(crate) mod pg_tests {
     /// The suspended-principal refusal needs a credential that verifies and is
     /// then refused by the shared issuer on status, which is a different shape
     /// from the placeholder-hash lifecycle rows [`insert_lifecycle_key`] seeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the account suspension update or the key seed fails.
     async fn seed_suspended_account_key(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
@@ -1345,6 +1359,13 @@ pub(crate) mod pg_tests {
         assert_eq!(reason, "backend_unavailable");
     }
 
+    /// A key whose prefix embeds one tenant is refused as `CrossTenant` when
+    /// presented on another tenant's connection, before any database lookup.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture or the second tenant's connection fails, or the
+    /// exchange returns anything other than `CrossTenant`.
     #[tokio::test]
     async fn cross_tenant_key_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1369,6 +1390,13 @@ pub(crate) mod pg_tests {
         assert!(matches!(result, Err(ExchangeError::CrossTenant)));
     }
 
+    /// A revoked key row is invisible to the prefix lookup, so the exchange
+    /// refuses it as `NotFound`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture or the revoked-key seed fails, or the exchange
+    /// returns anything other than `NotFound`.
     #[tokio::test]
     async fn revoked_key_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1404,6 +1432,13 @@ pub(crate) mod pg_tests {
         assert!(matches!(result, Err(ExchangeError::NotFound)));
     }
 
+    /// A live key row whose stored verifier is not the presented secret's
+    /// digest is refused as `HashMismatch`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture or the key seed fails, or the exchange returns
+    /// anything other than `HashMismatch`.
     #[tokio::test]
     async fn hash_mismatch_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");

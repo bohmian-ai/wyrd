@@ -3229,6 +3229,13 @@ mod tests {
 
     /// Native payloads preserve one valid client run identifier while stamping
     /// exactly one authoritative nullable `run_id` column for the physical record.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture Card does not parse, decode rejects the valid
+    /// Utf8 `run_id`, the output does not carry exactly one nullable Utf8
+    /// `run_id` holding the client value, or an Int64 or duplicated `run_id`
+    /// is accepted or refused with anything other than `InvalidFrame`.
     #[test]
     fn native_run_id_is_replaced_by_one_authoritative_nullable_field() {
         let card = CardRef::from_str("Service/python-integration-writer@1.0.0").expect("card");
@@ -3515,6 +3522,10 @@ mod tests {
     }
 
     /// Builds a card-scoped service principal used by native ingest arms.
+    ///
+    /// # Panics
+    /// Panics when the static Card reference or the minted UUIDv7 Card UID
+    /// fails to parse.
     fn scoped_service_principal() -> (Principal, CardRef) {
         let card = CardRef::from_str("Service/python-integration-writer@1.0.0").expect("card");
         let card = CardRef {
@@ -3694,6 +3705,9 @@ mod tests {
     }
 
     /// The signed UIDs of resolved `cards`, in order.
+    ///
+    /// # Panics
+    /// Panics when any of `cards` carries no UID.
     fn member_uids(cards: &[&CardRef]) -> Vec<CardUid> {
         cards
             .iter()

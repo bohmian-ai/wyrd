@@ -264,6 +264,13 @@ mod tests {
 
     /// A signed root accepts only an equal selector; a rootless bearer
     /// resolves any selector.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an equal selector needs resolution or errors, a differing
+    /// selector is not refused as `SignedWorkloadMismatch` for the signed root
+    /// or for a delegation chain carrying it, or a rootless bearer does not
+    /// need resolution.
     #[test]
     fn selector_never_rebinds_a_signed_root() {
         let rooted = service_principal("rooted");

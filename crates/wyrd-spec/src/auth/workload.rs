@@ -348,6 +348,11 @@ mod tests {
 
     /// No selector is rootless; one Card UID selects it; a repeated or
     /// malformed selector is refused like an unusable root.
+    ///
+    /// # Panics
+    /// Panics when an absent selector is not rootless, one UID is not selected
+    /// verbatim, or a repeated, non-UID, or non-UTF-8 selector is not refused
+    /// as `WorkloadUidRefused`.
     #[test]
     fn workload_uid_selector_accepts_one_card_uid() {
         let uid: &[u8] = b"01890a5d-ac96-774b-bcce-b302099a8057";

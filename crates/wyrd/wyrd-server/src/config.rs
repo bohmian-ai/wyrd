@@ -5381,6 +5381,11 @@ minimum_slots = 2
 
     // ── 19. Populated [[workload_bindings]] round-trips through TOML ─────────
 
+    /// A populated `[[workload_bindings]]` entry parses with every field intact.
+    ///
+    /// # Panics
+    /// Panics when the TOML fails to parse or any parsed binding field differs
+    /// from the input.
     #[test]
     fn workload_binding_toml_round_trip() {
         let toml = r#"
@@ -5431,6 +5436,11 @@ minimum_slots = 2
 
     // ── 21. Unknown field in binding entry rejected ───────────────────────────
 
+    /// An unknown key in a `[[workload_bindings]]` entry fails TOML parsing.
+    ///
+    /// # Panics
+    /// Panics when the TOML parses or fails with an error other than
+    /// `ConfigError::ParseToml`.
     #[test]
     fn workload_binding_entry_unknown_field_rejected() {
         let toml = r#"
@@ -5574,6 +5584,11 @@ minimum_slots = 2
 
     // ── 28. Empty issuer in workload binding → Invalid ────────────────────────
 
+    /// A workload binding with an empty issuer parses but fails validation.
+    ///
+    /// # Panics
+    /// Panics when the TOML fails to parse, or validation passes or fails
+    /// without an `Invalid` message naming the issuer.
     #[test]
     fn binding_entry_empty_issuer_invalid() {
         let toml = r#"
@@ -5592,6 +5607,11 @@ minimum_slots = 2
 
     // ── 29. Empty subject in workload binding → Invalid ───────────────────────
 
+    /// A workload binding with an empty subject parses but fails validation.
+    ///
+    /// # Panics
+    /// Panics when the TOML fails to parse, or validation passes or fails
+    /// without an `Invalid` message naming the subject.
     #[test]
     fn binding_entry_empty_subject_invalid() {
         let toml = r#"
@@ -5610,6 +5630,12 @@ minimum_slots = 2
 
     // ── 30. Malformed principal id in workload binding → ParseToml ────────────
 
+    /// A workload binding whose `principal_id` is not a principal id fails TOML
+    /// parsing.
+    ///
+    /// # Panics
+    /// Panics when the TOML parses or fails with an error other than
+    /// `ConfigError::ParseToml`.
     #[test]
     fn binding_entry_malformed_principal_id_rejected() {
         let toml = r#"
@@ -5666,6 +5692,12 @@ minimum_slots = 2
 
     // ── 33. workload_bindings present without tenant_slug → Invalid ───────────
 
+    /// Workload bindings configured without `auth.tenant_slug` fail validation,
+    /// because boot cannot resolve the tenant they bind to.
+    ///
+    /// # Panics
+    /// Panics when the TOML fails to parse, or validation passes or fails
+    /// without an `Invalid` message naming `tenant_slug`.
     #[test]
     fn bindings_without_tenant_slug_invalid() {
         let toml = r#"

@@ -1470,6 +1470,14 @@ mod pg_tests {
         settle_audit(&state).await;
     }
 
+    /// Deleting a trusted issuer that a live workload binding references
+    /// conflicts without leaking internals, and the cascade delete removes the
+    /// binding and then the issuer.
+    ///
+    /// # Panics
+    /// Panics when seeding or the binding create fails, the plain delete does
+    /// not return a safe conflict, or the cascade delete does not return
+    /// `204 No Content`.
     #[tokio::test]
     async fn delete_issuer_with_live_binding_conflicts_then_cascades() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1521,6 +1529,13 @@ mod pg_tests {
         settle_audit(&state).await;
     }
 
+    /// A workload binding round-trips through create, duplicate conflict,
+    /// issuer-filtered list, and delete, while a binding to an unknown
+    /// principal and a second delete are both not found.
+    ///
+    /// # Panics
+    /// Panics when seeding fails or any create, conflict, list, or delete step
+    /// returns a result other than the one the round trip pins.
     #[tokio::test]
     async fn workload_binding_crud_round_trip() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1610,6 +1625,14 @@ mod pg_tests {
         settle_audit(&state).await;
     }
 
+    /// Creating a binding whose issuer was never seeded is not found (the FK
+    /// has no target), and the permitted create still records its allowed
+    /// decision.
+    ///
+    /// # Panics
+    /// Panics when seeding fails, the create does not fail with
+    /// `AdminNotFound`, or the create decision is not audited exactly once as
+    /// allowed.
     #[tokio::test]
     async fn create_binding_for_unknown_issuer_is_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");

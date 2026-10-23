@@ -211,6 +211,11 @@ fn attribute_cards<'record>(
 }
 
 /// Builds the negative trace export with each span naming its own `card_uid`.
+///
+/// # Panics
+///
+/// Panics when the negative trace fixture has no first resource or no first
+/// scope to attribute.
 fn card_attributed_resource_spans(anchor: i64, cards: [Option<&str>; 3]) -> Vec<ResourceSpans> {
     let mut resource_spans = negative_resource_spans(anchor, &[]);
     attribute_cards(
@@ -224,6 +229,11 @@ fn card_attributed_resource_spans(anchor: i64, cards: [Option<&str>; 3]) -> Vec<
 }
 
 /// Builds the negative log export with each record naming its own `card_uid`.
+///
+/// # Panics
+///
+/// Panics when the negative log fixture has no first resource or no first
+/// scope to attribute.
 fn card_attributed_resource_logs(anchor: i64, cards: [Option<&str>; 3]) -> Vec<ResourceLogs> {
     let mut resource_logs = negative_resource_logs(anchor, &[]);
     attribute_cards(
@@ -958,6 +968,12 @@ mod pg_tests {
         }
 
         /// The protobuf export whose `i`th record names `cards[i]`.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the signal's card-attributed fixture builder panics: a
+        /// fixture without a first resource or scope, or a metric that is not
+        /// the single-point gauge or sum the fixture defines.
         fn body(self, anchor: i64, cards: [Option<&str>; 3]) -> Vec<u8> {
             match self {
                 Self::Traces => ExportTraceServiceRequest {
@@ -976,6 +992,11 @@ mod pg_tests {
         }
 
         /// The rejected count and first reason of one accepted protobuf answer.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `body` does not decode as the signal's protobuf export
+        /// response.
         fn rejected(self, body: &[u8]) -> (i64, String) {
             let encoding = HttpEncoding::Protobuf;
             match self {

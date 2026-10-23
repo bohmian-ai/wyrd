@@ -1361,6 +1361,11 @@ mod pg_tests {
     /// a refresh token. A row claiming otherwise is either pre-split residue or
     /// a forgery, and rotating it would hand out a long-lived successor to a
     /// holder the split says should not have one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture or seeding fails, or rotation is not refused
+    /// with `InvalidPrincipalKind`.
     #[tokio::test]
     async fn a_machine_refresh_row_cannot_rotate() {
         let fixture = PgFixture::start().await.expect("fixture starts");

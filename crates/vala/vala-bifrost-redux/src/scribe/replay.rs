@@ -2096,6 +2096,14 @@ mod tests {
     /// digest authenticates the single recovered slice, and the recovered Arrow
     /// payload must still carry the nested canonical columns and exactly the
     /// accepted rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projection fails or does not accept two of three spans
+    /// with nested columns, the durable append or replay fails, replay does not
+    /// yield exactly one fence and append meta for the batch with a non-zero
+    /// digest and the producing request id, or the recovered-slice,
+    /// idempotent-replay, or truncated-Arrow checks fail.
     #[tokio::test]
     async fn nested_accepted_subset_replays_one_fence_and_digest() {
         use crate::contracts::Scribe;

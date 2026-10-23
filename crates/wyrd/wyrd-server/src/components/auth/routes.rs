@@ -566,11 +566,18 @@ mod tests {
 
     use super::{auth_router, tenant_from_unverified_access_token};
 
+    /// The auth router builds with its token routes mounted without panicking.
     #[test]
     fn mounts_token_routes() {
         let _router = auth_router();
     }
 
+    /// The tenant id is read from an access token's unverified payload segment,
+    /// ignoring the header and signature.
+    ///
+    /// # Panics
+    /// Panics when the static ids do not parse, the claims fail to serialize,
+    /// or the extracted tenant differs from the claims' tenant.
     #[test]
     fn extracts_tenant_from_unverified_access_token() {
         let tenant_id: DataTenantId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"

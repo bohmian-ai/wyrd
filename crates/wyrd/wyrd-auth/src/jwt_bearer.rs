@@ -150,6 +150,18 @@ impl JwtBearer {
         Ok(verified)
     }
 
+    /// Map a verified workload assertion to its server-owned binding.
+    ///
+    /// Looks the tenant's binding up by issuer, subject, and the verifier's
+    /// expected audience, so the token exchange mints only for the Service
+    /// account an operator bound to this workload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the binding lookup
+    /// fails (the cause is logged, not returned), and
+    /// [`WyrdError::PrincipalNotFound`] when no active binding matches the
+    /// subject.
     async fn resolve_workload_binding(
         &self,
         tenant_id: DataTenantId,

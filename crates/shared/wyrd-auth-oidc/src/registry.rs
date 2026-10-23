@@ -203,6 +203,12 @@ pub trait WorkloadBindingResolver: Send + Sync + std::fmt::Debug {
     /// Returns `Ok(None)` when no binding exists for this subject (the server
     /// should respond with a `PrincipalNotFound` error). The token cannot
     /// supply or influence this mapping.
+    ///
+    /// # Errors
+    /// Returns an [`OidcError`] when the backing binding store cannot be read
+    /// (for example, the SQL impl reports [`OidcError::JwksUnavailable`] when
+    /// the tenant connection or query fails). A missing binding is `Ok(None)`,
+    /// never an error.
     fn binding(
         &self,
         tenant: &DataTenantId,

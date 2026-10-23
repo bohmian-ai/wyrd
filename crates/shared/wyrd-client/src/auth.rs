@@ -1166,6 +1166,10 @@ impl AuthMiddleware {
 
     /// Exchange the API key for an access token at `/auth/token`, requesting
     /// this middleware's workload root when it has one.
+    ///
+    /// # Errors
+    /// Returns the [`AuthError`] the exchange produced: a transport failure, or
+    /// [`AuthError::Server`] carrying the server's refusal of the key.
     async fn exchange(&self, api_key: &SecretString) -> Result<CachedToken, AuthError> {
         let request = TokenRequest::TokenExchange {
             subject_token: SecretBearer::new(api_key.expose_secret().to_owned()),
@@ -1184,6 +1188,11 @@ impl AuthMiddleware {
     ///
     /// The tenant slug is validated client-side first: an invalid slug is a
     /// client-local [`WyrdClientError::Config`] surfaced before any network call.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Client`] wrapping [`WyrdClientError::Config`] when
+    /// `tenant` is not a valid tenant slug, and otherwise the exchange's
+    /// transport failure or [`AuthError::Server`] carrying the server's refusal.
     async fn exchange_workload(
         &self,
         jwt: &SecretString,
@@ -2060,6 +2069,11 @@ mod tests {
     /// `workload_uid` (`token-rootless` without one), or a
     /// `WYRD_AUTH_401_WORKLOAD_UID_REFUSED` problem for `refused`, recording
     /// every request body.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the loopback listener cannot bind or report its address, or
+    /// when the recorded-bodies lock is poisoned inside a connection task.
     async fn spawn_workload_mock(refused: String) -> (MockServer, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");

@@ -571,6 +571,11 @@ mod pg_tests {
 
     /// A tenant administrative principal holds a credential without binding a
     /// Card, so an administrative identity needs no fabricated Card.
+    ///
+    /// # Panics
+    /// Panics when the fixture or tenant connection cannot start, the
+    /// card-free `tenant_admin` insert or its read-back fails, or the stored
+    /// row carries a restriction kind or name.
     #[tokio::test]
     async fn tenant_admin_principal_persists_without_a_card() {
         let Some(_) = database_url() else {
@@ -607,6 +612,10 @@ mod pg_tests {
 
     /// Only a Service account may carry a workload restriction, so the rule is
     /// enforced durably rather than only by the write path that observes it.
+    ///
+    /// # Panics
+    /// Panics when the fixture or tenant connection cannot start, or when
+    /// Postgres accepts a `tenant_admin` row restricted to a Service family.
     #[tokio::test]
     async fn tenant_admin_principal_cannot_carry_a_workload_restriction() {
         let Some(_) = database_url() else {

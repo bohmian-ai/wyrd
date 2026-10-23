@@ -1294,6 +1294,14 @@ mod tests {
 
     /// An oversized decoded request is refused at the pre-WAL size gate while
     /// the exact ceiling remains available to a subsequent bounded request.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the size gate admits a request one byte over or overflowing
+    /// the limit, refuses one at the exact ceiling, lets an oversized frame
+    /// through `ingest_frame` or change admission, memory, WAL bytes, or
+    /// memtable stats, or refuses the following small frame or leaves the WAL
+    /// unchanged after it.
     #[tokio::test]
     async fn oversized_decoded_request_is_rejected_before_wal_append() {
         let limit = 64 * 1024;

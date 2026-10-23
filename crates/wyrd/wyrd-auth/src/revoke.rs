@@ -247,6 +247,10 @@ pub(crate) mod pg_tests {
     ///
     /// Same contract as the user case, from the machine side: an agent-kinded
     /// request must not reach a service row.
+    ///
+    /// # Panics
+    /// Panics when the fixture or seeding fails, the revocation fails, or an
+    /// active service account row remains afterwards.
     #[tokio::test]
     async fn a_service_account_is_revoked_under_the_service_kind() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -306,6 +310,10 @@ pub(crate) mod pg_tests {
 
     /// A declared kind that does not match the stored row must refuse exactly
     /// like an unknown id, so the refusal cannot be read as "wrong table".
+    ///
+    /// # Panics
+    /// Panics when the fixture or seeding fails, or revoking the service
+    /// account as a user is not refused with `PrincipalNotFound`.
     #[tokio::test]
     async fn a_mismatched_kind_is_refused_as_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -334,6 +342,11 @@ pub(crate) mod pg_tests {
     /// `WyrdError::Internal.message` is published verbatim by the problem
     /// renderer, so a SQL error placed there would hand a caller the table, the
     /// role, and the statement that refused. The cause belongs in the trace.
+    ///
+    /// # Panics
+    /// Panics when seeding, the privilege revoke or restore fails, the refused
+    /// write is not `Internal` with the fixed message, or that message names
+    /// the table, permission, role, or statement.
     #[tokio::test]
     async fn a_failed_revocation_write_keeps_its_cause_server_side() {
         let fixture = PgFixture::start().await.expect("fixture starts");

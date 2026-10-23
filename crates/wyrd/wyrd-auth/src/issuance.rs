@@ -1362,6 +1362,11 @@ mod pg_tests {
     /// The token's authority is the principal's current grants, resolved at
     /// issuance: a grant withdrawn between two issuances is absent from the
     /// second token without any request-time lookup.
+    ///
+    /// # Panics
+    /// Panics when the fixture, seeding, role grant or revoke, or either
+    /// issuance fails, or `card:read` is missing from the first token or
+    /// present in the second.
     #[tokio::test]
     async fn issue_signs_current_grants_and_follows_grant_changes() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1474,6 +1479,9 @@ mod pg_tests {
     }
 
     /// A fresh UUIDv7 Card UID that names no registered Card.
+    ///
+    /// # Panics
+    /// Panics when a fresh UUIDv7 is not accepted as a Card UID.
     fn unregistered_uid() -> CardUid {
         CardUid::from_uuid(Uuid::now_v7()).expect("v7 uuid is a Card UID")
     }

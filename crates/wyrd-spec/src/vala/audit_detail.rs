@@ -1327,6 +1327,15 @@ mod tests {
         }
     }
 
+    /// Pins `audit_detail_canonical_json` against golden vectors: each input
+    /// parses as an [`AuditDetail`] and re-renders with keys sorted at every
+    /// nesting level (delegation chains, Card refs, scope members, origins),
+    /// a storage path trimmed, and a clean origin's `dirty: false` omitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a golden input does not parse or its canonical JSON differs
+    /// from the expected string.
     #[test]
     fn audit_detail_golden_vectors_cover_all_variants_and_nested_values() {
         let vectors = [

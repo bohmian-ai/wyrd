@@ -232,6 +232,10 @@ mod tests {
     }
 
     /// Discovery accepts only assignable kinds.
+    ///
+    /// # Panics
+    /// Panics when `user` or `service` is refused, or `agent` or
+    /// `tenant_admin` parses.
     #[test]
     fn list_accepts_only_assignable_kinds() {
         for kind in ["user", "service"] {

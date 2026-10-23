@@ -167,6 +167,14 @@ mod pg_tests {
     const EXTERNAL_KID: &str = "ext-workload-key";
     const ED_X: &str = "WhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ-DZ8Vw";
 
+    /// A bound workload assertion exchanges for a Service access token whose
+    /// principal is the binding's stable account with its granted roles, no
+    /// refresh token, and one successful self-attributed audit row.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding or the exchange fails, or when the issued
+    /// token's principal, roles, token type, refresh token, or audit row differ
+    /// from the binding's Service account.
     #[tokio::test]
     async fn workload_jwt_bearer_mints_service_token() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -233,6 +241,10 @@ mod pg_tests {
     /// The tenant slug fallback resolves the workload tenant when the host
     /// names none, and a binding's pinned default Service root becomes the
     /// token's exact root.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding or the slug-fallback exchange fails, or when
+    /// the issued token does not carry the binding's account and pinned root.
     #[tokio::test]
     async fn workload_jwt_bearer_falls_back_to_tenant_slug_with_service_root() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -287,6 +299,10 @@ mod pg_tests {
     /// A binding whose pinned default root is an Agent issues nothing:
     /// workloads are Services only, and the refusal is the same one an
     /// unknown root earns.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails or the exchange does not fail with
+    /// `WorkloadUidRefused`.
     #[tokio::test]
     async fn workload_jwt_bearer_refuses_an_agent_default_root() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -337,6 +353,13 @@ mod pg_tests {
         );
     }
 
+    /// An assertion for an audience the trusted issuer does not expect is
+    /// refused as an invalid token and audited under the platform principal.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails, the exchange succeeds or fails with
+    /// anything but `InvalidToken`, or the single audit row is not a platform
+    /// `INVALID_TOKEN` denial.
     #[tokio::test]
     async fn wrong_audience_is_rejected_and_audited() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -394,6 +417,12 @@ mod pg_tests {
         assert_eq!(rows[0].error_tag, "INVALID_TOKEN");
     }
 
+    /// An assertion whose `exp` is two minutes in the past is refused as an
+    /// expired token.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails or the exchange does not fail with
+    /// `TokenExpired`.
     #[tokio::test]
     async fn expired_assertion_is_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -436,6 +465,12 @@ mod pg_tests {
         assert!(matches!(error.0, WyrdError::TokenExpired { .. }));
     }
 
+    /// An assertion from an issuer the tenant does not trust is refused as an
+    /// invalid token.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails or the exchange does not fail with
+    /// `InvalidToken`.
     #[tokio::test]
     async fn untrusted_issuer_is_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -471,6 +506,12 @@ mod pg_tests {
         assert!(matches!(error.0, WyrdError::InvalidToken { .. }));
     }
 
+    /// A verified assertion whose subject has no server-owned workload binding
+    /// is refused as `PrincipalNotFound`, even when a Service account exists.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails or the exchange does not fail with
+    /// `PrincipalNotFound`.
     #[tokio::test]
     async fn server_owned_binding_denial_returns_principal_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -508,6 +549,13 @@ mod pg_tests {
         assert!(matches!(error.0, WyrdError::PrincipalNotFound { .. }));
     }
 
+    /// A cloud workload-identity `principal://` subject resolves through its
+    /// server-owned binding to the bound Service account like any other
+    /// subject shape.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding or the exchange fails, or when the issued
+    /// token is not a Service token for the bound account.
     #[tokio::test]
     async fn cloud_workload_subject_shape_uses_server_owned_binding() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -556,6 +604,12 @@ mod pg_tests {
         assert_eq!(verified.principal.id.as_uuid(), account);
     }
 
+    /// The same issuer and subject bound in tenant A grant nothing when the
+    /// exchange targets tenant B, which trusts the issuer but holds no binding.
+    ///
+    /// # Panics
+    /// Panics when fixture or tenant B seeding fails, or the tenant B exchange
+    /// does not fail with `PrincipalNotFound`.
     #[tokio::test]
     async fn same_issuer_subject_is_tenant_scoped() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -608,6 +662,13 @@ mod pg_tests {
     /// nothing, a binding to anything but an active Service account never
     /// lands, and foreign and unknown roots — explicit or pinned — refuse
     /// identically.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails, the stray binding lands, an allowed
+    /// root is not selected with the binding's account and roles, the rootless
+    /// exchange does not carry the family restriction, or a foreign, unknown,
+    /// or misbound root is not refused with one identical `WorkloadUidRefused`
+    /// code.
     #[tokio::test]
     async fn stable_account_mapping_selects_only_allowed_context() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -758,6 +819,12 @@ mod pg_tests {
         );
     }
 
+    /// The API-key exchange keeps issuing bearer tokens, without a refresh
+    /// token, alongside the workload jwt-bearer grant.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding, key issuance, or the exchange fails, or
+    /// when the exchange returns a refresh token.
     #[tokio::test]
     async fn api_key_grant_still_mints() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -807,6 +874,14 @@ mod pg_tests {
         )
     }
 
+    /// Build an [`AppState`] whose auth owner serves the given trusted issuers
+    /// and workload bindings from Postgres through the production Pg
+    /// resolvers, with a local Ed25519 issuing key and an external verifier.
+    ///
+    /// # Panics
+    /// Panics when an issuer or binding fails to seed or commit, a binding
+    /// does not target an active Service account, or the issuing key, kid, or
+    /// public key fails to parse.
     async fn test_state_with_external(
         fixture: &PgFixture,
         trusted: Vec<TrustedIssuer>,
@@ -889,6 +964,10 @@ mod pg_tests {
     ///
     /// # Errors
     /// Returns the [`sqlx::Error`] of the failing insert.
+    ///
+    /// # Panics
+    /// Panics when the tenant connection does not open, builtin roles fail to
+    /// seed, a named role is not a builtin role, or the seed fails to commit.
     async fn bootstrap_principal(
         fixture: &PgFixture,
         tenant: DataTenantId,
@@ -1198,6 +1277,9 @@ mod pg_tests {
 
     /// A binding of `subject` to the Service account `principal`, with an
     /// optional pinned default root.
+    ///
+    /// # Panics
+    /// Panics when the static external issuer URL does not parse.
     fn binding(
         tenant: DataTenantId,
         subject: &str,
@@ -1271,6 +1353,10 @@ mod pg_tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    /// Unresolved [`CardRef`] for `kind`/`name`@`version` with no uid.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid Card name or `version` does not parse.
     fn card_ref(kind: CardKind, name: &str, version: &str) -> CardRef {
         CardRef {
             kind,

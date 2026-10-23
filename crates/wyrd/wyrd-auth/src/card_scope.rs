@@ -412,6 +412,11 @@ mod pg_tests {
         );
     }
 
+    /// `issue_scope_error` maps only a too-large scope to a `WyrdError` and
+    /// returns every other issuance error unchanged.
+    ///
+    /// # Panics
+    /// Panics when `InvalidCardAccess` is not passed through as an issue error.
     #[test]
     fn issue_scope_error_passes_through_other_errors() {
         let root = make_card_ref(CardKind::Service, "svc");
@@ -511,6 +516,9 @@ mod pg_tests {
     // --- DB: resolve_workload_scope ---
 
     /// The registry UID of the seeded `card_ref`.
+    ///
+    /// # Panics
+    /// Panics when the seeded Card row cannot be loaded.
     async fn uid_of(conn: &mut TenantConn<'_>, card_ref: &CardRef) -> CardUid {
         get_card_by_ref(
             conn,
@@ -523,6 +531,12 @@ mod pg_tests {
         .card_uid
     }
 
+    /// A Service root with no components resolves to a one-member scope that
+    /// is the root itself, carrying its registry UID.
+    ///
+    /// # Panics
+    /// Panics when the fixture, seed, or resolve fails, or the scope is not
+    /// exactly the root with its UID.
     #[tokio::test]
     async fn resolve_single_service_card_produces_own_scope() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -544,6 +558,11 @@ mod pg_tests {
 
     /// A root outside the account's family is refused exactly like an
     /// unknown root, so a caller cannot probe another family's releases.
+    ///
+    /// # Panics
+    /// Panics when the fixture or seed fails, the own-family root is refused,
+    /// or the foreign or unknown root resolves or is refused with anything
+    /// other than `WorkloadUidRefused`.
     #[tokio::test]
     async fn resolve_refuses_foreign_and_unknown_roots_identically() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -582,6 +601,10 @@ mod pg_tests {
     /// Ingest stamps `card_uid` from trusted signed claims alone, so the mint
     /// walk must replace each authored reference — root and secondary — with the
     /// exact tenant-local registry identity and its `card_uid`.
+    ///
+    /// # Panics
+    /// Panics when the fixture, seed, or resolve fails, the scope is not the
+    /// root first plus the secondary, or either member lacks its registry UID.
     #[tokio::test]
     async fn resolve_scope_populates_every_member_uid() {
         let fixture = PgFixture::start().await.expect("fixture starts");

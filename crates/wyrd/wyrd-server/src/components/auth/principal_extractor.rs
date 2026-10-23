@@ -202,6 +202,12 @@ mod pg_tests {
         assert_error_code(error, "WYRD_AUTH_401_UNAUTHENTICATED");
     }
 
+    /// A principal already stored in the request extensions is returned as-is,
+    /// without a bearer header and without invoking the token verifier.
+    ///
+    /// # Panics
+    /// Panics when extraction fails or the extracted principal's id or tenant
+    /// differs from the stored principal.
     #[tokio::test]
     async fn extension_hit_returns_stored_principal_without_invoking_verifier() {
         let tenant = DataTenantId::new_v7();

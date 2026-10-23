@@ -3659,6 +3659,16 @@ impl WyrdTestServer {
         Ok(PrincipalId::new(principal_id))
     }
 
+    /// Insert an unrestricted machine account, a fixture Card of `card_kind`
+    /// it may select as its root, its roles, and one API key in the server's
+    /// default tenant.
+    ///
+    /// The default-tenant analogue of [`Self::bootstrap_machine_in_tenant`].
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError`] when the tenant's fixture administrator
+    /// cannot be ensured, the Card reference is not valid for the kind, or any
+    /// of the inserts fail.
     async fn bootstrap_machine(
         &self,
         name: &str,

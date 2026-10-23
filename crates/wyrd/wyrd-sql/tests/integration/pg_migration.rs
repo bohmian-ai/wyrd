@@ -707,6 +707,12 @@ mod pg_tests {
     ///   (d) live legacy user and machine refresh rows: both stay live and
     ///       unbound, so rotation refuses them (runtime renewal under a bound
     ///       connection is covered by the refresh rotation tests).
+    ///
+    /// # Panics
+    /// Panics when a pre-upgrade database or fixture row cannot be created,
+    /// the valid upgrade fails or moves a field differently, the table still
+    /// accepts a Human row, a refused upgrade changes state, or a legacy
+    /// refresh row is not left live and unbound.
     #[tokio::test]
     async fn human_connection_upgrade_preflight() {
         let Some(_) = database_url() else {
@@ -1677,6 +1683,13 @@ mod pg_tests {
         );
     }
 
+    /// The trusted-issuer foreign key refuses to delete an issuer while a
+    /// workload binding still references it.
+    ///
+    /// # Panics
+    /// Panics when Postgres or the migrations are unavailable, a fixture
+    /// insert or cleanup fails, or deleting the referenced issuer does not
+    /// fail with a database error.
     #[tokio::test]
     async fn cloud_issuer_fk_rejects_delete_with_live_binding() {
         let Some(url) = database_url() else {
@@ -1741,6 +1754,13 @@ mod pg_tests {
             .expect("tenant cleanup succeeds");
     }
 
+    /// A workload binding maps a subject to a stable Service account with no
+    /// workload root, and deleting that account removes its bindings.
+    ///
+    /// # Panics
+    /// Panics when Postgres or the migrations are unavailable, a fixture
+    /// insert, read, or cleanup fails, the stored binding carries another
+    /// account or a workload UID, or a binding survives its account's deletion.
     #[tokio::test]
     async fn cloud_issuer_binding_maps_a_stable_account() {
         let Some(url) = database_url() else {
@@ -1885,6 +1905,15 @@ mod pg_tests {
             .expect("tenant cleanup succeeds");
     }
 
+    /// The tenant read path returns every trusted-issuer column and the
+    /// NULL-audience workload binding verbatim, and RLS hides both from
+    /// another tenant that registers the same issuer URL.
+    ///
+    /// # Panics
+    /// Panics when Postgres, the app role, or the migrations are unavailable, a
+    /// fixture insert, read, or cleanup fails, a column or the sealed secret
+    /// differs from what was written, or one tenant sees the other's issuer or
+    /// binding.
     #[tokio::test]
     async fn cloud_issuer_read_path_roundtrips_and_rls() {
         let Some(migrator_url) = database_url() else {
@@ -2035,6 +2064,15 @@ mod pg_tests {
             .expect("tenant cleanup succeeds");
     }
 
+    /// The tenant write path inserts issuers and bindings, refuses duplicates
+    /// with a unique violation, blocks an issuer delete behind a live binding,
+    /// and removes the bindings and then the issuer on cascade.
+    ///
+    /// # Panics
+    /// Panics when Postgres, the app role, or the migrations are unavailable, a
+    /// write, read, commit, or cleanup step fails, a duplicate does not raise
+    /// `UniqueViolation`, the blocked delete does not raise `FkViolation`, a
+    /// delete reports another row count, or a row survives the cascade.
     #[tokio::test]
     async fn cloud_issuer_crud_write_path_conflict_and_cascade() {
         let Some(migrator_url) = database_url() else {

@@ -147,6 +147,11 @@ mod tests {
 
     /// Neither lookup nor listing reaches deleted principals, the tenant
     /// administrator, or the `system` writer.
+    ///
+    /// # Panics
+    /// Panics when either statement does not carry exactly two
+    /// `status <> 'deleted'` guards or does not restrict rows to
+    /// `principal_kind = 'service'`.
     #[test]
     fn directory_excludes_unassignable_principals() {
         for sql in [

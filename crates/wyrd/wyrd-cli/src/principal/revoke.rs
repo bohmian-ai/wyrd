@@ -102,6 +102,10 @@ mod tests {
         assert!(parsed.is_err(), "revoke must require --kind");
     }
 
+    /// `revoke` parses with each revocable `--kind`: `user` and `service`.
+    ///
+    /// # Panics
+    /// Panics when either kind fails to parse.
     #[test]
     fn revoke_parses_all_kinds() {
         for kind in ["user", "service"] {

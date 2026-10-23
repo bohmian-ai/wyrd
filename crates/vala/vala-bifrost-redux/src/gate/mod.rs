@@ -2605,6 +2605,11 @@ mod tests {
     /// root has no signed Card access, so any frame naming a Card is refused
     /// as needing workload context rather than attributed or scope-denied,
     /// while a frame naming no Card passes attribution unattributed.
+    ///
+    /// # Panics
+    /// Panics when the static family name is invalid, a Card-naming frame is
+    /// attributed or refused with another error than `WorkloadContextRequired`,
+    /// or a frame naming no Card fails or comes back attributed.
     #[tokio::test]
     async fn rootless_family_account_needs_a_root_to_attribute_cards() {
         let gate = Gate::<RecordingAudit>::with_test_scribe(

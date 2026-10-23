@@ -226,6 +226,17 @@ impl PgWorkloadBindingResolver {
 }
 
 impl WorkloadBindingResolver for PgWorkloadBindingResolver {
+    /// Read the tenant's workload binding for `issuer` and `subject`.
+    ///
+    /// Prefers a row whose audience equals `audience` and falls back to a
+    /// `NULL`-audience row; returns `Ok(None)` when neither exists so the
+    /// caller refuses the exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OidcError::JwksUnavailable`] when the tenant connection
+    /// cannot be acquired, the binding query fails, or the stored root
+    /// `workload_uid` is not a valid Card UID.
     #[tracing::instrument(skip(self), fields(tenant_id = %tenant, issuer = %issuer))]
     async fn binding(
         &self,
@@ -859,6 +870,12 @@ mod pg_tests {
     /// A stored human connection row mapping `subject` as `email` fails closed
     /// at decode, while the same row mapping `sub` decodes with its email and
     /// group paths intact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the `email` subject row decodes, its error is not
+    /// `HumanSubject("email")`, or the `sub` row fails to decode with its
+    /// subject and email paths.
     #[test]
     fn stored_human_connection_requires_the_sub_subject_claim() {
         let tenant: DataTenantId = "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
@@ -988,6 +1005,14 @@ mod pg_tests {
         );
     }
 
+    /// A `NULL`-audience binding answers an audience-qualified lookup through
+    /// [`PgWorkloadBindingResolver`], and an unbound subject resolves to `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture or seed writes fail, a lookup errors, the
+    /// fallback lookup misses or returns another account or root, or the
+    /// unbound subject resolves.
     #[tokio::test]
     async fn binding_resolver_prefers_audience_then_falls_back() {
         let fixture = PgFixture::start().await.expect("fixture starts");

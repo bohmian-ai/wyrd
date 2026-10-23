@@ -2021,6 +2021,16 @@ async fn release_failed_oracle_role(
 /// Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
 /// the implicit tenant. Issuers are seeded first because workload bindings
 /// reference them by FK.
+///
+/// Does nothing when neither list is configured.
+///
+/// # Errors
+/// Returns [`ServerBootError::TenantSlugUnresolved`] when federation entries are
+/// configured but `auth.tenant_slug` is unset or does not resolve to an active
+/// tenant; [`ServerBootError::InvalidWorkloadBinding`] when a binding's issuer is
+/// not a valid https issuer or names no active Service account; and any error
+/// [`crate::boot::issuer::seed_trusted_issuers`] returns (human issuer, issuer
+/// discovery, sealing, or [`ServerBootError::Sql`] write failures).
 async fn seed_federation(
     postgres: &ServerPostgres,
     config: &WyrdServerConfig,
@@ -2119,6 +2129,13 @@ pub fn build_workload_bindings(
 }
 
 /// Build a single [`WorkloadBinding`] from a config entry under `tenant_id`.
+///
+/// `index` is the entry's position in `[[workload_bindings]]` and is reported
+/// in the error so operators can find the bad entry.
+///
+/// # Errors
+/// Returns [`ServerBootError::InvalidWorkloadBinding`] when the entry's issuer
+/// is not a valid https issuer URL.
 fn build_workload_binding(
     index: usize,
     entry: &WorkloadBindingEntry,
@@ -2458,6 +2475,11 @@ mod tests {
             .expect("static tenant id is valid")
     }
 
+    /// Valid `[[workload_bindings]]` entry with an https issuer, subject,
+    /// audience, and principal id, for binding-construction tests.
+    ///
+    /// # Panics
+    /// Panics when the static principal id does not parse.
     fn sample_binding_entry() -> WorkloadBindingEntry {
         WorkloadBindingEntry {
             issuer: "https://idp.example.com".to_owned(),
@@ -2482,6 +2504,11 @@ mod tests {
         assert_ne!(bindings[0].tenant_id, DataTenantId::SYSTEM_OWNER);
     }
 
+    /// Boot refuses a workload binding whose issuer uses plain `http://`.
+    ///
+    /// # Panics
+    /// Panics when the non-https binding builds or fails with an error other than
+    /// [`ServerBootError::InvalidWorkloadBinding`].
     #[test]
     fn workload_binding_rejects_a_non_https_issuer() {
         let tenant = implicit_tenant();

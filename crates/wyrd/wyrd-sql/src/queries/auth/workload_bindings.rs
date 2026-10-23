@@ -295,6 +295,13 @@ mod tests {
         assert!(!DELETE_WORKLOAD_BINDINGS_FOR_ISSUER_SQL.contains("subject"));
     }
 
+    /// The binding upsert conflicts on the tenant, issuer, and subject key and
+    /// overwrites the principal, workload UID, and audience of the stored row.
+    ///
+    /// # Panics
+    /// Panics when the upsert does not target `wyrd.auth_workload_bindings`,
+    /// does not conflict on `(data_tenant_id, issuer_url, subject)`, or does not
+    /// take `principal_id`, `workload_uid`, and `audience` from `EXCLUDED`.
     #[test]
     fn upsert_targets_composite_key_and_overwrites_columns() {
         assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("INSERT INTO wyrd.auth_workload_bindings"));

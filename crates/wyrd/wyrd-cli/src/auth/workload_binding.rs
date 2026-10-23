@@ -222,6 +222,11 @@ mod tests {
         command: WorkloadBindingCommand,
     }
 
+    /// `add` parses with its required `--issuer`, `--subject`, `--principal`,
+    /// and `--server` arguments.
+    ///
+    /// # Panics
+    /// Panics when the complete argument list fails to parse.
     #[test]
     fn add_parses_required_args() {
         let parsed = Cli::try_parse_from([
@@ -239,6 +244,10 @@ mod tests {
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
     }
 
+    /// `add` refuses an argument list that omits `--principal`.
+    ///
+    /// # Panics
+    /// Panics when the list without `--principal` parses.
     #[test]
     fn add_requires_principal() {
         let parsed = Cli::try_parse_from([
@@ -254,6 +263,10 @@ mod tests {
         assert!(parsed.is_err(), "must require --principal");
     }
 
+    /// `add` refuses an argument list that omits `--subject`.
+    ///
+    /// # Panics
+    /// Panics when the list without `--subject` parses.
     #[test]
     fn add_requires_subject() {
         let parsed = Cli::try_parse_from([
@@ -269,6 +282,12 @@ mod tests {
         assert!(parsed.is_err(), "must require --subject");
     }
 
+    /// `add` accepts an optional `--audience` and carries its value into the
+    /// parsed arguments.
+    ///
+    /// # Panics
+    /// Panics when the list fails to parse, parses to another subcommand, or
+    /// the audience is not `myapp`.
     #[test]
     fn add_accepts_optional_audience() {
         let parsed = Cli::try_parse_from([

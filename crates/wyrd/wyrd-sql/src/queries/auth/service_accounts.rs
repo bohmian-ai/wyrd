@@ -534,6 +534,11 @@ mod tests {
 
     /// Family lookups and replacement rely on forced RLS, never a manual
     /// tenant predicate, and replacement never revives a deleted account.
+    ///
+    /// # Panics
+    /// Panics when either statement names `data_tenant_id`, the family lookup
+    /// drops its `status = 'active'` guard, or the replacement drops its
+    /// `status <> 'deleted'` or `principal_kind = 'service'` guard.
     #[test]
     fn restriction_statements_stay_tenant_implicit() {
         for sql in [FAMILY_ACCOUNT_SQL, SET_RESTRICTION_SQL] {

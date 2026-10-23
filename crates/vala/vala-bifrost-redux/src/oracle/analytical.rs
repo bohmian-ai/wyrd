@@ -3854,6 +3854,11 @@ mod tests {
     }
 
     /// Builds one authenticated Analytical context for a leasing fixture.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `AuthorizedQueryContext::try_new` refuses the fixture User
+    /// principal's internal `bifrost_query_read` request.
     fn context_for_leasing() -> AuthorizedQueryContext {
         let tenant = DataTenantId::new_v7();
         AuthorizedQueryContext::try_new(

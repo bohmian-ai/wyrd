@@ -88,7 +88,8 @@ def test_user_table_time_column_prunes_a_time_range(wyrd_server: WyrdTestServer)
     assert in_range == [1, 2]
     described = readings.describe_table(NAMESPACE, READINGS)
     assert described["physical_layout"]["time_column"] == "event_time"
-    assert described["table_version"] == "1"
+    assert type(described["table_version"]) is int
+    assert described["table_version"] == 1
     assert defaults.describe_table(NAMESPACE, DEFAULTS)["physical_layout"]["time_column"] == (
         "wyrd_ingested_at"
     )

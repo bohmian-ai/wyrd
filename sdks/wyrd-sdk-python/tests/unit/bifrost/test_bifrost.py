@@ -5,6 +5,7 @@ import pytest
 from pydantic import BaseModel
 from wyrd import WyrdError
 from wyrd.bifrost import Bifrost, TableConfig
+from wyrd.bifrost._client import _description
 
 TABLE = "vala.datasets.events"
 TARGET_FILE_SIZE_BYTES = 256 * 1024 * 1024
@@ -77,3 +78,11 @@ def test_underscore_compaction_type_is_refused(compaction_type: str) -> None:
         TableConfig(Event, TABLE, compaction_type=compaction_type)
 
     assert captured.value.code == "WYRD_SPEC_400_VALIDATION"
+
+
+@pytest.mark.parametrize("version", [1, 2**53 + 1, 2**63 - 1])
+def test_a_table_description_projects_its_version_as_an_exact_int(version: int) -> None:
+    described = _description({"table_version": str(version)})
+
+    assert type(described["table_version"]) is int
+    assert described["table_version"] == version

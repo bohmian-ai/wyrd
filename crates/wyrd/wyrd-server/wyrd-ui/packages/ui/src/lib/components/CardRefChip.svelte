@@ -1,4 +1,4 @@
-<!-- One exact Card identity, `kind name@version`; a link only when the host supplies one. -->
+<!-- One exact Card reference, `Kind/name@version`; a link only when the host supplies one. -->
 <script lang="ts">
   import type { CardRef } from '../contract.js';
   import { fmtCardRef } from '../format.js';
@@ -7,7 +7,6 @@
 </script>
 
 <svelte:element this={href ? 'a' : 'span'} class="chip" {href} title={fmtCardRef(cardRef)}>
-  <span class="kind">{cardRef.kind}</span>
   <span class="ref">{fmtCardRef(cardRef)}</span>
 </svelte:element>
 
@@ -29,9 +28,6 @@
   a.chip:hover {
     background: var(--surface-hover);
     color: var(--declare);
-  }
-  .kind {
-    color: var(--muted);
   }
   .ref {
     overflow: hidden;

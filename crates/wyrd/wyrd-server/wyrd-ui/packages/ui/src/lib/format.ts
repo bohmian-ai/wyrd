@@ -47,7 +47,7 @@ export function fmtInstant(ms: number): string {
   return `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 }
 
-/** An exact Card identity → "name@1.4.2". */
-export function fmtCardRef(ref: { name: string; version: string }): string {
-  return `${ref.name}@${ref.version}`;
+/** An exact Card reference in canonical spelling → "Model/ranker@1.4.2", plus "#uid" when one is supplied. */
+export function fmtCardRef(ref: { kind: string; name: string; version: string; uid?: string | null }): string {
+  return `${ref.kind}/${ref.name}@${ref.version}${ref.uid ? `#${ref.uid}` : ''}`;
 }

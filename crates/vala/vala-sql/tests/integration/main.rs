@@ -13,4 +13,5 @@ mod pg_migration;
 mod pg_olap_catalog;
 mod pg_oracle_membership;
 mod pg_schema_usage;
+mod pg_scribe_batch_commits;
 mod pg_stream_identity;

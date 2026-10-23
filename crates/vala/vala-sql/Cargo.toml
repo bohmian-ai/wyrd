@@ -28,6 +28,7 @@ workspace-hack.workspace = true
 secrecy = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-sql = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }

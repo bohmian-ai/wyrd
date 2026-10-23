@@ -126,9 +126,12 @@ mod pg_tests {
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .expect("tenant connection");
-            vala_sql::queries::scribe_batch_commits::record(&mut conn, &commit, chrono::Utc::now())
-                .await
-                .expect("fence records");
+            vala_sql::queries::scribe_batch_commits::record(
+                &mut conn,
+                &[(commit, chrono::Utc::now())],
+            )
+            .await
+            .expect("fence records");
             conn.commit().await.expect("fence commits");
         }
 

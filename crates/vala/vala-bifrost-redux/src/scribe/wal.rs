@@ -4072,7 +4072,7 @@ mod tests {
         let decoded = decode_slice_payload(&payload).expect("slice decodes");
         assert_eq!(decoded.seal_key, seal_key);
         assert_eq!(
-            decoded.seal_key.recipe.as_ref().map(|recipe| recipe.wire()),
+            decoded.seal_key.recipe.as_ref().map(crate::catalog::layout::AcceptedRecipe::wire),
             Some(recipe.wire())
         );
 

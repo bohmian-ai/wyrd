@@ -722,7 +722,7 @@ pub(crate) enum ShardCommand {
     /// Re-drive one replay generation after persistence queue progress.
     RetryReplayPersistence {
         /// Seal key whose FIFO front was unable to enter the bounded queue.
-        seal_key: crate::scribe::seal_key::SealKey,
+        seal_key: Box<crate::scribe::seal_key::SealKey>,
         /// Exact generation protected against stale retry notifications.
         generation_id: u64,
         /// Queue progress or terminal runtime-close result.
@@ -2246,7 +2246,7 @@ impl ShardOwner {
                         let progress = persistence.wait_for_submission_progress().await;
                         let _ = completion_tx
                             .send(ShardCommand::RetryReplayPersistence {
-                                seal_key,
+                                seal_key: Box::new(seal_key),
                                 generation_id,
                                 progress,
                             })
@@ -3634,14 +3634,17 @@ impl ShardOwner {
         let Some(postgres) = self.control_postgres.clone() else {
             return Ok(());
         };
-        let mut fences =
-            Vec::<(DataTenantId, Vec<(usize, ScribeBatchCommit, DateTime<Utc>)>)>::new();
+        let mut fences = Vec::<(
+            DataTenantId,
+            Vec<usize>,
+            Vec<(ScribeBatchCommit, DateTime<Utc>)>,
+        )>::new();
         for (index, identity, header, commit_lsn) in commits {
             state
                 .fenced
                 .push((index, identity.logical_digest, identity.slice_count));
             let append = &state.prepared[index];
-            let (commit, ingested_at) = Self::batch_commit_fence(
+            let fence = Self::batch_commit_fence(
                 append,
                 &state.durable[identity.first_index],
                 &identity,
@@ -3650,19 +3653,22 @@ impl ShardOwner {
             )?;
             match fences
                 .iter_mut()
-                .find(|(tenant, _)| *tenant == append.tenant)
+                .find(|(tenant, _, _)| *tenant == append.tenant)
             {
-                Some((_, batch)) => batch.push((index, commit, ingested_at)),
-                None => fences.push((append.tenant, vec![(index, commit, ingested_at)])),
+                Some((_, indices, offered)) => {
+                    indices.push(index);
+                    offered.push(fence);
+                }
+                None => fences.push((append.tenant, vec![index], vec![fence])),
             }
         }
-        for (tenant, batch) in fences {
+        for (tenant, indices, offered) in fences {
             let spent = self
-                .commit_batch_control_fences(&postgres, tenant, &batch)
+                .commit_batch_control_fences(&postgres, tenant, &offered)
                 .await?;
-            for ((index, _, _), already) in batch.iter().zip(spent) {
+            for (index, already) in indices.into_iter().zip(spent) {
                 if already {
-                    let append = &state.prepared[*index];
+                    let append = &state.prepared[index];
                     tracing::debug!(
                         tenant = %append.tenant,
                         table = %append.table.fqn(),
@@ -3731,17 +3737,17 @@ impl ShardOwner {
     /// Commits or durably reconciles one tenant's WAL batch-control fences
     /// from one group commit in a single `PostgreSQL` transaction.
     ///
-    /// Every fence in `batch` belongs to `tenant`. Each is recorded in the
-    /// same tenant transaction, so the group pays one COMMIT instead of one
-    /// per batch. `ingested_at` is each batch's admission instant, the value
+    /// Every fence in `offered` belongs to `tenant`. One statement records them
+    /// all in one tenant transaction, so the group pays one INSERT and one
+    /// COMMIT instead of one of each per batch. `ingested_at` is each batch's admission instant, the value
     /// stamped on its rows as `wyrd_ingested_at`; the fence stores it
     /// unchanged. The result holds, per fence and in order, whether the batch
     /// was already committed by an earlier attempt and must not become
     /// visible again.
     ///
     /// A `PostgreSQL` COMMIT error is always ambiguous. The method then opens
-    /// a fresh tenant transaction and resolves every fence by comparing its
-    /// durable identity fields. When every fence resolves, the result is
+    /// a fresh tenant transaction and resolves every fence in one read by
+    /// comparing its durable identity fields. When every fence resolves, the result is
     /// returned; when any is absent, the method retries the identical inserts,
     /// which reclassify the fences that did land. An unavailable or
     /// contradictory lookup poisons the shared governor so
@@ -3758,23 +3764,24 @@ impl ShardOwner {
         &self,
         postgres: &ValaPostgres,
         tenant: DataTenantId,
-        batch: &[(usize, ScribeBatchCommit, DateTime<Utc>)],
+        offered: &[(ScribeBatchCommit, DateTime<Utc>)],
     ) -> Result<Vec<bool>, ScribeError> {
         use vala_sql::queries::scribe_batch_commits::{
             ScribeBatchCommitResolution, record, resolve,
         };
+        let spent = |resolved: &[ScribeBatchCommitResolution]| {
+            resolved
+                .iter()
+                .map(|resolution| {
+                    matches!(resolution, ScribeBatchCommitResolution::AlreadyCommitted)
+                })
+                .collect::<Vec<_>>()
+        };
         loop {
             let mut conn = postgres.tenant_conn(tenant).await?;
-            let mut spent = Vec::with_capacity(batch.len());
-            for (_, commit, ingested_at) in batch {
-                let recorded = record(&mut conn, commit, *ingested_at).await?;
-                spent.push(matches!(
-                    recorded,
-                    ScribeBatchCommitResolution::AlreadyCommitted
-                ));
-            }
+            let recorded = record(&mut conn, offered).await?;
             if conn.commit().await.is_ok() {
-                return Ok(spent);
+                return Ok(spent(&recorded));
             }
 
             let mut reconciliation = match postgres.tenant_conn(tenant).await {
@@ -3784,20 +3791,20 @@ impl ShardOwner {
                     return Err(error.into());
                 }
             };
-            let mut resolved = Vec::with_capacity(batch.len());
-            for (_, commit, _) in batch {
-                match resolve(&mut reconciliation, commit).await {
-                    Ok(ScribeBatchCommitResolution::Committed) => resolved.push(false),
-                    Ok(ScribeBatchCommitResolution::AlreadyCommitted) => resolved.push(true),
-                    Ok(ScribeBatchCommitResolution::Absent) => break,
-                    Err(error) => {
-                        self.memory_ownership.poison();
-                        return Err(error.into());
-                    }
+            let resolved = match resolve(
+                &mut reconciliation,
+                offered.iter().map(|(commit, _)| commit),
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    self.memory_ownership.poison();
+                    return Err(error.into());
                 }
-            }
-            if resolved.len() == batch.len() {
-                return Ok(resolved);
+            };
+            if !resolved.contains(&ScribeBatchCommitResolution::Absent) {
+                return Ok(spent(&resolved));
             }
         }
     }

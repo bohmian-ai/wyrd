@@ -54,6 +54,10 @@ pub struct ScribeBatchCommit {
 /// Tenant-visible durable identity loaded after an idempotency conflict.
 #[derive(Debug, sqlx::FromRow)]
 struct ExistingScribeBatchCommit {
+    /// Persisted canonical logical table FQN, half of the lookup key.
+    logical_table_fqn: String,
+    /// Persisted batch identity, the other half of the lookup key.
+    batch_id: uuid::Uuid,
     /// Persisted ordered logical slice-set digest.
     slice_set_digest: Vec<u8>,
     /// Persisted closed-set cardinality.
@@ -187,7 +191,8 @@ pub async fn resolve_replay(
             "scribe batch replay tenant does not match TenantConn",
         ));
     }
-    let Some(existing) = load(conn, commit).await? else {
+    let existing = load(conn, std::iter::once(commit)).await?;
+    let Some(existing) = find(&existing, commit) else {
         return Ok(ScribeBatchReplayResolution::Restore);
     };
     if existing.slice_set_digest != commit.slice_set_digest
@@ -202,44 +207,29 @@ pub async fn resolve_replay(
     }
 }
 
-/// Resolves an uncertain transaction outcome against the durable batch fence.
+/// Resolves an uncertain transaction outcome against the durable batch fences.
 ///
-/// The lookup runs through the authenticated tenant connection and compares
-/// every persisted WAL, slice-set, and request field. It never treats key
-/// presence alone as proof that the caller's batch committed.
+/// One tenant-scoped read loads every offered fence's durable row, and each
+/// is classified by comparing every persisted WAL, slice-set, and request
+/// field. Key presence alone never proves that the caller's batch committed.
+/// The result holds one resolution per offered fence, in offered order.
 ///
 /// # Errors
 ///
-/// Returns [`SqlError`] when the tenant differs from `conn`, the lookup is
-/// unavailable, or the durable row holds different rows under this identity.
-pub async fn resolve(
+/// Returns [`SqlError`] when a fence's tenant differs from `conn`, the lookup
+/// is unavailable, or a durable row holds different rows under its identity.
+pub async fn resolve<'a>(
     conn: &mut TenantConn<'_>,
-    commit: &ScribeBatchCommit,
-) -> Result<ScribeBatchCommitResolution, SqlError> {
-    if conn.data_tenant_id() != commit.tenant {
-        return Err(invariant(
-            "scribe batch commit tenant does not match TenantConn",
-        ));
-    }
-    let existing = load(conn, commit).await?;
-    match existing {
-        None => Ok(ScribeBatchCommitResolution::Absent),
-        Some(existing) if existing.matches(commit) => Ok(ScribeBatchCommitResolution::Committed),
-        Some(existing) if existing.matches_logical(commit) => {
-            Ok(ScribeBatchCommitResolution::AlreadyCommitted)
-        }
-        Some(existing) => {
-            tracing::warn!(
-                logical_table = %commit.logical_table_fqn,
-                batch_id = %commit.batch_id,
-                divergent = ?existing.divergent_fields(commit),
-                durable_slice_count = existing.slice_count,
-                offered_slice_count = commit.slice_count,
-                "Scribe batch identity contradicts its durable fence"
-            );
-            Err(invariant("scribe batch commit identity mismatch"))
-        }
-    }
+    commits: impl Iterator<Item = &'a ScribeBatchCommit> + Clone,
+) -> Result<Vec<ScribeBatchCommitResolution>, SqlError> {
+    require_tenant(conn, commits.clone())?;
+    let existing = load(conn, commits.clone()).await?;
+    commits
+        .map(|commit| match find(&existing, commit) {
+            None => Ok(ScribeBatchCommitResolution::Absent),
+            Some(existing) => classify(existing, commit),
+        })
+        .collect()
 }
 
 /// Reads the `PostgreSQL` instant Scribe anchors its admission clock on.
@@ -259,83 +249,101 @@ pub async fn ingest_instant(conn: &mut TenantConn<'_>) -> Result<DateTime<Utc>, 
         .map_err(SqlError::from)
 }
 
-/// Records a Scribe commit, or classifies the conflict.
+/// Records one tenant group's Scribe commits, or classifies their conflicts.
 ///
-/// The caller commits the supplied tenant transaction. A first observation
-/// inserts the fence and reports [`ScribeBatchCommitResolution::Committed`].
-/// A primary-key conflict is classified by logical identity: the same attempt
-/// is `Committed`, the same rows from a different attempt are
+/// The caller commits the supplied tenant transaction. One statement inserts
+/// every offered fence; fences the insert did not create are classified by
+/// one more read in the same transaction, and an all-fresh group needs none.
+/// Each fence resolves in offered order: a first observation is
+/// [`ScribeBatchCommitResolution::Committed`]; on a primary-key conflict the
+/// same attempt is `Committed`, the same rows from a different attempt are
 /// [`ScribeBatchCommitResolution::AlreadyCommitted`] and the caller must not
 /// make them visible again, and different rows under the same batch identity
 /// are a contradiction. `Absent` is never returned.
 ///
-/// `ingested_at` is the batch's admission instant from [`ingest_instant`],
+/// A fence is keyed by tenant, table, and batch id, never by its position:
+/// `RETURNING` does not preserve input order, and one batch id may name
+/// batches of different tables. A contradiction returns an error before the
+/// caller commits, so none of the group's fresh fences become durable.
+///
+/// `ingested_at` is each batch's admission instant from [`ingest_instant`],
 /// the same value stamped on its rows. It is not part of the identity: a
 /// retry carries a fresh instant and still resolves against the first row.
 ///
 /// # Errors
 ///
-/// Returns [`SqlError`] when the tenant does not match `conn`, the insert
-/// fails, or an existing commit holds different rows under the same identity.
+/// Returns [`SqlError`] when a fence's tenant does not match `conn`, the
+/// insert fails, or an existing commit holds different rows under the same
+/// identity.
 pub async fn record(
     conn: &mut TenantConn<'_>,
-    commit: &ScribeBatchCommit,
-    ingested_at: DateTime<Utc>,
-) -> Result<ScribeBatchCommitResolution, SqlError> {
-    if conn.data_tenant_id() != commit.tenant {
-        return Err(invariant(
-            "scribe batch commit tenant does not match TenantConn",
-        ));
-    }
-    let inserted: Option<bool> = sqlx::query_scalar(
+    commits: &[(ScribeBatchCommit, DateTime<Utc>)],
+) -> Result<Vec<ScribeBatchCommitResolution>, SqlError> {
+    require_tenant(conn, commits.iter().map(|(commit, _)| commit))?;
+    let inserted: Vec<(String, uuid::Uuid)> = sqlx::query_as(
         "INSERT INTO vala.scribe_batch_commits \
          (data_tenant_id, logical_table_fqn, batch_id, slice_set_digest, slice_count, \
           wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence, \
           wal_lsn_min, wal_lsn_max, request_id, ingested_at) \
-         VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+         SELECT wyrd.current_tenant(), offered.* \
+           FROM unnest($1::text[], $2::uuid[], $3::bytea[], $4::integer[], $5::uuid[], \
+                       $6::bigint[], $7::smallint[], $8::bigint[], $9::bigint[], \
+                       $10::bigint[], $11::uuid[], $12::timestamptz[]) AS offered \
          ON CONFLICT (data_tenant_id, logical_table_fqn, batch_id) DO NOTHING \
-         RETURNING true",
+         RETURNING logical_table_fqn, batch_id",
     )
-    .bind(&commit.logical_table_fqn)
-    .bind(commit.batch_id)
-    .bind(commit.slice_set_digest.as_slice())
-    .bind(commit.slice_count)
-    .bind(commit.wal_node_id)
-    .bind(commit.wal_writer_epoch)
-    .bind(commit.wal_shard_id)
-    .bind(commit.wal_segment_sequence)
-    .bind(commit.wal_lsn_min)
-    .bind(commit.wal_lsn_max)
-    .bind(commit.request_id)
-    .bind(ingested_at)
-    .fetch_optional(&mut **conn.transaction())
+    .bind(column(commits, |c| c.logical_table_fqn.clone()))
+    .bind(column(commits, |c| c.batch_id))
+    .bind(column(commits, |c| c.slice_set_digest.to_vec()))
+    .bind(column(commits, |c| c.slice_count))
+    .bind(column(commits, |c| c.wal_node_id))
+    .bind(column(commits, |c| c.wal_writer_epoch))
+    .bind(column(commits, |c| c.wal_shard_id))
+    .bind(column(commits, |c| c.wal_segment_sequence))
+    .bind(column(commits, |c| c.wal_lsn_min))
+    .bind(column(commits, |c| c.wal_lsn_max))
+    .bind(column(commits, |c| c.request_id))
+    .bind(commits.iter().map(|(_, at)| *at).collect::<Vec<_>>())
+    .fetch_all(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
-    if inserted.is_some() {
-        return Ok(ScribeBatchCommitResolution::Committed);
-    }
 
-    let existing = load(conn, commit).await?;
-    let Some(existing) = existing else {
-        return Err(invariant(
-            "scribe batch commit conflict was not visible through TenantConn",
-        ));
+    let mut returned = inserted;
+    let fresh: Vec<bool> = commits
+        .iter()
+        .map(|(commit, _)| {
+            returned
+                .iter()
+                .position(|(fqn, batch_id)| {
+                    *fqn == commit.logical_table_fqn && *batch_id == commit.batch_id
+                })
+                .map(|position| returned.swap_remove(position))
+                .is_some()
+        })
+        .collect();
+    let conflicted = commits
+        .iter()
+        .zip(&fresh)
+        .filter(|(_, fresh)| !**fresh)
+        .map(|((commit, _), _)| commit);
+    let existing = if fresh.iter().all(|fresh| *fresh) {
+        Vec::new()
+    } else {
+        load(conn, conflicted).await?
     };
-    if existing.matches(commit) {
-        return Ok(ScribeBatchCommitResolution::Committed);
-    }
-    if existing.matches_logical(commit) {
-        return Ok(ScribeBatchCommitResolution::AlreadyCommitted);
-    }
-    tracing::warn!(
-        logical_table = %commit.logical_table_fqn,
-        batch_id = %commit.batch_id,
-        divergent = ?existing.divergent_fields(commit),
-        durable_slice_count = existing.slice_count,
-        offered_slice_count = commit.slice_count,
-        "Scribe batch identity contradicts its durable fence"
-    );
-    Err(invariant("scribe batch commit identity mismatch"))
+    commits
+        .iter()
+        .zip(fresh)
+        .map(|((commit, _), fresh)| {
+            if fresh {
+                return Ok(ScribeBatchCommitResolution::Committed);
+            }
+            let existing = find(&existing, commit).ok_or_else(|| {
+                invariant("scribe batch commit conflict was not visible through TenantConn")
+            })?;
+            classify(existing, commit)
+        })
+        .collect()
 }
 
 /// Returns the WAL segment sequence and COMMIT LSN of the newest fence of
@@ -367,26 +375,95 @@ pub async fn newest_wal_fence(
         .map_err(SqlError::from)
 }
 
-/// Loads one tenant-visible durable batch fence without interpreting identity.
+/// Loads the tenant-visible durable fences of `commits` in one read, without
+/// interpreting identity.
 ///
 /// # Errors
 ///
 /// Returns [`SqlError`] when PostgreSQL cannot execute the tenant-scoped read.
-async fn load(
+async fn load<'a>(
     conn: &mut TenantConn<'_>,
-    commit: &ScribeBatchCommit,
-) -> Result<Option<ExistingScribeBatchCommit>, SqlError> {
+    commits: impl Iterator<Item = &'a ScribeBatchCommit> + Clone,
+) -> Result<Vec<ExistingScribeBatchCommit>, SqlError> {
     sqlx::query_as(
-        "SELECT slice_set_digest, slice_count, wal_node_id, wal_writer_epoch, wal_shard_id, \
-                    wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id \
-               FROM vala.scribe_batch_commits \
-              WHERE logical_table_fqn = $1 AND batch_id = $2",
+        "SELECT logical_table_fqn, batch_id, slice_set_digest, slice_count, wal_node_id, \
+                wal_writer_epoch, wal_shard_id, wal_segment_sequence, wal_lsn_min, \
+                wal_lsn_max, request_id \
+           FROM vala.scribe_batch_commits \
+          WHERE (logical_table_fqn, batch_id) IN \
+                (SELECT * FROM unnest($1::text[], $2::uuid[]))",
     )
-    .bind(&commit.logical_table_fqn)
-    .bind(commit.batch_id)
-    .fetch_optional(&mut **conn.transaction())
+    .bind(
+        commits
+            .clone()
+            .map(|commit| commit.logical_table_fqn.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind(commits.map(|commit| commit.batch_id).collect::<Vec<_>>())
+    .fetch_all(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)
+}
+
+/// Finds the durable fence `existing` holds for `commit`'s table and batch.
+fn find<'a>(
+    existing: &'a [ExistingScribeBatchCommit],
+    commit: &ScribeBatchCommit,
+) -> Option<&'a ExistingScribeBatchCommit> {
+    existing.iter().find(|row| {
+        row.logical_table_fqn == commit.logical_table_fqn && row.batch_id == commit.batch_id
+    })
+}
+
+/// Classifies `commit` against the durable fence holding its identity.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when the durable fence holds different rows.
+fn classify(
+    existing: &ExistingScribeBatchCommit,
+    commit: &ScribeBatchCommit,
+) -> Result<ScribeBatchCommitResolution, SqlError> {
+    if existing.matches(commit) {
+        return Ok(ScribeBatchCommitResolution::Committed);
+    }
+    if existing.matches_logical(commit) {
+        return Ok(ScribeBatchCommitResolution::AlreadyCommitted);
+    }
+    tracing::warn!(
+        logical_table = %commit.logical_table_fqn,
+        batch_id = %commit.batch_id,
+        divergent = ?existing.divergent_fields(commit),
+        durable_slice_count = existing.slice_count,
+        offered_slice_count = commit.slice_count,
+        "Scribe batch identity contradicts its durable fence"
+    );
+    Err(invariant("scribe batch commit identity mismatch"))
+}
+
+/// Refuses a fence offered for a tenant other than `conn`'s.
+///
+/// # Errors
+///
+/// Returns [`SqlError::InvariantViolation`] for the first foreign fence.
+fn require_tenant<'a>(
+    conn: &TenantConn<'_>,
+    mut commits: impl Iterator<Item = &'a ScribeBatchCommit>,
+) -> Result<(), SqlError> {
+    if commits.any(|commit| commit.tenant != conn.data_tenant_id()) {
+        return Err(invariant(
+            "scribe batch commit tenant does not match TenantConn",
+        ));
+    }
+    Ok(())
+}
+
+/// Projects one fence field of every offered fence as a bindable array.
+fn column<T>(
+    commits: &[(ScribeBatchCommit, DateTime<Utc>)],
+    field: impl Fn(&ScribeBatchCommit) -> T,
+) -> Vec<T> {
+    commits.iter().map(|(commit, _)| field(commit)).collect()
 }
 
 /// Produces one invariant SQL error without widening the public error catalog.
@@ -418,6 +495,8 @@ mod tests {
             request_id: uuid::Uuid::now_v7(),
         };
         let existing = ExistingScribeBatchCommit {
+            logical_table_fqn: commit.logical_table_fqn.clone(),
+            batch_id: commit.batch_id,
             slice_set_digest: commit.slice_set_digest.to_vec(),
             slice_count: commit.slice_count,
             wal_node_id: commit.wal_node_id,

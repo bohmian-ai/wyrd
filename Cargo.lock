@@ -9246,6 +9246,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "workspace-hack",
  "wyrd-dev-fixtures",

@@ -475,12 +475,6 @@ async fn scribe_promotion_integration_rejects_physical_datafile_mismatch_before_
         }),
     ];
 
-    for (index, (name, mutate)) in MUTATIONS.into_iter().enumerate() {
-        let fixture =
-            PromotionIntegrationFixture::start(&format!("promotion_physical_{index}")).await;
-        assert_mutation_is_refused_before_catalog_io(&fixture, 0, name, mutate).await;
-    }
-
     // Partition-tuple contradictions only the durable row can see: the
     // object's footer and time bounds are intact under every one of these.
     // Each mutates the object of customer `alpha` or of the null customer.
@@ -503,6 +497,12 @@ async fn scribe_promotion_integration_rejects_physical_datafile_mismatch_before_
                 .insert("time_index".to_owned(), serde_json::Value::from(1));
         }),
     ];
+    for (index, (name, mutate)) in MUTATIONS.into_iter().enumerate() {
+        let fixture =
+            PromotionIntegrationFixture::start(&format!("promotion_physical_{index}")).await;
+        assert_mutation_is_refused_before_catalog_io(&fixture, 0, name, mutate).await;
+    }
+
     for (index, (name, null_customer, mutate)) in TUPLE_MUTATIONS.into_iter().enumerate() {
         let fixture = composite_fixture(&format!("promotion_tuple_{index}")).await;
         let record = fixture

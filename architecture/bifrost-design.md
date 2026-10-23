@@ -99,14 +99,67 @@ keys rows by that tuple: seal keys, WAL records, staged manifests, promotion
 records, and `vala.file_list.partition_dimensions`, which records it beside
 independent time bounds.
 
-Schema ids, partition-spec ids, and sort-order ids are distinct retained Iceberg
-identities. Admission binds each batch to the table's committed
-`LayoutRevision { schema_id, sort_order_id }` and spec, and the WAL, staged
-manifest, seal, and published file carry that revision, so a revision committed
-after acceptance never reinterprets accepted rows, and a retry keeps its
-original binding. Scribe stamps the revision schema's field ids on every
-admitted column (`PARQUET:field_id`), and every reader resolves columns by
-field id: a rename keeps its values, and a column a source predates reads null.
+### Table versions and publication
+
+One positive integer `table_version` identifies the complete immutable
+definition of a tenant-bound physical table: columns, names, types,
+nullability, field IDs, time column, partition specification, sort order,
+Bloom declaration and every writer/layout setting. It is scoped to the
+existing immutable table identity, not a reusable table name. Creation starts
+at 1; one effective definition edit increments it once. Invalid/no-op edits
+consume no committed version. Data, snapshot and housekeeping commits preserve
+it. There is no parallel configuration counter, composite layout revision,
+accepted-recipe JSON or definition fingerprint standing in for this version.
+Native Iceberg schema/spec/order IDs remain physical descriptors, not Bifrost
+definition versions. Snapshot IDs and Scribe publication progress describe
+visibility and do not select the definition of accepted data.
+
+The domain is `1..=9223372036854775807`, represented by Rust `i64`, SQL
+`BIGINT` with positivity enforced, protobuf `int64` and eight-byte persisted
+version values. JSON always uses canonical unsigned decimal strings, including
+`"1"`; TypeScript SDKs use `bigint` and convert directly to/from those strings.
+Python retains exact integers. Never convert through JavaScript `number`.
+Refuse zero, negative/out-of-range values, JSON numbers, signs, leading zeros,
+whitespace, fractional and exponent forms. At the maximum, an effective edit
+fails with a typed version-exhaustion conflict without wrapping or mutation.
+Public responses use `table_version`; PATCH uses `expected_table_version`.
+Old spellings are not accepted aliases.
+
+The Iceberg property `wyrd.bifrost.table-version` and complete definition edits
+commit in the same native metadata commit. Native metadata owns schema/spec/
+order facts; Wyrd table properties own settings with no native equivalent,
+including Blooms. Resolve writer defaults into that definition; a deployment
+default cannot silently change an existing version's writer policy.
+
+`BifrostCatalog` owns resolution and the retained
+`(immutable table identity, table_version) -> native metadata location`
+reference. Its Iceberg SQL catalog fork publishes the reference in the same
+catalog transaction as the metadata-pointer CAS, including creation. Assert
+the expected version and base pointer at that publication boundary; native
+schema/spec/order checks alone cannot protect concurrent Bloom-only edits.
+A losing CAS rolls back the reference and refreshes no cache. A data-only
+head move may retry after all assumptions and the unchanged expected version
+are revalidated; a definition conflict cannot silently rebase. Uncertain
+COMMIT reconciles exact pointer/reference evidence before reporting success.
+The reference is an address index into native metadata, not a second layout
+representation or a later independently committed SQL projection.
+
+Admission binds every batch to that definition. WAL slices/commits, seals,
+assembly, staged records, acceptance fences and promotion evidence carry the
+same version; Oracle pins and Forge resolve it through the existing native
+metadata cache and writer owners. Promotion records and file lineage retain
+the selected version beside exact native `DataFile` evidence. No hot-ingest
+PostgreSQL lookup is added.
+Scribe stamps its definition's field IDs (`PARQUET:field_id`); readers resolve
+by field ID so renames retain values and a column a source predates reads null.
+The current definition and every rooted older definition remain resolvable
+under Forge's retention rules below, independently of metadata-log rollover.
+
+This is an in-baseline persisted-contract replacement with no release
+migration, backfill, compatibility alias, automatic reset or dual authority.
+Legacy evidence may be used only if it maps unambiguously to exact retained
+version/definition evidence; otherwise refuse it, never infer from current
+schema, IDs or Bloom properties.
 
 The tenant is not a row column. It is a property of the physical table, of
 each Parquet file, and of each in-memory Scribe bucket, all bound from the
@@ -149,8 +202,12 @@ is stored. Gate validates the batch identity and routes the authenticated
 write, while table-owned validation prevents payload columns from supplying
 server-owned fields. A retry preserves
 the batch ID. Within the idempotency-retention window,
-reusing an accepted ID requires the same schema fingerprint, row count, row
+reusing an accepted ID requires the same source schema, row count, row
 order, and payload digest; any mismatch is a stable batch-identity conflict.
+Resolve accepted retries under the fence's original `table_version`, even
+when current partitioning or schema would prepare different slices or reject
+the old request. Stale versions on new batches are typed table-version
+conflicts; an accepted ID never bypasses strict content or permission checks.
 
 One authenticated tenant and logical `TableRef` bind exactly one physical
 Iceberg table, namespace, and object-store prefix. Callers never choose another
@@ -184,7 +241,7 @@ v3, and physical-table validation refuses a table that is not v3. There is no
 other format and no mixed-version state. Appends assign row ids through the v3
 first-row-id mechanism. The hidden lineage columns `_row_id` and
 `_last_updated_sequence_number` are Iceberg metadata, never logical columns:
-they are absent from the table schema, its fingerprints, and every query
+they are absent from the table's definition schema and every query
 result, and a Forge rewrite preserves both for every surviving row.
 
 Variant is a canonical column type (`DataTypeSpec::Variant`) for open,
@@ -193,9 +250,10 @@ self-describing values. On the Arrow wire a Variant column is the
 binary Struct; Iceberg and Parquet store it as the v3 Variant type. A field
 declared Variant must carry that extension at every nesting level: missing or
 foreign extension metadata is `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, even
-when the storage Struct matches. Extension metadata is not part of a
-fingerprint, so files with different shredding layouts share one table and one
-fingerprint.
+when the storage Struct matches. Different file-specific shredding results
+may share one table version under the same declared shredding policy; they do
+not create independent definition identities. Variant extension/value checks
+remain mandatory.
 
 A Variant value reads back with the type, nesting, and value it was written
 with. Integers stay integers and never pass through floating point; doubles
@@ -239,8 +297,8 @@ nesting depth, so valid JSON past the limit is too deep, never invalid, and
 Scribe repeats the extension, size, encoding, numeric, and depth checks over
 every declared Variant of a built-in table at its admission boundary, before
 the batch is acknowledged, because a raw Arrow writer can skip client
-preparation and the fingerprint compares storage types only. Extension
-identity is checked across all fields first, then each value in row and field
+preparation, and neither a claimed version nor a storage-type match proves
+value validity. Extension identity is checked across all fields first, then each value in row and field
 order in the order above; the first failure names the field, row, and path.
 
 Built-in tables store open caller content as Variant and closed shapes as
@@ -294,9 +352,10 @@ typed columns:
 Every Variant field — a table column, a Struct child, or a child of a List
 element's Struct — is stored in the standard Parquet shredded layout:
 `metadata`, a residual `value`, and `typed_value` leaves for the keys the file
-chose. The footer is the only record of a file's layout; Wyrd writes no layout
-metadata, and files with different layouts share one table and one
-fingerprint. Values that do not fit the layout stay in the residual `value`,
+chose. The footer records that file-specific shredding result; Wyrd keeps no
+parallel shredding recipe blob. Files with different adaptive results can
+share one table version when produced under the same definition/policy. Values
+that do not fit the layout stay in the residual `value`,
 so the layout changes performance only, never a result. Both readers unshred
 at any depth before rows leave the scan.
 
@@ -315,8 +374,11 @@ at any depth before rows leave the scan.
   of one rewrite with that layout. Forge only keeps or drops keys; Scribe
   discovers them.
 
-The sampling parameters and the per-node child and depth caps are internal
-writer constants, not public, wire, table, or persisted contracts.
+Sampling policy and per-node child/depth bounds remain internal writer
+controls, not new user tuning options. Freeze any resolved policy that affects
+writer/layout behavior in the table definition; changing that policy for an
+existing table is an effective versioned edit. The file-specific adaptive
+shredding result remains in its footer and allocates no separate version.
 
 ## Declared types and the registered schema
 
@@ -328,15 +390,24 @@ registration both call it, so an unstorable type (`UInt64`, `Date64`,
 depth) is `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` before any request or
 table exists.
 
-A table's registered Iceberg schema is its one schema. Registration stores
+A table version's retained Iceberg schema owns its schema. Registration stores
 each declared column in its Iceberg form, and a repeat declaration that spells
-the same Iceberg types repeats rather than conflicts. On every write Scribe
-matches the batch to that schema before acknowledging: columns match by name
+the same definition repeats rather than allocating a version. New native
+writes carry the current version obtained with that definition; canonical
+built-ins use Gate's versioned server projection. Accepted retries use their
+original fence version. On every write Scribe matches the batch to its bound
+schema before acknowledging: columns match by name
 in any order; a column whose Arrow type is another spelling of the registered
 Iceberg type (`Int8` for `int`, `LargeUtf8` for `string`, a timestamp in any
 zone) is cast once with Arrow's `cast`; a column whose storage matches but
 whose Variant identity does not is `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`;
-and any other difference is `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
+and any other difference is a typed schema-conformance conflict. A stale
+version on a new batch is a typed table-version conflict (HTTP 409), distinct
+from malformed payload validation. Keep structural, type, nullability,
+reserved-field and Variant/value checks. Version identity removes redundant
+schema/layout hashing, not required casts or trust-boundary validation.
+Reuse the existing conformance-plan cache by version/descriptor and actual
+source shape; do not hash layout JSON or resolve current metadata per batch.
 
 Bifrost has three timestamp types, named as Snowflake names them:
 
@@ -370,11 +441,14 @@ accepted append
 ```
 
 An append acknowledgement means the WAL append and batch fence are durable and
-the exact rows are authoritative in Scribe. It does not wait for local Parquet,
-object publication, Iceberg promotion, or compaction.
+the exact rows and their recorded table version are authoritative in Scribe.
+It does not wait for local Parquet, object publication, Iceberg promotion, or compaction.
 
 Every query pins one published cut: an Iceberg snapshot and committed Scribe
-hot objects not represented by that snapshot. Oracle also discovers active
+hot objects not represented by that snapshot, with the table versions needed
+to resolve its schema and sources. Definition pins protect native definition
+metadata; snapshot/file visibility retains its existing independent rules.
+Oracle also discovers active
 streams by listing, concurrently and under the query deadline, the Scribes in
 the attempt's frozen roster, and sends live work only to owners of relevant
 table partitions at the same frozen endpoint and fence. A listing that reveals
@@ -511,18 +585,35 @@ validate and split by canonical physical partition
 A shard commits admitted requests in groups. One group cycle writes every
 SLICE record, appends each complete batch's COMMIT record, and makes both
 durable with one sync over every segment the cycle touched before it records
-the batch fences. No request is acknowledged before that sync and its fence
-commit.
+the batch fences. Each tenant's group uses one multi-row INSERT in its existing
+tenant transaction, then one batched SELECT for conflicting identities if
+needed. Classify each batch by full durable key in original group order;
+RETURNING order is not input order. A contradictory duplicate rolls back that
+tenant group's fresh rows. Retain the scheduler's repeated-identity guard.
+One COMMIT per tenant remains; an ambiguous result uses batched resolution in
+a fresh tenant transaction, retries identical absent fences, and poisons on
+unavailable/contradictory authority. RLS, group ownership and transaction
+counts do not change. Versioning adds no normal-ingest PostgreSQL call.
+No request is acknowledged before WAL sync and its durable fence commit.
 
-An honest retry of a batch that is already fenced and visible is the one
-exception: its data was synced by the earlier attempt, so re-queueing it would
-only make it wait behind fresh writes' syncs before the fence suppressed it.
-After preprocessing, Scribe compares the request with a bounded pod-local index
-of batches its shards fenced and made visible. When the tenant, batch id,
-logical table, logical slice-set digest, and slice count all match, the request
-is acknowledged at once with no first commit and nothing is rewritten. A miss,
-an evicted entry, or any mismatch takes the shard path, where the durable fence
-remains the only authority for first commits and identity contradictions.
+An honest retry of a batch that is already fenced and visible can avoid the
+shard queue. The existing bounded committed-batch mirror returns its original
+table version and acceptance facts before current-definition preparation.
+Compare content under that retained definition, not current schema/partition
+rules; preserve exact source schema, row order/count, payload and origin/time.
+A matching mirror hit acknowledges the original acceptance without rewriting.
+
+On a cold miss, do not add a preliminary accepted-ID query. Preparation and
+WAL attempts remain provisional. The existing fence conflict read returns the
+original version/reference, digest/count, ingestion instant and canonical WAL
+coordinates. A mismatch rolls back the tenant group's uncommitted fresh
+fences before bounded retained-definition comparison outside the transaction;
+resume only after proving an identical retry. A genuine contradiction commits
+none of that group's fresh fences. An exceptional current-contract or stale-
+version refusal may resolve an accepted ID under the retained definition; an
+unknown ID preserves the original refusal. Keep authentication, permissions,
+limits and managed-field validation on all paths, with no new SQL on successful
+fresh admission or extra unconditional full-payload copy/hash pass.
 
 Each write request carries one profile in the Oracle query-profile pattern,
 emitted once when the request settles as
@@ -541,7 +632,8 @@ existing invalid-frame error before WAL append or fence and stores nothing.
 Each shard projects WAL bytes, Arrow and metadata ownership, age, and resource
 pressure before append. Rotation closes the shard generation when any validated
 limit requires it. The active memtable remains separated by exact
-`SealKey { tenant, table, physical_partition }`. Rotation freezes each nonempty
+`SealKey { tenant, table, table_version, physical_partition }`. Rotation
+freezes each nonempty
 bucket independently; no file or sort may mix tenants, tables, layouts, or
 physical partitions.
 
@@ -562,6 +654,10 @@ ImmutableArrow
 fsyncs the file, manifest, and directory, verifies checksum/schema/layout/footer,
 performs a bounded read preflight, and registers it as live-tail authority. The
 shared cohort WAL retires only after every member reaches that boundary.
+The staged manifest/context carries the table version and reconstructs its
+layout from retained native metadata, never a copied recipe or current Blooms.
+Its complete seal key and generation ordinal remain distinct through live
+capture; two versions sharing an ordinal must both be selected exactly once.
 Definite pre-registration failure returns to immutable Arrow; uncertain state
 keeps WAL and local evidence for reconciliation.
 
@@ -570,13 +666,13 @@ keeps WAL and local evidence for reconciliation.
 `StagingAssembler` claims complete ready members under the exact key:
 
 ```text
-(tenant, table, schema_fingerprint, physical_layout, layout_revision,
- physical_partition, node_id, writer_epoch)
+(tenant, table, table_version, physical_partition, node_id, writer_epoch)
 ```
 
 Claims may combine compatible members across generations and shards on the same
-node. Membership is deterministic and durable before merge; one member cannot
-be split across claims and a later member cannot join an existing claim.
+node. The table version supplies definition compatibility; no parallel layout
+fingerprint or recipe digest participates. Membership is deterministic and
+durable before merge; one member cannot be split across claims and a later member cannot join an existing claim.
 
 `ParquetBatchEncoder` performs a bounded external merge in canonical
 `PhysicalLayout` order; rows that tie on every layout key keep claim-member
@@ -592,8 +688,11 @@ pressure, drain, or final residue. The 512 MiB target is independent of WAL,
 active-memory, row-group, and Forge output geometry.
 
 `ScribePersistence` derives deterministic object identities, uploads through a
-bounded lane, and atomically commits `file_list` plus audit evidence under the
-publication fence. Staged runs remain authoritative until that transaction is
+bounded lane, and atomically commits `file_list` plus lineage evidence under
+the publication fence. Promotion evidence carries the same table version,
+complete typed partition and exact writer-derived Iceberg `DataFile`; no
+current-property reconstruction may relabel a staged output. Staged runs remain
+authoritative until that transaction is
 committed or reconciled as identical. New cuts then use the published object;
 existing staged-reader leases finish before local deletion.
 
@@ -613,8 +712,19 @@ independent tail timeout can end an otherwise active query.
 
 Startup replays WAL using the recorded shard ID, validates staged files and
 manifests, rebuilds source and claim indexes, and reconciles publishing
-operation IDs against `file_list` before opening admission. Unknown versions,
-checksum mismatch, contradictory lineage, or ambiguous authority fail closed.
+operation IDs against `file_list` before opening admission. Unknown codec/table
+versions, unmappable legacy evidence, checksum mismatch,
+contradictory lineage or ambiguous authority fail closed. WAL SLICE and COMMIT
+bind the same table version and retain per-attempt CRC, ordinal/count, terminal
+and payload/WAL integrity checks; no recipe JSON travels in either record.
+A cold retry may leave a complete provisional attempt with different geometry.
+The durable fence's canonical coordinates select the accepted attempt;
+noncanonical attempts for that spent ID restore no rows. Do not reject those
+attempts solely for differing cross-attempt geometry before consulting the
+fence. Contradictions at canonical coordinates still fail closed, and missing
+fence authority never permits speculative suppression. Preserve genuinely
+unfenced complete-commit recovery under its recorded version. No abort record,
+truncation workaround or second replay ledger is introduced.
 Because SLICE and COMMIT records share one sync, a crash may leave a complete
 but invalid record in a shard's unsynced tail. Replay ends that shard's chain
 at the first such record in its last segment, as it does a torn tail, only
@@ -642,7 +752,8 @@ metadata and projected onto the table's current schema by field id: the
 Iceberg scan binds the current schema rather than the snapshot's, Parquet
 columns resolve by field id, file pruning is re-planned against each file's own
 schema, and the live tail carries the required fields so memtable rows admitted
-under an earlier revision project by id. A column a source predates reads null,
+under an earlier table version project by id. A column a source predates reads
+null,
 so filters on it stay exact. There is no caller-selected source
 mode, freshness policy, or query class.
 
@@ -959,7 +1070,8 @@ writes no row, and nothing is released at the query's terminal. Oracle serves
 cuts from a cache kept fresh by the `bifrost_cut` notification channel; it
 serves cached cuts only while listening, and a query never accepts a cut
 older than its own deadline bound. The cache is not trusted for correctness:
-the statement also returns each table's per-node publication revisions from
+the statement also returns each table's definition version/reference and its
+per-node publication revisions from
 `vala.bifrost_table_publication_revisions`, which a `vala.file_list` insert
 trigger advances in the publishing transaction, and live-source selection
 validates the cached cut against the revisions Scribes report. A warm query
@@ -970,7 +1082,10 @@ then reads the selected metadata documents directly and concurrently; a
 document missing after a catalog move reacquires the whole cut once, and a
 second `NotFound` is terminal. All of this waits within the leader deadline,
 which is capped at `max_query_deadline_ms` (default 6 h); Forge's snapshot
-retention, never a per-query record, keeps the pinned objects readable.
+retention, never a per-query SQL record, keeps snapshot/data objects readable.
+The same cut retains in-memory definition pins through the existing owner;
+root-aware metadata cleanup protects them separately from snapshot visibility.
+Pin/source binding must not combine one version's schema with another's layout.
 
 Every query carries one execution profile, the analog of `ClickHouse`
 `ProfileEvents`. The leader's own steps — `cut_read`, `cut_materialize`,
@@ -1132,10 +1247,15 @@ table file geometry or creates a second grouping algorithm.
 Forge first promotes committed Scribe hot objects unchanged. The promotion
 worker validates the exact footer-derived Iceberg `DataFile` projection against
 the claimed `file_list` row, bound table, partition, path, checksum, and target
-branch. A record may name any partition spec and sort order the table
-retains, and its footer is decoded against the newest retained schema whose
-field ids it matches, so objects sealed before a revision keep the layout they
-were written with. It then performs one fenced duplicate-checking fast-append
+branch. A record's table version resolves the exact retained native definition
+and
+footer schema; its native spec, complete typed tuple and sort order must agree
+with that definition and the durable SQL authority. Validate contradictions on
+the worker revalidation path, without silently suppressing corrupt promotion
+debt during planning. Objects sealed before an edit keep their original Bloom,
+partition and sort policy. Do not choose a newer schema or current Bloom list
+merely because field IDs happen to match. It then performs one fenced
+duplicate-checking fast-append
 `commit_once`, which writes one manifest per partition spec. Promotion writes no data object and invokes no compaction core.
 
 On a definite compare-and-swap conflict, Forge refreshes the branch head and
@@ -1152,7 +1272,7 @@ An ambiguous catalog result keeps the same attempt and operation ID. Forge
 refreshes metadata and reconciles exact snapshot properties and manifest
 entries without retrying the catalog call. A second attempt cannot begin while
 the first is unresolved. After exact committed evidence exists, one fenced SQL
-and audit transaction records the promotion snapshot on every claimed row and
+and lineage transaction records the promotion snapshot on every claimed row and
 switches Oracle authority. During the catalog-to-SQL interval, Oracle
 suppresses a hot object only when its pinned snapshot contains the exact path,
 checksum, and operation evidence.
@@ -1160,16 +1280,22 @@ checksum, and operation evidence.
 ### Managed compaction and publication
 
 Iceberg maintenance rewrites eligible live files toward the table's
-`write.target-file-size-bytes`: the table's optional registered compaction
-target when one is set, otherwise the deployment default resolved once per
-attempt (approximately 1 GiB, overridable by environment). Row-group size is
+`write.target-file-size-bytes` resolved in the selected table-version
+definition. Creation or an effective definition edit resolves the authorized
+table/deployment default (approximately 1 GiB); an environment change cannot
+silently alter an existing version. Each attempt pins its output version and
+resolves writer/layout policy through the shared existing owner. Row-group
+size is
 independent and normally 128 MiB. A physical file rolls from the managed
 writer's encoded estimate after a completed write; partition and end-of-stream
 residue are valid. Neither target is a universal physical object-size
 guarantee. Planning groups files by their complete physical partition, spec
 included, so a rewrite never crosses a partition boundary to meet a target, and
-each output records the spec, partition tuple, and sort order its rows actually
-have. Forge never rewrites history to the current layout on its own.
+each output records its selected table version and the native spec, partition
+tuple and sort order its rows actually have. Resolve input definitions from
+their own versions; a rewrite uses its explicitly selected output definition,
+not a relabeling of existing files. Forge never rewrites history to the current
+layout on its own. Maintenance snapshot commits never increment the version.
 
 The managed compaction core is the sole owner of candidate selection, grouping,
 bin packing, delete application, sorting, partition fanout, bounded concurrent
@@ -1229,16 +1355,17 @@ the Iceberg commit so an applied delete does not reapply to replacement rows.
 Missing target evidence, mixed sequence semantics, or an unproven surviving
 scope fails commit validation.
 
-Attempt output paths are table-bound and retain the managed core's recipe
-segment:
+Attempt output paths are table-bound and identify the selected output table
+version:
 
 ```text
-{table}/data/forge/{recipe}/{attempt_uuidv7}-{writer_ordinal:05}-{writer_uuidv7}.parquet
+{table}/data/forge/{table_version}/{attempt_uuidv7}-{writer_ordinal:05}-{writer_uuidv7}.parquet
 ```
 
-The recipe segment is the managed core's canonical writer-recipe identity and
-keeps completed Forge outputs recognizable as current on the next selection
-pass. Each physical writer owns its filename counter and UUIDv7 suffix;
+The version segment is the canonical decimal table version, not a second
+writer-recipe fingerprint. The managed core recognizes output definition
+compatibility by that version while keeping its existing selection/execution
+ownership. Each physical writer owns its filename counter and UUIDv7 suffix;
 `writer_ordinal` is minimum-width five-digit canonical decimal and may restart
 for another writer because `writer_uuidv7` provides cross-writer uniqueness.
 Forge separately assigns each opened output one attempt-global
@@ -1254,7 +1381,9 @@ Committed, definitely uncommitted, fence-refused, cancelled, and uncertain are
 distinct per-plan outcomes. Concurrent siblings may optimistically race on the
 same branch head and cause an expected compare-and-swap conflict. On a definite
 conflict, Forge refreshes the branch head and revalidates the retained planning
-snapshot, current schema identity, selected-input existence, lease, and fence.
+snapshot, selected output table version/definition, selected-input existence,
+lease and fence. A definition edit invalidating output assumptions cannot be
+silently adopted by the retry.
 When those assumptions remain true, the same plan operation, output generation,
 and objects may make at most three further `commit_once` calls after fixed
 1s/2s/4s delays within the original deadline. Exhausted retries, an expired
@@ -1266,11 +1395,12 @@ from the current head. No conflict retry creates new output objects.
 An uncertain attempt protects its outputs and reconciles under the same
 identity; it never retries the catalog call, starts a fresh attempt, or reports
 terminal success until exact catalog evidence resolves it. Terminal SQL and
-audit settlement occurs exactly once.
+lineage settlement occurs exactly once.
 
 ### Convergence, retention, and cleanup
 
-Each rewrite snapshot records canonical versioned fingerprints for its base
+Each rewrite snapshot binds its selected output `table_version` and records
+canonical evidence fingerprints for its base
 live data set, resulting live data set, produced outputs, semantic debt shape,
 and lineage snapshot. Before object IO, Forge reconstructs those exact sets and
 refuses a rewrite when selected files are prior outputs, semantic debt is
@@ -1303,9 +1433,29 @@ through its known outcome, and the Forge lease TTL bounds that hold: an
 object-store call still running at the bound is an uncertain effect left for
 idempotent replay. Oracle never takes the authority, so maintenance never
 waits on a query and a query never waits on maintenance.
-An open Scribe fragment retains its local Arrow batches and staged resources
-until its stream completes or drops. It names no Forge-collectable object and
-contributes no independent Forge GC root.
+An open Scribe fragment retains its local Arrow batches, staged resources and
+definition pins until its stream completes or drops. Local files remain owned
+by Scribe; their retained table-version metadata remains a definition root.
+Definition metadata has separate root-based retention. Always retain the
+current table version's original native metadata location and reference, even
+after data-only commits move the current metadata pointer. Retain older
+versions while any WAL, staged data, fence, promotion/file-lineage, active
+query pin or accepted-retry retention root remains. A fence survives WAL retirement as a root.
+Settled promotion/rewrite evidence continues to root a definition while
+retained files need it, so a later query can still resolve their table version.
+Protect these references and objects in both expiry and orphan cleanup after
+native metadata-log rollover; native auto-delete cannot bypass this protection.
+
+Root discovery recovers before destructive cleanup. Derive work roots from
+existing durable records and pin owners, not a new per-batch SQL registration.
+An unavailable node's unsettled retained storage or missing root inventory is
+not proof of safety. Serialize root removal/deletion through existing
+maintenance/pin/fence owners so a newly needed definition cannot race with
+collection. Prune only noncurrent versions after all roots and accepted-retry
+retention are proven gone. Without an established retention horizon, retain;
+do not invent a definition TTL. Keeping definition metadata does not retain
+every historical data snapshot it mentions or change row-data retention.
+
 No cleanup infers safety from path shape; only snapshot expiry and orphan GC
 use age.
 
@@ -1465,7 +1615,15 @@ batch as a counted loss.
 
 The surface includes:
 
-- table management under `/v1/bifrost/tables`;
+- table creation/registration and describe under `/v1/bifrost/tables`, returning
+  resolved schema/layout, immutable table identity and `table_version`;
+- authorized `PATCH /v1/bifrost/tables/{namespace}/{name}` with
+  `expected_table_version`, optional partial layout, nullable custom-column
+  additions and stable-ID custom renames. Validate the complete result; omitted
+  lists preserve values and supplied lists replace them. A stale edit is a
+  typed HTTP 409 with no mutation; malformed/unsupported edits are 400 and
+  missing DDL authority is 403. Time-column identity and canonical/managed
+  schemas remain protected; re-registration never alters a table;
 - `AppendReceipt { batch_id, accepted_rows, durability }`, where `durability`
   is the closed `AppendDurability::Acknowledged` value; the synchronous append
   response never reports staged, published, promoted, or rewritten state;
@@ -1476,6 +1634,19 @@ The surface includes:
 - gRPC query projection through `wyrd.v1.BifrostQueryService`;
 - the `wyrd.bifrost` Python projection and matching TypeScript SDK;
 - agent-facing read and write operations governed by explicit permissions.
+
+The version representation is the single lossless contract defined under
+Table versions and publication: JSON decimal strings, TypeScript `bigint`,
+exact integers on native boundaries. No alternate field names or numeric-JSON
+shortcut exists. The SDK writer obtains the version with schema/layout from
+describe or registration, retains it with the immutable table identity and
+sends it on every native frame, including buffered/retried batches. Gate binds
+canonical built-in input to a versioned server projection. None of the SDKs
+allocates versions or silently rebinds queued content after an edit. A stale
+version on a new batch is a typed conflict directing a describe refresh and
+new batch construction; an accepted retry uses its original fence version and
+strict equality checks. Native input remains subject to structural/type/
+nullability/reserved-field/value checks, including built-in contracts.
 
 Observation namespaces such as `vala.traces`, `vala.metrics`, `vala.logs`,
 `vala.drift`, `vala.verification`, `vala.gateway`, and

@@ -1,15 +1,15 @@
 ---
 spec: SPEC-service-identity-and-telemetry
-spec_revision: 12
+spec_revision: 13
 status: approved
 ---
 
 # Unified tables, physical layouts, and correlation
 
-This is a normative approved supplement to [specification revision 12](../spec.md),
+This is the storage supplement to approved [specification revision 13](../spec.md),
 alongside [auth](auth-system.md) and [telemetry schemas](telemetry-schemas.md).
-It records the approved storage and table-unification contracts.
-Approval covers the complete packet; implementation follows its derived tasks.
+It records the storage and table-unification contracts. Auth and telemetry
+content is unchanged from revision 12.
 
 ## One table contract
 
@@ -27,15 +27,90 @@ universal record ID.
 | --- | --- | --- |
 | Tenant ownership | Verified physical table, namespace, and object prefix | Same |
 | Logical schema | Table owner's declared domain fields plus shared envelope | User fields plus shared envelope |
-| Table description | Full resolved schema, layout, and revisions | Same |
+| Table description | Full resolved schema, layout, immutable table identity and matching `table_version` | Same |
 | Admission | Typed validation, permission checks, accepted attribution, atomic batch identity | Same |
 | Physical layout | Ledger default plus authorized tenant configuration | Explicit bounded declaration or documented default |
 | Storage lifecycle | Scribe, Oracle, and Forge owners | Same |
 | Read authorization | Existing permissions for every referenced table | Same |
-| Evolution | Explicit coordinated revision | Same |
+| Evolution | Explicit atomic table-version edit | Same |
 
 Tenant is not another row column or partition key. A query cannot change the
 authenticated tenant through a table name, label, join key, or partition value.
+
+### One table version
+
+`table_version` identifies the complete immutable definition of one physical
+table, scoped to its existing immutable tenant-bound table identity. A
+same-named replacement cannot reuse an earlier table's authority. Creation
+starts at 1; every successful effective definition edit increments once.
+Columns, names, types, nullability, field IDs, time-column identity, partition
+specification, sort order, Bloom declaration and any writer/layout setting
+belong to that definition. Safe-edit restrictions still apply; inclusion of
+the time column does not permit changing it after creation.
+
+There is no separate configuration revision, composite schema/spec/order
+version or copied accepted-recipe JSON. Data/snapshot/housekeeping commits do
+not bump the version. No-op or invalid edits consume none. A changed declared
+Bloom-list order is an effective definition edit even though Bloom membership
+semantics are unchanged; sending the identical declaration is a no-op.
+
+The version is a positive signed 64-bit integer, `1..=9223372036854775807`.
+Its representations are:
+
+| Boundary | Exact representation |
+| --- | --- |
+| Rust / SQL | `i64` domain value / PostgreSQL `BIGINT`, positive and range checked |
+| Protobuf | `int64`; omitted/default zero is invalid where a version is required |
+| WAL and other fixed-width persistence | Eight-byte version value; no composite ID or recipe bytes |
+| HTTP/MCP/other JSON, including protobuf JSON | Canonical unsigned decimal string, e.g. `"1"` or `"9223372036854775807"` |
+| TypeScript SDK | `bigint`; encode/decode directly to/from the JSON string without a `number` intermediate |
+| Python SDK | Exact `int`, checked against the same range |
+| Iceberg property | Same canonical decimal string under `wyrd.bifrost.table-version` |
+
+JSON numbers are refused even for small versions. Refuse zero, signs, leading
+zeros, whitespace, fractions, exponent notation and out-of-range values.
+Responses use `table_version`; PATCH uses `expected_table_version`. These are
+the only public spellings; old field names are unknown fields, not aliases.
+At maximum version, an effective edit fails with a typed version-exhaustion
+conflict and changes nothing; versions never wrap or get reused.
+
+Native Iceberg schema, partition-spec and sort-order IDs remain physical
+descriptors. Snapshots and Scribe publication progress remain visibility
+identities. None is a competing Bifrost definition version or a substitute for
+`table_version`.
+
+### Native metadata publication
+
+Commit `wyrd.bifrost.table-version` with the complete validated definition edits
+in the same Iceberg metadata commit. Use native schema/spec/order metadata
+where it represents a setting, and table properties for Wyrd-specific layout
+facts such as Blooms. Resolve defaults into the committed definition: changing
+a deployment writer default cannot silently reinterpret an existing version.
+
+The existing catalog owns the retained
+`(immutable table identity, table_version) -> native metadata location`
+reference. Publish it in the **same catalog SQL transaction** as the Iceberg
+metadata-pointer CAS, including creation at version 1. Extend the Iceberg SQL
+catalog fork's publication boundary; a later Wyrd SQL upsert is not atomic
+publication. The reference is an address index into native metadata, not a
+second serialized layout or history service.
+
+Assert expected table version and expected base metadata pointer at the actual
+publication boundary. Concurrent Bloom-only edits from one version produce
+one winner even when schema/spec/order IDs have not changed. A data-only
+pointer move may retry only after revalidating unchanged expected definition
+and all edit assumptions; it cannot silently rebase over another definition
+edit. Losing CAS rolls back the reference, leaves no committed version and
+does not refresh caches. Reconcile uncertain COMMIT from exact committed
+pointer/reference evidence before returning success. Re-registration is
+idempotent and never allocates an edit version.
+
+Reuse the existing catalog/native-metadata cache, Scribe writer resolution,
+Oracle pins and Forge cleanup. SQL control projections and cache entries are
+derived views; refresh schema/layout/version together after proven commit.
+Normal ingest adds no catalog/reference SQL call. Historical conflict/recovery
+reads obtain the original version/reference through existing authority
+acquisition; do not add a preliminary accepted-ID read to fresh admission.
 
 ## Shared managed envelope
 
@@ -182,9 +257,9 @@ own durable time-partition contract; expanding that contract is included here.
 | Initial layout | System ledger recommendation | Shared creation default or explicit layout |
 | Tenant partition configuration | Supported, under the shared bounds | Same bounds |
 | Tenant Bloom configuration | Complete set configurable, including empty | Same bounds; no mandatory floor |
-| Current layout source | Persisted resolved tenant/table metadata plus revision | Same |
+| Current layout source | Committed native metadata selected by `table_version` | Same |
 | Startup behavior | Validate canonical schema and respect authorized stored layout | Respect registered schema/layout |
-| Read/write/compaction behavior | Resolve the accepted layout revision | Same |
+| Read/write/compaction behavior | Resolve the accepted or selected output `table_version` through retained native metadata | Same |
 | Alteration | Explicit authorized operation and concurrency precondition | Same mechanism; authorization reflects table ownership |
 
 System layout administration requires explicit tenant-administrative authority;
@@ -198,7 +273,7 @@ never replaces its canonical schema, sensitivity, managed fields, or time axis.
 
 The system ledger supplies defaults, not a layout to reimpose on every startup.
 Authorized tenant layouts must survive restart and deployment. Invalidate or
-refresh cached layouts on committed revision changes. An override for one
+refresh the coherent schema/layout/version descriptor on committed version changes. An override for one
 tenant/table cannot change another tenant's physical table or defaults.
 
 | Field handling | Creation | Explicit alteration |
@@ -207,12 +282,13 @@ tenant/table cannot change another tenant's physical table or defaults.
 | Supplied `partition_by` | Validate the complete list | Atomically replace with the validated complete list |
 | Omitted `bloom_columns` | Use this table's declared default set | Preserve its current resolved Bloom set |
 | Supplied `bloom_columns` | Use the complete validated requested set | Replace the complete set |
-| Empty `bloom_columns: []` | No Bloom columns | Disable Blooms for future files; existing files remain readable |
+| Empty `bloom_columns: []` | No Bloom columns at version 1 | Commit the next version with no Blooms for future files; existing/accepted files retain their own version |
+| `table_version` | Start at 1; client cannot allocate it | Increment once per effective definition edit, including Bloom-only edits; data commits do not increment it |
 
 The tenant controls the complete Bloom-column set, not the shared attribution
 schema or global false-positive/encoding policy. No shared correlation column
 is automatically reinserted after validation. A Bloom-only alteration cannot silently
-change partitions through omission. The resolved result and revision must be
+change partitions through omission. The resolved result and `table_version` must be
 visible in table description and survive startup. Existing files need no
 rewrite merely to add a Bloom policy for new files; missing historical filters
 fall back to ordinary reads. Partition evolution follows its own spec rules.
@@ -234,11 +310,11 @@ agreement does not authorize unrelated sort/default changes.
 | Automatic string-to-integer or other unsafe conversion | Refuse an implicit in-place conversion. |
 | Wyrd system or managed fields | Tenant layout configuration cannot rename/drop/replace them. |
 | Column used by current layout | Reject an incompatible drop/type change; no dangling partition/sort/Bloom reference. |
-| Concurrent administrators | Require the expected current revision; atomically reject a stale edit rather than overwriting a committed change. |
+| Concurrent administrators | Require `expected_table_version`; atomically reject a stale edit rather than overwriting a committed definition. |
 | Authorization | Recording/querying data grants no implicit table-administration authority. |
 
-For example, two administrators read revision 12. The first commits revision
-13. The second's revision-12 mutation is refused; it must reread and reconsider
+For example, two administrators read `table_version: "12"`. The first commits
+version 13. The second's `expected_table_version: "12"` edit is refused; it must reread and reconsider
 its change. The exact public contract and supported operations follow below.
 
 
@@ -317,16 +393,17 @@ columns. No historical data rewrite is implied by an allowed schema edit.
 Reuse the existing registration, catalog and schema/layout validation owners.
 Creation remains `POST /v1/bifrost/tables`; it never implicitly alters a table.
 Alteration uses `PATCH /v1/bifrost/tables/{namespace}/{name}` in the authenticated
-tenant. Query and ingest grants cannot authorize it. Describe and successful
-alteration return the existing resolved table description plus a positive
-integer `revision`; creation starts at revision 1. This configuration revision
-is distinct from Iceberg snapshots, partition-spec IDs and sort-order IDs.
+tenant. Query and ingest grants cannot authorize it. Describe, registration
+and successful alteration return the resolved schema/layout, immutable table
+identity and `table_version`, encoded as the canonical decimal JSON string
+defined above. Creation returns `"1"`. There is no parallel configuration
+counter and no old-name alias.
 
 The PATCH body has these fields; unknown fields and explicit nulls are refused:
 
 | Field | Contract |
 | --- | --- |
-| `expected_revision` | Required positive integer matching the current table configuration |
+| `expected_table_version` | Required canonical decimal string representing the current positive signed 64-bit table version |
 | `physical_layout` | Optional partial object containing `partition_by`, `sort_keys`, and/or `bloom_columns`; omitted lists are preserved and supplied lists replace the complete list |
 | `add_columns` | Optional array using the existing field-declaration shape, limited to nullable top-level custom columns |
 | `rename_columns` | Optional array of objects with string `from` and `to` names, limited to top-level custom columns |
@@ -334,14 +411,36 @@ The PATCH body has these fields; unknown fields and explicit nulls are refused:
 The time-column identity is immutable after creation. At least one effective
 change is required. Validate the full post-edit schema and layout, including
 name/field dependencies, before committing. Apply the whole request atomically
-against `expected_revision`; one successful edit increments `revision` once.
-Concurrent updates with a stale revision receive HTTP 409 and change nothing.
+against `expected_table_version`; one successful edit increments `table_version` once.
+Concurrent updates with a stale version receive a typed conflict (HTTP 409) and change nothing,
+including concurrent Bloom-only edits. Exhaustion also receives a typed 409
+without mutation. Malformed version representation is a 400, not a stale edit.
 Malformed or unsupported edits receive HTTP 400; missing administration grants
 receive HTTP 403. Use the existing typed error catalog and tenant-safe lookup
 behavior. A successful PATCH returns HTTP 200 with the resolved description
-and committed revision. Failed updates never refresh caches or publish a new
-configuration. Accepted batches keep their original schema/layout identity;
-new admission observes the committed configuration under the shared owner.
+and committed `table_version`. Failed updates never refresh caches or publish
+a new configuration. New native batches must send the current version; stale
+new batches receive a typed table-version conflict, no durable residue and
+instructions to refresh describe before constructing a new batch. Accepted
+retries resolve the fence's original version instead. Gate binds canonical
+built-in input to a versioned server projection. Rust/Python/TypeScript writers
+retain/send the shared-client binding and never rebind already queued batches.
+Keep structural/type/nullability/reserved-column/Variant/value validation;
+version claims cannot prove payload conformance or accepted-ID equality.
+
+For example, the PATCH body to clear Blooms at version 12 is:
+
+```json
+{
+  "expected_table_version": "12",
+  "physical_layout": {"bloom_columns": []}
+}
+```
+
+Its resolved response reports `"table_version": "13"`. `13n` is the matching
+TypeScript SDK value. Old-version accepted batches still publish their
+original declared Blooms; unchanged schema/spec/order IDs do not erase that
+definition distinction.
 
 Example proposed layout:
 
@@ -554,7 +653,7 @@ row filtering.
 
 ```text
 validate
-  -> resolve schema/layout revision
+  -> resolve the immutable table_version definition
   -> partition and preserve attribution
   -> durable acceptance
   -> publish
@@ -563,9 +662,10 @@ validate
   -> retain/expire under existing policy
 ```
 
-The durable partition identity contains the complete typed partition tuple and
-its layout/spec revision, including null values. Scribe routing, WAL, seals,
-manifests, publication, Oracle/peer reads, and Forge must agree on it. Preserve
+The durable binding contains `table_version` and the complete typed partition
+tuple, including its native spec ID and null values. Scribe routing, WAL
+slices/commits, seals, assembly keys, staged records, batch fences, promotion
+records, Oracle pins/peer reads and Forge must carry the same version. Preserve
 time bounds independently and consistently. Supporting multiple fields is a
 coordinated engine change, not just removal of catalog validation.
 
@@ -575,15 +675,65 @@ evolution guarantees:
 
 - Preserve field IDs on renames and compatible evolution; never reuse a
   retired ID for a different meaning.
-- Assign new partition-spec and sort-order revisions when changed.
-- Bind every accepted batch to its schema/layout revision. A retry preserves
-  that binding across alteration, restart, and publication.
+- Retain native partition-spec/sort-order IDs when changed, as physical
+  descriptors within the versioned definition.
+- Bind every accepted batch to its complete table version and original
+  ingestion instant/origin. A retry preserves that binding across alteration,
+  cold caches, restart, publication and WAL retirement, still proving exact
+  source schema/order/count/payload. Changed partition geometry under a new
+  version cannot make an identical accepted retry conflict.
 - Plan old and new files using their own retained specifications. Declaring a
   new sort order does not claim old files have been resorted.
 - Historical rewriting is explicit maintenance, not an assumed consequence
   of metadata evolution. No old partition disappears from reads.
 - Maintain snapshot/query pins and safe retention. Snapshot retention is not
   row-data TTL; this proposal adds no new automatic row-retention default.
+
+The existing pre-ACK PostgreSQL batch fence remains the acceptance authority.
+Use one multi-row INSERT per tenant per drained group, one batched read for
+conflicted identities when needed, and batched uncertain-COMMIT resolution.
+Preserve original per-batch Committed/AlreadyCommitted/conflict results, group
+order, tenant RLS, contradiction rollback and poisoning. Keep the existing
+transaction count and WAL-sync-before-fence-before-ACK ordering. No successful
+normal-ingest SQL call is added by versioning and replacing the fence is out
+of scope. No throughput has been measured yet. Benchmarks follow the
+specification's rule: capacity and tracing benchmarks run only when no other
+worktree is running, and a regression beyond 5% against the matched baseline
+fails the change.
+
+Resolve a warm accepted-ID mirror hit before current-definition preparation.
+Cold preparation/WAL attempts are provisional until the fence selects its
+original version and canonical WAL coordinates. Compare an honest retry under
+that definition; never restore its complete noncanonical provisional attempt
+as new rows. Preserve per-attempt integrity checks and unfenced-complete-WAL
+recovery. A failed current-contract/stale-version check may resolve an accepted
+ID on the exceptional failure path; an unknown ID keeps the original refusal.
+Unavailable or contradictory authority fails closed, without speculative
+suppression, extra abort markers or a second acceptance ledger.
+
+The current version/reference/native metadata is always retained, even after
+data-only commits move the current metadata pointer. Older definitions remain
+rooted while any WAL, staged record, retry fence, promotion/file-lineage, active
+query pin or accepted-retry retention needs them. A fence surviving WAL
+retirement still roots its definition. Integrate these roots into Forge
+expiry/orphan protection, including native metadata-log rollover; do not
+enable native auto-deletion that bypasses protection. Root discovery must
+survive restart and be established before destructive cleanup. Derive roots
+from existing durable owners rather than adding per-batch SQL registration.
+Prune only proven unreferenced noncurrent definitions after retry retention
+expires; absent/unavailable root evidence is not proof. No new TTL is invented;
+without a proven horizon, retain. Definition metadata retention does not pin
+all data snapshots it mentions or change their separate visibility/retention.
+Settled promotion and rewrite lineage remains a root while its retained files
+need that definition; a later query must not find their version unresolvable.
+Keep this evidence in the existing file/publication/maintenance owners, not a
+new history service.
+
+This is an in-baseline format replacement, not a release-upgrade contract.
+Do not introduce a release migration, backfill, alias, automatic reset or dual
+authority. Legacy on-disk evidence is accepted only when it maps unambiguously
+to exact retained version/definition evidence; otherwise refuse recovery or
+use of that evidence. Never guess from current schema/spec/order/Blooms.
 
 The supported schema edits and alteration contract above define this change;
 future type promotions or deletions require a separate explicit extension.
@@ -742,7 +892,7 @@ installations may recreate state directly under the new contract. Do not add
 backfill jobs, collision maps, legacy credential conversion, upgrade scripts,
 or dual readers. This document performs no destructive reset.
 
-Stable field IDs, accepted-batch revision binding, mixed-spec reads, and safe
+Stable field IDs, accepted-batch table-version binding, mixed-spec reads, and safe
 retention still apply to future operations after the new baseline is created.
 Adding a partition dimension later can create a new spec for future writes;
 old files remain queryable under their old specs. Rewriting that in-baseline
@@ -760,7 +910,7 @@ correctness. This is distinct from migrating a pre-change installation.
 | Group-end readers | Filter workload, group, and subject/Verifier tuples without merging different binding occurrences. |
 | System/table-scoped read authority | Construct grants for the resolved `bifrost` tables; remove hardcoded old-catalog fallback. |
 | Direct, queued, and hosted execution | Preserve the existing frozen principal/delegation authority plus workload context; do not rebuild grants from bare principal IDs. |
-| Accepted work and table evolution | Retain accepted schema/layout binding, retry identity, and evidence scope across restart and alteration. |
+| Accepted work and table evolution | Retain the accepted table-version binding, retry identity, and evidence scope across restart and alteration. |
 
 The current engine already freezes accepted principal/delegation authority.
 This change extends/preserves its workload context; it does not justify adding
@@ -812,7 +962,7 @@ Required optimization work and boundaries:
 | Group/window reads | Preserve existing combined-source batching; reduce round trips and projections where equivalent, without merging distinct binding occurrences or statistical windows. |
 | Default indexes | Review all system tables against proven/intended access paths. Validate each query-driven default against observed selectivity/cost during implementation; a shared column alone is not justification for indexing it. |
 | Measurement | Separate cut/source discovery, planning/admission, file/row-group/page scanning, decoding, and engine orchestration; record files/bytes scanned, pruning, duplicate query count, and end-to-end latency. |
-| Correctness | Compare authorized evidence and outcomes across inline/storage/dynamic/trace/window/group paths, live/hot/published sources, retries, and accepted layout revisions. |
+| Correctness | Compare authorized evidence and outcomes across inline/storage/dynamic/trace/window/group paths, live/hot/published sources, retries, and accepted table versions. |
 
 Current per-query published/live read consistency is not whole-execution
 snapshot consistency. Any new read deduplication/snapshot contract must be
@@ -909,11 +1059,13 @@ Inspected owners: `src/core/src/ingestion/mod.rs::get_write_partition_key`,
 conservative defaults from configurable capabilities; Wyrd does not copy its
 directory format or hashing algorithm.
 
-## Decision closure
+## Approval and decision closure
 
-The maintainer agreed the table-editing contracts and visible-trace behavior
-recorded in revision 12. No material decision remains open in this supplement.
-The maintainer approved the complete revision for task planning. Existing partition, sort, Bloom and writer defaults are unchanged.
+The maintainer approved revision 13's single-version, exact integer/wire,
+atomic publication, stale-writer/retry, rooted-retention and legacy-refusal
+contracts above. No material choice remains unresolved.
+Revision 12's safe-edit subset, visible-trace behavior and partition/sort/Bloom/
+writer default values are unchanged.
 
 Performance validation remains representative before/after measurement with
 correctness evidence, not an invented numerical lookup SLO. Partial arrival
@@ -934,3 +1086,4 @@ within the fresh baseline; it is separate from an upgrade migration.
 | 10 | draft | Records actual terminal-inconclusive trace-not-landed behavior versus the separate queue retry mechanism, a pending bounded-retry recommendation, and agreed measurement-based performance validation. Layout defaults are unchanged. |
 | 11 | draft | Records agreed hourly/daily defaults, safe editing/revision-conflict principles, and bounded queued retries for absent traces with terminal inconclusive exhaustion. Partial-trace/read-view/direct-call details and exact alteration matrices remain open. |
 | 12 | approved | Closes the supported layout/schema-edit matrices, existing DDL permission and atomic revisioned PATCH contract. Defines visible-trace evidence, per-attempt reuse, direct inconclusive behavior and late-arrival limits; preserves per-attempt queue timeouts. Defaults are unchanged. |
+| 13 | approved | Unifies definition identity as table_version with JSON decimal strings and TypeScript bigint, atomic Iceberg property/reference/pointer publication, original-version retries, current/older metadata roots and refusal of unmappable legacy evidence. Replaces the PATCH precondition spelling, batches existing pre-ACK fences without added normal-ingest SQL and leaves throughput unmeasured. |

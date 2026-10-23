@@ -1289,7 +1289,12 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     let a_token = server
         .exchange_api_key(a.api_key().ok_or("A carries no API key")?)
         .await?;
-    let b_client = client_for(&server, b.api_key().ok_or("B carries no API key")?)?;
+    // A delegating actor runs at its own fixture root.
+    let b_client = client_for(&server, b.api_key().ok_or("B carries no API key")?)?.for_workload(
+        b.card_ref()
+            .and_then(|card| card.uid.clone())
+            .ok_or("B has no fixture root")?,
+    );
 
     let delegated = b_client
         .on_behalf_of(

@@ -1321,22 +1321,11 @@ mod pg_tests {
         let actor = server
             .bootstrap_service("mcp-traced-actor", &["editor", "mcp_judge_invoker"])
             .await?;
-        let key = |principal: &Bootstrap| {
-            principal
-                .api_key()
-                .cloned()
-                .ok_or("a service bootstraps with a machine key")
-        };
         // The subject is A's family runtime account at A's root; the actor is
-        // an unrestricted account acting rootless.
-        let root = agent
-            .card_ref()
-            .and_then(|card| card.uid.clone())
-            .ok_or("a family runtime account names its registered root")?;
-        let subject_jwt = server
-            .exchange_api_key_for_workload(&key(&agent)?, &root)
-            .await?;
-        let actor_jwt = server.exchange_api_key(&key(&actor)?).await?;
+        // an unrestricted account at its own fixture root, which delegation
+        // requires.
+        let subject_jwt = server.exchange_rooted(&agent).await?;
+        let actor_jwt = server.exchange_rooted(&actor).await?;
         let delegated = server
             .delegate(&subject_jwt, &actor_jwt, TokenAudience::Wyrd)
             .await?;

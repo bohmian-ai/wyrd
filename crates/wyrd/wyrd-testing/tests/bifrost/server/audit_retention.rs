@@ -17,7 +17,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag, TokenAudience};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, BifrostSecurityViolationKind};
-use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_testing::WyrdTestServer;
 
 use super::query::ServerJourneyError;
 
@@ -196,15 +196,10 @@ async fn subject_actor_decisions_preserve_trusted_identity() -> Result<(), Serve
     let b = server.bootstrap_service("audit-b", &[READER]).await?;
     let c = server.bootstrap_service("audit-c", &[]).await?;
     let a_jwt = a.jwt().ok_or("a user carries a token")?.to_owned();
-    let exchange = async |service: &Bootstrap| -> Result<String, ServerJourneyError> {
-        let key = service.api_key().ok_or("a service carries an API key")?;
-        let root = service
-            .card_ref()
-            .and_then(|card| card.uid.clone())
-            .ok_or("a service carries its fixture root")?;
-        Ok(server.exchange_api_key_for_workload(key, &root).await?)
-    };
-    let (b_jwt, c_jwt) = (exchange(&b).await?, exchange(&c).await?);
+    let (b_jwt, c_jwt) = (
+        server.exchange_rooted(&b).await?,
+        server.exchange_rooted(&c).await?,
+    );
     let card = uuid::Uuid::now_v7();
     let read = async |token: Option<&str>| -> Result<StatusCode, ServerJourneyError> {
         let request = Request::builder()
@@ -312,13 +307,7 @@ async fn issued_key_audit_keeps_delegation() -> Result<(), ServerJourneyError> {
     let b = server.bootstrap_service("issue-b", &["admin"]).await?;
     let target = server.bootstrap_service("issue-target", &[]).await?;
     let a_jwt = a.jwt().ok_or("a user carries a token")?.to_owned();
-    let b_root = b
-        .card_ref()
-        .and_then(|card| card.uid.clone())
-        .ok_or("a service carries its fixture root")?;
-    let b_jwt = server
-        .exchange_api_key_for_workload(b.api_key().ok_or("a service carries an API key")?, &b_root)
-        .await?;
+    let b_jwt = server.exchange_rooted(&b).await?;
     let b_for_a = server.delegate(&a_jwt, &b_jwt, TokenAudience::Wyrd).await?;
 
     let mut issued = Vec::new();

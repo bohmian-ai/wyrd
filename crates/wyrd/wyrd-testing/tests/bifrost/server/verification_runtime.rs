@@ -2727,7 +2727,10 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
         return Err("A bootstraps a user".into());
     };
     let a_token = a_token.clone();
+    // B delegates while running as the verified subject, which its Card
+    // scope must cover.
     let delegated = super::query::client_for(&server, b.api_key().ok_or("B carries an API key")?)?
+        .for_workload(subject.clone())
         .on_behalf_of(
             secrecy::SecretString::from(a_token),
             wyrd_spec::auth::TokenAudience::Wyrd,
@@ -2911,7 +2914,10 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
         .bootstrap_service("history-b", &[QUEUED_RUNNER])
         .await?;
     let a_token = a.jwt().ok_or("A bootstraps a user")?.to_owned();
+    // B delegates while running as the verified subject, which its Card
+    // scope must cover.
     let delegated = super::query::client_for(&server, b.api_key().ok_or("B carries an API key")?)?
+        .for_workload(subject.clone())
         .on_behalf_of(
             secrecy::SecretString::from(a_token),
             wyrd_spec::auth::TokenAudience::Wyrd,
@@ -3176,9 +3182,11 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
     let b = server
         .bootstrap_service("widen-b", &[QUEUED_RUNNER])
         .await?;
+    // B delegates while running as the verified subject, which its Card
+    // scope must cover.
     let b_token = async || -> Result<String, ServerJourneyError> {
         Ok(server
-            .exchange_api_key(b.api_key().ok_or("B carries an API key")?)
+            .exchange_api_key_for_workload(b.api_key().ok_or("B carries an API key")?, &subject)
             .await?)
     };
     let initiating = server

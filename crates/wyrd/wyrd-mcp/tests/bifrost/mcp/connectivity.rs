@@ -248,9 +248,7 @@ mod pg_tests {
         let subject_jwt = server
             .exchange_api_key(subject.api_key().ok_or("service bootstrap carries a key")?)
             .await?;
-        let actor_jwt = server
-            .exchange_api_key(actor.api_key().ok_or("service bootstrap carries a key")?)
-            .await?;
+        let actor_jwt = server.exchange_rooted(&actor).await?;
         let delegated_jwt = server
             .delegate(&subject_jwt, &actor_jwt, TokenAudience::Wyrd)
             .await?;
@@ -289,6 +287,7 @@ mod pg_tests {
                 "gateway.get_provider_deployment",
                 "wyrd.guide",
                 "principals.revoke_credential",
+                "principals.set_workload_restriction",
                 "verification.evidence",
                 "verification.execute",
                 "verification.enqueue",

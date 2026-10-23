@@ -3533,6 +3533,28 @@ impl WyrdTestServer {
         .await
     }
 
+    /// Exchange a bootstrapped machine's API key for a token rooted at its own
+    /// fixture Card, the context a delegating actor must carry.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Auth`] when `machine` is a User or its
+    /// Card carries no uid, and the errors of
+    /// [`Self::exchange_api_key_for_workload`].
+    pub async fn exchange_rooted(
+        &self,
+        machine: &Bootstrap,
+    ) -> Result<String, WyrdTestServerError> {
+        let (Some(key), Some(root)) = (
+            machine.api_key(),
+            machine.card_ref().and_then(|card| card.uid.as_ref()),
+        ) else {
+            return Err(WyrdTestServerError::Auth(
+                "a rooted exchange needs a machine with a registered fixture Card".to_owned(),
+            ));
+        };
+        self.exchange_api_key_for_workload(key, root).await
+    }
+
     /// Exchange `subject_jwt` and `actor_jwt` through `/auth/token` for a
     /// token letting the actor act on the subject's behalf at `audience`.
     ///

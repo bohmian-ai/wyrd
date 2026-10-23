@@ -779,7 +779,7 @@ impl WyrdState {
         match &self.root_ref().uid {
             Some(uid)
                 if client.workload_uid() != Some(uid)
-                    || client.auth().deployment_environment() != environment =>
+                    || client.deployment_environment() != environment =>
             {
                 client.for_service(uid.clone(), environment.map(str::to_owned))
             }

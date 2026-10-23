@@ -524,6 +524,13 @@ impl WyrdClient {
         self.auth.workload_uid()
     }
 
+    /// The deployment environment this client's requests declare, or `None`
+    /// when none is configured: the one [`Self::for_service`] selected.
+    #[must_use]
+    pub fn deployment_environment(&self) -> Option<&str> {
+        self.auth.deployment_environment()
+    }
+
     /// Return the shared [`AuthMiddleware`] handle.
     ///
     /// Use this to obtain the current bearer for a transport the façade does

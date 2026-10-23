@@ -427,7 +427,10 @@ impl<'a> VerificationControl<'a> {
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on
-    /// the Verifier, [`WyrdError::VerificationTargetNotFound`] for an
+    /// the Verifier or when a Card-scoped caller's signed scope does not
+    /// carry the subject, [`WyrdError::WorkloadContextRequired`] when a
+    /// family-restricted caller selected no root,
+    /// [`WyrdError::VerificationTargetNotFound`] for an
     /// unknown, inactive, or non-Verifier target,
     /// [`WyrdError::VerificationInputUnsupported`] for a Window Verifier,
     /// [`WyrdError::VerificationInputInvalid`] for evidence that does not
@@ -469,6 +472,12 @@ impl<'a> VerificationControl<'a> {
     /// profile is emitted under beside the result; a request refused before
     /// the engine ran is `refused`, or `unavailable` when this process hosts
     /// no Verifier blocks.
+    ///
+    /// # Errors
+    /// The returned result carries every refusal [`execute`](Self::execute)
+    /// documents: subject admission and staging capacity before the target
+    /// loads, then target, environment, engine, deadline, and staging
+    /// failures, each paired with its outcome label.
     async fn run_direct(
         &self,
         caller: &Caller,
@@ -487,7 +496,13 @@ impl<'a> VerificationControl<'a> {
             request.verifier_card_uid, request.card_uid
         );
         let admitted = telemetry.time(Phase::Admit, || {
-            self.authorize_run(caller, &request.verifier_card_uid, None, EXECUTE, &resource)?;
+            self.authorize_run(
+                caller,
+                &request.verifier_card_uid,
+                &request.card_uid,
+                EXECUTE,
+                &resource,
+            )?;
             // The inputs and result rows, reserved before any work is done.
             self.state
                 .bifrost
@@ -683,7 +698,7 @@ impl<'a> VerificationControl<'a> {
         self.authorize_run(
             caller,
             &request.verifier_card_uid,
-            Some(&request.card_uid),
+            &request.card_uid,
             ENQUEUE,
             &resource,
         )?;
@@ -921,19 +936,24 @@ impl<'a> VerificationControl<'a> {
     /// Evaluate `verifier:run` on `verifier` for `operation` and stage the
     /// single allow or deny decision without waiting for its commit.
     ///
-    /// When `subject` is given, a Card-bound caller must also carry that UID
-    /// in its signed Card scope; this is the same in-memory rule the gateway
-    /// applies to attribution, so no registry read is needed. A caller bound
-    /// to no Card is decided by RBAC alone.
+    /// Direct and queued work both admit through here, before anything is
+    /// reserved or staged. A Card-scoped caller must carry the verified
+    /// `subject` in its signed Card scope, and a family-restricted caller
+    /// must have selected a root; this is the same in-memory rule the
+    /// gateway applies to attribution, so no registry read is needed. A
+    /// caller that may attribute to any registered Card is decided by RBAC
+    /// alone.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] when RBAC refuses the
-    /// Verifier or the signed scope does not carry `subject`.
+    /// Verifier or the signed scope does not carry `subject`, and
+    /// [`WyrdError::WorkloadContextRequired`] when a family-restricted
+    /// caller selected no root.
     fn authorize_run(
         &self,
         caller: &Caller,
         verifier: &CardUid,
-        subject: Option<&CardUid>,
+        subject: &CardUid,
         operation: &str,
         resource: &str,
     ) -> Result<(), WyrdError> {
@@ -945,13 +965,11 @@ impl<'a> VerificationControl<'a> {
             .check(&caller.principal, &required)
             .into_result()
             .map_err(permission_deny_reason_to_wyrd)
-            .and_then(|()| match (subject, caller.principal.card_attribution()) {
-                (Some(_), CardAttribution::RootRequired(_)) => {
-                    Err(WyrdError::workload_context_required(
-                        "the caller is restricted to one workload family and selected no root",
-                    ))
-                }
-                (Some(subject), CardAttribution::Scoped(scope)) if !scope.contains(subject) => {
+            .and_then(|()| match caller.principal.card_attribution() {
+                CardAttribution::RootRequired(_) => Err(WyrdError::workload_context_required(
+                    "the caller is restricted to one workload family and selected no root",
+                )),
+                CardAttribution::Scoped(scope) if !scope.contains(subject) => {
                     Err(WyrdError::PermissionDeniedRbac {
                         message: "the caller's Card scope does not cover the verified subject"
                             .to_owned(),

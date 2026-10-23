@@ -1182,6 +1182,74 @@ mod pg_tests {
         Ok(())
     }
 
+    /// `verification.execute` admits the subject through the caller's signed
+    /// Card limit before it judges anything: the subject's runtime account
+    /// at its root judges it, the same account without a root is refused as
+    /// needing workload context, and an unrelated Service rooted at its own
+    /// Card is refused as out of scope, while that Service without a root,
+    /// which may attribute to any registered Card, still judges it.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport, or
+    /// tool-call failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the administrator's Cards handle cannot connect or a
+    /// verdict or refusal code differs from the expectation.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn direct_execution_enforces_card_access() -> Result<(), McpJourneyError> {
+        let server = Box::pin(WyrdTestServer::start_bound()).await?;
+        let admin = server
+            .bootstrap_service("mcp-access-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
+        let fixture = register_fixture(&cards).await?;
+        let owner = server
+            .credential_registered_service(&fixture.service_ref, &["editor"])
+            .await?;
+        let foreign = server
+            .bootstrap_service("mcp-access-foreign", &["editor"])
+            .await?;
+
+        for (agent, code) in [
+            (
+                connect(&server, &owner).await?,
+                "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED",
+            ),
+            (
+                connect_rooted(&server, &foreign).await?,
+                "WYRD_PERMISSION_403_DENIED_RBAC",
+            ),
+        ] {
+            let refused = refusal(
+                agent
+                    .call_tool(call(EXECUTE, fixture.assert_request(PASSING_ANSWER))?)
+                    .await,
+            )?;
+            assert!(refused.contains(code), "{code}: {refused}");
+            agent.cancel().await?;
+        }
+        for agent in [
+            connect_rooted(&server, &owner).await?,
+            connect(&server, &foreign).await?,
+        ] {
+            let judged = structured(
+                agent
+                    .call_tool(call(EXECUTE, fixture.assert_request(PASSING_ANSWER))?)
+                    .await?,
+            )?;
+            assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+            agent.cancel().await?;
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// Trace id of the caller span the continuity journey sends.
     const CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
 

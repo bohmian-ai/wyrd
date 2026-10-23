@@ -128,6 +128,18 @@ impl Fixture {
         })
     }
 
+    /// The exact reference of the Service every request judges.
+    ///
+    /// # Panics
+    /// Panics when the reference does not decode, which a registered UID
+    /// never causes.
+    fn subject_ref(&self) -> CardRef {
+        serde_json::from_value(json!({
+            "kind": "Service", "name": "vr-service", "version": "1.0.0", "uid": self.service
+        }))
+        .expect("subject ref decodes")
+    }
+
     /// Count the tenant's queued executions.
     ///
     /// # Panics
@@ -683,12 +695,8 @@ async fn enqueue_admits_only_signed_scope_subjects() {
         .await
         .expect("role seeds");
 
-    let subject_ref: CardRef = serde_json::from_value(json!({
-        "kind": "Service", "name": "vr-service", "version": "1.0.0", "uid": fixture.service
-    }))
-    .expect("subject ref decodes");
     let owner = server
-        .credential_registered_service(&subject_ref, &["vq_exact_verifier"])
+        .credential_registered_service(&fixture.subject_ref(), &["vq_exact_verifier"])
         .await
         .expect("subject Service is credentialed");
     let owner_jwt = machine_jwt(&server, &owner).await;
@@ -973,7 +981,8 @@ async fn status_reads_audit_cards_read_decisions() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Another tenant's administrator cannot read this tenant's binding or
+/// Another tenant's rootless administrator, which Card admission lets
+/// attribute to any Card it can find, cannot read this tenant's binding or
 /// execution, nor execute its Verifier: each is indistinguishable from an
 /// absent one.
 ///
@@ -998,7 +1007,10 @@ async fn verification_state_is_tenant_isolated() {
         .bootstrap_service_in_tenant(other, "vr-other-admin", &["admin"])
         .await
         .expect("foreign admin bootstraps");
-    let foreign_jwt = machine_jwt(&server, &foreign).await;
+    let foreign_jwt = server
+        .exchange_api_key(foreign.api_key().expect("foreign admin has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
     let reads = [
         (
             format!("/v1/verification/bindings/{}", fixture.ready_binding),
@@ -1072,8 +1084,8 @@ async fn direct_execution_judges_inline_without_enqueueing() {
 /// Verifier, which judges only scheduled windows, are refused with stable
 /// codes. A caller without `verifier:run`, holding only an unrelated `operators:invoke`, or
 /// granted only an unrelated Verifier UID is refused with one audited denial,
-/// while a Card-bound principal granted exactly that Verifier UID is allowed
-/// whatever its observation scope; nothing is ever enqueued.
+/// while the subject's runtime account granted exactly that Verifier UID is
+/// allowed; nothing is ever enqueued.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
@@ -1170,9 +1182,9 @@ async fn direct_execution_refusals_are_stable() {
         .await
         .expect("role seeds");
     let machine = server
-        .bootstrap_service("vx-foreign-service", &["vx_exact_verifier"])
+        .credential_registered_service(&fixture.subject_ref(), &["vx_exact_verifier"])
         .await
-        .expect("card-bound service bootstraps");
+        .expect("subject Service is credentialed");
     let machine_token = machine_jwt(&server, &machine).await;
     let (status, judged) = execute(&server, &machine_token, allowed).await;
     assert_eq!(status, StatusCode::OK, "{judged}");
@@ -1182,6 +1194,77 @@ async fn direct_execution_refusals_are_stable() {
         vec![run_decision("allowed")]
     );
     assert_eq!(fixture.queued_before_sentinel(&server, &jwt).await, 0);
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Direct execution admits the verified subject through the caller's signed
+/// Card limit before any input is staged or the engine runs, exactly as
+/// enqueue does: the subject's runtime account rooted at the subject judges
+/// it, while the same account without a root is refused as needing workload
+/// context, and an unrelated Service rooted at its own Card is refused as out
+/// of scope, each with one audited denial. Rootless callers that may attribute
+/// to any registered Card, an editor user and an unrestricted Service, still
+/// judge it.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, code, verdict, input, queue, or audit
+/// expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_execution_enforces_card_access() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let body = fixture.request(&fixture.assertion, json!(1)).to_string();
+    let owner = server
+        .credential_registered_service(&fixture.subject_ref(), &["editor"])
+        .await
+        .expect("subject Service is credentialed");
+    let rootless_owner = server
+        .exchange_api_key(owner.api_key().expect("owner has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
+    let foreign = server
+        .bootstrap_service("vx-scope-foreign", &["editor"])
+        .await
+        .expect("unrelated Card-bound Service bootstraps");
+    let unrestricted = server
+        .exchange_api_key(foreign.api_key().expect("foreign Service has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
+    let (_, editor) = user(&server, "vx-scope-editor", &["editor"]).await;
+
+    let refusals = [
+        (&rootless_owner, "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED"),
+        (
+            &machine_jwt(&server, &foreign).await,
+            "WYRD_PERMISSION_403_DENIED_RBAC",
+        ),
+    ];
+    for (jwt, code) in refusals {
+        let (status, problem) = execute(&server, jwt, body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+        assert_eq!(problem["code"], code, "{problem}");
+    }
+    let (staged, _) = input_rows(&server, ExecutionId::new_v7()).await;
+    assert_eq!(staged, 0, "a refused execution stages no inputs");
+
+    for jwt in [machine_jwt(&server, &owner).await, unrestricted, editor] {
+        let (status, judged) = execute(&server, &jwt, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{judged}");
+        assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+    }
+    assert_eq!(
+        decisions(&server, "verification.execute", owner.id().as_uuid()).await,
+        vec![run_decision("allowed"), run_decision("denied")]
+    );
+    assert_eq!(
+        decisions(&server, "verification.execute", foreign.id().as_uuid()).await,
+        vec![run_decision("allowed"), run_decision("denied")],
+        "the rooted refusal and the rootless judgment"
+    );
+    assert_eq!(fixture.queued().await, 0, "direct execution never enqueues");
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -1613,8 +1696,8 @@ async fn verdict_declarations_validate_before_persistence() {
 }
 
 /// A direct execution returns its code check's custom data to the home
-/// tenant, through the execution read too, while another tenant can neither
-/// execute the Verifier nor read the execution.
+/// tenant, through the execution read too, while another tenant's rootless
+/// administrator can neither execute the Verifier nor read the execution.
 ///
 /// # Panics
 /// Panics when data is lost at home or any foreign read succeeds.
@@ -1646,7 +1729,10 @@ async fn custom_verdict_data_is_tenant_isolated() {
         .bootstrap_service_in_tenant(other, "vr-other-admin", &["admin"])
         .await
         .expect("foreign admin bootstraps");
-    let foreign_jwt = machine_jwt(&server, &foreign).await;
+    let foreign_jwt = server
+        .exchange_api_key(foreign.api_key().expect("foreign admin has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
     let (status, problem) = execute(&server, &foreign_jwt, body.to_string()).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
     assert!(!problem.to_string().contains("score"), "{problem}");

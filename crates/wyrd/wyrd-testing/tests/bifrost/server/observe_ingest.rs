@@ -16,7 +16,6 @@ use wyrd_client::observe::Run;
 use wyrd_client::state::WyrdState;
 use wyrd_client::verify::Submission;
 use wyrd_client::{Bifrost, QueueConfig, WyrdClient};
-use wyrd_runtime::builtin_roles::DEFAULT_CARD_ROLE;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::WyrdTestServer;
 
@@ -88,7 +87,7 @@ impl Observed {
             &server,
             &api_key(
                 server
-                    .credential_registered_service(&receipt.root, &[DEFAULT_CARD_ROLE])
+                    .credential_registered_service(&receipt.root, &["workload"])
                     .await
                     .expect("the Service is credentialed"),
             ),

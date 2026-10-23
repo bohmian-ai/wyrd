@@ -91,7 +91,8 @@ use wyrd_sql::queries::auth::{
     family_account_id, grant_role_to_service_account, grant_role_to_user, insert_api_key,
     insert_service_account, insert_user, provision_system_principal,
     revoke_role_from_service_account, revoke_role_from_user, role_by_name,
-    tenant_admin_principal_id, trusted_issuer_by_url, workload_binding_by_subject,
+    TrustedIssuerWrite, insert_trusted_issuer, tenant_admin_principal_id, trusted_issuer_by_url,
+    workload_binding_by_subject,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -3204,6 +3205,38 @@ impl WyrdTestServer {
             .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
         Ok(row.and_then(|row| row.client_secret_enc))
+    }
+
+    /// Trust `issuer_url` as a public workload issuer in the fixture tenant.
+    ///
+    /// Writes through the production trusted-issuer insert without OIDC
+    /// discovery, so a journey can administer workload bindings against an
+    /// issuer that need not be reachable. Its JWKS URI is `<issuer>/jwks`, its
+    /// audience `wyrd-api`, and it maps `sub` as the subject.
+    ///
+    /// # Errors
+    /// Returns an error when the issuer already exists or the write fails.
+    pub async fn seed_workload_issuer(&self, issuer_url: &str) -> Result<(), WyrdTestServerError> {
+        let mut conn = self.tenant_conn().await?;
+        insert_trusted_issuer(
+            &mut conn,
+            &TrustedIssuerWrite {
+                issuer_url: issuer_url.to_owned(),
+                jwks_uri: format!("{issuer_url}/jwks"),
+                expected_audience: "wyrd-api".to_owned(),
+                client_id: "wyrd-client".to_owned(),
+                client_auth: "Public".to_owned(),
+                claim_mapping: serde_json::json!({ "subject": "sub" }),
+                group_role_map: serde_json::json!({}),
+                default_roles: serde_json::json!([]),
+                principal_kind: "Workload".to_owned(),
+                jwks_ttl_secs: 3600,
+                client_secret_enc: None,
+            },
+        )
+        .await
+        .map_err(sql)?;
+        conn.commit().await.map_err(sql)
     }
 
     /// Report whether a workload binding is visible under a tenant's RLS scope.

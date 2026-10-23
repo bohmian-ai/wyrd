@@ -263,3 +263,225 @@ async fn principal_revoke_cli_journey_refuses_an_unprivileged_caller() {
 
     stop_served(server, shutdown, serve_handle).await;
 }
+
+/// An operator manages stable Service accounts and their workload context
+/// entirely through the CLI, against a real server.
+///
+/// Family association decides which workloads an account may speak for, so it
+/// needs tenant administration rather than `service_accounts:write`, and one
+/// family has at most one live account. The journey drives every surface that
+/// carries the restriction — create, set, list, and workload binding — and
+/// proves each refusal is the server's stable error rather than a local guess.
+///
+/// # Panics
+/// Panics when the server, a bootstrap, or the issuer seed fails, or a command
+/// succeeds or fails, or prints, contrary to the contract.
+#[tokio::test]
+async fn stable_account_context_cli_journey() {
+    const ISSUER: &str = "https://cli-family.issuer.test";
+    let (server, base_url, shutdown, serve_handle) = start_served("stable account context").await;
+    let admin = server
+        .bootstrap_service("cli-family-admin", &["admin"])
+        .await
+        .expect("admin bootstraps");
+    let admin_token = machine_token(&server, &admin).await;
+    server
+        .seed_role(
+            "credential_admin",
+            &["service_accounts:write"
+                .parse::<wyrd_runtime::Permission>()
+                .expect("permission parses")],
+        )
+        .await
+        .expect("role seeds");
+    let credentials = server
+        .bootstrap_service("cli-family-credentials", &["credential_admin"])
+        .await
+        .expect("credential admin bootstraps");
+    let credentials_token = machine_token(&server, &credentials).await;
+    let user = server
+        .bootstrap_user("cli-family-user", &["viewer"])
+        .await
+        .expect("user bootstraps");
+    let run = |arguments: &[&str], token: &str| {
+        let mut arguments: Vec<String> = arguments.iter().map(|&arg| arg.to_owned()).collect();
+        arguments.extend(["--server".to_owned(), base_url.clone()]);
+        run_cli_async(arguments, token.to_owned())
+    };
+    let succeeded = |output: &Output| {
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "command failed: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+    let refused = |output: &Output, code: &str| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "command must fail with {code}");
+        assert!(stderr.contains(code), "the CLI reports {code}: {stderr}");
+    };
+    let principal_id = |stdout: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("principal_id: "))
+            .expect("create-principal prints the principal id")
+            .to_owned()
+    };
+    let create = ["principal", "credential", "create-principal"];
+    let family = ["--workload-kind", "service", "--workload-name", "checkout"];
+    let set = ["principal", "credential", "set-restriction", "--principal"];
+
+    // Create without a family is unrestricted; with one, the account is that
+    // family's runtime account. A credential administrator cannot do the latter.
+    let free = principal_id(&succeeded(
+        &run(
+            &[&create[..], &["--name", "cli-free", "--role", "viewer"]].concat(),
+            &admin_token,
+        )
+        .await,
+    ));
+    let checkout = principal_id(&succeeded(
+        &run(
+            &[&create[..], &["--name", "cli-checkout"], &family[..]].concat(),
+            &admin_token,
+        )
+        .await,
+    ));
+    refused(
+        &run(
+            &[&create[..], &["--name", "cli-denied"], &family[..]].concat(),
+            &credentials_token,
+        )
+        .await,
+        "WYRD_PERMISSION_403_DENIED_RBAC",
+    );
+
+    // The listing shows the family beside its account and nothing beside the
+    // unrestricted one.
+    let listed = succeeded(&run(&["principal", "list", "--kind", "service"], &admin_token).await);
+    let line = |id: &str| {
+        listed
+            .lines()
+            .find(|line| line.starts_with(id))
+            .unwrap_or_else(|| panic!("{id} is listed: {listed}"))
+            .to_owned()
+    };
+    assert!(
+        line(&checkout).ends_with("cli-checkout  Service/checkout"),
+        "{listed}"
+    );
+    assert!(line(&free).ends_with("cli-free"), "{listed}");
+
+    // One family, one live account: a second claim is a conflict.
+    refused(
+        &run(
+            &[&set[..], &[free.as_str()], &family[..]].concat(),
+            &admin_token,
+        )
+        .await,
+        "WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT",
+    );
+    // Releasing the holder frees the family; setting it is idempotent.
+    assert_eq!(
+        succeeded(&run(&[&set[..], &[checkout.as_str()]].concat(), &admin_token).await),
+        format!("{checkout}: unrestricted\n")
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            succeeded(
+                &run(
+                    &[&set[..], &[free.as_str()], &family[..]].concat(),
+                    &admin_token
+                )
+                .await
+            ),
+            format!("{free}: restricted to Service/checkout\n")
+        );
+    }
+
+    // Refusals: a User account, a credential administrator, a half-named
+    // family, and a malformed id.
+    refused(
+        &run(
+            &[&set[..], &[user.id().to_string().as_str()], &family[..]].concat(),
+            &admin_token,
+        )
+        .await,
+        "WYRD_SPEC_400_VALIDATION",
+    );
+    refused(
+        &run(
+            &[&set[..], &[checkout.as_str()], &family[..]].concat(),
+            &credentials_token,
+        )
+        .await,
+        "WYRD_PERMISSION_403_DENIED_RBAC",
+    );
+    refused(
+        &run(
+            &[&set[..], &[checkout.as_str(), "--workload-kind", "service"]].concat(),
+            &admin_token,
+        )
+        .await,
+        "--workload-name",
+    );
+    assert!(
+        !run(&[&set[..], &["not-a-uuid"]].concat(), &admin_token)
+            .await
+            .status
+            .success(),
+        "a malformed principal id is refused"
+    );
+
+    // A workload binding names the account and a default workload root.
+    server
+        .seed_workload_issuer(ISSUER)
+        .await
+        .expect("trusted issuer seeds");
+    let workload_uid = uuid::Uuid::now_v7().to_string();
+    let binding = ["auth", "workload-binding"];
+    let added = succeeded(
+        &run(
+            &[
+                &binding[..],
+                &["add", "--issuer", ISSUER, "--subject", "checkout-runner"],
+                &[
+                    "--principal",
+                    free.as_str(),
+                    "--workload-uid",
+                    workload_uid.as_str(),
+                ],
+            ]
+            .concat(),
+            &admin_token,
+        )
+        .await,
+    );
+    assert!(added.contains(&format!("principal_id: {free}")), "{added}");
+    assert!(
+        added.contains(&format!("workload_uid: {workload_uid}")),
+        "{added}"
+    );
+    let bindings = succeeded(&run(&[&binding[..], &["list"]].concat(), &admin_token).await);
+    assert!(
+        bindings.contains(&format!("{ISSUER} / checkout-runner \u{2192} {free}")),
+        "{bindings}"
+    );
+    refused(
+        &run(
+            &[
+                &binding[..],
+                &["add", "--issuer", ISSUER, "--subject", "nobody"],
+                &["--principal", user.id().to_string().as_str()],
+            ]
+            .concat(),
+            &admin_token,
+        )
+        .await,
+        "WYRD_AUTH_404_ADMIN_NOT_FOUND",
+    );
+
+    stop_served(server, shutdown, serve_handle).await;
+}

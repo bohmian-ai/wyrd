@@ -1359,8 +1359,8 @@ fn assert_scored(result: &VerificationResult) {
 
 /// Valid custom Verdict data survives every read: the direct result, a
 /// queued execution's wait and status, and the retained outcome published to
-/// Bifrost; the plain formats execute without handwritten schemas and carry
-/// no data.
+/// Bifrost, including hosted-code data exactly at the byte and depth bounds;
+/// the plain formats execute without handwritten schemas and carry no data.
 ///
 /// # Panics
 /// Panics when a read loses, changes, or invents data.
@@ -1384,6 +1384,49 @@ async fn custom_verdict_data_survives_readback() {
     let status = execution.status().await.expect("the status reads");
     assert_eq!(status.result.as_ref(), Some(&waited));
 
+    assert_eq!(
+        retained(&desk, &waited).await,
+        waited.outcome,
+        "the retained outcome keeps its data"
+    );
+
+    for (marker, data) in exact_data() {
+        let text = format!("{marker} refunds");
+        let direct = desk
+            .state
+            .run()
+            .observe()
+            .verify("scored-review", json!({ "text": text }))
+            .await
+            .expect("the review runs");
+        let kept = |result: &VerificationResult| {
+            requirement(result, "well-formed")
+                .data
+                .clone()
+                .map(Value::Object)
+        };
+        assert_eq!(kept(&direct), Some(data.clone()), "{marker}: direct");
+        let execution = desk.submit_scored(&text).await;
+        let waited = execution.wait(WAIT).await.expect("the review settles");
+        assert_eq!(kept(&waited), Some(data.clone()), "{marker}: wait");
+        let status = execution.status().await.expect("the status reads");
+        assert_eq!(status.result.as_ref(), Some(&waited), "{marker}: status");
+        assert_eq!(
+            retained(&desk, &waited).await,
+            waited.outcome,
+            "{marker}: retained"
+        );
+    }
+    desk.deployment.shutdown().await;
+}
+
+/// The retained outcome of `result`'s execution, read back from Bifrost
+/// after publishing pending rows.
+///
+/// # Panics
+/// Panics when rows do not publish or the execution has not exactly one
+/// decodable retained outcome.
+async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> VerificationOutcome {
     desk.deployment
         .server()
         .flush_bifrost()
@@ -1396,25 +1439,50 @@ async fn custom_verdict_data_survives_readback() {
             .sql_as(
                 "SELECT to_json(outcome) AS outcome \
                    FROM vala.verification.results WHERE execution_id = $1",
-                &[QueryParam::String(waited.execution_id.to_string())],
+                &[QueryParam::String(result.execution_id.to_string())],
             )
             .await
             .expect("the result reads back");
     let [retained] = retained.as_slice() else {
         panic!("one retained result: {retained:?}");
     };
-    let outcome: VerificationOutcome =
-        serde_json::from_str(&retained.outcome).expect("the outcome decodes");
-    assert_eq!(
-        outcome, waited.outcome,
-        "the retained outcome keeps its data"
-    );
-    desk.deployment.shutdown().await;
+    serde_json::from_str(&retained.outcome).expect("the outcome decodes")
+}
+
+/// The `well-formed` code check's data at its inclusive bounds, by answer
+/// marker: exactly 65,536 compact bytes of UTF-8 and escapes, the same of a
+/// wide array, and 16 nested containers.
+fn exact_data() -> [(&'static str, Value); 3] {
+    let mut tree = json!("s3cr3t");
+    for _ in 1..16 {
+        tree = json!([tree]);
+    }
+    let data = [
+        (
+            "EXACT-BYTES",
+            json!({"score": 0.5, "category": format!("{}\n\"\u{1}{}", "é".repeat(32_000), "x".repeat(1_499))}),
+        ),
+        (
+            "EXACT-WIDE",
+            json!({"score": 0.5, "category": "format", "tree": vec![0; 32_747]}),
+        ),
+        (
+            "DEEP-16",
+            json!({"score": 0.5, "category": "format", "tree": tree}),
+        ),
+    ];
+    for (marker, value) in &data[..2] {
+        assert_eq!(value.to_string().len(), 65_536, "{marker} is at the bound");
+    }
+    data
 }
 
 /// Custom data the declared schema refuses or that exceeds the 65,536-byte
 /// bound makes its Agent or code requirement inconclusive, with no data and
-/// a reason naming the location or limit rather than the payload.
+/// a reason naming the location or limit rather than the payload. Hosted
+/// code also proves missing, null, and undeclared data, an unknown Verdict
+/// field, one byte over the bound (UTF-8 and escapes, and a wide array), and
+/// 17 containers, while valid sibling data survives.
 ///
 /// # Panics
 /// Panics when invalid data is kept, judged, or echoed.
@@ -1457,6 +1525,55 @@ async fn invalid_custom_verdict_data_is_inconclusive() {
             "{marker}: valid data elsewhere is kept"
         );
         assert_eq!(result.outcome.verdict, VerificationVerdict::Inconclusive);
+    }
+
+    for marker in [
+        "MISSING-DATA",
+        "NULL-DATA",
+        "EXTRA-DATA",
+        "EXTRA-FIELD",
+        "OVER-BYTES",
+        "OVER-WIDE",
+        "DEEP-17",
+    ] {
+        let result = desk
+            .state
+            .run()
+            .observe()
+            .verify(
+                "scored-review",
+                json!({ "text": format!("{marker} refunds") }),
+            )
+            .await
+            .expect("the review runs");
+        let refused = requirement(&result, "well-formed");
+        assert_eq!(
+            refused.outcome,
+            RequirementOutcome::Inconclusive,
+            "{marker}: {refused:?}"
+        );
+        assert_eq!(refused.data, None, "{marker}");
+        assert!(
+            !refused.reason.contains("s3cr3t") && !refused.reason.contains("xxxx"),
+            "{marker}: {}",
+            refused.reason
+        );
+        assert_eq!(
+            requirement(&result, "helpful")
+                .data
+                .clone()
+                .map(Value::Object),
+            Some(SCORED.clone()),
+            "{marker}: the Agent's valid data is kept"
+        );
+        assert_eq!(
+            requirement(&result, "tally-counted")
+                .data
+                .clone()
+                .map(Value::Object),
+            Some(json!({"words": 2})),
+            "{marker}: valid data elsewhere is kept"
+        );
     }
     desk.deployment.shutdown().await;
 }

@@ -2,7 +2,12 @@
 # format, plain or with a `data` schema, on whole-Verifier and step
 # requirements. An answer containing `BAD-DATA` makes both scored checks
 # return data their schema refuses, and `HUGE-DATA` data past the
-# 65,536-byte bound.
+# 65,536-byte bound. The code check also answers its own markers:
+# `EXACT-BYTES`/`OVER-BYTES` (UTF-8 and escapes) and `EXACT-WIDE`/`OVER-WIDE`
+# (a wide array) return exactly 65,536 and 65,537 compact bytes, `DEEP-16`/
+# `DEEP-17` nest that many containers, and `MISSING-DATA`, `NULL-DATA`,
+# `EXTRA-DATA`, and `EXTRA-FIELD` return no data, null data, an undeclared
+# data field, and an unknown Verdict field; refused values carry `s3cr3t`.
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
@@ -91,6 +96,7 @@ spec:
             properties:
               score: {type: number, minimum: 0, maximum: 1}
               category: {type: string}
+              tree: {}
             required: [score, category]
             additionalProperties: false
         source:
@@ -102,9 +108,38 @@ spec:
                     data = {"score": "high", "category": "format"}
                 if "HUGE-DATA" in text:
                     data = {"score": 0.5, "category": "x" * 70000}
-                return {
+                # {"score":0.5,"category":""} is 27 compact bytes; 32,000
+                # two-byte characters, the escaped newline and quote (2 bytes
+                # each), and the escaped U+0001 (6 bytes) leave 1,499 bytes.
+                utf8 = "é" * 32000 + "\n\"\u0001"
+                if "EXACT-BYTES" in text:
+                    data = {"score": 0.5, "category": utf8 + "x" * 1499}
+                if "OVER-BYTES" in text:
+                    data = {"score": 0.5, "category": utf8 + "x" * 1500}
+                # {"score":0.5,"category":"format","tree":[]} is 43 bytes;
+                # 32,747 one-digit items and their commas take 65,493.
+                if "EXACT-WIDE" in text:
+                    data = {"score": 0.5, "category": "format", "tree": [0] * 32747}
+                if "OVER-WIDE" in text:
+                    data = {"score": 0.5, "category": "format", "tree": [0] * 32746 + [10]}
+                for marker, containers in (("DEEP-16", 16), ("DEEP-17", 17)):
+                    if marker in text:
+                        tree = "s3cr3t"
+                        for _ in range(containers - 1):
+                            tree = [tree]
+                        data = {"score": 0.5, "category": "format", "tree": tree}
+                if "EXTRA-DATA" in text:
+                    data = {"score": 0.5, "category": "format", "extra": "s3cr3t"}
+                response = {
                     "outcome": "failed",
                     "reason": "scored the format",
                     "citations": [{"slot": "answer", "locator": {"json_pointer": "/text"}}],
                     "data": data,
                 }
+                if "NULL-DATA" in text:
+                    response["data"] = None
+                if "MISSING-DATA" in text:
+                    response.pop("data")
+                if "EXTRA-FIELD" in text:
+                    response["confidence"] = "s3cr3t"
+                return response

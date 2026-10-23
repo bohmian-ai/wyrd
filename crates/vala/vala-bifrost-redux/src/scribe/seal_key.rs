@@ -202,6 +202,29 @@ impl PartitionPlan {
         self.partitions.len()
     }
 
+    /// Folds this plan's partitions into one request's sorted distinct union.
+    ///
+    /// A native request may carry several record batches; the cap bounds the
+    /// complete tuples of the whole request, so a tuple already in `union`
+    /// counts once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] when the union would exceed
+    /// [`MAX_PHYSICAL_PARTITIONS`] distinct partitions.
+    pub(crate) fn union_into(&self, union: &mut Vec<PhysicalPartition>) -> Result<(), ScribeError> {
+        for (partition, _) in &self.partitions {
+            match union.binary_search(partition) {
+                Ok(_) => {}
+                Err(_) if union.len() == MAX_PHYSICAL_PARTITIONS => {
+                    return Err(ScribeError::InvalidFrame);
+                }
+                Err(position) => union.insert(position, partition.clone()),
+            }
+        }
+        Ok(())
+    }
+
     /// Materializes one planned partition from its retained source.
     ///
     /// The single-partition case aliases the source's Arrow buffers instead of

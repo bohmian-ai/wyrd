@@ -304,15 +304,18 @@ async fn forty_mib_row_stages_publishes_and_reads_back_at_48_mib_wire() {
     .await;
 }
 
-/// A composite-partitioned table admits a request spanning 32 distinct
-/// partition tuples within one hour and refuses a 33rd tuple whole, before
-/// any row is durable; the same batch id corrected to 32 tuples then lands.
+/// A composite-partitioned table bounds the distinct partition tuples of a
+/// whole request, not of each record batch: a 33rd tuple refuses the request
+/// whole before any row is durable, whether it arrives in one batch or in a
+/// second batch of the same stream, and the same batch id corrected to a
+/// 32-tuple union then lands even though its batches plan more than 32
+/// slices.
 ///
 /// # Panics
 ///
-/// Panics when the 32-tuple request is refused, the 33-tuple request is
-/// admitted or leaves a readable row or published object, or the corrected
-/// retry does not stage, publish, and read back.
+/// Panics when a 33-tuple request is admitted or leaves a readable row or
+/// published object, or the corrected retry is refused or does not stage,
+/// publish, and read back.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn composite_partition_fanout_is_atomic() {
@@ -358,9 +361,9 @@ async fn composite_partition_fanout_is_atomic() {
     .await
     .expect("the composite table registers");
     // Two rows per tuple, all within one hour, so only the extra dimension
-    // fans out and repeated tuples count once.
-    let batch = |tuples: i64| {
-        let rows = 0..tuples * 2;
+    // fans out and repeated tuples count once. Customers start at `first`.
+    let batch = |first: i64, tuples: i64| {
+        let rows = first * 2..(first + tuples) * 2;
         RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -378,16 +381,38 @@ async fn composite_partition_fanout_is_atomic() {
         )
         .expect("fanout batch")
     };
+    let stream = |batches: &[RecordBatch]| {
+        let mut ipc = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, schema.as_ref())
+            .expect("IPC writer");
+        for batch in batches {
+            writer.write(batch).expect("IPC batch");
+        }
+        writer.finish().expect("IPC terminal");
+        ipc
+    };
+    let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&client)
+        .await
+        .expect("public ingest transport connects");
     let count = format!("SELECT count(*) AS value FROM {fqn}");
 
     let retried = uuid::Uuid::now_v7();
-    let refusal = append_batch(&client, &fqn, retried, &batch(33))
+    let refusal = append_batch(&client, &fqn, retried, &batch(0, 33))
         .await
         .expect_err("a 33rd distinct tuple is refused");
     assert_eq!(
         (refusal.code(), refusal.status()),
         ("WYRD_VALA_400_OTLP_REQUEST_MALFORMED", 400),
         "the fanout refusal is a stable invalid request: {refusal:?}"
+    );
+    let refusal = ingest
+        .insert(&fqn, retried, stream(&[batch(0, 17), batch(17, 16)]))
+        .await
+        .expect_err("a 33rd distinct tuple in a later batch is refused");
+    assert_eq!(
+        (refusal.code(), refusal.status()),
+        ("WYRD_VALA_400_OTLP_REQUEST_MALFORMED", 400),
+        "the request-wide fanout refusal is the same invalid request: {refusal:?}"
     );
     let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
     scribe
@@ -410,9 +435,10 @@ async fn composite_partition_fanout_is_atomic() {
         "the refusal publishes nothing"
     );
 
-    append_batch(&client, &fqn, retried, &batch(32))
+    ingest
+        .insert(&fqn, retried, stream(&[batch(0, 17), batch(15, 17)]))
         .await
-        .expect("the corrected 32-tuple retry is acknowledged");
+        .expect("the corrected retry, 34 slices over 32 tuples, is acknowledged");
     assert_stages_and_publishes(
         &server,
         &client,
@@ -422,5 +448,5 @@ async fn composite_partition_fanout_is_atomic() {
         &[32],
     )
     .await;
-    assert_eq!(read_sql(&client, &count).await, [64]);
+    assert_eq!(read_sql(&client, &count).await, [68]);
 }

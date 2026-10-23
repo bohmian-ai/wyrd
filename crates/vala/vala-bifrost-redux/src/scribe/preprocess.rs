@@ -199,6 +199,8 @@ pub(crate) struct NativeSliceProducer {
     table: TableRef,
     /// Registered time axis used to bucket every produced slice.
     partition_scheme: PartitionScheme,
+    /// Sorted distinct partitions of every source decoded so far.
+    partitions: Vec<PhysicalPartition>,
 }
 
 /// One decoded native source and its fixed time-partition cursor.
@@ -237,6 +239,7 @@ impl NativeSliceProducer {
             tenant,
             table,
             partition_scheme,
+            partitions: Vec::new(),
         }
     }
 
@@ -337,6 +340,7 @@ impl NativeSliceProducer {
             }
             let rows = stamp_native_source(&rows, &self.source)?;
             let partitions = plan_partitions(&rows, &self.partition_scheme)?;
+            partitions.union_into(&mut self.partitions)?;
             self.current = Some(NativeCurrentSource {
                 rows,
                 partitions,

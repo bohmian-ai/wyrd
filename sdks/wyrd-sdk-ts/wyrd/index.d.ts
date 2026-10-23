@@ -253,15 +253,18 @@ export declare class NativeBifrostQueryStream {
   /**
    * Drains the whole stream into one bounded `{columns, rows, terminal}` JSON text.
    *
-   * An omitted ceiling takes the bounded-result default, 1000 rows or 4 MiB.
+   * An omitted ceiling takes the bounded-result default, 1000 rows or 4 MiB;
+   * a supplied one must lie in the same admitted range the MCP tool enforces
+   * ([`admit_ceilings`]).
    * The projection is [`JsonResultBuilder`], the same owner the server's MCP
    * `bifrost.query` tool builds through, so both surfaces return the same
    * value for the same result. The stream is released when this returns.
    *
    * # Errors
    *
-   * Returns a step carrying the stable Wyrd error for a failed, incomplete,
-   * or malformed stream and for a result past `max_rows` or `max_bytes`, and
+   * Returns a step carrying the stable Wyrd error for a ceiling outside its
+   * admitted range, for a failed, incomplete, or malformed stream, and for a
+   * result past `max_rows` or `max_bytes`, and
    * a napi error when the stream is already closed or [`Self::close`] stops
    * the drain.
    */

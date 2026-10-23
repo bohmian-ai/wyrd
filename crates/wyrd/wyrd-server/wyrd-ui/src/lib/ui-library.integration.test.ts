@@ -182,6 +182,23 @@ test('TASK-003: Identical authorized reads', async ({ server, seeded }) => {
         ok: false,
         problem: { code: 'WYRD_VALA_413_QUERY_RESULT_TOO_LARGE' }
       });
+    // A ceiling outside its admitted range is refused before any row, each surface in its own envelope.
+    for (const limit of [{ max_rows: 0 }, { max_rows: 10_001 }, { max_bytes: 0 }, { max_bytes: 16_777_217 }]) {
+      const request: WireRequest = { ...reads[2], ...limit } as WireRequest;
+      const reason = `${Object.keys(limit)[0]} is outside the allowed range`;
+      const [direct] = await sdk.run([request]);
+      expect(direct, JSON.stringify(direct)).toEqual({ ok: false, problem: expect.objectContaining({ code: 'WYRD_SPEC_400_VALIDATION', detail: expect.stringContaining(reason) }) });
+      const [tool] = await mcp.executor.run([request]);
+      expect(tool, JSON.stringify(tool)).toEqual({ ok: false, problem: expect.objectContaining({ detail: expect.stringContaining(reason) }) });
+    }
+    // The exact maxima answer, as the omitted defaults did above.
+    expect(await both({ ...reads[2], max_rows: 10_000, max_bytes: 16_777_216 } as WireRequest)).toMatchObject({ ok: true });
+    // A refused SDK collection releases its stream; later queries are unaffected.
+    const bifrost = await Bifrost.connect({ client });
+    const refused = await bifrost.stream(LATENCY_CHART.sql, [RANGE.from, RANGE.to]);
+    await expect(refused.collect({ maxRows: 10_001 })).rejects.toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+    await expect(refused.collect()).rejects.toThrow('query stream is closed');
+    expect((await (await bifrost.stream(LATENCY_CHART.sql, [RANGE.from, RANGE.to])).collect()).terminal).toMatchObject({ row_count: 3 });
     // A cancelled read rejects on both surfaces rather than answering.
     const cancelled = AbortSignal.abort();
     for (const executor of [sdk, mcp.executor])

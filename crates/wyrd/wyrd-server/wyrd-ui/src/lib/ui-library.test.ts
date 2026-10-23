@@ -53,6 +53,7 @@ import {
   Drawer,
   DurationBar,
   EmptyState,
+  fmtCardRef,
   Sparkline,
   StatusPill,
   VerdictPill,
@@ -267,7 +268,7 @@ test('TASK-003: Validated portable rendering', async () => {
     result: { state: 'populated', data: { card: registered, versions: { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1', 'deprecated')], truncated: true } } } }
   });
   expect(header.getByRole('heading', { level: 2 })).toHaveTextContent('ranker');
-  expect(header.container).toHaveTextContent('ranker@1.4.2');
+  expect(header.container).toHaveTextContent('Model/ranker@1.4.2');
   expect(header.container).toHaveTextContent('✓active');
   expect([...header.container.querySelectorAll('option')].map((option) => option.value)).toEqual(['1.4.2', '1.4.1']);
   expect(header.container).toHaveTextContent('showing the newest 2 versions');
@@ -275,10 +276,20 @@ test('TASK-003: Validated portable rendering', async () => {
   await fireEvent.click(header.getByRole('button', { name: 'Copy uid' }));
   expect(writeText).toHaveBeenCalledWith('card_01HX');
   expect(await header.findByText('Copied')).toBeInTheDocument();
+  // Copy ref writes the canonical reference, so two kinds sharing name@version stay distinct.
+  await fireEvent.click(header.getByRole('button', { name: 'Copy ref' }));
+  expect(writeText).toHaveBeenLastCalledWith('Model/ranker@1.4.2');
   writeText.mockRejectedValueOnce(new Error('denied'));
   await fireEvent.click(header.getByRole('button', { name: 'Copy ref' }));
   expect(await header.findByText('Copy failed')).toBeInTheDocument();
   header.unmount();
+  const dataHeader = render(CardHeader, { input: { cardRef: { ...card, kind: 'Data' } }, result: { state: 'populated', data: { card: { ...registered, kind: 'Data' } as never, versions: { state: 'populated', data: { items: [summary('1.4.2')], truncated: false } } } } });
+  await fireEvent.click(dataHeader.getByRole('button', { name: 'Copy ref' }));
+  expect(writeText).toHaveBeenLastCalledWith('Data/ranker@1.4.2');
+  dataHeader.unmount();
+  expect(fmtCardRef({ ...card, uid: 'card_01HX' })).toBe('Model/ranker@1.4.2#card_01HX');
+  expect(fmtCardRef({ ...card, uid: null })).toBe('Model/ranker@1.4.2');
+  expect(fmtCardRef(card)).toBe('Model/ranker@1.4.2');
   const noVersions = render(CardHeader, { input: { cardRef: card }, result: { state: 'populated', data: { card: registered, versions: { state: 'denied', problem: denied } } } });
   expect(noVersions.container).toHaveTextContent('versions unavailable: Forbidden (WYRD_AUTH_403_FORBIDDEN)');
   expect(noVersions.getByRole('heading', { level: 2 })).toHaveTextContent('ranker');
@@ -296,9 +307,12 @@ test('TASK-003: Validated portable rendering', async () => {
   const loading = render(EmptyState, { state: 'loading', title: 'Running' });
   expect(loading.getByRole('status')).toHaveAttribute('aria-busy', 'true');
   loading.unmount();
-  const chip = render(CardRefChip, { cardRef: card, href: '/cards/x' });
-  expect(chip.getByRole('link')).toHaveTextContent('Model ranker@1.4.2');
-  chip.unmount();
+  for (const kind of ['Model', 'Data'] as const) {
+    const chip = render(CardRefChip, { cardRef: { ...card, kind }, href: '/cards/x' });
+    expect(chip.getByRole('link')).toHaveTextContent(`${kind}/ranker@1.4.2`);
+    expect(chip.getByRole('link')).toHaveAttribute('title', `${kind}/ranker@1.4.2`);
+    chip.unmount();
+  }
   for (const [verdict, text] of [['passed', '✓passed'], ['failed', '✕failed'], ['inconclusive', '!inconclusive']] as const) {
     const pill = render(VerdictPill, { verdict });
     expect(pill.container).toHaveTextContent(text);
@@ -474,7 +488,9 @@ test('TASK-003: Dependent loads and safe actions', async () => {
   const tabs = [{ id: 'overview', label: 'Overview' }, { id: 'runs', label: 'Runs' }];
   const listed = { state: 'populated', data: { card: registered, versions: { state: 'populated', data: { items: [summary('1.4.2'), summary('1.4.1')], truncated: false } } } } as const;
   const headerAction = vi.fn();
-  const controls = render(CardHeader, { input: { cardRef: card, tabs }, result: listed, onaction: headerAction, actions: { 'card.version': { state: 'pending' }, 'card.tab': { state: 'pending' } } });
+  // The host's reference carries this version's uid; a different version never inherits it.
+  const pinned = { ...card, uid: 'card_01HX' };
+  const controls = render(CardHeader, { input: { cardRef: pinned, tabs }, result: listed, onaction: headerAction, actions: { 'card.version': { state: 'pending' }, 'card.tab': { state: 'pending' } } });
   const select = controls.getByRole('combobox', { name: 'Version' }) as HTMLSelectElement;
   expect(select).toBeDisabled();
   expect(controls.getByRole('button', { name: 'Runs' })).toBeDisabled();
@@ -484,13 +500,14 @@ test('TASK-003: Dependent loads and safe actions', async () => {
     [{ state: 'unavailable', reason: 'No navigation here' }, 'No navigation here'],
     [{ state: 'success', message: 'Opened 1.4.1' }, 'Opened 1.4.1']
   ] as const) {
-    await controls.rerender({ input: { cardRef: card, tabs }, result: listed, onaction: headerAction, actions: { 'card.version': state, 'card.tab': state } });
+    await controls.rerender({ input: { cardRef: pinned, tabs }, result: listed, onaction: headerAction, actions: { 'card.version': state, 'card.tab': state } });
     expect(controls.getAllByText(text)).toHaveLength(2);
     expect(select.disabled).toBe(state.state === 'unavailable');
   }
   // A refused or pending change leaves the selection on the version the host passed.
   await fireEvent.change(select, { target: { value: '1.4.1' } });
   expect(headerAction).toHaveBeenCalledExactlyOnceWith({ name: 'card.version', input: { card_ref: { ...card, version: '1.4.1' } } });
+  expect(headerAction.mock.calls[0][0].input.card_ref).not.toHaveProperty('uid');
   expect(select.value).toBe('1.4.2');
   await fireEvent.click(controls.getByRole('button', { name: 'Runs' }));
   expect(headerAction).toHaveBeenLastCalledWith({ name: 'card.tab', input: { tab: 'runs' } });

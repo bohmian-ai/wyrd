@@ -36,7 +36,9 @@ use wyrd_client::bifrost::Correlation;
 use wyrd_client::bifrost::TableConfig;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
-use wyrd_queue::json_result::{DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, JsonResultBuilder};
+use wyrd_queue::json_result::{
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, JsonResultBuilder, admit_ceilings,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AlterTableRequest, BifrostQueryRequest, QueryParam};
@@ -1425,15 +1427,18 @@ impl NativeBifrostQueryStream {
 
     /// Drains the whole stream into one bounded `{columns, rows, terminal}` JSON text.
     ///
-    /// An omitted ceiling takes the bounded-result default, 1000 rows or 4 MiB.
+    /// An omitted ceiling takes the bounded-result default, 1000 rows or 4 MiB;
+    /// a supplied one must lie in the same admitted range the MCP tool enforces
+    /// ([`admit_ceilings`]).
     /// The projection is [`JsonResultBuilder`], the same owner the server's MCP
     /// `bifrost.query` tool builds through, so both surfaces return the same
     /// value for the same result. The stream is released when this returns.
     ///
     /// # Errors
     ///
-    /// Returns a step carrying the stable Wyrd error for a failed, incomplete,
-    /// or malformed stream and for a result past `max_rows` or `max_bytes`, and
+    /// Returns a step carrying the stable Wyrd error for a ceiling outside its
+    /// admitted range, for a failed, incomplete, or malformed stream, and for a
+    /// result past `max_rows` or `max_bytes`, and
     /// a napi error when the stream is already closed or [`Self::close`] stops
     /// the drain.
     #[napi]
@@ -1446,12 +1451,19 @@ impl NativeBifrostQueryStream {
         let mut stream = stream_slot
             .take()
             .ok_or_else(|| napi::Error::from_reason("query stream is closed".to_owned()))?;
-        let mut result = JsonResultBuilder::new(
-            usize::try_from(max_rows.unwrap_or(DEFAULT_MAX_ROWS)).unwrap_or(usize::MAX),
-            max_bytes
-                .map_or(Ok(DEFAULT_MAX_BYTES), usize::try_from)
-                .unwrap_or(usize::MAX),
-        );
+        let max_rows = max_rows.unwrap_or(DEFAULT_MAX_ROWS);
+        let max_bytes = max_bytes
+            .map_or(Ok(DEFAULT_MAX_BYTES), usize::try_from)
+            .unwrap_or(usize::MAX);
+        // The stream is already taken, so a refusal drops and releases it.
+        if let Err(refused) = admit_ceilings(max_rows, max_bytes) {
+            return Ok(NativeQueryStep::failure(&WyrdError::Validation {
+                message: refused.reason.to_owned(),
+                details: refused.details,
+            }));
+        }
+        let mut result =
+            JsonResultBuilder::new(usize::try_from(max_rows).unwrap_or(usize::MAX), max_bytes);
         let mut columns = false;
         loop {
             let next = tokio::select! {

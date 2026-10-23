@@ -61,3 +61,32 @@ mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
 ```
 
 Record RED/GREEN, exact assertion outcomes and limits, and run `git diff --check`. No geometry change is selected, so no new physical-layout proof is needed. No schema regeneration, broad aggregate or full server journey suite is required for this bounded renderer/test remediation. Later task review reassesses the complete original cumulative range and all prior findings.
+
+## Implementation evidence
+
+Commit `a8a9c6a02` on `2b2ed0d9a`. Write set: `packages/ui/src/lib/WyrdView.svelte` (narrow `ordered` now `panels.filter((each) => placements.has(each.id)).sort(...)`) and the existing `TASK-027: Narrow views` scenario in `src/lib/ui-library.test.ts` (plus `rowsHeight` import from the existing layout module). Reuse: the current `placements` Map is the membership authority; `start`/`abortAll`/`settle`, authored reset, wide branch and geometry are unchanged. Filtering is by identity only, so loading, failed and panel-validation-error rows for current IDs are retained.
+
+RED: the extended selector failed before the source change with `TypeError: Cannot read properties of undefined (reading 'y')`. GREEN after the change.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| a/b -> c/d at 500px renders without exception, `(y,x)` order, full width, explicit h, no edit controls | `WyrdView.svelte` `ordered` | Narrow views: order `['d','c']`, `gridColumn '1 / -1'`, height `rowsHeight(3)`, no `Move or resize` button | PASS |
+| Membership reduction drops removed IDs | same | Narrow views: c/d -> d renders `['d']` | PASS |
+| Outgoing read aborted, late result cannot resurrect; current loading and failed states visible | existing `start`/`settle` unchanged | Narrow views: both old signals aborted; `pending[0]` resolved, no `a` panel; d `Running query`, c `Forbidden` | PASS |
+| Invalid -> valid recovery; same-ID input change reloads; layout-only change reorders without reads | unchanged load/content owners | Narrow views: invalid renders no panels, then `['f','e']`; renamed +2 reads; layout-only `['e','f']` with read count unchanged | PASS |
+| Wide replacement and prior closure remain green | wide branch unchanged | TASK-003 Dependent loads and safe actions; Layout editing; Pointer edit cancellation | PASS |
+
+Commands (all PASS):
+
+```sh
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Narrow views$'          # RED before fix, 1 passed after
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Layout editing$'         # 1 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Pointer edit cancellation$' # 1 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Dependent loads and safe actions$' # 1 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check   # 0 errors, 0 warnings (package and app)
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test    # 8 files, 40/40
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build   # done
+git diff --check                                                 # clean
+```
+
+Non-goals excluded: no schema, catalog, SDK, server, host API, dependency, geometry, reset or load-lifecycle change; no TASK-003 files touched. Limits: jsdom with mocked `clientWidth`; no fresh browser sweep.

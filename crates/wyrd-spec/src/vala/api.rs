@@ -25,6 +25,7 @@ pub use crate::vala::audit_detail::{
     ForgeSnapshotExpirePhase, OracleTableProtectionPhase, QueryAuditDigest, QueryExecutionMode,
     ScopeHash, StoragePath, audit_detail_canonical_json,
 };
+use crate::vala::ids::TableVersion;
 
 /// Bifrost table-identifier newtype.
 ///
@@ -104,6 +105,11 @@ pub struct BifrostTableEntry {
 pub struct BifrostTableDescription {
     /// The same lightweight entry returned by the list route.
     pub entry: BifrostTableEntry,
+    /// The table version this schema and layout describe.
+    ///
+    /// A writer sends it with every batch built from this description; a
+    /// batch naming a version other than the table's current one is refused.
+    pub table_version: TableVersion,
     /// The table's own declared columns, in stored order.
     ///
     /// Server-owned correlation and managed columns are not here; they are
@@ -550,6 +556,8 @@ pub struct RegisterTableResponse {
     pub table_uid: String,
     /// Server-authoritative lower-case hex of the 32-byte schema fingerprint.
     pub fingerprint: String,
+    /// The table's current version, `1` for a newly created table.
+    pub table_version: TableVersion,
 }
 
 /// Maximum number of warnings carried by a terminal frame.
@@ -2845,6 +2853,8 @@ mod bifrost_wire_tests {
         };
         let desc = BifrostTableDescription {
             entry: entry.clone(),
+            table_version: crate::vala::ids::TableVersion::new((1 << 53) + 1)
+                .expect("valid version"),
             user_fields: vec![FieldSpec {
                 name: "value".to_string(),
                 data_type: DataTypeSpec::Int64,
@@ -2898,6 +2908,7 @@ mod bifrost_wire_tests {
             outcome: RegisterOutcome::Created,
             table_uid: "ab".repeat(16),
             fingerprint: "01".repeat(32),
+            table_version: crate::vala::ids::TableVersion::INITIAL,
         });
         bifrost_wire_round_trip(&PhysicalLayoutWire {
             time_column: Some("created_at".to_string()),

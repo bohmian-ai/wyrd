@@ -104,6 +104,8 @@ struct Registration {
     outcome: RegisterOutcome,
     /// The stored user-schema fingerprint the registration was compared on.
     fingerprint: SchemaFingerprint,
+    /// The physical table's current version, `1` for a table this call created.
+    table_version: TableVersion,
 }
 
 /// Inputs for one tenant-qualified physical table registration.
@@ -972,6 +974,7 @@ impl BifrostCatalog {
             outcome: registration.outcome,
             table_uid: hex::encode(registration.table_uid.as_bytes()),
             fingerprint: hex::encode(registration.fingerprint.0),
+            table_version: registration.table_version,
         })
     }
 
@@ -1127,23 +1130,29 @@ impl BifrostCatalog {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
             compaction.assert_matches(physical.metadata(), &fqn)?;
+            let table_version = crate::catalog::layout::table_version(&fqn, physical.metadata())
+                .map_err(BifrostCatalogError::Registration)?;
             conn.commit().await?;
             return Ok(Registration {
                 table_uid: TableUid::from_row(&row.table_uid, &row.fqn)?,
                 outcome: RegisterOutcome::AlreadyExists,
                 fingerprint,
+                table_version,
             });
         }
 
         self.ensure_namespace(binding.physical_namespace()).await?;
-        if physical_exists {
+        let table_version = if physical_exists {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
             compaction.assert_matches(physical.metadata(), &fqn)?;
+            crate::catalog::layout::table_version(&fqn, physical.metadata())
+                .map_err(BifrostCatalogError::Registration)?
         } else {
             self.create_physical_table(&binding, &arrow_schema, &layout, compaction)
                 .await?;
-        }
+            TableVersion::INITIAL
+        };
 
         let table_uid = TableUid::new_v7();
         vala_sql::queries::olap_catalog::upsert_table(
@@ -1160,6 +1169,7 @@ impl BifrostCatalog {
             table_uid,
             outcome: RegisterOutcome::Created,
             fingerprint,
+            table_version,
         })
     }
 
@@ -1608,7 +1618,7 @@ impl BifrostCatalog {
         let row = self
             .lookup_table_row(&fqn, tenant)
             .await?
-            .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn))?;
+            .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
         // A canonical built-in is described from its own declaration, not from
         // the Iceberg round trip: the stored schema drops the ledger's
         // sensitivity markers and renames nested list elements, and it is the
@@ -1628,6 +1638,8 @@ impl BifrostCatalog {
         let described = described_fields_from_stored_schema(&arrow_schema)?;
         Ok(BifrostTableDescription {
             entry: entry_from_row(&row)?,
+            table_version: crate::catalog::layout::table_version(&fqn, iceberg_table.metadata())
+                .map_err(BifrostCatalogError::Registration)?,
             user_fields: described.user_fields,
             correlation_fields: described.correlation_fields,
             canonical_physical_fingerprint: builtin

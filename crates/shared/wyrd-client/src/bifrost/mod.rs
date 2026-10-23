@@ -763,7 +763,8 @@ mod sdk {
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "outcome": "Created",
                     "table_uid": uid,
-                    "fingerprint": fingerprint
+                    "fingerprint": fingerprint,
+                    "table_version": "1"
                 })))
                 .mount(&server)
                 .await;

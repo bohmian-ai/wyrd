@@ -1956,6 +1956,7 @@ mod tests {
                 "registered_at": "2026-07-01T00:00:00Z",
                 "updated_at": "2026-07-01T00:00:00Z"
             },
+            "table_version": "1",
             "user_fields": [
                 { "name": "trace_id", "data_type": "Binary", "nullable": false,
                   "metadata": { "PARQUET:field_id": "1" } }

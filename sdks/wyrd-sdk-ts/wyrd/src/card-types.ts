@@ -212,6 +212,12 @@ export interface BifrostTableDescription {
    */
   readonly physical_layout: PhysicalLayoutWire;
   /**
+   * The table version this schema and layout describe.
+   *
+   * A writer sends it with every batch built from this description; a batch naming a version other than the table's current one is refused.
+   */
+  readonly table_version: TableVersion;
+  /**
    * The table's own declared columns, in stored order.
    *
    * Server-owned correlation and managed columns are not here; they are reported separately so a writer can tell what it declares from what the server appends.
@@ -5377,6 +5383,8 @@ export type StepStatus = "succeeded" | "failed" | "skipped";
  * Lifecycle status of a registered Bifrost table.
  */
 export type TableStatus = "Active" | "Deprecated" | "Quarantined";
+
+export type TableVersion = string;
 
 export type TaskId = string;
 

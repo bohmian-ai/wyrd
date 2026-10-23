@@ -175,6 +175,7 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
             registered_at: "2026-07-01T00:00:00Z".parse().expect("fixture timestamp"),
             updated_at: "2026-07-01T00:00:00Z".parse().expect("fixture timestamp"),
         },
+        table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
         user_fields: wyrd_types::arrow_schema_to_fieldspec(&schema)
             .expect("the fixture schema is representable"),
         correlation_fields: vec![

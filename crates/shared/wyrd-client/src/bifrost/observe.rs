@@ -6,7 +6,7 @@
 
 use arrow_schema::SchemaRef;
 
-use crate::bifrost::facade::Bifrost;
+use crate::bifrost::facade::{Bifrost, RecordAdmission};
 use crate::bifrost::table::{Correlation, WriterTable};
 
 /// Record one telemetry observation, fire-and-forget.
@@ -52,16 +52,21 @@ pub fn record(bifrost: &Bifrost, table: &WriterTable, json: Vec<u8>, correlation
 /// * `schema` - The schema the row is checked against at seal.
 /// * `json` - One JSON-encoded row.
 /// * `correlation` - The card and run identities stamped onto the row.
+/// * `_admitted` - The [`Bifrost::admit_record`] the caller took before
+///   starting this future; held until the row is enqueued or dropped, so a
+///   flush or shutdown issued meanwhile waits for it.
 ///
 /// # Cancellation
 ///
-/// Abandoning the future records nothing and caches nothing.
+/// Abandoning the future records nothing, caches nothing, and settles the
+/// admission.
 pub async fn describe_and_record(
     bifrost: &Bifrost,
     fqn: &str,
     schema: SchemaRef,
     json: Vec<u8>,
     correlation: Correlation,
+    _admitted: RecordAdmission,
 ) {
     match bifrost.resolve_writer_table(fqn).await {
         Ok(table) => record(bifrost, &table.with_schema(schema), json, correlation),

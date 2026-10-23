@@ -49,7 +49,7 @@ mod scope;
 mod sink;
 mod table;
 
-pub use facade::{Bifrost, BifrostOptions, QueryResult};
+pub use facade::{Bifrost, BifrostOptions, QueryResult, RecordAdmission};
 /// Binding plumbing: the explicit-option client door and the shared register
 /// outcome spelling the Python and TypeScript bindings project.
 #[cfg(feature = "internal")]
@@ -356,6 +356,31 @@ mod sdk {
         bifrost.shutdown().expect("every table drains");
         let settled = bifrost.metrics();
         assert_eq!((settled.producers, settled.owned_bytes), (0, 0));
+    }
+
+    /// A shutdown waits for a telemetry record admitted before it, so a
+    /// record still describing its destination is enqueued rather than
+    /// refused by a pool already closed beneath it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when shutdown settles while the admission is held, or fails
+    /// once it is released.
+    #[tokio::test]
+    async fn shutdown_waits_for_an_admitted_record() {
+        let bifrost = client_over(Arc::new(MockSink::new()), QueueConfig::default());
+        let admitted = bifrost.admit_record();
+        let shutdown = bifrost.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => panic!("shutdown cannot settle while a record is admitted"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(admitted);
+        shutdown
+            .await
+            .expect("shutdown settles once the record does");
     }
 
     /// A saturated queue reaches the caller of the public client as a stable
@@ -832,6 +857,10 @@ mod sdk {
         );
         let bound = bifrost.table().expect("the bound table stays bound");
         let bound_identity = bound.resolved().cloned().expect("bound table resolved");
+        assert!(
+            bifrost.cached_writer_table("vala.datasets.bound").is_some(),
+            "a registered table is cached for named writes"
+        );
 
         bifrost.use_table(table("vala.datasets.inflight"));
         let register = bifrost.register();

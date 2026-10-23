@@ -69,6 +69,14 @@ pub struct TableConfig {
     compaction_type: Option<CompactionTypeWire>,
     /// Server-assigned once registered or described; `None` while inert.
     resolved: Option<ResolvedTable>,
+    /// The current table version a bind-time describe found for this
+    /// declaration, without claiming the server's identity for its columns.
+    ///
+    /// Local to this process and never serialized: a declaration whose
+    /// columns differ from the registered ones still writes at this version
+    /// and the server refuses its batches, while [`Self::resolved`] stays
+    /// `None` until register or describe answers this exact declaration.
+    bound_version: Option<TableVersion>,
 }
 
 impl TableConfig {
@@ -103,6 +111,7 @@ impl TableConfig {
             compaction_target_file_size_bytes: None,
             compaction_type: None,
             resolved: None,
+            bound_version: None,
         })
     }
 
@@ -226,6 +235,7 @@ impl TableConfig {
                 fingerprint: description.entry.fingerprint.clone(),
                 table_version: description.table_version,
             }),
+            bound_version: None,
         })
     }
 
@@ -345,15 +355,29 @@ impl TableConfig {
         });
     }
 
-    /// The write destination this binding names, once register or describe
-    /// resolved it; an unresolved config has no table version to write at.
+    /// Write at the table version `described` carries, keeping this
+    /// config's declared columns and leaving [`Self::resolved`] untouched.
+    pub(crate) fn bind_version(&mut self, described: &Self) {
+        self.bound_version = described
+            .resolved
+            .as_ref()
+            .map(|resolved| resolved.table_version);
+    }
+
+    /// The write destination this binding names, once register, describe,
+    /// or a bind-time describe gave it a table version; a config with none
+    /// has no version to write at.
     #[must_use]
     pub(crate) fn writer_table(&self) -> Option<WriterTable> {
-        let resolved = self.resolved.as_ref()?;
+        let table_version = self
+            .resolved
+            .as_ref()
+            .map(|resolved| resolved.table_version)
+            .or(self.bound_version)?;
         Some(WriterTable::new(
             &self.fqn(),
             Arc::clone(&self.user_schema),
-            resolved.table_version,
+            table_version,
         ))
     }
 }
@@ -425,6 +449,7 @@ impl TryFrom<TableConfigWire> for TableConfig {
             compaction_target_file_size_bytes: wire.compaction_target_file_size_bytes,
             compaction_type: wire.compaction_type,
             resolved: wire.resolved,
+            bound_version: None,
         })
     }
 }

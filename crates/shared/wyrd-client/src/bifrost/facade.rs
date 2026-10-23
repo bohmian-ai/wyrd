@@ -26,6 +26,7 @@ use arrow::json::writer::JsonArray;
 use arrow::record_batch::RecordBatch;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::watch;
 use wyrd_queue::QueueConfig;
 use wyrd_queue::variant::WyrdJsonEncoderFactory;
 #[cfg(feature = "internal")]
@@ -51,9 +52,8 @@ use crate::bifrost::scope::ClientScope;
 use crate::bifrost::sink::BifrostIngestSink;
 use crate::bifrost::table::{Correlation, TableConfig, WriterTable};
 
-/// The catalog code a query of a tenant's span table reports before its
-/// first span export creates the table.
-const SPANS_NOT_CREATED: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
+/// The catalog code a describe or query reports for a table not yet created.
+const TABLE_NOT_FOUND: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
 
 /// Construction options for [`Bifrost::connect`] and
 /// [`Bifrost::connect_with`].
@@ -99,6 +99,25 @@ pub struct Bifrost {
     /// tables also queue behind each other; per-table gating only if distinct
     /// first uses ever contend on a hot path.
     describe_gate: AsyncMutex<()>,
+    /// Telemetry records still describing their destination; flush and
+    /// shutdown wait for zero so a record admitted before them is not lost.
+    pending_records: Arc<watch::Sender<usize>>,
+}
+
+/// One telemetry record admitted by [`Bifrost::admit_record`] and not yet
+/// enqueued or dropped; [`Bifrost::flush`] and [`Bifrost::shutdown`] wait for
+/// every admission to settle.
+#[derive(Debug)]
+pub struct RecordAdmission {
+    /// The client's pending-record count this admission holds one unit of.
+    pending: Arc<watch::Sender<usize>>,
+}
+
+impl Drop for RecordAdmission {
+    /// Settles this admission and wakes a drain waiting for zero.
+    fn drop(&mut self) {
+        self.pending.send_modify(|pending| *pending -= 1);
+    }
 }
 
 impl Bifrost {
@@ -137,13 +156,17 @@ impl Bifrost {
     ///   from [`WyrdClient::on_behalf_of`].
     /// * `options` - The initial write target and producer tuning.
     ///
+    /// The initial table is bound through [`Self::bind_table`], so a declared
+    /// table costs its one describe here, before any row is queued.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostClientError::Queue`] carrying
     /// `WYRD_CLIENT_400_CONFIG_INVALID` before any IO when the queue tuning
     /// fails [`QueueConfig::validate`], the server's stable error when a
-    /// required exchange is refused or unreachable, and a transport error when
-    /// the ingest channel cannot be dialled.
+    /// required exchange or the declared table's describe is refused or
+    /// unreachable, and a transport error when the ingest channel cannot be
+    /// dialled.
     pub async fn connect_with(
         client: &WyrdClient,
         options: BifrostOptions,
@@ -151,7 +174,11 @@ impl Bifrost {
         let BifrostOptions { table, queue } = options;
         queue.validate().map_err(BifrostClientError::Queue)?;
         let client = client.connected().await?;
-        Self::assemble(&client, table, queue).await
+        let bifrost = Self::assemble(&client, None, queue).await?;
+        if let Some(table) = table {
+            bifrost.bind_table(table).await?;
+        }
+        Ok(bifrost)
     }
 
     /// Build a client over a caller-supplied batch sink.
@@ -184,6 +211,7 @@ impl Bifrost {
             active: Mutex::new(table),
             described: Mutex::new(HashMap::new()),
             describe_gate: AsyncMutex::new(()),
+            pending_records: Arc::new(watch::Sender::new(0)),
         }
     }
 
@@ -240,6 +268,7 @@ impl Bifrost {
             active: Mutex::new(table),
             described: Mutex::new(HashMap::new()),
             describe_gate: AsyncMutex::new(()),
+            pending_records: Arc::new(watch::Sender::new(0)),
         })
     }
 
@@ -294,6 +323,7 @@ impl Bifrost {
             && table.register_request() == request
         {
             table.resolve(&response);
+            self.remember(table);
         }
         Ok(response.outcome)
     }
@@ -302,7 +332,10 @@ impl Bifrost {
     ///
     /// Cheap and synchronous: the producer for the new table is built lazily on
     /// its first row. The previous table's producer stays in the pool, so its
-    /// buffered rows still flush.
+    /// buffered rows still flush. `table` is bound as given: a declared config
+    /// that neither register nor describe resolved names no table version, so
+    /// [`Self::insert`] refuses it until [`Self::register`]; bind it with
+    /// [`Self::bind_table`] to resolve it instead.
     ///
     /// # Arguments
     /// * `table` - The table to bind as the new write target.
@@ -328,8 +361,105 @@ impl Bifrost {
     /// As [`TableConfig::describe_with`].
     pub async fn use_table_by_name(&self, fqn: &str) -> Result<(), BifrostClientError> {
         let table = TableConfig::describe_with(self.query.client(), fqn).await?;
+        self.remember(&table);
         self.use_table(table);
         Ok(())
+    }
+
+    /// Bind `table` as the write target after resolving its table version.
+    ///
+    /// [`Self::resolve_table`] runs first, so the binding happens before any
+    /// row is queued and no queued batch is ever rebound.
+    ///
+    /// # Arguments
+    /// * `table` - The table to bind as the new write target.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_table`]. `table` is still bound, unresolved, so
+    /// [`Self::insert`] then refuses with [`BifrostClientError::NoActiveTable`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the active-table or described-table lock is poisoned.
+    pub async fn bind_table(
+        &self,
+        mut table: TableConfig,
+    ) -> Result<Option<TableConfig>, BifrostClientError> {
+        let resolution = self.resolve_table(&mut table).await;
+        let previous = self.use_table(table);
+        resolution.map(|()| previous)
+    }
+
+    /// Resolve `table`'s table version without binding it.
+    ///
+    /// A config that already names a version needs no IO. A declared one is
+    /// described once and writes at the current version with its declared
+    /// columns, so a stale declaration still binds and the server refuses its
+    /// batches; [`TableConfig::resolved`] stays `None` until register or
+    /// describe answers this exact declaration. A table not yet registered
+    /// stays versionless until [`Self::register`]. The described destination
+    /// is cached for named writes.
+    ///
+    /// # Arguments
+    /// * `table` - The config to resolve in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns the describe's stable authentication, authorization,
+    /// availability, or protocol error, leaving `table` unresolved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the described-table lock is poisoned.
+    pub async fn resolve_table(&self, table: &mut TableConfig) -> Result<(), BifrostClientError> {
+        if table.writer_table().is_none() {
+            match TableConfig::describe_with(self.query.client(), &table.fqn()).await {
+                Ok(described) => {
+                    self.remember(&described);
+                    table.bind_version(&described);
+                }
+                Err(error) if WyrdError::from(&error).code() == TABLE_NOT_FOUND => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if table.resolved().is_some() {
+            self.remember(table);
+        }
+        Ok(())
+    }
+
+    /// Cache `table`'s write destination, if resolved, for later named writes.
+    ///
+    /// Register, describe, and bind all call this, so a telemetry record to a
+    /// table this client already resolved needs no describe of its own. An
+    /// existing entry is kept: the first resolution is authoritative for this
+    /// client's lifetime, as [`Self::writer_table`] documents.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the described-table lock is poisoned.
+    fn remember(&self, table: &TableConfig) {
+        if let Some(destination) = table.writer_table() {
+            self.described
+                .lock()
+                .expect("described table lock poisoned")
+                .entry(Arc::from(table.fqn().as_str()))
+                .or_insert(destination);
+        }
+    }
+
+    /// Count one telemetry record that must describe its destination first.
+    ///
+    /// Taken synchronously before the describe is spawned, so a flush or
+    /// shutdown that follows waits for the record's enqueue instead of
+    /// closing the pool beneath it. Dropping the admission settles it.
+    #[must_use]
+    pub fn admit_record(&self) -> RecordAdmission {
+        self.pending_records.send_modify(|pending| *pending += 1);
+        RecordAdmission {
+            pending: Arc::clone(&self.pending_records),
+        }
     }
 
     /// Describe `fqn` once and return its cached destination for writes.
@@ -714,6 +844,12 @@ impl Bifrost {
     ///
     /// Panics when the blocking drain task cannot be joined.
     async fn drain(&self, kind: Drain) -> Result<(), BifrostClientError> {
+        self.pending_records
+            .subscribe()
+            .wait_for(|pending| *pending == 0)
+            .await
+            .map(drop)
+            .expect("the client owns its pending-record sender");
         let writer = Arc::clone(&self.writer);
         tokio::task::spawn_blocking(move || match kind {
             Drain::Flush => writer.flush(),
@@ -834,7 +970,7 @@ impl Bifrost {
             .await
         {
             Ok(result) => result,
-            Err(error) if WyrdError::from(&error).code() == SPANS_NOT_CREATED => {
+            Err(error) if WyrdError::from(&error).code() == TABLE_NOT_FOUND => {
                 return Ok(Vec::new());
             }
             Err(error) => return Err(error),

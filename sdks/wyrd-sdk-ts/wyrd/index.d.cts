@@ -114,7 +114,8 @@ export declare class NativeBifrost {
    * [`NativeBifrost::dropped`] instead of returned. The first row for a
    * table this client has not described records on a background task
    * once the describe returns its table version; a failed describe is
-   * counted the same way.
+   * counted the same way. That record is admitted before the task starts,
+   * so a following `flush` or `shutdown` waits for it.
    *
    * # Errors
    *

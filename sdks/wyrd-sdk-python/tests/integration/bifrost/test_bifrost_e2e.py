@@ -191,10 +191,12 @@ def test_negative_empty_permissions_denied_rbac_on_write(
             credential=wyrd_server.bootstrap_service([], name="bifrost-write-denied")
         ),
     )
-    denied.insert(Item(id=999, value="denied"))
     with pytest.raises(WyrdError) as raised:
-        denied.flush()
+        denied.insert(Item(id=999, value="denied"))
     assert raised.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+    with pytest.raises(WyrdError) as unbound:
+        denied.insert(Item(id=1000, value="denied"))
+    assert unbound.value.code == "WYRD_VALA_412_NO_ACTIVE_TABLE"
     denied.shutdown()
     wyrd_server.flush_bifrost()
     assert items(bifrost, "vala.datasets.denied") == []

@@ -558,13 +558,15 @@ impl Bifrost {
     ///
     /// The first caller after a successful connection moves the locally bound
     /// write target into the native client under the binding lock, so a
-    /// target bound concurrently with the connection is never lost.
+    /// target bound concurrently with the connection is never lost. A
+    /// declared target is described once first, outside the lock, so its
+    /// writer names the table's current version.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` with the stable configuration, credential, refused
     /// exchange, byte-budget, or ingest-dial error of the shared Rust
-    /// `Bifrost::connect`.
+    /// `Bifrost::connect`, or the declared target's describe error.
     fn handle(&self, py: Python<'_>) -> WyrdPyResult<&NativeBifrost> {
         let options = BifrostOptions {
             table: None,
@@ -579,9 +581,35 @@ impl Bifrost {
                 }
             })
             .map_err(client_error)?;
+        let declared = match &*self.binding() {
+            Binding::Local(Some(table)) if table.resolved().is_none() => {
+                Some(table.as_ref().clone())
+            }
+            _ => None,
+        };
+        // The describe runs with the binding unlocked: it releases the GIL, and
+        // a thread holding the GIL may be waiting on this lock.
+        let resolved = match declared {
+            Some(mut table) => {
+                let resolution = crate::trace::block_on(py, native.resolve_table(&mut table));
+                Some((table, resolution))
+            }
+            None => None,
+        };
         let mut binding = self.binding();
-        if let Binding::Local(Some(table)) = std::mem::replace(&mut *binding, Binding::Native) {
-            native.use_table(*table);
+        let local = match std::mem::replace(&mut *binding, Binding::Native) {
+            Binding::Local(local) => local.map(|table| *table),
+            Binding::Native => None,
+        };
+        match (local, resolved) {
+            (Some(local), Some((table, resolution))) if local.fqn() == table.fqn() => {
+                native.use_table(table);
+                resolution.map_err(client_error)?;
+            }
+            (Some(local), _) => {
+                native.use_table(local);
+            }
+            (None, _) => {}
         }
         Ok(native)
     }
@@ -1390,6 +1418,7 @@ fn record(
                 schema,
                 row,
                 correlation,
+                handle.admit_record(),
             ),
         ),
     }

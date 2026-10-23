@@ -169,7 +169,7 @@ def test_file_construction_reads_nothing(tmp_path: Path) -> None:
 
 def test_artifact_ref_names_a_registered_artifact_file() -> None:
     """``ArtifactRef`` takes the exact Artifact reference and an optional path."""
-    artifact = wyrd.CardRef("Artifact", "decks", "1.0.0", space="support")
+    artifact = wyrd.CardRef("Artifact", "decks", "1.0.0")
     ArtifactRef(artifact)
     ArtifactRef(artifact, "q3.pdf")
 

@@ -10,7 +10,7 @@ use crate::reference::CardRef;
 /// Resolved once at token-issue time and carried as a signed JWT claim, so the
 /// hot ingest path validates a client-supplied `card_ref` against membership
 /// without a registry read. Membership is exact [`CardRef`] equality — a
-/// concrete `(kind, name, version, space)` reference with the same optional
+/// concrete `(kind, name, version)` reference with the same optional
 /// `uid` convention on both sides — never a version range or partial-key match.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -72,7 +72,7 @@ impl CardScope {
 mod tests {
     use super::CardScope;
     use crate::envelope::CardKind;
-    use crate::ids::{CardName, SpaceName};
+    use crate::ids::CardName;
     use crate::reference::CardRef;
     use wyrd_semver::VersionBlock;
 
@@ -81,7 +81,6 @@ mod tests {
             kind,
             name: CardName::new(name).expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }

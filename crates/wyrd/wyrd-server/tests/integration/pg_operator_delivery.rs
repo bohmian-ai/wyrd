@@ -213,7 +213,7 @@ impl Delivery {
     async fn operator(&self, name: &str, spec: Value) -> CardUid {
         let body = json!({ "submissions": [{
             "apiVersion": "wyrd/v1", "kind": "Operator",
-            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "metadata": { "name": name, "version": "1.0.0" },
             "spec": spec, "artifacts": []
         }] });
         let (status, body) = self.call(Method::POST, "/v1/cards", Some(&body)).await;

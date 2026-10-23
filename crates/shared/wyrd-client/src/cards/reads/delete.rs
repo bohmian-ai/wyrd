@@ -26,12 +26,11 @@ pub(crate) async fn delete(
     let path = match &selector {
         CardSelector::Uid {
             kind,
-            space,
             name,
             version,
             uid,
         } => {
-            if space.is_some() || name.is_some() || version.is_some() {
+            if name.is_some() || version.is_some() {
                 get(client, &selector).await?;
             }
             format!(
@@ -43,9 +42,8 @@ pub(crate) async fn delete(
         CardSelector::Named { .. } | CardSelector::Exact(_) => {
             let card_ref = selector_ref(&selector)?;
             format!(
-                "/v1/cards/by-ref?kind={}&space={}&name={}&version={}",
+                "/v1/cards/by-ref?kind={}&name={}&version={}",
                 urlencoding::encode(card_ref.kind.wire_name()),
-                urlencoding::encode(card_ref.space.as_ref().map_or("", |space| space.as_str()),),
                 urlencoding::encode(card_ref.name.as_str()),
                 urlencoding::encode(card_ref.version.as_str()),
             )

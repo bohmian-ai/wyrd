@@ -176,8 +176,8 @@ impl Assistant {
         declare(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
         let assistant = declare(&cards, "cards/verify_in_real_time/assistant.yaml").await;
         let bundle = pull(&cards, &assistant.root).await;
-        let [kind, name, version, space] = coordinates(&assistant.root);
-        let key = cli::issue_key(&kind, &name, &version, &space, None, None, Some(admin))
+        let [kind, name, version] = coordinates(&assistant.root);
+        let key = cli::issue_key(&kind, &name, &version, None, None, Some(admin))
             .await
             .expect("the CLI issues the Service key");
         let state = WyrdState::from_path_with(
@@ -229,12 +229,11 @@ impl Assistant {
     /// # Panics
     /// Panics when the CLI refuses to issue the Service key.
     async fn principal(&self, service: &CardRef) -> String {
-        let [kind, name, version, space] = coordinates(service);
+        let [kind, name, version] = coordinates(service);
         cli::issue_key(
             &kind,
             &name,
             &version,
-            &space,
             None,
             None,
             Some(self.deployment.admin()),
@@ -1502,7 +1501,7 @@ async fn grouped_support_resumes() {
         json!({
             "apiVersion": "wyrd/v1",
             "kind": "Trigger",
-            "metadata": {"name": name, "version": "1.0.0", "space": "default"},
+            "metadata": {"name": name, "version": "1.0.0"},
             "spec": {"kind": "group_end", "after": after},
             "artifacts": [],
         })
@@ -1511,7 +1510,7 @@ async fn grouped_support_resumes() {
         json!({
             "apiVersion": "wyrd/v1",
             "kind": "Service",
-            "metadata": {"name": name, "version": "1.0.0", "space": "default"},
+            "metadata": {"name": name, "version": "1.0.0"},
             "spec": {
                 "service_type": "agent",
                 "components": [{
@@ -1539,7 +1538,6 @@ async fn grouped_support_resumes() {
         cards
             .get(CardSelector::named(
                 kind,
-                "default".parse().expect("space"),
                 "over-a-year".parse().expect("name"),
             ))
             .await
@@ -2221,11 +2219,7 @@ async fn grouped_coding_uses_declared_sources() {
             "{relative}: {refused:?}"
         );
         let absent = cards
-            .resolve_latest(
-                kind,
-                "default".parse().expect("space parses"),
-                name.parse().expect("name parses"),
-            )
+            .resolve_latest(kind, name.parse().expect("name parses"))
             .await
             .expect_err("a refused Card is not registered");
         assert_eq!(
@@ -2250,7 +2244,7 @@ async fn grouped_coding_uses_declared_sources() {
         let card = json!({
             "apiVersion": "wyrd/v1",
             "kind": "Verifier",
-            "metadata": {"name": relative, "version": "1.0.0", "space": "default"},
+            "metadata": {"name": relative, "version": "1.0.0"},
             "spec": {
                 "inputs": {"group_id": slot},
                 "requirements": [{
@@ -2788,8 +2782,8 @@ async fn grouped_conversations_coexist_with_drift() {
         .expect("handle connects");
     let b_support = declare(&b_cards, "cards/verify_in_real_time/support.yaml").await;
     let b_bundle = pull(&b_cards, &b_support.root).await;
-    let [kind, name, version, space] = coordinates(&b_support.root);
-    let b_key = cli::issue_key(&kind, &name, &version, &space, None, None, Some(tenant_b))
+    let [kind, name, version] = coordinates(&b_support.root);
+    let b_key = cli::issue_key(&kind, &name, &version, None, None, Some(tenant_b))
         .await
         .expect("the CLI issues tenant B's Service key")
         .key;

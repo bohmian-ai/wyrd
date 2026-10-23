@@ -83,7 +83,7 @@ use crate::bifrost::object_reads::ObjectReadProbe;
 use wyrd_spec::auth::{Attribution, RoleSource, TokenAudience, TokenResponse};
 use wyrd_spec::card::verifier::{DriftBaselineState, DriftBaselineStatus};
 use wyrd_spec::envelope::{CardKind, Spec};
-use wyrd_spec::ids::{BindingId, CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{BindingId, CardName, CardUid};
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
@@ -5500,7 +5500,6 @@ fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, WyrdTestServerError> 
         kind,
         name: CardName::new(name).map_err(|error| WyrdTestServerError::Auth(error.to_string()))?,
         version: VersionBlock::parse("1.0.0").expect("static semantic version block is valid"),
-        space: Some(SpaceName::new("test").expect("static space name is valid")),
         uid: Some(
             CardUid::new(Uuid::now_v7().to_string()).expect("generated UUIDv7 is a valid CardUid"),
         ),
@@ -5589,7 +5588,6 @@ async fn insert_fixture_card(
             card_uid,
             data_tenant_id,
             kind,
-            space,
             name,
             version,
             spec,
@@ -5608,24 +5606,16 @@ async fn insert_fixture_card(
             $4,
             $5,
             $6,
-            $7,
             NULL,
             '{}'::jsonb,
             '{}'::jsonb,
             'active',
-            $8, $8
+            $7, $7
         )
         ",
     )
     .bind(uid.as_uuid())
     .bind(card_ref.kind.wire_name())
-    .bind(
-        card_ref
-            .space
-            .as_ref()
-            .expect("fixture card ref carries a space")
-            .as_str(),
-    )
     .bind(card_ref.name.as_str())
     .bind(card_ref.version.as_str())
     .bind(spec_json)

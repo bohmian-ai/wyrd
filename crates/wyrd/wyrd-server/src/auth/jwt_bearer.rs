@@ -129,7 +129,7 @@ mod pg_tests {
     use wyrd_spec::auth::{IssuerUrl, TokenType};
     use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::{CardName, SpaceName, TenantSlug};
+    use wyrd_spec::ids::{CardName, TenantSlug};
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
@@ -1008,7 +1008,6 @@ mod pg_tests {
             kind,
             name: CardName::new(name).expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }

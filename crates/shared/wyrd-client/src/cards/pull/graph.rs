@@ -411,11 +411,7 @@ pub(super) fn validate_alias(alias: &str) -> Result<(), WyrdError> {
 /// Builds the deterministic fallback alias for one exact Card identity.
 fn default_alias(card_ref: &CardRef) -> String {
     format!(
-        "{}-{}-{}-{}",
-        card_ref
-            .space
-            .as_ref()
-            .map_or("default", |space| space.as_str()),
+        "{}-{}-{}",
         card_ref.kind.wire_name(),
         card_ref.name,
         card_ref.version
@@ -436,11 +432,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use wyrd_semver::VersionBlock;
-    use wyrd_spec::{
-        envelope::CardKind,
-        ids::{CardName, SpaceName},
-        reference::CardRef,
-    };
+    use wyrd_spec::{envelope::CardKind, ids::CardName, reference::CardRef};
 
     use super::{default_alias, register_alias, validate_alias};
 
@@ -450,7 +442,6 @@ mod tests {
             kind: CardKind::Prompt,
             name: CardName::new("welcome").expect("test name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-            space: Some(SpaceName::new("default").expect("test space is valid")),
             uid: None,
         }
     }
@@ -466,10 +457,7 @@ mod tests {
     /// Default aliases encode exact identity without requiring a UID.
     #[test]
     fn default_alias_contains_exact_identity_without_uid() {
-        assert_eq!(
-            default_alias(&test_card_ref()),
-            "default-Prompt-welcome-1.0.0"
-        );
+        assert_eq!(default_alias(&test_card_ref()), "Prompt-welcome-1.0.0");
     }
 
     /// One alias cannot identify two exact Card references.

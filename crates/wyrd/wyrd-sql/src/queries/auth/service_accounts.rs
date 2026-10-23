@@ -16,14 +16,12 @@ use crate::TenantConn;
 ///
 /// Containment, not equality: registering a Card-bound principal stores a
 /// `uid`-bearing `card_ref` — the projection at `queries::cards::auth_projection`
-/// writes `space: Some(..)` and `uid: Some(..)` — while a caller can only name
-/// `space/Kind/name@version`, so `card_ref = $2` matched no registered principal
-/// at all.
+/// writes `uid: Some(..)` — while a caller can only name `Kind/name@version`, so
+/// `card_ref = $2` matched no registered principal at all.
 ///
-/// Containment relaxes *every* optional `CardRef` field, `space` included: a ref
-/// with no space matches a row in any space, and Card-bound principals are not
-/// name-unique (two exact Card versions, or one name in two spaces, are distinct
-/// principals). The predicate can therefore match several rows, so it fetches at
+/// Containment relaxes the optional `uid`, and Card-bound principals are not
+/// name-unique (two exact Card versions are distinct principals). The predicate
+/// can match several rows, so it fetches at
 /// most two and [`service_account_by_card_ref`] accepts only a single match; an
 /// ambiguous reference resolves no principal rather than an arbitrary one.
 const SERVICE_ACCOUNT_BY_CARD_REF_SQL: &str = r"
@@ -120,22 +118,15 @@ pub async fn insert_service_account(
             Uuid::parse_str(uid.as_str()).expect("CardUid invariant: stored value is a valid UUID")
         })
     });
-    let space = card_ref.map(|card_ref| {
-        card_ref
-            .space
-            .as_ref()
-            .expect("invariant: card-bound principal CardRef has resolved space")
-            .as_str()
-    });
     let version = card_ref.map(|card_ref| card_ref.version.as_str());
 
     sqlx::query(
         r"
         INSERT INTO wyrd.auth_service_accounts (
             id, data_tenant_id, principal_kind, card_kind, card_uid,
-            card_ref, space, name, version, description, status,
+            card_ref, name, version, description, status,
             sub_principal_id, act_principal_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11, $12)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', $10, $11)
         ",
     )
     .bind(id)
@@ -144,7 +135,6 @@ pub async fn insert_service_account(
     .bind(card_kind)
     .bind(card_uid)
     .bind(card_ref.map(Json))
-    .bind(space)
     .bind(name)
     .bind(version)
     .bind(description)
@@ -182,12 +172,11 @@ pub async fn delete_service_account(
 /// Find the one active Service/Agent principal a card ref names.
 ///
 /// Binds the caller's ref as JSONB for a `card_ref @> $2` containment
-/// predicate, so a ref carrying no `uid` matches a stored ref that has one and
-/// a ref carrying no space matches a row in any space. A credential, workload
-/// assertion, or delegation must target exactly one principal, so the lookup
-/// returns a row only when the predicate matches exactly one: an explicit-space
-/// or `uid`-bearing ref stays exact, while a partial ref matching principals in
-/// several spaces returns `None` and the caller's not-found refusal applies.
+/// predicate, so a ref carrying no `uid` matches a stored ref that has one. A
+/// credential, workload assertion, or delegation must target exactly one
+/// principal, so the lookup returns a row only when the predicate matches
+/// exactly one; an ambiguous ref returns `None` and the caller's not-found
+/// refusal applies.
 /// The durable key remains `(card_kind, card_uid)`; this is the lookup for the
 /// identity a client can express, and the GIN index on `card_ref` serves it.
 /// Tenant scope comes solely from the forced RLS policy `conn` activates, so
@@ -473,7 +462,7 @@ mod tests {
     use sqlx::types::Json;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::CardRef;
 
     use super::{ApiKeyStatus, INSERT_REFRESH_TOKEN_SQL, SERVICE_ACCOUNT_BY_CARD_REF_SQL};
@@ -522,7 +511,6 @@ mod tests {
             kind: CardKind::Agent,
             name: CardName::new("runtime").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         };
         let Json(bound) = Json(card_ref.clone());

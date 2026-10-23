@@ -17,7 +17,7 @@ mod pg_tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{Attribution, PrincipalKindTag};
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::queries::auth::{
         ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, credential_belongs_to,
@@ -596,7 +596,7 @@ mod pg_tests {
         .expect("card-free administrative principal inserts");
 
         let row = sqlx::query(
-            "SELECT card_kind, card_uid, card_ref, space, version
+            "SELECT card_kind, card_uid, card_ref, version
                FROM wyrd.auth_service_accounts WHERE id = $1",
         )
         .bind(principal)
@@ -610,7 +610,6 @@ mod pg_tests {
             row.get::<Option<serde_json::Value>, _>("card_ref")
                 .is_none()
         );
-        assert!(row.get::<Option<String>, _>("space").is_none());
         assert!(row.get::<Option<String>, _>("version").is_none());
     }
 
@@ -627,9 +626,9 @@ mod pg_tests {
         let result = sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
                  (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref,
-                  space, name, version, status, sub_principal_id, act_principal_id)
+                  name, version, status, sub_principal_id, act_principal_id)
              VALUES ($1, $2, 'tenant_admin', 'Service', $3, '{}'::jsonb,
-                     'system', 'bogus', '1.0.0', 'active', $4, $4)",
+                     'bogus', '1.0.0', 'active', $4, $4)",
         )
         .bind(Uuid::now_v7())
         .bind(fixture.data_tenant_id().as_uuid())
@@ -808,7 +807,7 @@ mod pg_tests {
             Some(first)
         );
         let rows = sqlx::query(
-            "SELECT name, status, card_kind, card_uid, card_ref, space, version \
+            "SELECT name, status, card_kind, card_uid, card_ref, version \
                FROM wyrd.auth_service_accounts WHERE principal_kind = 'system'",
         )
         .fetch_all(&mut **conn.transaction())
@@ -818,7 +817,7 @@ mod pg_tests {
         let row = &rows[0];
         assert_eq!(row.get::<String, _>("name"), "verification-results-writer");
         assert_eq!(row.get::<String, _>("status"), "active");
-        for column in ["card_kind", "space", "version"] {
+        for column in ["card_kind", "version"] {
             assert_eq!(row.get::<Option<String>, _>(column), None, "{column}");
         }
         assert_eq!(row.get::<Option<Uuid>, _>("card_uid"), None);
@@ -893,7 +892,6 @@ mod pg_tests {
             kind: CardKind::Verifier,
             name: CardName::new("verification-results-writer").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         };
         assert!(
@@ -922,7 +920,7 @@ mod pg_tests {
                 "a Card binding",
                 "UPDATE wyrd.auth_service_accounts \
                     SET card_kind = 'Verifier', card_uid = gen_random_uuid(), \
-                        card_ref = '{}'::jsonb, space = 'prod', version = '1.0.0' \
+                        card_ref = '{}'::jsonb, version = '1.0.0' \
                   WHERE principal_kind = 'system'",
             ),
             (

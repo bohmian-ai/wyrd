@@ -28,14 +28,14 @@ pub const ASSERT_VERIFIER: &str = "bench-assert";
 const PADDING: usize = 1_980;
 
 /// The assertion Verifier: four `equals "yes"` checks over one `json` slot.
-const ASSERT: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: bench-assert\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    context: {type: json}\n  requirements:\n    - id: a\n      statement: a is yes.\n      check: {kind: assert, path: inputs.context.a, operator: equals, expected: \"yes\"}\n    - id: b\n      statement: b is yes.\n      check: {kind: assert, path: inputs.context.b, operator: equals, expected: \"yes\"}\n    - id: c\n      statement: c is yes.\n      check: {kind: assert, path: inputs.context.c, operator: equals, expected: \"yes\"}\n    - id: d\n      statement: d is yes.\n      check: {kind: assert, path: inputs.context.d, operator: equals, expected: \"yes\"}\n";
+const ASSERT: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: bench-assert\n  version: 1.0.0\nspec:\n  inputs:\n    context: {type: json}\n  requirements:\n    - id: a\n      statement: a is yes.\n      check: {kind: assert, path: inputs.context.a, operator: equals, expected: \"yes\"}\n    - id: b\n      statement: b is yes.\n      check: {kind: assert, path: inputs.context.b, operator: equals, expected: \"yes\"}\n    - id: c\n      statement: c is yes.\n      check: {kind: assert, path: inputs.context.c, operator: equals, expected: \"yes\"}\n    - id: d\n      statement: d is yes.\n      check: {kind: assert, path: inputs.context.d, operator: equals, expected: \"yes\"}\n";
 
 /// The Model the Verifier judges.
-const MODEL: &str = "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: bench-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: f0\n        dtype: float64\n    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n";
+const MODEL: &str = "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: bench-model\n  version: 1.0.0\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: f0\n        dtype: float64\n    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n";
 
 /// The Service binding the assertion Verifier to the Model; each
 /// application renames it `bench-service-<index>`.
-const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: bench-service\n  version: 1.0.0\n  space: default\nspec:\n  components:\n    - alias: model\n      ref: ./model.yaml\n      verified_by:\n        - verifier: ./assert.yaml\n";
+const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: bench-service\n  version: 1.0.0\nspec:\n  components:\n    - alias: model\n      ref: ./model.yaml\n      verified_by:\n        - verifier: ./assert.yaml\n";
 
 /// Whether arrival `sequence` answers `d` wrong: every odd one, so both
 /// verdicts stay in every window.

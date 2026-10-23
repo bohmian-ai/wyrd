@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, DeclarationReceipt};
+use wyrd_ai::cards::{
+    CardKind, CardRef, CardSelector, Cards, DeclarationReceipt, ListCardsRequest,
+};
 use wyrd_ai::cli::{self, SelectorArgs};
 use wyrd_ai::state::{DeclareOptions, HydratedCard, WyrdState};
 use wyrd_ai::{Card, Spec, VerificationVerdict};
@@ -53,7 +55,6 @@ fn inline_agent(dir: &Path, name: &str, message: &str) -> PathBuf {
 kind: Agent
 metadata:
   name: {name}
-  space: default
 spec:
   prompt:
     provider: openai
@@ -109,11 +110,10 @@ async fn persisted_prompt(cards: &Cards, agent: &CardRef) -> CardRef {
         .clone()
 }
 
-/// The CLI selector naming `name` at 1.0.0 in the default space.
+/// The CLI selector naming the Service `name` at 1.0.0.
 fn service_selector(name: &str) -> SelectorArgs {
     SelectorArgs {
         kind: Some("Service".to_owned()),
-        space: Some("default".to_owned()),
         name: Some(name.to_owned()),
         version: Some("1.0.0".to_owned()),
         uid: None,
@@ -300,7 +300,6 @@ async fn latest_version_resolves_to_the_declared_card() {
     let latest = cards
         .resolve_latest(
             CardKind::Service,
-            "default".parse().expect("space parses"),
             "support-desk".parse().expect("name parses"),
         )
         .await
@@ -308,7 +307,6 @@ async fn latest_version_resolves_to_the_declared_card() {
     let refused = cards
         .resolve_latest(
             CardKind::Service,
-            "default".parse().expect("space parses"),
             "never-registered".parse().expect("name parses"),
         )
         .await
@@ -737,7 +735,6 @@ async fn agent_prompt_declaration_identity() {
         declare_inline(&cards, dir.path(), "second-agent", "Answer briefly.").await;
 
     assert_eq!(prompt.kind, CardKind::Prompt);
-    assert_eq!(prompt.space, agent.space);
     assert_eq!(persisted_prompt(&cards, &agent).await, prompt);
     assert_eq!(replay, (agent.clone(), prompt.clone()));
     assert_ne!(changed_prompt.version, prompt.version);
@@ -757,7 +754,6 @@ kind: Prompt
 metadata:
   name: clash-agent-prompt
   version: 1.0.0
-  space: default
 spec:
   provider: openai
   model: gpt-4o
@@ -881,4 +877,108 @@ async fn pulled_agent_prompt_card_navigation() {
             .code(),
         "WYRD_SDK_400_CARD_KIND_MISMATCH"
     );
+}
+
+/// A Card is identified by its tenant, kind, name, and version alone: the
+/// declared root renders as `Kind/name@version#uid`, resolves by name and by
+/// exact reference, lists without a space, and every removed space form is
+/// refused.
+///
+/// # Panics
+/// Panics when registration or a read differs, or a removed form is accepted.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn flat_card_identity_round_trip() {
+    let deployment = Deployment::start().await;
+    let cards = deployment.cards().await;
+    let (_, desk) = declare_desk(&cards).await;
+    let root = desk.root.clone();
+    let uid = root.uid.clone().expect("the receipt pins the root uid");
+
+    assert_eq!(
+        root.to_string(),
+        format!("Service/support-desk@1.0.0#{uid}")
+    );
+    assert_eq!(
+        root.to_string()
+            .parse::<CardRef>()
+            .expect("canonical text parses"),
+        root
+    );
+    let named = cards
+        .get(
+            CardSelector::named(
+                CardKind::Service,
+                "support-desk".parse().expect("name parses"),
+            )
+            .with_version("1.0.0".parse().expect("version parses")),
+        )
+        .await
+        .expect("the desk reads by name");
+    let exact = cards
+        .get(CardSelector::exact(root.clone()))
+        .await
+        .expect("the desk reads by exact reference");
+    assert_eq!(named, exact);
+    assert_eq!(
+        serde_json::to_value(&exact.metadata)
+            .expect("metadata serializes")
+            .get("space"),
+        None
+    );
+    let listed = cards
+        .list(ListCardsRequest {
+            kind: Some(CardKind::Service),
+            name: Some("support-desk".parse().expect("name parses")),
+            version_range: None,
+            status: None,
+            filter: None,
+            include_prerelease: false,
+            limit: None,
+            cursor: None,
+        })
+        .await
+        .expect("the desk lists");
+    assert_eq!(listed.items.len(), 1);
+
+    assert!(
+        "default/Service/support-desk@1.0.0"
+            .parse::<CardRef>()
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<CardRef>(json!({
+            "kind": "Service", "space": "default", "name": "support-desk", "version": "1.0.0"
+        }))
+        .is_err()
+    );
+    let dir = tempfile::tempdir().expect("fixture directory creates");
+    let spaced = dir.path().join("spaced.yaml");
+    std::fs::write(
+        &spaced,
+        "apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: spaced
+  space: default
+  version: 1.0.0
+spec:
+  provider: openai
+  model: gpt-4o
+  messages:
+    - role: user
+      content: hi
+",
+    )
+    .expect("spaced card writes");
+    let refused = cards
+        .declare_from_path(&spaced)
+        .await
+        .expect_err("a Card naming a space is refused");
+    assert_eq!(refused.code(), "WYRD_LOADER_400_INVALID_ENVELOPE");
+    assert!(
+        format!("{refused:?}").contains("unknown field `space`"),
+        "{refused:?}"
+    );
+    deployment.shutdown().await;
 }

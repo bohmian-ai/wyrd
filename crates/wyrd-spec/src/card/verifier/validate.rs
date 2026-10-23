@@ -1071,7 +1071,7 @@ mod tests {
                      "agent": agent(&[], json!([{"type": "document", "source": "${media:policy}"}, {"type": "text", "text": "{{claim}} {{answer}} {{findings}}"}]), Some(verdict_schema())),
                      "inputs": {"claim": "requirement.statement", "answer": "inputs.answer.text", "policy": "inputs.policy", "findings": "steps.findings.output"}}},
                 {"id": "counted", "statement": "Counting code agrees",
-                 "check": {"kind": "code", "entrypoint": "check", "source": {"artifact": {"card": {"kind": "Artifact", "space": "support", "name": "checks", "version": "1.0.0"}, "path": "check.py"}},
+                 "check": {"kind": "code", "entrypoint": "check", "source": {"artifact": {"card": {"kind": "Artifact", "name": "checks", "version": "1.0.0"}, "path": "check.py"}},
                      "inputs": {"count": "steps.count.output", "statement": "requirement.statement"}}}
             ],
             "decide": {"pass_rate": {"threshold": 0.75}}
@@ -1084,7 +1084,7 @@ mod tests {
             "inputs": {"current": {"type": "samples", "features": ["income", "dti"]}},
             "requirements": [{"id": "stable", "statement": "Inputs are stable",
                 "check": {"kind": "drift", "on": "inputs.current", "method": "Spc",
-                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["income"]},
+                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "name": "train", "version": "1.0.0"}, "features": ["income"]},
                     "condition": {"kind": "Statistical"},
                     "profile": {"kind": "Spc", "sample_size": 5}}}]
         })
@@ -1543,7 +1543,7 @@ mod tests {
             (
                 with(
                     "/steps/1/action/agent",
-                    json!({"kind": "Prompt", "space": "support", "name": "answer-prompt", "version": "1.0.0"}),
+                    json!({"kind": "Prompt", "name": "answer-prompt", "version": "1.0.0"}),
                 ),
                 "agent_kind",
             ),
@@ -1553,7 +1553,7 @@ mod tests {
         }
         let registered = with(
             "/requirements/2/check/agent",
-            json!({"kind": "Agent", "space": "support", "name": "judge", "version": "1.0.0"}),
+            json!({"kind": "Agent", "name": "judge", "version": "1.0.0"}),
         );
         parse(&registered)
             .validate()
@@ -1704,8 +1704,7 @@ mod tests {
             agent(&[], json!("{{findings}}"), Some(incompatible[0].clone()));
         assert_eq!(rule(&stepped), "check_agent_schema");
 
-        let card =
-            json!({"kind": "Agent", "space": "support", "name": "judge", "version": "1.0.0"});
+        let card = json!({"kind": "Agent", "name": "judge", "version": "1.0.0"});
         let registered = with(review(), "/requirements/2/check/agent", card);
         for (declared, valid) in [(verdict_schema(), true), (incompatible[0].clone(), false)] {
             let resolved: crate::card::agent::AgentSpec =
@@ -1842,8 +1841,7 @@ mod tests {
         ))
         .expect("Agent");
         let prompt = resolved.prompt.as_inline().expect("inline Prompt");
-        let card =
-            json!({"kind": "Agent", "space": "support", "name": "reviewer", "version": "1.0.0"});
+        let card = json!({"kind": "Agent", "name": "reviewer", "version": "1.0.0"});
         for (selector, valid) in [
             ("steps.findings.output.score.value", true),
             ("steps.findings.output.points", false),

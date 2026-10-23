@@ -6,7 +6,6 @@ kind: Service
 metadata:
   name: forever
   version: 1.0.0
-  space: default
 spec:
   service_type: agent
   components:

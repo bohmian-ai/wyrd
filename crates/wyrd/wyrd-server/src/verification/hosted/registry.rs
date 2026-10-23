@@ -14,7 +14,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 
 use crate::components::auth::Caller;
-use crate::components::cards::routes::{get_card_by_ref_for, get_card_for};
+use crate::components::cards::routes::get_card_by_ref_for;
 use crate::state::AppState;
 
 /// Resolves Agent and Prompt Cards as one accepted caller.
@@ -36,27 +36,19 @@ impl TenantRegistry {
 
     /// Load the spec of the Card `reference` names.
     ///
-    /// A reference with a space reads by identity and, when it also pins a
-    /// UID, must match it; a UID-only reference reads that exact Card of the
-    /// reference's kind. Both reads authorize `card:read` first.
+    /// The reference reads by its exact kind, name, and version identity and,
+    /// when it also pins a UID, must match it. The read authorizes `card:read`
+    /// first.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] with no caller, for a reference with
-    /// neither space nor UID, or for a denied, absent, or mismatched Card,
-    /// and [`BlockError::Retryable`] when the registry is unavailable.
+    /// Returns [`BlockError::Terminal`] with no caller, or for a denied,
+    /// absent, or mismatched Card, and [`BlockError::Retryable`] when the
+    /// registry is unavailable.
     async fn spec(&self, reference: &CardRef) -> Result<Spec, BlockError> {
         let caller = self.caller.as_ref().ok_or_else(|| BlockError::Terminal {
             reason: format!("no accepted caller may read card {reference}"),
         })?;
-        let response = match (&reference.space, &reference.uid) {
-            (Some(_), _) => get_card_by_ref_for(&self.state, caller, reference).await,
-            (None, Some(uid)) => get_card_for(&self.state, caller, &reference.kind, uid).await,
-            (None, None) => {
-                return Err(BlockError::Terminal {
-                    reason: format!("reference {reference} names no space or uid"),
-                });
-            }
-        };
+        let response = get_card_by_ref_for(&self.state, caller, reference).await;
         Ok(response.map_err(|error| refusal(&error))?.card.spec)
     }
 }

@@ -1053,7 +1053,7 @@ pub(crate) mod correlation_fixture {
     pub(crate) const OUT_OF_SCOPE: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b33";
 
     /// The signed member's Card reference text, which is not a UID.
-    pub(crate) const REFERENCE_TEXT: &str = "prod/Service/checkout@1.0.0";
+    pub(crate) const REFERENCE_TEXT: &str = "Service/checkout@1.0.0";
 
     /// Build the shared scope: the one in-scope Card UID.
     pub(crate) fn scope() -> Vec<CardUid> {

@@ -1096,7 +1096,7 @@ mod tests {
             verifier_card_uid: CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 card uid"),
             verifier_ref: "verifier/drift@1.0.0".to_owned(),
             subject_uid: CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 card uid"),
-            subject_ref: "service/owner@1.0.0".to_owned(),
+            subject_ref: "Service/owner@1.0.0".to_owned(),
             verdict: VerificationVerdict::Failed,
             completed_at: Utc::now(),
             summary: "failed".to_owned(),

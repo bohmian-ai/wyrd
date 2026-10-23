@@ -7,7 +7,7 @@ use crate::api_version::ApiVersion;
 use crate::card::verifier::VerificationBinding;
 use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use crate::error::WyrdError;
-use crate::ids::{CardName, CardUid, ProviderDeploymentName, SpaceName};
+use crate::ids::{CardName, CardUid, ProviderDeploymentName};
 use crate::metadata::{Annotations, Labels};
 use crate::reference::{CardRef, InlineableRef};
 use wyrd_semver::VersionBlock;
@@ -160,8 +160,6 @@ fn is_default_run_config(config: &AgentRunConfigSpec) -> bool {
 /// Local typed holder for a Wyrd Agent Card envelope.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentCard {
-    /// Logical card space.
-    pub space: String,
     /// User-authored card name.
     pub name: String,
     /// Exact card version.
@@ -193,7 +191,6 @@ impl AgentCard {
                 name: card_name("metadata.name", &self.name)?,
                 version: Some(version_block("metadata.version", &self.version)?.into()),
                 bump: None,
-                space: Some(space_name(&self.space)?),
                 uid: optional_card_uid(&self.uid)?,
                 labels: self.labels.clone(),
                 annotations: self.annotations.clone(),
@@ -231,11 +228,6 @@ impl AgentCard {
 
         let cascade_children = derive_cascade_children(&spec);
         Ok(Self {
-            space: card
-                .metadata
-                .space
-                .as_ref()
-                .map_or_else(|| "default".to_owned(), ToString::to_string),
             name: card.metadata.name.to_string(),
             version: card
                 .metadata
@@ -267,7 +259,6 @@ impl AgentCard {
             kind: CardKind::Agent,
             name: card_name("metadata.name", &self.name)?,
             version: version_block("metadata.version", &self.version)?,
-            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -301,16 +292,6 @@ fn card_name(field: &str, value: &str) -> Result<CardName, WyrdError> {
 fn version_block(field: &str, value: &str) -> Result<VersionBlock, WyrdError> {
     VersionBlock::parse(value)
         .map_err(|error| validation_error(format!("{field} must be a semantic version: {error}")))
-}
-
-fn space_name(value: &str) -> Result<SpaceName, WyrdError> {
-    if value.is_empty() {
-        return Err(validation_error(
-            "metadata.space is required and cannot be empty",
-        ));
-    }
-    SpaceName::new(value)
-        .map_err(|error| validation_error(format!("metadata.space is invalid: {error}")))
 }
 
 fn optional_card_uid(value: &str) -> Result<Option<CardUid>, WyrdError> {
@@ -412,7 +393,6 @@ mod agent_spec_tests {
                 kind: CardKind::Prompt,
                 name: "planner-prompt".parse().expect("valid card name"),
                 version: "0.3.0".parse().expect("valid version"),
-                space: Some("research".parse().expect("valid space")),
                 uid: None,
             }),
             execution_route: crate::card::agent::ExecutionRoute::Native {},
@@ -443,7 +423,6 @@ mod agent_spec_tests {
     #[test]
     fn agent_card_uses_the_shared_envelope_without_client_derived_state() {
         let card = AgentCard {
-            space: "research".to_owned(),
             name: "planner".to_owned(),
             version: "0.3.0".to_owned(),
             uid: "018f90f5-8e1b-7c4a-a834-4d2d4df6e9c2".to_owned(),
@@ -502,7 +481,7 @@ mod agent_spec_tests {
             "format": "messages",
             "body": {"max_tokens": 64, "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]},
         });
-        let reference = json!({"kind": "Prompt", "name": "support-answer", "version": "1.0.0", "space": "default"});
+        let reference = json!({"kind": "Prompt", "name": "support-answer", "version": "1.0.0"});
         let gateway = json!({"kind": "wyrd_gateway", "deployment": "openai-primary"});
         let agent = |prompt: &Value, route: Value| json!({"prompt": prompt, "execution_route": route, "run_config": {"max_iterations": 5}});
 

@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: quality
   version: 1.0.0
-  space: default
 spec:
   inputs:
     answer:

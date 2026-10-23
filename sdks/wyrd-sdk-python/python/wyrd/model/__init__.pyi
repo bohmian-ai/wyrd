@@ -730,7 +730,7 @@ class ModelCard(Generic[_ModelInterfaceT]):
 
     ```python
     cards = Cards()
-    card = cards.model.get(space="ml", name="fraud-model", interface=MyModelInterface)
+    card = cards.model.get(name="fraud-model", interface=MyModelInterface)
     ```
 
     ``get`` returns the validated envelope without model bytes. Pull a
@@ -740,7 +740,6 @@ class ModelCard(Generic[_ModelInterfaceT]):
     re-validates the spec.
     """
 
-    space: str
     name: str
     version: str
     uid: str
@@ -769,7 +768,6 @@ class ModelCard(Generic[_ModelInterfaceT]):
     def __init__(
         self,
         model_or_interface: _ModelInterfaceT,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
@@ -786,8 +784,6 @@ class ModelCard(Generic[_ModelInterfaceT]):
             model_or_interface: a built-in interface or subclass instance. An
                 interface class is rejected; pass classes to
                 ``Cards.model.get``.
-            space: card space. Omitted, the nearest ``wyrd.toml`` default
-                applies, else ``"default"``.
             name: card name. Defaults to ``"model"``.
             version: semantic version. Defaults to ``"0.1.0"``.
             uid: card UID. Omitted, a new UUIDv7 is generated.
@@ -812,7 +808,6 @@ class ModelCard(Generic[_ModelInterfaceT]):
     def __init__(
         self: ModelCard[ModelInterface],
         model_or_interface: object,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
@@ -829,7 +824,6 @@ class ModelCard(Generic[_ModelInterfaceT]):
 
         Args:
             model_or_interface: the model object.
-            space: as for the interface overload.
             name: as for the interface overload.
             version: as for the interface overload.
             uid: as for the interface overload.
@@ -903,7 +897,7 @@ class ModelCard(Generic[_ModelInterfaceT]):
         """Return a ``Model`` CardRef for this card's identity.
 
         Raises:
-            WyrdError: If name, version, space, or UID is invalid.
+            WyrdError: If name, version, or UID is invalid.
         """
         ...
 

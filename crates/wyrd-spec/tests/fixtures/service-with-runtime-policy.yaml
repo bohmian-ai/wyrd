@@ -3,7 +3,6 @@
 apiVersion: wyrd/v1
 kind: Service
 metadata:
-  space: retention
   name: churn-remediation-service
   version: 1.0.0
   annotations:
@@ -31,11 +30,9 @@ spec:
       ref:
         kind: Trigger
         name: churn-drift-trigger
-        space: retention
         version: 1.0.0
     - alias: operator
       ref:
         kind: Operator
         name: churn-retrain-on-drift
-        space: retention
         version: 1.0.0

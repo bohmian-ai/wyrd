@@ -17,7 +17,7 @@ use crate::row_types::cards::{CardRow, CardStatus, ParsedCardRow};
 use crate::tenant_conn::TenantConn;
 
 const SELECT_FOR_DELETE: &str = r"
-    SELECT card_uid, data_tenant_id, kind, space, name, version,
+    SELECT card_uid, data_tenant_id, kind, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
            status, sub_principal_id, act_principal_id, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
@@ -165,20 +165,27 @@ async fn soft_delete_card_with_expected_kind(
 }
 
 /// Soft-delete a card selected by its exact identity tuple.
+///
+/// The flat `kind`/`name`/`version` lookup locks the row in the caller's
+/// tenant transaction, then the existing UID delete runs. The caller owns the
+/// transaction and commits only after this succeeds; storage cleanup follows
+/// the commit.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no row has that identity,
+/// registry unavailability when a query fails, the Card UID error for an
+/// invalid stored UID, and the errors of [`soft_delete_card_with_state`],
+/// including the conflict raised while another Card still references it.
 pub async fn soft_delete_card_by_ref(
     conn: &mut TenantConn<'_>,
     card_ref: &CardRef,
 ) -> Result<CardDeleteState, WyrdError> {
-    let space = card_ref.space.as_ref().ok_or_else(|| {
-        WyrdError::registry_invalid_card_spec("CardRef.space is required for card deletion")
-    })?;
     let uid = sqlx::query_scalar::<_, uuid::Uuid>(
         "SELECT card_uid FROM wyrd.cards \
-          WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4 \
+          WHERE kind = $1 AND name = $2 AND version = $3 \
           FOR UPDATE",
     )
     .bind(card_ref.kind.wire_name())
-    .bind(space.as_str())
     .bind(card_ref.name.as_str())
     .bind(card_ref.version.as_str())
     .fetch_optional(&mut **conn.transaction())

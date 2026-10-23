@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use wyrd_semver::VersionBlock;
 
 use crate::envelope::{Card, CardKind};
-use crate::ids::{CardName, CardUid, SpaceName};
+use crate::ids::{CardName, CardUid};
 use crate::query::MetadataQuery;
 use crate::reference::CardRef;
 use crate::registry::{CardLifecycleStatus, RelativeArtifactPath};
@@ -43,8 +43,6 @@ pub struct CardSummary {
     pub card_uid: CardUid,
     /// Card kind.
     pub kind: CardKind,
-    /// Workspace.
-    pub space: SpaceName,
     /// Card name.
     pub name: CardName,
     /// Resolved version.
@@ -69,8 +67,6 @@ pub struct CardSummary {
 pub struct ListCardsRequest {
     /// Optional kind filter.
     pub kind: Option<CardKind>,
-    /// Optional workspace filter.
-    pub space: Option<SpaceName>,
     /// Optional name filter.
     pub name: Option<CardName>,
     /// Optional semver range filter.
@@ -280,7 +276,6 @@ mod tests {
     fn list_filter_serializes_as_canonical_query_string() {
         let request = ListCardsRequest {
             kind: None,
-            space: None,
             name: None,
             version_range: None,
             status: None,

@@ -3,7 +3,6 @@ kind: Service
 metadata:
   name: conflicting-desk
   version: 1.0.0
-  space: default
 spec:
   service_type: agent
   tables:
@@ -20,4 +19,3 @@ spec:
         kind: Agent
         name: support-agent
         version: 1.0.0
-        space: default

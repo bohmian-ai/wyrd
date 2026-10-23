@@ -103,7 +103,7 @@ impl PyAgentCard {
     /// label/annotation, and the envelope validation error for invalid
     /// identity.
     #[new]
-    #[pyo3(signature = (prompt, *, execution_route, space=None, name=None, version=None, uid=None, labels=None, annotations=None))]
+    #[pyo3(signature = (prompt, *, execution_route, name=None, version=None, uid=None, labels=None, annotations=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new] signature mirrors the complete Python AgentCard constructor"
@@ -111,7 +111,6 @@ impl PyAgentCard {
     pub fn __new__(
         prompt: &Bound<'_, PromptReference>,
         execution_route: &Bound<'_, PyDict>,
-        space: Option<&str>,
         name: Option<&str>,
         version: Option<&str>,
         uid: Option<&str>,
@@ -119,12 +118,10 @@ impl PyAgentCard {
         annotations: Option<BTreeMap<String, String>>,
     ) -> CardPyResult<Self> {
         let py = prompt.py();
-        let mut resolved_space = space.map(str::to_owned);
         let mut resolved_labels = labels_from_user(labels.unwrap_or_default())?;
         let mut resolved_annotations = annotations_from_user(annotations.unwrap_or_default())?;
         crate::identity::apply_repo_defaults(
             &CardKind::Agent,
-            &mut resolved_space,
             &mut resolved_labels,
             &mut resolved_annotations,
         );
@@ -136,7 +133,6 @@ impl PyAgentCard {
             verified_by: Vec::new(),
         };
         let inner = AgentCard {
-            space: resolved_space.unwrap_or_else(|| "default".to_owned()),
             name: name.unwrap_or("agent").to_owned(),
             version: version.unwrap_or("0.1.0").to_owned(),
             uid: uid.map_or_else(wyrd_utils::uuid7, str::to_owned),
@@ -217,12 +213,6 @@ impl PyAgentCard {
         Self::from_card(py, WyrdPyError::parse_json_input(json_string)?)
     }
 
-    /// Return the Agent Card space.
-    #[getter]
-    pub fn space(&self) -> &str {
-        &self.inner.space
-    }
-
     /// Return the Agent Card name.
     #[getter]
     pub fn name(&self) -> &str {
@@ -286,8 +276,8 @@ impl PyAgentCard {
     /// Return a readable Agent Card representation.
     pub fn __repr__(&self) -> String {
         format!(
-            "AgentCard(name={:?}, version={:?}, space={:?})",
-            self.inner.name, self.inner.version, self.inner.space
+            "AgentCard(name={:?}, version={:?})",
+            self.inner.name, self.inner.version
         )
     }
 

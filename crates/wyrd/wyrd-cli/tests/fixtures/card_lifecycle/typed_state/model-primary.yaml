@@ -3,7 +3,6 @@ kind: Model
 metadata:
   name: primary
   version: 1.0.0
-  space: default
 spec:
   interface:
     kind: Sklearn

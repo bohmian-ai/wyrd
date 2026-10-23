@@ -2,7 +2,7 @@
 
 It serves the Quickstart's ``support-reply`` Service, pulled once at deploy time:
 
-    wyrd pull --space default --kind Service --name support-reply --version 1.0.0 \
+    wyrd pull --kind Service --name support-reply --version 1.0.0 \
       --output-dir .wyrd-bundle
     uv run uvicorn app:app
 """

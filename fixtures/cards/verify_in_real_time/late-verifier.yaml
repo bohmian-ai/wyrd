@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: late-verifier
   version: 1.0.0
-  space: default
 spec:
   description: A judge Agent judges every answer of the conversation and its judgment.
   inputs:

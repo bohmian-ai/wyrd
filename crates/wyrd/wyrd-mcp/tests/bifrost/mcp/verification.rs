@@ -73,10 +73,10 @@ mod pg_tests {
     const SETTLE: Duration = Duration::from_secs(90);
 
     /// A ready Custom Drift Verifier the Service binds on a schedule.
-    const VERIFIER: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: mcp-run-drift\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    scores: {type: samples, features: [score]}\n  requirements:\n    - id: score-steady\n      statement: The score stays at or under its alert threshold\n      check:\n        kind: drift\n        on: inputs.scores\n        method: Custom\n        signal: {kind: Metric, name: score}\n        condition: {kind: Statistical}\n        profile: {kind: Custom, metric_name: score, baseline_value: 1.0, alert_threshold: 0.5}\n";
+    const VERIFIER: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: mcp-run-drift\n  version: 1.0.0\nspec:\n  inputs:\n    scores: {type: samples, features: [score]}\n  requirements:\n    - id: score-steady\n      statement: The score stays at or under its alert threshold\n      check:\n        kind: drift\n        on: inputs.scores\n        method: Custom\n        signal: {kind: Metric, name: score}\n        condition: {kind: Statistical}\n        profile: {kind: Custom, metric_name: score, baseline_value: 1.0, alert_threshold: 0.5}\n";
 
     /// A Service bound to [`VERIFIER`] on a schedule over its `score` metric.
-    const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: mcp-run-service\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: mcp-run-drift\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n";
+    const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: mcp-run-service\n  version: 1.0.0\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: mcp-run-drift\n        version: 1.0.0\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n";
 
     /// SHA-256 of the five bytes `hello`, the evidence file the journey plans.
     const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -367,7 +367,7 @@ mod pg_tests {
                 ),
                 (
                     CARDS_GET,
-                    serde_json::json!({ "card_ref": { "kind": "Service", "name": "absent", "version": "1.0.0", "space": "default" } }),
+                    serde_json::json!({ "card_ref": { "kind": "Service", "name": "absent", "version": "1.0.0" } }),
                     "WYRD_REGISTRY_404_CARD_NOT_FOUND",
                 ),
             ] {

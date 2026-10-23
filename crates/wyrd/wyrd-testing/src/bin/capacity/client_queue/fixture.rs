@@ -35,16 +35,16 @@ pub fn drift_verifier_yaml(features: usize) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {DRIFT_VERIFIER}\n  version: 1.0.0\n  space: default\nspec:\n  inputs:\n    samples: {{type: samples, features: [{names}]}}\n  requirements:\n    - id: f0-bounded\n      statement: f0 stays bounded.\n      check: {{kind: drift, on: inputs.samples, method: Custom, signal: {{kind: Metric, name: f0}}, condition: {{kind: Above, limit: 1000.0}}}}\n"
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {DRIFT_VERIFIER}\n  version: 1.0.0\nspec:\n  inputs:\n    samples: {{type: samples, features: [{names}]}}\n  requirements:\n    - id: f0-bounded\n      statement: f0 stays bounded.\n      check: {{kind: drift, on: inputs.samples, method: Custom, signal: {{kind: Metric, name: f0}}, condition: {{kind: Above, limit: 1000.0}}}}\n"
     )
 }
 
 /// The Model Card whose Drift observations the benchmark emits.
-const MODEL: &str = "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: ingest-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: f0\n        dtype: float64\n    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n";
+const MODEL: &str = "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: ingest-model\n  version: 1.0.0\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: f0\n        dtype: float64\n    outputs:\n      - name: score\n        dtype: float64\n  card_refs: []\n";
 
 /// The Service Card composing [`MODEL`] under the alias `model`, bound
 /// without a schedule to the Window Verifier of `ingest.yaml`.
-const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: ingest-service\n  version: 1.0.0\n  space: default\nspec:\n  components:\n    - alias: model\n      ref: ./model.yaml\n      verified_by:\n        - verifier: ./ingest.yaml\n";
+const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: ingest-service\n  version: 1.0.0\nspec:\n  components:\n    - alias: model\n      ref: ./model.yaml\n      verified_by:\n        - verifier: ./ingest.yaml\n";
 
 /// One provisioned tenant and the identities its traffic uses.
 pub struct Tenant {

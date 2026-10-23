@@ -34,7 +34,7 @@ pub struct AddArgs {
     /// Optional audience constraint.
     #[arg(long, value_name = "AUD")]
     pub audience: Option<String>,
-    /// Card the bound workload acts as (space/kind/name@version[#uid]).
+    /// Card the bound workload acts as (Kind/name@version[#uid]).
     #[arg(long, value_name = "CARD_REF")]
     pub card: String,
     /// Wyrd server base URL. The credential is read from the ambient chain

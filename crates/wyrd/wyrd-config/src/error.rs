@@ -33,7 +33,7 @@ pub enum WyrdConfigError {
     /// TOML deserialized but failed the typed schema. Catches
     /// `deny_unknown_fields` violations, lowercase or unknown
     /// `[kind.X]` keys, invalid validated-newtype values
-    /// (`SpaceName`, `LabelKey`, …), and the explicit
+    /// (`LabelKey`, `AnnotationKey`, …), and the explicit
     /// `[kind.External]` rejection.
     #[error("schema mismatch at {path}: {message}")]
     Schema {

@@ -4,7 +4,6 @@
 apiVersion: wyrd/v1
 kind: Source
 metadata:
-  space: prod
   name: service-traces
   version: 1.0.0
 

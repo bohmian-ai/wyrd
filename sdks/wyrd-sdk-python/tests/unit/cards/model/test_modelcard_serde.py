@@ -54,8 +54,7 @@ def test_data_card_file_is_refused_as_a_model_card(fixtures_dir: Path) -> None:
 def test_model_card_file_loads_its_identity_and_task(fixtures_dir: Path) -> None:
     card = ModelCard.from_path(fixtures_dir / "authoring" / "model" / "churn-model.yaml")
 
-    assert (card.space, card.name, card.task_type) == (
-        "prod",
+    assert (card.name, card.task_type) == (
         "churn-model",
         "binary_classification",
     )

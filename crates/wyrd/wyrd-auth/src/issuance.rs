@@ -1283,8 +1283,8 @@ mod pg_tests {
         let card_uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
         sqlx::query(
             "INSERT INTO wyrd.cards \
-                (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
-             VALUES ($1, wyrd.current_tenant(), 'Service', 'default', 'bound-svc', '1.0.0', \
+                (card_uid, data_tenant_id, kind, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
+             VALUES ($1, wyrd.current_tenant(), 'Service', 'bound-svc', '1.0.0', \
                      '{}'::jsonb, 'spec-hash', 'active', '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
         )
         .bind(card_uid.as_uuid())
@@ -1293,7 +1293,7 @@ mod pg_tests {
         .expect("service card inserts");
         let card_ref: CardRef = serde_json::from_value(json!({
             "kind": "Service", "name": "bound-svc", "version": "1.0.0",
-            "space": "default", "uid": card_uid.as_str()
+            "uid": card_uid.as_str()
         }))
         .expect("card ref decodes");
         let id = Uuid::now_v7();

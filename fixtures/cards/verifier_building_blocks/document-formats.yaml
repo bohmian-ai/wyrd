@@ -5,7 +5,6 @@ kind: Verifier
 metadata:
   name: document-formats
   version: 1.0.0
-  space: default
 spec:
   description: A document of any extractable format is read into its locked extract output.
   inputs:

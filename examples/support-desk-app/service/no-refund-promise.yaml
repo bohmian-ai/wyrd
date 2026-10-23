@@ -5,7 +5,6 @@ kind: Verifier
 metadata:
   name: no-refund-promise
   version: 1.0.0
-  space: support
 spec:
   description: A support answer never promises a guaranteed refund.
   inputs:

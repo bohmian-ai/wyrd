@@ -740,7 +740,7 @@ mod pg_tests {
                 bound_issuer,
                 "workload-subject",
                 &serde_json::json!({
-                    "kind": "Service", "name": "svc", "version": "1.0.0", "space": "prod"
+                    "kind": "Service", "name": "svc", "version": "1.0.0"
                 }),
             )
             .await;
@@ -1709,8 +1709,7 @@ mod pg_tests {
             &serde_json::json!({
                 "kind": "Service",
                 "name": "billing",
-                "version": "1.0.0",
-                "space": "prod"
+                "version": "1.0.0"
             }),
         )
         .await;
@@ -1773,7 +1772,6 @@ mod pg_tests {
             "kind": "Service",
             "name": "billing-service",
             "version": "1.0.0",
-            "space": "prod",
             "uid": "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
         });
 
@@ -1801,10 +1799,6 @@ mod pg_tests {
         assert_eq!(card_ref.kind.wire_name(), "Service");
         assert_eq!(card_ref.name.to_string(), "billing-service");
         assert_eq!(card_ref.version.to_string(), "1.0.0");
-        assert_eq!(
-            card_ref.space.as_ref().map(ToString::to_string).as_deref(),
-            Some("prod")
-        );
         assert!(card_ref.uid.is_some(), "uid must survive the round-trip");
 
         // Cleanup.
@@ -1932,8 +1926,7 @@ mod pg_tests {
         let card_ref_json = serde_json::json!({
             "kind": "Service",
             "name": "svc",
-            "version": "1.0.0",
-            "space": "prod"
+            "version": "1.0.0"
         });
 
         insert_tenant(store.pool(), tenant_a, &format!("rp-a-{suffix}")).await;
@@ -2010,10 +2003,6 @@ mod pg_tests {
             assert_eq!(card_ref.kind.wire_name(), "Service");
             assert_eq!(card_ref.name.to_string(), "svc");
             assert_eq!(card_ref.version.to_string(), "1.0.0");
-            assert_eq!(
-                card_ref.space.as_ref().map(ToString::to_string).as_deref(),
-                Some("prod")
-            );
         }
 
         // Seed the same issuer_url under tenant B.
@@ -2113,8 +2102,7 @@ mod pg_tests {
             card_ref: serde_json::json!({
                 "kind": "Service",
                 "name": "svc",
-                "version": "1.0.0",
-                "space": "prod"
+                "version": "1.0.0"
             }),
         };
 

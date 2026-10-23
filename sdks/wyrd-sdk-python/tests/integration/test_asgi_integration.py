@@ -252,7 +252,7 @@ def test_asgi_lifespan(
     assert events == ["startup"] and closed(state)
 
     # A failed drain is logged with its code and reported as shutdown failure.
-    agent_key = cli.issue_key(kind="Agent", name="observed-agent", version="1.0.0", space="default")
+    agent_key = cli.issue_key(kind="Agent", name="observed-agent", version="1.0.0")
     agent = hydrated(observed_bundle, WyrdClient(credential=agent_key.key))
     events = []
     with caplog.at_level(logging.ERROR, logger="wyrd.integrations.asgi"):

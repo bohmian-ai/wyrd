@@ -110,19 +110,17 @@ def test_datacard_rejects_non_data_interface() -> None:
 
 
 def test_artifact_card_input_is_recorded_as_a_card_reference() -> None:
-    artifact = CardRef(
-        kind=CardKind.Artifact, name="existing-data", version="1.0.0", space="default"
-    )
+    artifact = CardRef(kind=CardKind.Artifact, name="existing-data", version="1.0.0")
 
     card = DataCard(artifact)
 
     assert card.metadata.to_dict()["card_refs"] == [
-        {"kind": "Artifact", "name": "existing-data", "version": "1.0.0", "space": "default"}
+        {"kind": "Artifact", "name": "existing-data", "version": "1.0.0"}
     ]
 
 
 def test_artifact_card_input_rejects_non_artifact_card_ref() -> None:
-    data_ref = CardRef(kind=CardKind.Data, name="existing-data", version="1.0.0", space="default")
+    data_ref = CardRef(kind=CardKind.Data, name="existing-data", version="1.0.0")
 
     with pytest.raises(WyrdError) as exc:
         DataCard(data_ref)

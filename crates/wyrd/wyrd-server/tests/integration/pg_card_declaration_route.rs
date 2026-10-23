@@ -23,7 +23,7 @@ use wyrd_loader::{build_declaration_input, load};
 use wyrd_server::verification::authority::BackgroundAuthority;
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::envelope::{CardKind, Spec};
-use wyrd_spec::ids::{CardName, CardUid, DataTenantId, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid, DataTenantId};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::registry::{CardLifecycleStatus, DeclarationOutcomeKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
@@ -117,8 +117,8 @@ async fn seed_card(
     let spec_hash = blake3::hash(name.as_bytes()).to_hex().to_string();
     sqlx::query(
         "INSERT INTO wyrd.cards \
-            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
-         VALUES ($1, $2, $3, 'default', $4, '1.0.0', $5, $6, $7, '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
+            (card_uid, data_tenant_id, kind, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
+         VALUES ($1, $2, $3, $4, '1.0.0', $5, $6, $7, '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
     )
     .bind(uid.as_uuid())
     .bind(tenant.as_uuid())
@@ -274,8 +274,7 @@ fn declaration_request() -> Request<Body> {
                     "kind": "Prompt",
                     "metadata": {
                         "name": "route-journey",
-                        "version": "1.0.0",
-                        "space": "default"
+                        "version": "1.0.0"
                     },
                     "spec": {
                         "provider": "openai",
@@ -307,8 +306,7 @@ fn prompt_declaration_request(name: &str, idempotency_key: &str) -> Request<Body
                     "kind": "Prompt",
                     "metadata": {
                         "name": name,
-                        "version": "1.0.0",
-                        "space": "default"
+                        "version": "1.0.0"
                     },
                     "spec": {
                         "provider": "openai",
@@ -340,15 +338,13 @@ fn agent_declaration_request(name: &str, child_name: &str, idempotency_key: &str
                     "kind": "Agent",
                     "metadata": {
                         "name": name,
-                        "version": "1.0.0",
-                        "space": "default"
+                        "version": "1.0.0"
                     },
                     "spec": {
                         "prompt": {
                             "kind": "Prompt",
                             "name": child_name,
-                            "version": "1.0.0",
-                            "space": "default"
+                            "version": "1.0.0"
                         }, "execution_route": {"kind": "native"}
                     },
                     "artifacts": []
@@ -366,24 +362,24 @@ fn three_card_composite_request(idempotency_key: &str) -> Request<Body> {
         json!({ "submissions": [
             {
                 "apiVersion": "wyrd/v1", "kind": "Service",
-                "metadata": { "name": "composite-service", "version": "1.0.0", "space": "default" },
+                "metadata": { "name": "composite-service", "version": "1.0.0" },
                 "spec": { "components": [{
                     "alias": "agent",
-                    "ref": { "sibling": { "kind": "Agent", "name": "composite-agent", "version": "1.0.0", "space": "default" } }
+                    "ref": { "sibling": { "kind": "Agent", "name": "composite-agent", "version": "1.0.0" } }
                 }] },
                 "artifacts": []
             },
             {
                 "apiVersion": "wyrd/v1", "kind": "Agent",
-                "metadata": { "name": "composite-agent", "version": "1.0.0", "space": "default" },
+                "metadata": { "name": "composite-agent", "version": "1.0.0" },
                 "spec": { "prompt": {
-                    "sibling": { "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0", "space": "default" }
+                    "sibling": { "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0" }
                 }, "execution_route": {"kind": "native"} },
                 "artifacts": []
             },
             {
                 "apiVersion": "wyrd/v1", "kind": "Prompt",
-                "metadata": { "name": "composite-prompt", "version": "1.0.0", "space": "default" },
+                "metadata": { "name": "composite-prompt", "version": "1.0.0" },
                 "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                 "artifacts": []
             }
@@ -398,24 +394,24 @@ fn permuted_three_card_composite_request(idempotency_key: &str) -> Request<Body>
         json!({ "submissions": [
             {
                 "apiVersion": "wyrd/v1", "kind": "Prompt",
-                "metadata": { "name": "composite-prompt", "version": "1.0.0", "space": "default" },
+                "metadata": { "name": "composite-prompt", "version": "1.0.0" },
                 "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                 "artifacts": []
             },
             {
                 "apiVersion": "wyrd/v1", "kind": "Service",
-                "metadata": { "name": "composite-service", "version": "1.0.0", "space": "default" },
+                "metadata": { "name": "composite-service", "version": "1.0.0" },
                 "spec": { "components": [{
                     "alias": "agent",
-                    "ref": { "sibling": { "kind": "Agent", "name": "composite-agent", "version": "1.0.0", "space": "default" } }
+                    "ref": { "sibling": { "kind": "Agent", "name": "composite-agent", "version": "1.0.0" } }
                 }] },
                 "artifacts": []
             },
             {
                 "apiVersion": "wyrd/v1", "kind": "Agent",
-                "metadata": { "name": "composite-agent", "version": "1.0.0", "space": "default" },
+                "metadata": { "name": "composite-agent", "version": "1.0.0" },
                 "spec": { "prompt": {
-                    "sibling": { "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0", "space": "default" }
+                    "sibling": { "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0" }
                 }, "execution_route": {"kind": "native"} },
                 "artifacts": []
             }
@@ -429,7 +425,7 @@ fn heavy_declaration_request(idempotency_key: &str) -> Request<Body> {
         idempotency_key,
         json!({ "submissions": [{
             "apiVersion": "wyrd/v1", "kind": "Prompt",
-            "metadata": { "name": "heavy-prompt", "version": "1.0.0", "space": "default" },
+            "metadata": { "name": "heavy-prompt", "version": "1.0.0" },
             "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
             "artifacts": [{
                 "relative_path": "prompt.txt",
@@ -467,7 +463,7 @@ async fn client_declaration_saga_returns_active_receipt() {
     std::fs::write(
         &prompt_path,
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: client-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: client-prompt\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
             artifact.len()
         ),
     )
@@ -530,7 +526,6 @@ async fn client_declaration_saga_returns_active_receipt() {
     let listed = cards
         .list(ListCardsRequest {
             kind: Some(CardKind::Prompt),
-            space: Some(SpaceName::new("default").expect("test space is valid")),
             name: Some(CardName::new("client-prompt").expect("test name is valid")),
             version_range: None,
             status: Some(CardLifecycleStatus::Active),
@@ -547,7 +542,6 @@ async fn client_declaration_saga_returns_active_receipt() {
     let latest = cards
         .resolve_latest(
             CardKind::Prompt,
-            SpaceName::new("default").expect("test space is valid"),
             CardName::new("client-prompt").expect("test name is valid"),
         )
         .await
@@ -709,12 +703,12 @@ async fn declaration_accepts_loader_projection_and_persists_sibling_binding() {
     let agent_path = temp.path().join("agent.yaml");
     std::fs::write(
         &prompt_path,
-        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: loader-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\n",
+        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: loader-prompt\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\n",
     )
     .expect("prompt card writes");
     std::fs::write(
         &agent_path,
-        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: loader-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: loader-agent\n  version: 1.0.0\nspec:\n  prompt: prompt.yaml\n  execution_route:\n    kind: native\n",
     )
     .expect("agent card writes");
 
@@ -937,14 +931,14 @@ fn bound_agent_request(
     let mut binding = json!({
         "verifier": {
             "kind": "Verifier", "name": verifier_name,
-            "version": "1.0.0", "space": "default"
+            "version": "1.0.0"
         },
         "on_failure": on_failure,
     });
     if let Some(trigger_name) = trigger_name {
         binding["runs_on"] = json!({
             "kind": "Trigger", "name": trigger_name,
-            "version": "1.0.0", "space": "default"
+            "version": "1.0.0"
         });
     }
     request_with_body(
@@ -952,11 +946,11 @@ fn bound_agent_request(
         json!({ "submissions": [{
             "apiVersion": "wyrd/v1",
             "kind": "Agent",
-            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "metadata": { "name": name, "version": "1.0.0" },
             "spec": {
                 "prompt": {
                     "kind": "Prompt", "name": prompt_name,
-                    "version": "1.0.0", "space": "default"
+                    "version": "1.0.0"
                 }, "execution_route": {"kind": "native"},
                 "verified_by": [binding],
             },
@@ -1043,7 +1037,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
             "referenced",
             json!([{
                 "kind": "Operator", "name": "binding-drift-counts-operator",
-                "version": "1.0.0", "space": "default"
+                "version": "1.0.0"
             }]),
         ),
         (
@@ -1196,8 +1190,7 @@ async fn referenced_binding_refusals_leave_no_writes() {
                     "kind": "Verifier",
                     "metadata": {
                         "name": "binding-nested-judge",
-                        "version": "1.0.0",
-                        "space": "default"
+                        "version": "1.0.0"
                     },
                     "spec": {
                         "requirements": [{
@@ -1208,14 +1201,13 @@ async fn referenced_binding_refusals_leave_no_writes() {
                                 "agent": {
                                     "prompt": {
                                         "kind": "Prompt", "name": "binding-prompt",
-                                        "version": "1.0.0", "space": "default"
+                                        "version": "1.0.0"
                                     }, "execution_route": {"kind": "native"},
                                     "verified_by": [{
                                         "verifier": {
                                             "kind": "Verifier",
                                             "name": "binding-assertion-verifier",
-                                            "version": "1.0.0",
-                                            "space": "default"
+                                            "version": "1.0.0"
                                         },
                                     }],
                                 },
@@ -1249,11 +1241,11 @@ fn agent_with_bindings(name: &str, verified_by: Value, idempotency_key: &str) ->
         json!({ "submissions": [{
             "apiVersion": "wyrd/v1",
             "kind": "Agent",
-            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "metadata": { "name": name, "version": "1.0.0" },
             "spec": {
                 "prompt": {
                     "kind": "Prompt", "name": "vc-prompt",
-                    "version": "1.0.0", "space": "default"
+                    "version": "1.0.0"
                 }, "execution_route": {"kind": "native"},
                 "verified_by": verified_by,
             },
@@ -1269,7 +1261,7 @@ fn standalone_card_request(kind: &str, name: &str, spec: Value, key: &str) -> Re
         json!({ "submissions": [{
             "apiVersion": "wyrd/v1",
             "kind": kind,
-            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "metadata": { "name": name, "version": "1.0.0" },
             "spec": spec,
             "artifacts": []
         }] }),
@@ -1306,7 +1298,8 @@ async fn verifier_contract_refusals_leave_no_writes() {
     };
     let tenant = server.data_tenant_id();
     seed_dependency(&server, tenant, "vc-prompt", "active").await;
-    let card_ref = |kind: &str, name: &str| json!({ "kind": kind, "name": name, "version": "1.0.0", "space": "default" });
+    let card_ref =
+        |kind: &str, name: &str| json!({ "kind": kind, "name": name, "version": "1.0.0" });
     let register = |kind: &'static str, name: &'static str, spec: Value| {
         let server = &server;
         let jwt = jwt.as_str();
@@ -1354,9 +1347,8 @@ async fn verifier_contract_refusals_leave_no_writes() {
         }
     };
 
-    // The declaration body is decoded by the plain JSON extractor, whose
-    // rejection is a 422 text body naming the failure rather than a Wyrd
-    // problem document; the refusal and its no-write boundary are what hold.
+    // A body the typed envelope cannot decode is refused as the stable
+    // validation problem whose reason names the failure, before any write.
     let undecodable = |label: &str, request: Request<Body>, needle: &str| {
         let server = &server;
         let jwt = jwt.as_str();
@@ -1368,12 +1360,19 @@ async fn verifier_contract_refusals_leave_no_writes() {
                 .await
                 .expect("undecodable registration responds");
             let status = response.status();
-            let bytes = to_bytes(response.into_body(), 1 << 20)
-                .await
-                .expect("response body reads");
-            let text = String::from_utf8_lossy(&bytes);
-            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{label}: {text}");
-            assert!(text.contains(needle.as_str()), "{label}: {text}");
+            let problem = response_json(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {problem}");
+            assert_eq!(
+                problem["code"], "WYRD_SPEC_400_VALIDATION",
+                "{label}: {problem}"
+            );
+            assert_eq!(problem["details"]["location"], "body", "{label}: {problem}");
+            assert!(
+                problem["details"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains(needle.as_str())),
+                "{label}: {problem}"
+            );
         }
     };
 
@@ -1520,6 +1519,31 @@ async fn verifier_contract_refusals_leave_no_writes() {
 ///
 /// # Panics
 /// Panics when a count cannot be read or any count is non-zero.
+/// Assert a removed `space` selector is refused as the stable validation problem.
+///
+/// `location` is the request part the typed extractor refused, `query` or
+/// `body`; the problem must name it and the rejected `space` field.
+///
+/// # Panics
+/// Panics when the response is not a 400 `application/problem+json`
+/// `WYRD_SPEC_400_VALIDATION` problem naming the location and `space`.
+async fn assert_space_refusal(response: Response<Body>, location: &str) {
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/problem+json"
+    );
+    let problem = response_json(response).await;
+    assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION", "{problem}");
+    assert_eq!(problem["details"]["location"], location, "{problem}");
+    assert!(
+        problem["details"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("unknown field `space`")),
+        "{problem}"
+    );
+}
+
 async fn assert_no_declaration_writes(server: &WyrdTestServer, operation_key: &str, name: &str) {
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -1591,13 +1615,13 @@ async fn composite_with_manifest_rejects_before_writes() {
                 json!({ "submissions": [
                     {
                         "apiVersion": "wyrd/v1", "kind": "Prompt",
-                        "metadata": { "name": "heavy", "version": "1.0.0", "space": "default" },
+                        "metadata": { "name": "heavy", "version": "1.0.0" },
                         "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                         "artifacts": [{ "relative_path": "prompt.txt", "sha256": "YQ==", "size_bytes": 1 }]
                     },
                     {
                         "apiVersion": "wyrd/v1", "kind": "Prompt",
-                        "metadata": { "name": "light", "version": "1.0.0", "space": "default" },
+                        "metadata": { "name": "light", "version": "1.0.0" },
                         "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                         "artifacts": []
                     }
@@ -1648,7 +1672,7 @@ async fn conflicting_artifact_paths_are_refused() {
                     key,
                     json!({ "submissions": [{
                         "apiVersion": "wyrd/v1", "kind": "Prompt",
-                        "metadata": { "name": key, "version": "1.0.0", "space": "default" },
+                        "metadata": { "name": key, "version": "1.0.0" },
                         "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
                         "artifacts": artifacts
                     }] }),
@@ -2172,7 +2196,7 @@ async fn delete_by_ref_not_found_records_one_decision() {
 
     let request = Request::builder()
         .method(Method::DELETE)
-        .uri("/v1/cards/by-ref?kind=Prompt&space=default&name=never-registered&version=1.0.0")
+        .uri("/v1/cards/by-ref?kind=Prompt&name=never-registered&version=1.0.0")
         .body(Body::empty())
         .expect("delete request builds");
     let response = server
@@ -2364,16 +2388,16 @@ async fn dependency_cycle_rejects_before_writes() {
                 json!({ "submissions": [
                     {
                         "apiVersion": "wyrd/v1", "kind": "Service",
-                        "metadata": { "name": "cycle-a", "version": "1.0.0", "space": "default" },
+                        "metadata": { "name": "cycle-a", "version": "1.0.0" },
                         "spec": { "components": [{ "alias": "b", "ref": { "sibling": {
-                            "kind": "Service", "name": "cycle-b", "version": "1.0.0", "space": "default"
+                            "kind": "Service", "name": "cycle-b", "version": "1.0.0"
                         }}}] }, "artifacts": []
                     },
                     {
                         "apiVersion": "wyrd/v1", "kind": "Service",
-                        "metadata": { "name": "cycle-b", "version": "1.0.0", "space": "default" },
+                        "metadata": { "name": "cycle-b", "version": "1.0.0" },
                         "spec": { "components": [{ "alias": "a", "ref": { "sibling": {
-                            "kind": "Service", "name": "cycle-a", "version": "1.0.0", "space": "default"
+                            "kind": "Service", "name": "cycle-a", "version": "1.0.0"
                         }}}] }, "artifacts": []
                     }
                 ] }),
@@ -2413,16 +2437,14 @@ async fn service_peer_composition_rejects_before_registry_resolution() {
                     "kind": "Service",
                     "metadata": {
                         "name": "component-service",
-                        "version": "1.0.0",
-                        "space": "default"
+                        "version": "1.0.0"
                     },
                     "spec": { "components": [{
                         "alias": "quality",
                         "ref": {
                             "kind": "Verifier",
                             "name": "quality",
-                            "version": "1.0.0",
-                            "space": "default"
+                            "version": "1.0.0"
                         }
                     }] },
                     "artifacts": []
@@ -2448,8 +2470,7 @@ async fn service_peer_composition_rejects_before_registry_resolution() {
                         "kind": "Service",
                         "metadata": {
                             "name": "orphan-service",
-                            "version": "1.0.0",
-                            "space": "default"
+                            "version": "1.0.0"
                         },
                         "spec": {},
                         "artifacts": []
@@ -2459,8 +2480,7 @@ async fn service_peer_composition_rejects_before_registry_resolution() {
                         "kind": "Verifier",
                         "metadata": {
                             "name": "orphan-quality",
-                            "version": "1.0.0",
-                            "space": "default"
+                            "version": "1.0.0"
                         },
                         "spec": assertion_verifier_spec(),
                         "artifacts": []
@@ -2599,7 +2619,7 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
             Request::builder()
                 .method(Method::GET)
                 .uri(format!(
-                    "/v1/cards/by-ref?kind=Prompt&space=default&name={prompt_name}&version=1.0.0"
+                    "/v1/cards/by-ref?kind=Prompt&name={prompt_name}&version=1.0.0"
                 ))
                 .body(Body::empty())
                 .expect("ref read request builds"),
@@ -2621,7 +2641,7 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
             &jwt,
             Request::builder()
                 .method(Method::GET)
-                .uri("/v1/cards/Prompt/default/composite-prompt/latest")
+                .uri("/v1/cards/Prompt/composite-prompt/latest")
                 .body(Body::empty())
                 .expect("latest read request builds"),
         )
@@ -2638,7 +2658,7 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
             &jwt,
             Request::builder()
                 .method(Method::GET)
-                .uri("/v1/cards/Prompt/default/composite-prompt/versions")
+                .uri("/v1/cards/Prompt/composite-prompt/versions")
                 .body(Body::empty())
                 .expect("versions request builds"),
         )
@@ -2707,7 +2727,7 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
             &jwt,
             Request::builder()
                 .method(Method::DELETE)
-                .uri("/v1/cards/by-ref?kind=Service&space=default&name=composite-service&version=1.0.0")
+                .uri("/v1/cards/by-ref?kind=Service&name=composite-service&version=1.0.0")
                 .body(Body::empty())
                 .expect("delete request builds"),
         )
@@ -2767,7 +2787,7 @@ async fn seed_binding_dependencies(server: &WyrdTestServer) -> CardUid {
 
 /// The reference to the seeded `vb-schedule` Trigger.
 fn schedule_trigger_ref() -> Value {
-    json!({ "kind": "Trigger", "name": "vb-schedule", "version": "1.0.0", "space": "default" })
+    json!({ "kind": "Trigger", "name": "vb-schedule", "version": "1.0.0" })
 }
 
 /// Build a Service-root declaration whose Service and component both own a binding.
@@ -2796,14 +2816,14 @@ fn bound_service_request(
 /// `on_failure` list, before posting it with [`request_with_body`].
 fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&str>) -> Value {
     let agent_ref = json!({ "sibling": {
-        "kind": "Agent", "name": "vb-agent", "version": "1.0.0", "space": "default"
+        "kind": "Agent", "name": "vb-agent", "version": "1.0.0"
     } });
     let mut components = vec![json!({
         "alias": "assistant",
         "ref": agent_ref,
         "verified_by": [{
             "verifier": {
-                "kind": "Verifier", "name": "vb-drift", "version": "1.0.0", "space": "default"
+                "kind": "Verifier", "name": "vb-drift", "version": "1.0.0"
             },
             "runs_on": { "kind": "schedule", "cron": "0 3 * * *" }
         }]
@@ -2814,13 +2834,13 @@ fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&
     json!({ "submissions": [
             {
                 "apiVersion": "wyrd/v1", "kind": "Service",
-                "metadata": { "name": service_name, "version": "1.0.0", "space": "default" },
+                "metadata": { "name": service_name, "version": "1.0.0" },
                 "spec": {
                     "components": components,
                     "verified_by": [{
                         "verifier": {
                             "kind": "Verifier", "name": "vb-drift",
-                            "version": "1.0.0", "space": "default"
+                            "version": "1.0.0"
                         },
                         "runs_on": runs_on,
                         "on_failure": [{
@@ -2833,9 +2853,9 @@ fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&
             },
             {
                 "apiVersion": "wyrd/v1", "kind": "Agent",
-                "metadata": { "name": "vb-agent", "version": "1.0.0", "space": "default" },
+                "metadata": { "name": "vb-agent", "version": "1.0.0" },
                 "spec": { "prompt": {
-                    "kind": "Prompt", "name": "vb-prompt", "version": "1.0.0", "space": "default"
+                    "kind": "Prompt", "name": "vb-prompt", "version": "1.0.0"
                 }, "execution_route": {"kind": "native"} },
                 "artifacts": []
             }
@@ -3122,7 +3142,7 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
     assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
 
     let service_ref: wyrd_spec::reference::CardRef = serde_json::from_value(json!({
-        "kind": "Service", "name": "vb-service", "version": "1.0.0", "space": "default"
+        "kind": "Service", "name": "vb-service", "version": "1.0.0"
     }))
     .expect("service ref decodes");
     let Bootstrap::Machine { api_key, .. } = server
@@ -3310,7 +3330,7 @@ async fn operator_bearing_declaration_requires_operator_invoke() {
         (
             "vb-referenced-op",
             json!([{
-                "kind": "Operator", "name": "vb-hook", "version": "1.0.0", "space": "default"
+                "kind": "Operator", "name": "vb-hook", "version": "1.0.0"
             }]),
         ),
     ];
@@ -3350,8 +3370,7 @@ async fn operator_bearing_declaration_requires_operator_invoke() {
                 with_on_failure(
                     "vb-both",
                     json!([{
-                        "kind": "Operator", "name": "vb-hook", "version": "1.0.0",
-                        "space": "default"
+                        "kind": "Operator", "name": "vb-hook", "version": "1.0.0"
                     }]),
                 ),
             ),
@@ -3369,134 +3388,6 @@ async fn operator_bearing_declaration_requires_operator_invoke() {
         declaration_audits(&server, both_id.as_uuid()).await,
         vec![allowed("cards:write"), allowed("operators:invoke")],
         "one allowed row per evaluated permission commits with the registration"
-    );
-
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// Declare the bound `vb-twin` Service in `space` and return its Service UID.
-///
-/// # Panics
-/// Panics when the declaration route fails to respond, refuses the graph, or
-/// returns no Service outcome UID.
-async fn register_twin(server: &WyrdTestServer, jwt: &str, space: &str) -> Uuid {
-    let mut body = bound_service_body("vb-twin", schedule_trigger_ref(), None);
-    body["submissions"][0]["metadata"]["space"] = json!(space);
-    let response = server
-        .oneshot_authenticated(
-            jwt,
-            request_with_body(&format!("vb-twin-{space}-operation"), body),
-        )
-        .await
-        .expect("twin registration responds");
-    let status = response.status();
-    let body = response_json(response).await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    let uid = body["outcomes"]
-        .as_array()
-        .expect("registration outcomes are an array")
-        .iter()
-        .find(|outcome| outcome["card_ref"]["kind"] == "Service")
-        .and_then(|outcome| outcome["card_ref"]["uid"].as_str())
-        .expect("Service outcome UID exists");
-    Uuid::parse_str(uid).expect("Service UID parses")
-}
-
-/// POST `/auth/issue-key` for `card_ref` as `jwt` and return status and body.
-///
-/// # Panics
-/// Panics when the request cannot be built or the route fails to respond.
-async fn issue_key(server: &WyrdTestServer, jwt: &str, card_ref: Value) -> (StatusCode, Value) {
-    let response = server
-        .oneshot_authenticated(
-            jwt,
-            Request::builder()
-                .method(Method::POST)
-                .uri("/auth/issue-key")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({ "card_ref": card_ref }).to_string()))
-                .expect("issue-key request builds"),
-        )
-        .await
-        .expect("issue-key responds");
-    let status = response.status();
-    (status, response_json(response).await)
-}
-
-/// Whether every binding row of `owner` still has no recorded activity.
-///
-/// # Panics
-/// Panics when the activity read fails.
-async fn never_activated(server: &WyrdTestServer, owner: Uuid) -> bool {
-    owner_activity(server, owner)
-        .await
-        .iter()
-        .all(|(seen, _, cursor)| seen.is_none() && cursor.is_none())
-}
-
-/// One Card identity in two spaces resolves only through an exact reference.
-///
-/// Declares the same bound Service kind, name, and version in the `default`
-/// and `blue` spaces, which projects two distinct Card-bound principals. An
-/// explicit-space `card_ref` issues a key for and — through the real API-key
-/// exchange — activates only its own space's owner; the same ref with its
-/// space omitted matches both principals and fails closed with the stable
-/// principal-not-found refusal, leaving both owners' activity untouched.
-///
-/// # Panics
-/// Panics when the server fails to start or stop, a bootstrap or fixture write
-/// fails, a route fails to respond, or any status, code, or activity
-/// expectation does not hold.
-#[tokio::test(flavor = "current_thread")]
-async fn same_card_in_two_spaces_resolves_only_exact_refs() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    seed_binding_dependencies(&server).await;
-    let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("vb-twin-admin", &["admin"])
-        .await
-        .expect("admin bootstraps")
-    else {
-        panic!("user bootstrap returned a non-user principal");
-    };
-    let default_owner = register_twin(&server, &jwt, "default").await;
-    let blue_owner = register_twin(&server, &jwt, "blue").await;
-    let twin_ref = |space: Option<&str>| {
-        let mut card_ref = json!({ "kind": "Service", "name": "vb-twin", "version": "1.0.0" });
-        if let Some(space) = space {
-            card_ref["space"] = json!(space);
-        }
-        card_ref
-    };
-
-    let (status, ambiguous) = issue_key(&server, &jwt, twin_ref(None)).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{ambiguous}");
-    assert_eq!(ambiguous["code"], "WYRD_AUTH_404_PRINCIPAL_NOT_FOUND");
-    assert!(never_activated(&server, default_owner).await);
-    assert!(never_activated(&server, blue_owner).await);
-
-    let (status, issued) = issue_key(&server, &jwt, twin_ref(Some("blue"))).await;
-    assert_eq!(status, StatusCode::OK, "{issued}");
-    let key = SecretString::from(issued["key"].as_str().expect("issued key").to_owned());
-    assert!(
-        never_activated(&server, blue_owner).await,
-        "issuance never activates the owner"
-    );
-    server
-        .exchange_api_key(&key)
-        .await
-        .expect("exact owner key exchanges");
-    assert!(
-        owner_activity(&server, blue_owner)
-            .await
-            .iter()
-            .all(|(seen, _, _)| seen.is_some()),
-        "the exchange activates the exact owner"
-    );
-    assert!(
-        never_activated(&server, default_owner).await,
-        "the same-named owner in another space is untouched"
     );
 
     server.shutdown().await.expect("test server shuts down");
@@ -3530,13 +3421,13 @@ async fn register_live(server: &WyrdTestServer, jwt: &str, version: &str) -> Uui
     Uuid::parse_str(uid).expect("Service UID parses")
 }
 
-/// The `vb-live` Service reference at `version` in the default space.
+/// The `vb-live` Service reference at `version`.
 ///
 /// # Panics
 /// Panics when the reference does not decode.
 fn live_ref(version: &str) -> CardRef {
     serde_json::from_value(json!({
-        "kind": "Service", "name": "vb-live", "version": version, "space": "default"
+        "kind": "Service", "name": "vb-live", "version": version
     }))
     .expect("live ref decodes")
 }
@@ -3959,7 +3850,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
             &jwt,
             Request::builder()
                 .method(Method::DELETE)
-                .uri("/v1/cards/by-ref?kind=Service&space=default&name=vb-live&version=2.0.0")
+                .uri("/v1/cards/by-ref?kind=Service&name=vb-live&version=2.0.0")
                 .body(Body::empty())
                 .expect("delete request builds"),
         )
@@ -4106,7 +3997,7 @@ fn inline_agent_request(name: &str, message: &str, idempotency_key: &str) -> Req
             "submissions": [{
                 "apiVersion": "wyrd/v1",
                 "kind": "Agent",
-                "metadata": { "name": name, "space": "default" },
+                "metadata": { "name": name },
                 "spec": {
                     "prompt": portable_prompt(message),
                     "execution_route": { "kind": "native" }
@@ -4222,7 +4113,6 @@ async fn inline_agent_prompt_materializes() {
     let prompt = outcome_for(&first, "Prompt");
     let agent = outcome_for(&first, "Agent");
     assert_eq!(prompt["card_ref"]["name"], "inline-agent-prompt");
-    assert_eq!(prompt["card_ref"]["space"], "default");
     assert_eq!(prompt["outcome"], "declared");
     assert_eq!(prompt["status"], "active");
     let pinned = persisted_agent_prompt(&server, agent).await;
@@ -4323,7 +4213,7 @@ fn pinned_inline_agent(name: &str, version: &str, message: &str, tool_names: &[&
     json!({
         "apiVersion": "wyrd/v1",
         "kind": "Agent",
-        "metadata": { "name": name, "version": version, "space": "default" },
+        "metadata": { "name": name, "version": version },
         "spec": {
             "prompt": portable_prompt(message),
             "execution_route": { "kind": "native" },
@@ -4340,14 +4230,14 @@ fn sibling_service(name: &str, components: &[(&str, &str, &str, &str)]) -> Value
         .iter()
         .map(|(alias, kind, card, version)| {
             json!({ "alias": alias, "ref": { "sibling": {
-                "kind": kind, "name": card, "version": version, "space": "default"
+                "kind": kind, "name": card, "version": version
             } } })
         })
         .collect();
     json!({
         "apiVersion": "wyrd/v1",
         "kind": "Service",
-        "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+        "metadata": { "name": name, "version": "1.0.0" },
         "spec": { "components": components },
         "artifacts": []
     })
@@ -4594,7 +4484,7 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
             json!({
                 "apiVersion": "wyrd/v1",
                 "kind": "Prompt",
-                "metadata": { "name": "authored-agent-prompt", "version": "0.1.0", "space": "default" },
+                "metadata": { "name": "authored-agent-prompt", "version": "0.1.0" },
                 "spec": portable_prompt("same"),
                 "artifacts": []
             }),
@@ -4653,7 +4543,7 @@ async fn inline_agent_prompt_reuses_transaction_selection() {
             json!({
                 "apiVersion": "wyrd/v1",
                 "kind": "Prompt",
-                "metadata": { "name": "twin-agent-prompt", "version": "0.1.0", "space": "default" },
+                "metadata": { "name": "twin-agent-prompt", "version": "0.1.0" },
                 "spec": portable_prompt("other"),
                 "artifacts": []
             }),
@@ -4811,6 +4701,234 @@ async fn invalid_prompt_authoring_is_refused_before_writes() {
             assert_no_declaration_writes(&server, name, name).await;
         }
     }
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+#[tokio::test(flavor = "current_thread")]
+/// The HTTP contract names a Card by kind, name, and version alone.
+///
+/// A declared Prompt's receipt and stored metadata carry no space, the flat
+/// `by-ref` and `latest` reads find it, the removed space route segment is not
+/// served, and a submission naming `metadata.space` is refused before
+/// persisting.
+///
+/// # Panics
+/// Panics when the server, bootstrap, or a request fails, or a response
+/// carries a space, serves the removed route, or accepts a spaced submission.
+async fn flat_card_http_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("flat-http-writer", &["editor"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let get = |uri: &str| {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("read request builds")
+    };
+    let delete = |uri: &str| {
+        Request::builder()
+            .method(Method::DELETE)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("delete request builds")
+    };
+
+    let declared = server
+        .oneshot_authenticated(
+            &jwt,
+            prompt_declaration_request("flat-http", "flat-http-001"),
+        )
+        .await
+        .expect("declaration responds");
+    assert_eq!(declared.status(), StatusCode::CREATED);
+    let receipt = response_json(declared).await;
+    let card_ref = &receipt["outcomes"][0]["card_ref"];
+    assert_eq!(card_ref["kind"], "Prompt");
+    assert_eq!(card_ref["name"], "flat-http");
+    assert!(card_ref.get("space").is_none(), "{receipt}");
+
+    let by_ref = server
+        .oneshot_authenticated(
+            &jwt,
+            get("/v1/cards/by-ref?kind=Prompt&name=flat-http&version=1.0.0"),
+        )
+        .await
+        .expect("by-ref responds");
+    assert_eq!(by_ref.status(), StatusCode::OK);
+    let card = response_json(by_ref).await["card"].clone();
+    assert_eq!(card["metadata"]["uid"], card_ref["uid"]);
+    assert!(card["metadata"].get("space").is_none(), "{card}");
+
+    let latest = server
+        .oneshot_authenticated(&jwt, get("/v1/cards/Prompt/flat-http/latest"))
+        .await
+        .expect("latest responds");
+    assert_eq!(latest.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(latest).await["card"]["metadata"]["uid"],
+        card_ref["uid"]
+    );
+
+    let removed_route = server
+        .oneshot_authenticated(&jwt, get("/v1/cards/Prompt/default/flat-http/latest"))
+        .await
+        .expect("removed route responds");
+    assert_eq!(removed_route.status(), StatusCode::NOT_FOUND);
+
+    let spaced = server
+        .oneshot_authenticated(
+            &jwt,
+            request_with_body(
+                "flat-http-spaced",
+                json!({
+                    "submissions": [{
+                        "apiVersion": "wyrd/v1",
+                        "kind": "Prompt",
+                        "metadata": {"name": "flat-spaced", "space": "default", "version": "1.0.0"},
+                        "spec": {
+                            "provider": "openai",
+                            "model": "gpt-4o",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        },
+                        "artifacts": []
+                    }]
+                }),
+            ),
+        )
+        .await
+        .expect("spaced declaration responds");
+    assert_space_refusal(spaced, "body").await;
+    assert_no_declaration_writes(&server, "flat-http-spaced", "flat-spaced").await;
+
+    let nested = server
+        .oneshot_authenticated(
+            &jwt,
+            request_with_body(
+                "flat-http-nested",
+                json!({
+                    "submissions": [{
+                        "apiVersion": "wyrd/v1",
+                        "kind": "Agent",
+                        "metadata": {"name": "flat-nested", "version": "1.0.0"},
+                        "spec": {
+                            "prompt": {
+                                "kind": "Prompt",
+                                "name": "flat-http",
+                                "space": "default",
+                                "version": "1.0.0"
+                            },
+                            "execution_route": {"kind": "native"}
+                        },
+                        "artifacts": []
+                    }]
+                }),
+            ),
+        )
+        .await
+        .expect("nested spaced declaration responds");
+    assert_eq!(nested.status(), StatusCode::BAD_REQUEST);
+    let problem = response_json(nested).await;
+    assert_eq!(
+        problem["code"], "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+        "{problem}"
+    );
+    assert!(problem.to_string().contains("space"), "{problem}");
+    assert_no_declaration_writes(&server, "flat-http-nested", "flat-nested").await;
+
+    let listed = server
+        .oneshot_authenticated(&jwt, get("/v1/cards?kind=Prompt&space=default"))
+        .await
+        .expect("spaced list responds");
+    assert_space_refusal(listed, "query").await;
+    let versions = server
+        .oneshot_authenticated(
+            &jwt,
+            get("/v1/cards/Prompt/flat-http/versions?space=default"),
+        )
+        .await
+        .expect("spaced versions read responds");
+    assert_space_refusal(versions, "query").await;
+
+    let uid = card_ref["uid"].clone();
+    for space in ["default", "nowhere"] {
+        let selector =
+            format!("/v1/cards/by-ref?kind=Prompt&name=flat-http&version=1.0.0&space={space}");
+        let read = server
+            .oneshot_authenticated(&jwt, get(&selector))
+            .await
+            .expect("spaced by-ref read responds");
+        assert_space_refusal(read, "query").await;
+        let deleted = server
+            .oneshot_authenticated(&jwt, delete(&selector))
+            .await
+            .expect("spaced by-ref delete responds");
+        assert_space_refusal(deleted, "query").await;
+        let kept = server
+            .oneshot_authenticated(
+                &jwt,
+                get("/v1/cards/by-ref?kind=Prompt&name=flat-http&version=1.0.0"),
+            )
+            .await
+            .expect("flat read after refused delete responds");
+        assert_eq!(kept.status(), StatusCode::OK);
+        let card = response_json(kept).await["card"].clone();
+        assert_eq!(card["metadata"]["uid"], uid);
+        assert_eq!(card["status"]["phase"], "active", "{card}");
+    }
+
+    let unparsable = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/cards")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "flat-http-syntax")
+                .body(Body::from("{\"submissions\": ["))
+                .expect("syntax request builds"),
+        )
+        .await
+        .expect("syntax refusal responds");
+    assert_eq!(unparsable.status(), StatusCode::BAD_REQUEST);
+    let untyped = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/cards")
+                .header("Idempotency-Key", "flat-http-untyped")
+                .body(Body::from("{}"))
+                .expect("content-type request builds"),
+        )
+        .await
+        .expect("content-type refusal responds");
+    assert_eq!(untyped.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let removed = server
+        .oneshot_authenticated(
+            &jwt,
+            delete("/v1/cards/by-ref?kind=Prompt&name=flat-http&version=1.0.0"),
+        )
+        .await
+        .expect("flat delete responds");
+    assert_eq!(removed.status(), StatusCode::OK);
+    let gone = server
+        .oneshot_authenticated(
+            &jwt,
+            get("/v1/cards/by-ref?kind=Prompt&name=flat-http&version=1.0.0"),
+        )
+        .await
+        .expect("read after delete responds");
+    assert_eq!(gone.status(), StatusCode::NOT_FOUND);
 
     server.shutdown().await.expect("test server shuts down");
 }

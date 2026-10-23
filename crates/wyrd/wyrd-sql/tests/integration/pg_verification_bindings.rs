@@ -44,7 +44,7 @@ fn service_card(name: &str, version: &str) -> Card {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": "Service",
-        "metadata": { "name": name, "version": version, "space": "default" },
+        "metadata": { "name": name, "version": version },
         "spec": {},
         "relationships": { "outbound": [], "inbound": [] }
     }))
@@ -324,9 +324,9 @@ async fn agent_owner_occurrence_is_the_reserved_key() {
     let agent: Card = serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": "Agent",
-        "metadata": { "name": "helper", "version": "1.0.0", "space": "default" },
+        "metadata": { "name": "helper", "version": "1.0.0" },
         "spec": { "prompt": {
-            "kind": "Prompt", "name": "helper-prompt", "version": "1.0.0", "space": "default"
+            "kind": "Prompt", "name": "helper-prompt", "version": "1.0.0"
         }, "execution_route": {"kind": "native"}},
         "relationships": { "outbound": [], "inbound": [] }
     }))
@@ -738,8 +738,8 @@ async fn non_v7_stored_identities_are_refused() {
     let v4_owner = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO wyrd.cards \
-            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
-         VALUES ($1, wyrd.current_tenant(), 'Service', 'default', 'v4-owner', '1.0.0', \
+            (card_uid, data_tenant_id, kind, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
+         VALUES ($1, wyrd.current_tenant(), 'Service', 'v4-owner', '1.0.0', \
                  '{}'::jsonb, 'spec-hash', 'active', '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
     )
     .bind(v4_owner)

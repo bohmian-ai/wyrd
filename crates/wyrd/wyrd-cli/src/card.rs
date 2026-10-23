@@ -56,9 +56,6 @@ pub struct SelectorArgs {
     /// Card kind, such as `Model` or `Prompt`.
     #[arg(long, value_name = "KIND")]
     pub kind: Option<String>,
-    /// Card space for a named selector or an optional UID assertion.
-    #[arg(long, value_name = "SPACE")]
-    pub space: Option<String>,
     /// Card name for a named selector or an optional UID assertion.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
@@ -131,9 +128,6 @@ pub struct LatestArgs {
     /// Card kind, such as `Model` or `Prompt`.
     #[arg(long, value_name = "KIND")]
     pub kind: String,
-    /// Card space.
-    #[arg(long, value_name = "SPACE")]
-    pub space: String,
     /// Card name.
     #[arg(long, value_name = "NAME")]
     pub name: String,
@@ -151,9 +145,6 @@ pub struct ListArgs {
     /// Optional Card kind filter.
     #[arg(long, value_name = "KIND")]
     pub kind: Option<String>,
-    /// Optional Card space filter.
-    #[arg(long, value_name = "SPACE")]
-    pub space: Option<String>,
     /// Optional Card name filter.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
@@ -219,8 +210,6 @@ pub struct CheckReport {
 pub struct CheckCard {
     /// Card kind wire name.
     pub kind: String,
-    /// Authored space, or `None` for the default space.
-    pub space: Option<String>,
     /// Card name.
     pub name: String,
     /// Authored version, or `None` when the server assigns one.
@@ -375,8 +364,8 @@ pub async fn dispatch_declare(args: DeclareArgs) -> Result<ExitCode, WyrdCliErro
 /// omitted, as a client built from the ambient credential chain.
 ///
 /// # Arguments
-/// - `selector`: the Card to read, by kind, space, name, and version, or by
-///   kind and UID.
+/// - `selector`: the Card to read, by kind, name, and version, or by kind
+///   and UID.
 /// - `client`: the principal to read as; `None` resolves the ambient chain.
 ///
 /// # Errors
@@ -434,8 +423,8 @@ pub async fn dispatch_get(args: GetArgs) -> Result<ExitCode, WyrdCliError> {
 /// from the ambient credential chain.
 ///
 /// # Arguments
-/// - `selector`: the Card to resolve, by kind, space, name, and version, or
-///   by UID.
+/// - `selector`: the Card to resolve, by kind, name, and version, or by
+///   UID.
 /// - `output_dir`: the directory the Card bundle is published to.
 /// - `metadata_only`: write Card metadata without artifact payloads.
 /// - `client`: the principal to read as; `None` resolves the ambient chain.
@@ -510,7 +499,7 @@ pub async fn dispatch_pull(args: PullArgs) -> Result<ExitCode, WyrdCliError> {
 
 /// Resolve and print the latest Active Card version for a named identity.
 ///
-/// The command parses the kind, space, and name before asking the shared
+/// The command parses the kind and name before asking the shared
 /// registry handle for the exact server-resolved `CardRef`.
 ///
 /// # Errors
@@ -524,11 +513,10 @@ pub async fn dispatch_pull(args: PullArgs) -> Result<ExitCode, WyrdCliError> {
 /// printed; the read is non-durable and safe to retry.
 pub async fn dispatch_latest(args: LatestArgs) -> Result<ExitCode, WyrdCliError> {
     let kind = parse_kind(&args.kind)?;
-    let space = parse_id("space", &args.space, "a valid Card space")?;
     let name = parse_id("name", &args.name, "a valid Card name")?;
     let cards = build_cards(args.connection.server.as_deref()).await?;
     let card_ref = cards
-        .resolve_latest(kind, space, name)
+        .resolve_latest(kind, name)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
     let output = LatestOutput { card_ref };
@@ -565,11 +553,6 @@ pub async fn dispatch_list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
     }
     let request = ListCardsRequest {
         kind: args.kind.as_deref().map(parse_kind).transpose()?,
-        space: args
-            .space
-            .as_deref()
-            .map(|value| parse_id("space", value, "a valid Card space"))
-            .transpose()?,
         name: args
             .name
             .as_deref()
@@ -637,6 +620,18 @@ async fn build_cards(server: Option<&str>) -> Result<Cards, WyrdCliError> {
     Ok(Cards::connect_with(&crate::client::from_global(server)?).await?)
 }
 
+/// Build the Card selector a `get`, `pull`, or `delete` invocation names.
+///
+/// `--uid` wins: it needs `--kind` and treats `--name` and `--version` as
+/// assertions about the UID's Card. Otherwise the selector is the flat
+/// `--kind`/`--name` line, narrowed to one Card by `--version`. A delete
+/// (`require_exact_for_delete`) must name one exact Card, never a line.
+///
+/// # Errors
+/// Returns an invalid-argument error for an unknown kind, an ill-formed
+/// version, name, or UID, or a missing `--kind` or `--name`, and
+/// [`WyrdCliError::DeleteSelectorRequiresExact`] for a delete naming neither a
+/// UID nor a version.
 fn selector_from_args(
     args: &SelectorArgs,
     require_exact_for_delete: bool,
@@ -654,35 +649,25 @@ fn selector_from_args(
         let kind =
             kind.ok_or_else(|| invalid_argument("kind", "<missing>", "required with --uid"))?;
         let uid = parse_id("uid", uid, "a valid UUIDv7 Card UID")?;
-        let space = args
-            .space
-            .as_deref()
-            .map(|value| parse_id("space", value, "a valid Card space"))
-            .transpose()?;
         let name = args
             .name
             .as_deref()
             .map(|value| parse_id("name", value, "a valid Card name"))
             .transpose()?;
         return Ok(CardSelector::uid(kind, uid)
-            .with_identity_assertions(space, name)
+            .with_identity_assertions(name)
             .with_optional_version(version));
     }
     if require_exact_for_delete && version.is_none() {
         return Err(WyrdCliError::DeleteSelectorRequiresExact);
     }
     let kind = kind.ok_or_else(|| invalid_argument("kind", "<missing>", "required"))?;
-    let space = args
-        .space
-        .as_deref()
-        .ok_or_else(|| invalid_argument("space", "<missing>", "required for a named selector"))
-        .and_then(|value| parse_id("space", value, "a valid Card space"))?;
     let name = args
         .name
         .as_deref()
         .ok_or_else(|| invalid_argument("name", "<missing>", "required for a named selector"))
         .and_then(|value| parse_id("name", value, "a valid Card name"))?;
-    let selector = CardSelector::named(kind, space, name);
+    let selector = CardSelector::named(kind, name);
     Ok(selector.with_optional_version(version))
 }
 
@@ -754,13 +739,16 @@ pub(crate) fn invalid_argument(field: &str, value: &str, expected: &str) -> Wyrd
     }
 }
 
+/// Project loaded submissions onto the `check` report's flat Card identities.
+///
+/// The version is the authored selection, or `None` when the server will
+/// allocate one.
 fn check_cards(input: &DeclarationInput) -> Vec<CheckCard> {
     input
         .submissions
         .iter()
         .map(|submission| CheckCard {
             kind: submission.kind.wire_name().to_owned(),
-            space: submission.metadata.space.as_ref().map(ToString::to_string),
             name: submission.metadata.name.to_string(),
             version: submission
                 .metadata
@@ -771,12 +759,13 @@ fn check_cards(input: &DeclarationInput) -> Vec<CheckCard> {
         .collect()
 }
 
+/// Print a passing `check` report for a person: one `Kind/name@version` line
+/// per Card, with `auto` for a server-allocated version, then any warnings.
 fn print_check_text(report: &CheckReport) {
     println!("check valid: {} card(s)", report.cards.len());
     for card in &report.cards {
-        let space = card.space.as_deref().unwrap_or("default");
         let version = card.version.as_deref().unwrap_or("auto");
-        println!("  {} {space}/{}@{version}", card.kind, card.name);
+        println!("  {}/{}@{version}", card.kind, card.name);
     }
     for diagnostic in &report.diagnostics {
         println!("warning {}: {}", diagnostic.code, diagnostic.message);
@@ -831,12 +820,13 @@ fn print_pull_text(output: &PullSummary) {
     );
 }
 
+/// Print one list page for a person: one `Kind/name@version status=…` line
+/// per summary, then the continuation cursor when another page exists.
 fn print_list_text(response: &ListCardsResponse) {
     for item in &response.items {
         println!(
-            "{} {}/{}@{} status={:?}",
+            "{}/{}@{} status={:?}",
             item.kind.wire_name(),
-            item.space,
             item.name,
             item.version,
             item.status
@@ -872,7 +862,6 @@ mod tests {
     fn unknown_kind_selector() -> SelectorArgs {
         SelectorArgs {
             kind: Some("NotAKind".to_owned()),
-            space: Some("default".to_owned()),
             name: Some("cli-prompt".to_owned()),
             version: None,
             uid: None,
@@ -891,7 +880,7 @@ mod tests {
         let path = temp.path().join("prompt.yaml");
         std::fs::write(
             &path,
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\n",
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: cli-prompt\n  version: 1.0.0\nspec:\n  provider: openai\n  model: gpt-4o\n  messages:\n    - role: user\n      content: hello\n",
         )
         .expect("prompt card writes");
         let missing = temp.path().join("missing.yaml");
@@ -903,7 +892,6 @@ mod tests {
                 "ok": true,
                 "cards": [{
                     "kind": "Prompt",
-                    "space": "default",
                     "name": "cli-prompt",
                     "version": "1.0.0",
                 }],

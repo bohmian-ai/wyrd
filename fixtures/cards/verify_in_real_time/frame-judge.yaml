@@ -3,7 +3,6 @@ kind: Agent
 metadata:
   name: frame-judge
   version: 1.0.0
-  space: default
 spec:
   prompt: ./frame-prompt.yaml
   execution_route: {kind: wyrd_gateway, deployment: openai}

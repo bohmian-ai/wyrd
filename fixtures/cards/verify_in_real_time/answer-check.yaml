@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: answer-check
   version: 1.0.0
-  space: default
 spec:
   description: The agent answers "yes".
   inputs:

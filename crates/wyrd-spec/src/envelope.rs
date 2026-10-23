@@ -26,7 +26,7 @@ use crate::card::service::ServiceSpec;
 use crate::card::source::SourceSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::verifier::{VerificationStatus, VerifierSpec};
-use crate::ids::{CardName, CardUid, SpaceName};
+use crate::ids::{CardName, CardUid};
 use crate::metadata::{Annotations, Labels};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 
@@ -160,6 +160,7 @@ pub struct Card {
 ///   [`VersionBlock`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Metadata {
     /// Card name.
     pub name: CardName,
@@ -174,9 +175,6 @@ pub struct Metadata {
     /// path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bump: Option<VersionBump>,
-    /// Optional space.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub space: Option<SpaceName>,
     /// Optional resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<CardUid>,

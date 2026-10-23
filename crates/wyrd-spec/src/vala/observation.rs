@@ -66,7 +66,7 @@ mod observation_tests {
     //! descriptor.
 
     use crate::envelope::CardKind;
-    use crate::ids::{CardName, SpaceName};
+    use crate::ids::CardName;
     use crate::reference::CardRef;
     use crate::vala::api::BifrostTableName;
     use crate::vala::ids::RunId;
@@ -78,7 +78,6 @@ mod observation_tests {
             kind: CardKind::Agent,
             name: CardName::new("my-agent").unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
         }
     }

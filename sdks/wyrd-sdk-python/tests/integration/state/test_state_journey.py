@@ -23,13 +23,13 @@ TYPED_STATE_SOURCE = (
     / "crates/wyrd/wyrd-cli/tests/fixtures/card_lifecycle/typed_state"
 )
 EXPECTED_ALIASES = (
+    "Data-training-1.0.0",
+    "Prompt-inline-prompt-0.1.0",
+    "Prompt-triage-prompt-1.0.0",
+    "Verifier-model-drift-1.0.0",
+    "Verifier-quality-1.0.0",
     "agent_inline",
     "agent_triage",
-    "default-Data-training-1.0.0",
-    "default-Prompt-inline-prompt-0.1.0",
-    "default-Prompt-triage-prompt-1.0.0",
-    "default-Verifier-model-drift-1.0.0",
-    "default-Verifier-quality-1.0.0",
     "model_primary",
     "model_shadow",
     "root",
@@ -56,7 +56,6 @@ def models(cards: Cards) -> dict[str, CardRef]:
         alias: cards.model.declare(
             ModelCard(
                 SklearnInterface(model=model),
-                space="default",
                 name=name,
                 version="1.0.0",
                 metadata=metadata,
@@ -70,9 +69,7 @@ def models(cards: Cards) -> dict[str, CardRef]:
 def service(cards: Cards, models: dict[str, CardRef]) -> CardRef:
     """The registered ``typed_state`` Service, after its Models and training Data."""
     cards.data.declare(
-        DataCard(
-            PandasInterface(data=TRAINING_DATA), space="default", name="training", version="1.0.0"
-        )
+        DataCard(PandasInterface(data=TRAINING_DATA), name="training", version="1.0.0")
     )
     return cards.declare_from_path(TYPED_SERVICE).root
 
@@ -117,15 +114,15 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
             state.model(alias).model.predict([[0.0], [1.0]]), np.array([0, 1])
         )
     assert state.model("model_primary") is not state.model("model_shadow")
-    pd.testing.assert_frame_equal(state.data("default-Data-training-1.0.0").data, TRAINING_DATA)
+    pd.testing.assert_frame_equal(state.data("Data-training-1.0.0").data, TRAINING_DATA)
     assert state.agent("agent_triage").prompt().ref == state.card_ref("triage_prompt")
     assert state.agent("agent_inline").prompt().ref.name == "inline-prompt"
-    assert state.prompt("triage_prompt") is state.prompt("default-Prompt-triage-prompt-1.0.0")
+    assert state.prompt("triage_prompt") is state.prompt("Prompt-triage-prompt-1.0.0")
     assert state.prompt("triage_prompt") is state.prompt("shared_prompt")
-    quality = state.verifier("default-Verifier-quality-1.0.0")
+    quality = state.verifier("Verifier-quality-1.0.0")
     assert quality.kind is wyrd.CardKind.Verifier
     assert quality.spec["requirements"][0]["check"]["kind"] == "assert"
-    drift = state.verifier("default-Verifier-model-drift-1.0.0")
+    drift = state.verifier("Verifier-model-drift-1.0.0")
     assert drift.kind is wyrd.CardKind.Verifier
     assert drift.spec["requirements"][0]["check"]["kind"] == "drift"
     for alias in state.aliases:

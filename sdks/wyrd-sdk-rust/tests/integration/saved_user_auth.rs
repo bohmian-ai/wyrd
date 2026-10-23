@@ -110,7 +110,6 @@ impl SavedLogins {
 fn prompts() -> ListCardsRequest {
     ListCardsRequest {
         kind: Some(CardKind::Prompt),
-        space: None,
         name: None,
         version_range: None,
         status: None,

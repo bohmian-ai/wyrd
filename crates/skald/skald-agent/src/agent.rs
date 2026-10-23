@@ -452,13 +452,6 @@ impl Agent {
         self
     }
 
-    /// Return a copy with a card space.
-    #[must_use]
-    pub fn space(mut self, space: impl Into<String>) -> Self {
-        self.meta.space = Some(space.into());
-        self
-    }
-
     /// Return a copy with labels.
     #[must_use]
     pub fn labels(mut self, labels: Labels) -> Self {
@@ -555,12 +548,6 @@ impl Agent {
     #[must_use]
     pub fn version_str(&self) -> Option<&str> {
         self.meta.version.as_deref()
-    }
-
-    /// Return the optional card space.
-    #[must_use]
-    pub fn space_str(&self) -> Option<&str> {
-        self.meta.space.as_deref()
     }
 
     /// Return the preserved prompt reference.
@@ -693,7 +680,6 @@ impl Agent {
         agent.meta = CardMetadata {
             name: Some(card.name),
             version: Some(card.version),
-            space: Some(card.space),
             uid: (!card.uid.is_empty()).then_some(card.uid),
             labels: card.labels,
             annotations: card.annotations,
@@ -849,11 +835,6 @@ impl Agent {
         let name = self.meta.name.clone()?;
         let Some(version) = self.meta.version.clone() else {
             return Some(AgentCard {
-                space: self
-                    .meta
-                    .space
-                    .clone()
-                    .unwrap_or_else(|| "default".to_owned()),
                 name,
                 version: String::new(),
                 uid: self.meta.uid.clone().unwrap_or_default(),
@@ -865,11 +846,6 @@ impl Agent {
             });
         };
         Some(AgentCard {
-            space: self
-                .meta
-                .space
-                .clone()
-                .unwrap_or_else(|| "default".to_owned()),
             name,
             version,
             uid: self.meta.uid.clone().unwrap_or_default(),

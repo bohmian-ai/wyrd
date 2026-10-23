@@ -123,11 +123,11 @@ async fn quickstart_verifies_and_repeats() {
     assert_eq!(passed, "passed: the comparison held");
     assert_eq!(failed, "failed: operator NotContains returned false");
     assert!(
-        subject.starts_with("  subject:  default/Service/support-reply@1.0.0#"),
+        subject.starts_with("  subject:  Service/support-reply@1.0.0#"),
         "{first}"
     );
     assert!(
-        verifier.starts_with("  verifier: default/Verifier/no-refund-promise@1.0.0#"),
+        verifier.starts_with("  verifier: Verifier/no-refund-promise@1.0.0#"),
         "{first}"
     );
     assert_eq!((failed_subject, failed_verifier), (subject, verifier));

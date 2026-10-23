@@ -134,7 +134,7 @@ async fn script_investigator(upstream: &MockServer) {
             "call-card",
             TOOLS[0],
             &json!({ "card_ref": {
-                "kind": "Service", "name": "policy-desk", "version": "1.0.0", "space": "default"
+                "kind": "Service", "name": "policy-desk", "version": "1.0.0"
             } }),
         ),
         tool_call(

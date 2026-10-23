@@ -353,7 +353,7 @@ test("unfitted baseline is skipped on schedule", async ({ server }) => {
   const { root } = await cards.declareFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-unfitted-"));
   await cards.pull(root, bundle);
-  const key = await cli.issueKey({ ...root, space: root.space ?? "default" });
+  const key = await cli.issueKey(root);
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key.key }) });
   await state.startBifrost();
   const observe = state.run("model").observe;
@@ -501,7 +501,7 @@ async function grouped(baseUrl: string, path: string) {
   const receipt = await cards.declareFromPath(fixture(path));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
   await cards.pull(receipt.root, bundle);
-  const issued = await cli.issueKey({ ...receipt.root, space: receipt.root.space ?? "default" });
+  const issued = await cli.issueKey(receipt.root);
   const token = await WyrdClient.connect().accessToken();
   const bindingIds: string[] = [];
   for (const id of (await cards.get(receipt.root)).status?.verification?.binding_ids ?? []) {
@@ -760,7 +760,7 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
     );
     expect(refused?.code, name).toBe(code);
     expect(`${refused?.message} ${JSON.stringify(refused?.details)}`, name).toContain(reason);
-    await expect(cards.resolveLatest(kind, "default", name), name).rejects.toMatchObject({
+    await expect(cards.resolveLatest(kind, name), name).rejects.toMatchObject({
       code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
     });
   }
@@ -798,7 +798,7 @@ test("grouped sampled frames use visible outcomes", async ({ server, provider, a
   const other = await cards.declareFromPath(fixture("cards/verify_in_real_time/frames-other.yaml"));
   const otherBundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
   await cards.pull(other.root, otherBundle);
-  const otherKey = await cli.issueKey({ ...other.root, space: other.root.space ?? "default" });
+  const otherKey = await cli.issueKey(other.root);
   const otherState = WyrdState.fromPath(otherBundle, { client: WyrdClient.connect({ credential: otherKey.key }) });
   await otherState.startBifrost();
   const reported = (event: string) =>
@@ -940,7 +940,7 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
   const bReceipt = await bCards.declareFromPath(fixture("cards/verify_in_real_time/support.yaml"));
   const bBundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
   await bCards.pull(bReceipt.root, bBundle);
-  const bKey = await cli.issueKey({ ...bReceipt.root, space: bReceipt.root.space ?? "default" }, { client: tenantB });
+  const bKey = await cli.issueKey(bReceipt.root, { client: tenantB });
   const bState = WyrdState.fromPath(bBundle, { client: WyrdClient.connect({ credential: bKey.key }) });
   await bState.startBifrost();
   await bState.run("agent").observe.verify("turn-check", turn("tenant b"), { positional: true, group_id: "conv-a" });

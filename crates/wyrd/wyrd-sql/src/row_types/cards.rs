@@ -10,7 +10,7 @@ use wyrd_semver::VersionBlock;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::envelope::{CardKind, Spec};
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::metadata::{Annotations, Labels};
 
 use crate::error::SqlError;
@@ -18,7 +18,7 @@ use crate::error::SqlError;
 /// Shared SELECT column list for `wyrd.cards` queries.
 ///
 /// Must stay in lockstep with the positional `FromRow` decode order on [`CardRow`].
-pub const CARD_ROW_COLUMNS: &str = "card_uid, data_tenant_id, kind, space, name, version, \
+pub const CARD_ROW_COLUMNS: &str = "card_uid, data_tenant_id, kind, name, version, \
      spec, spec_hash, artifact_hash, labels, annotations, \
      status, sub_principal_id, act_principal_id, created_at, updated_at, card_blob_uri";
 
@@ -35,8 +35,6 @@ pub struct CardRow {
     pub data_tenant_id: Uuid,
     /// Wire-name kind string (`"Data"`, `"Model"`, …).
     pub kind: String,
-    /// Space slug.
-    pub space: String,
     /// Card name slug.
     pub name: String,
     /// Canonical version block string (resolved semver pin).
@@ -88,8 +86,6 @@ pub struct ParsedCardRow {
     pub data_tenant_id: Uuid,
     /// Card kind discriminator.
     pub kind: CardKind,
-    /// Typed space slug.
-    pub space: SpaceName,
     /// Typed card name slug.
     pub name: CardName,
     /// Parsed version block.
@@ -121,13 +117,13 @@ impl TryFrom<CardRow> for ParsedCardRow {
 
     /// Parse a raw `wyrd.cards` row into its typed Card fields.
     ///
-    /// Decodes the kind, space, name, version, kind-specific spec, labels,
+    /// Decodes the kind, name, version, kind-specific spec, labels,
     /// annotations, status, and UID, and pairs the stored subject and actor
     /// into the Card's creation [`Attribution`] unchanged. Pure: no IO.
     ///
     /// # Errors
     /// Returns [`SqlError::InvariantViolation`] when any stored value does not
-    /// decode, such as an unknown kind or status, an invalid space, name,
+    /// decode, such as an unknown kind or status, an invalid name,
     /// version, or UID, or a spec, labels, or annotations document that does
     /// not match its type; the database then holds a row Wyrd never writes.
     fn try_from(row: CardRow) -> Result<Self, Self::Error> {
@@ -135,7 +131,6 @@ impl TryFrom<CardRow> for ParsedCardRow {
             CardKind::from_wire_name(&row.kind).ok_or_else(|| SqlError::InvariantViolation {
                 detail: format!("cards.kind has invalid value {:?}", row.kind),
             })?;
-        let space = SpaceName::new(row.space).map_err(SqlError::from_id_error)?;
         let name = CardName::new(row.name).map_err(SqlError::from_id_error)?;
         let version: VersionBlock = row.version.parse().map_err(SqlError::from_version)?;
         let spec =
@@ -158,7 +153,6 @@ impl TryFrom<CardRow> for ParsedCardRow {
             card_uid,
             data_tenant_id: row.data_tenant_id,
             kind,
-            space,
             name,
             version,
             spec,

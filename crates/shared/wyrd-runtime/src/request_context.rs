@@ -196,7 +196,7 @@ mod tests {
     use chrono::Utc;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, IdempotencyKey, SpaceName};
+    use wyrd_spec::ids::{CardName, IdempotencyKey};
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
 
@@ -210,7 +210,6 @@ mod tests {
             kind,
             name: CardName::new(name).expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }

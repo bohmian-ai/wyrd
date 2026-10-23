@@ -404,14 +404,13 @@ mod tests {
     /// Build a stable Card reference for composition fixtures.
     ///
     /// # Panics
-    /// Panics when the fixture Card name, version, or space is not a valid
+    /// Panics when the fixture Card name or version is not a valid
     /// typed identifier.
     fn card_ref(kind: CardKind, name: &str) -> CardRef {
         CardRef {
             kind,
             name: name.parse().expect("test Card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-            space: Some("default".parse().expect("test space is valid")),
             uid: None,
         }
     }
@@ -419,7 +418,7 @@ mod tests {
     /// Build a graph-ready submission around a JSON spec fixture.
     ///
     /// # Panics
-    /// Panics when the fixture Card name, version, or space is not a valid
+    /// Panics when the fixture Card name or version is not a valid
     /// typed identifier.
     fn submission(kind: CardKind, name: &str, spec: serde_json::Value) -> CardSubmission {
         let card_ref = card_ref(kind.clone(), name);
@@ -430,7 +429,6 @@ mod tests {
                 name: card_ref.name,
                 version: Some(VersionSpec::Pin(card_ref.version)),
                 bump: None,
-                space: card_ref.space,
                 uid: None,
                 labels: BTreeMap::default(),
                 annotations: BTreeMap::default(),

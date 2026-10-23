@@ -7,7 +7,7 @@ import pytest
 from wyrd.cards import CardRef
 from wyrd.data import DataCard, Split, WyrdError
 
-TEST_ROWS = CardRef("Artifact", "test", "1.0.0", space="default")
+TEST_ROWS = CardRef("Artifact", "test", "1.0.0")
 
 
 @pytest.mark.parametrize(
@@ -90,9 +90,19 @@ def test_split_materialized_allows_authored_ref_without_space() -> None:
     }
 
 
+def test_split_materialized_refuses_a_ref_with_a_space() -> None:
+    with pytest.raises(WyrdError) as exc:
+        Split.materialized(
+            {"kind": "Artifact", "name": "train", "version": "1.0.0", "space": "default"}
+        )
+
+    assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
+    assert "unknown field `space`" in exc.value.details["source"]
+
+
 def test_materialized_split_refuses_a_non_artifact_card_ref() -> None:
     with pytest.raises(WyrdError) as exc:
-        Split.materialized(CardRef("Model", "test", "1.0.0", space="default"))
+        Split.materialized(CardRef("Model", "test", "1.0.0"))
 
     assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
 

@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Service
 metadata:
-  space: wyrd-team
   name: churn-response-service
   version: "1.0.0"
   labels:
@@ -18,7 +17,6 @@ spec:
   verified_by:
     - verifier:
         kind: Verifier
-        space: wyrd-team
         name: retention-guardrail
         version: "1.0.0"
       # Explicit-only: callers verify or submit evidence for it directly.
@@ -33,14 +31,13 @@ spec:
     - verifier: agent1/cohort-check.yaml
 
   # Every component uses the unified ref variant: `path` (sibling submission)
-  # or `ref` (external, identity by kind+space+name+exact version). Inline is
+  # or `ref` (external, identity by kind+name+exact version). Inline is
   # not legal at component positions.
   components:
     - alias: model
       # `ref:` — external card with an exact identity pin.
       ref:
         kind: Model
-        space: wyrd-team
         name: churn-classifier
         version: "1.4.2"
       # Monitoring is deployment-specific, so the Service binds this reusable

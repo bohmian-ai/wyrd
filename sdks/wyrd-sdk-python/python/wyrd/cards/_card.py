@@ -12,7 +12,6 @@ class Card(Protocol):
     directly.
     """
 
-    space: str
     name: str
     version: str
     uid: str

@@ -566,7 +566,7 @@ pub(crate) mod pg_tests {
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
     use wyrd_sql::TenantConn;
@@ -595,7 +595,6 @@ pub(crate) mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new(name).expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }
@@ -734,20 +733,13 @@ pub(crate) mod pg_tests {
         let sa_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
-                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, space, name, version, status, sub_principal_id, act_principal_id)
-             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, $7, 'active', $8, $8)",
+                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, name, version, status, sub_principal_id, act_principal_id)
+             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, 'active', $7, $7)",
         )
         .bind(sa_id)
         .bind(tenant_id.as_uuid())
         .bind(Uuid::now_v7())
         .bind(Json(card_ref.clone()))
-        .bind(
-            card_ref
-                .space
-                .as_ref()
-                .expect("fixture service card ref has a resolved space")
-                .as_str(),
-        )
         .bind(format!("svc-{sa_id}"))
         .bind(card_ref.version.as_str())
         .bind(creator)
@@ -800,7 +792,7 @@ pub(crate) mod pg_tests {
         use wyrd_semver::VersionBlock;
         use wyrd_spec::DataTenantId;
         use wyrd_spec::envelope::CardKind;
-        use wyrd_spec::ids::{CardName, SpaceName};
+        use wyrd_spec::ids::CardName;
         use wyrd_spec::reference::CardRef;
 
         let tenant_id: DataTenantId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
@@ -810,7 +802,6 @@ pub(crate) mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new(name).expect("static name"),
             version: VersionBlock::parse("1.0.0").expect("static version"),
-            space: Some(SpaceName::new("prod").expect("static space")),
             uid: None,
         };
         let id_a: PrincipalId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"

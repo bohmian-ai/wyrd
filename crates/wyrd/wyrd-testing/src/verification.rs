@@ -628,7 +628,7 @@ fn card(kind: &str, name: &str, spec: &Value) -> Result<Card, VerificationFixtur
     serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": kind,
-        "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+        "metadata": { "name": name, "version": "1.0.0" },
         "spec": spec,
         "relationships": { "outbound": [], "inbound": [] }
     }))

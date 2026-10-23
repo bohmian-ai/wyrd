@@ -79,7 +79,7 @@ def test_run_view_exposes_its_alias(observed: WyrdState) -> None:
 
 
 def test_card_scoped_key_cannot_write_another_cards_observations(observed_bundle: Path) -> None:
-    agent_key = cli.issue_key(kind="Agent", name="observed-agent", version="1.0.0", space="default")
+    agent_key = cli.issue_key(kind="Agent", name="observed-agent", version="1.0.0")
     agent = hydrated(observed_bundle, WyrdClient(credential=agent_key.key))
     agent.start_bifrost()
 

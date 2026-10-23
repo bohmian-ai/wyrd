@@ -21,7 +21,7 @@ const DENIED = { code: "WYRD_PERMISSION_403_DENIED_RBAC" };
 
 /** Issue the observed Service's own key; its principal id and key. */
 async function issue(): Promise<{ principal: string; key: string }> {
-  const issued = await cli.issueKey({ kind: "Service", name: "observed-service", version: "1.0.0", space: "default" });
+  const issued = await cli.issueKey({ kind: "Service", name: "observed-service", version: "1.0.0" });
   return { principal: issued.principal_id, key: issued.key };
 }
 

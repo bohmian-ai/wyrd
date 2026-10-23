@@ -1303,7 +1303,7 @@ async fn drift_requirements_score_through_vala_drift() {
             id,
             slot,
             json!({"method": "Psi",
-            "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["x"]},
+            "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "name": "train", "version": "1.0.0"}, "features": ["x"]},
             "profile": {"kind": "Psi", "binning_strategy": {"kind": "EqualWidth", "n_bins": 4}, "threshold": {"kind": "Fixed", "value": 0.2}}}),
         )
     };
@@ -1414,7 +1414,7 @@ async fn drift_requirement_maps_caller_scored_report() {
             "psi-shift",
             "current",
             json!({"method": "Psi",
-            "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["x"]},
+            "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "name": "train", "version": "1.0.0"}, "features": ["x"]},
             "profile": {"kind": "Psi", "binning_strategy": {"kind": "EqualWidth", "n_bins": 4}, "threshold": {"kind": "Fixed", "value": 0.2}}}),
         )]
     }));

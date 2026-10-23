@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
-  space: wyrd-team
   name: churn-triage-check
   version: "1.0.0"
 spec:

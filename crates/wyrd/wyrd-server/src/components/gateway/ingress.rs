@@ -873,7 +873,7 @@ mod tests {
             (
                 vec![
                     (RUN_HEADER, "run-1"),
-                    (CARD_UID_HEADER, "prod/Agent/support-agent@1.0.0"),
+                    (CARD_UID_HEADER, "Agent/support-agent@1.0.0"),
                 ],
                 CARD_UID_HEADER,
             ),

@@ -151,7 +151,7 @@ def test_scheduled_binding_rejects_redundant_inputs(
         cards.declare_from_path(FIXTURES / "invalid" / file)
     assert field in json.dumps(raised.value.details), raised.value.details
     with pytest.raises(WyrdError) as absent:
-        cards.resolve_latest(kind, "default", name)
+        cards.resolve_latest(kind, name)
     assert absent.value.code == "WYRD_REGISTRY_404_CARD_NOT_FOUND"
 
 

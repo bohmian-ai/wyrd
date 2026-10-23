@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::SpaceName;
 use crate::metadata::Labels;
 
 /// Execution kind recorded as a Run.
@@ -39,9 +38,6 @@ pub struct RunRef {
     pub uid: String,
     /// Run kind.
     pub kind: RunKind,
-    /// Optional space.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub space: Option<SpaceName>,
     /// Query/display labels.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: Labels,

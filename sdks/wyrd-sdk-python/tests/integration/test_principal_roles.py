@@ -49,7 +49,6 @@ def issue(server: WyrdTestServer, service: CardRef) -> tuple[str, str]:
         kind="Service",
         name=service.name,
         version="1.0.0",
-        space="default",
         client=client_of(server),
     )
     return issued.principal_id, issued.key

@@ -66,19 +66,13 @@ impl WyrdConfigPy {
     }
 
     fn __repr__(&self) -> String {
-        let space = self
-            .inner
-            .defaults
-            .space
-            .as_ref()
-            .map_or("", wyrd_spec::ids::SpaceName::as_str);
         let kinds: Vec<&'static str> = self
             .inner
             .kind_overrides
             .keys()
             .filter_map(CardKind::native_name)
             .collect();
-        format!("WyrdConfig(space='{space}', kinds={kinds:?})")
+        format!("WyrdConfig(kinds={kinds:?})")
     }
 }
 
@@ -92,12 +86,6 @@ pub struct ConfigDefaultsPy(Defaults);
 
 #[pymethods]
 impl ConfigDefaultsPy {
-    /// Return the default `metadata.space`, or `None` when unset.
-    #[getter]
-    fn space(&self) -> Option<&str> {
-        self.0.space.as_ref().map(wyrd_spec::ids::SpaceName::as_str)
-    }
-
     /// Return the default labels merged into `metadata.labels`.
     #[getter]
     fn labels(&self) -> BTreeMap<String, String> {
@@ -134,13 +122,6 @@ fn write_merge_outputs<'py>(
     meta: &Metadata,
 ) -> WyrdPyResult<()> {
     let mut payload = serde_json::Map::new();
-    if let Some(s) = &meta.space {
-        payload.insert(
-            "space".into(),
-            serde_json::to_value(s)
-                .map_err(|e| schema_error(format!("metadata reserialize failed: {e}")))?,
-        );
-    }
     if !meta.labels.is_empty() {
         payload.insert(
             "labels".into(),

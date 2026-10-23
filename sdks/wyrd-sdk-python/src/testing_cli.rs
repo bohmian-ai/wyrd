@@ -63,12 +63,6 @@ impl PyCheckCard {
         &self.inner.kind
     }
 
-    /// Authored space, or `None` for the default space.
-    #[getter]
-    fn space(&self) -> Option<&str> {
-        self.inner.space.as_deref()
-    }
-
     /// Card name.
     #[getter]
     fn name(&self) -> &str {
@@ -299,7 +293,7 @@ fn declare(
     Ok(block_on(py, commands::declare(&path, client))?.into())
 }
 
-/// Card selector fields in `(kind, space, name, version, uid)` order.
+/// Card selector fields in `(kind, name, version, uid)` order.
 ///
 /// The public `wyrd.testing.cli` wrappers pass their selector keywords as
 /// this tuple; the shared CLI selector parser validates them.
@@ -308,14 +302,12 @@ type SelectorFields = (
     Option<String>,
     Option<String>,
     Option<String>,
-    Option<String>,
 );
 
 /// Build the shared CLI selector from its Python fields.
-fn selector((kind, space, name, version, uid): SelectorFields) -> SelectorArgs {
+fn selector((kind, name, version, uid): SelectorFields) -> SelectorArgs {
     SelectorArgs {
         kind,
-        space,
         name,
         version,
         uid,
@@ -367,7 +359,7 @@ fn pull(
 
 /// Issue an API key bound to one exact Card (`wyrd auth issue-key`).
 ///
-/// `card` is `(kind, name, version, space)`.
+/// `card` is `(kind, name, version)`.
 ///
 /// # Errors
 ///
@@ -377,12 +369,12 @@ fn pull(
 #[pyo3(signature = (card, label, expires_in_seconds, client))]
 fn issue_key(
     py: Python<'_>,
-    card: (String, String, String, String),
+    card: (String, String, String),
     label: Option<String>,
     expires_in_seconds: Option<u32>,
     client: Option<&Bound<'_, PyWyrdClient>>,
 ) -> WyrdPyResult<PyIssueKeyResponse> {
-    let (kind, name, version, space) = card;
+    let (kind, name, version) = card;
     let client = rust_client(client);
     let inner = block_on(
         py,
@@ -390,7 +382,6 @@ fn issue_key(
             &kind,
             &name,
             &version,
-            &space,
             label.as_deref(),
             expires_in_seconds,
             client,

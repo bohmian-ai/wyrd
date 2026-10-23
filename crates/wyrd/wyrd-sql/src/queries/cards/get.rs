@@ -4,13 +4,13 @@
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid};
 
 use crate::row_types::cards::{CardRow, ParsedCardRow};
 use crate::tenant_conn::TenantConn;
 
 const SELECT_BY_UID: &str = r"
-    SELECT card_uid, data_tenant_id, kind, space, name, version,
+    SELECT card_uid, data_tenant_id, kind, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
            status, sub_principal_id, act_principal_id, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
@@ -18,16 +18,16 @@ const SELECT_BY_UID: &str = r"
 ";
 
 const SELECT_BY_REF: &str = r"
-    SELECT card_uid, data_tenant_id, kind, space, name, version,
+    SELECT card_uid, data_tenant_id, kind, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
            status, sub_principal_id, act_principal_id, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
-    WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4
+    WHERE kind = $1 AND name = $2 AND version = $3
       AND status != 'deleted'
 ";
 
 const SELECT_FOR_RECONCILIATION: &str = r"
-    SELECT card_uid, data_tenant_id, kind, space, name, version,
+    SELECT card_uid, data_tenant_id, kind, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
            status, sub_principal_id, act_principal_id, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
@@ -97,7 +97,7 @@ pub async fn get_card_for_reconciliation(
     })
 }
 
-/// Load one card by its `(kind, space, name, version)` identity tuple.
+/// Load one card by its `(kind, name, version)` identity tuple.
 ///
 /// # Errors
 /// Same error surface as [`get_card_by_uid`].
@@ -106,7 +106,6 @@ pub async fn get_card_for_reconciliation(
     fields(
         tenant_id = %conn.data_tenant_id(),
         kind = ?kind,
-        space = %space,
         name = %name,
         version = %version,
     ),
@@ -114,13 +113,11 @@ pub async fn get_card_for_reconciliation(
 pub async fn get_card_by_ref(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
-    space: &SpaceName,
     name: &CardName,
     version: &VersionBlock,
 ) -> Result<ParsedCardRow, WyrdError> {
     let row = sqlx::query_as::<_, CardRow>(SELECT_BY_REF)
         .bind(kind.wire_name())
-        .bind(space.as_str())
         .bind(name.as_str())
         .bind(version.as_str())
         .fetch_optional(&mut **conn.transaction())
@@ -131,9 +128,8 @@ pub async fn get_card_by_ref(
         })?
         .ok_or_else(|| {
             WyrdError::registry_card_not_found(format!(
-                "no card {}/{}/{} @ {}",
+                "no card {}/{} @ {}",
                 kind.wire_name(),
-                space,
                 name,
                 version,
             ))
@@ -144,16 +140,22 @@ pub async fn get_card_by_ref(
 }
 
 /// Find a card by identity without turning an absent row into a public 404.
+///
+/// Identity is the tenant's flat `kind`, `name`, and `version`. `Ok(None)`
+/// means no non-deleted row is visible at that identity in the caller's
+/// tenant, which is distinct from a failed lookup.
+///
+/// # Errors
+/// Returns registry unavailability when the query fails, and
+/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the stored row no longer parses.
 pub async fn find_card_by_ref(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
-    space: &SpaceName,
     name: &CardName,
     version: &VersionBlock,
 ) -> Result<Option<ParsedCardRow>, WyrdError> {
     let row = sqlx::query_as::<_, CardRow>(SELECT_BY_REF)
         .bind(kind.wire_name())
-        .bind(space.as_str())
         .bind(name.as_str())
         .bind(version.as_str())
         .fetch_optional(&mut **conn.transaction())

@@ -3,7 +3,6 @@ kind: Agent
 metadata:
   name: inline
   version: 1.0.0
-  space: default
 spec:
   prompt:
     provider: google

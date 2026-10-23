@@ -68,17 +68,9 @@ pub async fn resolve_card_ref_scope(
             return Err(too_large("cards", MAX_SCOPE_CARDS, root));
         }
 
-        let space = card_ref
-            .space
-            .as_ref()
-            .ok_or_else(|| WyrdError::Validation {
-                message: "card scope member is missing a resolved space".to_owned(),
-                details: json!({ "card_ref": card_ref }),
-            })?;
         let row = get_card_by_ref(
             conn,
             card_ref.kind.clone(),
-            space,
             &card_ref.name,
             &card_ref.version,
         )
@@ -315,22 +307,20 @@ mod pg_tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::CardRef;
 
     use super::*;
 
-    /// Return the resolved space of a test card reference.
-    fn space_of(card_ref: &CardRef) -> &SpaceName {
-        card_ref.space.as_ref().expect("test card ref has a space")
-    }
-
-    fn make_card_ref(kind: CardKind, space: &str, name: &str) -> CardRef {
+    /// Build a flat, UID-free `kind`/`name`@`1.0.0` reference fixture.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid Card name.
+    fn make_card_ref(kind: CardKind, name: &str) -> CardRef {
         CardRef {
             kind,
             name: CardName::new(name).expect("valid name"),
             version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: Some(SpaceName::new(space).expect("valid space")),
             uid: None,
         }
     }
@@ -339,7 +329,7 @@ mod pg_tests {
 
     #[test]
     fn too_large_depth_sets_scope_mint_root() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let err = too_large("depth", MAX_SCOPE_DEPTH, &root);
         let WyrdError::CardScopeTooLarge { details, .. } = err else {
             panic!("expected CardScopeTooLarge");
@@ -356,7 +346,7 @@ mod pg_tests {
 
     #[test]
     fn too_large_cards_sets_scope_mint_root() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let err = too_large("cards", MAX_SCOPE_CARDS, &root);
         let WyrdError::CardScopeTooLarge { details, .. } = err else {
             panic!("expected CardScopeTooLarge");
@@ -371,7 +361,7 @@ mod pg_tests {
 
     #[test]
     fn issue_scope_error_converts_too_large_and_sets_root() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let issue_err = IssueError::CardScopeTooLarge {
             encoded_len: 9000,
             limit: 8192,
@@ -394,7 +384,7 @@ mod pg_tests {
 
     #[test]
     fn issue_scope_error_passes_through_other_errors() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let issue_err = IssueError::InvalidCardRef;
         let result = issue_scope_error(issue_err, &root);
         assert!(matches!(
@@ -407,7 +397,7 @@ mod pg_tests {
 
     #[test]
     fn scope_failure_root_reads_scope_mint_root_field() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let err = too_large("depth", MAX_SCOPE_DEPTH, &root);
         let found = scope_failure_root(&err).expect("scope_failure_root returns Some");
         assert!(found.same_identity(&root));
@@ -415,7 +405,7 @@ mod pg_tests {
 
     #[test]
     fn scope_failure_root_falls_back_to_root_field() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let err = WyrdError::CardScopeTooLarge {
             message: "test".to_owned(),
             details: json!({ "root": root.to_string() }),
@@ -447,20 +437,20 @@ mod pg_tests {
     #[test]
     fn scope_hash_is_order_independent() {
         let a = vec![
-            "prod/Service/svc-a@1.0.0".to_owned(),
-            "prod/Service/svc-b@1.0.0".to_owned(),
+            "Service/svc-a@1.0.0".to_owned(),
+            "Service/svc-b@1.0.0".to_owned(),
         ];
         let b = vec![
-            "prod/Service/svc-b@1.0.0".to_owned(),
-            "prod/Service/svc-a@1.0.0".to_owned(),
+            "Service/svc-b@1.0.0".to_owned(),
+            "Service/svc-a@1.0.0".to_owned(),
         ];
         assert_eq!(scope_hash(&a), scope_hash(&b));
     }
 
     #[test]
     fn scope_hash_differs_for_different_members() {
-        let a = vec!["prod/Service/svc-a@1.0.0".to_owned()];
-        let b = vec!["prod/Service/svc-b@1.0.0".to_owned()];
+        let a = vec!["Service/svc-a@1.0.0".to_owned()];
+        let b = vec!["Service/svc-b@1.0.0".to_owned()];
         assert_ne!(scope_hash(&a), scope_hash(&b));
     }
 
@@ -470,7 +460,7 @@ mod pg_tests {
     #[test]
     fn scope_member_summary_keeps_members_under_limit() {
         let members: Vec<CardRef> = (0..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT)
-            .map(|i| make_card_ref(CardKind::Service, "prod", &format!("svc-{i}")))
+            .map(|i| make_card_ref(CardKind::Service, &format!("svc-{i}")))
             .collect();
         assert_eq!(scope_member_summary(&members), members);
     }
@@ -480,7 +470,7 @@ mod pg_tests {
     #[test]
     fn scope_member_summary_truncates_past_limit() {
         let members: Vec<CardRef> = (0..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT + 5)
-            .map(|i| make_card_ref(CardKind::Service, "prod", &format!("svc-{i}")))
+            .map(|i| make_card_ref(CardKind::Service, &format!("svc-{i}")))
             .collect();
         assert_eq!(
             scope_member_summary(&members),
@@ -494,7 +484,7 @@ mod pg_tests {
     async fn resolve_single_service_card_produces_own_scope() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let creator = uuid::Uuid::new_v4();
-        let root = make_card_ref(CardKind::Service, "prod", "svc-resolve-test");
+        let root = make_card_ref(CardKind::Service, "svc-resolve-test");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         seed_backing_card(&mut conn, &root, creator).await;
@@ -514,8 +504,8 @@ mod pg_tests {
     async fn resolve_scope_populates_every_member_uid() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let creator = uuid::Uuid::new_v4();
-        let root = make_card_ref(CardKind::Service, "prod", "svc-uid-root");
-        let secondary = make_card_ref(CardKind::Service, "prod", "svc-uid-secondary");
+        let root = make_card_ref(CardKind::Service, "svc-uid-root");
+        let secondary = make_card_ref(CardKind::Service, "svc-uid-secondary");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         seed_backing_card(&mut conn, &secondary, creator).await;
@@ -526,7 +516,6 @@ mod pg_tests {
                     "alias": "secondary",
                     "ref": {
                         "kind": "Service",
-                        "space": space_of(&secondary).as_str(),
                         "name": secondary.name.as_str(),
                         "version": secondary.version.as_str(),
                     },
@@ -536,20 +525,14 @@ mod pg_tests {
         .expect("root service spec decodes");
         seed_card_with_spec(&mut conn, &root, &root_spec, creator).await;
 
-        let expected_root_uid = get_card_by_ref(
-            &mut conn,
-            root.kind.clone(),
-            space_of(&root),
-            &root.name,
-            &root.version,
-        )
-        .await
-        .expect("root card row loads")
-        .card_uid;
+        let expected_root_uid =
+            get_card_by_ref(&mut conn, root.kind.clone(), &root.name, &root.version)
+                .await
+                .expect("root card row loads")
+                .card_uid;
         let expected_secondary_uid = get_card_by_ref(
             &mut conn,
             secondary.kind.clone(),
-            space_of(&secondary),
             &secondary.name,
             &secondary.version,
         )
@@ -587,7 +570,7 @@ mod pg_tests {
     #[tokio::test]
     async fn resolve_missing_card_returns_error() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let root = make_card_ref(CardKind::Service, "prod", "nonexistent-card");
+        let root = make_card_ref(CardKind::Service, "nonexistent-card");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let result = resolve_card_ref_scope(&mut conn, &root).await;
@@ -608,7 +591,7 @@ mod pg_tests {
         // but we can verify the pure error shape produced by too_large directly
         // and confirm resolve errors for a missing card (cap logic is unreachable
         // without Agent cards having scope children).
-        let root = make_card_ref(CardKind::Service, "prod", "svc-cap-test");
+        let root = make_card_ref(CardKind::Service, "svc-cap-test");
         let err = too_large("cards", MAX_SCOPE_CARDS, &root);
         let WyrdError::CardScopeTooLarge { message, details } = err else {
             panic!("expected CardScopeTooLarge");
@@ -626,7 +609,7 @@ mod pg_tests {
 
     #[tokio::test]
     async fn resolve_caps_at_max_scope_depth() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc-depth-test");
+        let root = make_card_ref(CardKind::Service, "svc-depth-test");
         let err = too_large("depth", MAX_SCOPE_DEPTH, &root);
         let WyrdError::CardScopeTooLarge { message, details } = err else {
             panic!("expected CardScopeTooLarge");

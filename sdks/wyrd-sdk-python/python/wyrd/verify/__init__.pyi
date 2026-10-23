@@ -15,7 +15,6 @@ class CardRefWire(TypedDict):
     kind: str
     name: str
     version: str
-    space: NotRequired[str]
     uid: NotRequired[str]
 
 class JsonInput(TypedDict):

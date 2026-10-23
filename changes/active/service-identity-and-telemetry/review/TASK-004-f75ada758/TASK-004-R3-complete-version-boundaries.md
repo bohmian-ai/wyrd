@@ -154,3 +154,66 @@ mise run ts:typecheck
 Record an exact selector for the new Python race once introduced. If generated declarations actually change, regenerate through their owner and run `codegen:check` and the affected `ts:napi:check`; never hand-edit outputs. Keep Python authored stubs consistent. Do not add new scripts or named verification lanes for this task.
 
 No `gate`, broad Redux aggregate, full language suites or `verify:bifrost` aggregate is required solely for R3. Full integrated verification remains change-review work. Do not run benchmarks now. Record exact RED/GREEN/check results, selected counts, immutable dependency revision, prior closure preservation and unmeasured throughput. The next `$wyrd-task-review` includes the original cumulative base, prior verdicts/ledgers, R1/R2/R3 and the remediated immutable candidate.
+
+## Implementation evidence
+
+| Criterion | Implementation | Verification | Result |
+|---|---|---|---|
+| FIND-TASK-004-1 | `f01c268c7`: `scribe/ingress.rs::prepare_and_dispatch` fills a no-version frame from `CommittedBatches::version` (warm); a cold miss prepares under current and, on `ScribeBatchCommitResolution::AcceptedUnder`, re-prepares once under the accepting version (`vala-sql queries/scribe_batch_commits.rs::classify`, `scribe/shards.rs`, `scribe/preprocess.rs::DurableCompletion.accepted_under`). An explicit native version claim stays strict. | New `wyrd-testing --test otlp negative::pg_tests::otlp_replay_across_a_definition_edit_is_acknowledged_once` (export → Bloom edit → warm replay → restart → cold replay → rows exactly once). RED: both recovery paths disabled → `WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT`; cold retry alone disabled → the same conflict after the restart. GREEN: passed, as did `mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success`, vala-sql lib + `pg_scribe_batch_commits` (6/6), `write_read::accepted_batch_revision_survives_alteration_and_restart` and `write_read::mixed_runtime_specifications_preserve_rows_and_pins` | PASS |
+| FIND-TASK-004-8 | `8a23e75ab`: `scribe/execution_lanes.rs`, `ingress.rs` conform to the selected native definition; registration fingerprint no longer a definition authority | `write_read::mixed_runtime_specifications_preserve_rows_and_pins`, `write_read::accepted_batch_revision_survives_alteration_and_restart` | PASS |
+| FIND-TASK-004-9 | `65c85b219`: promoted-object evidence records and revalidates its accepting table version (`forge/scribe_promotion.rs`, `parquet/promoted_object.rs`, `forge/compact.rs`) | `forge::promotion::scribe_promotion_integration_rejects_physical_datafile_mismatch_before_catalog_io`; `scribe_promotion::mixed_specifications_preserve_partition_and_sort_truth` | PASS |
+| FIND-TASK-004-10 | `2dbe64f06`: `catalog/layout.rs::forge_data_location` writes to `{table}/data/forge/{table_version}/…`; `executor.rs::forge_output_view` passes an in-memory `write.data.path` (nothing persisted); `publication.rs` adds `forge.rewrite.table_version` lineage; `worker.rs::rewrite_authority` revalidates through `Forge::retained_definition` | `forge::publication::rewrite_publication_conflict_revalidates_once_or_resets`, which parks a commit, applies a Bloom-only edit, then checks paths, lineage and rows. RED: executor given the live table → assertion fails. GREEN: redux integration `forge::` 47/47; `production_closeout::revoked_term_stops_promotion_dispatch_and_maintenance`; `policy::tests::forge_table_policy_*` 4/4 | PASS |
+| FIND-TASK-004-11 | `97eeb23cd`: `bifrost_catalog.rs` persists the resolved target in a new table's definition | `catalog::bifrost_catalog::production_pin_tests::an_omitted_target_is_fixed_by_the_creating_deployment`; `forge::managed_rewrite::managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling` (now asserts the persisted 1 GiB target) | PASS |
+| FIND-TASK-004-12 | `44dcf935e`: Python `_client.py`, TS `index.ts` project exact integers | `tests/unit/bifrost/test_bifrost.py -k exact_int` (3), `tests/unit/bifrost-describe.test.ts` (3), Python and TS `table_time_column` integration | PASS |
+| FIND-TASK-004-13 | `92e607345`: `sdks/wyrd-sdk-python/src/bifrost/mod.rs` keeps a binding replaced during its connect-time describe | `test_bifrost_e2e.py::test_a_binding_replaced_during_its_describe_stays_replaced` (in 29 passed) | PASS |
+| FIND-TASK-004-14 | `bfe4eb23c`: `wyrd-spec/src/vala/ids.rs` rustdoc | `vala::ids::tests::table_version_round_trips_canonical_strings_beyond_two_to_the_53`, `table_version_refuses_noncanonical_forms` | PASS |
+| FIND-TASK-004-15 | iceberg-rust `850d308a8c50cdd7890ecfdf5bfd9825efebb241` (`catalog/sql catalog.rs::edits_definition`) refuses a version-intended edit that changes nothing; iceberg-compaction `c213af00eac40377d800e24f3ed68945034e7de4` resolves it; Wyrd pins in `58a46b3b4` | Fork: `cargo test -p iceberg-catalog-sql --lib invalid_version_changes_are_refused_without_a_reference` (RED before the fix, GREEN after; whole lib 44/44). Wyrd journeys that commit Bloom/sort edits stay green | PASS |
+| Lanes | `ac792d88f` clears clippy `clone_on_copy`/`useless_format` and a `ty` error in the FIND-13 proxy | `fmt`, `lints`, `check:deps`, `check:tenant-isolation`, `codegen:check`, `py:format`, `py:lints`, `py:typecheck`, `ts:lints`, `ts:typecheck`, `git diff --check` | PASS |
+
+### Diagnoses
+
+- **Native no-claim journey step (FIND-1).**
+  - **Symptom:** `accepted_batch_revision_survives_alteration_and_restart` failed with `TableVersionConflict { table_version: 1 }`.
+  - **Evidence:** the ingress trace showed the frame arriving at `Some(3)`.
+  - **Cause:** `RawIngest::insert` states the described current version, so the step was an explicit changed claim, not a no-claim retry. R3 keeps that case strict.
+  - **Fix site:** the test. The step now retries at the original version after the Bloom edit. The no-claim proof moved to the OTLP journey, where the Gate states no version.
+- **Forge tests after FIND-10/11.**
+  - **Symptom:** three `orphan_cleanup` tests failed. The error was "plan prefix …/data/forge/1 is not this table's Forge root".
+  - **Cause:** the test helper `forge_root` was returning the version root instead of the data root.
+  - **Fix:** the helper now returns the data root, and object paths add `/1/`.
+  - **Second symptom:** `managed_rewrite_scaled_geometry…` asserted that no target is persisted, which FIND-11 now changes intentionally.
+- **Two timeouts in the first combined redux run (903 tests).**
+  - **Symptom:** two tests timed out.
+  - **Evidence:** the filtered log did not name them, and they did not reproduce. Lib passed 855/855, integration `forge::` 47/47 and the rest 1/1, all under Postgres with `WYRD_LOG`.
+  - **Cause:** not established. This is recorded as a residual risk for review.
+
+### Commands
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p vala-bifrost-redux --lib'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p vala-bifrost-redux --test integration -E "test(/forge::/)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p vala-sql --lib --test integration -E "test(/scribe_batch_commits/)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test otlp -P journey --run-ignored=all -E "test(/otlp_replay_across_a_definition_edit_is_acknowledged_once$/) | test(/mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success$/)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E "test(=write_read::accepted_batch_revision_survives_alteration_and_restart) | test(=write_read::mixed_runtime_specifications_preserve_rows_and_pins)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test forge -P journey --run-ignored=all -E "test(=scribe_promotion::mixed_specifications_preserve_partition_and_sort_truth) | test(=production_closeout::revoked_term_stops_promotion_dispatch_and_maintenance)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E "test(=distributed::bloom_policy_versions_answer_exactly_through_compaction)"'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/^forge::managed::policy::tests::forge_table_policy_/)'
+mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=vala::ids::tests::table_version_round_trips_canonical_strings_beyond_two_to_the_53) | test(=vala::ids::tests::table_version_refuses_noncanonical_forms)'
+mise run py:setup && mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m "integration and not local_dev" tests/integration/bifrost/test_table_time_column.py tests/integration/bifrost/test_bifrost_e2e.py'   # 29 passed
+mise run ts:build && mise run ts:build:testing && mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/table-time-column.test.ts'   # 2 passed
+mise run fmt && mise run lints && mise run check:deps && mise run check:tenant-isolation && mise run codegen:check
+mise run py:lints && mise run py:typecheck && mise run ts:lints && mise run ts:typecheck && git diff --check
+# fork: cargo test -p iceberg-catalog-sql --lib invalid_version_changes_are_refused_without_a_reference   (at 850d308a8)
+```
+
+### Limits
+
+- **Non-goals excluded:** no new spec revision, public async API, retry subsystem, cache, ledger, service, script or verification lane. The unrelated task drafts were not touched.
+- **Throughput:** not measured; no benchmarks were run.
+  - Fresh ingest adds no accepted-ID read or transaction, no extra payload copy or hash pass, and no per-row version metadata or new global lock.
+  - The OTLP no-claim recovery copies a frame only when it states no version.
+- **Departure from the selected correction:** on a cold `AcceptedUnder`, the other fresh fences in the tenant group commit rather than roll back. Ingress compares outside the shard transaction, and the conflicting batch is suppressed with nothing acknowledged.
+- **Immutable dependency revisions:** iceberg-rust `850d308a8c50cdd7890ecfdf5bfd9825efebb241`; iceberg-compaction-core `c213af00eac40377d800e24f3ed68945034e7de4`.
+- **Prior closures:** findings 2–7 were preserved where this write set intersects them.
+
+**Status: IMPLEMENTED**

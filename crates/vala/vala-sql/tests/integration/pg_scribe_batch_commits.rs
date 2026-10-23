@@ -4,6 +4,8 @@
 //! - one statement inserts a whole tenant group and one read classifies its
 //!   conflicts, in offered order, even when a batch id repeats across tables
 //! - a contradiction rolls back the group's fresh fences and never resolves
+//! - a changed batch under another version reports that version, so its
+//!   caller can roll back the fresh fences before comparing it
 //! - uncertain-commit resolution classifies a whole offered set in one read
 //! - a fence offered for another tenant is refused
 
@@ -17,7 +19,7 @@ mod pg_tests {
     use uuid::Uuid;
     use vala_sql::TenantConn;
     use vala_sql::queries::scribe_batch_commits::{
-        ScribeBatchCommit, ScribeBatchCommitResolution, record, resolve,
+        ScribeBatchCommit, ScribeBatchCommitResolution, accepted_version, record, resolve,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -285,6 +287,86 @@ mod pg_tests {
                 .expect("fence resolves"),
             [ScribeBatchCommitResolution::Absent],
             "the failed group committed none of its fresh fences"
+        );
+    }
+
+    /// Proves a changed batch under another table version is classified as
+    /// that version in the group's one INSERT and one read, and that a caller
+    /// dropping the transaction leaves none of the group's fresh fences.
+    ///
+    /// The exceptional `accepted_version` read then names the accepting
+    /// version for the spent id and nothing for a fresh one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, the mismatch is misclassified or
+    /// costs more statements, a fresh fence survives the dropped transaction,
+    /// or the version read disagrees with the durable fence.
+    #[tokio::test]
+    async fn a_changed_batch_under_another_version_reports_it_before_any_commit() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let tenant = fixture.data_tenant_id();
+        let accepted = fence(tenant, "bifrost.a", Uuid::now_v7(), 10);
+        commit_group(&fixture, &[(accepted.clone(), Utc::now())]).await;
+
+        let fresh = [
+            fence(tenant, "bifrost.a", Uuid::now_v7(), 20),
+            fence(tenant, "bifrost.a", Uuid::now_v7(), 30),
+        ];
+        let next = wyrd_spec::vala::ids::TableVersion::new(2).expect("positive version");
+        let changed = ScribeBatchCommit {
+            table_version: next,
+            slice_set_digest: [0xEE; 32],
+            wal_lsn_min: 90,
+            wal_lsn_max: 91,
+            request_id: Uuid::now_v7(),
+            ..accepted.clone()
+        };
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let (resolved, log) = StatementLog::capture(record(
+            &mut conn,
+            &[
+                (fresh[0].clone(), Utc::now()),
+                (changed, Utc::now()),
+                (fresh[1].clone(), Utc::now()),
+            ],
+        ))
+        .await;
+        assert_eq!(
+            resolved.expect("the group records"),
+            [
+                ScribeBatchCommitResolution::Committed,
+                ScribeBatchCommitResolution::AcceptedUnder(accepted.table_version),
+                ScribeBatchCommitResolution::Committed,
+            ],
+        );
+        assert_eq!(log.count("INSERT INTO vala.scribe_batch_commits"), 1);
+        assert_eq!(log.count("SELECT"), 1);
+        drop(conn);
+
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        assert_eq!(
+            resolve(&mut conn, fresh.iter())
+                .await
+                .expect("fences resolve"),
+            [ScribeBatchCommitResolution::Absent; 2],
+            "the dropped transaction committed no fresh fence"
+        );
+        assert_eq!(
+            accepted_version(&mut conn, "bifrost.a", accepted.batch_id)
+                .await
+                .expect("version reads"),
+            Some(accepted.table_version)
+        );
+        assert_eq!(
+            accepted_version(&mut conn, "bifrost.a", fresh[0].batch_id)
+                .await
+                .expect("version reads"),
+            None
         );
     }
 

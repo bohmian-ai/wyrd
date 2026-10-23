@@ -628,8 +628,11 @@ fn decode_rows(
 ///   Arrow would refuse to relabel;
 /// - the same Iceberg type in another Arrow spelling (`Int8` for `int`, a
 ///   `UTC` zone for `+00:00`, a list element named `item`) is cast once with
-///   Arrow's `cast` to the registered type, keeping the sent field's name,
-///   nullability, and metadata;
+///   Arrow's `cast` to the registered type, keeping the sent field's name
+///   and metadata;
+/// - every matched column takes the registered top-level requiredness, so
+///   Arrow refuses a null in a required column even when the sender's field
+///   declared it nullable;
 /// - a column whose storage matches but whose Variant identity does not — a
 ///   Struct sent for a Variant, a Variant sent for a Struct, or a Variant
 ///   marker with parameters, at any depth — is refused as an unsupported type
@@ -648,8 +651,8 @@ fn decode_rows(
 /// [`ScribeError::FingerprintMismatch`] for a column the registered schema
 /// does not accept, a missing registered column, a registered schema with no
 /// Arrow form, or an equivalent column Arrow cannot cast, and
-/// [`ScribeError::InvalidFrame`] when Arrow refuses the conformed batch, which
-/// duplicate-free input cannot cause.
+/// [`ScribeError::InvalidFrame`] when Arrow refuses the conformed batch, such
+/// as a null in a column the registered schema requires.
 fn conform_to_registered(
     rows: &RecordBatch,
     registered: &IcebergSchema,
@@ -731,11 +734,17 @@ impl ConformPlan {
                 None if !policy.reserves(field.name()) => return Err(mismatch()),
                 None => None,
             };
-            fields.push(match &cast {
-                Some(data_type) => {
-                    Arc::new(field.as_ref().clone().with_data_type(data_type.clone()))
-                }
-                None => Arc::clone(field),
+            // The selected schema owns top-level requiredness, so Arrow
+            // refuses a null the sender's own field would have allowed.
+            let nullable = wanted.map_or(field.is_nullable(), |wanted| wanted.is_nullable());
+            fields.push(if cast.is_none() && nullable == field.is_nullable() {
+                Arc::clone(field)
+            } else {
+                let conformed = field.as_ref().clone().with_nullable(nullable);
+                Arc::new(match &cast {
+                    Some(data_type) => conformed.with_data_type(data_type.clone()),
+                    None => conformed,
+                })
             });
             columns.push((index, cast));
         }
@@ -752,7 +761,7 @@ impl ConformPlan {
     ///
     /// Returns [`ScribeError::FingerprintMismatch`] when Arrow cannot cast an
     /// equivalent column and [`ScribeError::InvalidFrame`] when Arrow refuses
-    /// the conformed batch, which duplicate-free input cannot cause.
+    /// the conformed batch, such as a null in a required registered column.
     fn apply(&self, rows: &RecordBatch) -> Result<RecordBatch, ScribeError> {
         let columns = self
             .columns
@@ -2527,6 +2536,64 @@ mod tests {
             Arc::ptr_eq(&first.schema(), &second.schema()),
             "the second batch of one sent shape reuses the remembered plan"
         );
+    }
+
+    /// The selected schema's top-level requiredness decides which nulls a
+    /// scalar may carry, whatever the sender's Arrow field declares.
+    ///
+    /// A nullable sent field holding a null is refused for a required
+    /// registered column; the same field holding only values conforms as
+    /// required; an optional registered column keeps its null.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a registered schema does not convert, a required column
+    /// admits a null, valid values are refused or keep the sender's
+    /// nullability, or an optional column refuses its null.
+    #[test]
+    fn registered_requiredness_decides_scalar_nulls() {
+        let registered = |nullable| {
+            crate::tables::iceberg_schema_for(&Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                nullable,
+            )]))
+            .expect("the registered schema converts to Iceberg")
+        };
+        let sent = |values: Vec<Option<i64>>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    true,
+                )])),
+                vec![Arc::new(arrow::array::Int64Array::from(values))],
+            )
+            .expect("the sent batch satisfies its own schema")
+        };
+
+        assert!(matches!(
+            conform_to_registered(
+                &sent(vec![Some(1), None]),
+                &registered(false),
+                CorrelationPolicy::Observation
+            ),
+            Err(ScribeError::InvalidFrame)
+        ));
+        let valid = conform_to_registered(
+            &sent(vec![Some(1), Some(2)]),
+            &registered(false),
+            CorrelationPolicy::Observation,
+        )
+        .expect("non-null values conform to a required column");
+        assert!(!valid.schema().field(0).is_nullable());
+        let optional = conform_to_registered(
+            &sent(vec![Some(1), None]),
+            &registered(true),
+            CorrelationPolicy::Observation,
+        )
+        .expect("an optional column keeps its null");
+        assert_eq!(optional.column(0).null_count(), 1);
     }
 
     /// Spellings Iceberg stores as the registered column type are cast to it.

@@ -571,6 +571,12 @@ mod tests {
     /// JSON carries every version, including values a float cannot represent
     /// exactly, as the canonical decimal string it parses back from; the
     /// domain maximum has no successor.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a positive value is refused, a version does not serialize
+    /// to its canonical decimal string or parse back to itself, or the domain
+    /// maximum has a successor.
     #[test]
     fn table_version_round_trips_canonical_strings_beyond_two_to_the_53() {
         for value in [1_i64, (1 << 53) + 1, i64::MAX] {
@@ -588,6 +594,11 @@ mod tests {
     /// Bare numbers, null, zero, signs, padding, leading zeros, fractions,
     /// exponents and out-of-range decimals are refused rather than coerced,
     /// so one version has exactly one wire spelling.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any noncanonical spelling deserializes or zero is accepted
+    /// as a version.
     #[test]
     fn table_version_refuses_noncanonical_forms() {
         for json in [

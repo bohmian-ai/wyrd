@@ -319,6 +319,40 @@ pub async fn is_accepted(
     .map_err(SqlError::from)
 }
 
+/// The table version whose durable fence accepted `batch_id` on `logical_table_fqn`.
+///
+/// The exceptional recovery read for a request stating no version that the
+/// current definition refused: it runs only after that refusal, never on
+/// fresh ingest, so the caller can compare its retained input under the
+/// accepting definition. `None` means no fence, or one with no recorded
+/// version, and the caller keeps its original refusal.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot execute the tenant-scoped read
+/// or the recorded version is not positive.
+pub async fn accepted_version(
+    conn: &mut TenantConn<'_>,
+    logical_table_fqn: &str,
+    batch_id: uuid::Uuid,
+) -> Result<Option<TableVersion>, SqlError> {
+    let version: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT table_version FROM vala.scribe_batch_commits \
+          WHERE logical_table_fqn = $1 AND batch_id = $2",
+    )
+    .bind(logical_table_fqn)
+    .bind(batch_id)
+    .fetch_optional(&mut **conn.transaction())
+    .await?;
+    version
+        .flatten()
+        .map(|version| {
+            TableVersion::new(version)
+                .map_err(|_| invariant("scribe batch commit table version is not positive"))
+        })
+        .transpose()
+}
+
 /// Reads the `PostgreSQL` instant Scribe anchors its admission clock on.
 ///
 /// PostgreSQL is the clock of record for `wyrd_ingested_at`: the value is

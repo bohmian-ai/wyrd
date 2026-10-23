@@ -28,22 +28,39 @@ use wyrd_spec::ids::DataTenantId;
 
 /// The successful terminal a shard owner sends to one admitted append's waiter.
 ///
-/// Sent only after the append's rows are query-visible, or after the durable
-/// fence suppressed them as an already-committed replay of the same batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Sent only after the append's rows are query-visible, after the durable
+/// fence suppressed them as an already-committed replay of the same batch, or
+/// while the shard holds its group for [`AcceptedUnder`] verification.
+#[derive(Debug)]
 pub(crate) struct DurableCompletion {
     /// Rows the append carried, whether inserted now or already visible.
     pub rows: u64,
     /// Whether this append's group inserted the batch rather than suppressing
     /// a replay the fence or memtable identity showed was already committed.
     pub first_commit: bool,
-    /// Table version whose durable fence already spent this batch id when it
-    /// was not the version this append was prepared under.
+    /// The durable fence's claim that another table version already spent
+    /// this batch id.
     ///
     /// Such an append's rows were suppressed and nothing is acknowledged yet:
     /// the caller decides whether it is that batch by preparing it under the
-    /// accepting version.
-    pub accepted_under: Option<wyrd_spec::vala::ids::TableVersion>,
+    /// accepting version, and the shard holds the append's tenant group
+    /// uncommitted until it answers.
+    pub accepted_under: Option<AcceptedUnder>,
+}
+
+/// A batch id the durable fence accepted under another table version, held
+/// open until the caller proves or refuses its retained input as that batch.
+///
+/// The shard has rolled back its tenant group's fresh fences and waits on
+/// `verdict` outside any SQL transaction: `true` resumes fencing without this
+/// batch, while `false` or a dropped sender fails the group, so a
+/// contradiction commits none of its fresh peers.
+#[derive(Debug)]
+pub(crate) struct AcceptedUnder {
+    /// Table version whose fence accepted the batch id.
+    pub version: wyrd_spec::vala::ids::TableVersion,
+    /// Answered `true` only when the retained input is exactly that batch.
+    pub verdict: oneshot::Sender<bool>,
 }
 
 /// A complete request accepted by pod-global admission.

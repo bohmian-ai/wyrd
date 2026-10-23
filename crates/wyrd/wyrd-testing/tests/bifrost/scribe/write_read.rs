@@ -1575,8 +1575,8 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
 /// another tenant. After the revision the description names the new columns,
 /// a batch spelled with them is written, and a spec-1 batch retried at its
 /// original version is still acknowledged once; the replaced column name, a
-/// mistyped added column, and changed content under the accepted id are
-/// refused.
+/// mistyped added column, a null in a required column the sender declared
+/// nullable, and changed content under the accepted id are refused.
 ///
 /// # Panics
 ///
@@ -1683,6 +1683,20 @@ async fn mixed_runtime_specifications_preserve_rows_and_pins() {
             "{why}: {error}"
         );
     }
+    let error = super::support::append_batch_at(
+        &client,
+        &table,
+        current,
+        uuid::Uuid::now_v7(),
+        &null_value(&evolved),
+    )
+    .await
+    .expect_err("a null in the required `value` column is refused");
+    assert_eq!(
+        error.code(),
+        "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+        "a sender-nullable field cannot carry a null into a required column: {error}"
+    );
     assert!(
         super::support::append_batch_at(
             &client,
@@ -1791,6 +1805,33 @@ fn mistyped_note(batch: &RecordBatch) -> RecordBatch {
     let mut columns = batch.columns().to_vec();
     columns[note] = Arc::new(Int64Array::from(vec![0_i64; batch.num_rows()]));
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("mistyped batch")
+}
+
+/// Re-declares an evolved batch's required `value` as nullable and nulls its
+/// first row: a stream valid under its own schema, not the table's.
+///
+/// # Panics
+///
+/// Panics when `batch` is not an evolved batch.
+fn null_value(batch: &RecordBatch) -> RecordBatch {
+    let value = batch
+        .schema()
+        .index_of("value")
+        .expect("evolved batch has value");
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields[value] = Field::new("value", DataType::Int64, true);
+    let mut columns = batch.columns().to_vec();
+    columns[value] = Arc::new(Int64Array::from_iter(
+        (0_i64..)
+            .take(batch.num_rows())
+            .map(|row| (row > 0).then_some(row)),
+    ));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("null-value batch")
 }
 
 /// Requires the three mixed-spec batches once each, by their renamed column,

@@ -145,18 +145,6 @@ async fn soft_delete_card_with_expected_kind(
     .await
     .map_err(registry_db_error)?;
 
-    if matches!(card.kind, CardKind::Service | CardKind::Agent) {
-        sqlx::query(
-            "UPDATE wyrd.auth_service_accounts \
-                SET status = 'deleted', updated_at = now() \
-              WHERE card_uid = $1",
-        )
-        .bind(uid.as_uuid())
-        .execute(&mut **conn.transaction())
-        .await
-        .map_err(registry_db_error)?;
-    }
-
     Ok(CardDeleteState {
         card,
         manifests,

@@ -63,9 +63,10 @@ pub use roles::{
 };
 pub use service_accounts::{
     ApiKeyLookupRow, ApiKeyStatus, ServiceAccountPrincipalRow, api_key_by_prefix,
-    api_key_status_by_prefix, delete_service_account, insert_api_key, insert_refresh_token,
-    insert_service_account, provision_system_principal, service_account_by_card_ref,
-    service_account_by_id, system_principal_id, tenant_admin_principal_id, touch_api_key_last_used,
+    api_key_status_by_prefix, delete_service_account, family_account_id, insert_api_key,
+    insert_refresh_token, insert_service_account, provision_system_principal,
+    service_account_by_id, set_workload_restriction, system_principal_id,
+    tenant_admin_principal_id, touch_api_key_last_used, workload_family,
 };
 pub use trusted_issuers::{
     TrustedIssuerWrite, delete_trusted_issuer, insert_trusted_issuer, trusted_issuer_by_url,

@@ -14,7 +14,6 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::UnmigratedDatabase;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{Attribution, PrincipalId};
-    use wyrd_spec::reference::CardRef;
     use wyrd_spec::storage::{StorageBackendKind, UploadId, WireProtocol};
     use wyrd_sql::pool::build_app_pool;
     use wyrd_sql::queries::auth::{
@@ -734,16 +733,8 @@ mod pg_tests {
                 serde_json::json!([]),
             )
             .await;
-            insert_workload_binding(
-                pool,
-                bound_tenant,
-                bound_issuer,
-                "workload-subject",
-                &serde_json::json!({
-                    "kind": "Service", "name": "svc", "version": "1.0.0"
-                }),
-            )
-            .await;
+            insert_legacy_workload_binding(pool, bound_tenant, bound_issuer, "workload-subject")
+                .await;
             insert_legacy_human_issuer(
                 pool,
                 secret_tenant,
@@ -823,7 +814,10 @@ mod pg_tests {
             .fetch_one(pool)
             .await
             .expect("bindings read");
-            assert_eq!(bindings, 1, "the workload binding survives");
+            assert_eq!(
+                bindings, 0,
+                "the stable-account baseline drops every Card-version workload binding"
+            );
             let refused =
                 sqlx::query("UPDATE wyrd.auth_trusted_issuers SET principal_kind = 'Human'")
                     .execute(pool)
@@ -1706,11 +1700,6 @@ mod pg_tests {
             tenant,
             &issuer_url,
             "system:serviceaccount:default:wyrd",
-            &serde_json::json!({
-                "kind": "Service",
-                "name": "billing",
-                "version": "1.0.0"
-            }),
         )
         .await;
 
@@ -1740,6 +1729,11 @@ mod pg_tests {
             .execute(pool)
             .await
             .expect("issuer cleanup succeeds");
+        sqlx::query("DELETE FROM wyrd.auth_service_accounts WHERE data_tenant_id = $1")
+            .bind(tenant.as_uuid())
+            .execute(pool)
+            .await
+            .expect("account cleanup succeeds");
         sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id = $1")
             .bind(tenant.as_uuid())
             .execute(pool)
@@ -1748,7 +1742,7 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    async fn cloud_issuer_card_ref_jsonb_round_trips() {
+    async fn cloud_issuer_binding_maps_a_stable_account() {
         let Some(url) = database_url() else {
             return;
         };
@@ -1761,24 +1755,15 @@ mod pg_tests {
         let pool = store.pool();
         let tenant = DataTenantId::new_v7();
         let suffix = tenant.as_uuid().to_string();
-        let issuer_url = format!("https://idp.example.com/card-ref-test-{suffix}");
+        let issuer_url = format!("https://idp.example.com/account-test-{suffix}");
         let subject = format!("system:sa:{suffix}");
 
-        insert_tenant(pool, tenant, &format!("card-ref-{suffix}")).await;
+        insert_tenant(pool, tenant, &format!("account-{suffix}")).await;
         insert_trusted_issuer(pool, tenant, &issuer_url).await;
+        let account = insert_workload_binding(pool, tenant, &issuer_url, &subject).await;
 
-        // CardRef with all five fields (kind serializes to its wire name).
-        let card_ref_json = serde_json::json!({
-            "kind": "Service",
-            "name": "billing-service",
-            "version": "1.0.0",
-            "uid": "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
-        });
-
-        insert_workload_binding(pool, tenant, &issuer_url, &subject, &card_ref_json).await;
-
-        let row: (serde_json::Value,) = sqlx::query_as(
-            "SELECT card_ref FROM wyrd.auth_workload_bindings
+        let row: (Uuid, Option<Uuid>) = sqlx::query_as(
+            "SELECT principal_id, workload_uid FROM wyrd.auth_workload_bindings
           WHERE data_tenant_id = $1 AND issuer_url = $2 AND subject = $3",
         )
         .bind(tenant.as_uuid())
@@ -1786,20 +1771,22 @@ mod pg_tests {
         .bind(&subject)
         .fetch_one(pool)
         .await
-        .expect("card_ref select succeeds");
+        .expect("binding select succeeds");
+        assert_eq!(row, (account, None), "a binding maps an account, no root");
 
-        assert_eq!(
-            row.0, card_ref_json,
-            "card_ref JSONB must round-trip through Postgres without loss"
-        );
-
-        // Prove the stored JSON is valid for CardRef deserialization via serde.
-        let card_ref: CardRef = serde_json::from_value(row.0)
-            .expect("stored card_ref JSONB must deserialize to a valid CardRef");
-        assert_eq!(card_ref.kind.wire_name(), "Service");
-        assert_eq!(card_ref.name.to_string(), "billing-service");
-        assert_eq!(card_ref.version.to_string(), "1.0.0");
-        assert!(card_ref.uid.is_some(), "uid must survive the round-trip");
+        sqlx::query("DELETE FROM wyrd.auth_service_accounts WHERE id = $1")
+            .bind(account)
+            .execute(pool)
+            .await
+            .expect("account deletes");
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.auth_workload_bindings WHERE data_tenant_id = $1",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("bindings count");
+        assert_eq!(remaining, 0, "deleting the account removes its bindings");
 
         // Cleanup.
         sqlx::query("DELETE FROM wyrd.auth_workload_bindings WHERE data_tenant_id = $1")
@@ -1923,12 +1910,6 @@ mod pg_tests {
         // 12-byte nonce + 16-byte ciphertext (representative AES-GCM bytes).
         let secret_bytes: Vec<u8> = (0u8..28).collect();
 
-        let card_ref_json = serde_json::json!({
-            "kind": "Service",
-            "name": "svc",
-            "version": "1.0.0"
-        });
-
         insert_tenant(store.pool(), tenant_a, &format!("rp-a-{suffix}")).await;
         insert_tenant(store.pool(), tenant_b, &format!("rp-b-{suffix}")).await;
 
@@ -1936,14 +1917,7 @@ mod pg_tests {
         // group_role_map and client_secret_enc; human trust lives in
         // auth_human_connections.
         insert_secret_issuer(store.pool(), tenant_a, &issuer_url, &secret_bytes).await;
-        insert_workload_binding(
-            store.pool(),
-            tenant_a,
-            &issuer_url,
-            &subject,
-            &card_ref_json,
-        )
-        .await;
+        let account = insert_workload_binding(store.pool(), tenant_a, &issuer_url, &subject).await;
 
         // Read back under TenantConn(A) and assert every column round-trips.
         {
@@ -1999,10 +1973,8 @@ mod pg_tests {
             assert_eq!(binding.issuer_url, issuer_url);
             assert_eq!(binding.subject, subject);
             assert!(binding.audience.is_none());
-            let card_ref = &binding.card_ref;
-            assert_eq!(card_ref.kind.wire_name(), "Service");
-            assert_eq!(card_ref.name.to_string(), "svc");
-            assert_eq!(card_ref.version.to_string(), "1.0.0");
+            assert_eq!(binding.principal_id, account);
+            assert_eq!(binding.workload_uid, None);
         }
 
         // Seed the same issuer_url under tenant B.
@@ -2050,6 +2022,11 @@ mod pg_tests {
             .execute(store.pool())
             .await
             .expect("issuer cleanup succeeds");
+        sqlx::query("DELETE FROM wyrd.auth_service_accounts WHERE data_tenant_id = $1")
+            .bind(tenant_a.as_uuid())
+            .execute(store.pool())
+            .await
+            .expect("account cleanup succeeds");
         sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id IN ($1, $2)")
             .bind(tenant_a.as_uuid())
             .bind(tenant_b.as_uuid())
@@ -2099,11 +2076,8 @@ mod pg_tests {
             issuer_url: issuer_url.clone(),
             subject: subject.clone(),
             audience: None,
-            card_ref: serde_json::json!({
-                "kind": "Service",
-                "name": "svc",
-                "version": "1.0.0"
-            }),
+            principal_id: insert_service_account(store.pool(), tenant).await,
+            workload_uid: None,
         };
 
         // Insert persists, and the encrypted-secret bytes round-trip verbatim.
@@ -2224,6 +2198,11 @@ mod pg_tests {
             );
         }
 
+        sqlx::query("DELETE FROM wyrd.auth_service_accounts WHERE data_tenant_id = $1")
+            .bind(tenant.as_uuid())
+            .execute(store.pool())
+            .await
+            .expect("account cleanup succeeds");
         sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id = $1")
             .bind(tenant.as_uuid())
             .execute(store.pool())
@@ -2299,12 +2278,62 @@ mod pg_tests {
         .await
     }
 
+    /// Insert one workload binding of `subject` to a fresh Service account;
+    /// return the account id.
+    ///
+    /// # Panics
+    /// Panics when either insert fails.
     async fn insert_workload_binding(
         pool: &PgPool,
         data_tenant_id: DataTenantId,
         issuer_url: &str,
         subject: &str,
-        card_ref: &serde_json::Value,
+    ) -> Uuid {
+        let account = insert_service_account(pool, data_tenant_id).await;
+        sqlx::query(
+            "INSERT INTO wyrd.auth_workload_bindings
+             (data_tenant_id, issuer_url, subject, principal_id)
+         VALUES ($1, $2, $3, $4)",
+        )
+        .bind(data_tenant_id.as_uuid())
+        .bind(issuer_url)
+        .bind(subject)
+        .bind(account)
+        .execute(pool)
+        .await
+        .expect("workload binding inserts");
+        account
+    }
+
+    /// Insert one unrestricted Service account; return its id.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
+    async fn insert_service_account(pool: &PgPool, data_tenant_id: DataTenantId) -> Uuid {
+        let account = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO wyrd.auth_service_accounts
+             (id, data_tenant_id, principal_kind, name, status, sub_principal_id, act_principal_id)
+         VALUES ($1, $2, 'service', $3, 'active', $1, $1)",
+        )
+        .bind(account)
+        .bind(data_tenant_id.as_uuid())
+        .bind(format!("runtime-{account}"))
+        .execute(pool)
+        .await
+        .expect("account inserts");
+        account
+    }
+
+    /// Insert one workload binding as the pre-stable-account schema stored it.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
+    async fn insert_legacy_workload_binding(
+        pool: &PgPool,
+        data_tenant_id: DataTenantId,
+        issuer_url: &str,
+        subject: &str,
     ) {
         sqlx::query(
             "INSERT INTO wyrd.auth_workload_bindings
@@ -2314,10 +2343,10 @@ mod pg_tests {
         .bind(data_tenant_id.as_uuid())
         .bind(issuer_url)
         .bind(subject)
-        .bind(card_ref)
+        .bind(serde_json::json!({ "kind": "Service", "name": "svc", "version": "1.0.0" }))
         .execute(pool)
         .await
-        .expect("workload binding inserts");
+        .expect("legacy workload binding inserts");
     }
 
     /// Platform-login operator DSN that runs migrations and owns every object,

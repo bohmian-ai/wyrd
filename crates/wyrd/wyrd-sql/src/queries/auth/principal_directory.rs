@@ -1,34 +1,36 @@
 //! Tenant-scoped directory of principals a tenant administrator can assign
 //! Roles to.
 //!
-//! Assignable principals are users and Service or Agent principals that are
-//! not deleted. The tenant administrator and the internal `system` writer are
+//! Assignable principals are users and Service accounts that are not
+//! deleted. The tenant administrator and the internal `system` writer are
 //! deliberately absent: their authority is fixed and never re-assigned.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use sqlx::types::{Json, Uuid};
-use wyrd_spec::reference::CardRef;
+use sqlx::types::Uuid;
+use wyrd_spec::auth::WorkloadFamily;
 
 use crate::TenantConn;
+use crate::queries::auth::service_accounts::workload_family;
 
-/// Users and Service or Agent principals in one shape; each statement below
-/// appends its own predicate.
+/// Users and Service accounts in one shape; each statement below appends its
+/// own predicate.
 macro_rules! assignable_principals_sql {
     () => {
         r"
-        SELECT id, kind, status, email, name, card_ref
+        SELECT id, kind, status, email, name, restriction_kind, restriction_name
           FROM (
                 SELECT id, 'user'::text AS kind, status, email,
-                       NULL::text AS name, NULL::jsonb AS card_ref
+                       NULL::text AS name, NULL::text AS restriction_kind,
+                       NULL::text AS restriction_name
                   FROM wyrd.auth_users
                  WHERE data_tenant_id = wyrd.current_tenant()
                    AND status <> 'deleted'
                 UNION ALL
                 SELECT id, principal_kind AS kind, status, NULL::text AS email,
-                       name, card_ref
+                       name, restriction_kind, restriction_name
                   FROM wyrd.auth_service_accounts
                  WHERE data_tenant_id = wyrd.current_tenant()
-                   AND principal_kind IN ('service', 'agent')
+                   AND principal_kind = 'service'
                    AND status <> 'deleted'
                ) principals
         "
@@ -56,27 +58,42 @@ const LIST_ASSIGNABLE_PRINCIPALS_SQL: &str = concat!(
 pub struct AssignablePrincipalRow {
     /// Principal id.
     pub id: Uuid,
-    /// Principal kind label: `user`, `service`, or `agent`.
+    /// Principal kind label: `user` or `service`.
     pub kind: String,
     /// Status label: `active` or `suspended`.
     pub status: String,
     /// Email, for users that have one.
     pub email: Option<String>,
-    /// Principal name, for services and agents.
+    /// Principal name, for Service accounts.
     pub name: Option<String>,
-    /// Bound Card, for Card-bound services and agents.
-    pub card_ref: Option<Json<CardRef>>,
+    /// Restricting family kind, for a family-restricted Service account.
+    pub restriction_kind: Option<String>,
+    /// Restricting family name, for a family-restricted Service account.
+    pub restriction_name: Option<String>,
+}
+
+impl AssignablePrincipalRow {
+    /// The account's restricting family, when it has one.
+    ///
+    /// # Errors
+    /// Returns [`sqlx::Error::Decode`] when the stored pair is malformed.
+    pub fn workload_family(&self) -> Result<Option<WorkloadFamily>, sqlx::Error> {
+        workload_family(
+            self.restriction_kind.as_deref(),
+            self.restriction_name.as_deref(),
+        )
+    }
 }
 
 /// Exact-match filters and keyset position for
 /// [`list_assignable_principals`]. `None` leaves a dimension unfiltered.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PrincipalFilter<'a> {
-    /// Kind label: `user`, `service`, or `agent`.
+    /// Kind label: `user` or `service`.
     pub kind: Option<&'a str>,
     /// Exact email; only users carry one.
     pub email: Option<&'a str>,
-    /// Exact name; only services and agents carry one.
+    /// Exact name; only Service accounts carry one.
     pub name: Option<&'a str>,
     /// Return only principals whose id sorts after this one.
     pub after: Option<Uuid>,
@@ -137,7 +154,7 @@ mod tests {
             LIST_ASSIGNABLE_PRINCIPALS_SQL,
         ] {
             assert_eq!(sql.matches("status <> 'deleted'").count(), 2);
-            assert!(sql.contains("principal_kind IN ('service', 'agent')"));
+            assert!(sql.contains("principal_kind = 'service'"));
         }
     }
 }

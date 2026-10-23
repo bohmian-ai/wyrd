@@ -63,3 +63,30 @@ mise exec -- git diff --check
 Record meaningful RED/GREEN for the new admission/copy assertions, and the actual selected/passing test counts. Retain rustdoc for changed Rust items. Native build owns generated declaration updates; preserve generated parity if signatures/docs change. The correction does not require changing catalog, dependency, deployment or packaging contracts. Do not add broad journeys or aggregate gates here; combined proof belongs to change review.
 
 Implementation write scope follows existing owners: shared JSON result admission, server argument admission, native SDK collection, shared UI formatter and directly affected tests/declarations. Private helper names, control flow and fixture structure remain implementation-owned. No new public behavior decision, query transport, setting, lifecycle owner, retry, identity model or unrelated cleanup is authorized by this task.
+
+## Implementation evidence
+
+Status: `IMPLEMENTED` at `18e62740f` (base `2b2ed0d9a`).
+
+Reuse map: the existing shared owner `wyrd_queue::json_result` (constants + `JsonResultBuilder`) gains `admit_ceilings`/`RefusedCeiling`, the single range rule. MCP `QueryArguments::validate` now delegates to it (same reasons/details, same JSON-RPC invalid-params mapping). Native `collect` calls it after `take()`, so a refusal returns `NativeQueryStep::failure(WyrdError::Validation)` and drops the taken stream; the slot stays empty, so a later native collect is refused ("query stream is closed"). The existing `fmtCardRef` emits `Kind/name@version[#uid]`; CardHeader and CardRefChip reuse it. The chip's separate kind label was removed because the canonical text now carries the kind.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-003-11: Node and MCP refuse rows/bytes of 0 and max+1 with no rows, each in its own envelope | `crates/shared/wyrd-queue/src/json_result.rs::admit_ceilings`; `wyrd-server/src/query/collect.rs::QueryArguments::validate`; `sdks/wyrd-sdk-ts/native/src/lib.rs::collect` | `TASK-003: Identical authorized reads`: four invalid cases, Node `WYRD_SPEC_400_VALIDATION` with the reason, MCP invalid-params problem with the reason, `toEqual` with no `value`. RED with the native change reverted: `max_rows:0` returned `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` (1 failed). GREEN: 1 passed | PASS |
+| Exact maxima and omitted defaults succeed; smaller-budget overflow stays 413 | same | same scenario: `max_rows:10000,max_bytes:16777216` passes through `both()`; defaults and the existing 2-row/64-byte 413 cases are unchanged | PASS |
+| Direct SDK refusal releases the native stream; ordinary querying continues | native `collect` refuses after `take()` | same scenario: `collect({maxRows:10001})` rejects with validation, then a second `collect()` rejects with `query stream is closed`, then a new stream returns `row_count: 3` | PASS |
+| MCP admission is unchanged | `validate` delegates | `mcp::bifrost::tests::query_schema_is_closed_bounded_and_has_no_path_selector` (zero/above-ceiling cases) and `query::collect::tests::query_result_is_positional_and_counts_exact_structured_json_bytes`: 2 passed | PASS |
+| FIND-003-12: Copy ref copies canonical references for two kinds; chip text/title keep the kind | `packages/ui/src/lib/format.ts::fmtCardRef`; `CardRefChip.svelte` | `TASK-003: Validated portable rendering`: Copy ref writes `Model/ranker@1.4.2` and `Data/ranker@1.4.2`; chip text and title are `Model/…` and `Data/…`; the formatter covers a present, null and absent uid. RED with the formatter reverted: header text `ranker@1.4.2` failed (1 failed). GREEN: passed | PASS |
+| Copy failure, Copy uid and version actions remain; a changed version never inherits a stale uid | CardHeader is unchanged (its `ref` is built from kind/name/selected version) | Validated portable rendering keeps Copy uid and Copy failed. In `TASK-003: Dependent loads and safe actions` the host ref carries `uid`; the emitted `card.version` ref equals `{...card, version:'1.4.1'}` and has no `uid` | PASS |
+
+Commands, run in sequence after `mise run ts:build`, `mise run build:server` and `mise run ts:build:testing`:
+
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^(TASK-003: Validated portable rendering|TASK-003: Dependent loads and safe actions|Node query acquisition cancellation)$'`: 3 passed, 7 skipped
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts -t "^TASK-003: Identical authorized reads$"'`: 1 passed, 1 skipped
+- `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=query::collect::tests::query_result_is_positional_and_counts_exact_structured_json_bytes) | test(=mcp::bifrost::tests::query_schema_is_closed_bounded_and_has_no_path_selector)'`: 2 passed
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check`: 0 errors, 0 warnings, for both the package and the app
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test`: 8 files, 40 passed
+- `mise exec -- cargo clippy --locked -p wyrd-queue -p wyrd-sdk-ts -p wyrd-server --lib -- -D warnings`: clean
+- `mise run fmt:check`: clean. `mise exec -- git diff --check`: clean
+
+The generated `sdks/wyrd-sdk-ts/wyrd/index.d.ts` and `index.d.cts` were regenerated by `ts:build` for the updated `collect` rustdoc only; the signature is unchanged. The SDK `collect` JSDoc now states the admitted range. Non-goals stayed excluded: there is no new error code, transport, setting, lifecycle owner, parser, route or schema/catalog change, and `WyrdView.svelte` and TASK-027 scenarios were not touched. `ts:build:testing` emitted only the existing macOS linker `__eh_frame` notice.

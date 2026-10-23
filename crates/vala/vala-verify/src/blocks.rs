@@ -182,6 +182,35 @@ pub trait CheckExecutor: Send + Sync {
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError>;
 }
 
+/// Decodes a check's raw `response` as the Verdict its declared `schema`
+/// describes.
+///
+/// The whole response must satisfy the exact declared schema, decode as a
+/// [`Verdict`], and keep its custom `data` within the fixed bounds. Agent
+/// and code checks share this rule; a refusal names the failing schema
+/// location or limit, never the response contents or a path into them,
+/// since returned dictionary keys are response contents.
+///
+/// # Errors
+/// Returns [`BlockError::Terminal`], which makes the requirement
+/// inconclusive, for an invalid schema, a response the schema refuses, a
+/// response that is not a Verdict, or data beyond its bounds.
+pub fn verdict_from(schema: &Value, response: Value) -> Result<Verdict, BlockError> {
+    let terminal = |reason: String| BlockError::Terminal { reason };
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|_| terminal("the declared Verdict format is not a valid schema".to_owned()))?;
+    if let Some(error) = validator.iter_errors(&response).next() {
+        return Err(terminal(format!(
+            "the check response violates its declared Verdict format at schema `{}`",
+            error.schema_path()
+        )));
+    }
+    let verdict: Verdict = serde_json::from_value(response)
+        .map_err(|_| terminal("the check response is not a Verdict".to_owned()))?;
+    verdict.check_data_bounds().map_err(terminal)?;
+    Ok(verdict)
+}
+
 #[cfg(test)]
 mod tests {
     //! Executor seam calls and the tool-record handoff into step results.
@@ -280,5 +309,97 @@ mod tests {
         assert_eq!(parsed.tool_calls, vec![record]);
         assert_eq!(parsed.tool_calls[0].tool, BuiltinTool::FsRead);
         assert_eq!(parsed.tool_calls[0].returned_bytes, 512);
+    }
+
+    /// A declared data schema keeps its own reference root once embedded in
+    /// the Verdict envelope: `#/properties/reason` names the data's integer
+    /// field, not the Verdict's string reason, with or without a declared
+    /// 2020-12 `$schema`; `prefixItems` still constrains a tuple; a `$ref`'s
+    /// siblings still apply; and definitions named like the Verdict's own
+    /// resolve to the author's.
+    ///
+    /// # Panics
+    /// Panics when a composed schema accepts bad data or refuses good data.
+    #[test]
+    fn verdict_data_keeps_its_schema_resource() {
+        let cases = [
+            (
+                json!({"type": "object", "additionalProperties": false,
+                    "required": ["reason", "copy", "pair"],
+                    "properties": {
+                        "reason": {"type": "integer"},
+                        "copy": {"$ref": "#/properties/reason"},
+                        "pair": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]}}}),
+                json!({"reason": 1, "copy": 2, "pair": ["a", 1]}),
+                vec![
+                    json!({"reason": 1, "copy": "wrong", "pair": ["a", 1]}),
+                    json!({"reason": 1, "copy": 2, "pair": [1, "a"]}),
+                ],
+            ),
+            (
+                json!({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+                    "required": ["reason", "copy"],
+                    "properties": {"reason": {"type": "integer"}, "copy": {"$ref": "#/properties/reason"}}}),
+                json!({"reason": 1, "copy": 2}),
+                vec![json!({"reason": 1, "copy": "wrong"})],
+            ),
+            (
+                json!({"type": "object", "required": ["cite"],
+                    "properties": {"cite": {"$ref": "#/definitions/Citation", "maximum": 1}},
+                    "definitions": {"Citation": {"type": "integer"}}}),
+                json!({"cite": 1}),
+                vec![json!({"cite": 3}), json!({"cite": {"slot": "deck"}})],
+            ),
+            (
+                json!({"type": "object", "required": ["cite"],
+                    "properties": {"cite": {"$ref": "#/$defs/Citation"}},
+                    "$defs": {"Citation": {"type": "string"}}}),
+                json!({"cite": "p3"}),
+                vec![json!({"cite": 3})],
+            ),
+        ];
+        let response = |data: Value| json!({"outcome": "passed", "reason": "judged", "citations": [], "data": data});
+        for (data, good, bad) in cases {
+            let format: skald_spec::NamedResponseFormat =
+                serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
+            let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
+            let verdict = verdict_from(&schema, response(good.clone()))
+                .unwrap_or_else(|error| panic!("{good}: {error}"));
+            assert_eq!(serde_json::to_value(verdict.data).expect("data"), good);
+            for bad in bad {
+                assert!(
+                    matches!(
+                        verdict_from(&schema, response(bad.clone())),
+                        Err(BlockError::Terminal { .. })
+                    ),
+                    "{bad}"
+                );
+            }
+        }
+    }
+
+    /// A refusal names where the declared schema failed, never where the
+    /// returned data did, so a dictionary key the check returned stays out
+    /// of the retained reason.
+    ///
+    /// # Panics
+    /// Panics when the refusal is not terminal or echoes the returned key.
+    #[test]
+    fn verdict_refusal_omits_returned_keys() {
+        let format: skald_spec::NamedResponseFormat = serde_json::from_value(json!({
+            "kind": "verdict",
+            "data": {"type": "object", "additionalProperties": {"type": "integer"}}
+        }))
+        .expect("format");
+        let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
+        let secret = "customer-secret@example.test";
+        let response = json!({"outcome": "passed", "reason": "judged", "citations": [],
+            "data": {"nested": 1, secret: "wrong"}});
+        match verdict_from(&schema, response) {
+            Err(BlockError::Terminal { reason }) => {
+                assert!(!reason.contains("customer-secret"), "{reason}");
+            }
+            other => panic!("expected a terminal refusal, got {other:?}"),
+        }
     }
 }

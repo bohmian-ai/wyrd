@@ -91,8 +91,8 @@ A requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`.
 | --- | --- | --- |
 | `assert` | `path` or `each`, `operator`, `expected` | Comparing a value; `each` with `[*]` requires every item to pass |
 | `trace` | `on`, `span_selector`, `operator`, `expected` | Comparing values selected from trace spans |
-| `agent` | `agent`, `inputs` | An Agent with no workspace and no tool but `bifrost.query`, whose `response_format` is a closed [verdict](#verdicts-and-citations) |
-| `code` | `runtime`, `source`, `entrypoint`, `inputs` | A Python function that returns a verdict |
+| `agent` | `agent`, `inputs` | An Agent with no workspace and no tool but `bifrost.query`, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema |
+| `code` | `runtime`, `source`, `entrypoint`, `inputs`, optional `response_format` | A Python function that returns a verdict |
 | `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline |
 
 ## Comparison operators
@@ -168,6 +168,19 @@ An `agent` or `code` check returns a verdict:
 
 A citation names the original slot, never an extract step. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/reference/extraction-output/#citations).
 
+### Custom data
+
+`response_format: verdict` (or `{kind: verdict}`) asks for exactly the verdict above. `{kind: verdict, data: <JSON Schema>}` also requires a `data` object matching that object schema, written in JSON Schema 2020-12 (omit `$schema` or declare 2020-12) and without a root `$id`. An Agent declares it on its Prompt; a `code` check declares it on the check, beside `entrypoint`, and returns `data` in its verdict. Without a `data` schema, a verdict must not carry `data`.
+
+The server validates the whole verdict against the declared schema. Data must fit both limits, inclusive:
+
+| Limit | Bound |
+| --- | --- |
+| Size | 65,536 bytes of compact UTF-8 JSON |
+| Depth | 16 containers; the root object is one, each nested object or array adds one |
+
+A verdict that fails its schema or a limit makes the requirement `inconclusive` with no `data`; the reason names the location or limit, never the content. Accepted data is the requirement result's `data`, on step and Verifier requirements alike, and is kept with the rest of the result.
+
 ## Decide
 
 | Value | Verdict |
@@ -197,3 +210,5 @@ Common `rule` values in `WYRD_SPEC_400_VALIDATION`:
 | `operator` | An operator's parameters are invalid, such as a bad regex |
 | `step_budget` | `timeout_seconds` is 0 or `retries` is above 5 |
 | `pass_rate` | `threshold` is not above 0 and at most 1 |
+| `check_response_format` | A `code` check's `response_format` names an unknown format or an invalid `data` schema |
+| `check_agent_schema` | A check Agent's Prompt cannot produce a verdict, or declares `data` without requiring an object |

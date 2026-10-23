@@ -10,7 +10,7 @@ use thiserror::Error;
 use wyrd_spec::error::WyrdError;
 
 #[cfg(test)]
-use schemars::schema::RootSchema;
+use schemars::Schema;
 
 /// Loader error collecting every error-severity diagnostic.
 #[derive(Debug, Error)]
@@ -221,7 +221,7 @@ impl Diagnostic {
 /// Return the JSON Schema for the machine-readable diagnostic contract.
 #[must_use]
 #[cfg(test)]
-pub fn diagnostic_schema() -> RootSchema {
+pub fn diagnostic_schema() -> Schema {
     schemars::schema_for!(Diagnostic)
 }
 

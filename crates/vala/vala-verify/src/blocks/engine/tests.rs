@@ -312,6 +312,7 @@ fn verdict(outcome: VerificationVerdict, citations: Value) -> CheckOutput {
             outcome,
             reason: "scripted".to_owned(),
             citations: serde_json::from_value(citations).expect("citations"),
+            data: None,
         },
         actual: None,
         detail: None,

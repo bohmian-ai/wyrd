@@ -567,6 +567,7 @@ fn drift_outcome(
             reason: "scripted".to_owned(),
             actual: None,
             citations: Vec::new(),
+            data: None,
             detail: Some(RequirementDetail::Drift(report)),
             check: serde_json::from_value::<Check>(serde_json::json!({
                 "kind": "drift", "on": "inputs.samples", "method": "Custom",

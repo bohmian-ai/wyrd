@@ -19,7 +19,7 @@ pub use parameter::{
     ParameterName, extract_media_placeholders, extract_text_placeholders, is_valid_parameter_name,
 };
 pub use promptref::PromptRef;
-pub use spec::PromptSpec;
+pub use spec::{PromptSpec, compile_prompt};
 pub use validate::{PromptError, validate};
 
 #[cfg(test)]

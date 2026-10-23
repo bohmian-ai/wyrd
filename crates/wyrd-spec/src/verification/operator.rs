@@ -299,11 +299,11 @@ impl<'de> Deserialize<'de> for ComparisonOperator {
 }
 
 impl schemars::JsonSchema for ComparisonOperator {
-    fn schema_name() -> String {
-        "ComparisonOperator".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ComparisonOperator".into()
     }
 
-    fn json_schema(schema_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(schema_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         <ComparisonOperatorWireSchema as schemars::JsonSchema>::json_schema(schema_gen)
     }
 }

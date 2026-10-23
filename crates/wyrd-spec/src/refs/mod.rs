@@ -314,7 +314,7 @@ where
         let prefix = format!("{prefix}[{i}].check");
         match &mut requirement.check {
             Check::Agent(call) => visit_agent_call(call, &prefix, f),
-            Check::Code(call) => visit_code_call(call, &prefix, f),
+            Check::Code(check) => visit_code_call(&mut check.call, &prefix, f),
             Check::Drift(drift) => drift.spec.visit_at(&prefix, f),
             Check::Assert { .. } | Check::Trace(_) => {}
         }

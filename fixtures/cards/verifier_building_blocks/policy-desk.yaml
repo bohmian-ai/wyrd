@@ -1,7 +1,8 @@
 # The subject of the building-block coverage story: a Service verified by
 # one Verifier that uses every action and Run check kind, one that extracts
-# each of the nine extractable formats, and one whose Agent calls the
-# built-in Card, Bifrost, and code tools.
+# each of the nine extractable formats, one whose Agent calls the
+# built-in Card, Bifrost, and code tools, and one whose checks return custom
+# Verdict data.
 apiVersion: wyrd/v1
 kind: Service
 metadata:
@@ -12,3 +13,4 @@ spec:
     - verifier: ./policy-review.yaml
     - verifier: ./document-formats.yaml
     - verifier: ./tool-review.yaml
+    - verifier: ./scored-review.yaml

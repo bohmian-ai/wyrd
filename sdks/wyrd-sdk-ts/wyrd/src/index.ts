@@ -74,8 +74,11 @@ import type {
   SpanRecord,
   TokenAudience,
   UpdateOperatorConnectionRequest,
-  VerificationExecutionState,
-  VerificationResult,
+  NamedResponseFormatVariant2 as VerdictResponseFormat,
+  RequirementResult as WireRequirementResult,
+  VerificationExecutionState as WireVerificationExecutionState,
+  VerificationOutcome as WireVerificationOutcome,
+  VerificationResult as WireVerificationResult,
 } from "./card-types.js";
 
 import type {
@@ -225,14 +228,89 @@ export type {
   TriggerSpec,
   TypedCardKind,
   VerificationError,
-  VerificationExecutionState,
   VerificationExecutionStatus,
-  VerificationOutcome,
-  VerificationResult,
   VerificationStatus,
   VerificationVerdict,
   VerifierSpec,
 } from "./card-types.js";
+/** The JSON custom `data` a requirement carries when read without a type. */
+export type VerdictData = NonNullable<WireRequirementResult["data"]>;
+
+/** The judgment of one requirement, its custom `data` typed `T`. */
+export type RequirementResult<T = VerdictData> = Omit<WireRequirementResult, "data"> & { readonly data?: T };
+
+/** Overall verdict with its requirement and step breakdown, custom `data` typed `T`. */
+export type VerificationOutcome<T = VerdictData> = Omit<WireVerificationOutcome, "requirements"> & {
+  readonly requirements: readonly RequirementResult<T>[];
+};
+
+/** The attributable result of one Verifier execution, custom `data` typed `T`. */
+export type VerificationResult<T = VerdictData> = Omit<WireVerificationResult, "outcome"> & {
+  readonly outcome: VerificationOutcome<T>;
+};
+
+/** A verification execution's status, its result's custom `data` typed `T`. */
+export type VerificationExecutionState<T = VerdictData> = Omit<WireVerificationExecutionState, "result"> & {
+  readonly result?: VerificationResult<T> | null;
+};
+
+/**
+ * Anything that turns unknown custom Verdict `data` into a `T`, throwing when
+ * it does not fit. A Zod schema satisfies it by construction; no schema
+ * library is a dependency of this SDK.
+ */
+export interface VerdictDataParser<T> {
+  parse(value: unknown): T;
+}
+
+/**
+ * Decode every present requirement `data` of `result` with `parser`.
+ *
+ * Absent data stays absent; failed requirements decode too. Whatever the
+ * parser throws, the first mismatch raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID`
+ * without returning a partly typed result. It names the requirement and the
+ * data root's empty `path`, never the data, the thrown value, or a deeper
+ * path, which may hold a returned dictionary key.
+ */
+function typedResult<T>(result: VerificationResult, parser: VerdictDataParser<T>): VerificationResult<T> {
+  const requirements = result.outcome.requirements.map((requirement): RequirementResult<T> => {
+    const { data, ...rest } = requirement;
+    if (data === undefined) {
+      return rest;
+    }
+    try {
+      return { ...rest, data: parser.parse(data) };
+    } catch {
+      throw new WyrdError(
+        "WYRD_SDK_422_VERIFICATION_DATA_INVALID",
+        422,
+        "Verification data does not match the requested type",
+        `requirement \`${requirement.id}\` data does not match the requested type`,
+        "Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type.",
+        { requirement: requirement.id, path: "" },
+      );
+    }
+  });
+  return { ...result, outcome: { ...result.outcome, requirements } };
+}
+
+/**
+ * The `verdict` response format for a Prompt's `response_format` or a code
+ * check's `check.response_format`, with `data` as the custom data schema.
+ *
+ * `data` is a JSON Schema document or a schema that emits one, such as a Zod
+ * object, so the same schema can also parse typed results. Omitted, the
+ * format is the plain Verdict.
+ *
+ * @param data - The custom data's object schema.
+ * @returns The expanded `{ kind: "verdict", data }` format.
+ */
+export function verdictFormat(data?: Readonly<Record<string, unknown>> | JsonSchemaSource): VerdictResponseFormat {
+  return data === undefined
+    ? { kind: "verdict" }
+    : { kind: "verdict", data: JSON.parse(jsonSchemaText(data)) as VerdictResponseFormat["data"] };
+}
+
 /** Every type generated from the `wyrd-spec` Card schema, including nested spec types. */
 export type * as CardTypes from "./card-types.js";
 
@@ -2237,6 +2315,35 @@ export namespace verify {
     async wait(options: { readonly timeoutMs: number }): Promise<VerificationResult> {
       return lifecycleValue(await this.#native.wait(options.timeoutMs));
     }
+
+    /**
+     * {@link Execution.status}, with a present result's custom `data` parsed
+     * by `parser`.
+     *
+     * @param parser - Parses each present `data`, such as a Zod schema.
+     * @throws {@link WyrdError} the errors of {@link Execution.status}, then
+     * `WYRD_SDK_422_VERIFICATION_DATA_INVALID` when present data does not parse.
+     */
+    async statusTyped<T>(parser: VerdictDataParser<T>): Promise<VerificationExecutionState<T>> {
+      const { result, ...state } = await this.status();
+      return result == null ? state : { ...state, result: typedResult(result, parser) };
+    }
+
+    /**
+     * {@link Execution.wait}, with the result's custom `data` parsed by
+     * `parser`; a mismatch never repeats the execution.
+     *
+     * @param options - `timeoutMs`, as for {@link Execution.wait}.
+     * @param parser - Parses each present `data`, such as a Zod schema.
+     * @throws {@link WyrdError} the errors of {@link Execution.wait}, then
+     * `WYRD_SDK_422_VERIFICATION_DATA_INVALID` when present data does not parse.
+     */
+    async waitTyped<T>(
+      options: { readonly timeoutMs: number },
+      parser: VerdictDataParser<T>,
+    ): Promise<VerificationResult<T>> {
+      return typedResult(await this.wait(options), parser);
+    }
   }
 }
 
@@ -2293,6 +2400,26 @@ export class Observe {
     options?: VerifierInputOptions,
   ): Promise<VerificationResult> {
     return lifecycleValue(await this.#native.verify(verifier, nativeInputs(inputs, options), options?.group_id));
+  }
+
+  /**
+   * {@link Observe.verify}, with every requirement's custom `data` parsed by
+   * `parser` after the ordinary execution; a mismatch never repeats it.
+   *
+   * @param verifier - The bound Verifier's name.
+   * @param inputs - As {@link Observe.verify}.
+   * @param parser - Parses each present `data`, such as a Zod schema.
+   * @param options - As {@link Observe.verify}.
+   * @throws a {@link WyrdError}: the errors of {@link Observe.verify}, then
+   * `WYRD_SDK_422_VERIFICATION_DATA_INVALID` when present data does not parse.
+   */
+  async verifyTyped<T>(
+    verifier: string,
+    inputs: VerifierInput | VerifierInputs,
+    parser: VerdictDataParser<T>,
+    options?: VerifierInputOptions,
+  ): Promise<VerificationResult<T>> {
+    return typedResult(await this.verify(verifier, inputs, options), parser);
   }
 
   /**

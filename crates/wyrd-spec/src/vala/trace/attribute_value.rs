@@ -60,11 +60,11 @@ impl<'de> Deserialize<'de> for AttributeValue {
 }
 
 impl schemars::JsonSchema for AttributeValue {
-    fn schema_name() -> String {
-        "AttributeValue".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "AttributeValue".into()
     }
 
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         <serde_json::Value as schemars::JsonSchema>::json_schema(generator)
     }
 }

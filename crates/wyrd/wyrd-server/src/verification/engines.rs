@@ -113,6 +113,7 @@ mod tests {
             reason: "failed".to_owned(),
             actual: None,
             citations: Vec::new(),
+            data: None,
             detail,
             check: serde_json::from_value::<Check>(serde_json::json!({
                 "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true

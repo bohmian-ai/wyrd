@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -97,7 +97,7 @@ class DeskUpstream(BaseHTTPRequestHandler):
 
 
 @contextmanager
-def upstream_answering(answers: tuple[tuple[str, str], ...]) -> Iterator[Receiver]:
+def upstream_answering(answers: tuple[tuple[str, str], ...]) -> Generator[Receiver]:
     """Serve a recording local model provider that answers by body marker."""
     handler = type("Answering", (DeskUpstream,), {"answers": answers})
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), handler)

@@ -1559,7 +1559,7 @@ class Prompt:
         *,
         provider: str,
         system: str | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         operation: str | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
@@ -1586,6 +1586,10 @@ class Prompt:
                 ``instructions``. Omitted, no system instruction is sent.
             response_format: a ``ResponseFormat``, or a JSON Schema object or
                 Pydantic model class used as a schema named ``"response"``.
+                ``"verdict"`` asks for Wyrd's Verdict, and
+                ``{"kind": "verdict", "data": Model}`` adds a required custom
+                ``data`` object, given as a JSON Schema or Pydantic model
+                class; the Prompt keeps the name and Wyrd supplies the schema.
                 Omitted, the provider's default text output applies.
             output: a structured-output declaration that replaces
                 ``response_format`` when both are set. A Pydantic model class
@@ -1623,7 +1627,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
         model_settings: OpenAISettings | Mapping[str, Any] | None = ...,
@@ -1656,7 +1660,7 @@ class Prompt:
         *,
         instructions: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: OpenAIResponsesSettings | Mapping[str, Any] | None = ...,
     ) -> Prompt:
@@ -1687,7 +1691,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: AnthropicSettings | Mapping[str, Any] | None = ...,
     ) -> Prompt:
@@ -1718,7 +1722,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
     ) -> Prompt:
@@ -1749,7 +1753,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
     ) -> Prompt:

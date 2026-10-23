@@ -17,7 +17,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator, Iterator, MutableMapping
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator, MutableMapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -85,7 +85,7 @@ def reset_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: Any) -> AsyncIterator[list[dict[str, Any]]]:
+async def lifespan(app: Any) -> AsyncGenerator[list[dict[str, Any]]]:
     """Drive ``app``'s lifespan as a server does, collecting its replies.
 
     Startup runs on entry; shutdown runs on exit only when startup completed.
@@ -197,7 +197,7 @@ def test_asgi_lifespan(
 
     def app(state: Any, events: list[str], refuse: bool = False, **options: Any) -> FastAPI:
         @asynccontextmanager
-        async def application_lifespan(_: FastAPI) -> AsyncIterator[None]:
+        async def application_lifespan(_: FastAPI) -> AsyncGenerator[None]:
             events.append("startup")
             if refuse:
                 raise RuntimeError("the application refused to start")

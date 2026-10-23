@@ -132,6 +132,7 @@ fn drift_outcome(report: Option<DriftReport>) -> Result<VerificationOutcome, Ser
             reason: "scored by the journey".to_owned(),
             actual: None,
             citations: Vec::new(),
+            data: None,
             detail: report.map(RequirementDetail::Drift),
             check: serde_json::from_value::<Check>(json!({
                 "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true

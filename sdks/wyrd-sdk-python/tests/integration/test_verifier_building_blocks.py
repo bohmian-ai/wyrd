@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from opentelemetry import trace
-from pydantic import BaseModel
+from pydantic import BaseModel, RootModel
 from wyrd import WyrdError, verify
 from wyrd.auth import Principals
 from wyrd.bifrost import Bifrost
@@ -203,6 +203,76 @@ def record_trace(
     trace_id = format(span.get_span_context().trace_id, "032x")
     assert len(timeline(server, trace_id)) == 2, "both spans are stored"
     return trace_id
+
+
+SCORED_TEXT = "Refunds follow our policy."
+"""The ``scored-review`` answer naming no scripted case: four words."""
+
+SCORED_DATA = {
+    "helpful": {"score": 0.9, "category": "refund"},
+    "well-formed": {"score": 0.5, "category": "format"},
+    "tally-counted": {"words": 4},
+}
+"""The custom data each scored ``scored-review`` requirement returns for ``SCORED_TEXT``."""
+
+
+class Score(BaseModel):
+    """A score with its category."""
+
+    score: float
+    category: str
+
+
+class Tally(BaseModel):
+    """A word count."""
+
+    words: int
+
+
+class Scored(RootModel[Score | Tally]):
+    """Either scored shape ``scored-review`` returns."""
+
+
+class Numbers(RootModel[dict[str, float]]):
+    """Numbers only, which the scores' text categories do not fit."""
+
+
+class RetainedOutcome(BaseModel):
+    """One retained result's outcome as JSON text."""
+
+    outcome: str
+
+
+def scored_review(desk: WyrdState, text: str = SCORED_TEXT) -> verify.VerificationResult:
+    """Verify ``text`` with ``scored-review`` now."""
+    return desk.run().observe.verify("scored-review", answer={"text": text})
+
+
+def submit_scored(desk: WyrdState, text: str = SCORED_TEXT) -> verify.Execution:
+    """Submit ``text`` to ``scored-review`` and return its queued execution."""
+    execution = desk.run().observe.submit("scored-review", answer={"text": text})
+    assert isinstance(execution, verify.Execution)
+    return execution
+
+
+def assert_scored(requirements: list[RequirementResult]) -> None:
+    """Assert the plain judges pass without data and the scored checks keep their exact data."""
+    by_id = {each["id"]: each for each in requirements}
+    for id in ("polite", "on-topic"):
+        assert by_id[id]["outcome"] == "passed", by_id[id]
+        assert "data" not in by_id[id], id
+    assert by_id["helpful"]["outcome"] == "passed"
+    assert by_id["well-formed"]["outcome"] == "failed"
+    assert by_id["tally-counted"]["outcome"] == "passed"
+    assert by_id["tally-counted"]["step"] == "tally"
+    for id, data in SCORED_DATA.items():
+        assert by_id[id]["data"] == data, id
+        assert by_id[id]["citations"] == ANSWER_TEXT, id
+
+
+def scored_calls(receiver: Receiver) -> int:
+    """How many scored-judge calls the local provider has answered."""
+    return sum("SCORE:" in json.dumps(each.body) for each in receiver.to("/v1/chat/completions"))
 
 
 class Attribution(BaseModel):
@@ -534,3 +604,139 @@ def test_delegated_tools_keep_the_narrower_authority(
             act_principal_id=principal_id("tool_delegate"),
         )
     ]
+
+
+def test_custom_verdict_data_survives_readback(
+    desk: WyrdState, wyrd_server: WyrdTestServer
+) -> None:
+    assert_scored(scored_review(desk).requirements)
+    execution = submit_scored(desk)
+    waited = execution.wait(WAIT_SECONDS)
+    assert_scored(waited.requirements)
+    status = execution.status()
+    assert status["result"]["outcome"]["requirements"] == waited.requirements
+
+    assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"]
+
+    for marker, data in EXACT_DATA.items():
+        text = f"{marker} refunds"
+        assert requirement(scored_review(desk, text), "well-formed")["data"] == data, marker
+        execution = submit_scored(desk, text)
+        waited = execution.wait(WAIT_SECONDS)
+        assert requirement(waited, "well-formed")["data"] == data, marker
+        status = execution.status()
+        assert status["result"]["outcome"]["requirements"] == waited.requirements, marker
+        assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"], marker
+
+
+def retained(wyrd_server: WyrdTestServer, execution_id: str) -> object:
+    """The retained outcome of ``execution_id``, read back from Bifrost after publishing."""
+    wyrd_server.flush_bifrost()
+    [row] = Bifrost(client=client_of(wyrd_server)).sql(
+        "SELECT to_json(outcome) AS outcome FROM vala.verification.results WHERE execution_id = $1",
+        [execution_id],
+        model=RetainedOutcome,
+    )
+    return json.loads(row.outcome)
+
+
+def deep(containers: int) -> object:
+    """A ``tree`` that, inside its data object, nests ``containers`` containers."""
+    tree: object = "s3cr3t"
+    for _ in range(containers - 1):
+        tree = [tree]
+    return tree
+
+
+EXACT_DATA = {
+    "EXACT-BYTES": {"score": 0.5, "category": "é" * 32_000 + '\n"\u0001' + "x" * 1_499},
+    "EXACT-WIDE": {"score": 0.5, "category": "format", "tree": [0] * 32_747},
+    "DEEP-16": {"score": 0.5, "category": "format", "tree": deep(16)},
+}
+"""The ``well-formed`` code check's data at its inclusive bounds, by answer marker."""
+
+
+def test_invalid_custom_verdict_data_is_inconclusive(desk: WyrdState) -> None:
+    for marker in ("BAD-DATA", "HUGE-DATA"):
+        result = scored_review(desk, f"{marker} refunds")
+        for id in ("helpful", "well-formed"):
+            refused = requirement(result, id)
+            assert refused["outcome"] == "inconclusive", (marker, refused)
+            assert "data" not in refused, (marker, id)
+            assert "high" not in refused["reason"] and "xxxx" not in refused["reason"]
+        assert requirement(result, "tally-counted")["data"] == {"words": 2}, marker
+        assert result.verdict == "inconclusive"
+
+    for marker in (
+        "MISSING-DATA",
+        "NULL-DATA",
+        "EXTRA-DATA",
+        "EXTRA-FIELD",
+        "OVER-BYTES",
+        "OVER-WIDE",
+        "DEEP-17",
+    ):
+        result = scored_review(desk, f"{marker} refunds")
+        refused = requirement(result, "well-formed")
+        assert refused["outcome"] == "inconclusive", (marker, refused)
+        assert "data" not in refused, marker
+        assert "s3cr3t" not in refused["reason"] and "xxxx" not in refused["reason"], marker
+        assert requirement(result, "helpful")["data"] == SCORED_DATA["helpful"], marker
+        assert requirement(result, "tally-counted")["data"] == {"words": 2}, marker
+
+    result = scored_review(desk, "ENVELOPE-DATA refunds")
+    refused = requirement(result, "plainly-checked")
+    assert refused["outcome"] == "inconclusive", refused
+    assert "data" not in refused
+    assert "s3cr3t" not in refused["reason"]
+    assert requirement(result, "well-formed")["data"] == {"score": 0.5, "category": "format"}
+
+
+def test_custom_verdict_data_is_typed_on_return(desk: WyrdState) -> None:
+    expected = {
+        "helpful": Score(score=0.9, category="refund"),
+        "well-formed": Score(score=0.5, category="format"),
+        "tally-counted": Tally(words=4),
+    }
+
+    def assert_typed(requirements: list[RequirementResult[Scored]]) -> None:
+        by_id = {each["id"]: each for each in requirements}
+        assert by_id["polite"].get("data") is None
+        assert {id: by_id[id]["data"].root for id in expected} == expected
+
+    direct = desk.run().observe.verify_typed("scored-review", Scored, answer={"text": SCORED_TEXT})
+    assert_typed(direct.requirements)
+    assert isinstance(requirement(scored_review(desk), "helpful")["data"], dict)
+    execution = submit_scored(desk)
+    assert_typed(execution.wait_typed(WAIT_SECONDS, Scored).requirements)
+    assert_typed(execution.status_typed(Scored)["result"]["outcome"]["requirements"])
+
+    with pytest.raises(WyrdError) as slot:
+        desk.run().observe.verify_typed("scored-review", Scored, data_type={"text": "x"})
+    assert slot.value.code == "WYRD_VERIFICATION_400_INPUT_INVALID"
+
+
+def test_typed_verdict_data_mismatch_keeps_original_result(
+    desk: WyrdState, receiver: Receiver
+) -> None:
+    def assert_mismatch(raised: pytest.ExceptionInfo[WyrdError]) -> None:
+        assert raised.value.code == "WYRD_SDK_422_VERIFICATION_DATA_INVALID"
+        assert raised.value.details == {"requirement": "helpful", "path": ""}
+        assert "refund" not in raised.value.message
+
+    with pytest.raises(WyrdError) as direct:
+        desk.run().observe.verify_typed("scored-review", Numbers, answer={"text": SCORED_TEXT})
+    assert_mismatch(direct)
+    execution = submit_scored(desk)
+    ordinary = execution.wait(WAIT_SECONDS)
+    judged = scored_calls(receiver)
+    with pytest.raises(WyrdError) as waited:
+        execution.wait_typed(WAIT_SECONDS, Numbers)
+    assert_mismatch(waited)
+    with pytest.raises(WyrdError) as status:
+        execution.status_typed(Numbers)
+    assert_mismatch(status)
+
+    assert execution.status()["result"]["outcome"]["requirements"] == ordinary.requirements
+    assert_scored(ordinary.requirements)
+    assert scored_calls(receiver) == judged, "nothing is judged again"

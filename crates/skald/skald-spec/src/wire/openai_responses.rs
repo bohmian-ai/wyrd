@@ -303,21 +303,14 @@ pub enum OpenAiResponsesInput {
 /// text or content-part `content`, with `type` omitted or `message`. The easy
 /// message is registered as a named definition so generated declarations name
 /// it; decoded and re-encoded items stay canonical.
-///
-/// # Panics
-///
-/// Panics only if the literal easy-message schema stops being a valid
-/// [`schemars::schema::Schema`], a fixed invariant of this function.
 #[cfg(feature = "schemars")]
-fn input_items_schema(
-    generator: &mut schemars::r#gen::SchemaGenerator,
-) -> schemars::schema::Schema {
+fn input_items_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
     /// Definition name of the easy input message: the key it is registered
     /// under and the target of each item's `$ref`, so both stay identical.
     const EASY: &str = "OpenAiEasyInputMessage";
     let item = generator.subschema_for::<OpenAiResponseItem>();
     let parts = generator.subschema_for::<Vec<OpenAiResponseContentPart>>();
-    let easy = serde_json::from_value(serde_json::json!({
+    let easy = serde_json::json!({
         "description": "Easy input message: `type` may be omitted and `content` may be text.",
         "type": "object",
         "required": ["content", "role"],
@@ -326,15 +319,13 @@ fn input_items_schema(
             "role": {"type": "string"},
             "type": {"type": "string", "enum": ["message"]}
         }
-    }))
-    .expect("the easy input message schema literal is a valid schema");
+    });
     generator.definitions_mut().insert(EASY.to_owned(), easy);
-    let easy_ref = format!("{}{EASY}", generator.settings().definitions_path);
-    serde_json::from_value(serde_json::json!({
+    let easy_ref = format!("#{}/{EASY}", generator.settings().definitions_path);
+    schemars::json_schema!({
         "type": "array",
         "items": {"anyOf": [item, {"$ref": easy_ref}]}
-    }))
-    .expect("the input item list schema literal is a valid schema")
+    })
 }
 
 /// Decodes Responses input items, accepting `OpenAI`'s easy input message.
@@ -738,15 +729,15 @@ mod tests {
     fn input_items_schema_admits_easy_messages() {
         let root = schemars::schema_for!(OpenAiResponsesRequest);
         let schema = serde_json::to_value(&root).expect("schema encodes");
-        let input = &schema["definitions"]["OpenAiResponsesInput"]["anyOf"];
+        let input = &schema["$defs"]["OpenAiResponsesInput"]["anyOf"];
         assert_eq!(
             input[1]["items"]["anyOf"],
             json!([
-                {"$ref": "#/definitions/OpenAiResponseItem"},
-                {"$ref": "#/definitions/OpenAiEasyInputMessage"}
+                {"$ref": "#/$defs/OpenAiResponseItem"},
+                {"$ref": "#/$defs/OpenAiEasyInputMessage"}
             ])
         );
-        let easy = &schema["definitions"]["OpenAiEasyInputMessage"];
+        let easy = &schema["$defs"]["OpenAiEasyInputMessage"];
         assert_eq!(easy["required"], json!(["content", "role"]));
         assert_eq!(easy["properties"]["type"]["enum"], json!(["message"]));
     }

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use rmcp::model::{CallToolResult, Tool, ToolAnnotations};
 use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
+use schemars::SchemaGenerator;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use wyrd_runtime::Permission;
@@ -75,18 +75,16 @@ pub(super) fn may_administer(caller: &Caller) -> bool {
 
 /// Derive one tool schema from the Rust type the tool actually speaks.
 ///
-/// rmcp's typed helpers are unusable here because rmcp carries `schemars` 1
-/// while the shared `wyrd-spec` DTOs derive the workspace `schemars` 0.8, so
-/// the schema is generated from the same derive the repository uses everywhere
-/// else and handed to rmcp as a raw object.
+/// The schema comes from the workspace's default JSON Schema 2020-12
+/// generator, the same one every other contract uses, and is handed to rmcp as
+/// a raw object.
 ///
 /// # Panics
 /// Panics when the derived schema is not a JSON object, which the `JsonSchema`
 /// derive cannot produce for a struct.
 pub(super) fn schema_of<T: JsonSchema>() -> Arc<JsonMap<String, JsonValue>> {
     let root = SchemaGenerator::default().into_root_schema_for::<T>();
-    let JsonValue::Object(schema) = serde_json::to_value(root).expect("a derived schema is JSON")
-    else {
+    let JsonValue::Object(schema) = root.to_value() else {
         panic!("a derived struct schema is a JSON object");
     };
     Arc::new(schema)

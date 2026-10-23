@@ -25,7 +25,7 @@ import tempfile
 import termios
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -460,7 +460,7 @@ PROVIDER_KEY_VARIABLES = (
 
 
 @contextmanager
-def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
+def local_deployment() -> Generator[tuple[Path, dict[str, str]]]:
     """Own one deployment's empty database and temporary installed files.
 
     The database outlives every CLI and SDK process started for this
@@ -525,7 +525,7 @@ def installed_local_cli(
     terminal: str,
     tenant: str = "local",
     extra: tuple[str, ...] = (),
-) -> Iterator[None]:
+) -> Generator[None]:
     """Run a real installed CLI serving ``tenant`` against ``home`` until the block ends.
 
     ``extra`` appends further ``wyrd init`` arguments, such as a gateway file.

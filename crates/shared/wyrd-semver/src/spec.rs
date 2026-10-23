@@ -4,10 +4,10 @@ use std::fmt;
 use std::str::FromStr;
 
 use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::Schema;
+use schemars::{Schema, SchemaGenerator};
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 
 use crate::block::VersionBlock;
 use crate::error::VersionError;
@@ -146,17 +146,16 @@ impl<'de> Deserialize<'de> for VersionSpec {
 }
 
 impl JsonSchema for VersionSpec {
-    fn schema_name() -> String {
-        "VersionSpec".to_owned()
+    fn schema_name() -> Cow<'static, str> {
+        "VersionSpec".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        serde_json::from_value(serde_json::json!({
+        schemars::json_schema!({
             "type": "string",
             "description": "Authored version on the card-declaration path. Either a full semver triple pin (e.g. \"1.4.2\", \"1.4.2-rc.1+meta\") or a bare partial scope (e.g. \"1\", \"1.0\"). Range comparators (^, ~, *, >=, ...) are rejected on this path.",
             "examples": ["1.4.2", "1.4.2-rc.1+meta", "1.0", "1"]
-        }))
-        .expect("VersionSpec schema is valid JSON Schema")
+        })
     }
 }
 

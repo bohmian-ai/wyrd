@@ -56,6 +56,19 @@ pub struct Prompt {
     /// from its image or document block at compile time. Native placeholders
     /// carry no kind and are absent; the list survives text and media binds.
     pub(crate) media_kinds: Vec<(String, MediaKind)>,
+    /// The host-named response format this Prompt was authored with; it
+    /// survives binds so an unresolved name keeps refusing to render.
+    pub(crate) named_format: Option<NamedFormat>,
+}
+
+/// A named authored response format and the schema its host resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NamedFormat {
+    /// The authored format name.
+    pub(crate) name: String,
+    /// The resolved schema; `None` until compiled through
+    /// [`AuthoredPrompt::compile_with`].
+    pub(crate) schema: Option<serde_json::Map<String, Value>>,
 }
 
 /// Prompts are equal when they serialize to the same authored form; a
@@ -106,12 +119,12 @@ impl<'de> Deserialize<'de> for Prompt {
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for Prompt {
     /// Names the schema `Prompt`.
-    fn schema_name() -> String {
-        "Prompt".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Prompt".into()
     }
 
     /// Publishes the authored form's schema, which is the wire form.
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         AuthoredPrompt::json_schema(generator)
     }
 }
@@ -230,11 +243,7 @@ pub fn check_model(model: &str) -> SkaldResult<()> {
 /// the dotted path to the first offending keyword: the schema itself when it
 /// is not a JSON object, `$schema` for an unsupported meta-schema, `type` for
 /// a strict OpenAI non-object root, or the meta-validation error location.
-pub(crate) fn check_output_schema(
-    schema: &Value,
-    field: &str,
-    object_root: bool,
-) -> SkaldResult<()> {
+pub fn check_output_schema(schema: &Value, field: &str, object_root: bool) -> SkaldResult<()> {
     let Some(object) = schema.as_object() else {
         return Err(invalid(field, "an output schema is a JSON object"));
     };
@@ -372,6 +381,7 @@ impl Prompt {
             provider: None,
             authored: None,
             media_kinds: Vec::new(),
+            named_format: None,
         };
         prompt.normalize_media_placeholders_mut()?;
         prompt.variables = extract_text_variables(&prompt.request)?;
@@ -394,11 +404,17 @@ impl Prompt {
         // fields private if Prompt serialization ever shows up in a profile.
         match self.authored.as_deref() {
             Some(authored)
-                if authored.compile().is_ok_and(|compiled| {
-                    compiled.request == self.request
-                        && compiled.model == self.model
-                        && compiled.provider == self.provider
-                }) =>
+                if authored
+                    .compile_resolved(
+                        self.named_format
+                            .as_ref()
+                            .and_then(|format| format.schema.clone()),
+                    )
+                    .is_ok_and(|compiled| {
+                        compiled.request == self.request
+                            && compiled.model == self.model
+                            && compiled.provider == self.provider
+                    }) =>
             {
                 Ok(std::borrow::Cow::Borrowed(authored))
             }
@@ -582,7 +598,26 @@ impl Prompt {
     /// Values are escaped as JSON string content before substitution, so a
     /// variable value cannot inject new fields into the serialized provider
     /// request. The returned request remains in the same provider-native shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptInvalid`] at `response_format` for a named
+    /// format its host has not resolved, and the missing-variable, media,
+    /// and binding errors otherwise.
     pub fn render(&self, vars: &[(&str, &str)]) -> SkaldResult<ProviderRequest> {
+        if let Some(format) = self
+            .named_format
+            .as_ref()
+            .filter(|format| format.schema.is_none())
+        {
+            return Err(invalid(
+                "response_format",
+                &format!(
+                    "named response format `{}` must be resolved by its host before rendering",
+                    format.name
+                ),
+            ));
+        }
         let mut prompt = self.clone();
         prompt.normalize_media_placeholders_mut()?;
         if let Some(name) = prompt.media_variables.first() {
@@ -1896,6 +1931,7 @@ mod prompt_render {
             provider: None,
             authored: None,
             media_kinds: Vec::new(),
+            named_format: None,
         }
     }
 

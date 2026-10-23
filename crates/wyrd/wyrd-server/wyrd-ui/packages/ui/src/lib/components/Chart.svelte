@@ -99,7 +99,8 @@
   function release() {
     const selected = brush;
     brush = undefined;
-    if (!selected || !onaction || Math.abs(selected.to - selected.from) < 6) return;
+    // Only null values plotted: there is no time domain to brush.
+    if (!selected || !onaction || xs.length === 0 || Math.abs(selected.to - selected.from) < 6) return;
     const at = (x: number) => bounds.x0 + ((x - PAD.left) / (W - PAD.left - PAD.right)) * (bounds.x1 - bounds.x0);
     const [from, to] = [at(Math.min(selected.from, selected.to)), at(Math.max(selected.from, selected.to))];
     onaction({ name: 'chart.range', input: { from: new Date(from).toISOString(), to: new Date(to).toISOString() } });

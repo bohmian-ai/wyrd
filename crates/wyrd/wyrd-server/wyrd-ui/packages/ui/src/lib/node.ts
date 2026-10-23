@@ -11,12 +11,20 @@ function problem(error: unknown): Problem {
   throw error;
 }
 
+/** Share one in-flight or successful connection; a failed one is dropped so the next read connects again. */
+function retained<T>(connect: () => Promise<T>): () => Promise<T> {
+  let handle: Promise<T> | undefined;
+  return () =>
+    (handle ??= connect().catch((error) => {
+      handle = undefined;
+      throw error;
+    }));
+}
+
 /** Build an executor over one SDK client. */
 export function nodeExecutor(client: WyrdClient): Executor {
-  let cardsHandle: Promise<Cards> | undefined;
-  let bifrostHandle: Promise<Bifrost> | undefined;
-  const cards = () => (cardsHandle ??= Cards.connect({ client }));
-  const bifrost = () => (bifrostHandle ??= Bifrost.connect({ client }));
+  const cards = retained(() => Cards.connect({ client }));
+  const bifrost = retained(() => Bifrost.connect({ client }));
 
   async function read(request: WireRequest, signal?: AbortSignal): Promise<unknown> {
     switch (request.op) {

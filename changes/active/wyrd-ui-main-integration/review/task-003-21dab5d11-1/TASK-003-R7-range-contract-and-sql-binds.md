@@ -67,3 +67,34 @@ mise exec -- git diff --check
 ```
 
 These pure TypeScript corrections need no native rebuild, broad aggregate, full journey suite or renewed release matrix in this task. Change review owns combined journey proof. Mandatory Rust documentation is already closed; do not create a documentation-only round. Subsequent task review reassesses the complete original cumulative task.
+
+## Implementation evidence
+
+Status: **IMPLEMENTED**. Production commit `bca10dcfa`; UI paths rooted at `crates/wyrd/wyrd-server/wyrd-ui/`.
+
+Reuse map. FIND-003-13: owner `packages/ui/src/lib/schemas.ts`. Gap: RelativeRangeSchema checked only native Date capacity. Extension: one private `bounds(last)` computes resolved bounds at the current clock and returns them only when `AbsoluteRangeSchema` admits them; RelativeRangeSchema refines on it and `resolveRange` returns it. A later clock only moves the start forward, so a span admitted at validation still resolves at load. Every existing caller (validateView, validatePanel/loadPanel, WyrdView, both POST hosts) already parses through RangeSchema, so root errors, panel-only errors and endpoint refusals use their existing canonical paths with no host change. `resolveRange` lost its unused `now` parameter (no caller passed it) so it cannot resolve at a clock admission never saw; its `RangeError` is reachable only for input that never passed RangeSchema. FIND-003-15: owner `chartParams` in `packages/ui/src/lib/loaders.ts`; no portable tokenizer exists. Extension: private `highestBind` follows the query owner's DataFusion generic dialect (sqlparser 0.63 `GenericDialect`): `'..'` with doubled quotes, `E'..'` with backslash escapes, `".."`/`` `..` `` identifiers, `$$..$$`/`$tag$..$tag$`, `--` and nested `/* */` comments, `$` inside identifiers, and `$` followed by a word counted only when the word is exactly 1–3. SQL text is never rewritten.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-003-13 absolute output invariant | `schemas.ts` `bounds`, `RelativeRangeSchema`, `resolveRange` | Validated portable rendering: at fixed 2026-10-22 clock `6h`/`24h`/the last admitted day (`0000-…`) resolve and pass AbsoluteRangeSchema; `1000000000000d`, `100000000d`, and one day past year 0000 are `View input.range` validation | PASS |
+| FIND-003-13 root initial/replacement and portability | existing WyrdView/validateView paths | same test: each bad span with Chart + range-independent CardHeader shows `View input.range` with zero executor reads and zero remote loader calls; valid→bad replacement adds no reads | PASS |
+| FIND-003-13 explicit panel and endpoints | existing validatePanel/loadPanel/POST paths | same test: bad explicit Chart range fails only that panel, sibling binds `[RANGE.from, RANGE.to]` once; Canonical UI problem projections: both POST harnesses answer 400 problem+json `Chart input.range` for both spans, `Bifrost.connect` never called | PASS |
+| FIND-003-13 preserved resolution | unchanged loadChart precedence/WyrdView single clock | Dependent loads and safe actions (shared 6h bounds, explicit precedence, relative `1h` at fixed clock, cancellation) green | PASS |
+| FIND-003-15 inert SQL | `loaders.ts` `highestBind`, `chartParams` | Dependent loads: ten range-free table queries via `loadPanel` (quoted literal, doubled quote, `E'\''`, double-quoted and backtick identifiers with `""` escape, `$$`/`$q$`, line, nested block comments, `price$1`, `$12`) each reach the executor once with identical SQL, `params: []`, populated result and matching `executed` | PASS |
+| FIND-003-15 real/inert mix | same | real `$1`/`$2` + inert `$3` in literal and comment binds exactly `[from, to]` with matching executed values; without range it and `'$1', $1` / `$3 /* $1 */` are validation errors with zero reads; three-bind plan with inert `$4` unchanged; existing exact-bind and Open in Query assertions green | PASS |
+
+RED (implementation files reverted to HEAD, new tests kept): Validated portable rendering 1 failed/9 skipped (`100000000d` admitted, `ui-library.test.ts:389`); Dependent loads 1 failed/9 skipped (literal `$1` refused, zero executor calls, `:470`); Canonical 1 failed/9 skipped (endpoint admitted `100000000d` and reached `Bifrost.connect`). GREEN:
+
+| Command | Result |
+|---|---|
+| `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Validated portable rendering$'` | 1 passed, 9 skipped |
+| `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Dependent loads and safe actions$'` | 1 passed, 9 skipped |
+| `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^Canonical UI problem projections$'` | 1 passed, 9 skipped |
+| `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` | 0 errors, 0 warnings |
+| `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test` | 8 files, 40 passed |
+| `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec node packages/ui/scripts/catalog.ts --check` | exit 0 (no projection change) |
+| `mise run fmt:check` | pass |
+| `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts'` | 1 file, 2 passed |
+| `mise exec -- git diff --check` | clean |
+
+No Rust changed, so `mise run lints` was not run. Non-goals held: no new public field, dependency, configuration, host change, retention cap, widened absolute contract, or generated-artifact edit; changed files are only `schemas.ts`, `loaders.ts`, `ui-library.test.ts` and this record. Limit: the bind scanner mirrors the generic dialect DataFusion uses today; a different configured dialect would need the scanner revisited.

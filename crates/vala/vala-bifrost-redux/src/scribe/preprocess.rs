@@ -303,6 +303,7 @@ impl NativeSliceProducer {
                             tenant: self.tenant,
                             table: &self.table,
                             revision: self.partition_scheme.revision(),
+                            recipe: self.partition_scheme.recipe(),
                         },
                         partition,
                         rows,
@@ -678,6 +679,7 @@ fn prepare_rows(
                     tenant,
                     table: &table,
                     revision: partition_scheme.revision(),
+                    recipe: partition_scheme.recipe(),
                 },
                 &partition_scheme,
                 &rows,
@@ -858,6 +860,8 @@ struct SliceContext<'a> {
     table: &'a TableRef,
     /// Revision the seal key binds the slice to.
     revision: crate::catalog::LayoutRevision,
+    /// Recipe the seal key binds the slice to.
+    recipe: Option<&'a crate::catalog::AcceptedRecipe>,
 }
 
 /// Builds one exact-capacity WAL slice from the current materialized day.
@@ -877,7 +881,8 @@ fn prepare_slice(
     known: Option<&LogicalIdentity>,
 ) -> Result<PreparedSlice, ScribeError> {
     let seal_key = SealKey::new(context.tenant, context.table.clone(), partition)
-        .with_revision(context.revision);
+        .with_revision(context.revision)
+        .with_recipe(context.recipe.cloned());
     let data_payload = encode_ipc(&rows)?;
     let identity_span = tracing::debug_span!(
         "scribe_logical_batch_identity",

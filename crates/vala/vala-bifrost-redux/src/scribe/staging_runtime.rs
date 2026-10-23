@@ -783,6 +783,10 @@ impl ScribeStagingRuntime {
 
     /// Reconstructs one recovered key's encoding context, or fails closed.
     ///
+    /// The layout is re-resolved from the recipe the members' rows were
+    /// accepted under, which their record carries, against the runs' own
+    /// schema, so a later Bloom or layout alteration never strands them.
+    ///
     /// `members` are the members restore keeps. The schema is read from their
     /// runs only: a key can also hold the leftovers of a claim that already
     /// committed, and restore has removed those members' runs by the time it
@@ -826,8 +830,7 @@ impl ScribeStagingRuntime {
             pool,
             self.catalog.as_deref(),
             &binding,
-            key.revision(),
-            key.partition().spec_id(),
+            &key.seal_key(),
             schema.as_ref(),
         )
         .await?;
@@ -839,7 +842,8 @@ impl ScribeStagingRuntime {
             key.revision(),
             key.partition().clone(),
             StreamIdentity::new(key.node_id(), key.writer_epoch()),
-        );
+        )
+        .with_recipe(key.recipe().cloned());
         if resolved != *key {
             return Err(ScribeError::Internal {
                 detail: "the registered write recipe no longer reproduces a recovered staged key"

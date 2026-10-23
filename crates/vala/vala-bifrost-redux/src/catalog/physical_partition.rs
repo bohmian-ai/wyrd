@@ -382,6 +382,9 @@ pub struct PartitionScheme {
     time_index: u8,
     /// Additional dimensions in spec order.
     dimensions: Vec<(String, PartitionTransform)>,
+    /// Complete recipe planned slices are accepted under, when the scheme
+    /// comes from a registered declaration.
+    recipe: Option<crate::catalog::AcceptedRecipe>,
 }
 
 /// A bare time partition is the time-only identity under the initial spec.
@@ -403,7 +406,21 @@ impl PartitionScheme {
             revision: LayoutRevision::INITIAL,
             time_index: 0,
             dimensions: Vec::new(),
+            recipe: None,
         }
+    }
+
+    /// Binds the scheme's planned slices to `recipe`.
+    #[must_use]
+    pub fn with_recipe(mut self, recipe: crate::catalog::AcceptedRecipe) -> Self {
+        self.recipe = Some(recipe);
+        self
+    }
+
+    /// Borrows the recipe planned slices are accepted under.
+    #[must_use]
+    pub const fn recipe(&self) -> Option<&crate::catalog::AcceptedRecipe> {
+        self.recipe.as_ref()
     }
 
     /// Binds the scheme's planned slices to `revision`.
@@ -453,6 +470,7 @@ impl PartitionScheme {
             revision: LayoutRevision::INITIAL,
             time_index,
             dimensions,
+            recipe: None,
         })
     }
 

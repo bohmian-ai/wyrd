@@ -105,9 +105,9 @@ impl ScribeClaimIdentity {
 /// Seal key — `(DataTenantId, TableRef, LayoutRevision, PhysicalPartition)`
 /// identifying one WAL/memtable/seal scope.
 ///
-/// The revision is part of the scope, so batches accepted under different
-/// schema or sort-order revisions never share a generation and each seals
-/// under the retained metadata it was accepted with.
+/// The revision and recipe are part of the scope, so batches accepted under
+/// different schema, sort-order, or Bloom recipes never share a generation and
+/// each seals under the recipe it was accepted with.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SealKey {
     /// Tenant ID for this seal scope.
@@ -118,6 +118,10 @@ pub struct SealKey {
     pub revision: LayoutRevision,
     /// Exact partition for this seal scope.
     pub partition: PhysicalPartition,
+    /// Complete recipe every batch in the scope was accepted under; `None`
+    /// only where no registered declaration admitted the rows, which seal
+    /// resolves from the registered control row.
+    pub recipe: Option<crate::catalog::AcceptedRecipe>,
 }
 
 impl SealKey {
@@ -134,6 +138,7 @@ impl SealKey {
             table,
             revision: LayoutRevision::INITIAL,
             partition: partition.into(),
+            recipe: None,
         }
     }
 
@@ -144,12 +149,20 @@ impl SealKey {
         self
     }
 
+    /// Binds the key to the recipe its batches were accepted under.
+    #[must_use]
+    pub fn with_recipe(mut self, recipe: Option<crate::catalog::AcceptedRecipe>) -> Self {
+        self.recipe = recipe;
+        self
+    }
+
     /// Returns the canonical text identity of this seal scope,
-    /// `{namespace}/{table}/tenant={tenant}/{revision}/{partition}`.
+    /// `{namespace}/{table}/tenant={tenant}/{revision}/{partition}`, followed
+    /// by `/recipe={digest}` when the key binds a recipe.
     ///
     /// WAL manifests and replay indexes key on this text, so it is injective:
-    /// it renders the revision ids and the partition's spec, time, and every
-    /// typed value.
+    /// it renders the revision ids, the partition's spec, time, and every
+    /// typed value, and the recipe digest.
     #[must_use]
     pub fn canonical_key(&self) -> String {
         self.to_string()
@@ -167,7 +180,11 @@ impl std::fmt::Display for SealKey {
             self.tenant.as_uuid(),
             self.revision,
             self.partition
-        )
+        )?;
+        match &self.recipe {
+            Some(recipe) => write!(f, "/recipe={}", hex::encode(recipe.digest())),
+            None => Ok(()),
+        }
     }
 }
 

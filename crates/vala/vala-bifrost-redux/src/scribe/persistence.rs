@@ -2234,8 +2234,7 @@ impl PersistenceWorker {
                 })?,
             self.catalog.as_deref(),
             binding,
-            generation.seal_key.revision,
-            generation.seal_key.partition.spec_id(),
+            &generation.seal_key,
             &frozen.schema,
         )
         .await?;

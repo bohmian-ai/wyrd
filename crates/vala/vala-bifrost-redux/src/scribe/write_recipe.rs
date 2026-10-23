@@ -1,16 +1,11 @@
 //! Seal-time resolution of the physical write recipe.
 //!
-//! Bifrost follows the table-format write-task convention: a writer resolves
-//! schema, partitioning, sort order, and footer properties from the table once
-//! per write task. Row batches carry only the revision ids they were accepted
-//! under, never the layout itself, and the recipe is that retained revision, so
-//! a revision committed after acceptance never reinterprets accepted rows and
-//! WAL replay gets the same recipe as a live seal.
-//!
-//! Resolution is unconditional rather than cached. One indexed control-row read
-//! per seal is negligible next to Parquet encoding and object upload, and it
-//! removes any window in which a stale recipe could label an artifact
-//! `bifrost-writer-v2` while writing a different physical layout.
+//! Admission binds every batch to the complete recipe it was accepted under,
+//! and the seal key carries it through WAL and replay, so a revision or Bloom
+//! alteration committed after acceptance never reinterprets accepted rows and
+//! WAL replay gets the same recipe as a live seal. Only rows admitted with no
+//! registered declaration — the embedded engine seam — resolve the registered
+//! control row here.
 
 use std::sync::Arc;
 
@@ -20,15 +15,16 @@ use vala_sql::OperatorPool;
 use crate::catalog::layout::{BIFROST_PARTITION_SPEC_ID, PhysicalLayout};
 use crate::catalog::{BifrostCatalog, LayoutRevision, TenantTableBinding};
 use crate::contracts::ScribeError;
+use crate::scribe::seal_key::SealKey;
 
-/// Resolves the write recipe for rows `binding` accepted under `revision` and
-/// partition spec `spec_id`.
+/// Resolves the write recipe for the rows `binding` accepted under `seal_key`.
 ///
-/// With a catalog owner the recipe is the retained Iceberg revision the rows
-/// were accepted under ([`BifrostCatalog::retained_layout`]), so a revision
-/// committed after acceptance never re-labels them. Without one — the embedded
-/// engine seam, whose tables are never revised — it is the registered control
-/// row, which only describes the creation revision.
+/// A key that carries its accepted recipe is written under exactly that
+/// recipe with no catalog read. Otherwise, with a catalog owner the recipe is
+/// the retained Iceberg revision the rows were accepted under
+/// ([`BifrostCatalog::retained_layout`]); without one — the embedded engine
+/// seam, whose tables are never revised — it is the registered control row,
+/// which only describes the creation revision.
 ///
 /// `operator` is the Scribe operator lane's control capability. The registry
 /// read itself belongs to the `vala-sql` `olap_catalog` owner, which names the
@@ -56,12 +52,15 @@ pub(crate) async fn resolve_write_recipe(
     operator: &OperatorPool,
     catalog: Option<&BifrostCatalog>,
     binding: &TenantTableBinding,
-    revision: LayoutRevision,
-    spec_id: i32,
+    seal_key: &SealKey,
     schema: &Schema,
 ) -> Result<Arc<PhysicalLayout>, ScribeError> {
     let fqn = binding.table_ref.fqn();
-    let stored = if let Some(catalog) = catalog {
+    let revision = seal_key.revision;
+    let spec_id = seal_key.partition.spec_id();
+    let stored = if let Some(recipe) = &seal_key.recipe {
+        recipe.wire().clone()
+    } else if let Some(catalog) = catalog {
         catalog
             .retained_layout(binding, revision, spec_id)
             .await

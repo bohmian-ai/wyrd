@@ -301,6 +301,9 @@ pub struct CommittedRevision {
     pub schema: Arc<spec::Schema>,
     /// Layout the revision declares, rebuilt from the Iceberg metadata.
     pub layout: PhysicalLayout,
+    /// The layout's canonical declaration, bound once as the recipe every
+    /// batch admitted under this revision is accepted with.
+    pub recipe: crate::catalog::AcceptedRecipe,
 }
 
 /// Estimated-weight eviction limit of the node-wide decoded manifest cache.
@@ -1383,11 +1386,14 @@ impl BifrostCatalog {
         let spec_id = metadata.default_partition_spec_id();
         let (layout, schema) = PhysicalLayout::of_iceberg(&key.1, metadata, revision, spec_id)
             .map_err(|error| BifrostCatalogError::MetadataMismatch(error.to_string()))?;
+        let recipe = crate::catalog::AcceptedRecipe::new(layout.to_wire())
+            .map_err(BifrostCatalogError::MetadataMismatch)?;
         let committed = Arc::new(CommittedRevision {
             revision,
             spec_id,
             schema,
             layout,
+            recipe,
         });
         self.committed_revisions
             .write()

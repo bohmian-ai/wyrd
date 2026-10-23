@@ -187,7 +187,8 @@ impl ScribeMemberStager {
             request.frozen.seal_key.revision,
             request.frozen.seal_key.partition.clone(),
             StreamIdentity::new(request.origin.node_id, request.origin.writer_epoch),
-        );
+        )
+        .with_recipe(request.frozen.seal_key.recipe.clone());
         let member = StagedMemberId::new(request.origin.shard, request.origin.generation);
         let directory = self.stage.member_directory(&key, member);
         let staged = directory

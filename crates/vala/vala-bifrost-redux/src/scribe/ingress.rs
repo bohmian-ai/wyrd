@@ -230,8 +230,9 @@ impl ScribeImpl {
             expected_schema_fingerprint: frame
                 .expected_schema_fingerprint
                 .unwrap_or(registered_fingerprint),
-            partition_scheme: scheme_of(&committed.layout.to_wire(), committed.spec_id)?
-                .with_revision(committed.revision),
+            partition_scheme: scheme_of(committed.recipe.wire(), committed.spec_id)?
+                .with_revision(committed.revision)
+                .with_recipe(committed.recipe.clone()),
             registered_schema: Some(Arc::clone(&committed.schema)),
         })
     }

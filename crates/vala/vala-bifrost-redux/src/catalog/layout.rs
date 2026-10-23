@@ -118,6 +118,96 @@ impl std::fmt::Display for LayoutRevision {
     }
 }
 
+/// The complete physical recipe one batch was accepted under.
+///
+/// Revision ids name the retained schema, spec, and sort order, but the Bloom
+/// set is a table property with no Iceberg id, so the ids alone cannot say how
+/// an accepted batch is written. Admission binds the committed canonical
+/// [`PhysicalLayoutWire`] here once per committed revision; seal keys, WAL
+/// slices, and the batch fence carry it, so a later alteration never rewrites
+/// how accepted rows are partitioned or written.
+///
+/// Equality and hashing use the SHA-256 of the canonical JSON encoding, which
+/// is computed once, so a seal-key lookup never hashes the recipe itself.
+#[derive(Debug, Clone)]
+pub struct AcceptedRecipe {
+    /// Canonical declaration the batch was accepted under.
+    wire: Arc<PhysicalLayoutWire>,
+    /// Canonical JSON encoding of `wire`, the bytes WAL and the fence store.
+    encoded: Arc<[u8]>,
+    /// SHA-256 of `encoded`.
+    digest: [u8; 32],
+}
+
+impl AcceptedRecipe {
+    /// Binds `wire` as an accepted recipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when `wire` cannot be encoded as JSON, which a
+    /// resolved declaration never is.
+    pub fn new(wire: PhysicalLayoutWire) -> Result<Self, String> {
+        let encoded: Arc<[u8]> = serde_json::to_vec(&wire)
+            .map_err(|error| format!("accepted recipe does not encode: {error}"))?
+            .into();
+        Ok(Self {
+            digest: <sha2::Sha256 as sha2::Digest>::digest(&encoded).into(),
+            wire: Arc::new(wire),
+            encoded,
+        })
+    }
+
+    /// Decodes a recipe from the canonical bytes WAL or the fence stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when `encoded` is not a declaration or is not the
+    /// canonical encoding of the declaration it holds.
+    pub fn decode(encoded: &[u8]) -> Result<Self, String> {
+        let wire: PhysicalLayoutWire = serde_json::from_slice(encoded)
+            .map_err(|error| format!("accepted recipe does not decode: {error}"))?;
+        let recipe = Self::new(wire)?;
+        if *recipe.encoded != *encoded {
+            return Err("accepted recipe is not canonically encoded".to_owned());
+        }
+        Ok(recipe)
+    }
+
+    /// Borrows the accepted declaration.
+    #[must_use]
+    pub fn wire(&self) -> &PhysicalLayoutWire {
+        &self.wire
+    }
+
+    /// Borrows the canonical encoding.
+    #[must_use]
+    pub fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+
+    /// Returns the recipe identity.
+    #[must_use]
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+impl PartialEq for AcceptedRecipe {
+    /// Compares canonical encodings by their digest.
+    fn eq(&self, other: &Self) -> bool {
+        self.digest == other.digest
+    }
+}
+
+impl Eq for AcceptedRecipe {}
+
+impl std::hash::Hash for AcceptedRecipe {
+    /// Hashes the digest, never the declaration.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.digest.hash(state);
+    }
+}
+
 /// Time-partition granularity owned by the engine.
 ///
 /// Bifrost v1 admits exactly these two Iceberg-native transforms on the

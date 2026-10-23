@@ -80,6 +80,10 @@ pub struct ScribeAssemblyKey {
     node_id: NodeId,
     /// Fenced writer epoch whose LSN stream produced the members.
     writer_epoch: WriterEpoch,
+    /// Complete recipe every member's rows were accepted under, so members of
+    /// two seal keys never share a claim even when their resolved layouts
+    /// digest alike.
+    recipe: Option<crate::catalog::AcceptedRecipe>,
 }
 
 impl ScribeAssemblyKey {
@@ -107,7 +111,21 @@ impl ScribeAssemblyKey {
             partition,
             node_id: stream.node_id,
             writer_epoch: stream.writer_epoch,
+            recipe: None,
         }
+    }
+
+    /// Binds the key to the recipe its members' seal key carries.
+    #[must_use]
+    pub fn with_recipe(mut self, recipe: Option<crate::catalog::AcceptedRecipe>) -> Self {
+        self.recipe = recipe;
+        self
+    }
+
+    /// Borrows the recipe the members' rows were accepted under.
+    #[must_use]
+    pub const fn recipe(&self) -> Option<&crate::catalog::AcceptedRecipe> {
+        self.recipe.as_ref()
     }
 
     /// Rebuilds a key from fields recovered from a durable staged record.
@@ -135,6 +153,7 @@ impl ScribeAssemblyKey {
             partition,
             node_id: stream.node_id,
             writer_epoch: stream.writer_epoch,
+            recipe: None,
         }
     }
 
@@ -199,6 +218,7 @@ impl ScribeAssemblyKey {
             self.partition.clone(),
         )
         .with_revision(self.revision)
+        .with_recipe(self.recipe.clone())
     }
 
     /// Returns the revision every member was accepted under.
@@ -231,6 +251,9 @@ impl ScribeAssemblyKey {
         hasher.update(partition);
         hasher.update(self.node_id.as_bytes());
         hasher.update(self.writer_epoch.as_i64().to_be_bytes());
+        if let Some(recipe) = &self.recipe {
+            hasher.update(recipe.digest());
+        }
     }
 }
 

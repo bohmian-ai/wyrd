@@ -51,7 +51,7 @@ use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::tables::AuditLogTable;
 
 /// Only staged-record version this server reads or writes.
-const STAGED_RECORD_VERSION: u16 = 1;
+const STAGED_RECORD_VERSION: u16 = 2;
 /// Largest staged record accepted during fail-closed recovery.
 const MAX_STAGED_RECORD_BYTES: u64 = 1024 * 1024;
 /// Bytes read per hash step when validating a run against its record.
@@ -328,6 +328,10 @@ pub struct StagedHotSourceRecordV1 {
     /// Uncompressed Arrow bytes the member's rows held in the memtable, which
     /// the assembler's size target counts.
     raw_bytes: u64,
+    /// Recipe the rows were accepted under, which recovery re-resolves
+    /// against the runs' own schema instead of the table's current properties;
+    /// `None` only for rows admitted with no registered declaration.
+    recipe: Option<wyrd_spec::vala::api::PhysicalLayoutWire>,
     /// Instant the member became durable and queryable.
     ready_at: DateTime<Utc>,
     /// Current lifecycle position.
@@ -363,6 +367,7 @@ impl StagedHotSourceRecordV1 {
             wal_range,
             runs,
             raw_bytes,
+            recipe: key.recipe().map(|recipe| recipe.wire().clone()),
             ready_at,
             state: StagedMemberState::Ready,
         }
@@ -446,6 +451,12 @@ impl StagedHotSourceRecordV1 {
             .ok_or_else(|| invalid("layout fingerprint is not a 32-byte hex digest".to_owned()))?;
         let partition = PhysicalPartition::from_wire(&self.partition)
             .map_err(|error| invalid(format!("partition is invalid: {error}")))?;
+        let recipe = self
+            .recipe
+            .clone()
+            .map(crate::catalog::AcceptedRecipe::new)
+            .transpose()
+            .map_err(|error| invalid(format!("recipe is invalid: {error}")))?;
         Ok(ScribeAssemblyKey::from_parts(
             self.tenant,
             table,
@@ -457,7 +468,8 @@ impl StagedHotSourceRecordV1 {
                 NodeId::new(self.node_id),
                 WriterEpoch::new(self.writer_epoch),
             ),
-        ))
+        )
+        .with_recipe(recipe))
     }
 
     /// Projects the record into the value the ready index orders and claims.
@@ -1212,6 +1224,13 @@ mod tests {
             .into(),
             StreamIdentity::new(NodeId::new(Uuid::from_u128(11)), WriterEpoch::new(6)),
         )
+        .with_recipe(Some(
+            crate::catalog::AcceptedRecipe::new(PhysicalLayoutWire {
+                bloom_columns: vec!["customer".to_owned()],
+                ..declared
+            })
+            .expect("fixture recipe encodes"),
+        ))
     }
 
     /// Writes one fsynced run into a member directory and describes it.
@@ -1400,7 +1419,7 @@ mod tests {
         );
         let mut encoded: serde_json::Value =
             serde_json::to_value(&record).expect("the record encodes");
-        encoded["version"] = serde_json::json!(2);
+        encoded["version"] = serde_json::json!(STAGED_RECORD_VERSION + 1);
         tokio::fs::write(
             member_directory.join("member.staged.json"),
             serde_json::to_vec(&encoded).expect("the altered record encodes"),
@@ -1416,10 +1435,10 @@ mod tests {
             matches!(
                 error,
                 HotStageError::UnknownVersion {
-                    found: 2,
-                    expected: 1,
+                    found,
+                    expected: STAGED_RECORD_VERSION,
                     ..
-                }
+                } if found == STAGED_RECORD_VERSION + 1
             ),
             "unexpected refusal: {error}"
         );

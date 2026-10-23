@@ -323,6 +323,7 @@ impl VerifierRunner {
                 tenant,
                 &run.verifier_card_uid,
                 &run.card_uid,
+                None,
             )
             .await?;
         Ok(resolved.map_err(|refusal| {

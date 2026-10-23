@@ -340,8 +340,8 @@ impl EffectiveSpecs {
     /// # Errors
     /// Returns the activation-mismatch and Operator refusals
     /// documented on [`EffectiveSpecs::validate_bindings`],
-    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an unarmable schedule, the
-    /// source refusals of [`Self::validate_sources`], plus any registry read
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an unarmable schedule or an
+    /// empty `deployment_environment`, the source refusals of [`Self::validate_sources`], plus any registry read
     /// failure raised while loading a referenced body.
     async fn validate_binding(
         &mut self,
@@ -378,6 +378,11 @@ impl EffectiveSpecs {
                 format!("{field}.on_verdict_change"),
                 "requires a group_end Trigger",
             ));
+        }
+        if binding.deployment_environment.as_deref() == Some("") {
+            return Err(WyrdError::registry_invalid_card_spec(format!(
+                "{field}.deployment_environment must be non-empty or omitted"
+            )));
         }
         if let Some(Spec::Verifier(verifier)) = &verifier {
             let sources = verifier

@@ -3084,6 +3084,7 @@ pub(crate) mod tests {
             }),
             on_failure: Vec::new(),
             on_verdict_change: Vec::new(),
+            deployment_environment: None,
         }
     }
 

@@ -4525,3 +4525,221 @@ async fn only_associated_account_activity_activates_exact_root() {
         "concurrent claims accept one occurrence for the associated account"
     );
 }
+
+/// A configured deployment environment is reconciled with the binding's
+/// selector before acceptance and frozen through restart.
+///
+/// The root Service binds one Verifier with `deployment_environment: prod`
+/// and its Agent component another, unscoped. Its runtime account, rooted
+/// at the Service, enqueues the Service-bound check with no environment (the
+/// binding's sole value is frozen), with an equal one, and the Agent-bound
+/// check with `staging` (the invocation's sole value). A conflicting value
+/// and an empty one are refused with `WYRD_SPEC_400_VALIDATION` before any
+/// execution exists. The runtime stops with every accepted execution
+/// unfinished; a fresh runtime completes them, and status reads return each
+/// one's own subject and frozen environment.
+///
+/// # Panics
+/// Panics when a refusal is accepted or leaves an execution, an accepted
+/// execution freezes another environment or subject, or recovery fails.
+#[tokio::test]
+async fn configured_service_context_survives_acceptance_and_restart() {
+    let harness = Harness::start().await;
+    let server = &harness.server;
+    let pinned = |kind: &str, name: &str, uid: &CardUid| serde_json::json!({ "kind": kind, "name": name, "version": "1.0.0", "uid": uid });
+    let service_check = harness
+        .seed
+        .declare("Verifier", "service-check", &serde_json::json!({
+            "requirements": [{ "id": "ok", "statement": "The Service answers.",
+                "check": { "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": 1 } }]
+        }))
+        .await
+        .expect("Service Verifier registers");
+    let agent_check = harness
+        .seed
+        .declare("Verifier", "agent-check", &serde_json::json!({
+            "requirements": [{ "id": "ok", "statement": "The Agent answers.",
+                "check": { "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": 1 } }]
+        }))
+        .await
+        .expect("Agent Verifier registers");
+    harness
+        .seed
+        .declare(
+            "Prompt",
+            "ask-prompt",
+            &serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "messages": [{ "role": "user", "content": "Answer." }],
+            }),
+        )
+        .await
+        .expect("Prompt registers");
+    let agent = harness
+        .seed
+        .declare(
+            "Agent",
+            "ask-agent",
+            &serde_json::json!({
+                "prompt": { "kind": "Prompt", "name": "ask-prompt", "version": "1.0.0" },
+                "execution_route": { "kind": "native" },
+            }),
+        )
+        .await
+        .expect("Agent registers");
+    let (service, _) = harness
+        .seed
+        .service_with("ask-service", &serde_json::json!({
+            "verified_by": [{
+                "verifier": pinned("Verifier", "service-check", &service_check),
+                "deployment_environment": "prod",
+            }],
+            "components": [{
+                "alias": "ask",
+                "ref": pinned("Agent", "ask-agent", &agent),
+                "verified_by": [{ "verifier": pinned("Verifier", "agent-check", &agent_check) }],
+            }],
+        }))
+        .await
+        .expect("Service registers");
+    let account = server
+        .credential_registered_service(&service_ref("ask-service", "1.0.0"), &["editor"])
+        .await
+        .expect("the Service's family account is credentialed");
+    let wyrd_testing::Bootstrap::Machine { api_key, .. } = &account else {
+        panic!("credentialed Service returned a user principal");
+    };
+    let jwt = server
+        .exchange_api_key_for_workload(api_key, &service)
+        .await
+        .expect("the account exchanges at the Service root");
+    let enqueue = |verifier: &CardUid, subject: &CardUid, environment: Option<&str>| {
+        let mut body = serde_json::json!({
+            "verifier_card_uid": verifier, "card_uid": subject, "inputs": {},
+        });
+        if let Some(environment) = environment {
+            body["deployment_environment"] = environment.into();
+        }
+        body
+    };
+    let post = axum::http::Method::POST;
+    let before = harness.seed.executions().await.expect("executions read");
+    for (body, why) in [
+        (
+            enqueue(&service_check, &service, Some("staging")),
+            "conflicts with prod",
+        ),
+        (enqueue(&service_check, &service, Some("")), "is empty"),
+    ] {
+        let (code, problem) = send(
+            server,
+            &jwt,
+            post.clone(),
+            "/v1/verification/enqueue",
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            code,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{why}: {problem}"
+        );
+        assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION", "{why}");
+        assert_eq!(
+            problem["details"]["field"], "deployment_environment",
+            "{why}"
+        );
+    }
+
+    let script = EngineScript::default();
+    script.hold();
+    for _ in 0..3 {
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let runtime = harness.spawn(
+        &RuntimeLimits {
+            drain_grace: Duration::from_millis(300),
+            ..Harness::limits()
+        },
+        &script,
+    );
+    let mut accepted = Vec::new();
+    for (verifier, subject, requested, frozen) in [
+        (&service_check, &service, None, "prod"),
+        (&service_check, &service, Some("prod"), "prod"),
+        (&agent_check, &agent, Some("staging"), "staging"),
+    ] {
+        let (code, body) = send(
+            server,
+            &jwt,
+            post.clone(),
+            "/v1/verification/enqueue",
+            Some(enqueue(verifier, subject, requested)),
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{body}");
+        let run: ExecutionId = body["execution_id"]
+            .as_str()
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_else(|| panic!("the run is accepted: {body}"));
+        harness.wait_execution(run, |_| true).await;
+        accepted.push((run, subject.clone(), frozen));
+    }
+    let after = harness.seed.executions().await.expect("executions read");
+    assert_eq!(after.len(), before.len() + 3, "refusals leave no execution");
+    runtime.stop().await;
+
+    for (run, subject, frozen) in &accepted {
+        let (environment, card_uid): (Option<String>, Uuid) = sqlx::query_as(
+            "SELECT deployment_environment, card_uid FROM wyrd.verifier_executions \
+             WHERE execution_id = $1",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(&harness.assertion)
+        .await
+        .expect("execution reads");
+        assert_eq!(
+            (environment.as_deref(), card_uid),
+            (Some(*frozen), subject.as_uuid())
+        );
+        assert_ne!(
+            harness
+                .seed
+                .execution(*run)
+                .await
+                .expect("execution reads")
+                .status,
+            "completed",
+            "{run} is unfinished when the runtime stops"
+        );
+    }
+
+    script.release();
+    let restarted = harness.spawn(&Harness::limits(), &script);
+    for (run, ..) in &accepted {
+        harness.wait_execution(*run, status("completed")).await;
+    }
+    restarted.stop().await;
+    harness.durable_rows().await;
+    for (run, subject, frozen) in &accepted {
+        let (code, state) = send(
+            server,
+            &jwt,
+            axum::http::Method::GET,
+            &format!("/v1/verification/executions/{run}"),
+            None,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{state}");
+        assert_eq!(
+            state["result"]["deployment_environment"], *frozen,
+            "{state}"
+        );
+        assert_eq!(
+            state["result"]["subject"]["uid"],
+            subject.as_str(),
+            "{state}"
+        );
+    }
+}

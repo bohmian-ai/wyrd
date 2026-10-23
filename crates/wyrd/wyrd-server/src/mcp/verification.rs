@@ -229,7 +229,7 @@ impl WyrdMcpHandler {
                         message: format!("idempotency_key is invalid: {error}"),
                         details: serde_json::json!({ "tool": ENQUEUE }),
                     })?;
-                structured(&control.enqueue(&caller, args.request, key.as_ref())?)
+                structured(&control.enqueue(&caller, args.request, key.as_ref()).await?)
             }
         }
     }

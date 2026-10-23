@@ -56,6 +56,12 @@ pub struct VerificationRequest {
     /// Whole execution-route replacements keyed by Agent block ID.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub execution_route_overrides: BTreeMap<TaskId, ExecutionRoute>,
+    /// The invoking workload's deployment environment, a non-empty
+    /// evaluation selector. It must agree with the binding's own selector
+    /// when both are set; the accepted execution freezes the effective one.
+    /// Descriptive context, never permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_environment: Option<String>,
 }
 
 /// What a caller supplies for one input slot. Execution results echo the
@@ -205,6 +211,10 @@ pub struct VerificationResult<T = Map<String, Value>> {
     pub verifier: CardRef,
     /// The exact subject judged.
     pub subject: CardRef,
+    /// The effective deployment environment the execution was accepted
+    /// under, or absent when unscoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_environment: Option<String>,
     /// Verdict, breakdown, and evidence.
     #[cfg_attr(feature = "server", schema(value_type = VerificationOutcome))]
     pub outcome: VerificationOutcome<T>,
@@ -486,6 +496,7 @@ impl VerificationResult {
             run_id,
             verifier,
             subject,
+            deployment_environment,
             outcome,
         } = self;
         let requirements = outcome
@@ -498,6 +509,7 @@ impl VerificationResult {
             run_id,
             verifier,
             subject,
+            deployment_environment,
             outcome: VerificationOutcome {
                 verdict: outcome.verdict,
                 requirements,

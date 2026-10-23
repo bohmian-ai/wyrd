@@ -177,6 +177,7 @@ impl OutboxSink for SubmissionSink {
                     tenant,
                     &request.verifier_card_uid,
                     &request.card_uid,
+                    None,
                 )
                 .await?
             {
@@ -255,6 +256,7 @@ mod tests {
                     group_id: None,
                     inputs: BTreeMap::new(),
                     execution_route_overrides: BTreeMap::new(),
+                    deployment_environment: None,
                 };
                 let key = keys.map(|keys| format!("key-{}", position % keys));
                 Submission::new(

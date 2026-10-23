@@ -107,7 +107,8 @@ const INSERT_SUBMISSIONS_SQL: &str = r"
         origin, run_id, inputs, route_overrides,
         sub_principal_id, act_principal_id, authority, cause_trace_id, cause_span_id,
         idempotency_key, request_sha256, status, error, max_attempts,
-        next_attempt_at, settled_at, created_at, updated_at, cause_sampled, group_id
+        next_attempt_at, settled_at, created_at, updated_at, cause_sampled, group_id,
+        deployment_environment
     )
     SELECT r.execution_id, wyrd.current_tenant(), v.card_uid, v.version, s.card_uid,
            'manual', r.run_id, r.inputs, r.route_overrides,
@@ -116,15 +117,16 @@ const INSERT_SUBMISSIONS_SQL: &str = r"
            CASE WHEN r.error IS NULL THEN 'pending' ELSE 'errored' END, r.error, $17,
            CASE WHEN r.error IS NULL THEN statement_timestamp() END,
            CASE WHEN r.error IS NOT NULL THEN statement_timestamp() END,
-           statement_timestamp(), statement_timestamp(), r.cause_sampled, r.group_id
+           statement_timestamp(), statement_timestamp(), r.cause_sampled, r.group_id,
+           r.deployment_environment
       FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::jsonb[],
                   $6::jsonb[], $7::uuid[], $8::uuid[], $9::jsonb[], $10::bytea[],
                   $11::bytea[], $12::text[], $13::bytea[], $14::jsonb[], $15::bool[],
-                  $16::text[])
+                  $16::text[], $18::text[])
            AS r(execution_id, verifier_card_uid, card_uid, run_id, inputs,
                 route_overrides, sub_principal_id, act_principal_id, authority,
                 cause_trace_id, cause_span_id, idempotency_key, request_sha256,
-                error, cause_sampled, group_id)
+                error, cause_sampled, group_id, deployment_environment)
       JOIN wyrd.cards v ON v.card_uid = r.verifier_card_uid
       JOIN wyrd.cards s ON s.card_uid = r.card_uid
     ON CONFLICT DO NOTHING
@@ -561,7 +563,7 @@ const RELEASE_SQL: &str = r"
 const STATUS_SQL: &str = r"
     SELECT execution_id, status, sub_principal_id, act_principal_id,
            verifier_card_uid, card_uid, result_id, error,
-           group_id, owner_card_uid, group_sources
+           group_id, owner_card_uid, group_sources, deployment_environment
       FROM wyrd.verifier_executions
      WHERE execution_id = $1
 ";
@@ -1426,6 +1428,9 @@ pub struct ExecutionStatus {
     pub card_uid: CardUid,
     /// Result pointer of a completed execution.
     pub result_id: Option<VerificationResultId>,
+    /// The effective deployment environment frozen at acceptance; `None`
+    /// for unscoped work.
+    pub deployment_environment: Option<String>,
 }
 
 /// Bounded retry of engine failures: attempts and exponential backoff.
@@ -1795,6 +1800,11 @@ impl VerifierExecutionQueue {
                     .collect::<Vec<_>>(),
             )
             .bind(self.retry.max_attempts)
+            .bind(
+                requests()
+                    .map(|request| request.deployment_environment.as_deref())
+                    .collect::<Vec<_>>(),
+            )
             .execute(&mut **conn.transaction())
             .await?;
         Ok(())
@@ -2646,6 +2656,7 @@ impl VerifierExecutionQueue {
                     .result_id
                     .map(|id| stored(VerificationResultId::new(id)))
                     .transpose()?,
+                deployment_environment: row.deployment_environment,
             }))
         })
         .await
@@ -3123,6 +3134,8 @@ struct StatusRow {
     owner_card_uid: Option<Uuid>,
     /// A group execution's pinned source selections.
     group_sources: Option<Json<BTreeMap<SlotName, GroupSourceSnapshot>>>,
+    /// Effective deployment environment frozen at acceptance.
+    deployment_environment: Option<String>,
 }
 
 /// A dispatch row from [`DISPATCHES_SQL`].
@@ -3263,6 +3276,7 @@ mod tests {
             group_id: None,
             inputs: BTreeMap::new(),
             execution_route_overrides: BTreeMap::new(),
+            deployment_environment: None,
         }
     }
 

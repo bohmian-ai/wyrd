@@ -2,11 +2,14 @@
 //! submission acceptance, and the queued runner.
 //!
 //! Every Verifier execution first resolves its target: the exact Verifier and
-//! its spec, the exact subject, and the tenant's SYSTEM principal, or the
+//! its spec, the exact subject, the deployment environments the caller's owner
+//! Service binds the Verifier to that subject under, and the tenant's SYSTEM
+//! principal, or the
 //! [`EnqueueRefusal`] that keeps it from running. [`VerifierCardCache::resolve`]
 //! is the only way any path does that. It reads `wyrd.verification_target`,
 //! whose `wyrd.verifier_readiness` is the one rule deciding whether a Verifier
-//! can run, and caches each resolved target by tenant, Verifier, and subject.
+//! can run, and caches each resolved target by tenant, Verifier, subject, and
+//! owner Service.
 //! Entries are never shared across tenants and are bounded by total bytes
 //! with least-recently-used eviction, because every Wyrd-owned buffer is
 //! bounded. Refusals are never cached, so a Card registered after one is seen
@@ -25,6 +28,7 @@
 //! racing a Card deletion or deprecation can still serve the old target for
 //! that delivery latency.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lru::LruCache;
@@ -35,6 +39,7 @@ use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::envelope::Spec;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::VerifierReadiness;
@@ -48,8 +53,9 @@ pub(crate) const TARGET_CHANNEL: &str = "wyrd_verification_target";
 /// Total bytes of cached targets one process keeps.
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Cache key: tenant, Verifier Card UID, and subject Card UID.
-type TargetKey = (DataTenantId, Uuid, Uuid);
+/// Cache key: tenant, Verifier Card UID, subject Card UID, and the caller's
+/// owner Service Card UID, if any.
+type TargetKey = (DataTenantId, Uuid, Uuid, Option<Uuid>);
 
 /// The exact Verifier and subject an execution resolved.
 #[derive(Debug)]
@@ -60,6 +66,12 @@ pub(crate) struct Target {
     pub(crate) spec: Arc<VerifierSpec>,
     /// Exact subject reference.
     pub(crate) subject: CardRef,
+    /// The distinct `deployment_environment` selectors of every binding
+    /// that attaches this Verifier to this subject: the owner Service's own
+    /// when the subject is that Service, each of its component occurrences
+    /// referencing the subject, and a subject Agent's own. Empty when none
+    /// binds it, including when no owner was resolved.
+    pub(crate) binding_environments: BTreeSet<Option<String>>,
     /// The tenant's active SYSTEM principal, which executes the Verifier;
     /// `None` when the tenant has none, which each caller refuses its own way.
     pub(crate) system_principal: Option<PrincipalId>,
@@ -78,12 +90,14 @@ impl Target {
         if let Some(refusal) = read.refusal() {
             return Err(refusal);
         }
+        let owner = read.owner.and_then(Self::parse);
         let (Some(verifier), Some(subject)) = (read.verifier, read.subject) else {
             return Err(unavailable);
         };
         let verifier = Self::parse(verifier).ok_or(unavailable)?;
         let subject = Self::parse(subject).ok_or(EnqueueRefusal::SubjectUnavailable)?;
         let reference = exact_ref(&verifier);
+        let binding_environments = binding_environments(owner.as_ref(), &subject, &verifier);
         let Spec::Verifier(spec) = verifier.spec else {
             return Err(unavailable);
         };
@@ -91,6 +105,7 @@ impl Target {
             verifier: reference,
             spec: Arc::new(spec),
             subject: exact_ref(&subject),
+            binding_environments,
             system_principal: read.system_principal.map(PrincipalId::new),
         })
     }
@@ -104,6 +119,88 @@ impl Target {
             )
             .ok()
     }
+}
+
+/// The effective deployment environment of an invocation that configured
+/// `requested`, against the `bound` selectors of
+/// [`Target::binding_environments`].
+///
+/// Equal invocation and binding values are that value; a sole value on either
+/// side is used; neither leaves the work unscoped. Pure: no IO.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` naming `deployment_environment` when
+/// `requested` is empty, when the matching bindings disagree, or when
+/// `requested` conflicts with the binding's selector.
+pub(crate) fn effective_environment(
+    requested: Option<&str>,
+    bound: &BTreeSet<Option<String>>,
+) -> Result<Option<String>, WyrdError> {
+    let refuse = |message: &str| WyrdError::Validation {
+        message: message.to_owned(),
+        details: serde_json::json!({
+            "field": "deployment_environment",
+            "requested": requested,
+            "bound": bound,
+        }),
+    };
+    if requested == Some("") {
+        return Err(refuse(
+            "deployment_environment must be non-empty or omitted",
+        ));
+    }
+    if bound.len() > 1 {
+        return Err(refuse(
+            "the bindings of this Verifier on this subject select different deployment environments",
+        ));
+    }
+    match (requested, bound.first().and_then(Option::as_ref)) {
+        (Some(requested), Some(selector)) if requested != selector => Err(refuse(
+            "the configured deployment environment conflicts with the binding's selector",
+        )),
+        (requested, selector) => Ok(requested.map(str::to_owned).or_else(|| selector.cloned())),
+    }
+}
+
+/// The distinct `deployment_environment` selectors of the bindings attaching
+/// `verifier` to `subject`; see [`Target::binding_environments`]. Bindings
+/// are matched by pinned UID, which registration always records.
+fn binding_environments(
+    owner: Option<&ParsedCardRow>,
+    subject: &ParsedCardRow,
+    verifier: &ParsedCardRow,
+) -> BTreeSet<Option<String>> {
+    let mut bindings = Vec::new();
+    if let Some(ParsedCardRow {
+        card_uid,
+        spec: Spec::Service(service),
+        ..
+    }) = owner
+    {
+        if *card_uid == subject.card_uid {
+            bindings.extend(&service.verified_by);
+        }
+        for component in &service.components {
+            if component
+                .card_ref
+                .as_card_ref()
+                .and_then(|r| r.uid.as_ref())
+                == Some(&subject.card_uid)
+            {
+                bindings.extend(&component.verified_by);
+            }
+        }
+    }
+    if let Spec::Agent(agent) = &subject.spec {
+        bindings.extend(&agent.verified_by);
+    }
+    bindings
+        .into_iter()
+        .filter(|binding| {
+            binding.verifier.as_card_ref().and_then(|r| r.uid.as_ref()) == Some(&verifier.card_uid)
+        })
+        .map(|binding| binding.deployment_environment.clone())
+        .collect()
 }
 
 /// The exact reference of a stored Card row.
@@ -185,8 +282,10 @@ impl VerifierCardCache {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Resolve `verifier` on `subject` in `tenant`: the one read route of
-    /// every Verifier execution.
+    /// Resolve `verifier` on `subject` in `tenant` for a caller rooted at
+    /// `owner`: the one read route of every Verifier execution. Only an
+    /// invocation's admission passes `owner`; a worker re-resolving accepted
+    /// work passes `None`, since its environment is already frozen.
     ///
     /// A target cached while listening is returned with no IO. Otherwise
     /// `wyrd.verification_target` reads it from `db` in one statement and
@@ -203,8 +302,14 @@ impl VerifierCardCache {
         tenant: DataTenantId,
         verifier: &CardUid,
         subject: &CardUid,
+        owner: Option<&CardUid>,
     ) -> Result<Result<Arc<Target>, EnqueueRefusal>, SqlError> {
-        let key = (tenant, verifier.as_uuid(), subject.as_uuid());
+        let key = (
+            tenant,
+            verifier.as_uuid(),
+            subject.as_uuid(),
+            owner.map(CardUid::as_uuid),
+        );
         if let Some(target) = self.cached(&key) {
             return Ok(Ok(target));
         }
@@ -214,12 +319,12 @@ impl VerifierCardCache {
             Db::Pool(postgres) => {
                 let mut conn = postgres.conn().await?;
                 VerificationTargets::new(&mut conn, tenant)
-                    .read(verifier, subject)
+                    .read(verifier, subject, owner)
                     .await
             }
             Db::Conn(conn) => {
                 VerificationTargets::new(conn, tenant)
-                    .read(verifier, subject)
+                    .read(verifier, subject, owner)
                     .await
             }
         }
@@ -304,9 +409,11 @@ impl VerifierCardCache {
             .targets
             .iter()
             .map(|(key, _)| *key)
-            .filter(|(owner, verifier, subject)| {
-                Some(*owner) == tenant
-                    && card.is_none_or(|card| *verifier == card || *subject == card)
+            .filter(|(key_tenant, verifier, subject, owner)| {
+                Some(*key_tenant) == tenant
+                    && card.is_none_or(|card| {
+                        *verifier == card || *subject == card || *owner == Some(card)
+                    })
             })
             .collect();
         for key in stale {
@@ -360,7 +467,9 @@ mod tests {
     use wyrd_spec::card::verifier::VerifierSpec;
     use wyrd_spec::reference::CardRef;
 
-    use super::{Target, TargetKey, VerifierCardCache};
+    use std::collections::BTreeSet;
+
+    use super::{Target, TargetKey, VerifierCardCache, effective_environment};
 
     /// A static Card reference of `kind`.
     ///
@@ -391,13 +500,14 @@ mod tests {
                 .expect("static Verifier spec"),
             ),
             subject: reference("Service"),
+            binding_environments: BTreeSet::new(),
             system_principal: None,
         }
     }
 
     /// A fresh key in `tenant`.
     fn key(tenant: DataTenantId) -> TargetKey {
-        (tenant, Uuid::now_v7(), Uuid::now_v7())
+        (tenant, Uuid::now_v7(), Uuid::now_v7(), Some(Uuid::now_v7()))
     }
 
     /// Caches a target for `key` as one read under the current generation
@@ -424,7 +534,7 @@ mod tests {
         fill(&cache, b);
         assert!(cache.cached(&a).is_some());
         assert!(
-            cache.cached(&(other, a.1, a.2)).is_none(),
+            cache.cached(&(other, a.1, a.2, a.3)).is_none(),
             "never across tenants"
         );
 
@@ -435,6 +545,9 @@ mod tests {
         assert!(cache.cached(&b).is_some(), "another tenant's Card");
         cache.invalidate(&format!("{}|{}", tenant.as_uuid(), b.1));
         assert!(cache.cached(&b).is_none(), "b's Verifier changed");
+        fill(&cache, b);
+        cache.invalidate(&format!("{}|{}", tenant.as_uuid(), b.3.expect("owned key")));
+        assert!(cache.cached(&b).is_none(), "b's owner changed");
 
         fill(&cache, a);
         cache.invalidate(&tenant.as_uuid().to_string());
@@ -473,5 +586,46 @@ mod tests {
         tiny.reset(true);
         tiny.insert(a, tiny.fill_generation(), target());
         assert!(tiny.cached(&a).is_none(), "an oversized target is not kept");
+    }
+
+    /// Equal invocation and binding environments are accepted, a sole value
+    /// is used, neither stays unscoped, and an empty value, a conflict, or
+    /// disagreeing bindings are refused.
+    #[test]
+    fn effective_environment_follows_the_selector_rules() {
+        let bound = |values: &[Option<&str>]| -> BTreeSet<Option<String>> {
+            values
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect()
+        };
+        let prod = Some("prod".to_owned());
+        assert_eq!(
+            effective_environment(Some("prod"), &bound(&[Some("prod")])).ok(),
+            Some(prod.clone())
+        );
+        assert_eq!(
+            effective_environment(None, &bound(&[Some("prod")])).ok(),
+            Some(prod.clone())
+        );
+        assert_eq!(
+            effective_environment(Some("prod"), &bound(&[None])).ok(),
+            Some(prod.clone())
+        );
+        assert_eq!(
+            effective_environment(Some("prod"), &bound(&[])).ok(),
+            Some(prod)
+        );
+        assert_eq!(effective_environment(None, &bound(&[])).ok(), Some(None));
+        for (requested, values) in [
+            (Some(""), bound(&[])),
+            (Some("staging"), bound(&[Some("prod")])),
+            (None, bound(&[Some("prod"), Some("staging")])),
+            (None, bound(&[None, Some("prod")])),
+        ] {
+            let error = effective_environment(requested, &values).expect_err("refused");
+            assert_eq!(error.problem().code, "WYRD_SPEC_400_VALIDATION");
+            assert_eq!(error.problem().details["field"], "deployment_environment");
+        }
     }
 }

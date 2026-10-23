@@ -152,7 +152,34 @@ impl VerificationFixture {
         name: &str,
         version: &str,
     ) -> Result<(CardUid, PrincipalId), VerificationFixtureError> {
-        let card = card("Service", name, version, &serde_json::json!({}))?;
+        self.release_with(name, version, &serde_json::json!({}))
+            .await
+    }
+
+    /// Register one active `1.0.0` Service Card named `name` with `spec`, such
+    /// as one whose `verified_by` and component bindings a test exercises,
+    /// and seed or reuse its family's runtime account; returns the Card UID
+    /// and that account.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when `spec` is not a Service spec
+    /// or a write fails.
+    pub async fn service_with(
+        &self,
+        name: &str,
+        spec: &Value,
+    ) -> Result<(CardUid, PrincipalId), VerificationFixtureError> {
+        self.release_with(name, "1.0.0", spec).await
+    }
+
+    /// [`Self::release`] with an explicit Service `spec`.
+    async fn release_with(
+        &self,
+        name: &str,
+        version: &str,
+        spec: &Value,
+    ) -> Result<(CardUid, PrincipalId), VerificationFixtureError> {
+        let card = card("Service", name, version, spec)?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let uid = self.insert(&mut conn, &card).await?;
         let principal = crate::server::family_account(
@@ -232,7 +259,22 @@ impl VerificationFixture {
         name: &str,
         spec: &Value,
     ) -> Result<CardUid, VerificationFixtureError> {
-        let card = card("Verifier", name, "1.0.0", spec)?;
+        self.declare("Verifier", name, spec).await
+    }
+
+    /// Register one active `1.0.0` Card of `kind` named `name` with `spec`,
+    /// such as an Agent a Service component references.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when `spec` is not a `kind` spec
+    /// or a write fails.
+    pub async fn declare(
+        &self,
+        kind: &str,
+        name: &str,
+        spec: &Value,
+    ) -> Result<CardUid, VerificationFixtureError> {
+        let card = card(kind, name, "1.0.0", spec)?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let uid = self.insert(&mut conn, &card).await?;
         conn.commit().await?;
@@ -526,6 +568,7 @@ impl VerificationFixture {
                 group_id: None,
                 inputs,
                 execution_route_overrides: BTreeMap::new(),
+                deployment_environment: None,
             },
             None,
             None,

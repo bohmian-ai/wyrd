@@ -509,6 +509,7 @@ fn request(verifier: &CardUid, subject: &CardUid) -> VerificationRequest {
             },
         )]),
         execution_route_overrides: BTreeMap::new(),
+        deployment_environment: None,
     }
 }
 
@@ -559,7 +560,7 @@ async fn refusals(
     for submission in submissions {
         let request = &submission.request;
         let target = VerificationTargets::new(conn.transaction(), tenant)
-            .read(&request.verifier_card_uid, &request.card_uid)
+            .read(&request.verifier_card_uid, &request.card_uid, None)
             .await
             .expect("target reads");
         if let Some(refusal) = target.refusal() {
@@ -3130,7 +3131,7 @@ async fn a_verification_target_reads_its_tenant_in_one_statement() {
         .await
         .expect("plain connection");
     let target = VerificationTargets::new(&mut conn, tenant)
-        .read(&verifier, &owner)
+        .read(&verifier, &owner, None)
         .await
         .expect("target reads");
     assert_eq!(target.readiness, VerifierReadiness::Ready);
@@ -3144,9 +3145,17 @@ async fn a_verification_target_reads_its_tenant_in_one_statement() {
         Some(owner.as_uuid())
     );
     assert_eq!(target.system_principal, Some(system));
+    assert!(target.owner.is_none());
+
+    let owned = VerificationTargets::new(&mut conn, tenant)
+        .read(&verifier, &owner, Some(&owner))
+        .await
+        .expect("an owned target reads");
+    assert_eq!(owned.owner.map(|row| row.card_uid), Some(owner.as_uuid()));
+    assert_eq!(owned.subject.map(|row| row.card_uid), Some(owner.as_uuid()));
 
     let itself = VerificationTargets::new(&mut conn, tenant)
-        .read(&verifier, &verifier)
+        .read(&verifier, &verifier, None)
         .await
         .expect("a self-target reads");
     assert!(itself.verifier.is_some() && itself.subject.is_some());
@@ -3156,7 +3165,7 @@ async fn a_verification_target_reads_its_tenant_in_one_statement() {
         .await
         .expect("second tenant seeds");
     let foreign = VerificationTargets::new(&mut conn, other)
-        .read(&verifier, &owner)
+        .read(&verifier, &owner, None)
         .await
         .expect("another tenant reads");
     assert!(foreign.verifier.is_none() && foreign.subject.is_none());
@@ -3172,7 +3181,7 @@ async fn a_verification_target_reads_its_tenant_in_one_statement() {
         .await
         .expect("bound transaction opens");
     let refused = VerificationTargets::new(bound.transaction(), other)
-        .read(&verifier, &owner)
+        .read(&verifier, &owner, None)
         .await;
     assert!(
         refused.is_err(),

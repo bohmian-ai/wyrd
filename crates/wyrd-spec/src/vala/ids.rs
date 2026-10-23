@@ -447,6 +447,10 @@ impl FromStr for TableVersion {
 
     /// Parses a canonical unsigned decimal: no sign, leading zero,
     /// whitespace, fraction or exponent.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when `s` is not canonical decimal
+    /// syntax or names a value outside `1..=i64::MAX`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let canonical = s.bytes().all(|byte| byte.is_ascii_digit()) && !s.starts_with('0');
         match s.parse::<i64>() {
@@ -564,6 +568,9 @@ mod tests {
         assert_eq!(json, "\"0102030405060708\"");
     }
 
+    /// JSON carries every version, including values a float cannot represent
+    /// exactly, as the canonical decimal string it parses back from; the
+    /// domain maximum has no successor.
     #[test]
     fn table_version_round_trips_canonical_strings_beyond_two_to_the_53() {
         for value in [1_i64, (1 << 53) + 1, i64::MAX] {
@@ -578,6 +585,9 @@ mod tests {
         assert_eq!(TableVersion::new(i64::MAX).expect("max").next(), None);
     }
 
+    /// Bare numbers, null, zero, signs, padding, leading zeros, fractions,
+    /// exponents and out-of-range decimals are refused rather than coerced,
+    /// so one version has exactly one wire spelling.
     #[test]
     fn table_version_refuses_noncanonical_forms() {
         for json in [

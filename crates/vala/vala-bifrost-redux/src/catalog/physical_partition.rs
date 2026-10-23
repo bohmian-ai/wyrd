@@ -15,9 +15,10 @@ use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use iceberg::spec::{Literal, PartitionSpec, PrimitiveLiteral, Struct};
 use wyrd_spec::vala::api::{PartitionValueWire, PhysicalLayoutWire, PhysicalPartitionWire};
+use wyrd_spec::vala::ids::TableVersion;
 
 use super::layout::{
-    BIFROST_PARTITION_SPEC_ID, LayoutRevision, MAX_PARTITION_FIELDS, PartitionTransform, TimeAxis,
+    BIFROST_PARTITION_SPEC_ID, MAX_PARTITION_FIELDS, PartitionTransform, TimeAxis,
     TimeColumnValues, TimeGranularity, TimePartition, TimePartitionError,
 };
 
@@ -367,24 +368,21 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], PhysicalPartitionError
 
 /// The rule that maps a row of one table to its [`PhysicalPartition`].
 ///
-/// Built from the committed revision admission writes under; every ingest
-/// path plans through this one value, and every slice it plans is bound to
-/// the scheme's [`LayoutRevision`].
+/// Built from the table version admission writes under; every ingest path
+/// plans through this one value, and every slice it plans is bound to the
+/// scheme's [`TableVersion`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionScheme {
     /// Time column and its hour or day granularity.
     axis: TimeAxis,
     /// Iceberg partition-spec id identities are computed under.
     spec_id: i32,
-    /// Schema and sort-order revision planned slices are bound to.
-    revision: LayoutRevision,
+    /// Table version planned slices are bound to.
+    table_version: TableVersion,
     /// Position of the time field among the spec's fields.
     time_index: u8,
     /// Additional dimensions in spec order.
     dimensions: Vec<(String, PartitionTransform)>,
-    /// Complete recipe planned slices are accepted under, when the scheme
-    /// comes from a registered declaration.
-    recipe: Option<crate::catalog::AcceptedRecipe>,
 }
 
 /// A bare time partition is the time-only identity under the initial spec.
@@ -403,37 +401,23 @@ impl PartitionScheme {
         Self {
             axis,
             spec_id: BIFROST_PARTITION_SPEC_ID,
-            revision: LayoutRevision::INITIAL,
+            table_version: TableVersion::INITIAL,
             time_index: 0,
             dimensions: Vec::new(),
-            recipe: None,
         }
     }
 
-    /// Binds the scheme's planned slices to `recipe`.
+    /// Binds the scheme's planned slices to `table_version`.
     #[must_use]
-    pub fn with_recipe(mut self, recipe: crate::catalog::AcceptedRecipe) -> Self {
-        self.recipe = Some(recipe);
+    pub const fn with_table_version(mut self, table_version: TableVersion) -> Self {
+        self.table_version = table_version;
         self
     }
 
-    /// Borrows the recipe planned slices are accepted under.
+    /// Returns the table version planned slices are bound to.
     #[must_use]
-    pub const fn recipe(&self) -> Option<&crate::catalog::AcceptedRecipe> {
-        self.recipe.as_ref()
-    }
-
-    /// Binds the scheme's planned slices to `revision`.
-    #[must_use]
-    pub const fn with_revision(mut self, revision: LayoutRevision) -> Self {
-        self.revision = revision;
-        self
-    }
-
-    /// Returns the revision planned slices are bound to.
-    #[must_use]
-    pub const fn revision(&self) -> LayoutRevision {
-        self.revision
+    pub const fn table_version(&self) -> TableVersion {
+        self.table_version
     }
 
     /// Builds the scheme a registered layout declares under `spec_id`.
@@ -467,10 +451,9 @@ impl PartitionScheme {
         Ok(Self {
             axis,
             spec_id,
-            revision: LayoutRevision::INITIAL,
+            table_version: TableVersion::INITIAL,
             time_index,
             dimensions,
-            recipe: None,
         })
     }
 

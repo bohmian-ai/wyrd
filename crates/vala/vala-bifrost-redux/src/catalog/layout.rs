@@ -28,6 +28,7 @@ use wyrd_spec::vala::api::{
     NullOrderWire, PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire,
     SortDirectionWire, SortKeyWire, TimeGranularityWire, TimePartitionWire,
 };
+use wyrd_spec::vala::ids::TableVersion;
 use wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT;
 use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 
@@ -71,142 +72,6 @@ pub const BIFROST_SORT_ORDER_ID: i32 = 1;
 
 /// Iceberg schema id table creation installs.
 pub const BIFROST_SCHEMA_ID: i32 = 0;
-
-/// The Iceberg schema and sort-order revision one accepted batch is bound to.
-///
-/// The batch's partition-spec revision travels in its
-/// [`PhysicalPartition`](crate::catalog::PhysicalPartition); this carries the
-/// other two. Admission binds the table's committed revision, and every later
-/// step — seal, staging, recovery, publication — writes the batch under the
-/// retained metadata these ids name, never under the table's current revision.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-pub struct LayoutRevision {
-    /// Iceberg schema id the batch's field ids were stamped from.
-    pub schema_id: i32,
-    /// Iceberg sort-order id the batch is written and claimed under.
-    pub sort_order_id: i32,
-}
-
-impl LayoutRevision {
-    /// The revision table creation installs.
-    pub const INITIAL: Self = Self {
-        schema_id: BIFROST_SCHEMA_ID,
-        sort_order_id: BIFROST_SORT_ORDER_ID,
-    };
-
-    /// Returns the committed revision `metadata` admits new batches under.
-    ///
-    /// # Errors
-    ///
-    /// Returns a diagnostic when the default sort-order id does not fit the
-    /// `i32` id domain Iceberg data files record.
-    pub fn current(metadata: &iceberg::spec::TableMetadata) -> Result<Self, String> {
-        Ok(Self {
-            schema_id: metadata.current_schema_id(),
-            sort_order_id: i32::try_from(metadata.default_sort_order_id())
-                .map_err(|_| "the default sort-order id exceeds the i32 domain".to_owned())?,
-        })
-    }
-}
-
-impl std::fmt::Display for LayoutRevision {
-    /// Renders `schema={id}.sort={id}`, the revision's segment of a seal key.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "schema={}.sort={}", self.schema_id, self.sort_order_id)
-    }
-}
-
-/// The complete physical recipe one batch was accepted under.
-///
-/// Revision ids name the retained schema, spec, and sort order, but the Bloom
-/// set is a table property with no Iceberg id, so the ids alone cannot say how
-/// an accepted batch is written. Admission binds the committed canonical
-/// [`PhysicalLayoutWire`] here once per committed revision; seal keys, WAL
-/// slices, and the batch fence carry it, so a later alteration never rewrites
-/// how accepted rows are partitioned or written.
-///
-/// Equality and hashing use the SHA-256 of the canonical JSON encoding, which
-/// is computed once, so a seal-key lookup never hashes the recipe itself.
-#[derive(Debug, Clone)]
-pub struct AcceptedRecipe {
-    /// Canonical declaration the batch was accepted under.
-    wire: Arc<PhysicalLayoutWire>,
-    /// Canonical JSON encoding of `wire`, the bytes WAL and the fence store.
-    encoded: Arc<[u8]>,
-    /// SHA-256 of `encoded`.
-    digest: [u8; 32],
-}
-
-impl AcceptedRecipe {
-    /// Binds `wire` as an accepted recipe.
-    ///
-    /// # Errors
-    ///
-    /// Returns a diagnostic when `wire` cannot be encoded as JSON, which a
-    /// resolved declaration never is.
-    pub fn new(wire: PhysicalLayoutWire) -> Result<Self, String> {
-        let encoded: Arc<[u8]> = serde_json::to_vec(&wire)
-            .map_err(|error| format!("accepted recipe does not encode: {error}"))?
-            .into();
-        Ok(Self {
-            digest: <sha2::Sha256 as sha2::Digest>::digest(&encoded).into(),
-            wire: Arc::new(wire),
-            encoded,
-        })
-    }
-
-    /// Decodes a recipe from the canonical bytes WAL or the fence stored.
-    ///
-    /// # Errors
-    ///
-    /// Returns a diagnostic when `encoded` is not a declaration or is not the
-    /// canonical encoding of the declaration it holds.
-    pub fn decode(encoded: &[u8]) -> Result<Self, String> {
-        let wire: PhysicalLayoutWire = serde_json::from_slice(encoded)
-            .map_err(|error| format!("accepted recipe does not decode: {error}"))?;
-        let recipe = Self::new(wire)?;
-        if *recipe.encoded != *encoded {
-            return Err("accepted recipe is not canonically encoded".to_owned());
-        }
-        Ok(recipe)
-    }
-
-    /// Borrows the accepted declaration.
-    #[must_use]
-    pub fn wire(&self) -> &PhysicalLayoutWire {
-        &self.wire
-    }
-
-    /// Borrows the canonical encoding.
-    #[must_use]
-    pub fn encoded(&self) -> &[u8] {
-        &self.encoded
-    }
-
-    /// Returns the recipe identity.
-    #[must_use]
-    pub const fn digest(&self) -> &[u8; 32] {
-        &self.digest
-    }
-}
-
-impl PartialEq for AcceptedRecipe {
-    /// Compares canonical encodings by their digest.
-    fn eq(&self, other: &Self) -> bool {
-        self.digest == other.digest
-    }
-}
-
-impl Eq for AcceptedRecipe {}
-
-impl std::hash::Hash for AcceptedRecipe {
-    /// Hashes the digest, never the declaration.
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.digest.hash(state);
-    }
-}
 
 /// Time-partition granularity owned by the engine.
 ///
@@ -631,6 +496,34 @@ impl NullOrder {
 /// back rather than reconstructing a recipe.
 pub const BLOOM_COLUMNS_PROPERTY: &str = "wyrd.bifrost.bloom-columns";
 
+/// Iceberg table property carrying the table's [`TableVersion`].
+///
+/// The catalog stamps `1` at creation and publishes each later version, with
+/// its retained metadata reference, in the same commit as the definition
+/// edit it names.
+pub const TABLE_VERSION_PROPERTY: &str = "wyrd.bifrost.table-version";
+
+/// Reads the [`TableVersion`] one Iceberg metadata document declares.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::PhysicalDrift`] when the property is missing or not
+/// a canonical version; a table is never assumed to be at any version.
+pub fn table_version(
+    table: &str,
+    metadata: &iceberg::spec::TableMetadata,
+) -> Result<TableVersion, BifrostError> {
+    let value = metadata
+        .properties()
+        .get(TABLE_VERSION_PROPERTY)
+        .ok_or_else(|| BifrostError::PhysicalDrift {
+            detail: format!("{table} metadata has no {TABLE_VERSION_PROPERTY}"),
+        })?;
+    value.parse().map_err(|_| BifrostError::PhysicalDrift {
+        detail: format!("{table} {TABLE_VERSION_PROPERTY} {value:?} is not a table version"),
+    })
+}
+
 /// Iceberg table property naming the base location every Iceberg writer uses.
 ///
 /// Bifrost sets it at registration so the only Iceberg writer in the system —
@@ -1022,44 +915,42 @@ impl PhysicalLayout {
         Ok(resolved)
     }
 
-    /// Rebuilds the layout one retained Iceberg revision declares.
+    /// Rebuilds the layout one table version's Iceberg metadata declares.
     ///
-    /// `metadata` retains every schema, partition spec, and sort order the
-    /// table has had, so a batch accepted under an earlier revision is written
-    /// exactly as it was accepted. Every reference is resolved by field id in
-    /// the retained schema, so a later rename never re-points it. The Bloom set
-    /// is the table's current property narrowed to columns the retained schema
-    /// has: Blooms are a pruning aid every reader falls back from, not part of a
-    /// file's identity. The rebuilt declaration then runs through
-    /// [`Self::resolve`], the one validator.
+    /// `metadata` is the version's own retained document, or any later
+    /// document at the same version, so its current schema, default sort
+    /// order, and Bloom property are exactly that version's definition and a
+    /// later edit never reinterprets it. `spec_id` must be the version's
+    /// default partition spec. Every reference resolves by field id, so a
+    /// later rename never re-points it. The rebuilt declaration then runs
+    /// through [`Self::resolve`], the one validator.
     ///
-    /// Returns the layout with the retained Iceberg schema it was resolved
-    /// over, the field-id authority for the batch.
+    /// Returns the layout with the Iceberg schema it was resolved over, the
+    /// field-id authority for the batch.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::PhysicalDrift`] when a revision id is not
-    /// retained, a field references no retained column, a transform is outside
-    /// the contract, or the Bloom property is malformed, and the resolver's
-    /// error when the rebuilt declaration does not validate.
+    /// Returns [`BifrostError::PhysicalDrift`] when `spec_id` is not the
+    /// version's default spec, a field references no column, a transform is
+    /// outside the contract, or the Bloom property is malformed, and the
+    /// resolver's error when the rebuilt declaration does not validate.
     pub fn of_iceberg(
         table: &str,
         metadata: &iceberg::spec::TableMetadata,
-        revision: LayoutRevision,
         spec_id: i32,
     ) -> Result<(Self, Arc<IcebergSchema>), BifrostError> {
         let drift = |detail: String| BifrostError::PhysicalDrift {
-            detail: format!("{table} revision {revision} spec {spec_id}: {detail}"),
+            detail: format!("{table} spec {spec_id}: {detail}"),
         };
-        let schema = metadata
-            .schema_by_id(revision.schema_id)
-            .ok_or_else(|| drift("the schema is not retained".to_owned()))?;
-        let spec = metadata
-            .partition_spec_by_id(spec_id)
-            .ok_or_else(|| drift("the partition spec is not retained".to_owned()))?;
-        let order = metadata
-            .sort_order_by_id(i64::from(revision.sort_order_id))
-            .ok_or_else(|| drift("the sort order is not retained".to_owned()))?;
+        if metadata.default_partition_spec_id() != spec_id {
+            return Err(drift(format!(
+                "the version partitions under spec {}",
+                metadata.default_partition_spec_id()
+            )));
+        }
+        let schema = metadata.current_schema();
+        let spec = metadata.default_partition_spec();
+        let order = metadata.default_sort_order();
         let name = |id: i32| {
             schema
                 .name_by_field_id(id)
@@ -1097,10 +988,7 @@ impl PhysicalLayout {
         let bloom_columns =
             Self::bloom_columns_from_property(metadata.properties().get(BLOOM_COLUMNS_PROPERTY))
                 .map_err(drift)?
-                .iter()
-                .filter(|column| schema.field_by_name(column).is_some())
-                .cloned()
-                .collect();
+                .to_vec();
         let arrow = iceberg::arrow::schema_to_arrow_schema(schema)
             .map_err(|error| drift(error.to_string()))?;
         let declared = PhysicalLayoutWire {

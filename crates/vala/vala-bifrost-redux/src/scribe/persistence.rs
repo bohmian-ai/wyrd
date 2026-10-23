@@ -2226,7 +2226,7 @@ impl PersistenceWorker {
         frozen: &FrozenMemtable,
     ) -> Result<crate::scribe::assembly::StagedMemberId, ScribeError> {
         let staging = self.staging()?;
-        let layout = crate::scribe::write_recipe::resolve_write_recipe(
+        let recipe = crate::scribe::write_recipe::resolve_write_recipe(
             self.operator_pool
                 .as_ref()
                 .ok_or_else(|| ScribeError::Internal {
@@ -2252,7 +2252,7 @@ impl PersistenceWorker {
                 crate::scribe::execution_lanes::StageMemberOp {
                     frozen: Box::new(frozen.clone()),
                     binding: binding.clone(),
-                    layout,
+                    recipe,
                     origin: crate::scribe::member_stager::StagedMemberOrigin {
                         node_id: generation.stream.node_id,
                         writer_epoch: generation.stream.writer_epoch,

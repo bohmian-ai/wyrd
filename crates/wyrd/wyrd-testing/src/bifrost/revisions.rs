@@ -14,7 +14,7 @@ use arrow::record_batch::RecordBatch;
 use iceberg::TableRequirement;
 use iceberg::spec::TableMetadata;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+use vala_bifrost_redux::catalog::{TABLE_VERSION_PROPERTY, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire};
@@ -156,8 +156,8 @@ pub fn shifted(batch: &RecordBatch, by: i64) -> RecordBatch {
 impl WyrdTestServer {
     /// Commits the updates `revise` derives from a table's current metadata
     /// straight through its Iceberg catalog, guarded by the current schema,
-    /// spec, and sort-order ids, then evicts this node's cached revision so
-    /// the next admission reads it.
+    /// spec, and sort-order ids, advancing the table version by one, then
+    /// evicts this node's cached definition so the next admission reads it.
     ///
     /// # Panics
     ///
@@ -178,7 +178,17 @@ impl WyrdTestServer {
             .expect("physical table loads");
         let metadata = physical.metadata();
         let transaction = Transaction::new(&physical);
-        let action = revise(metadata).into_iter().fold(
+        let version: i64 = metadata
+            .properties()
+            .get(TABLE_VERSION_PROPERTY)
+            .expect("a Bifrost table carries its version")
+            .parse()
+            .expect("the version is canonical");
+        let mut updates = revise(metadata);
+        updates.push(iceberg::TableUpdate::SetProperties {
+            updates: [(TABLE_VERSION_PROPERTY.to_owned(), (version + 1).to_string())].into(),
+        });
+        let action = updates.into_iter().fold(
             transaction
                 .apply_updates()
                 .requirement(TableRequirement::CurrentSchemaIdMatch {
@@ -197,7 +207,7 @@ impl WyrdTestServer {
             .commit(catalog.iceberg_catalog().as_ref())
             .await
             .expect("revision commits");
-        catalog.evict_committed_revision(table, tenant);
+        catalog.evict_current_definition(table, tenant);
     }
 
     /// Commits a new default sort order — the current keys plus `value`

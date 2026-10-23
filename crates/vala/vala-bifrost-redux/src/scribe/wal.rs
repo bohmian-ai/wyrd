@@ -30,13 +30,14 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
 
+use crate::catalog::PhysicalPartition;
 use crate::catalog::TableRef;
-use crate::catalog::{LayoutRevision, PhysicalPartition};
 use crate::contracts::ScribeError;
 use crate::resources::{ScribeMemoryLease, ScribeResources};
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::tables::AuditLogTable;
+use wyrd_spec::vala::ids::TableVersion;
 
 /// Record one physical WAL append attempt while preserving its original result.
 fn record_wal_append(result: &Result<(), ScribeError>, bytes: usize, started: Instant) {
@@ -679,14 +680,7 @@ impl PreparedWalAppend {
             .saturating_add(usize::from(table_len))
             .saturating_add(2)
             .saturating_add(seal_key.partition.to_bytes().len())
-            .saturating_add(REVISION_BYTES)
-            .saturating_add(4)
-            .saturating_add(
-                seal_key
-                    .recipe
-                    .as_ref()
-                    .map_or(0, |recipe| recipe.encoded().len()),
-            )
+            .saturating_add(TABLE_VERSION_BYTES)
             .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
         Ok(payload_len)
     }
@@ -772,17 +766,8 @@ fn append_prepared_borrowed(
                 detail: "WAL Arrow payload exceeds v7 payload limits".to_owned(),
             })?
             .to_le_bytes();
-        let revision = encode_revision(seal_key.revision);
-        let recipe = seal_key
-            .recipe
-            .as_ref()
-            .map_or(&[][..], crate::catalog::AcceptedRecipe::encoded);
-        let recipe_len = u32::try_from(recipe.len())
-            .map_err(|_| ScribeError::Internal {
-                detail: "WAL accepted recipe exceeds its u32 length".to_owned(),
-            })?
-            .to_le_bytes();
-        let parts: [&[u8]; 14] = [
+        let table_version = seal_key.table_version.get().to_be_bytes();
+        let parts: [&[u8]; 12] = [
             &SLICE_PAYLOAD_MAGIC,
             &tenant_id,
             &table_len,
@@ -791,9 +776,7 @@ fn append_prepared_borrowed(
             name,
             &partition_len,
             &partition,
-            &revision,
-            &recipe_len,
-            recipe,
+            &table_version,
             &prepared.schema_fingerprint,
             &data_len,
             &prepared.data,
@@ -803,18 +786,10 @@ fn append_prepared_borrowed(
     Ok((payload_digest, payload_len))
 }
 
-const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S8SL";
+const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S9SL";
 
-/// Encoded width of a slice's [`LayoutRevision`]: two big-endian `i32` ids.
-const REVISION_BYTES: usize = 8;
-
-/// Encodes the schema and sort-order ids one slice was accepted under.
-fn encode_revision(revision: LayoutRevision) -> [u8; REVISION_BYTES] {
-    let mut encoded = [0_u8; REVISION_BYTES];
-    encoded[..4].copy_from_slice(&revision.schema_id.to_be_bytes());
-    encoded[4..].copy_from_slice(&revision.sort_order_id.to_be_bytes());
-    encoded
-}
+/// Encoded width of a slice's [`TableVersion`]: one big-endian `i64`.
+const TABLE_VERSION_BYTES: usize = 8;
 
 /// Encodes one slice payload for `seal_key`, the test entry to the v7 codec.
 ///
@@ -831,8 +806,7 @@ fn encode_slice_payload(
         seal_key.tenant.as_uuid().as_bytes(),
         &seal_key.table.fqn(),
         &seal_key.partition,
-        seal_key.revision,
-        seal_key.recipe.as_ref(),
+        seal_key.table_version,
         &schema_fingerprint,
         data,
     )
@@ -850,8 +824,7 @@ fn encode_slice_payload_parts(
     tenant: &[u8; 16],
     table_fqn: &str,
     partition: &PhysicalPartition,
-    revision: LayoutRevision,
-    recipe: Option<&crate::catalog::AcceptedRecipe>,
+    table_version: TableVersion,
     schema_fingerprint: &[u8; 32],
     data: &[u8],
 ) -> Result<Vec<u8>, ScribeError> {
@@ -871,9 +844,7 @@ fn encode_slice_payload_parts(
         .saturating_add(table_fqn.len())
         .saturating_add(2)
         .saturating_add(partition.len())
-        .saturating_add(REVISION_BYTES)
-        .saturating_add(4)
-        .saturating_add(recipe.map_or(0, |recipe| recipe.encoded().len()))
+        .saturating_add(TABLE_VERSION_BYTES)
         .saturating_add(32)
         .saturating_add(4)
         .saturating_add(data.len());
@@ -884,13 +855,7 @@ fn encode_slice_payload_parts(
     payload.extend_from_slice(table_fqn.as_bytes());
     payload.extend_from_slice(&partition_len.to_le_bytes());
     payload.extend_from_slice(&partition);
-    payload.extend_from_slice(&encode_revision(revision));
-    let recipe = recipe.map_or(&[][..], crate::catalog::AcceptedRecipe::encoded);
-    let recipe_len = u32::try_from(recipe.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL accepted recipe exceeds its u32 length".to_owned(),
-    })?;
-    payload.extend_from_slice(&recipe_len.to_le_bytes());
-    payload.extend_from_slice(recipe);
+    payload.extend_from_slice(&table_version.get().to_be_bytes());
     payload.extend_from_slice(schema_fingerprint);
     payload.extend_from_slice(&data_len.to_le_bytes());
     payload.extend_from_slice(data);
@@ -1057,28 +1022,20 @@ fn decode_slice_metadata(
     }
     let partition_len = reader.read_u16("WAL partition length decode failed")?;
     let partition = decode_slice_partition(reader.take(partition_len)?)?;
-    let revision = reader.take(REVISION_BYTES)?;
-    let revision = LayoutRevision {
-        schema_id: i32::from_be_bytes(revision[..4].try_into().expect("invariant: 4-byte id")),
-        sort_order_id: i32::from_be_bytes(revision[4..].try_into().expect("invariant: 4-byte id")),
-    };
-    let recipe_len = reader.read_u32("WAL accepted recipe length decode failed")?;
-    let recipe = match recipe_len {
-        0 => None,
-        length => Some(
-            crate::catalog::AcceptedRecipe::decode(reader.take(length)?).map_err(|detail| {
-                ScribeError::Internal {
-                    detail: format!("WAL slice recipe is invalid: {detail}"),
-                }
-            })?,
-        ),
-    };
+    let table_version = i64::from_be_bytes(
+        reader
+            .take(TABLE_VERSION_BYTES)?
+            .try_into()
+            .expect("invariant: 8-byte table version"),
+    );
+    let table_version =
+        TableVersion::new(table_version).map_err(|error| ScribeError::Internal {
+            detail: format!("WAL slice table version is invalid: {error}"),
+        })?;
     let mut schema_fingerprint = [0_u8; 32];
     schema_fingerprint.copy_from_slice(reader.take(32)?);
     Ok(DecodedSliceMetadata {
-        seal_key: SealKey::new(tenant, table, partition)
-            .with_revision(revision)
-            .with_recipe(recipe),
+        seal_key: SealKey::new(tenant, table, partition).with_table_version(table_version),
         schema_fingerprint,
     })
 }
@@ -4048,57 +4005,30 @@ mod tests {
         assert!(error.to_string().contains("trailing bytes"));
     }
 
-    /// A slice carries its accepted recipe through the codec byte-for-byte,
-    /// and a recipe that is not canonically encoded is refused.
+    /// A slice carries its table version through the codec exactly, beyond
+    /// 2^53, and a version outside `1..=i64::MAX` is refused.
     ///
     /// # Panics
     ///
-    /// Panics when the recipe does not round-trip or the noncanonical recipe
+    /// Panics when the version does not round-trip or an invalid version
     /// decodes.
     #[test]
-    fn slice_payload_round_trips_its_accepted_recipe() {
-        let recipe =
-            crate::catalog::AcceptedRecipe::new(wyrd_spec::vala::api::PhysicalLayoutWire {
-                time_column: Some("event_time".to_owned()),
-                partition_by: Vec::new(),
-                sort_keys: Vec::new(),
-                bloom_columns: vec!["customer".to_owned()],
-            })
-            .expect("recipe encodes");
-        let seal_key =
-            test_seal_key(crate::test_support::tenant()).with_recipe(Some(recipe.clone()));
+    fn slice_payload_round_trips_its_table_version() {
+        let version = TableVersion::new((1_i64 << 53) + 1).expect("valid version");
+        let seal_key = test_seal_key(crate::test_support::tenant()).with_table_version(version);
         let payload =
             encode_slice_payload(&seal_key, [7_u8; 32], b"data").expect("encode slice payload");
         let decoded = decode_slice_payload(&payload).expect("slice decodes");
         assert_eq!(decoded.seal_key, seal_key);
-        assert_eq!(
-            decoded
-                .seal_key
-                .recipe
-                .as_ref()
-                .map(crate::catalog::layout::AcceptedRecipe::wire),
-            Some(recipe.wire())
-        );
+        assert_eq!(decoded.seal_key.table_version, version);
 
-        let spaced = [b" ".as_slice(), recipe.encoded()].concat();
-        let noncanonical = encode_slice_payload_parts(
-            seal_key.tenant.as_uuid().as_bytes(),
-            &seal_key.table.fqn(),
-            &seal_key.partition,
-            seal_key.revision,
-            None,
-            &[7_u8; 32],
-            b"data",
-        )
-        .expect("encode recipe-free slice");
-        let mut payload = noncanonical[..noncanonical.len() - (4 + 32 + 4 + 4)].to_vec();
-        payload.extend_from_slice(&u32::try_from(spaced.len()).expect("fits").to_le_bytes());
-        payload.extend_from_slice(&spaced);
-        payload.extend_from_slice(&[7_u8; 32]);
-        payload.extend_from_slice(&4_u32.to_le_bytes());
-        payload.extend_from_slice(b"data");
-        let error = decode_slice_payload(&payload).expect_err("noncanonical recipe fails closed");
-        assert!(error.to_string().contains("not canonically encoded"));
+        let offset = payload.len() - (TABLE_VERSION_BYTES + 32 + 4 + 4);
+        for invalid in [0_i64, -1] {
+            let mut payload = payload.clone();
+            payload[offset..offset + TABLE_VERSION_BYTES].copy_from_slice(&invalid.to_be_bytes());
+            let error = decode_slice_payload(&payload).expect_err("invalid version fails closed");
+            assert!(error.to_string().contains("table version is invalid"));
+        }
     }
 
     #[test]
@@ -4110,8 +4040,7 @@ mod tests {
             &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
                 2026, 1, 1,
             )),
-            LayoutRevision::INITIAL,
-            None,
+            TableVersion::INITIAL,
             &[0_u8; 32],
             b"data",
         )
@@ -4139,8 +4068,7 @@ mod tests {
             &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
                 2026, 1, 1,
             )),
-            LayoutRevision::INITIAL,
-            None,
+            TableVersion::INITIAL,
             &[0_u8; 32],
             b"data",
         )
@@ -4154,8 +4082,7 @@ mod tests {
             &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
                 2026, 1, 1,
             )),
-            LayoutRevision::INITIAL,
-            None,
+            TableVersion::INITIAL,
             &[0_u8; 32],
             b"data",
         )

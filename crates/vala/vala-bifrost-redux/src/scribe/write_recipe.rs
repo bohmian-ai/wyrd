@@ -1,30 +1,38 @@
 //! Seal-time resolution of the physical write recipe.
 //!
-//! Admission binds every batch to the complete recipe it was accepted under,
-//! and the seal key carries it through WAL and replay, so a revision or Bloom
-//! alteration committed after acceptance never reinterprets accepted rows and
-//! WAL replay gets the same recipe as a live seal. Only rows admitted with no
-//! registered declaration — the embedded engine seam — resolve the registered
-//! control row here.
+//! Admission binds every batch to the table version it was accepted under,
+//! and the seal key carries it through WAL and replay, so a definition edit
+//! committed after acceptance never reinterprets accepted rows and WAL replay
+//! gets the same recipe as a live seal. Only rows admitted with no registered
+//! declaration — the embedded engine seam — resolve the registered control row
+//! here.
 
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use vala_sql::OperatorPool;
+use wyrd_spec::vala::ids::TableVersion;
 
-use crate::catalog::layout::{BIFROST_PARTITION_SPEC_ID, PhysicalLayout};
-use crate::catalog::{BifrostCatalog, LayoutRevision, TenantTableBinding};
+use crate::catalog::layout::{BIFROST_PARTITION_SPEC_ID, BIFROST_SORT_ORDER_ID, PhysicalLayout};
+use crate::catalog::{BifrostCatalog, TenantTableBinding};
 use crate::contracts::ScribeError;
 use crate::scribe::seal_key::SealKey;
 
+/// The physical recipe one table version writes accepted rows under.
+#[derive(Debug, Clone)]
+pub(crate) struct WriteRecipe {
+    /// Layout narrowed to the sealed physical schema.
+    pub layout: Arc<PhysicalLayout>,
+    /// Iceberg sort-order id the version writes and claims files under.
+    pub sort_order_id: i32,
+}
+
 /// Resolves the write recipe for the rows `binding` accepted under `seal_key`.
 ///
-/// A key that carries its accepted recipe is written under exactly that
-/// recipe with no catalog read. Otherwise, with a catalog owner the recipe is
-/// the retained Iceberg revision the rows were accepted under
-/// ([`BifrostCatalog::retained_layout`]); without one — the embedded engine
-/// seam, whose tables are never revised — it is the registered control row,
-/// which only describes the creation revision.
+/// With a catalog owner the recipe is the definition of the table version the
+/// rows were accepted under ([`BifrostCatalog::retained_definition`]); without
+/// one — the embedded engine seam, whose tables are never edited — it is the
+/// registered control row, which only describes the creation version.
 ///
 /// `operator` is the Scribe operator lane's control capability. The registry
 /// read itself belongs to the `vala-sql` `olap_catalog` owner, which names the
@@ -38,7 +46,8 @@ use crate::scribe::seal_key::SealKey;
 ///
 /// Returns [`ScribeError::Internal`] when the catalog or control read fails,
 /// when the table has no control row, when the stored JSON is malformed, when
-/// a non-creation revision has no catalog owner to resolve it, or when the
+/// the version is not retained or its partition spec is not the batch's, when
+/// a non-creation version has no catalog owner to resolve it, or when the
 /// recipe no longer resolves against `schema`. The last case means the layout
 /// and the physical schema have diverged, and encoding under either
 /// interpretation would mislabel the output, so resolution fails closed.
@@ -54,26 +63,34 @@ pub(crate) async fn resolve_write_recipe(
     binding: &TenantTableBinding,
     seal_key: &SealKey,
     schema: &Schema,
-) -> Result<Arc<PhysicalLayout>, ScribeError> {
+) -> Result<WriteRecipe, ScribeError> {
     let fqn = binding.table_ref.fqn();
-    let revision = seal_key.revision;
+    let table_version = seal_key.table_version;
     let spec_id = seal_key.partition.spec_id();
-    let stored = if let Some(recipe) = &seal_key.recipe {
-        recipe.wire().clone()
-    } else if let Some(catalog) = catalog {
-        catalog
-            .retained_layout(binding, revision, spec_id)
+    let (stored, sort_order_id) = if let Some(catalog) = catalog {
+        let definition = catalog
+            .retained_definition(binding, table_version)
             .await
             .map_err(|error| ScribeError::Internal {
                 detail: format!(
-                    "write recipe for {fqn} revision {revision} is unavailable: {error}"
+                    "write recipe for {fqn} version {table_version} is unavailable: {error}"
                 ),
-            })?
-            .to_wire()
-    } else {
-        if revision != LayoutRevision::INITIAL || spec_id != BIFROST_PARTITION_SPEC_ID {
+            })?;
+        if definition.spec_id != spec_id {
             return Err(ScribeError::Internal {
-                detail: format!("write recipe for {fqn} revision {revision} needs a catalog owner"),
+                detail: format!(
+                    "{fqn} version {table_version} partitions under spec {}, not {spec_id}",
+                    definition.spec_id
+                ),
+            });
+        }
+        (definition.layout.to_wire(), definition.sort_order_id)
+    } else {
+        if table_version != TableVersion::INITIAL || spec_id != BIFROST_PARTITION_SPEC_ID {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "write recipe for {fqn} version {table_version} needs a catalog owner"
+                ),
             });
         }
         let stored = vala_sql::queries::olap_catalog::registered_physical_layout(
@@ -88,12 +105,16 @@ pub(crate) async fn resolve_write_recipe(
         .ok_or_else(|| ScribeError::Internal {
             detail: format!("write recipe has no registered control row for {fqn}"),
         })?;
-        serde_json::from_value(stored).map_err(|error| ScribeError::Internal {
+        let stored = serde_json::from_value(stored).map_err(|error| ScribeError::Internal {
             detail: format!("registered physical layout for {fqn} is malformed: {error}"),
-        })?
+        })?;
+        (stored, BIFROST_SORT_ORDER_ID)
     };
     PhysicalLayout::resolve_for_physical_schema(&fqn, schema, &stored)
-        .map(Arc::new)
+        .map(|layout| WriteRecipe {
+            layout: Arc::new(layout),
+            sort_order_id,
+        })
         .map_err(|error| ScribeError::Internal {
             detail: format!(
                 "registered physical layout for {fqn} does not match the sealed schema: {error}"

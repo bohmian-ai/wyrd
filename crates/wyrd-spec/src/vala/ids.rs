@@ -425,6 +425,109 @@ impl FromStr for SpanId {
     }
 }
 
+/// Version of one Bifrost table's complete immutable definition.
+///
+/// Creation publishes [`TableVersion::INITIAL`]; each effective definition
+/// edit publishes the next version. Data, snapshot and housekeeping commits
+/// keep it. The domain is `1..=i64::MAX`, and JSON carries it as a canonical
+/// unsigned decimal string so no reader rounds it through a float.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "server", schema(value_type = String))]
+pub struct TableVersion(i64);
+
+impl TableVersion {
+    /// The version a newly created table starts at.
+    pub const INITIAL: TableVersion = TableVersion(1);
+
+    /// Adopts a stored version.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when `value` is not positive.
+    pub fn new(value: i64) -> Result<Self, WyrdError> {
+        if value > 0 {
+            Ok(Self(value))
+        } else {
+            Err(WyrdError::Validation {
+                message: format!("table_version must be positive, got {value}"),
+                details: serde_json::Value::Null,
+            })
+        }
+    }
+
+    /// Returns the version as its stored integer.
+    #[must_use]
+    pub fn get(self) -> i64 {
+        self.0
+    }
+
+    /// Returns the version an effective edit publishes, or `None` once the
+    /// domain is exhausted.
+    #[must_use]
+    pub fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+impl std::fmt::Display for TableVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for TableVersion {
+    type Err = WyrdError;
+
+    /// Parses a canonical unsigned decimal: no sign, leading zero,
+    /// whitespace, fraction or exponent.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let canonical = s.bytes().all(|byte| byte.is_ascii_digit()) && !s.starts_with('0');
+        match s.parse::<i64>() {
+            Ok(value) if canonical => Self::new(value),
+            _ => Err(WyrdError::Validation {
+                message: format!(
+                    "table_version must be a canonical decimal string in 1..=9223372036854775807, got {s:?}"
+                ),
+                details: serde_json::Value::Null,
+            }),
+        }
+    }
+}
+
+impl Serialize for TableVersion {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for TableVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for TableVersion {
+    fn schema_name() -> String {
+        "TableVersion".to_string()
+    }
+
+    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
+
+        SchemaObject {
+            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
+            string: Some(Box::new(StringValidation {
+                max_length: Some(19),
+                min_length: Some(1),
+                pattern: Some(r"^[1-9][0-9]*$".to_string()),
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
 fn hex_nibble(byte: u8) -> Result<u8, WyrdError> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -448,7 +551,7 @@ fn hex_char(nibble: u8) -> char {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntityUid, RecordId, SessionId, SpanId, TraceId, WorkflowUid};
+    use super::{EntityUid, RecordId, SessionId, SpanId, TableVersion, TraceId, WorkflowUid};
 
     #[test]
     fn id_uuid_types_serde_round_trip() {
@@ -498,5 +601,43 @@ mod tests {
             serde_json::from_str("[1,2,3,4,5,6,7,8]").expect("legacy byte array deserializes");
         let json = serde_json::to_string(&span).expect("span id serializes");
         assert_eq!(json, "\"0102030405060708\"");
+    }
+
+    #[test]
+    fn table_version_round_trips_canonical_strings_beyond_two_to_the_53() {
+        for value in [1_i64, (1 << 53) + 1, i64::MAX] {
+            let version = TableVersion::new(value).expect("positive");
+            let json = serde_json::to_string(&version).expect("serialize");
+            assert_eq!(json, format!("\"{value}\""));
+            assert_eq!(
+                serde_json::from_str::<TableVersion>(&json).expect("deserialize"),
+                version
+            );
+        }
+        assert_eq!(TableVersion::new(i64::MAX).expect("max").next(), None);
+    }
+
+    #[test]
+    fn table_version_refuses_noncanonical_forms() {
+        for json in [
+            "1",
+            "\"0\"",
+            "\"01\"",
+            "\"+1\"",
+            "\"-1\"",
+            "\" 1\"",
+            "\"1 \"",
+            "\"1.0\"",
+            "\"1e3\"",
+            "\"\"",
+            "\"9223372036854775808\"",
+            "null",
+        ] {
+            assert!(
+                serde_json::from_str::<TableVersion>(json).is_err(),
+                "{json} must be refused"
+            );
+        }
+        assert!(TableVersion::new(0).is_err());
     }
 }

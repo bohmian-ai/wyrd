@@ -10,8 +10,6 @@ use wyrd_spec::DataTenantId;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
-use crate::scribe::memtable::FrozenMemtable;
-use crate::scribe::parquet_writer::ParquetEncoded;
 use crate::scribe::promotion::{PublishedHotFileIdentity, ScribePublishedHotFileV1};
 
 /// The unique replay key on `vala.file_list`.
@@ -216,44 +214,6 @@ fn artifact_set_outcome(
     })
 }
 
-/// Builds the ordered writer-v2 SQL rows for one sealed artifact set.
-///
-/// # Errors
-/// Returns a Scribe invariant error for an empty/noncontiguous set, malformed
-/// checksum, identity mismatch, or values outside `PostgreSQL` integer domains.
-pub fn build_artifact_inserts(
-    frozen: &FrozenMemtable,
-    encoded: &ParquetEncoded,
-    binding: &TenantTableBinding,
-    node_id: &str,
-    writer_epoch: i64,
-) -> Result<Vec<FileListArtifactInsert>, ScribeError> {
-    if encoded.artifacts.is_empty()
-        || binding.tenant != frozen.seal_key.tenant
-        || binding.table_ref != frozen.seal_key.table
-    {
-        return Err(ScribeError::Internal {
-            detail: "writer-v2 artifact set does not match its frozen generation".to_owned(),
-        });
-    }
-    let node_id = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
-        detail: format!("invalid writer-v2 node identity: {error}"),
-    })?;
-    let (wal_lsn_min, wal_lsn_max) = extract_lsn_range(encoded)?;
-    build_inserts(
-        encoded.artifacts.iter(),
-        &PublishedArtifactFacts {
-            binding,
-            partition: encoded.partition.clone(),
-            sort_order_id: frozen.seal_key.revision.sort_order_id,
-            node_id,
-            writer_epoch,
-            wal_lsn_min,
-            wal_lsn_max,
-        },
-    )
-}
-
 /// Builds the ordered writer-v2 SQL rows for one assembled claim's objects.
 ///
 /// A claim has no frozen generation behind it: its identity comes from the
@@ -271,6 +231,7 @@ pub fn build_claim_inserts(
     key: &crate::scribe::assembly::ScribeAssemblyKey,
     artifacts: &crate::scribe::parquet_writer::BoundedParquetArtifactSet,
     binding: &TenantTableBinding,
+    sort_order_id: i32,
     wal: crate::scribe::hot_stage::StagedLsnRange,
 ) -> Result<Vec<FileListArtifactInsert>, ScribeError> {
     if artifacts.is_empty() || binding.tenant != key.tenant() || binding.table_ref != *key.table() {
@@ -294,7 +255,7 @@ pub fn build_claim_inserts(
         &PublishedArtifactFacts {
             binding,
             partition: key.partition().clone(),
-            sort_order_id: key.revision().sort_order_id,
+            sort_order_id,
             node_id: key.node_id().as_uuid(),
             writer_epoch: key.writer_epoch().as_i64(),
             wal_lsn_min,
@@ -432,33 +393,6 @@ fn artifact_row_id(object_identity: &str) -> Uuid {
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
-}
-
-/// Extract LSN range from append metadata.
-///
-/// LSN values are u64 but real-world Postgres LSNs fit in i64 (PG column is BIGINT).
-fn extract_lsn_range(encoded: &ParquetEncoded) -> Result<(i64, i64), ScribeError> {
-    let min = encoded
-        .append_metas
-        .iter()
-        .map(|m| m.wal_lsn_min.as_u64())
-        .min()
-        .unwrap_or(0);
-    let max = encoded
-        .append_metas
-        .iter()
-        .map(|m| m.wal_lsn_max.as_u64())
-        .max()
-        .unwrap_or(0);
-
-    let min_i = i64::try_from(min).map_err(|_| ScribeError::Internal {
-        detail: format!("wal_lsn_min {min} exceeds i64::MAX (invariant violation)"),
-    })?;
-    let max_i = i64::try_from(max).map_err(|_| ScribeError::Internal {
-        detail: format!("wal_lsn_max {max} exceeds i64::MAX (invariant violation)"),
-    })?;
-
-    Ok((min_i, max_i))
 }
 
 /// Atomically publishes a complete writer-v2 artifact set under one actor fence.

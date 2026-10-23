@@ -1364,8 +1364,8 @@ pub(crate) struct StageMemberOp {
     pub(crate) frozen: Box<FrozenMemtable>,
     /// Tenant-qualified physical table binding.
     pub(crate) binding: TenantTableBinding,
-    /// Registered physical write recipe resolved before the lane was entered.
-    pub(crate) layout: std::sync::Arc<crate::catalog::layout::PhysicalLayout>,
+    /// Physical write recipe resolved before the lane was entered.
+    pub(crate) recipe: crate::scribe::write_recipe::WriteRecipe,
     /// Shard, epoch, node, and WAL facts describing where the rows came from.
     pub(crate) origin: crate::scribe::member_stager::StagedMemberOrigin,
     /// Scribe capability charged for the batches the writer materializes.
@@ -1456,14 +1456,15 @@ fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, 
     let StageMemberOp {
         frozen,
         binding,
-        layout,
+        recipe,
         origin,
         memory,
         staging,
     } = operation;
     let context = crate::scribe::staging_runtime::ClaimContext {
         schema: std::sync::Arc::clone(&frozen.schema),
-        layout: (*layout).clone(),
+        layout: (*recipe.layout).clone(),
+        sort_order_id: recipe.sort_order_id,
         binding: binding.clone(),
     };
     staging
@@ -1471,7 +1472,7 @@ fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, 
             crate::scribe::member_stager::StageMemberRequest {
                 frozen: &frozen,
                 binding: &binding,
-                layout: &layout,
+                layout: &recipe.layout,
                 origin,
                 memory,
             },

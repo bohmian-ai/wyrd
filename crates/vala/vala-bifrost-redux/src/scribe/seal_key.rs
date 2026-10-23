@@ -18,12 +18,12 @@ use arrow::compute::take;
 use arrow::record_batch::RecordBatch;
 use wyrd_spec::ids::DataTenantId;
 
-use crate::catalog::LayoutRevision;
 use crate::catalog::TableRef;
 use crate::catalog::TenantTableBinding;
 pub use crate::catalog::layout::TimePartition;
 pub use crate::catalog::{PartitionScheme, PhysicalPartition};
 use crate::contracts::ScribeError;
+use wyrd_spec::vala::ids::TableVersion;
 
 /// Durable identity shared by every object one assembly claim publishes.
 ///
@@ -102,30 +102,26 @@ impl ScribeClaimIdentity {
     }
 }
 
-/// Seal key — `(DataTenantId, TableRef, LayoutRevision, PhysicalPartition)`
+/// Seal key — `(DataTenantId, TableRef, TableVersion, PhysicalPartition)`
 /// identifying one WAL/memtable/seal scope.
 ///
-/// The revision and recipe are part of the scope, so batches accepted under
-/// different schema, sort-order, or Bloom recipes never share a generation and
-/// each seals under the recipe it was accepted with.
+/// The table version is part of the scope, so batches accepted under
+/// different definitions never share a generation and each seals under the
+/// definition it was accepted with.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SealKey {
     /// Tenant ID for this seal scope.
     pub tenant: DataTenantId,
     /// Table reference for this seal scope.
     pub table: TableRef,
-    /// Schema and sort-order revision every batch in the scope is bound to.
-    pub revision: LayoutRevision,
+    /// Table version every batch in the scope was accepted under.
+    pub table_version: TableVersion,
     /// Exact partition for this seal scope.
     pub partition: PhysicalPartition,
-    /// Complete recipe every batch in the scope was accepted under; `None`
-    /// only where no registered declaration admitted the rows, which seal
-    /// resolves from the registered control row.
-    pub recipe: Option<crate::catalog::AcceptedRecipe>,
 }
 
 impl SealKey {
-    /// Construct a new seal key under the creation revision; a bare
+    /// Construct a new seal key under the creation version; a bare
     /// [`TimePartition`] is the time-only identity.
     #[must_use]
     pub fn new(
@@ -136,33 +132,24 @@ impl SealKey {
         Self {
             tenant,
             table,
-            revision: LayoutRevision::INITIAL,
+            table_version: TableVersion::INITIAL,
             partition: partition.into(),
-            recipe: None,
         }
     }
 
-    /// Rebinds the key to `revision`.
+    /// Rebinds the key to `table_version`.
     #[must_use]
-    pub const fn with_revision(mut self, revision: LayoutRevision) -> Self {
-        self.revision = revision;
-        self
-    }
-
-    /// Binds the key to the recipe its batches were accepted under.
-    #[must_use]
-    pub fn with_recipe(mut self, recipe: Option<crate::catalog::AcceptedRecipe>) -> Self {
-        self.recipe = recipe;
+    pub const fn with_table_version(mut self, table_version: TableVersion) -> Self {
+        self.table_version = table_version;
         self
     }
 
     /// Returns the canonical text identity of this seal scope,
-    /// `{namespace}/{table}/tenant={tenant}/{revision}/{partition}`, followed
-    /// by `/recipe={digest}` when the key binds a recipe.
+    /// `{namespace}/{table}/tenant={tenant}/version={version}/{partition}`.
     ///
     /// WAL manifests and replay indexes key on this text, so it is injective:
-    /// it renders the revision ids, the partition's spec, time, and every
-    /// typed value, and the recipe digest.
+    /// it renders the version, the partition's spec, time, and every typed
+    /// value.
     #[must_use]
     pub fn canonical_key(&self) -> String {
         self.to_string()
@@ -174,17 +161,13 @@ impl std::fmt::Display for SealKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}/{}/tenant={}/{}/{}",
+            "{}/{}/tenant={}/version={}/{}",
             self.table.namespace.as_str(),
             self.table.name,
             self.tenant.as_uuid(),
-            self.revision,
+            self.table_version,
             self.partition
-        )?;
-        match &self.recipe {
-            Some(recipe) => write!(f, "/recipe={}", hex::encode(recipe.digest())),
-            None => Ok(()),
-        }
+        )
     }
 }
 

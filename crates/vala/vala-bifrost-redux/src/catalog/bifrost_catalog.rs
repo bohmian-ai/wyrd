@@ -24,6 +24,7 @@ use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, PhysicalLayoutWire,
     RegisterOutcome, RegisterTableResponse,
 };
+use wyrd_spec::vala::ids::TableVersion;
 
 use crate::catalog::cut_cache::{CUT_CHANNEL, CutCache};
 use crate::catalog::error::BifrostCatalogError;
@@ -266,44 +267,90 @@ pub struct BifrostCatalog {
     /// Registrations this node has already read, by tenant and table name.
     ///
     /// A registration's UID is minted once and `(tenant, fqn)` is unique; its
-    /// fingerprint and layout change only with a committed revision, after
-    /// which [`BifrostCatalog::evict_committed_revision`] drops the entry.
+    /// fingerprint and layout change only with a new table version, after
+    /// which [`BifrostCatalog::evict_current_definition`] drops the entry.
     /// Only found rows are cached, so a table registered later is still
     /// seen on its first lookup. One control-row read fills the UID,
     /// fingerprint, and layout every write and query resolves. Grows with
     /// registered tables, never with writes or queries.
     registrations: Arc<RwLock<HashMap<(DataTenantId, String), CachedRegistration>>>,
-    /// Committed revisions this node has already loaded, by tenant and table
-    /// name.
+    /// Current table definitions this node has already loaded, by tenant and
+    /// table name.
     ///
-    /// The revision is what new admission binds: its schema is the field-id
+    /// The definition is what new admission binds: its schema is the field-id
     /// authority Scribe stamps into every Parquet object. An entry stays until
-    /// [`BifrostCatalog::evict_committed_revision`] drops it after a revision
-    /// commits; batches already accepted are unaffected because each carries
-    /// its own revision. Grows with registered tables, never with writes.
-    committed_revisions: Arc<RwLock<CommittedRevisions>>,
+    /// [`BifrostCatalog::evict_current_definition`] drops it after a new
+    /// version commits; batches already accepted are unaffected because each
+    /// carries its own version. Grows with registered tables, never with
+    /// writes.
+    current_definitions: Arc<RwLock<CurrentDefinitions>>,
     /// Node-local Oracle cut cache, served only while [`Self::watch_cuts`]
     /// is listening for invalidations.
     cut_cache: Arc<CutCache>,
 }
 
-/// Committed revisions a node has loaded, keyed by tenant and table name.
-type CommittedRevisions = HashMap<(DataTenantId, String), Arc<CommittedRevision>>;
+/// Current table definitions a node has loaded, keyed by tenant and table
+/// name.
+type CurrentDefinitions = HashMap<(DataTenantId, String), Arc<TableDefinition>>;
 
-/// The committed physical revision new admission binds for one table.
+/// The complete definition one table version declares.
+///
+/// Rebuilt from that version's native Iceberg metadata, so every batch bound
+/// to the version is admitted, sealed, recovered, and published under the
+/// same schema, spec, sort order, and Bloom set.
 #[derive(Debug)]
-pub struct CommittedRevision {
-    /// Schema and sort-order revision accepted batches are bound to.
-    pub revision: crate::catalog::LayoutRevision,
-    /// Default partition-spec id accepted batches are partitioned under.
+pub struct TableDefinition {
+    /// Version this definition belongs to.
+    pub table_version: TableVersion,
+    /// Default partition-spec id the version partitions under.
     pub spec_id: i32,
-    /// Committed Iceberg schema, the field-id authority Scribe stamps.
+    /// Default sort-order id the version writes under.
+    pub sort_order_id: i32,
+    /// The version's Iceberg schema, the field-id authority Scribe stamps.
     pub schema: Arc<spec::Schema>,
-    /// Layout the revision declares, rebuilt from the Iceberg metadata.
+    /// Layout the version declares.
     pub layout: PhysicalLayout,
-    /// The layout's canonical declaration, bound once as the recipe every
-    /// batch admitted under this revision is accepted with.
-    pub recipe: crate::catalog::AcceptedRecipe,
+    /// Partition scheme the version plans slices under, bound to the version.
+    pub partition_scheme: crate::catalog::PartitionScheme,
+}
+
+impl TableDefinition {
+    /// Rebuilds the definition one metadata document declares.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::MetadataMismatch`] when the document has
+    /// no canonical version, its sort-order id leaves the `i32` domain, or its
+    /// layout or partition scheme does not rebuild.
+    fn of_metadata(fqn: &str, metadata: &TableMetadata) -> Result<Self, BifrostCatalogError> {
+        let mismatch = |error: wyrd_spec::vala::BifrostError| {
+            BifrostCatalogError::MetadataMismatch(error.to_string())
+        };
+        let table_version =
+            crate::catalog::layout::table_version(fqn, metadata).map_err(mismatch)?;
+        let spec_id = metadata.default_partition_spec_id();
+        let sort_order_id = i32::try_from(metadata.default_sort_order_id()).map_err(|_| {
+            BifrostCatalogError::MetadataMismatch(format!(
+                "{fqn} default sort-order id exceeds the i32 domain"
+            ))
+        })?;
+        let (layout, schema) =
+            PhysicalLayout::of_iceberg(fqn, metadata, spec_id).map_err(mismatch)?;
+        let partition_scheme = crate::catalog::PartitionScheme::of_wire(&layout.to_wire(), spec_id)
+            .map_err(|error| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "{fqn} partition layout is invalid: {error}"
+                ))
+            })?
+            .with_table_version(table_version);
+        Ok(Self {
+            table_version,
+            spec_id,
+            sort_order_id,
+            schema,
+            layout,
+            partition_scheme,
+        })
+    }
 }
 
 /// Estimated-weight eviction limit of the node-wide decoded manifest cache.
@@ -815,7 +862,7 @@ impl BifrostCatalog {
             manifest_cache: Arc::new(std::sync::OnceLock::new()),
             metadata_cache: mini_moka::sync::Cache::new(METADATA_CACHE_ENTRIES),
             registrations: Arc::default(),
-            committed_revisions: Arc::default(),
+            current_definitions: Arc::default(),
             cut_cache: Arc::default(),
         })
     }
@@ -1345,101 +1392,118 @@ impl BifrostCatalog {
         Ok(self.registration(table, tenant).await?.table_uid)
     }
 
-    /// Return the committed revision new admission binds for one table.
+    /// Return the current definition new admission binds for one table.
     ///
     /// The registered table, not any declaration, assigns every physical field
     /// id, nested and managed fields included; Scribe stamps exactly the
-    /// committed schema's ids into the objects it writes so Forge and Oracle
-    /// resolve its columns by the table's own numbering. Answers from the
-    /// node's cache when this table was loaded before, and otherwise loads the
-    /// tenant-bound Iceberg table once and caches its current revision.
+    /// definition's ids into the objects it writes so Forge and Oracle resolve
+    /// its columns by the table's own numbering. Answers from the node's cache
+    /// when this table was loaded before, and otherwise loads the tenant-bound
+    /// Iceberg table once and caches its current definition.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::InvalidBinding`] when the tenant-qualified
     /// binding cannot be resolved, the Iceberg error when the physical table
     /// cannot be loaded, and [`BifrostCatalogError::MetadataMismatch`] when
-    /// the committed revision does not rebuild a valid layout.
+    /// the current metadata does not rebuild a valid definition.
     ///
     /// # Panics
     /// Panics only if a thread panicked while holding the cache lock.
-    pub async fn committed_revision(
+    pub async fn current_definition(
         &self,
         table: &TableRef,
         tenant: DataTenantId,
-    ) -> Result<Arc<CommittedRevision>, BifrostCatalogError> {
+    ) -> Result<Arc<TableDefinition>, BifrostCatalogError> {
         let key = (tenant, table.fqn());
         let cached = self
-            .committed_revisions
+            .current_definitions
             .read()
-            .expect("the committed revision cache lock is never poisoned")
+            .expect("the current definition cache lock is never poisoned")
             .get(&key)
             .map(Arc::clone);
-        if let Some(revision) = cached {
-            return Ok(revision);
+        if let Some(definition) = cached {
+            return Ok(definition);
         }
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let loaded = self.catalog.load_table(&binding.table_ident()).await?;
-        let metadata = loaded.metadata();
-        let revision = crate::catalog::LayoutRevision::current(metadata)
-            .map_err(BifrostCatalogError::MetadataMismatch)?;
-        let spec_id = metadata.default_partition_spec_id();
-        let (layout, schema) = PhysicalLayout::of_iceberg(&key.1, metadata, revision, spec_id)
-            .map_err(|error| BifrostCatalogError::MetadataMismatch(error.to_string()))?;
-        let recipe = crate::catalog::AcceptedRecipe::new(layout.to_wire())
-            .map_err(BifrostCatalogError::MetadataMismatch)?;
-        let committed = Arc::new(CommittedRevision {
-            revision,
-            spec_id,
-            schema,
-            layout,
-            recipe,
-        });
-        self.committed_revisions
+        let definition = Arc::new(TableDefinition::of_metadata(&key.1, loaded.metadata())?);
+        self.current_definitions
             .write()
-            .expect("the committed revision cache lock is never poisoned")
-            .insert(key, Arc::clone(&committed));
-        Ok(committed)
+            .expect("the current definition cache lock is never poisoned")
+            .insert(key, Arc::clone(&definition));
+        Ok(definition)
     }
 
-    /// Rebuilds the layout one retained revision of a table declares.
+    /// Resolves the definition one retained version of a table declares.
     ///
-    /// Seal, staged recovery, and publication call this with the revision a
+    /// Seal, staged recovery, and publication call this with the version a
     /// batch was accepted under, so the batch is written exactly as accepted
-    /// whatever the table's current revision is. See
-    /// [`PhysicalLayout::of_iceberg`].
+    /// whatever the table's current version is. The current version answers
+    /// from the cache; an older one reads its retained metadata reference and
+    /// that immutable document. ponytail: an older version re-reads its
+    /// reference per call; cache it if seals behind an edit become frequent.
     ///
     /// # Errors
-    /// Returns the Iceberg error when the physical table cannot be loaded and
-    /// [`BifrostCatalogError::MetadataMismatch`] when the revision is not
-    /// retained or does not rebuild a valid layout.
-    pub async fn retained_layout(
+    /// Returns the Iceberg error when the table or reference cannot be read and
+    /// [`BifrostCatalogError::MetadataMismatch`] when the version is not
+    /// retained for this table or its document does not declare it.
+    pub async fn retained_definition(
         &self,
         binding: &TenantTableBinding,
-        revision: crate::catalog::LayoutRevision,
-        spec_id: i32,
-    ) -> Result<PhysicalLayout, BifrostCatalogError> {
-        let loaded = self.catalog.load_table(&binding.table_ident()).await?;
-        PhysicalLayout::of_iceberg(
-            &binding.table_ref.fqn(),
-            loaded.metadata(),
-            revision,
-            spec_id,
-        )
-        .map(|(layout, _)| layout)
-        .map_err(|error| BifrostCatalogError::MetadataMismatch(error.to_string()))
+        table_version: TableVersion,
+    ) -> Result<Arc<TableDefinition>, BifrostCatalogError> {
+        let fqn = binding.table_ref.fqn();
+        let current = self
+            .current_definition(&binding.table_ref, binding.tenant)
+            .await?;
+        if current.table_version == table_version {
+            return Ok(current);
+        }
+        let identifier = binding.table_ident();
+        let loaded = self.catalog.load_table(&identifier).await?;
+        let location = self
+            .catalog
+            .load_table_version_location(
+                &identifier,
+                &loaded.metadata().uuid().to_string(),
+                table_version.get(),
+            )
+            .await?
+            .ok_or_else(|| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "{fqn} retains no table version {table_version}"
+                ))
+            })?;
+        let metadata = match self.metadata_cache.get(&location) {
+            Some(metadata) => metadata,
+            None => {
+                let metadata = Arc::new(TableMetadata::read_from(&self.file_io, &location).await?);
+                self.metadata_cache
+                    .insert(location.clone(), Arc::clone(&metadata));
+                metadata
+            }
+        };
+        let definition = TableDefinition::of_metadata(&fqn, &metadata)?;
+        if definition.table_version != table_version {
+            return Err(BifrostCatalogError::MetadataMismatch(format!(
+                "{fqn} version {table_version} references a document at version {}",
+                definition.table_version
+            )));
+        }
+        Ok(Arc::new(definition))
     }
 
-    /// Drops this node's cached registration and committed revision of one
-    /// table, so the next admission reads the revision committed since.
+    /// Drops this node's cached registration and current definition of one
+    /// table, so the next admission reads the version committed since.
     ///
     /// # Panics
     /// Panics only if a thread panicked while holding a cache lock.
-    pub fn evict_committed_revision(&self, table: &TableRef, tenant: DataTenantId) {
+    pub fn evict_current_definition(&self, table: &TableRef, tenant: DataTenantId) {
         let key = (tenant, table.fqn());
-        self.committed_revisions
+        self.current_definitions
             .write()
-            .expect("the committed revision cache lock is never poisoned")
+            .expect("the current definition cache lock is never poisoned")
             .remove(&key);
         self.registrations
             .write()
@@ -2886,6 +2950,13 @@ mod production_pin_tests {
                 iceberg::TableUpdate::SetCurrentSchema { schema_id: -1 },
                 iceberg::TableUpdate::AddSpec { spec },
                 iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
+                iceberg::TableUpdate::SetProperties {
+                    updates: [(
+                        crate::catalog::TABLE_VERSION_PROPERTY.to_owned(),
+                        "2".to_owned(),
+                    )]
+                    .into(),
+                },
             ]
             .into_iter()
             .fold(
@@ -2897,7 +2968,26 @@ mod production_pin_tests {
                 .commit(catalog.iceberg_catalog().as_ref())
                 .await
                 .expect("revision commits");
-            catalog.evict_committed_revision(&table, tenant);
+            catalog.evict_current_definition(&table, tenant);
+
+            let current = catalog
+                .current_definition(&table, tenant)
+                .await
+                .expect("the current definition loads");
+            assert_eq!(current.table_version.get(), 2);
+            let retained = catalog
+                .retained_definition(&binding, wyrd_spec::vala::ids::TableVersion::INITIAL)
+                .await
+                .expect("the retained reference resolves the prior version");
+            assert_eq!(
+                retained.table_version,
+                wyrd_spec::vala::ids::TableVersion::INITIAL
+            );
+            assert!(
+                retained.schema.field_by_name("note").is_none()
+                    && current.schema.field_by_name("note").is_some(),
+                "each version resolves its own schema"
+            );
 
             let pinned = catalog
                 .pinned_provider(&table, tenant, snapshot_id)

@@ -222,18 +222,16 @@ impl ScribeImpl {
             .table_registration(&frame.table, frame.authenticated_tenant)
             .await
             .map_err(scribe_catalog_error)?;
-        let committed = catalog
-            .committed_revision(&frame.table, frame.authenticated_tenant)
+        let definition = catalog
+            .current_definition(&frame.table, frame.authenticated_tenant)
             .await
             .map_err(scribe_catalog_error)?;
         Ok(LogicalFrameContract {
             expected_schema_fingerprint: frame
                 .expected_schema_fingerprint
                 .unwrap_or(registered_fingerprint),
-            partition_scheme: scheme_of(committed.recipe.wire(), committed.spec_id)?
-                .with_revision(committed.revision)
-                .with_recipe(committed.recipe.clone()),
-            registered_schema: Some(Arc::clone(&committed.schema)),
+            partition_scheme: definition.partition_scheme.clone(),
+            registered_schema: Some(Arc::clone(&definition.schema)),
         })
     }
 

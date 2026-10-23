@@ -40,6 +40,8 @@ pub struct PublishClaimRequest<'a> {
     pub assembled: &'a AssembledClaim,
     /// Tenant-qualified physical binding the rows are published under.
     pub binding: &'a TenantTableBinding,
+    /// Iceberg sort-order id the claim's table version writes under.
+    pub sort_order_id: i32,
     /// Deterministic object prefix the claim's objects were sealed under.
     pub object_base: &'a str,
     /// Fenced writer identity of the pod authorizing the transaction.
@@ -389,6 +391,7 @@ impl ClaimPublisher {
             request.claim.key(),
             &request.assembled.artifacts,
             request.binding,
+            request.sort_order_id,
             request.runs.wal(),
         )?;
         let operation_id = publication_operation_id(request.claim);

@@ -183,12 +183,10 @@ impl ScribeMemberStager {
             request.frozen.seal_key.tenant,
             request.frozen.seal_key.table.clone(),
             crate::parquet::footer::schema_fingerprint(request.frozen.schema.as_ref()),
-            request.layout,
-            request.frozen.seal_key.revision,
+            request.frozen.seal_key.table_version,
             request.frozen.seal_key.partition.clone(),
             StreamIdentity::new(request.origin.node_id, request.origin.writer_epoch),
-        )
-        .with_recipe(request.frozen.seal_key.recipe.clone());
+        );
         let member = StagedMemberId::new(request.origin.shard, request.origin.generation);
         let directory = self.stage.member_directory(&key, member);
         let staged = directory

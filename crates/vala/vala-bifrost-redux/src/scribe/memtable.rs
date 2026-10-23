@@ -2963,13 +2963,9 @@ mod tests {
 
         let registry = Arc::new(ScribeHotSourceRegistry::new());
         let old = make_test_seal_key();
-        let new = SealKey {
-            revision: crate::catalog::LayoutRevision {
-                sort_order_id: old.revision.sort_order_id + 1,
-                ..old.revision
-            },
-            ..old.clone()
-        };
+        let new = old
+            .clone()
+            .with_table_version(old.table_version.next().expect("a next version"));
         let ordinal = GenerationOrdinal::new(0, 1);
         registry
             .restore_durable(

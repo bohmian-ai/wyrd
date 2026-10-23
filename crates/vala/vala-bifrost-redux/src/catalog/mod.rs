@@ -34,8 +34,8 @@ pub use bifrost_catalog::{
 };
 pub use error::BifrostCatalogError;
 pub use layout::{
-    AcceptedRecipe, LayoutRevision, LayoutSortKey, NullOrder, PhysicalLayout, SortDirection,
-    TimeAxis, TimeColumnValues, TimeGranularity, TimePartition, TimePartitionError, TimePrecision,
+    LayoutSortKey, NullOrder, PhysicalLayout, SortDirection, TABLE_VERSION_PROPERTY, TimeAxis,
+    TimeColumnValues, TimeGranularity, TimePartition, TimePartitionError, TimePrecision,
 };
 pub(crate) use logical_table_identity::{LogicalTableIdentity, PhysicalTableProjection};
 pub use physical_partition::{PartitionScheme, PhysicalPartition, PhysicalPartitionError};

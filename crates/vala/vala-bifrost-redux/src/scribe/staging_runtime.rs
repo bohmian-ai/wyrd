@@ -60,6 +60,8 @@ pub struct ClaimContext {
     pub schema: SchemaRef,
     /// Registered write recipe fixing sort order and partitioning.
     pub layout: PhysicalLayout,
+    /// Iceberg sort-order id the members' table version writes under.
+    pub sort_order_id: i32,
     /// Tenant-qualified binding the merged objects publish under.
     pub binding: TenantTableBinding,
 }
@@ -826,7 +828,7 @@ impl ScribeStagingRuntime {
                     ),
                 }
             })?;
-        let layout = crate::scribe::write_recipe::resolve_write_recipe(
+        let recipe = crate::scribe::write_recipe::resolve_write_recipe(
             pool,
             self.catalog.as_deref(),
             &binding,
@@ -834,25 +836,10 @@ impl ScribeStagingRuntime {
             schema.as_ref(),
         )
         .await?;
-        let resolved = ScribeAssemblyKey::new(
-            key.tenant(),
-            key.table().clone(),
-            key.schema_fingerprint(),
-            layout.as_ref(),
-            key.revision(),
-            key.partition().clone(),
-            StreamIdentity::new(key.node_id(), key.writer_epoch()),
-        )
-        .with_recipe(key.recipe().cloned());
-        if resolved != *key {
-            return Err(ScribeError::Internal {
-                detail: "the registered write recipe no longer reproduces a recovered staged key"
-                    .to_owned(),
-            });
-        }
         Ok(ClaimContext {
             schema,
-            layout: (*layout).clone(),
+            layout: (*recipe.layout).clone(),
+            sort_order_id: recipe.sort_order_id,
             binding,
         })
     }
@@ -938,6 +925,7 @@ impl ScribeStagingRuntime {
                 runs,
                 assembled,
                 binding: &context.binding,
+                sort_order_id: context.sort_order_id,
                 object_base: &object_base,
                 actor_stream,
             })
@@ -1237,6 +1225,7 @@ mod tests {
                 ClaimContext {
                     schema: Arc::clone(&schema),
                     layout: layout.clone(),
+                    sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
                     binding: binding.clone(),
                 },
             )
@@ -1332,6 +1321,7 @@ mod tests {
                 ClaimContext {
                     schema: Arc::clone(&schema),
                     layout: layout.clone(),
+                    sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
                     binding: binding.clone(),
                 },
             )
@@ -1423,6 +1413,7 @@ mod tests {
                     ClaimContext {
                         schema: Arc::clone(&schema),
                         layout: layout.clone(),
+                        sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
                         binding: binding.clone(),
                     },
                 )
@@ -1521,6 +1512,7 @@ mod tests {
                 ClaimContext {
                     schema: Arc::clone(&schema),
                     layout: layout.clone(),
+                    sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
                     binding: binding.clone(),
                 },
             )
@@ -1774,6 +1766,7 @@ mod tests {
                     ClaimContext {
                         schema: Arc::clone(schema),
                         layout: layout.clone(),
+                        sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
                         binding: binding.clone(),
                     },
                 )

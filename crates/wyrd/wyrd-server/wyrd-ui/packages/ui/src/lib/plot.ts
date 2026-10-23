@@ -26,42 +26,70 @@ export function numeric(value: unknown): number {
 
 /**
  * Build time series: one per `y` column, or per `series` value × `y` when a
- * series column is bound. Past {@link MAX_SERIES}, the largest totals keep
- * their own line and the rest are summed per instant as "other", qualified
- * when an authored series already has that caption.
+ * series column is bound. Groups are keyed by the typed (value, `y`) pair, so
+ * distinct groups never merge however their text reads. Past
+ * {@link MAX_SERIES}, the largest totals keep their own line and the rest are
+ * summed per instant as "other", qualified when an authored series already
+ * has that caption.
  */
 export function timeSeries(result: QueryResult, x: string, ys: readonly string[], series?: string): Series[] {
   const xi = columnIndex(result, x);
   const si = series === undefined ? -1 : columnIndex(result, series);
-  const lines = new Map<string, Map<number, number>>();
+  const lines = new Map<string, { group: unknown; y: string; points: Map<number, number> }>();
   for (const row of result.rows) {
     const at = parseInstant(row[xi]);
     for (const y of ys) {
       const value = row[columnIndex(result, y)];
       if (value === null || Number.isNaN(at)) continue;
-      const label = si < 0 ? y : ys.length > 1 ? `${String(row[si])} ${y}` : String(row[si]);
-      const points = lines.get(label) ?? new Map<number, number>();
-      points.set(at, (points.get(at) ?? 0) + numeric(value));
-      lines.set(label, points);
+      const key = si < 0 ? y : JSON.stringify([row[si], y]);
+      const line = lines.get(key) ?? { group: si < 0 ? undefined : row[si], y, points: new Map<number, number>() };
+      line.points.set(at, (line.points.get(at) ?? 0) + numeric(value));
+      lines.set(key, line);
     }
   }
-  let entries = [...lines];
+  let entries = [...lines.values()];
+  let other: Map<number, number> | undefined;
   if (entries.length > MAX_SERIES) {
     const total = (points: Map<number, number>) => [...points.values()].reduce((sum, value) => sum + value, 0);
-    entries.sort(([, a], [, b]) => total(b) - total(a));
-    const other = new Map<number, number>();
-    for (const [, points] of entries.slice(MAX_SERIES - 1))
+    entries.sort((a, b) => total(b.points) - total(a.points));
+    other = new Map<number, number>();
+    for (const { points } of entries.slice(MAX_SERIES - 1))
       for (const [at, value] of points) other.set(at, (other.get(at) ?? 0) + value);
-    const kept = entries.slice(0, MAX_SERIES - 1);
+    entries = entries.slice(0, MAX_SERIES - 1);
+  }
+  const labels = captions(entries, si >= 0, ys.length > 1);
+  const plotted = entries.map(({ points }, index) => [labels[index], points] as const);
+  if (other) {
     // An authored series may already be called "other"; the aggregate's caption must still name only itself.
     let label = 'other';
-    for (let n = 1; kept.some(([each]) => each === label); n++) label = n === 1 ? 'other (aggregate)' : `other (aggregate ${n})`;
-    entries = [...kept, [label, other]];
+    for (let n = 1; labels.includes(label); n++) label = n === 1 ? 'other (aggregate)' : `other (aggregate ${n})`;
+    plotted.push([label, other]);
   }
-  return entries.map(([label, points]) => ({
+  return plotted.map(([label, points]) => ({
     label,
     points: [...points].sort(([a], [b]) => a - b).map(([x, y]) => ({ x, y }))
   }));
+}
+
+/**
+ * Distinct captions for plotted groups. Each reads as before unless it
+ * matches another; then it becomes its group's JSON spelling (value, plus `y`
+ * when several are bound), which is unique per group and tells null from the
+ * text "null". Repeats until no caption matches another, since a JSON spelling
+ * can equal some other group's authored text.
+ */
+function captions(groups: readonly { group: unknown; y: string }[], bySeries: boolean, byY: boolean): string[] {
+  const labels = groups.map(({ group, y }) => (!bySeries ? y : byY ? `${String(group)} ${y}` : String(group)));
+  const qualified = new Set<number>();
+  for (;;) {
+    const clash = labels.flatMap((label, index) => (!qualified.has(index) && labels.some((other, at) => at !== index && other === label) ? [index] : []));
+    if (clash.length === 0) return labels;
+    for (const index of clash) {
+      const { group, y } = groups[index];
+      labels[index] = byY ? JSON.stringify([group, y]).slice(1, -1) : JSON.stringify(group);
+      qualified.add(index);
+    }
+  }
 }
 
 /** Bar rows: one category label with a value per `y`. */

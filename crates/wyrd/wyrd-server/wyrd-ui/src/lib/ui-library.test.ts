@@ -125,6 +125,7 @@ test('TASK-003: Validated portable rendering', async () => {
   // Authored series named "other" keep their values; the aggregate's caption stays distinct from every one of them.
   const grouped = (groups: [string, number][]): QueryResult => ({ ...series, rows: groups.map(([name, value]) => ['2026-10-20T10:00:00Z', name, value]), terminal: terminal(groups.length) });
   const captions = (view: { container: Element }) => [...view.container.querySelectorAll('.legend li')].map((item) => item.textContent?.trim());
+  const readings = (view: { container: Element }) => [...view.container.querySelectorAll('.tooltip span')].map((item) => item.textContent);
   const taken: [string, number][] = [['other', 21], ['other (aggregate)', 20], ...Array.from({ length: 19 }, (_, index): [string, number] => [`s${index + 1}`, index + 1])];
   const named = render(Chart, { input: timeseries, result: { state: 'populated', data: grouped(taken) } });
   expect(captions(named)).toHaveLength(20);
@@ -144,6 +145,32 @@ test('TASK-003: Validated portable rendering', async () => {
   await named.rerender({ result: { state: 'populated', data: grouped([['other', 21], ['s1', 1], ['s2', 2]]) } });
   expect(captions(named)).toEqual(['other', 's1', 's2']);
   named.unmount();
+
+  // Distinct (series, y) groups never merge; captions that would collide name their typed group instead.
+  const instant = '2026-10-20T10:00:00Z';
+  const tokens: QueryResult = {
+    columns: [{ name: 'at', data_type: 'Timestamp(Microsecond, None)', nullable: false }, { name: 'model', data_type: 'Utf8', nullable: true }, { name: 'tokens', data_type: 'Int64', nullable: true }, { name: 'input tokens', data_type: 'Int64', nullable: true }],
+    rows: [[instant, 'model input', 1, 10], [instant, 'model', 2, 20]],
+    terminal: terminal(2)
+  };
+  const pairs = render(Chart, { input: { ...timeseries, y: ['tokens', 'input tokens'] } as ChartInput, result: { state: 'populated', data: tokens } });
+  expect(captions(pairs)).toEqual(['"model input","tokens"', 'model input input tokens', 'model tokens', '"model","input tokens"']);
+  expect(pairs.container.querySelectorAll('svg.plot polyline')).toHaveLength(4);
+  expect(pairs.getByRole('application').getAttribute('aria-label')).toContain('"model input","tokens", model input input tokens, model tokens, "model","input tokens"');
+  await fireEvent.focus(pairs.getByRole('application'));
+  expect(readings(pairs)).toEqual(['"model input","tokens": 1 ms', 'model input input tokens: 10 ms', 'model tokens: 2 ms', '"model","input tokens": 20 ms']);
+  pairs.unmount();
+  // Null and the text "null" stay apart, as does authored text spelling a qualified caption.
+  const nulls = (groups: [string | null, number][]): QueryResult => ({ ...tokens, rows: groups.map(([name, value]) => [instant, name, value, null]), terminal: terminal(groups.length) });
+  const nullable = render(Chart, { input: { ...timeseries, y: ['tokens'] } as ChartInput, result: { state: 'populated', data: nulls([[null, 1], ['null', 2], ['"null"', 4]]) } });
+  expect(captions(nullable)).toEqual(['null', '"null"', '"\\"null\\""']);
+  await fireEvent.focus(nullable.getByRole('application'));
+  expect(readings(nullable)).toEqual(['null: 1 ms', '"null": 2 ms', '"\\"null\\"": 4 ms']);
+  // A rerender with other groups shows only the current captions and values.
+  await nullable.rerender({ result: { state: 'populated', data: nulls([[null, 5], ['x', 6]]) } });
+  expect(captions(nullable)).toEqual(['null', 'x']);
+  expect(readings(nullable)).toEqual(['null: 5 ms', 'x: 6 ms']);
+  nullable.unmount();
 
   // Signed values draw finite geometry around a zero baseline.
   const signed = (values: number[]): QueryResult => ({

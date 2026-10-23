@@ -64,3 +64,26 @@ mise exec -- git diff --check
 ```
 
 The existing test script retains native public-import smoke automatically. A pure producer assertion may supplement but not replace mounted attribution proof. No generated input changes are needed; do not prescribe codegen, Rust/release/Linux aggregates or broad journey suites for this write set. Record exact RED/GREEN/check results and limits. Preserve separate TASK-027 changes, all closed FIND-003-1..9, server-owned behavior and non-goals (no Ask/A2UI/persistence/MCP registration/npm publication). Stop for any genuinely material public/product/durable decision; this correction requires none. Next review reassesses the complete cumulative original task and all remediation rounds.
+
+## Implementation evidence
+
+Status `IMPLEMENTED` on the post-#205 rebase (`ff895d159` base; pre-rebase SHAs above describe unchanged code).
+
+Owner and gap: `timeSeries` in `packages/ui/src/lib/plot.ts` is the only producer; it keyed groups by formatted caption. It now keys groups by `JSON.stringify([raw series value, y])` when series is bound, keeps the y-only key otherwise, and keeps the tuple beside the points. A private `captions` helper keeps ordinary captions. Captions that clash become their group's JSON spelling (value, plus `y` when several y are bound), repeating until none clash. JSON is injective per tuple, so qualified captions never collide with each other, and the loop ends because each pass qualifies at least one new group. The "other" aggregate caption is then chosen against the final authored captions with the existing FIND-003-9 loop. The `Series` shape and every Chart consumer are unchanged.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Two-y/two-group example renders four attributable entries 1/10/2/20, no false 21 | `plot.ts` `timeSeries` typed pair key; `captions` | portable-rendering scenario: legend `['"model input","tokens"', 'model input input tokens', 'model tokens', '"model","input tokens"']`, 4 polylines, aria-label, tooltip rows | PASS |
+| Actual null vs text null render separately as 1 and 2; qualification-like/escaped authored text stays distinct | `captions` fixpoint over JSON spelling | scenario: `[null,1],['null',2],['"null"',4]` gives captions `null`, `"null"`, `"\"null\""` with matching tooltip values | PASS |
+| Rerender with changed cardinality shows current labels and values | unchanged Chart derivation over new producer output | scenario rerender: `['null','x']`, `null: 5 ms`, `x: 6 ms` | PASS |
+| Existing summation, duplicate-column, null-y, signed geometry, 5/20/21, authored other/qualification, fold totals stay green | ranking/fold/aggregate caption logic preserved | full `TASK-003: Validated portable rendering` scenario | PASS |
+
+Commands (from repository root):
+
+- RED, before the `plot.ts` change: `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Validated portable rendering$'` failed. Received legend `['model input tokens', 'model input input tokens', 'model tokens']` (three lines, merged group).
+- GREEN: same command, 1 passed, 9 skipped.
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`: pass.
+- `git diff --check`: pass.
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check`: fails only on the 6 known flat-identity `space` errors in `packages/ui/src/lib/loaders.ts` and `CardHeader.svelte`. Those are owned by the parallel identity remediation and are outside this write set. Because the package check fails first, the app check was run directly with `svelte-check --tsconfig ./tsconfig.json`. It reports 0 errors in `plot.ts` or the TASK-003 test. Its remaining 3 errors are the same `space` family in `src/lib/ui-fixtures.ts` and `src/lib/ui-library.integration.test.ts`, also outside this write set.
+
+Limits: in a fresh worktree, `examples/ui-app/.svelte-kit/tsconfig.json` has to be generated with `svelte-kit sync` before the vitest file transforms, because the test imports the example route. This is a setup prerequisite and was not changed here. Non-goals stayed excluded: no schema, transport, host, dependency or generated-artifact changes, and only `plot.ts` plus the TASK-003 portable-rendering scenario changed.

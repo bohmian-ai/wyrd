@@ -2,7 +2,8 @@
 
 A table declares ``time_column``; the column partitions the table and bounds
 its files, so a time-range read returns exactly the rows inside the range.
-``describe_table`` reports the declared column, a table declared without one
+``describe_table`` reports the declared column at the version the rows were
+written under, a table declared without one
 reports ``wyrd_ingested_at``, and a declaration naming a column that cannot be
 a time column is refused naming the field.
 """
@@ -85,9 +86,9 @@ def test_user_table_time_column_prunes_a_time_range(wyrd_server: WyrdTestServer)
     )
 
     assert in_range == [1, 2]
-    assert readings.describe_table(NAMESPACE, READINGS)["physical_layout"]["time_column"] == (
-        "event_time"
-    )
+    described = readings.describe_table(NAMESPACE, READINGS)
+    assert described["physical_layout"]["time_column"] == "event_time"
+    assert described["table_version"] == "1"
     assert defaults.describe_table(NAMESPACE, DEFAULTS)["physical_layout"]["time_column"] == (
         "wyrd_ingested_at"
     )

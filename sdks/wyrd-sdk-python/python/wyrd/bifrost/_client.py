@@ -1406,11 +1406,14 @@ class _TableDescriptionOptional(TypedDict, total=False):
 class TableDescription(_TableDescriptionOptional):
     """Server projection of one registered table's stored physical schema.
 
-    ``user_fields`` are the declared columns, ``correlation_fields`` the
-    write-time ``card_uid``/``run_id`` inputs.
+    ``table_version`` is the decimal version the schema and layout describe;
+    a writer sends it with every batch, and a batch naming any other version
+    is refused. ``user_fields`` are the declared columns,
+    ``correlation_fields`` the write-time ``card_uid``/``run_id`` inputs.
     """
 
     entry: TableEntry
+    table_version: str
     user_fields: list[FieldSpec]
     correlation_fields: list[FieldSpec]
     physical_layout: PhysicalLayout

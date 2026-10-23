@@ -67,3 +67,28 @@ mise exec -- git diff --check
 ```
 
 No queue/server correction is selected. If source evidence makes changing that shared owner necessary, preserve its exact regression with `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=query::collect::tests::query_result_is_positional_and_counts_exact_structured_json_bytes)'`. Do not expand into unrelated query or numeric-boundary redesign. A new material contract/security/ownership decision returns to specification authority rather than being chosen here.
+
+## Implementation evidence
+
+Status: `IMPLEMENTED` at `0d60b2b68` on cumulative candidate `35aa2eaf6`.
+
+Reuse map: native `NativeBifrostQueryStream::collect` remains the one owner. Its two ceilings are now extracted as N-API `f64` and narrowed by private `parse_ceiling`, which reuses the file's existing `parse_deadline_ms` lossless decimal round trip and `validation_error` catalog refusal, then hands the exact `u32` to the unchanged shared `admit_ceilings` and `JsonResultBuilder`. Parsing happens after the stream is taken, so every refusal drops and releases it. No wrapper, host, MCP, queue or server change; no new dependency, error family or numeric abstraction. Generated declarations changed only in regenerated rustdoc text (public JS type stays `number`).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-003-11 wrapping/fractional rows and bytes refused on Node and MCP | `sdks/wyrd-sdk-ts/native/src/lib.rs` `collect` + `parse_ceiling` | `ui-library.integration.test.ts` loop over `max_rows` 4294977296 / 10000.5, `max_bytes` 4299161600 / 4194304.5: Node `WYRD_SPEC_400_VALIDATION`, MCP `ok:false`. RED before rebuild (4294977296 returned `ok:true` with 3 rows); GREEN after `ts:build` | PASS |
+| Refusal releases ownership | stream `take()` precedes parsing | direct `collect({ maxRows: 4_294_977_296 })` rejects with validation, second `collect()` rejects `query stream is closed`, fresh query returns `row_count: 3` | PASS |
+| Adjacent behavior remains | shared admission/builder unchanged | existing zero/max+1, defaults/exact maxima, `QueryResultTooLarge` and cancellation assertions in the same scenario; `Node query acquisition cancellation` | PASS |
+
+Commands (sequential, all exit 0 unless noted):
+
+- `mise run ts:build`
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && WYRD_UI_INTEGRATION=1 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.integration.test.ts -t "^TASK-003: Identical authorized reads$"'` — RED on prior addon (1 failed), GREEN after rebuild: 1 passed, 1 skipped
+- `mise run build:server`, `mise run ts:build:testing`, then the same lane without `-t`: 2 passed
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^Node query acquisition cancellation$'` — 1 passed, 9 skipped
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check`; `... test` — 40/40
+- `mise exec -- cargo clippy --locked -p wyrd-sdk-ts --lib -- -D warnings`; `mise run lints`; `mise run fmt:check`
+- `mise run ts:napi:check` — passes after commit (it diffs committed `index.d.ts`; failed only while regenerated docs were uncommitted)
+- `mise run ts:test:unit`; `mise run codegen:check`; `mise exec -- git diff --check`
+
+Non-goals held: no clamping, MCP/queue/server change, TASK-027 file or unrelated source touched.

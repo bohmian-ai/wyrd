@@ -63,7 +63,7 @@ import {
   type WireRequest,
   type WireResult
 } from 'wyrd-ai-ui';
-import { chartParams, loadCardHeader, loadChart, shapeChart, validateIntent, validatePanel, type ChartInput } from 'wyrd-ai-ui/loaders';
+import { AbsoluteRangeSchema, chartParams, loadCardHeader, loadChart, loadPanel, resolveRange, shapeChart, validateIntent, validatePanel, type ChartInput } from 'wyrd-ai-ui/loaders';
 import { mountView, remoteLoader, validateView, WyrdView } from 'wyrd-ai-ui/view';
 import examples from '../../../../../wyrd-spec/schemas/ui_problem_examples.json';
 import { POST as bffLoad } from '../routes/t/[tenantKey]/ui/load/+server';
@@ -371,29 +371,55 @@ test('TASK-003: Validated portable rendering', async () => {
   expect(validatePanel('CardHeader', { cardRef: { ...card, space: 'search' } })).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION', detail: expect.stringContaining('space') });
   expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels })).not.toHaveProperty('code');
 
-  // A relative range no instant can represent is a field error: no read, siblings still load, before or after a valid document.
-  const unresolvable = { last: '1000000000000d' };
-  const ranged = recording(() => ({ ok: true, value: series }));
-  const outOfRange = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: unresolvable, panels };
-  const invalidRoot = render(WyrdView, { doc: outOfRange, executor: ranged.executor });
-  expect(invalidRoot.container).toHaveTextContent('View input.range');
-  expect(invalidRoot.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
-  await invalidRoot.rerender({ doc: { ...outOfRange, range: RANGE }, executor: ranged.executor });
-  await waitFor(() => expect(ranged.calls).toHaveLength(1));
-  await invalidRoot.rerender({ doc: outOfRange, executor: ranged.executor });
-  expect(invalidRoot.container).toHaveTextContent('View input.range');
-  expect(ranged.calls).toHaveLength(1);
-  invalidRoot.unmount();
-  const invalidPanel = render(WyrdView, {
-    doc: { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'far', component: 'Chart', input: { ...timeseries, range: unresolvable } }, { id: 'near', component: 'Chart', input: timeseries }] },
-    executor: ranged.executor
-  });
-  await waitFor(() => expect(invalidPanel.container.querySelector('[data-panel="near"] .legend')).not.toBeNull());
-  expect(invalidPanel.container.querySelector('[data-panel="far"]')).toHaveTextContent('Chart input.range');
-  expect(invalidPanel.container.querySelector('[data-panel="far"]')).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
-  expect(ranged.calls).toHaveLength(2);
-  invalidPanel.unmount();
-  expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last: '100000000d' }, panels })).not.toHaveProperty('code');
+  // A relative range that cannot resolve to RFC 3339 bounds is a field error: no read, local or remote, before or
+  // after a valid document; a Chart's own such range fails only that panel.
+  vi.useFakeTimers({ now: Date.parse('2026-10-22T00:00:00Z'), toFake: ['Date'] });
+  try {
+    const yearZero = new Date(0);
+    yearZero.setUTCFullYear(0, 0, 1);
+    const days = Math.floor((Date.now() - yearZero.getTime()) / 86_400_000);
+    for (const last of ['6h', '24h', `${days}d`]) {
+      expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last }, panels }), last).not.toHaveProperty('code');
+      expect(AbsoluteRangeSchema.safeParse(resolveRange({ last })).success, last).toBe(true);
+    }
+    expect(resolveRange({ last: `${days}d` }).from).toMatch(/^0000-/);
+    expect(resolveRange(RANGE)).toBe(RANGE);
+    const headed = [...panels, { id: 'header', component: 'CardHeader', input: { cardRef: card } }];
+    for (const last of ['1000000000000d', '100000000d', `${days + 1}d`]) {
+      expect(validateView({ version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: { last }, panels }), last).toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION', detail: expect.stringMatching(/^View input\.range/) });
+      const unresolvable = { last };
+      const ranged = recording((request) => (request.op === 'bifrost.query' ? { ok: true, value: series } : { ok: true, value: registered }));
+      const remote = vi.fn(async () => ({ input: timeseries, result: { state: 'loading' } }) as never);
+      const outOfRange = { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: unresolvable, panels: headed };
+      for (const host of [{ executor: ranged.executor }, { load: remote }]) {
+        const invalidRoot = render(WyrdView, { doc: outOfRange, ...host });
+        expect(invalidRoot.container, last).toHaveTextContent('View input.range');
+        expect(invalidRoot.container).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+        invalidRoot.unmount();
+      }
+      expect(ranged.calls).toHaveLength(0);
+      expect(remote).not.toHaveBeenCalled();
+      const replaced = render(WyrdView, { doc: { ...outOfRange, range: RANGE }, executor: ranged.executor });
+      await waitFor(() => expect(ranged.calls.length).toBeGreaterThan(1));
+      const settled = ranged.calls.length;
+      await replaced.rerender({ doc: outOfRange, executor: ranged.executor });
+      expect(replaced.container).toHaveTextContent('View input.range');
+      expect(ranged.calls).toHaveLength(settled);
+      replaced.unmount();
+      const before = ranged.calls.length;
+      const invalidPanel = render(WyrdView, {
+        doc: { version: 'wyrd.view/v1', catalogId: 'wyrd.ui/v1', range: RANGE, panels: [{ id: 'far', component: 'Chart', input: { ...timeseries, range: unresolvable } }, { id: 'near', component: 'Chart', input: timeseries }] },
+        executor: ranged.executor
+      });
+      await waitFor(() => expect(invalidPanel.container.querySelector('[data-panel="near"] .legend')).not.toBeNull());
+      expect(invalidPanel.container.querySelector('[data-panel="far"]')).toHaveTextContent('Chart input.range');
+      expect(invalidPanel.container.querySelector('[data-panel="far"]')).toHaveTextContent('WYRD_SPEC_400_VALIDATION');
+      expect(ranged.calls.slice(before).map((call) => call.request)).toEqual([{ op: 'bifrost.query', sql: timeseries.sql, params: [RANGE.from, RANGE.to] }]);
+      invalidPanel.unmount();
+    }
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('TASK-003: Dependent loads and safe actions', async () => {
@@ -423,6 +449,39 @@ test('TASK-003: Dependent loads and safe actions', async () => {
   const loaded = await loadChart(timeseries, { executor: chart.executor, range: RANGE });
   expect(chart.calls[0].request).toEqual({ op: 'bifrost.query', sql: timeseries.sql, params: [RANGE.from, RANGE.to] });
   expect(loaded.executed).toEqual({ sql: timeseries.sql, params: [RANGE.from, RANGE.to] });
+
+  // Only real placeholders bind: `$n` inside quoted strings, quoted identifiers, dollar quotes, comments, or an identifier
+  // is query text, so a range-free table reaches the executor unchanged with no params.
+  const inert = [
+    "SELECT '$1' AS label FROM vala.gateway.calls",
+    "SELECT 'it''s $2' AS label FROM vala.gateway.calls",
+    "SELECT E'\\'$3' AS label FROM vala.gateway.calls",
+    'SELECT call_id AS "$1", "a""$2" FROM vala.gateway.calls',
+    'SELECT call_id AS `$3` FROM vala.gateway.calls',
+    'SELECT $$ $1 $$ AS a, $q$ $2 $q$ AS b FROM vala.gateway.calls',
+    'SELECT call_id FROM vala.gateway.calls -- $3 is explanatory text',
+    'SELECT call_id /* outer /* $1 */ $2 */ FROM vala.gateway.calls',
+    'SELECT price$1 FROM vala.gateway.calls',
+    'SELECT call_id FROM vala.gateway.calls WHERE n = $12'
+  ];
+  for (const sql of inert) {
+    const table = recording(() => ({ ok: true, value: series }));
+    const props = (await loadPanel('Chart', { type: 'table', sql }, { executor: table.executor })) as Awaited<ReturnType<typeof loadChart>>;
+    expect(table.calls.map((call) => call.request), sql).toEqual([{ op: 'bifrost.query', sql, params: [] }]);
+    expect(props.executed).toEqual({ sql, params: [] });
+    expect(props.result).toEqual({ state: 'populated', data: series });
+  }
+  // Real `$1`/`$2` beside an inert `$3` bind exactly two values; without a range they are still refused before any read.
+  const mixedSql = "SELECT at FROM t WHERE at >= $1 AND at < $2 AND note <> '$3' -- $3\n";
+  const real = recording(() => ({ ok: true, value: series }));
+  const bound = await loadChart({ type: 'table', sql: mixedSql }, { executor: real.executor, range: RANGE });
+  expect(real.calls.map((call) => call.request)).toEqual([{ op: 'bifrost.query', sql: mixedSql, params: [RANGE.from, RANGE.to] }]);
+  expect(bound.executed).toEqual({ sql: mixedSql, params: [RANGE.from, RANGE.to] });
+  const missing = recording(() => ({ ok: true, value: series }));
+  for (const sql of [mixedSql, "SELECT '$1', $1 FROM t", 'SELECT $3 /* $1 */ FROM t'])
+    expect((await loadChart({ type: 'table', sql }, { executor: missing.executor })).result, sql).toMatchObject({ state: 'error', problem: { code: 'WYRD_SPEC_400_VALIDATION' } });
+  expect(missing.calls).toHaveLength(0);
+  expect(chartParams("SELECT date_bin($3::interval, at) FROM t WHERE at >= $1 AND at < $2 AND s <> '$4'", RANGE)).toEqual([RANGE.from, RANGE.to, '5 minutes']);
 
   // A relative range resolves once per view load; every panel binds the same bounds.
   const pending: ((result: WireResult) => void)[] = [];
@@ -657,8 +716,8 @@ test('Canonical UI problem projections', async () => {
   }
   // A valid inherited range does not admit a Chart's own unresolvable range: each endpoint refuses it without a read.
   const unread = vi.spyOn(Bifrost, 'connect');
-  for (const POST of [bffLoad, exampleLoad]) {
-    const body = JSON.stringify({ component: 'Chart', input: { ...timeseries, range: { last: '1000000000000d' } }, range: RANGE });
+  for (const [POST, last] of [bffLoad, exampleLoad].flatMap((POST) => ['1000000000000d', '100000000d'].map((last) => [POST, last] as const))) {
+    const body = JSON.stringify({ component: 'Chart', input: { ...timeseries, range: { last } }, range: RANGE });
     const response = await POST({ locals: { browserSession: { client: () => ({}) } }, request: new Request('http://ui/load', { method: 'POST', body }) } as never);
     expect(response.status).toBe(400);
     expect(response.headers.get('content-type')).toBe('application/problem+json');

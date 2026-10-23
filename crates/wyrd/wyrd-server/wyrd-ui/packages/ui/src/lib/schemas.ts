@@ -60,16 +60,29 @@ function span(last: string): number {
 }
 
 /**
+ * The bounds `last` reaches back to from now, or `undefined` when they are not
+ * an `AbsoluteRangeSchema` range: a start before year 0000, or one no `Date`
+ * can hold. A later clock only moves the start forward, so a span admitted now
+ * still resolves when the view loads.
+ */
+function bounds(last: string): AbsoluteRange | undefined {
+  const now = Date.now();
+  const from = new Date(now - span(last));
+  if (Number.isNaN(from.getTime())) return undefined;
+  const range = { from: from.toISOString(), to: new Date(now).toISOString() };
+  return AbsoluteRangeSchema.safeParse(range).success ? range : undefined;
+}
+
+/**
  * A range relative to when the view loads, such as `{"last": "6h"}`. Its span
- * must reach back from 1970 to an instant a `Date` can hold, so it resolves
- * against any current clock.
+ * must resolve to RFC 3339 bounds, so it reaches back no further than year 0000.
  */
 export const RelativeRangeSchema = z
   .object({
     last: z
       .string()
       .regex(/^[1-9]\d*[mhd]$/, 'minutes, hours, or days, such as 6h')
-      .refine((last) => !Number.isNaN(new Date(-span(last)).getTime()), 'a span a date can represent, such as 6h')
+      .refine((last) => bounds(last) !== undefined, 'a span reaching back no further than year 0000, such as 6h')
   })
   .strict();
 
@@ -192,12 +205,15 @@ export type Range = z.infer<typeof RangeSchema>;
 export type AbsoluteRange = z.infer<typeof AbsoluteRangeSchema>;
 
 /**
- * Resolve `range` against `now`; a view resolves its relative range once per
- * load so every panel reads the same bounds.
+ * Resolve `range` against the current clock; a view resolves its relative
+ * range once per load so every panel reads the same bounds. An admitted range
+ * always resolves to `AbsoluteRangeSchema` bounds.
  */
-export function resolveRange(range: Range, now: number = Date.now()): AbsoluteRange {
+export function resolveRange(range: Range): AbsoluteRange {
   if ('from' in range) return range;
-  return { from: new Date(now - span(range.last)).toISOString(), to: new Date(now).toISOString() };
+  const resolved = bounds(range.last);
+  if (resolved === undefined) throw new RangeError(`range ${range.last} was not admitted by RangeSchema`);
+  return resolved;
 }
 
 /**

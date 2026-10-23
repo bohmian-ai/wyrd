@@ -286,6 +286,57 @@ impl WyrdTestServer {
         .await;
     }
 
+    /// Commits a partition spec that keeps the current fields but buckets
+    /// `shard` into `buckets`, so the new spec's tuples have the same shape
+    /// and can hold the same values as the old spec's.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the revision does not commit.
+    pub async fn commit_bucket_revision(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+        buckets: u32,
+    ) {
+        self.commit_table_revision(tenant, table, |metadata| {
+            let shard = metadata
+                .current_schema()
+                .field_by_name("shard")
+                .expect("shard is a column")
+                .id;
+            let spec = metadata
+                .default_partition_spec()
+                .fields()
+                .iter()
+                .try_fold(
+                    iceberg::spec::UnboundPartitionSpec::builder(),
+                    |builder, field| {
+                        if field.source_id == shard {
+                            builder.add_partition_field(
+                                shard,
+                                format!("shard_bucket_{buckets}"),
+                                iceberg::spec::Transform::Bucket(buckets),
+                            )
+                        } else {
+                            builder.add_partition_field(
+                                field.source_id,
+                                field.name.clone(),
+                                field.transform,
+                            )
+                        }
+                    },
+                )
+                .expect("spec builds")
+                .build();
+            vec![
+                iceberg::TableUpdate::AddSpec { spec },
+                iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
+            ]
+        })
+        .await;
+    }
+
     /// Commits a schema that renames `customer` to `client` under its field
     /// id and adds a nullable `note` string.
     ///

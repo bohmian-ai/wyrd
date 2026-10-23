@@ -1077,13 +1077,16 @@ async fn assert_live_layout_truth(
 /// compact without changing a public row: every live file — promoted and
 /// rewritten — holds only rows of the partition tuple it records under the
 /// spec it records, ordered by the sort order it records, and promotion keeps
-/// each object under the spec and order it was written with.
+/// each object under the spec and order it was written with. The specs bucket
+/// `shard` four and eight ways, so equal tuples, null customers included,
+/// exist under both; every rewrite still reads one spec's partition.
 ///
 /// # Panics
 ///
 /// Panics when the pod cannot start, a public call fails, Forge leaves work
-/// owed or commits no rewrite, a public read differs, or a live file
-/// contradicts its recorded layout.
+/// owed or commits no rewrite, a public read differs, a live file
+/// contradicts its recorded layout, or a rewrite's inputs span two specs or
+/// partitions.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn mixed_specifications_preserve_partition_and_sort_truth() {
@@ -1143,7 +1146,7 @@ async fn mixed_specifications_preserve_partition_and_sort_truth() {
         .expect("the journey table loads")
         .metadata()
         .default_partition_spec_id();
-    server.commit_spec_revision(tenant, &table_ref).await;
+    server.commit_bucket_revision(tenant, &table_ref, 8).await;
     let revised_order = server.commit_sort_revision(tenant, &table_ref).await;
     append_round([2, 3]).await;
     let expected = crate::public_support::canonical_order(rows);
@@ -1163,6 +1166,22 @@ async fn mixed_specifications_preserve_partition_and_sort_truth() {
         .expect("the journey table loads")
         .metadata()
         .default_partition_spec_id();
+    let promoted_files = {
+        let promoted = server
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&table.binding.table_ident())
+            .await
+            .expect("the journey table loads");
+        let snapshot = promoted
+            .metadata()
+            .current_snapshot()
+            .expect("a promoted table has a snapshot")
+            .clone();
+        crate::live_rewrite::snapshot_files(&promoted, &snapshot, &table.binding)
+            .await
+            .data
+    };
     let promoted = assert_live_layout_truth(server, &table.binding, "promoted").await;
     let rows_per_layout = 2 * u64::try_from(COMPOSITE_ROWS).expect("row count");
     assert_eq!(
@@ -1188,4 +1207,65 @@ async fn mixed_specifications_preserve_partition_and_sort_truth() {
         2 * rows_per_layout,
         "compaction keeps every row exactly once: {compacted:?}"
     );
+
+    // Equal tuples exist under both specs, so a spec-blind grouping would
+    // read both specs' files in one rewrite.
+    let layouts = |spec: i32| {
+        promoted_files
+            .values()
+            .filter(|file| file.partition_spec_id == spec)
+            .map(|file| format!("{:?}", file.partition))
+            .collect::<BTreeSet<_>>()
+    };
+    assert!(
+        layouts(first_spec)
+            .intersection(&layouts(revised_spec))
+            .next()
+            .is_some(),
+        "the two specs share at least one partition tuple"
+    );
+    let rewrites = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT current_detail FROM vala.forge_operation_state \
+         WHERE data_tenant_id = $1 AND family = 'iceberg_rewrite' \
+           AND phase IN ('committed', 'recovered') AND resource LIKE $2 \
+         ORDER BY prepared_at, operation_id",
+    )
+    .bind(tenant.as_uuid())
+    .bind(format!("%/{name}"))
+    .fetch_all(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("Forge rewrite inspection");
+    // Each committed rewrite's promoted inputs; a rewrite of rewritten
+    // outputs reads none.
+    let groups = rewrites
+        .into_iter()
+        .map(|detail| {
+            let wyrd_spec::vala::audit_detail::AuditDetail::ForgeIcebergRewrite {
+                input_paths, ..
+            } = serde_json::from_value(detail).expect("rewrite detail decodes")
+            else {
+                panic!("an iceberg_rewrite operation records rewrite detail");
+            };
+            input_paths
+                .iter()
+                .filter_map(|path| promoted_files.get(path.as_str()))
+                .map(|file| (file.partition_spec_id, file.partition.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        groups.iter().any(|group| !group.is_empty()),
+        "a committed rewrite read promoted files"
+    );
+    for group in groups.iter().filter(|group| !group.is_empty()) {
+        let layouts = group
+            .iter()
+            .map(|(spec, partition)| (*spec, format!("{partition:?}")))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            layouts.len(),
+            1,
+            "one rewrite reads one spec's partition: {layouts:?}"
+        );
+    }
 }

@@ -1,10 +1,14 @@
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { Cards, WyrdClient, WyrdState } from "wyrd-ai";
 
 import { observedService } from "../support/observed-service.js";
-import { binding, scheduledResult } from "../support/server.js";
+import { binding, fixture, runtimeAccount, scheduledResult } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -91,4 +95,43 @@ test("unsealable byte budget is refused at connect", async ({ state }) => {
   await expect(state.startBifrost({ clientByteLimitBytes: 1024 })).rejects.toMatchObject({
     code: "WYRD_CLIENT_400_CONFIG_INVALID",
   });
+});
+
+test("configured service context reaches both verification subjects", async ({ server: _ }) => {
+  const cards = await Cards.connect();
+  const { root } = await cards.declareFromPath(fixture("cards/observe_a_run/configured-service.yaml"));
+  const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-configured-"));
+  await cards.pull(root, bundle);
+  const { key } = await runtimeAccount({ kind: "Service", name: "configured-service" });
+
+  for (const environment of ["prod", "staging"]) {
+    const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+    state.configure({ deploymentEnvironment: environment });
+    const run = state.run();
+    const agent = run.forCard("agent");
+
+    const result = await agent.observe.verify("agent-check", "yes");
+    expect(result.subject).toEqual(state.cardRef("agent"));
+    expect(result.deployment_environment).toBe(environment);
+    const submitted = await agent.observe.submit("agent-check", "yes");
+    if (submitted.kind !== "queued") {
+      throw new Error("Run evidence queues an execution");
+    }
+    const queued = await submitted.execution.wait({ timeoutMs: 60_000 });
+    expect(queued.subject).toEqual(state.cardRef("agent"));
+    expect(queued.deployment_environment).toBe(environment);
+
+    const rootCheck = run.observe.verify("service-check", "yes");
+    if (environment === "prod") {
+      const checked = await rootCheck;
+      expect(checked.subject).toEqual(state.rootRef);
+      expect(checked.deployment_environment).toBe("prod");
+    } else {
+      await expect(rootCheck).rejects.toMatchObject({
+        code: "WYRD_SPEC_400_VALIDATION",
+        details: { field: "deployment_environment" },
+      });
+    }
+    expect(() => state.configure()).toThrow(expect.objectContaining({ code: "WYRD_SDK_409_STATE_CONFIG_FROZEN" }));
+  }
 });

@@ -8,7 +8,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use wyrd_ai::bifrost::BifrostOptions;
 use wyrd_ai::bifrost::QueryParam;
-use wyrd_ai::state::WyrdState;
+use wyrd_ai::state::{ConfigureOptions, WyrdState};
 use wyrd_ai::verify::Submission;
 use wyrd_ai::{Bifrost, QueueConfig, RequirementDetail, VerificationVerdict, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
@@ -258,5 +258,83 @@ async fn unsealable_byte_budget_is_refused_at_connect() {
         .expect_err("the budget is refused");
 
     assert_eq!(refused.code(), "WYRD_CLIENT_400_CONFIG_INVALID");
+    deployment.shutdown().await;
+}
+
+/// Two states of one Service, configured for `prod` and `staging`, verify the
+/// Service-bound `service-check` (whose binding selects `prod`) on the root
+/// and the unscoped Agent-bound `agent-check` on the Agent component. Each
+/// result names its own subject and the effective environment, directly and
+/// queued; the `staging` state's root check conflicts with the binding and is
+/// refused before any execution; a late configure is refused.
+///
+/// # Panics
+/// Panics when a step fails or a result names another subject or
+/// environment.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn configured_service_context_reaches_both_verification_subjects() {
+    let deployment =
+        Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
+            .await;
+    let cards = deployment.cards().await;
+    let service = declare(&cards, "cards/observe_a_run/configured-service.yaml").await;
+    let dir = pull(&cards, &service.root).await;
+    let root = state(&dir).root_ref().clone();
+    let mut states = Vec::new();
+    for environment in ["prod", "staging"] {
+        let state = state_as(&dir, deployment.service_client(&root).await);
+        state
+            .configure(ConfigureOptions {
+                deployment_environment: Some(environment.to_owned()),
+                ..ConfigureOptions::default()
+            })
+            .expect("configure succeeds before use");
+        states.push((state, environment));
+    }
+
+    for (state, environment) in &states {
+        let run = state.run();
+        let agent = run.for_card("agent").expect("agent view resolves");
+        let result = agent
+            .observe()
+            .verify("agent-check", json!("yes"))
+            .await
+            .expect("the Agent check runs");
+        assert_eq!(&result.subject, agent.subject());
+        assert_eq!(result.deployment_environment.as_deref(), Some(*environment));
+        let Submission::Queued(execution) = agent
+            .observe()
+            .submit("agent-check", json!("yes"))
+            .await
+            .expect("the Agent check enqueues")
+        else {
+            panic!("Run evidence queues an execution");
+        };
+        let queued = execution
+            .wait(Duration::from_mins(1))
+            .await
+            .expect("the queued Agent check completes");
+        assert_eq!(&queued.subject, agent.subject());
+        assert_eq!(queued.deployment_environment.as_deref(), Some(*environment));
+
+        let root = run.observe().verify("service-check", json!("yes")).await;
+        if *environment == "prod" {
+            let result = root.expect("the Service check runs");
+            assert_eq!(&result.subject, state.root_ref());
+            assert_eq!(result.deployment_environment.as_deref(), Some("prod"));
+        } else {
+            let refused = root.expect_err("the staging Service check conflicts");
+            assert_eq!(refused.code(), "WYRD_SPEC_400_VALIDATION");
+            assert_eq!(refused.problem().details["field"], "deployment_environment");
+        }
+        assert_eq!(
+            state
+                .configure(ConfigureOptions::default())
+                .expect_err("configure after use is refused")
+                .code(),
+            "WYRD_SDK_409_STATE_CONFIG_FROZEN"
+        );
+    }
     deployment.shutdown().await;
 }

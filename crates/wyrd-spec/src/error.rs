@@ -4106,6 +4106,25 @@ impl WyrdError {
         }
     }
 
+    /// Construct [`WyrdError::SignedWorkloadMismatch`] for a request selector
+    /// naming `selected` on a bearer that already pins `signed`.
+    #[must_use]
+    pub fn signed_workload_mismatch(
+        signed: &crate::ids::CardUid,
+        selected: &crate::ids::CardUid,
+    ) -> Self {
+        Self::SignedWorkloadMismatch {
+            message: format!(
+                "the bearer pins workload root {signed}; the request selected {selected}"
+            ),
+            details: serde_json::json!({
+                "reason": "signed_workload_mismatch",
+                "signed_workload_uid": signed,
+                "workload_uid": selected,
+            }),
+        }
+    }
+
     /// Construct [`WyrdError::WorkloadContextRequired`] with its stable
     /// `workload_context_required` reason; `message` names what lacked a root.
     #[must_use]

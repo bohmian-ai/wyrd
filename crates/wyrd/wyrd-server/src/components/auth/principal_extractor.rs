@@ -2,9 +2,13 @@ use std::sync::Arc;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use wyrd_auth::issuance::select_request_root;
 use wyrd_auth_verify::VerifiedToken;
-use wyrd_runtime::{DelegationStep, Principal};
+use wyrd_runtime::{DelegationStep, Principal, needs_root_resolution};
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 
+use crate::components::auth::routes::store_unavailable;
 use crate::components::auth::token_extract::verify_authenticated_principal;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -58,6 +62,47 @@ impl AuthenticatedPrincipal {
     #[must_use]
     pub fn delegation_chain(&self) -> &[DelegationStep] {
         &self.verified.delegation_chain
+    }
+
+    /// The verified token, for an owner that takes it by value.
+    #[must_use]
+    pub(crate) fn into_verified(self) -> VerifiedToken {
+        Arc::unwrap_or_clone(self.verified)
+    }
+
+    /// Apply a request's optional `x-wyrd-workload-uid` selector.
+    ///
+    /// A bearer already signing `root` is returned unchanged without a store
+    /// read; a rootless bearer is narrowed to `root` under its signed Card
+    /// access by [`select_request_root`], in a read-only tenant transaction
+    /// that records no activity. Every bearer ingress that accepts the
+    /// selector routes through here.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::SignedWorkloadMismatch`] for a different signed
+    /// root, [`WyrdError::WorkloadUidRefused`] for an unusable root, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the tenant store is
+    /// unavailable.
+    pub(crate) async fn select_root(
+        self,
+        state: &AppState,
+        root: Option<&CardUid>,
+    ) -> Result<Self, WyrdError> {
+        let Some(root) = root else {
+            return Ok(self);
+        };
+        let principal = &self.verified.principal;
+        if !needs_root_resolution(principal, &self.verified.delegation_chain, root)? {
+            return Ok(self);
+        }
+        let mut conn = state
+            .postgres
+            .tenant_conn(principal.tenant_id)
+            .await
+            .map_err(store_unavailable)?;
+        Ok(select_request_root(&mut conn, &self.verified, root)
+            .await?
+            .map_or(self, |selected| Self::from_verified(Arc::new(selected))))
     }
 }
 

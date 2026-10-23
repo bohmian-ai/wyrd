@@ -14,7 +14,7 @@
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, RawQuery, Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
+use axum::http::{HeaderMap, HeaderName, Method};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -48,8 +48,8 @@ use super::routes::{self, PUBLIC_CALL_TIMEOUT, openai_error, relay, token_bound,
 use super::telemetry::IngressClock;
 use crate::components::auth::Caller;
 use crate::components::auth::token_extract::{
-    ANTHROPIC_API_KEY_HEADER, GOOGLE_API_KEY_HEADER, WYRD_WORKLOAD_UID_HEADER,
-    extract_gateway_access_token, verify_access_token, workload_uid_selector,
+    ANTHROPIC_API_KEY_HEADER, GOOGLE_API_KEY_HEADER, extract_gateway_access_token,
+    verify_access_token, workload_uid_header,
 };
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::metrics::RequestArrival;
@@ -119,7 +119,8 @@ impl GatewayIngress {
     /// The single accepted credential header is classified by
     /// [`GatewayCredential::classify`]: a Wyrd API key is exchanged through
     /// [`super::GatewayApiKeys`], anything else is verified as a Wyrd access token,
-    /// and the principal is inserted for the handler's [`Caller`]. A missing,
+    /// either under the optional `x-wyrd-workload-uid` root, and the principal
+    /// is inserted for the handler's [`Caller`]. A missing,
     /// ambiguous, URL-borne, or invalid credential, or a key the exchange
     /// refuses, is refused in the protocol's envelope without reading the
     /// body; a refused key never falls back to token verification. An
@@ -135,37 +136,30 @@ impl GatewayIngress {
             self.query_names(&request),
         )
         .map(GatewayCredential::classify);
-        let verified = match credential {
-            Ok(GatewayCredential::AccessToken(token)) => verify_access_token(
-                state.auth.token_verifier.as_deref(),
-                token,
-                wyrd_auth_verify::TokenAudience::Wyrd,
-            )
-            .map_err(|WyrdErrorResponse(error)| error),
-            Ok(GatewayCredential::ApiKey(api_key)) => {
+        let verified = match (credential, workload_uid_header(request.headers())) {
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Ok(GatewayCredential::AccessToken(token)), Ok(root)) => {
+                match verify_access_token(
+                    state.auth.token_verifier.as_deref(),
+                    token,
+                    wyrd_auth_verify::TokenAudience::Wyrd,
+                ) {
+                    Ok(principal) => principal.select_root(&state, root.as_ref()).await,
+                    Err(WyrdErrorResponse(error)) => Err(error),
+                }
+            }
+            (Ok(GatewayCredential::ApiKey(api_key)), Ok(root)) => {
                 let request_id = request
                     .extensions()
                     .get::<RequestId>()
                     .cloned()
                     .unwrap_or_else(RequestId::now_v7);
-                match workload_uid_selector(
-                    request
-                        .headers()
-                        .get_all(WYRD_WORKLOAD_UID_HEADER)
-                        .iter()
-                        .map(HeaderValue::as_bytes),
-                ) {
-                    Ok(workload_uid) => {
-                        state
-                            .gateway
-                            .api_keys()
-                            .authenticate(&state, &api_key, workload_uid, request_id.as_str())
-                            .await
-                    }
-                    Err(error) => Err(error),
-                }
+                state
+                    .gateway
+                    .api_keys()
+                    .authenticate(&state, &api_key, root, request_id.as_str())
+                    .await
             }
-            Err(error) => Err(error),
         };
         match verified {
             Ok(principal) => {

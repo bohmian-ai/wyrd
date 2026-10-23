@@ -4,6 +4,7 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 use wyrd_spec::auth::Attribution;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, IdempotencyKey};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::AuditDelegationStep;
@@ -73,6 +74,30 @@ pub fn owning_root<'a>(
         .map_or(principal.workload_uid.as_ref(), |step| {
             step.principal.workload_uid.as_ref()
         })
+}
+
+/// Whether a request's `selected` workload root must still be resolved for a
+/// verified bearer.
+///
+/// A bearer whose owning root ([`owning_root`]) is already signed is
+/// immutable: an equal selector is an idempotent `Ok(false)` and a different
+/// one is refused, never unpinned. A rootless bearer answers `Ok(true)`, and
+/// the selector is resolved under its signed Card access. Every ingress
+/// routes a selector through here, so none silently drops or rebinds one.
+///
+/// # Errors
+/// Returns [`WyrdError::SignedWorkloadMismatch`] when `selected` differs from
+/// the signed root.
+pub fn needs_root_resolution(
+    principal: &Principal,
+    chain: &[DelegationStep],
+    selected: &CardUid,
+) -> Result<bool, WyrdError> {
+    match owning_root(principal, chain) {
+        Some(signed) if signed == selected => Ok(false),
+        Some(signed) => Err(WyrdError::signed_workload_mismatch(signed, selected)),
+        None => Ok(true),
+    }
 }
 
 /// The verified effective authority one accepted operation runs under.
@@ -205,7 +230,9 @@ impl TraceParent {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcceptedAuthority, DelegationStep, RequestContext, TraceParent};
+    use super::{
+        AcceptedAuthority, DelegationStep, RequestContext, TraceParent, needs_root_resolution,
+    };
     use crate::permission::PermissionSet;
     use crate::principal::{Principal, PrincipalId, PrincipalKind, PrincipalRef};
     use chrono::Utc;
@@ -233,6 +260,35 @@ mod tests {
             },
             Some(root),
         )
+    }
+
+    /// A signed root accepts only an equal selector; a rootless bearer
+    /// resolves any selector.
+    #[test]
+    fn selector_never_rebinds_a_signed_root() {
+        let rooted = service_principal("rooted");
+        let signed = rooted.workload_uid.clone().expect("signed root");
+        let other = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 Card UID");
+        assert!(!needs_root_resolution(&rooted, &[], &signed).expect("equal selector"));
+        assert!(matches!(
+            needs_root_resolution(&rooted, &[], &other),
+            Err(wyrd_spec::error::WyrdError::SignedWorkloadMismatch { .. })
+        ));
+        let rootless = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            wyrd_spec::DataTenantId::new_v7(),
+            Vec::new(),
+            PermissionSet::new(),
+        );
+        assert!(needs_root_resolution(&rootless, &[], &other).expect("rootless"));
+        let delegated = [DelegationStep {
+            principal: PrincipalRef::from_principal(&rooted),
+        }];
+        assert!(matches!(
+            needs_root_resolution(&rootless, &delegated, &other),
+            Err(wyrd_spec::error::WyrdError::SignedWorkloadMismatch { .. })
+        ));
     }
 
     #[test]

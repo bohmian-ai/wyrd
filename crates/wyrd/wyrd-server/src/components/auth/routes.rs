@@ -522,7 +522,7 @@ fn not_configured() -> WyrdError {
 
 /// The refusal of a grant whose tenant store is unavailable; the cause is
 /// logged, never returned.
-fn store_unavailable(error: wyrd_sql::SqlError) -> WyrdError {
+pub(crate) fn store_unavailable(error: wyrd_sql::SqlError) -> WyrdError {
     tracing::warn!(error = %error, "auth db unavailable");
     WyrdError::AuthVerifyUnavailable {
         message: "auth backend unavailable".to_owned(),

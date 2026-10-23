@@ -3,7 +3,7 @@
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::uri::Authority;
-use axum::http::{HeaderValue, Method, Request};
+use axum::http::{Method, Request};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -20,8 +20,8 @@ use crate::auth::exchange_api_key::api_key_invalid;
 use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::routes::TokenGrants;
 use crate::components::auth::token_extract::{
-    WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER, WYRD_WORKLOAD_UID_HEADER,
-    verify_authenticated_principal, workload_uid_selector,
+    WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER, verify_authenticated_principal,
+    workload_uid_header,
 };
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -173,13 +173,7 @@ pub async fn require_otlp_authenticated(
         return WyrdErrorResponse(api_key_invalid()).into_response();
     };
     let api_key = SecretString::from(presented.to_owned());
-    let workload_uid = match workload_uid_selector(
-        request
-            .headers()
-            .get_all(WYRD_WORKLOAD_UID_HEADER)
-            .iter()
-            .map(HeaderValue::as_bytes),
-    ) {
+    let workload_uid = match workload_uid_header(request.headers()) {
         Ok(workload_uid) => workload_uid,
         Err(error) => return WyrdErrorResponse(error).into_response(),
     };
@@ -203,24 +197,33 @@ pub async fn require_otlp_authenticated(
     }
 }
 
-/// Verify the request's token for `surface`, insert the principal, and run
-/// `next`; any verification failure is returned without calling `next`.
+/// Verify the request's token for `surface`, apply its optional
+/// `x-wyrd-workload-uid` selector, insert the principal, and run `next`; any
+/// verification or selection failure is returned without calling `next`.
 async fn authenticate_on(
     state: &AppState,
     mut request: Request<Body>,
     next: Next,
     surface: TokenAudience,
 ) -> Response {
-    match verify_authenticated_principal(
+    let verified = match verify_authenticated_principal(
         state.auth.token_verifier.as_deref(),
         request.headers(),
         surface,
     ) {
+        Ok(principal) => principal,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let selected = match workload_uid_header(request.headers()) {
+        Ok(root) => verified.select_root(state, root.as_ref()).await,
+        Err(error) => Err(error),
+    };
+    match selected {
         Ok(principal) => {
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
-        Err(rejection) => rejection.into_response(),
+        Err(error) => WyrdErrorResponse(error).into_response(),
     }
 }
 

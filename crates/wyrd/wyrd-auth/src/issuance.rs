@@ -381,6 +381,49 @@ impl ResolvedContext {
     }
 }
 
+/// Narrow a verified bearer to the workload root its request selects.
+///
+/// Returns `None` when the bearer already signs exactly `root`, which leaves
+/// it unchanged. A rootless bearer's root is resolved under its signed Card
+/// access alone, never broader live grants: a `root_required` account's
+/// family must allow it, and any other access is intersected with the root's
+/// exact graph, so the selector only ever narrows. Identity, grants, and
+/// tenant never change, and no runtime activity is recorded.
+///
+/// # Errors
+/// Returns [`WyrdError::SignedWorkloadMismatch`] when the bearer pins another
+/// root, and every [`resolve_workload_scope`] refusal for `root`, unknown and
+/// foreign roots alike.
+pub async fn select_request_root(
+    conn: &mut TenantConn<'_>,
+    verified: &VerifiedToken,
+    root: &CardUid,
+) -> Result<Option<VerifiedToken>, WyrdError> {
+    if !wyrd_runtime::needs_root_resolution(&verified.principal, &verified.delegation_chain, root)?
+    {
+        return Ok(None);
+    }
+    let signed = &verified.principal.card_access;
+    let restriction = match signed {
+        CardAccess::RootRequired {
+            restriction: FamilyRestriction::Family(family),
+        } => Some(family),
+        CardAccess::AnyRegistered | CardAccess::Scoped { .. } => None,
+    };
+    let selected = ResolvedContext::resolve(conn, Some(root), restriction)
+        .await?
+        .access;
+    let access = signed.intersection(&selected).unwrap_or(selected);
+    Ok(Some(VerifiedToken {
+        principal: verified
+            .principal
+            .clone()
+            .with_card_access(access, Some(root.clone())),
+        delegation_chain: verified.delegation_chain.clone(),
+        exp: verified.exp,
+    }))
+}
+
 /// Tenant issuance refusal or failure.
 ///
 /// Entry paths map the refusals onto their own stable public errors (an API
@@ -1712,6 +1755,73 @@ mod pg_tests {
             ),
             "{refused:?}"
         );
+    }
+
+    /// A request selector narrows a rootless bearer under its signed access
+    /// only: the family account's root becomes its exact scope, a foreign or
+    /// unknown root is refused identically, a signed root is unchanged by an
+    /// equal selector and never rebound by a different one, and no activity
+    /// is recorded.
+    ///
+    /// # Panics
+    /// Panics when a fixture write, issuance, or verification fails, or any
+    /// selection differs.
+    #[tokio::test]
+    async fn request_selector_narrows_only_rootless_bearers() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = RecordedAudit::new();
+        let tenant = fixture.data_tenant_id();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let creator = seed_user(&mut conn).await;
+        let family = service_family("checkout");
+        let account = insert_test_service_account(&mut conn, creator, Some(&family)).await;
+        let r1 = seed_root(&mut conn, &named_service_card_ref("checkout"), creator).await;
+        let foreign = seed_root(&mut conn, &named_service_card_ref("billing"), creator).await;
+        let rootless = verifier()
+            .verify(
+                &issuer(&audit)
+                    .issue(&mut conn, account, api_key(None), "req-rootless")
+                    .await
+                    .expect("rootless issuance succeeds")
+                    .access_token,
+                &tenant,
+            )
+            .expect("rootless token verifies");
+        let selected = super::select_request_root(&mut conn, &rootless, &r1)
+            .await
+            .expect("family root selects")
+            .expect("rootless bearer narrows");
+        assert_eq!(selected.principal.id, rootless.principal.id);
+        assert_eq!(
+            selected.principal.effective_permissions,
+            rootless.principal.effective_permissions
+        );
+        assert_eq!(
+            selected.principal.card_access,
+            CardAccess::Scoped {
+                cards: vec![r1.clone()]
+            }
+        );
+        assert_eq!(selected.principal.workload_uid, Some(r1.clone()));
+        for root in [foreign.clone(), unregistered_uid()] {
+            let refused = super::select_request_root(&mut conn, &rootless, &root).await;
+            assert!(
+                matches!(refused, Err(WyrdError::WorkloadUidRefused { .. })),
+                "{refused:?}"
+            );
+        }
+        assert!(
+            super::select_request_root(&mut conn, &selected, &r1)
+                .await
+                .expect("equal selector")
+                .is_none()
+        );
+        let rebound = super::select_request_root(&mut conn, &selected, &foreign).await;
+        assert!(
+            matches!(rebound, Err(WyrdError::SignedWorkloadMismatch { .. })),
+            "{rebound:?}"
+        );
+        assert_eq!(activity(&mut conn, account, &r1).await.0, None);
     }
 
     /// A human session carries the user's current grants and a refresh token.

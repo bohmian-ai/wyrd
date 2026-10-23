@@ -68,5 +68,5 @@ pub use token::{
 };
 pub use workload::{
     CardAccess, FamilyRestriction, MAX_SCOPED_CARDS, WORKLOAD_UID_HEADER, WorkloadFamily,
-    WorkloadKind, WorkloadRestriction,
+    WorkloadKind, WorkloadRestriction, workload_uid_selector,
 };

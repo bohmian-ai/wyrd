@@ -310,4 +310,65 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].tool, BuiltinTool::FsRead);
         assert_eq!(parsed.tool_calls[0].returned_bytes, 512);
     }
+
+    /// A declared data schema keeps its own reference root and dialect once
+    /// embedded in the Verdict envelope: `#/properties/reason` names the
+    /// data's integer field, not the Verdict's string reason; 2020-12
+    /// `prefixItems` still constrains a tuple; a declared draft-07 dialect
+    /// still ignores a `$ref`'s siblings; and definitions named like the
+    /// Verdict's own resolve to the author's.
+    ///
+    /// # Panics
+    /// Panics when a composed schema accepts bad data or refuses good data.
+    #[test]
+    fn verdict_data_keeps_its_schema_resource() {
+        let cases = [
+            (
+                json!({"type": "object", "additionalProperties": false,
+                    "required": ["reason", "copy", "pair"],
+                    "properties": {
+                        "reason": {"type": "integer"},
+                        "copy": {"$ref": "#/properties/reason"},
+                        "pair": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]}}}),
+                json!({"reason": 1, "copy": 2, "pair": ["a", 1]}),
+                vec![
+                    json!({"reason": 1, "copy": "wrong", "pair": ["a", 1]}),
+                    json!({"reason": 1, "copy": 2, "pair": [1, "a"]}),
+                ],
+            ),
+            (
+                json!({"$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
+                    "required": ["cite"],
+                    "properties": {"cite": {"$ref": "#/definitions/Citation", "maximum": 1}},
+                    "definitions": {"Citation": {"type": "integer"}}}),
+                json!({"cite": 3}),
+                vec![json!({"cite": {"slot": "deck"}})],
+            ),
+            (
+                json!({"type": "object", "required": ["cite"],
+                    "properties": {"cite": {"$ref": "#/$defs/Citation"}},
+                    "$defs": {"Citation": {"type": "string"}}}),
+                json!({"cite": "p3"}),
+                vec![json!({"cite": 3})],
+            ),
+        ];
+        let response = |data: Value| json!({"outcome": "passed", "reason": "judged", "citations": [], "data": data});
+        for (data, good, bad) in cases {
+            let format: skald_spec::NamedResponseFormat =
+                serde_json::from_value(json!({"kind": "verdict", "data": data})).expect("format");
+            let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
+            let verdict = verdict_from(&schema, response(good.clone()))
+                .unwrap_or_else(|error| panic!("{good}: {error}"));
+            assert_eq!(serde_json::to_value(verdict.data).expect("data"), good);
+            for bad in bad {
+                assert!(
+                    matches!(
+                        verdict_from(&schema, response(bad.clone())),
+                        Err(BlockError::Terminal { .. })
+                    ),
+                    "{bad}"
+                );
+            }
+        }
+    }
 }

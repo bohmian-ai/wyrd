@@ -1824,7 +1824,16 @@ mod tests {
                 schema["additionalProperties"], false,
                 "the Verdict envelope stays closed"
             );
-            assert_eq!(schema.pointer("/properties/data"), format.get("data"));
+            let embedded = format.get("data").map(|data| {
+                let mut data = data.clone();
+                data["$id"] = json!("verdict-data");
+                data
+            });
+            assert_eq!(
+                schema.pointer("/properties/data"),
+                embedded.as_ref(),
+                "the data schema is embedded unchanged as its own resource"
+            );
 
             let native = json!({"provider": "anthropic", "model": "claude", "format": "messages",
                 "body": {"max_tokens": 64, "messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "${media:policy}"}}, {"type": "text", "text": "{{claim}} {{answer}} {{findings}}"}]}]},
@@ -1875,8 +1884,9 @@ mod tests {
                 "response_format.data.properties.a.type",
             ),
             (
-                json!({"kind": "verdict", "data": {"type": "object", "$defs": {"Citation": {"type": "string"}}}}),
-                "response_format.data.$defs.Citation",
+                json!({"kind": "verdict", "data": {"$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
+                    "properties": {"pair": {"type": "array", "items": [{"type": "string"}]}}}}),
+                "response_format.data.properties.pair.items",
             ),
         ] {
             let body = with(

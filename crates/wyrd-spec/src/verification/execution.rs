@@ -408,6 +408,11 @@ pub const MAX_VERDICT_DATA_DEPTH: usize = 16;
 /// The name of the generated Verdict response format.
 pub const VERDICT_FORMAT: &str = "verdict";
 
+/// The `$id` that makes a declared `data` schema its own resource inside the
+/// Verdict envelope, relative to the envelope's base, when the author set
+/// none: the data's `#` then names the data schema, not the envelope.
+const DATA_RESOURCE: &str = "verdict-data";
+
 /// The closed schema every Agent and code check returns.
 ///
 /// `data` is present exactly when the check declares a custom-data schema
@@ -545,17 +550,19 @@ impl Verdict {
     /// must satisfy.
     ///
     /// The plain form is the generated closed Verdict without `data`; an
-    /// expanded `data` schema becomes the required `data` member, its
-    /// `$defs` and `definitions` moved to the root so its local `$ref`s still
-    /// resolve. This is the resolver Prompt compilation and code-check
-    /// validation share.
+    /// expanded `data` schema becomes the required `data` member, embedded
+    /// as its own JSON Schema 2020-12 resource (`$id`, kept when the author
+    /// set one) so its local `$ref`s and any `$schema` it declares resolve
+    /// exactly as they do standalone. This is the resolver Prompt
+    /// compilation and code-check validation share.
     ///
     /// # Errors
     ///
     /// Returns [`SkaldError::PromptInvalid`] at `response_format` for a name
     /// other than `verdict`, and at `response_format.data...` for a data
-    /// schema that is not a valid object JSON Schema or whose definitions
-    /// collide with the Verdict's own.
+    /// schema that is not a valid object JSON Schema, or that declares another
+    /// draft and uses syntax 2020-12 refuses, such as a draft-07 tuple
+    /// `items` array.
     ///
     /// # Panics
     ///
@@ -597,26 +604,21 @@ impl Verdict {
         };
         check_output_schema(&Value::Object(data.clone()), "response_format.data", true)?;
         let mut data = data.clone();
-        data.remove("$schema");
-        for keyword in ["$defs", "definitions"] {
-            let Some(Value::Object(definitions)) = data.remove(keyword) else {
-                continue;
-            };
-            let root = schema
-                .entry(keyword)
-                .or_insert_with(|| Value::Object(Map::new()))
-                .as_object_mut()
-                .expect("schema definitions are an object");
-            for (name, definition) in definitions {
-                if root.contains_key(&name) {
-                    return Err(invalid(
-                        &format!("response_format.data.{keyword}.{name}"),
-                        "this definition name is reserved by the Verdict schema; rename it",
-                    ));
-                }
-                root.insert(name, definition);
-            }
+        if let Some(dialect) = data.remove("$schema") {
+            check_output_schema(&Value::Object(data.clone()), "response_format.data", true)
+                .map_err(|error| match error {
+                    SkaldError::PromptInvalid { field, message } => SkaldError::PromptInvalid {
+                        field,
+                        message: format!(
+                            "the Verdict envelope is JSON Schema 2020-12, which validates every embedded schema's syntax, so this data schema must also be valid 2020-12: {message}"
+                        ),
+                    },
+                    other => other,
+                })?;
+            data.insert("$schema".to_owned(), dialect);
         }
+        data.entry("$id")
+            .or_insert_with(|| Value::from(DATA_RESOURCE));
         schema["properties"]["data"] = Value::Object(data);
         schema
             .get_mut("required")

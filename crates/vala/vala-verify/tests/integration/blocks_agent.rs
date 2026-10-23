@@ -684,6 +684,40 @@ async fn check_agent_validates_custom_data() {
             "{format}"
         );
     }
+
+    let rooted = named_judge(json!({"kind": "verdict", "data": {"type": "object",
+        "required": ["reason", "copy", "pair"],
+        "properties": {"reason": {"type": "integer"}, "copy": {"$ref": "#/properties/reason"},
+            "pair": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]}}}}));
+    let good = json!({"reason": 1, "copy": 2, "pair": ["a", 1]});
+    let executor = executor(vec![
+        answer("passed", json!({"data": good})),
+        answer(
+            "passed",
+            json!({"data": {"reason": 1, "copy": "wrong", "pair": ["a", 1]}}),
+        ),
+        answer(
+            "passed",
+            json!({"data": {"reason": 1, "copy": 2, "pair": [1, "a"]}}),
+        ),
+    ])
+    .with_evidence(Arc::new(PinnedDeck));
+    let output = check(&executor, &rooted, from_deck(json!("x")))
+        .await
+        .expect("data refs resolve against the data schema");
+    assert_eq!(
+        serde_json::to_value(&output.verdict.data).expect("data"),
+        good
+    );
+    for _ in 0..2 {
+        assert!(
+            matches!(
+                check(&executor, &rooted, from_deck(json!("x"))).await,
+                Err(BlockError::Terminal { .. })
+            ),
+            "data violating its own refs or prefixItems is refused"
+        );
+    }
 }
 
 /// A check Agent answer outside the Verdict schema is terminal.

@@ -8,7 +8,6 @@ kind: Verifier
 metadata:
   name: scored-review
   version: 1.0.0
-  space: default
 spec:
   description: A support answer is judged with a score and a category.
   inputs:

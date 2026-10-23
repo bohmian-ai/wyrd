@@ -1488,7 +1488,7 @@ async fn declare_verifier(
 ) -> (StatusCode, Value) {
     let body = json!({ "submissions": [{
         "apiVersion": "wyrd/v1", "kind": "Verifier",
-        "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+        "metadata": { "name": name, "version": "1.0.0" },
         "spec": spec, "artifacts": []
     }] });
     post(
@@ -1555,12 +1555,7 @@ async fn verdict_declarations_validate_before_persistence() {
             problem.to_string().contains("response_format"),
             "{name} names the field: {problem}"
         );
-        let (status, _) = get(
-            &server,
-            &jwt,
-            &format!("/v1/cards/Verifier/default/{name}/latest"),
-        )
-        .await;
+        let (status, _) = get(&server, &jwt, &format!("/v1/cards/Verifier/{name}/latest")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{name} was not persisted");
     }
     for (name, spec) in [
@@ -1573,12 +1568,7 @@ async fn verdict_declarations_validate_before_persistence() {
     ] {
         let (status, body) = declare_verifier(&server, &jwt, name, &spec).await;
         assert!(status.is_success(), "{name}: {status} {body}");
-        let (status, card) = get(
-            &server,
-            &jwt,
-            &format!("/v1/cards/Verifier/default/{name}/latest"),
-        )
-        .await;
+        let (status, card) = get(&server, &jwt, &format!("/v1/cards/Verifier/{name}/latest")).await;
         assert_eq!(status, StatusCode::OK, "{name}: {card}");
     }
     server.shutdown().await.expect("test server shuts down");

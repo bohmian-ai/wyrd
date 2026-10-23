@@ -70,7 +70,7 @@ import { POST as bffLoad } from '../routes/t/[tenantKey]/ui/load/+server';
 import { POST as exampleLoad } from '../../../../../../examples/ui-app/src/routes/view/load/+server';
 import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
-import { Bifrost, type WyrdClient } from 'wyrd-ai';
+import { Bifrost, WyrdError, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
 import { card, denied, fixtureExecutor, RANGE, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
@@ -173,6 +173,16 @@ test('TASK-003: Validated portable rendering', async () => {
   expect(captions(nullable)).toEqual(['null', 'x']);
   expect(readings(nullable)).toEqual(['null: 5 ms', 'x: 6 ms']);
   nullable.unmount();
+  // Brushing a chart whose values are all null emits nothing and does not throw.
+  const onaction = vi.fn();
+  const empty = render(Chart, { input: { ...timeseries, y: ['input tokens'] } as ChartInput, result: { state: 'populated', data: nulls([['x', 1]]) }, onaction });
+  const blank = empty.container.querySelector('svg.plot') as SVGSVGElement;
+  blank.getBoundingClientRect = () => ({ left: 0, width: 600, top: 0, height: 220, right: 600, bottom: 220, x: 0, y: 0, toJSON: () => ({}) });
+  await fireEvent.pointerDown(blank, { clientX: 100, pointerId: 1 });
+  await fireEvent.pointerMove(blank, { clientX: 400, pointerId: 1 });
+  await fireEvent.pointerUp(blank, { clientX: 400, pointerId: 1 });
+  expect(onaction).not.toHaveBeenCalled();
+  empty.unmount();
 
   // Signed values draw finite geometry around a zero baseline.
   const signed = (values: number[]): QueryResult => ({
@@ -594,6 +604,23 @@ test('Node query acquisition cancellation', async () => {
     begin.mockClear();
     await expect(nodeExecutor({} as WyrdClient).run(query, AbortSignal.abort())).rejects.toThrow();
     expect(begin).not.toHaveBeenCalled();
+  } finally {
+    connect.mockRestore();
+  }
+});
+
+test('Node executor reconnects after a failed connect', async () => {
+  const query = [{ op: 'bifrost.list_tables' }] as const;
+  const connect = vi
+    .spyOn(Bifrost, 'connect')
+    .mockRejectedValueOnce(new WyrdError('WYRD_UPSTREAM_503' as never, 503, 'Unavailable', 'down'))
+    .mockResolvedValue({ listTables: async () => [] } as never);
+  try {
+    const executor = nodeExecutor({} as WyrdClient);
+    expect((await executor.run(query))[0]).toMatchObject({ ok: false });
+    expect((await executor.run(query))[0]).toEqual({ ok: true, value: { tables: [] } });
+    await executor.run(query);
+    expect(connect).toHaveBeenCalledTimes(2);
   } finally {
     connect.mockRestore();
   }

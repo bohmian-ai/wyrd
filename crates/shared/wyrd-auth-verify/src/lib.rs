@@ -640,7 +640,7 @@ pub struct AccessTokenClaims {
     /// delegated token, the intersection of the subject's and the actor's.
     /// The only tenant authority claim.
     pub permissions: PermissionSet,
-    /// The subject's exact selected Service or Agent root, when one was
+    /// The subject's exact selected Service root, when one was
     /// selected. Execution context, never account identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_uid: Option<CardUid>,

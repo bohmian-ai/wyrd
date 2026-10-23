@@ -472,7 +472,7 @@ impl WyrdClient {
         })
     }
 
-    /// Return a client whose requests run as the exact Service or Agent root
+    /// Return a client whose requests run as the exact Service root
     /// `uid`, with this client's credential and connection pools.
     ///
     /// The returned client keeps its own token cache, so rootless and rooted
@@ -485,7 +485,7 @@ impl WyrdClient {
     /// not select.
     ///
     /// # Arguments
-    /// * `uid` - Exact Service or Agent Card UID the returned client runs as.
+    /// * `uid` - Exact Service Card UID the returned client runs as.
     #[must_use]
     pub fn for_workload(&self, uid: CardUid) -> Self {
         let auth = self.auth.for_workload(uid);

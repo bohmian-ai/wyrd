@@ -751,7 +751,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
         status = 401,
         title = "Workload root refused",
-        remediation = "`workload_uid` is optional. When supplied it must name an active, registered Service or Agent Card version in this tenant that the account's workload restriction allows; unknown and foreign roots are refused identically. Omit it to authenticate the account without workload context, or register the release and pass its exact Card UID."
+        remediation = "`workload_uid` is optional. When supplied it must name an active, registered Service Card version in this tenant that the account's workload restriction allows; unknown and foreign roots are refused identically. Omit it to authenticate the account without workload context, or register the release and pass its exact Card UID."
     )]
     WorkloadUidRefused {
         /// Human-readable error message.
@@ -794,7 +794,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT",
         status = 409,
         title = "Workload family already has a runtime account",
-        remediation = "Each Service or Agent family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`."
+        remediation = "Each Service family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`."
     )]
     WorkloadBindingConflict {
         /// Human-readable error message.

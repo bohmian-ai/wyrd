@@ -1,7 +1,7 @@
 //! HTTP response mapping for Wyrd errors.
 
 use axum::body::Body;
-use axum::extract::rejection::PathRejection;
+use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use std::fmt::Display;
@@ -90,6 +90,20 @@ pub fn path_rejection(rejection: &PathRejection) -> WyrdErrorResponse {
     WyrdErrorResponse(WyrdError::Validation {
         message: format!("path identifier is invalid: {}", rejection.body_text()),
         details: serde_json::json!({ "location": "path" }),
+    })
+}
+
+/// Refuse a JSON body the route's typed extractor could not decode.
+///
+/// The body counterpart of [`path_rejection`]: a handler taking
+/// `Result<Json<T>, JsonRejection>` answers a body outside its closed wire
+/// shape, such as an unknown union variant, with the canonical
+/// `WYRD_SPEC_400_VALIDATION` problem instead of Axum's plain-text body.
+#[must_use]
+pub fn body_rejection(rejection: &JsonRejection) -> WyrdErrorResponse {
+    WyrdErrorResponse(WyrdError::Validation {
+        message: format!("request body is invalid: {}", rejection.body_text()),
+        details: serde_json::json!({ "location": "body" }),
     })
 }
 

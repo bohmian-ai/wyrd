@@ -215,7 +215,7 @@ mod pg_tests {
         async fn start() -> Result<Self, McpJourneyError> {
             let server = WyrdTestServer::start_bound().await?;
             let admin = server
-                .bootstrap_agent("mcp-card-discovery", &["admin"])
+                .bootstrap_service("mcp-card-discovery", &["admin"])
                 .await?;
             let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
             let fixtures = Path::new(concat!(

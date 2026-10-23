@@ -330,7 +330,7 @@ async fn stable_account_context_cli_journey() {
             .to_owned()
     };
     let create = ["principal", "credential", "create-principal"];
-    let family = ["--workload-kind", "service", "--workload-name", "checkout"];
+    let family = ["--workload-name", "checkout"];
     let set = ["principal", "credential", "set-restriction", "--principal"];
 
     // Create without a family is unrestricted; with one, the account is that
@@ -421,11 +421,11 @@ async fn stable_account_context_cli_journey() {
     );
     refused(
         &run(
-            &[&set[..], &[checkout.as_str(), "--workload-kind", "service"]].concat(),
+            &[&set[..], &[checkout.as_str(), "--workload-kind", "Agent"]].concat(),
             &admin_token,
         )
         .await,
-        "--workload-name",
+        "--workload-kind",
     );
     assert!(
         !run(&[&set[..], &["not-a-uuid"]].concat(), &admin_token)

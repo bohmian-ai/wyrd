@@ -6379,8 +6379,11 @@ export type VertexLocation = string;
 
 /**
  * Card kind a workload family or root may name.
+ *
+ * Workloads are Services only: an Agent is a registered subject inside a
+ * Service graph, never a root or a restricting family.
  */
-export type WorkloadKind = "Service" | "Agent";
+export type WorkloadKind = "Service";
 
 /**
  * A Service account's durable workload restriction.

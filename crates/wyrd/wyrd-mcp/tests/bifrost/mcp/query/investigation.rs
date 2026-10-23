@@ -62,7 +62,7 @@ impl EvidenceInvestigation {
         let signals =
             canonical_signals::seed_canonical_signals(&server, "mcp-investigation").await?;
         let admin = server
-            .bootstrap_agent("mcp-evidence-admin", &["admin"])
+            .bootstrap_service("mcp-evidence-admin", &["admin"])
             .await?;
         let key = admin.api_key().ok_or("administrator has a machine key")?;
         let credential = ResolvedCredential::ApiKey(key.expose_secret().to_owned().into());
@@ -387,7 +387,7 @@ impl EvidenceInvestigation {
             .await?;
         let reader = self
             .server
-            .bootstrap_agent("evidence-reader", &["mcp_evidence_reader"])
+            .bootstrap_service("evidence-reader", &["mcp_evidence_reader"])
             .await?;
         let token = self
             .server

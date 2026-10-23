@@ -231,10 +231,10 @@ mod pg_tests {
     }
 
     /// The tenant slug fallback resolves the workload tenant when the host
-    /// names none, and a binding's pinned default Agent root becomes the
+    /// names none, and a binding's pinned default Service root becomes the
     /// token's exact root.
     #[tokio::test]
-    async fn workload_jwt_bearer_falls_back_to_tenant_slug_with_agent_root() {
+    async fn workload_jwt_bearer_falls_back_to_tenant_slug_with_service_root() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let slug = tenant_slug(&fixture);
@@ -243,7 +243,7 @@ mod pg_tests {
         let account = bootstrap_principal(&fixture, tenant, "agent-runtime", None, &[role_name])
             .await
             .expect("service account seeds");
-        let agent = seed_root(&fixture, tenant, CardKind::Agent, "agent", "1.0.0").await;
+        let agent = seed_root(&fixture, tenant, CardKind::Service, "agent", "1.0.0").await;
         let state = test_state_with_external(
             &fixture,
             vec![trusted_issuer(
@@ -282,6 +282,59 @@ mod pg_tests {
         assert_eq!(verified.principal.id.as_uuid(), account);
         assert_eq!(verified.principal.workload_uid, Some(agent.clone()));
         assert!(verified.principal.authorizes_card_uid(&agent));
+    }
+
+    /// A binding whose pinned default root is an Agent issues nothing:
+    /// workloads are Services only, and the refusal is the same one an
+    /// unknown root earns.
+    #[tokio::test]
+    async fn workload_jwt_bearer_refuses_an_agent_default_root() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let slug = tenant_slug(&fixture);
+        let subject = "spiffe://cluster.local/ns/default/sa/agent";
+        let role_name = builtin_role_name();
+        let account = bootstrap_principal(&fixture, tenant, "agent-runtime", None, &[role_name])
+            .await
+            .expect("service account seeds");
+        let agent = seed_root(&fixture, tenant, CardKind::Agent, "agent", "1.0.0").await;
+        let state = test_state_with_external(
+            &fixture,
+            vec![trusted_issuer(
+                tenant,
+                jwks_uri(&fixture).await,
+                EXTERNAL_AUDIENCE,
+            )],
+            vec![binding(
+                tenant,
+                subject,
+                account,
+                Some(agent),
+                Some(EXTERNAL_AUDIENCE),
+            )],
+        )
+        .await;
+
+        let assertion = encode_external_token(&external_claims(
+            subject,
+            EXTERNAL_AUDIENCE,
+            ChronoDuration::hours(1),
+        ));
+        let refused = exchange_jwt_bearer(
+            &state,
+            &localhost_headers(),
+            SecretString::from(assertion),
+            Some(slug),
+            None,
+            "req-agent-root",
+        )
+        .await
+        .expect_err("an Agent root is refused");
+        assert!(
+            matches!(refused.0, WyrdError::WorkloadUidRefused { .. }),
+            "{:?}",
+            refused.0
+        );
     }
 
     #[tokio::test]

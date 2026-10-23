@@ -16,7 +16,7 @@
 //! administrator cannot raise anyone's authority.
 
 use axum::Json;
-use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use secrecy::ExposeSecret;
@@ -46,7 +46,7 @@ use wyrd_sql::queries::auth::{
 
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::http::error::{WyrdErrorResponse, internal_failure, path_rejection};
+use crate::http::error::{WyrdErrorResponse, body_rejection, internal_failure, path_rejection};
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -245,8 +245,9 @@ async fn mint_credential(
     responses(
         (status = 200, description = "Principal created with its first credential, returned once",
          body = CreateServicePrincipalResponse),
-        (status = 400, description = "A requested role name is invalid or does not exist in \
-          this tenant (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "The body is not a valid request, such as a family that \
+          is not a Service, or a requested role name is invalid or does not exist in this \
+          tenant (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
@@ -266,8 +267,9 @@ async fn mint_credential(
 async fn create_service_principal(
     State(state): State<AppState>,
     caller: Caller,
-    Json(request): Json<CreateServicePrincipalRequest>,
+    request: Result<Json<CreateServicePrincipalRequest>, JsonRejection>,
 ) -> Result<Json<CreateServicePrincipalResponse>, WyrdErrorResponse> {
+    let Json(request) = request.map_err(|rejection| body_rejection(&rejection))?;
     for role in &request.roles {
         RoleRef::new(role).map_err(|_| {
             WyrdErrorResponse::from(WyrdError::Validation {
@@ -858,7 +860,8 @@ async fn revoke_principal_role(
     responses(
         (status = 200, description = "The account carries exactly this restriction",
          body = PrincipalSummary),
-        (status = 400, description = "The id is not a valid UUID, or names a User \
+        (status = 400, description = "The id is not a valid UUID or names a User, or the \
+          body is not a restriction, such as a family that is not a Service \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
@@ -881,9 +884,10 @@ async fn set_principal_workload_restriction(
     State(state): State<AppState>,
     caller: Caller,
     target: Result<Path<Uuid>, PathRejection>,
-    Json(restriction): Json<WorkloadRestriction>,
+    restriction: Result<Json<WorkloadRestriction>, JsonRejection>,
 ) -> Result<Json<PrincipalSummary>, WyrdErrorResponse> {
     let Path(principal_id) = target.map_err(|rejection| path_rejection(&rejection))?;
+    let Json(restriction) = restriction.map_err(|rejection| body_rejection(&rejection))?;
     set_workload_restriction_for(&state, &caller, principal_id, &restriction)
         .await
         .map(Json)

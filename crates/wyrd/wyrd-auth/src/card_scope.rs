@@ -35,7 +35,7 @@ pub const MINT_KIND_JWT_BEARER: CardScopeMintKind = CardScopeMintKind::JwtBearer
 
 /// Validate an explicitly selected workload root and resolve its graph.
 ///
-/// The root must be an active Service or Agent Card version in the caller's
+/// The root must be an active Service Card version in the caller's
 /// tenant that `restriction` allows; `None` is an unrestricted caller. The
 /// graph walk is tenant-scoped, fail-closed, cycle-guarded, and capped; only
 /// observation-target kinds are included and expanded, and every member

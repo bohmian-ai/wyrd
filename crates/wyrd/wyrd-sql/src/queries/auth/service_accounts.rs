@@ -105,7 +105,7 @@ impl ApiKeyLookupRow {
 ///
 /// # Errors
 /// Returns [`sqlx::Error::Decode`] when exactly one half is present, the kind
-/// is not `Service` or `Agent`, or the name is not a Card name; the table's
+/// is not `Service`, or the name is not a Card name; the table's
 /// check constraints rule all of these out.
 pub fn workload_family(
     kind: Option<&str>,
@@ -117,7 +117,6 @@ pub fn workload_family(
         (Some(kind), Some(name)) => {
             let kind = match kind {
                 "Service" => WorkloadKind::Service,
-                "Agent" => WorkloadKind::Agent,
                 other => return Err(decode(format!("unknown restriction kind {other:?}"))),
             };
             let name = CardName::new(name).map_err(|error| decode(error.to_string()))?;
@@ -517,13 +516,14 @@ mod tests {
     #[test]
     fn stored_restriction_decodes_only_complete_families() {
         assert!(workload_family(None, None).expect("unrestricted").is_none());
-        let family = workload_family(Some("Agent"), Some("planner"))
+        let family = workload_family(Some("Service"), Some("planner"))
             .expect("valid pair")
             .expect("restricted");
-        assert_eq!(family.kind, WorkloadKind::Agent);
+        assert_eq!(family.kind, WorkloadKind::Service);
         assert_eq!(family.name.as_str(), "planner");
         for (kind, name) in [
             (Some("Model"), Some("m")),
+            (Some("Agent"), Some("planner")),
             (Some("Service"), None),
             (None, Some("checkout")),
             (Some("Service"), Some("Not A Name")),

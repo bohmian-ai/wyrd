@@ -1,7 +1,7 @@
 //! Workload restriction and Card-access contracts.
 //!
 //! A Service account is a stable identity that outlives every release. Which
-//! exact Service or Agent version a request runs as is execution context, not
+//! exact Service version a request runs as is execution context, not
 //! account identity: the account's durable [`WorkloadRestriction`] limits which
 //! roots it may select, and every tenant access token signs the resulting
 //! [`CardAccess`] state beside — never inside — the account reference.
@@ -53,13 +53,14 @@ pub fn workload_uid_selector<'a>(
 pub const MAX_SCOPED_CARDS: usize = 32;
 
 /// Card kind a workload family or root may name.
+///
+/// Workloads are Services only: an Agent is a registered subject inside a
+/// Service graph, never a root or a restricting family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum WorkloadKind {
     /// A Service Card family.
     Service,
-    /// An Agent Card family.
-    Agent,
 }
 
 impl WorkloadKind {
@@ -68,7 +69,6 @@ impl WorkloadKind {
     pub const fn card_kind(self) -> CardKind {
         match self {
             Self::Service => CardKind::Service,
-            Self::Agent => CardKind::Agent,
         }
     }
 
@@ -77,7 +77,6 @@ impl WorkloadKind {
     pub const fn from_card_kind(kind: &CardKind) -> Option<Self> {
         match kind {
             CardKind::Service => Some(Self::Service),
-            CardKind::Agent => Some(Self::Agent),
             _ => None,
         }
     }
@@ -87,12 +86,11 @@ impl WorkloadKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Service => "Service",
-            Self::Agent => "Agent",
         }
     }
 }
 
-/// One tenant workload family: every version of one Service or Agent name.
+/// One tenant workload family: every version of one Service name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -283,12 +281,16 @@ mod tests {
                 "{refused} must not parse as Card access"
             );
         }
-        assert!(
-            serde_json::from_value::<WorkloadRestriction>(
-                json!({"mode": "family", "kind": "Model", "name": "m"})
-            )
-            .is_err()
-        );
+        for kind in ["Model", "Agent"] {
+            assert!(
+                serde_json::from_value::<WorkloadRestriction>(
+                    json!({"mode": "family", "kind": kind, "name": "m"})
+                )
+                .is_err(),
+                "{kind} is not a workload family kind"
+            );
+        }
+        assert_eq!(WorkloadKind::from_card_kind(&CardKind::Agent), None);
     }
 
     /// Delegation intersects scopes by UID, treats any-registered as identity,

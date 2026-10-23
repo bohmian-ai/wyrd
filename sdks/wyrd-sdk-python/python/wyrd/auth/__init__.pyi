@@ -41,13 +41,13 @@ class Unrestricted(TypedDict):
     mode: Literal["unrestricted"]
 
 class FamilyRestriction(TypedDict):
-    """Limited to roots of the one Service or Agent family ``kind``/``name``.
+    """Limited to roots of the one Service family ``kind``/``name``.
 
     The account is that family's unique scheduled runtime account.
     """
 
     mode: Literal["family"]
-    kind: Literal["Service", "Agent"]
+    kind: Literal["Service"]
     name: str
 
 WorkloadRestriction: TypeAlias = Unrestricted | FamilyRestriction

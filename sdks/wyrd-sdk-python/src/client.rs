@@ -244,7 +244,7 @@ impl PyWyrdClient {
     ///   (`wyrd_sk_…`), exchanged for a short-lived access token and renewed,
     ///   or an access token, presented as-is. `None` resolves the chain.
     /// * `grpc_url` - The gRPC endpoint, or `None` to derive it.
-    /// * `workload_uid` - Exact Service or Agent Card UID the client runs as,
+    /// * `workload_uid` - Exact Service Card UID the client runs as,
     ///   as [`Self::for_workload`] selects it, or `None` for
     ///   `WYRD_WORKLOAD_UID`, else rootless work.
     ///
@@ -351,14 +351,14 @@ impl PyWyrdClient {
             .map_err(WyrdPyError::from)
     }
 
-    /// The exact Service or Agent Card UID this client runs as, or `None`
+    /// The exact Service Card UID this client runs as, or `None`
     /// for rootless work.
     #[getter]
     fn workload_uid(&self) -> Option<&str> {
         self.inner.workload_uid().map(CardUid::as_str)
     }
 
-    /// Return a client that runs as the exact Service or Agent root
+    /// Return a client that runs as the exact Service root
     /// `workload_uid`, sharing this client's credential and connection pools
     /// but not its token cache. Performs no IO; the server validates the root
     /// on first use.

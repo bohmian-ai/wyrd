@@ -34,7 +34,7 @@ ALTER TABLE wyrd.auth_service_accounts
     DROP COLUMN card_ref,
     DROP COLUMN version,
     DROP COLUMN last_authenticated_at,
-    ADD COLUMN restriction_kind TEXT CHECK (restriction_kind IN ('Service', 'Agent')),
+    ADD COLUMN restriction_kind TEXT CHECK (restriction_kind = 'Service'),
     ADD COLUMN restriction_name TEXT,
     ADD CONSTRAINT auth_service_accounts_principal_kind_check
         CHECK (principal_kind IN ('tenant_admin', 'service', 'system')),

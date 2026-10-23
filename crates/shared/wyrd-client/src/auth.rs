@@ -661,7 +661,7 @@ pub struct AuthMiddleware {
     /// Set once the first short-TTL token is observed, so the operational
     /// warning fires at most once per middleware instance (see [`Self::exchange`]).
     short_ttl_warned: AtomicBool,
-    /// The exact Service or Agent root this middleware's requests run as, or
+    /// The exact Service root this middleware's requests run as, or
     /// `None` for rootless work. An exchanged credential requests it in the
     /// grant; every request also carries it on [`WORKLOAD_UID_HEADER`]. Fixed
     /// for the middleware's lifetime, so its one cache never mixes contexts.
@@ -821,7 +821,7 @@ impl AuthMiddleware {
         })
     }
 
-    /// Derive a middleware whose requests run as the exact Service or Agent
+    /// Derive a middleware whose requests run as the exact Service
     /// root `uid`.
     ///
     /// The derived middleware shares this one's `/auth` connection pool and
@@ -835,7 +835,7 @@ impl AuthMiddleware {
     /// made here; the server validates the root on first use.
     ///
     /// # Arguments
-    /// * `uid` - Exact Service or Agent Card UID the derived middleware runs as.
+    /// * `uid` - Exact Service Card UID the derived middleware runs as.
     #[must_use]
     pub fn for_workload(self: &Arc<Self>, uid: CardUid) -> Arc<Self> {
         let (credential, workload_uid) = match &self.credential {

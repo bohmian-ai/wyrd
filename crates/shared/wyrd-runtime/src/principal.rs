@@ -16,7 +16,7 @@ pub use wyrd_spec::auth::PrincipalId;
 /// The authenticated identity behind a request.
 ///
 /// Account identity (`id`, `kind`, `tenant_id`) is stable across releases.
-/// Which exact Service or Agent version the request runs as is execution
+/// Which exact Service version the request runs as is execution
 /// context carried beside it in `workload_uid`, and which Cards it may
 /// attribute evidence to is the signed `card_access` limit; neither changes
 /// the account.
@@ -45,7 +45,7 @@ pub struct Principal {
     ///
     /// Independent of `effective_permissions`: Card-attributed work needs both.
     pub card_access: CardAccess,
-    /// The subject's exact Service or Agent root, when one was selected.
+    /// The subject's exact Service root, when one was selected.
     ///
     /// Present exactly when the subject's own context is a validated root.
     /// For delegated work the owning root is the current actor's instead; see

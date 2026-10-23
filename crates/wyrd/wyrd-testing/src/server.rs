@@ -3071,7 +3071,7 @@ impl WyrdTestServer {
     /// in the fixture tenant.
     ///
     /// # Errors
-    /// Returns an error when the Card is not a Service or Agent, or when SQL
+    /// Returns an error when the Card is not a Service, or when SQL
     /// writes or API-key hashing fail.
     pub async fn credential_registered_service(
         &self,
@@ -3312,18 +3312,6 @@ impl WyrdTestServer {
         .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
         Ok(api_key.secret)
-    }
-
-    /// Bootstrap an Agent principal through fixture SQL.
-    ///
-    /// # Errors
-    /// Returns an error when SQL writes or API-key hashing fail.
-    pub async fn bootstrap_agent(
-        &self,
-        name: &str,
-        roles: &[&str],
-    ) -> Result<Bootstrap, WyrdTestServerError> {
-        self.bootstrap_machine(name, roles, CardKind::Agent).await
     }
 
     /// Seed one non-builtin role carrying exactly the requested permissions.
@@ -3618,7 +3606,7 @@ impl WyrdTestServer {
     /// fresh one when it has none.
     ///
     /// # Errors
-    /// Returns an error when the card kind is not Service/Agent, or SQL fails.
+    /// Returns an error when the card kind is not Service, or SQL fails.
     pub async fn seed_card_principal(
         &self,
         card_ref: &CardRef,
@@ -3635,7 +3623,7 @@ impl WyrdTestServer {
     /// tenant A.
     ///
     /// # Errors
-    /// Returns an error when the card kind is not Service/Agent, or SQL fails.
+    /// Returns an error when the card kind is not Service, or SQL fails.
     ///
     /// # Panics
     ///
@@ -5534,7 +5522,7 @@ fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, WyrdTestServerError> 
 /// family's unique scheduled runtime account.
 ///
 /// # Errors
-/// Returns an error when `kind` is not Service or Agent, or SQL fails.
+/// Returns an error when `kind` is not Service, or SQL fails.
 pub(crate) async fn family_account(
     conn: &mut TenantConn<'_>,
     kind: &CardKind,
@@ -5543,7 +5531,7 @@ pub(crate) async fn family_account(
 ) -> Result<Uuid, WyrdTestServerError> {
     let workload_kind = WorkloadKind::from_card_kind(kind).ok_or_else(|| {
         WyrdTestServerError::Unsupported(format!(
-            "a family account requires a Service or Agent card, got {kind:?}"
+            "a family account requires a Service card, got {kind:?}"
         ))
     })?;
     let family = WorkloadFamily {

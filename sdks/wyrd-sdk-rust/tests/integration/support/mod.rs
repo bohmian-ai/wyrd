@@ -575,7 +575,7 @@ pub async fn runtime_account(admin: &WyrdClient, card: &CardRef) -> (PrincipalId
             description: None,
             workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
                 kind: WorkloadKind::from_card_kind(&card.kind)
-                    .expect("a runtime account names a Service or Agent"),
+                    .expect("a runtime account names a Service"),
                 name: card.name.clone(),
             })),
         })

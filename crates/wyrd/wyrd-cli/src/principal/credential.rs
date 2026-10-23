@@ -7,7 +7,7 @@
 
 use std::process::ExitCode;
 
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use url::Url;
 use uuid::Uuid;
 use wyrd_spec::auth::{
@@ -33,40 +33,24 @@ pub enum CredentialCommand {
     SetRestriction(SetRestrictionArgs),
 }
 
-/// CLI mirror of [`WorkloadKind`].
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum WorkloadKindCli {
-    /// A Service Card family.
-    Service,
-    /// An Agent Card family.
-    Agent,
-}
-
-/// An optional workload family, given as kind and name together.
+/// An optional Service workload family, named by its Card name.
 #[derive(Debug, Args)]
 pub struct WorkloadFamilyArgs {
-    /// Kind of the family the account is restricted to.
-    #[arg(long, value_enum, requires = "workload_name")]
-    pub workload_kind: Option<WorkloadKindCli>,
-    /// Card name of the family the account is restricted to.
-    #[arg(long, value_name = "NAME", requires = "workload_kind")]
+    /// Card name of the Service family the account is restricted to.
+    #[arg(long, value_name = "NAME")]
     pub workload_name: Option<CardName>,
 }
 
 impl WorkloadFamilyArgs {
-    /// The restriction these flags name: a family when both are given,
-    /// otherwise unrestricted.
+    /// The restriction these flags name: the Service family when a name is
+    /// given, otherwise unrestricted.
     fn restriction(self) -> WorkloadRestriction {
-        match (self.workload_kind, self.workload_name) {
-            (Some(kind), Some(name)) => WorkloadRestriction::Family(WorkloadFamily {
-                kind: match kind {
-                    WorkloadKindCli::Service => WorkloadKind::Service,
-                    WorkloadKindCli::Agent => WorkloadKind::Agent,
-                },
+        self.workload_name
+            .map(|name| WorkloadFamily {
+                kind: WorkloadKind::Service,
                 name,
-            }),
-            _ => WorkloadRestriction::Unrestricted,
-        }
+            })
+            .into()
     }
 }
 

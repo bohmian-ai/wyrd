@@ -1575,7 +1575,7 @@ export class WyrdClient {
    * as-is (else `WYRD_ACCESS_TOKEN`, then `WYRD_WORKLOAD_TOKEN` with its
    * tenant, then `WYRD_API_KEY`, then a saved login). `grpcUrl`, the Bifrost
    * ingest endpoint (else `WYRD_GRPC_URL`, else the server's host on port
-   * `50051`). `workloadUid`, the exact Service or Agent Card UID the client
+   * `50051`). `workloadUid`, the exact Service Card UID the client
    * runs as, as {@link WyrdClient.forWorkload} selects it (else
    * `WYRD_WORKLOAD_UID`, else rootless work).
    * @returns The client.
@@ -1610,13 +1610,13 @@ export class WyrdClient {
     return this.#native.grpcUrl;
   }
 
-  /** The exact Service or Agent Card UID this client runs as, or `undefined` for rootless work. */
+  /** The exact Service Card UID this client runs as, or `undefined` for rootless work. */
   get workloadUid(): string | undefined {
     return this.#native.workloadUid ?? undefined;
   }
 
   /**
-   * Return a client that runs as the exact Service or Agent root `workloadUid`.
+   * Return a client that runs as the exact Service root `workloadUid`.
    *
    * The returned client shares this client's credential and connection pools
    * but keeps its own token cache: an API key or workload token requests the
@@ -1624,7 +1624,7 @@ export class WyrdClient {
    * `x-wyrd-workload-uid`. No network call is made; the server validates the
    * root on first use.
    *
-   * @param workloadUid - The exact Service or Agent Card UID to run as.
+   * @param workloadUid - The exact Service Card UID to run as.
    * @returns The rooted client.
    * @throws {@link WyrdError}: `WYRD_SPEC_400_VALIDATION` when `workloadUid`
    * is not a UUIDv7.

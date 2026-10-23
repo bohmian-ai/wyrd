@@ -373,10 +373,7 @@ fn delegation_chain(
     subject: &VerifiedToken,
     actor: &VerifiedToken,
 ) -> Result<(Vec<DelegationStep>, CardUid), DelegateError> {
-    if matches!(
-        subject.principal.kind,
-        wyrd_runtime::PrincipalKind::System { .. }
-    ) {
+    if matches!(subject.principal.kind, wyrd_runtime::PrincipalKind::System) {
         return Err(DelegateError::MalformedIdentity("subject_is_system"));
     }
     if !actor.delegation_chain.is_empty() {
@@ -574,14 +571,13 @@ pub(crate) mod pg_tests {
     use chrono::{Duration, Utc};
     use secrecy::{ExposeSecret, SecretString};
     use serde_json::Value as JsonValue;
-    use sqlx::types::Json;
     use uuid::Uuid;
     use wyrd_auth_issue::{AccessGrant, IssuingKey};
     use wyrd_auth_verify::{
         ActClaim, AuthError, Kid, TokenAudience, TokenPrincipalRef, TokenVerifier,
         WyrdAuthVerifySettings, public_key_from_pem,
     };
-    use wyrd_dev_fixtures::cards::seed_backing_card;
+    use wyrd_dev_fixtures::cards::{seed_backing_card, seed_card_with_spec};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{
         Action, BifrostPermissionScope, BifrostTableScope, Permission, PermissionScope,
@@ -589,13 +585,18 @@ pub(crate) mod pg_tests {
     };
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::auth::{
+        Attribution, CardAccess, FamilyRestriction, PrincipalKindTag, WorkloadFamily, WorkloadKind,
+    };
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::CardName;
-    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use wyrd_spec::ids::{CardName, CardUid};
+    use wyrd_spec::reference::CardRef;
     use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
+    use wyrd_spec::vala::audit_detail::AuditDelegationStep;
     use wyrd_sql::TenantConn;
+    use wyrd_sql::queries::auth::insert_service_account;
+    use wyrd_sql::queries::cards::get_card_by_ref;
 
     use crate::audit::test_audit::RecordedAudit;
     use wyrd_sql::queries::auth::{ApiKeyStatus, grant_role_to_service_account, insert_role};
@@ -616,7 +617,7 @@ pub(crate) mod pg_tests {
     ///
     /// # Panics
     /// Panics when `name` is not a valid Card name.
-    fn named_service_card_ref(name: &str) -> CardRef {
+    pub(crate) fn named_service_card_ref(name: &str) -> CardRef {
         CardRef {
             kind: CardKind::Service,
             name: CardName::new(name).expect("static name is valid"),
@@ -674,8 +675,9 @@ pub(crate) mod pg_tests {
         }
     }
 
-    /// Mint a direct `wyrd`-audience token for `principal` carrying
-    /// `permissions`, attributed to `credential_id`, with an optional `act`.
+    /// Mint a `wyrd`-audience token for `principal` carrying `permissions`
+    /// and `card_access`, attributed to `credential_id`, with an optional
+    /// selected `root` and `act`.
     ///
     /// # Panics
     /// Panics when the test issuing key cannot sign the token.
@@ -683,6 +685,8 @@ pub(crate) mod pg_tests {
         principal: TokenPrincipalRef,
         permissions: PermissionSet,
         credential_id: Option<Uuid>,
+        card_access: CardAccess,
+        root: Option<CardUid>,
         act: Option<Box<ActClaim>>,
     ) -> String {
         test_issuing_key()
@@ -691,6 +695,8 @@ pub(crate) mod pg_tests {
                     principal,
                     roles: vec![],
                     permissions,
+                    card_access,
+                    workload_uid: root,
                     credential_id,
                     act,
                     audience: TokenAudience::Wyrd,
@@ -700,22 +706,39 @@ pub(crate) mod pg_tests {
             .expect("test token issues")
     }
 
-    /// A Card-bound Service principal reference named `name`.
-    fn service_ref(id: Uuid, tenant: DataTenantId, name: &str) -> TokenPrincipalRef {
+    /// A Service account principal reference.
+    fn service_ref(id: Uuid, tenant: DataTenantId) -> TokenPrincipalRef {
         TokenPrincipalRef {
             id: PrincipalId::new(id),
             kind: PrincipalKindTag::Service,
             tenant_id: tenant,
-            card_ref: Some(named_service_card_ref(name)),
-            card_ref_scope: CardRefScope::default(),
         }
     }
 
-    /// Mint a Card-bound Service subject token carrying `permissions`.
+    /// A fresh UUIDv7 Card UID that names no registered Card.
+    fn unregistered_uid() -> CardUid {
+        CardUid::from_uuid(Uuid::now_v7()).expect("v7 uuid is a Card UID")
+    }
+
+    /// The Service family named `name`.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid Card name.
+    pub(crate) fn service_family(name: &str) -> WorkloadFamily {
+        WorkloadFamily {
+            kind: WorkloadKind::Service,
+            name: CardName::new(name).expect("static name is valid"),
+        }
+    }
+
+    /// Mint a rootless unrestricted Service subject token carrying
+    /// `permissions`.
     fn subject_token(tenant: DataTenantId, permissions: PermissionSet) -> String {
         mint(
-            service_ref(Uuid::new_v4(), tenant, "test-service"),
+            service_ref(Uuid::new_v4(), tenant),
             permissions,
+            None,
+            CardAccess::AnyRegistered,
             None,
             None,
         )
@@ -744,35 +767,60 @@ pub(crate) mod pg_tests {
         user_id
     }
 
-    /// Seed `card_ref`'s backing Card and one active service account bound to
-    /// it, returning the account id an API key can be issued to.
+    /// Seed one active stable Service account created by `creator`,
+    /// restricted to `family` when given, and return its id.
     ///
     /// # Panics
-    /// Panics when the Card or account insert fails.
+    /// Panics when the account insert fails, including a second live account
+    /// for one family.
     pub(crate) async fn insert_test_service_account(
         conn: &mut TenantConn<'_>,
-        tenant_id: DataTenantId,
         creator: Uuid,
-        card_ref: &CardRef,
+        family: Option<&WorkloadFamily>,
     ) -> Uuid {
-        seed_backing_card(conn, card_ref, creator).await;
-        let sa_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO wyrd.auth_service_accounts
-                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, name, version, status, sub_principal_id, act_principal_id)
-             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, 'active', $7, $7)",
+        let sa_id = Uuid::now_v7();
+        insert_service_account(
+            conn,
+            sa_id,
+            "service",
+            family,
+            &format!("svc-{sa_id}"),
+            None,
+            Attribution::direct(PrincipalId::new(creator)),
         )
-        .bind(sa_id)
-        .bind(tenant_id.as_uuid())
-        .bind(Uuid::now_v7())
-        .bind(Json(card_ref.clone()))
-        .bind(format!("svc-{sa_id}"))
-        .bind(card_ref.version.as_str())
-        .bind(creator)
-        .execute(&mut **conn.transaction())
         .await
         .expect("service account inserts");
         sa_id
+    }
+
+    /// Seed `card_ref`'s backing Card and return its registry UID, the root a
+    /// grant can select.
+    ///
+    /// # Panics
+    /// Panics when the Card insert or read-back fails.
+    pub(crate) async fn seed_root(
+        conn: &mut TenantConn<'_>,
+        card_ref: &CardRef,
+        creator: Uuid,
+    ) -> CardUid {
+        seed_backing_card(conn, card_ref, creator).await;
+        root_uid(conn, card_ref).await
+    }
+
+    /// The registry UID of the already seeded `card_ref`.
+    ///
+    /// # Panics
+    /// Panics when the Card row cannot be read.
+    pub(crate) async fn root_uid(conn: &mut TenantConn<'_>, card_ref: &CardRef) -> CardUid {
+        get_card_by_ref(
+            conn,
+            card_ref.kind.clone(),
+            &card_ref.name,
+            &card_ref.version,
+        )
+        .await
+        .expect("seeded card row loads")
+        .card_uid
     }
 
     async fn insert_lifecycle_key(
@@ -810,72 +858,46 @@ pub(crate) mod pg_tests {
         serde_json::to_value(error.problem()).expect("a problem serializes")
     }
 
+    /// Rebuilding an `act` chain keeps RFC order, each actor's root, and its
+    /// credential provenance, and refuses a rootless step instead of dropping
+    /// an actor.
+    ///
+    /// # Panics
+    /// Panics when the rebuilt chain differs or a rootless step is accepted.
     #[test]
     fn act_from_chain_roundtrip() {
-        use wyrd_runtime::{
-            DelegationStep, PrincipalId, PrincipalKind, PrincipalRef as RuntimePrincipalRef,
-        };
-        use wyrd_semver::VersionBlock;
-        use wyrd_spec::DataTenantId;
-        use wyrd_spec::envelope::CardKind;
-        use wyrd_spec::ids::CardName;
-        use wyrd_spec::reference::CardRef;
+        use wyrd_runtime::{DelegationStep, PrincipalKind, PrincipalRef as RuntimePrincipalRef};
 
-        let tenant_id: DataTenantId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
-            .parse()
-            .expect("static tenant id");
-        let make_card = |name: &str| CardRef {
-            kind: CardKind::Service,
-            name: CardName::new(name).expect("static name"),
-            version: VersionBlock::parse("1.0.0").expect("static version"),
-            uid: None,
-        };
-        let id_a: PrincipalId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"
-            .parse()
-            .expect("static id");
-        let id_b: PrincipalId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03"
-            .parse()
-            .expect("static id");
-        let initiator_ref = make_card("initiator");
-        let a = DelegationStep {
+        let tenant_id = DataTenantId::new_v7();
+        let step = |root: Option<CardUid>, credential_id| DelegationStep {
             principal: RuntimePrincipalRef {
-                id: id_a,
-                kind: PrincipalKind::Service {
-                    card_ref: Some(initiator_ref.clone()),
-                    card_ref_scope: CardRefScope::own(&initiator_ref),
-                },
+                id: PrincipalId::new(Uuid::now_v7()),
+                kind: PrincipalKind::Service,
+                workload_uid: root,
+                credential_id,
             },
         };
-        let immediate_ref = make_card("immediate");
-        let b = DelegationStep {
-            principal: RuntimePrincipalRef {
-                id: id_b,
-                kind: PrincipalKind::Service {
-                    card_ref: Some(immediate_ref.clone()),
-                    card_ref_scope: CardRefScope::own(&immediate_ref),
-                },
-            },
-        };
+        let (root_a, root_b) = (unregistered_uid(), unregistered_uid());
+        let a = step(Some(root_a.clone()), None);
+        let b = step(Some(root_b.clone()), Some(ACTOR_CREDENTIAL));
 
         let result = super::act_from_chain(&[a.clone(), b.clone()], tenant_id)
+            .expect("verified steps build")
             .expect("non-empty chain builds act");
 
         assert_eq!(result.sub, b.principal.id.to_string());
-        assert_eq!(
-            result.act.as_ref().expect("inner act present").sub,
-            a.principal.id.to_string()
-        );
+        assert_eq!(result.workload_uid, root_b);
+        assert_eq!(result.cid, Some(ACTOR_CREDENTIAL.to_string()));
+        let inner = result.act.as_ref().expect("inner act present");
+        assert_eq!(inner.sub, a.principal.id.to_string());
+        assert_eq!(inner.workload_uid, root_a);
+        assert_eq!(inner.cid, None);
+        assert!(inner.act.is_none());
 
-        // Round-trip: walk outermost-first, reverse → initiator-first order
-        let mut flat = Vec::new();
-        let mut cur = Some(result.as_ref());
-        while let Some(layer) = cur {
-            flat.push(layer.sub.clone());
-            cur = layer.act.as_deref();
-        }
-        flat.reverse();
-        assert_eq!(flat[0], a.principal.id.to_string());
-        assert_eq!(flat[1], b.principal.id.to_string());
+        assert!(matches!(
+            super::act_from_chain(&[a, step(None, None)], tenant_id),
+            Err(DelegateError::MalformedIdentity("actor_has_no_root"))
+        ));
     }
 
     /// Seed a live API key for `principal_id` in `conn`'s open transaction and
@@ -939,10 +961,10 @@ pub(crate) mod pg_tests {
         (records.len(), credential)
     }
 
-    /// A Card-free tenant grant is recorded and names the key that bought it.
+    /// A rootless tenant grant is recorded and names the key that bought it.
     ///
-    /// A tenant administrator binds no Card, so it takes the Card-free branch
-    /// and writes no scope mint. Without a grant record on that branch the most
+    /// A tenant administrator selecting no root takes the rootless branch and
+    /// writes no scope mint. Without a grant record on that branch the most
     /// privileged tenant principal could exchange its credential repeatedly and
     /// leave nothing behind to attribute afterwards.
     ///
@@ -950,7 +972,7 @@ pub(crate) mod pg_tests {
     /// Panics when the exchange fails, when the grant is not recorded exactly
     /// once, or when the record does not name the presented key.
     #[tokio::test]
-    async fn a_card_free_exchange_commits_one_attributed_grant_record() {
+    async fn a_rootless_exchange_commits_one_attributed_grant_record() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
@@ -974,7 +996,7 @@ pub(crate) mod pg_tests {
 
         let service = exchange_service(&audit);
         service
-            .execute(&mut conn, secret, "req-cardfree-grant")
+            .execute(&mut conn, secret, None, "req-cardfree-grant")
             .await
             .expect("a card-free administrator exchanges its credential");
 
@@ -987,17 +1009,17 @@ pub(crate) mod pg_tests {
         );
     }
 
-    /// A Card-bound tenant grant records the exchange and the scope mint.
+    /// A rooted tenant grant records the exchange and the scope mint.
     ///
     /// They answer different questions — which credential bought a token, and
-    /// what emit authority the Card conferred — so one cannot stand in for the
-    /// other.
+    /// what emit authority the selected root conferred — so one cannot stand
+    /// in for the other.
     ///
     /// # Panics
     /// Panics when the exchange fails, when the grant is not recorded exactly
     /// once naming the key, or when the scope mint is missing.
     #[tokio::test]
-    async fn a_card_bound_exchange_records_the_grant_and_the_scope_mint() {
+    async fn a_rooted_exchange_records_the_grant_and_the_scope_mint() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
@@ -1005,14 +1027,15 @@ pub(crate) mod pg_tests {
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+        let root = seed_root(&mut conn, &card_ref, user_id).await;
+        let sa_id = insert_test_service_account(&mut conn, user_id, None).await;
         let (api_key_id, secret) = insert_live_api_key(&mut conn, tenant, sa_id, user_id).await;
 
         let service = exchange_service(&audit);
         service
-            .execute(&mut conn, secret, "req-cardbound-grant")
+            .execute(&mut conn, secret, Some(root), "req-cardbound-grant")
             .await
-            .expect("a card-bound service exchanges its credential");
+            .expect("a rooted service exchanges its credential");
 
         let (count, credential) = staged_exchange(&audit, tenant, sa_id);
         assert_eq!(count, 1, "exactly one grant record is staged");
@@ -1046,11 +1069,10 @@ pub(crate) mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
-        let card_ref = test_service_card_ref();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+        let sa_id = insert_test_service_account(&mut conn, user_id, None).await;
 
         let key = WyrdApiKey::generate(tenant);
         let hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
@@ -1070,7 +1092,7 @@ pub(crate) mod pg_tests {
         .expect("live api key inserts");
 
         let exchanged = exchange_service(&audit)
-            .execute(&mut conn, key.secret, "req-api-key-no-refresh")
+            .execute(&mut conn, key.secret, None, "req-api-key-no-refresh")
             .await
             .expect("a live api key exchanges");
 
@@ -1104,11 +1126,10 @@ pub(crate) mod pg_tests {
     async fn every_invalid_api_key_condition_renders_one_problem() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let card_ref = test_service_card_ref();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+        let sa_id = insert_test_service_account(&mut conn, user_id, None).await;
 
         insert_lifecycle_key(
             &mut conn,
@@ -1165,13 +1186,8 @@ pub(crate) mod pg_tests {
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
         creator: Uuid,
-        base_card: &CardRef,
     ) -> SecretString {
-        let card_ref = CardRef {
-            name: CardName::new("suspended-exchange-subject").expect("static name"),
-            ..base_card.clone()
-        };
-        let sa_id = insert_test_service_account(conn, tenant, creator, &card_ref).await;
+        let sa_id = insert_test_service_account(conn, creator, None).await;
         sqlx::query("UPDATE wyrd.auth_service_accounts SET status = 'suspended' WHERE id = $1")
             .bind(sa_id)
             .execute(&mut **conn.transaction())
@@ -1190,10 +1206,7 @@ pub(crate) mod pg_tests {
     /// # Panics
     ///
     /// Panics when any seed write, commit, or the suspension fails.
-    async fn seed_unadmitted_tenant_key(
-        fixture: &PgFixture,
-        card_ref: &CardRef,
-    ) -> (DataTenantId, SecretString) {
+    async fn seed_unadmitted_tenant_key(fixture: &PgFixture) -> (DataTenantId, SecretString) {
         let unadmitted_tenant = fixture
             .seed_additional_tenant("unadmitted")
             .await
@@ -1203,13 +1216,8 @@ pub(crate) mod pg_tests {
             .await
             .expect("unadmitted tenant conn opens");
         let unadmitted_user = insert_test_user(&mut unadmitted_conn, unadmitted_tenant).await;
-        let unadmitted_sa = insert_test_service_account(
-            &mut unadmitted_conn,
-            unadmitted_tenant,
-            unadmitted_user,
-            card_ref,
-        )
-        .await;
+        let unadmitted_sa =
+            insert_test_service_account(&mut unadmitted_conn, unadmitted_user, None).await;
         let (_, unadmitted) = insert_live_api_key(
             &mut unadmitted_conn,
             unadmitted_tenant,
@@ -1244,7 +1252,6 @@ pub(crate) mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
-        let card_ref = test_service_card_ref();
 
         let unknown = WyrdApiKey::generate(tenant);
         let revoked = WyrdApiKey::generate(tenant);
@@ -1253,7 +1260,7 @@ pub(crate) mod pg_tests {
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        let live_sa = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+        let live_sa = insert_test_service_account(&mut conn, user_id, None).await;
 
         insert_lifecycle_key(
             &mut conn,
@@ -1276,7 +1283,7 @@ pub(crate) mod pg_tests {
         )
         .await;
 
-        let disabled = seed_suspended_account_key(&mut conn, tenant, user_id, &card_ref).await;
+        let disabled = seed_suspended_account_key(&mut conn, tenant, user_id).await;
 
         let expected = rendered(&super::api_key_invalid());
         let service = exchange_service(&audit);
@@ -1290,7 +1297,7 @@ pub(crate) mod pg_tests {
         ];
         for (label, presented) in cases {
             let error = service
-                .execute(&mut conn, presented, &format!("req-{label}"))
+                .execute(&mut conn, presented, None, &format!("req-{label}"))
                 .await
                 .expect_err("an invalid api key is refused");
             let prefix = "probe";
@@ -1304,13 +1311,13 @@ pub(crate) mod pg_tests {
         // Admission is decided on the presented key's own tenant, so the key
         // lives in a second tenant that is suspended once it holds a live
         // credential; the shared issuer then refuses it after verification.
-        let (unadmitted_tenant, unadmitted) = seed_unadmitted_tenant_key(&fixture, &card_ref).await;
+        let (unadmitted_tenant, unadmitted) = seed_unadmitted_tenant_key(&fixture).await;
         let mut unadmitted_conn = fixture
             .tenant_conn_for(unadmitted_tenant)
             .await
             .expect("unadmitted tenant conn reopens");
         let error = service
-            .execute(&mut unadmitted_conn, unadmitted, "req-unadmitted")
+            .execute(&mut unadmitted_conn, unadmitted, None, "req-unadmitted")
             .await
             .expect_err("a tenant that does not admit credentials is refused");
         assert!(matches!(error, ExchangeError::TenantNotAdmitting));
@@ -1356,7 +1363,7 @@ pub(crate) mod pg_tests {
             .await
             .expect("tenant B conn opens");
         let result = exchange_service(&audit)
-            .execute(&mut conn, key.secret, "req-cross-tenant")
+            .execute(&mut conn, key.secret, None, "req-cross-tenant")
             .await;
 
         assert!(matches!(result, Err(ExchangeError::CrossTenant)));
@@ -1367,12 +1374,11 @@ pub(crate) mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
-        let card_ref = test_service_card_ref();
         let key = WyrdApiKey::generate(tenant);
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+        let sa_id = insert_test_service_account(&mut conn, user_id, None).await;
 
         // Insert the key row with revoked_at = now(). The prefix-lookup query
         // filters on `revoked_at IS NULL`, so this row is invisible and the
@@ -1392,7 +1398,7 @@ pub(crate) mod pg_tests {
         .expect("revoked api key inserts");
 
         let result = exchange_service(&audit)
-            .execute(&mut conn, key.secret, "req-revoked")
+            .execute(&mut conn, key.secret, None, "req-revoked")
             .await;
 
         assert!(matches!(result, Err(ExchangeError::NotFound)));
@@ -1403,12 +1409,11 @@ pub(crate) mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
-        let card_ref = test_service_card_ref();
         let key = WyrdApiKey::generate(tenant);
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+        let sa_id = insert_test_service_account(&mut conn, user_id, None).await;
 
         // Store a verifier that is not this key's SHA-256 digest.
         sqlx::query(
@@ -1426,7 +1431,7 @@ pub(crate) mod pg_tests {
         .expect("api key with wrong hash inserts");
 
         let result = exchange_service(&audit)
-            .execute(&mut conn, key.secret, "req-hash-mismatch")
+            .execute(&mut conn, key.secret, None, "req-hash-mismatch")
             .await;
 
         assert!(matches!(result, Err(ExchangeError::HashMismatch)));
@@ -1437,41 +1442,69 @@ pub(crate) mod pg_tests {
     /// Credential the minted actor token is attributed to.
     const ACTOR_CREDENTIAL: Uuid = Uuid::from_u128(0xAC7);
 
-    /// Seed a Card-bound Service actor holding `permissions` through one role
-    /// and return its id.
+    /// Card name of the actor root's observation-target child.
+    const SHARED_CARD: &str = "delegation-shared";
+
+    /// A seeded delegation actor: its account and the Cards its root reaches.
+    struct SeededActor {
+        /// The actor's stable Service account id.
+        id: Uuid,
+        /// The actor's root, `ACTOR_CARD`, inside the actor's family.
+        root: CardUid,
+        /// The root's one observation-target child, `SHARED_CARD`.
+        shared: CardUid,
+    }
+
+    /// Seed a Service actor restricted to the `ACTOR_CARD` family, holding
+    /// `permissions` through one role, whose root reaches one shared child.
     ///
     /// # Panics
-    /// Panics when the tenant connection, role seed, role grant, or commit
-    /// fails.
-    async fn seed_actor(fixture: &PgFixture, permissions: serde_json::Value) -> Uuid {
+    /// Panics when the tenant connection, a Card, account, role seed, role
+    /// grant, or commit fails.
+    async fn seed_actor(fixture: &PgFixture, permissions: serde_json::Value) -> SeededActor {
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let creator = insert_test_user(&mut conn, tenant).await;
-        let actor = insert_test_service_account(
-            &mut conn,
-            tenant,
-            creator,
-            &named_service_card_ref(ACTOR_CARD),
+        let shared_ref = named_service_card_ref(SHARED_CARD);
+        let shared = seed_root(&mut conn, &shared_ref, creator).await;
+        let root_ref = named_service_card_ref(ACTOR_CARD);
+        let root_spec = Spec::from_kind_and_value(
+            &CardKind::Service,
+            serde_json::json!({
+                "components": [{
+                    "alias": "shared",
+                    "ref": { "kind": "Service", "name": SHARED_CARD, "version": "1.0.0" },
+                }],
+            }),
         )
-        .await;
+        .expect("actor root spec decodes");
+        seed_card_with_spec(&mut conn, &root_ref, &root_spec, creator).await;
+        let root = root_uid(&mut conn, &root_ref).await;
+        let id = insert_test_service_account(&mut conn, creator, Some(&service_family(ACTOR_CARD)))
+            .await;
         let role_id = Uuid::new_v4();
         insert_role(&mut conn, role_id, "delegation_actor", &permissions, false)
             .await
             .expect("actor role seeds");
-        grant_role_to_service_account(&mut conn, actor, role_id)
+        grant_role_to_service_account(&mut conn, id, role_id)
             .await
             .expect("actor role grants");
         conn.commit().await.expect("seed commits");
-        actor
+        SeededActor { id, root, shared }
     }
 
-    /// Mint the actor's own direct token. Its permissions claim is empty on
-    /// purpose: the exchange must read the actor's current grants instead.
-    fn actor_token(actor: Uuid, tenant: DataTenantId) -> String {
+    /// Mint the actor's own direct token under `root`. Its permissions claim
+    /// is empty on purpose: the exchange must read the actor's current grants
+    /// instead.
+    fn actor_token(actor: Uuid, tenant: DataTenantId, root: &CardUid) -> String {
         mint(
-            service_ref(actor, tenant, ACTOR_CARD),
+            service_ref(actor, tenant),
             PermissionSet::new(),
             Some(ACTOR_CREDENTIAL),
+            CardAccess::Scoped {
+                cards: vec![root.clone()],
+            },
+            Some(root.clone()),
             None,
         )
     }
@@ -1557,7 +1590,7 @@ pub(crate) mod pg_tests {
             &fixture,
             &audit,
             subject_token(tenant, PermissionSet::new()),
-            actor_token(Uuid::new_v4(), tenant),
+            actor_token(Uuid::new_v4(), tenant, &unregistered_uid()),
         )
         .await;
 
@@ -1585,38 +1618,43 @@ pub(crate) mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let actor = seed_actor(&fixture, serde_json::json!([])).await;
         let subject = subject_token(tenant, PermissionSet::new());
-        let actor_card = service_ref(actor, tenant, ACTOR_CARD);
+        let earlier = Uuid::now_v7();
         let delegated_actor = mint(
-            actor_card.clone(),
+            service_ref(actor.id, tenant),
             PermissionSet::new(),
             None,
+            CardAccess::Scoped {
+                cards: vec![actor.root.clone()],
+            },
+            Some(actor.root.clone()),
             Some(Box::new(ActClaim {
-                sub: Uuid::new_v4().to_string(),
-                principal: service_ref(Uuid::new_v4(), tenant, "earlier"),
+                sub: earlier.to_string(),
+                principal: service_ref(earlier, tenant),
+                workload_uid: unregistered_uid(),
+                cid: None,
                 act: None,
             })),
         );
-        let card_free_actor = mint(
-            TokenPrincipalRef {
-                card_ref: None,
-                ..actor_card
-            },
+        let rootless_actor = mint(
+            service_ref(actor.id, tenant),
             PermissionSet::new(),
+            None,
+            CardAccess::AnyRegistered,
             None,
             None,
         );
-        let foreign_actor = actor_token(actor, DataTenantId::new_v7());
+        let foreign_actor = actor_token(actor.id, DataTenantId::new_v7(), &actor.root);
 
         let cases: [(&str, String, String); 6] = [
             (
                 "invalid subject",
                 "not-a-token".to_owned(),
-                actor_token(actor, tenant),
+                actor_token(actor.id, tenant, &actor.root),
             ),
             ("invalid actor", subject.clone(), "not-a-token".to_owned()),
             ("cross-tenant actor", subject.clone(), foreign_actor),
             ("delegated actor", subject.clone(), delegated_actor),
-            ("card-free actor", subject.clone(), card_free_actor),
+            ("rootless actor", subject.clone(), rootless_actor),
             ("self exchange", subject.clone(), subject),
         ];
         for (label, subject, actor) in cases {
@@ -1675,9 +1713,9 @@ pub(crate) mod pg_tests {
             })),
         };
         let subject_id = Uuid::new_v4();
-        let earlier = service_ref(Uuid::new_v4(), tenant, "earlier-actor");
+        let earlier = service_ref(Uuid::new_v4(), tenant);
         let subject = mint(
-            service_ref(subject_id, tenant, "test-service"),
+            service_ref(subject_id, tenant),
             [
                 Permission::card_read(),
                 Permission::policy_lock(),
@@ -1686,13 +1724,19 @@ pub(crate) mod pg_tests {
             .into_iter()
             .collect(),
             None,
+            CardAccess::Scoped { cards: Vec::new() },
+            None,
             Some(Box::new(ActClaim {
                 sub: earlier.id.to_string(),
                 principal: earlier.clone(),
+                workload_uid: unregistered_uid(),
+                cid: None,
                 act: None,
             })),
         );
-        let exchanged = exchange(&fixture, &audit, subject, actor_token(actor, tenant))
+        let actor_bearer = actor_token(actor.id, tenant, &actor.root);
+        let actor = actor.id;
+        let exchanged = exchange(&fixture, &audit, subject, actor_bearer)
             .await
             .expect("exchange succeeds");
 
@@ -1794,7 +1838,7 @@ pub(crate) mod pg_tests {
                 &fixture,
                 &audit,
                 subject_token(tenant, subject_grants.into_iter().collect()),
-                actor_token(actor, tenant),
+                actor_token(actor.id, tenant, &actor.root),
             )
             .await;
             if let Some(expected) = expected {
@@ -1819,5 +1863,202 @@ pub(crate) mod pg_tests {
                 "{actor_grants}"
             );
         }
+    }
+
+    /// Delegation keeps the subject's root, adds the actor's revalidated root
+    /// and credential provenance as the outer actor, and signs only the exact
+    /// intersection of the subject's Card access with the actor's root graph.
+    ///
+    /// Covers an overlapping scoped subject with an earlier actor, a disjoint
+    /// scoped subject (an empty intersection still issues), a rootless
+    /// unrestricted subject (`any_registered` is the identity), a rootless
+    /// restricted subject (refused: no Card authority to delegate), and an
+    /// actor token whose root lies outside the actor's family (refused).
+    ///
+    /// # Panics
+    /// Panics when an exchange's outcome, signed roots, Card access, chain,
+    /// provenance, or audit chain differ from the case's expectation.
+    #[tokio::test]
+    async fn delegation_preserves_roots_and_exact_intersections() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let actor = seed_actor(
+            &fixture,
+            serde_json::json!([{ "resource": "cards", "action": "read", "scope": "all" }]),
+        )
+        .await;
+        let verifier = delegate_service(&RecordedAudit::new()).verifier;
+        let subject_root = unregistered_uid();
+        let subject_id = Uuid::now_v7();
+        let earlier_id = Uuid::now_v7();
+        let earlier_root = unregistered_uid();
+        let earlier_credential = Uuid::now_v7();
+        let reads: PermissionSet = std::iter::once(Permission::card_read()).collect();
+        let actor_bearer = actor_token(actor.id, tenant, &actor.root);
+        let scoped = |cards: Vec<CardUid>| CardAccess::Scoped { cards };
+
+        let cases = [
+            (
+                "overlapping subject with an earlier actor",
+                mint(
+                    service_ref(subject_id, tenant),
+                    reads.clone(),
+                    None,
+                    scoped(vec![unregistered_uid(), actor.shared.clone()]),
+                    Some(subject_root.clone()),
+                    Some(Box::new(ActClaim {
+                        sub: earlier_id.to_string(),
+                        principal: service_ref(earlier_id, tenant),
+                        workload_uid: earlier_root.clone(),
+                        cid: Some(earlier_credential.to_string()),
+                        act: None,
+                    })),
+                ),
+                Some(subject_root.clone()),
+                scoped(vec![actor.shared.clone()]),
+                true,
+            ),
+            (
+                "disjoint direct subject",
+                mint(
+                    service_ref(subject_id, tenant),
+                    reads.clone(),
+                    None,
+                    scoped(vec![subject_root.clone()]),
+                    Some(subject_root.clone()),
+                    None,
+                ),
+                Some(subject_root.clone()),
+                scoped(Vec::new()),
+                false,
+            ),
+            (
+                "rootless unrestricted subject",
+                subject_token(tenant, reads.clone()),
+                None,
+                scoped(vec![actor.root.clone(), actor.shared.clone()]),
+                false,
+            ),
+        ];
+        for (label, subject, expected_root, expected_access, nested) in cases {
+            let audit = RecordedAudit::new();
+            let exchanged = exchange(&fixture, &audit, subject, actor_bearer.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{label}: exchange succeeds, got {error:?}"));
+            let delegated = verifier
+                .verify_on(&exchanged.access_token, &tenant, TokenAudience::Bifrost)
+                .expect("delegated token verifies");
+            let principal = &delegated.principal;
+            assert_eq!(
+                principal.workload_uid, expected_root,
+                "{label}: subject root"
+            );
+            assert_eq!(
+                principal.card_access, expected_access,
+                "{label}: card access"
+            );
+            assert_eq!(principal.credential_id, None, "{label}: no top-level cid");
+            assert_eq!(
+                principal.effective_permissions, reads,
+                "{label}: permissions"
+            );
+            let current = &delegated
+                .delegation_chain
+                .last()
+                .expect("an actor is current")
+                .principal;
+            assert_eq!(current.id.as_uuid(), actor.id, "{label}: actor");
+            assert_eq!(
+                current.workload_uid.as_ref(),
+                Some(&actor.root),
+                "{label}: actor root"
+            );
+            assert_eq!(
+                current.credential_id,
+                Some(ACTOR_CREDENTIAL),
+                "{label}: actor cid"
+            );
+
+            let decisions = exchange_decisions(&audit);
+            let [
+                (
+                    _,
+                    _,
+                    _,
+                    _,
+                    AuditDetail::TokenExchange {
+                        delegation_chain, ..
+                    },
+                ),
+            ] = decisions.as_slice()
+            else {
+                panic!("{label}: one token-exchange decision, got {decisions:?}");
+            };
+            if nested {
+                let earlier = &delegated.delegation_chain[0].principal;
+                assert_eq!(earlier.id.as_uuid(), earlier_id);
+                assert_eq!(earlier.workload_uid.as_ref(), Some(&earlier_root));
+                assert_eq!(earlier.credential_id, Some(earlier_credential));
+                assert_eq!(
+                    delegation_chain,
+                    &[AuditDelegationStep {
+                        principal_id: PrincipalId::new(earlier_id),
+                        principal_kind: PrincipalKindTag::Service,
+                        workload_uid: Some(earlier_root.clone()),
+                    }],
+                    "the audit chain names the earlier actor and its root"
+                );
+            } else {
+                assert_eq!(delegated.delegation_chain.len(), 1, "{label}: chain");
+                assert!(delegation_chain.is_empty(), "{label}: audit chain");
+            }
+        }
+
+        let restricted_subject = mint(
+            service_ref(subject_id, tenant),
+            reads.clone(),
+            None,
+            CardAccess::RootRequired {
+                restriction: FamilyRestriction::Family(service_family("subject-family")),
+            },
+            None,
+            None,
+        );
+        let error = exchange(
+            &fixture,
+            &RecordedAudit::new(),
+            restricted_subject,
+            actor_bearer,
+        )
+        .await
+        .expect_err("a rootless restricted subject has no Card authority to delegate");
+        let error = WyrdError::from(error);
+        assert!(
+            matches!(error, WyrdError::WorkloadContextRequired { .. }),
+            "{error:?}"
+        );
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let creator = insert_test_user(&mut conn, tenant).await;
+        let foreign_root = seed_root(
+            &mut conn,
+            &named_service_card_ref("delegation-foreign"),
+            creator,
+        )
+        .await;
+        conn.commit().await.expect("foreign root commits");
+        let error = exchange(
+            &fixture,
+            &RecordedAudit::new(),
+            subject_token(tenant, reads),
+            actor_token(actor.id, tenant, &foreign_root),
+        )
+        .await
+        .expect_err("an actor root outside the actor's family is refused");
+        let error = WyrdError::from(error);
+        assert!(
+            matches!(error, WyrdError::WorkloadUidRefused { .. }),
+            "{error:?}"
+        );
     }
 }

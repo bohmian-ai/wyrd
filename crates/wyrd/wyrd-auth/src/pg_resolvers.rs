@@ -746,6 +746,8 @@ mod pg_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use uuid::Uuid;
+
     use secrecy::{ExposeSecret, SecretString};
     use wyrd_auth_oidc::{
         ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, TrustedIssuer, WorkloadBinding,
@@ -753,13 +755,10 @@ mod pg_tests {
     };
     use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::CardName;
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::auth::PrincipalId;
     use wyrd_sql::queries::auth::{upsert_trusted_issuer, upsert_workload_binding};
 
     use super::{
@@ -767,6 +766,7 @@ mod pg_tests {
         binding_write_from_binding, human_connection_trusted_issuer, issuer_write_from_trusted,
         trusted_issuer_from_row,
     };
+    use crate::exchange_api_key::pg_tests::insert_test_service_account;
 
     const ISSUER_URL: &str = "https://idp.example.com/realms/wyrd";
 
@@ -865,7 +865,7 @@ mod pg_tests {
             .parse()
             .expect("tenant id is valid");
         let row = |subject: &str| wyrd_sql::row_types::auth::HumanConnectionRow {
-            connection_id: uuid::Uuid::new_v4(),
+            connection_id: Uuid::new_v4(),
             data_tenant_id: tenant.as_uuid(),
             revision: 1,
             state: "Active".to_owned(),
@@ -996,22 +996,18 @@ mod pg_tests {
         let issuer = sample_issuer(tenant);
         let issuer_write = issuer_write_from_trusted(&issuer, Some(&key)).expect("encode succeeds");
 
-        let card_ref = CardRef {
-            kind: CardKind::Service,
-            name: CardName::new("my-model").expect("card name"),
-            version: VersionBlock::parse("1.0.0").expect("version"),
-            uid: None,
-        };
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let account = insert_test_service_account(&mut conn, Uuid::now_v7(), None).await;
         let binding = WorkloadBinding {
             tenant_id: tenant,
             issuer: issuer.issuer.clone(),
             subject: "system:serviceaccount:default/my-sa".to_owned(),
             audience: None,
-            card_ref: card_ref.clone(),
+            principal_id: PrincipalId::new(account),
+            workload_uid: None,
         };
-        let binding_write = binding_write_from_binding(&binding).expect("binding encodes");
+        let binding_write = binding_write_from_binding(&binding);
 
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         upsert_trusted_issuer(&mut conn, &issuer_write)
             .await
             .expect("issuer upsert");
@@ -1033,7 +1029,8 @@ mod pg_tests {
             .await
             .expect("lookup ok")
             .expect("subject resolves via fallback");
-        assert_eq!(resolved_binding.name.to_string(), "my-model");
+        assert_eq!(resolved_binding.principal_id, binding.principal_id);
+        assert_eq!(resolved_binding.workload_uid, None);
 
         // An unbound subject resolves to None.
         let unbound = resolver

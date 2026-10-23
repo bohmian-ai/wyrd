@@ -48,6 +48,11 @@ pub const MINT_KIND_JWT_BEARER: CardScopeMintKind = CardScopeMintKind::JwtBearer
 /// [`WyrdError::CardScopeTooLarge`] when the walk exceeds its depth or member
 /// cap, and the mapped registry error when a store read fails or a referenced
 /// Card cannot be read.
+///
+/// # Panics
+///
+/// Never in practice: the walk seeds its members with the root, so the
+/// resolved list always has a first member.
 pub async fn resolve_workload_scope(
     conn: &mut TenantConn<'_>,
     root_uid: &CardUid,
@@ -172,26 +177,31 @@ pub enum IssueErrorOrWyrd {
 
 /// Stage the successful card-ref scope mint audit event on the process audit stage.
 ///
-/// The event carries the scope digest, the full member count, and at most
+/// The event names the scope's root, its first member, and carries the scope
+/// digest, the full member count, and at most
 /// [`SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT`] members. It is staged without waiting
 /// and never refuses the grant; a digest that is not a valid audit value is
 /// logged and the event is staged without it.
 ///
 /// # Panics
 ///
-/// Panics if `scope.len()` exceeds `u32::MAX`. Callers must enforce the
-/// `MAX_SCOPE_CARDS` limit upstream; violating it is a programmer error,
-/// not a runtime condition.
+/// Panics if `scope` is empty or `scope.len()` exceeds `u32::MAX`. Callers
+/// pass a scope from [`resolve_workload_scope`], which always starts with its
+/// root and enforces the `MAX_SCOPE_CARDS` limit; violating either is a
+/// programmer error, not a runtime condition.
 pub fn stage_scope_mint_success_audit(
     audit: &dyn AuditStage,
     tenant_id: DataTenantId,
     principal_id: Uuid,
     principal_kind: PrincipalKindTag,
-    root: &CardRef,
     scope: &CardRefScope,
     request_id: &str,
     mint_kind: CardScopeMintKind,
 ) {
+    let root = scope
+        .as_slice()
+        .first()
+        .expect("resolved scope invariant: the root is the first member");
     let scope_hash = ScopeHash::new(scope_hash(&scope_member_strings(scope)))
         .inspect_err(|error| {
             tracing::error!(error = %error, "scope digest is not a valid audit value");

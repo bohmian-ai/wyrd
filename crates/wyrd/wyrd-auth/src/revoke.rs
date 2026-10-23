@@ -122,35 +122,22 @@ pub(crate) mod pg_tests {
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::Kid;
-    use wyrd_dev_fixtures::cards::seed_backing_card;
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::PrincipalId;
-    use wyrd_semver::VersionBlock;
     use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag};
-    use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::CardName;
-    use wyrd_spec::reference::CardRef;
     use wyrd_sql::queries::auth::{
-        insert_human_refresh_token, insert_refresh_token, insert_service_account, insert_user,
-        refresh_by_hash, service_account_by_id, user_by_id,
+        insert_human_refresh_token, insert_refresh_token, insert_user, refresh_by_hash,
+        service_account_by_id, user_by_id,
     };
     use wyrd_sql::row_types::auth::HumanSessionBinding;
 
     use super::revoke_principal_in_conn;
     use crate::audit::test_audit::RecordedAudit;
+    use crate::exchange_api_key::pg_tests::insert_test_service_account;
     use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
     use crate::refresh::RefreshTokens;
     use wyrd_auth_issue::hash_secret;
-
-    fn make_service_card_ref(name: &str) -> CardRef {
-        CardRef {
-            kind: CardKind::Service,
-            name: CardName::new(name).expect("valid name"),
-            version: VersionBlock::parse("1.0.0").expect("valid version"),
-            uid: None,
-        }
-    }
 
     /// A user is revocable only as a user, and the revocation suspends it.
     ///
@@ -267,20 +254,7 @@ pub(crate) mod pg_tests {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
 
         let creator = Uuid::new_v4();
-        let sa_id = Uuid::new_v4();
-        let card_ref = make_service_card_ref("svc-revoke-service");
-        seed_backing_card(&mut conn, &card_ref, creator).await;
-        insert_service_account(
-            &mut conn,
-            sa_id,
-            "service",
-            Some(&card_ref),
-            "svc-revoke-service",
-            None,
-            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
-        )
-        .await
-        .expect("service account inserts");
+        let sa_id = insert_test_service_account(&mut conn, creator, None).await;
 
         revoke_principal_in_conn(
             &mut conn,
@@ -339,74 +313,20 @@ pub(crate) mod pg_tests {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
 
         let creator = Uuid::new_v4();
-        let sa_id = Uuid::new_v4();
-        let card_ref = make_service_card_ref("svc-revoke-mismatch");
-        seed_backing_card(&mut conn, &card_ref, creator).await;
-        insert_service_account(
-            &mut conn,
-            sa_id,
-            "service",
-            Some(&card_ref),
-            "svc-revoke-mismatch",
-            None,
-            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
-        )
-        .await
-        .expect("service account inserts");
+        let sa_id = insert_test_service_account(&mut conn, creator, None).await;
 
         let result = revoke_principal_in_conn(
             &mut conn,
             PrincipalId::new(sa_id),
-            PrincipalKindTag::Agent,
+            PrincipalKindTag::User,
             tenant,
         )
         .await;
 
         assert!(
             matches!(result, Err(WyrdError::PrincipalNotFound { .. })),
-            "a service account must not be revocable as an agent, got: {result:?}"
+            "a service account must not be revocable as a user, got: {result:?}"
         );
-    }
-
-    /// An agent account is revocable only as an agent.
-    ///
-    /// The third arm of the kind separation, and the one that also checks the
-    /// refusal message names nothing the caller did not already send.
-    #[tokio::test]
-    async fn an_agent_account_is_revoked_under_the_agent_kind() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-
-        let creator = Uuid::new_v4();
-        let sa_id = Uuid::new_v4();
-        let card_ref = CardRef {
-            kind: CardKind::Agent,
-            name: CardName::new("agent-revoke-test").expect("valid name"),
-            version: VersionBlock::parse("1.0.0").expect("valid version"),
-            uid: None,
-        };
-        seed_backing_card(&mut conn, &card_ref, creator).await;
-        insert_service_account(
-            &mut conn,
-            sa_id,
-            "agent",
-            Some(&card_ref),
-            "agent-revoke-test",
-            None,
-            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
-        )
-        .await
-        .expect("agent account inserts");
-
-        revoke_principal_in_conn(
-            &mut conn,
-            PrincipalId::new(sa_id),
-            PrincipalKindTag::Agent,
-            tenant,
-        )
-        .await
-        .expect("revocation succeeds");
     }
 
     /// A failed revocation write says so without saying how.
@@ -420,24 +340,12 @@ pub(crate) mod pg_tests {
         let tenant = fixture.data_tenant_id();
 
         let creator = Uuid::new_v4();
-        let sa_id = Uuid::new_v4();
-        let card_ref = make_service_card_ref("svc-revoke-denied");
-        {
+        let sa_id = {
             let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-            seed_backing_card(&mut conn, &card_ref, creator).await;
-            insert_service_account(
-                &mut conn,
-                sa_id,
-                "service",
-                Some(&card_ref),
-                "svc-revoke-denied",
-                None,
-                wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
-            )
-            .await
-            .expect("service account inserts");
+            let sa_id = insert_test_service_account(&mut conn, creator, None).await;
             conn.commit().await.expect("seed commits");
-        }
+            sa_id
+        };
 
         // Remove the tenant login's write privilege so the revocation statement
         // fails exactly as an unavailable or misconfigured store would.

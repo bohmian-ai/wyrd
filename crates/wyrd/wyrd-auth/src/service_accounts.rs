@@ -28,6 +28,7 @@ mod tests {
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_runtime::principal::{PrincipalId, PrincipalKind, RoleRef};
     use wyrd_runtime::{Permission, Principal};
+    use wyrd_spec::auth::CardAccess;
     use wyrd_spec::error::WyrdError;
 
     use super::require_service_accounts_write;
@@ -40,6 +41,8 @@ mod tests {
             roles: vec![RoleRef::new("viewer").expect("static role is valid")],
             effective_permissions: PermissionSet::from_iter(permissions),
             credential_id: None,
+            card_access: CardAccess::AnyRegistered,
+            workload_uid: None,
         }
     }
 

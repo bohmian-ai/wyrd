@@ -190,6 +190,8 @@ pub struct PublishedHotFileIdentity<'a> {
     pub schema_fingerprint: String,
     /// Iceberg sort-order identity the object was written under.
     pub sort_order_id: i32,
+    /// Table version whose definition accepted and sealed the rows.
+    pub table_version: wyrd_spec::vala::ids::TableVersion,
 }
 
 /// What a reader observed about the uploaded object, for revalidation.
@@ -231,6 +233,12 @@ pub struct ScribePublishedHotFileV1 {
     pub schema_fingerprint: String,
     /// Iceberg sort-order identity the object was written under.
     pub sort_order_id: i32,
+    /// Table version whose retained definition accepted and sealed the rows.
+    ///
+    /// Promotion resolves exactly this definition to revalidate the object,
+    /// because two versions can share schema, spec, and sort ids and differ
+    /// only in Bloom policy.
+    pub table_version: wyrd_spec::vala::ids::TableVersion,
     /// Physical partition the object belongs to, including the Iceberg
     /// partition-spec id it was written under.
     pub partition: PhysicalPartitionWire,
@@ -246,7 +254,8 @@ impl ScribePublishedHotFileV1 {
     /// about column metrics is exactly what that footer carried. Partition,
     /// spec, and sort identity come from `identity` rather than from the
     /// writer because they are publication facts — the writer seals an object
-    /// before anything decides which fenced row will name it.
+    /// before anything decides which fenced row will name it. The table
+    /// version is the assembly key's accepting version.
     pub fn from_metrics(
         identity: &PublishedHotFileIdentity<'_>,
         data_file: ScribeDataFileV1,
@@ -261,6 +270,7 @@ impl ScribePublishedHotFileV1 {
             file_checksum: identity.file_checksum.to_owned(),
             schema_fingerprint: identity.schema_fingerprint.clone(),
             sort_order_id: identity.sort_order_id,
+            table_version: identity.table_version,
             partition: identity.partition.to_wire(),
             data_file,
         }
@@ -445,6 +455,7 @@ mod tests {
                 partition: &partition,
                 schema_fingerprint: "cd".repeat(32),
                 sort_order_id: BIFROST_SORT_ORDER_ID,
+                table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
             },
             ScribeDataFileV1 {
                 record_count: 4,

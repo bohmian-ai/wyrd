@@ -25,7 +25,7 @@ mod wire;
 
 pub use bifrost_catalog::{
     BifrostCatalog, CompactionRegistration, CreateTableRequest, MAX_PHYSICAL_LEAF_COLUMNS,
-    PinnedIcebergFile, PinnedSealedTable, TableUid,
+    PinnedIcebergFile, PinnedSealedTable, TableDefinition, TableUid,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use bifrost_catalog::{

@@ -400,6 +400,10 @@ fn flip_first_bound(record: &mut serde_json::Value, field: &str) {
 
 /// Every physical or policy contradiction is refused before any catalog effect.
 ///
+/// That includes evidence naming an unretained version or a Bloom-only
+/// version its object was not sealed under, while objects sealed before a
+/// Bloom-only edit still promote under their own version.
+///
 /// The object is a real sealed Parquet file and it is never altered by a record
 /// mutation, so a refusal can only come from Forge re-deriving the object's own
 /// footer and disagreeing with the persisted evidence. Size and checksum alone
@@ -503,6 +507,44 @@ async fn scribe_promotion_integration_rejects_physical_datafile_mismatch_before_
         assert_mutation_is_refused_before_catalog_io(&fixture, 0, name, mutate).await;
     }
 
+    // Evidence naming a version the table does not retain is refused, and so
+    // is evidence naming a Bloom-only version that shares every schema, spec,
+    // and sort id with the accepting one: only the object's own Bloom filters
+    // tell the two apart.
+    let name_version_two = |record: &mut serde_json::Value| {
+        record["table_version"] = serde_json::Value::from("2");
+    };
+    let fixture = PromotionIntegrationFixture::start("promotion_unretained_version").await;
+    assert_mutation_is_refused_before_catalog_io(
+        &fixture,
+        0,
+        "unretained table version",
+        name_version_two,
+    )
+    .await;
+    let fixture = bloom_revised_fixture("promotion_bloom_version").await;
+    assert_mutation_is_refused_before_catalog_io(
+        &fixture,
+        0,
+        "Bloom-only table version",
+        name_version_two,
+    )
+    .await;
+    let intact = bloom_revised_fixture("promotion_bloom_intact").await;
+    let mut forge = SupervisedPromotion::start(
+        &intact,
+        intact.catalog.iceberg_catalog(),
+        CountingObjectStore::new(&intact.storage) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    forge.run_one_success().await;
+    forge.shutdown().await;
+    assert_eq!(
+        intact.live_data_paths().await.len(),
+        intact.file_rows().await.len(),
+        "objects accepted before a Bloom-only edit still promote under their own version"
+    );
+
     for (index, (name, null_customer, mutate)) in TUPLE_MUTATIONS.into_iter().enumerate() {
         let fixture = composite_fixture(&format!("promotion_tuple_{index}")).await;
         let record = fixture
@@ -527,6 +569,32 @@ async fn scribe_promotion_integration_rejects_physical_datafile_mismatch_before_
         2,
         "intact composite evidence still promotes"
     );
+}
+
+/// Seals the default fixture's objects at version 1, then commits version 2,
+/// a Bloom-only edit adding a `value` Bloom filter.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start or the edit does not commit.
+async fn bloom_revised_fixture(table_name: &str) -> PromotionIntegrationFixture {
+    let fixture = PromotionIntegrationFixture::start(table_name).await;
+    super::support::set_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[
+            (
+                vala_bifrost_redux::catalog::layout::BLOOM_COLUMNS_PROPERTY,
+                r#"["value"]"#,
+            ),
+            (
+                vala_bifrost_redux::catalog::layout::TABLE_VERSION_PROPERTY,
+                "2",
+            ),
+        ],
+    )
+    .await;
+    fixture
 }
 
 /// Borrows the dimension values of a promotion record's partition.

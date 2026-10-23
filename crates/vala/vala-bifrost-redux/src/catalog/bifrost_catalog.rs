@@ -326,7 +326,10 @@ impl TableDefinition {
     /// Returns [`BifrostCatalogError::MetadataMismatch`] when the document has
     /// no canonical version, its sort-order id leaves the `i32` domain, or its
     /// layout or partition scheme does not rebuild.
-    fn of_metadata(fqn: &str, metadata: &TableMetadata) -> Result<Self, BifrostCatalogError> {
+    pub(crate) fn of_metadata(
+        fqn: &str,
+        metadata: &TableMetadata,
+    ) -> Result<Self, BifrostCatalogError> {
         let mismatch = |error: wyrd_spec::vala::BifrostError| {
             BifrostCatalogError::MetadataMismatch(error.to_string())
         };

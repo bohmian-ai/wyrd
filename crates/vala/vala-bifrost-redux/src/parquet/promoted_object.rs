@@ -33,6 +33,8 @@ pub struct PromotedObjectFooter {
     data_file: DataFile,
     /// Lowercase hex Wyrd schema fingerprint the footer carries.
     schema_fingerprint: String,
+    /// Column paths any row group carries a Bloom filter for.
+    bloom_columns: std::collections::BTreeSet<String>,
 }
 
 impl PromotedObjectFooter {
@@ -108,9 +110,17 @@ impl PromotedObjectFooter {
         .map_err(|error| {
             format!("promoted object footer does not assemble a data file: {error}")
         })?;
+        let bloom_columns = metadata
+            .row_groups()
+            .iter()
+            .flat_map(parquet::file::metadata::RowGroupMetaData::columns)
+            .filter(|column| column.bloom_filter_offset().is_some())
+            .map(|column| column.column_path().string())
+            .collect();
         Ok(Self {
             data_file,
             schema_fingerprint,
+            bloom_columns,
         })
     }
 
@@ -130,6 +140,13 @@ impl PromotedObjectFooter {
     #[must_use]
     pub fn schema_fingerprint(&self) -> &str {
         &self.schema_fingerprint
+    }
+
+    /// Borrows the column paths the object carries Bloom filters for, the
+    /// physical trace of the Bloom policy it was sealed under.
+    #[must_use]
+    pub const fn bloom_columns(&self) -> &std::collections::BTreeSet<String> {
+        &self.bloom_columns
     }
 
     /// Borrows the Iceberg projection of the object's own footer.

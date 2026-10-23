@@ -1073,18 +1073,21 @@ async fn assert_live_layout_truth(
 }
 
 /// Rows written under two partition specs and two sort orders, two batches
-/// each, promote and
+/// each, plus a Bloom-only version sharing the second's ids, promote and
 /// compact without changing a public row: every live file — promoted and
 /// rewritten — holds only rows of the partition tuple it records under the
 /// spec it records, ordered by the sort order it records, and promotion keeps
 /// each object under the spec and order it was written with. The specs bucket
 /// `shard` four and eight ways, so equal tuples, null customers included,
-/// exist under both; every rewrite still reads one spec's partition.
+/// exist under both; every rewrite still reads one spec's partition. Each
+/// object's published evidence names the version that accepted it, so the
+/// Bloom-only version stays distinguishable, and promotion revalidates every
+/// object against that version's retained definition.
 ///
 /// # Panics
 ///
-/// Panics when the pod cannot start, a public call fails, Forge leaves work
-/// owed or commits no rewrite, a public read differs, a live file
+/// Panics when the pod cannot start, a public call fails, published evidence
+/// names another accepting version, Forge leaves work owed or commits no rewrite, a public read differs, a live file
 /// contradicts its recorded layout, or a rewrite's inputs span two specs or
 /// partitions.
 #[tokio::test]
@@ -1149,7 +1152,31 @@ async fn mixed_specifications_preserve_partition_and_sort_truth() {
     server.commit_bucket_revision(tenant, &table_ref, 8).await;
     let revised_order = server.commit_sort_revision(tenant, &table_ref).await;
     append_round([2, 3]).await;
+    server
+        .commit_bloom_revision(tenant, &table_ref, &["customer"])
+        .await;
+    append_round([4, 5]).await;
     let expected = crate::public_support::canonical_order(rows);
+    let rows_per_layout = 2 * u64::try_from(COMPOSITE_ROWS).expect("row count");
+    let mut accepted = BTreeMap::new();
+    for file in server
+        .published_hot_files_for_test(tenant, "vala.datasets", &name)
+        .await
+        .expect("published evidence reads")
+    {
+        *accepted
+            .entry(file.promotion_record.table_version.get())
+            .or_insert(0) += file.row_count;
+    }
+    assert_eq!(
+        accepted,
+        BTreeMap::from([
+            (1, rows_per_layout),
+            (3, rows_per_layout),
+            (4, rows_per_layout)
+        ]),
+        "published evidence names each object's accepting version, Bloom-only ones included"
+    );
     crate::live_rewrite::assert_public_rows(&client, &table, &expected, "hot").await;
 
     server
@@ -1183,7 +1210,6 @@ async fn mixed_specifications_preserve_partition_and_sort_truth() {
             .data
     };
     let promoted = assert_live_layout_truth(server, &table.binding, "promoted").await;
-    let rows_per_layout = 2 * u64::try_from(COMPOSITE_ROWS).expect("row count");
     assert_eq!(
         promoted,
         BTreeMap::from([
@@ -1194,7 +1220,7 @@ async fn mixed_specifications_preserve_partition_and_sort_truth() {
                 ),
                 rows_per_layout
             ),
-            ((revised_spec, Some(revised_order)), rows_per_layout),
+            ((revised_spec, Some(revised_order)), 2 * rows_per_layout),
         ]),
         "promotion keeps each object under the spec and sort order it was written with"
     );
@@ -1204,7 +1230,7 @@ async fn mixed_specifications_preserve_partition_and_sort_truth() {
     let compacted = assert_live_layout_truth(server, &table.binding, "compacted").await;
     assert_eq!(
         compacted.values().sum::<u64>(),
-        2 * rows_per_layout,
+        3 * rows_per_layout,
         "compaction keeps every row exactly once: {compacted:?}"
     );
 

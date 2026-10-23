@@ -2317,6 +2317,7 @@ mod tests {
                 partition: &PhysicalPartition::from(partition),
                 schema_fingerprint: "0".repeat(64),
                 sort_order_id: BIFROST_SORT_ORDER_ID,
+                table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
             },
             ScribeDataFileV1 {
                 record_count: 1,

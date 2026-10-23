@@ -76,8 +76,11 @@ schema and every reserved-name check derives from that declaration.
 replicas to within one anchor's monotonic drift, but it is the admission instant, not a commit order, and is not an
 incremental-read checkpoint.
 
-Every table has exactly one time column: a non-null `Timestamp` in
-microseconds or nanoseconds, with or without a zone. A registration declares
+Every table has exactly one time column: a non-null zoned `Timestamp`
+(`TIMESTAMP_LTZ`, one UTC instant) in microseconds or nanoseconds. Any
+column may hold a `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ` value,
+but a naive `TIMESTAMP_NTZ` column names no instant, so registration refuses
+it as the time column rather than guess its zone. A registration declares
 it as `time_column` on its physical layout, and omitting it selects
 `wyrd_ingested_at`. The time column alone drives the hour or day partition
 transform, the default first sort key (descending), hot and published time

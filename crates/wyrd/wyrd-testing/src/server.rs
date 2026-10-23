@@ -3478,6 +3478,29 @@ impl WyrdTestServer {
         .await
     }
 
+    /// Exchange an API key through the real `/auth/token` route for a token
+    /// bound to the exact workload root `root`.
+    ///
+    /// # Errors
+    /// Returns an error when the route refuses the key or the root, or response
+    /// parsing fails.
+    pub async fn exchange_api_key_for_workload(
+        &self,
+        key: &SecretString,
+        root: &CardUid,
+    ) -> Result<String, WyrdTestServerError> {
+        self.token(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", key.expose_secret()),
+            ("subject_token_type", "urn:wyrd:oauth:token-type:api_key"),
+            ("workload_uid", root.as_str()),
+        ])
+        .await
+    }
+
     /// Exchange `subject_jwt` and `actor_jwt` through `/auth/token` for a
     /// token letting the actor act on the subject's behalf at `audience`.
     ///

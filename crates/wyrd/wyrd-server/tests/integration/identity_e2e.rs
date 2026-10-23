@@ -25,11 +25,10 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, WorkloadBindingEntry};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl, PrincipalId, Sha256Hex,
-    TokenAudience,
+    IssuedCredential, IssuerTokenPolicy, IssuerUrl, PrincipalId, Sha256Hex, TokenAudience,
 };
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::CardName;
+use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::reference::CardRef;
 use wyrd_testing::{
     Bootstrap, KeycloakAdmin, OidcIssuerFixture, WyrdTestServer, WyrdTestServerBuilder,
@@ -97,8 +96,29 @@ fn binding_card_ref(kind: CardKind, name: &str) -> CardRef {
         kind,
         name: CardName::new(name).expect("card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("version is valid"),
-        uid: None,
+        uid: Some(CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a Card UID")),
     }
+}
+
+/// Boot a config-driven replica of `base` trusting Keycloak with `bindings`.
+///
+/// A config binding names an existing active Service account, so a journey
+/// seeds its accounts through `base` first; the replica then runs the
+/// production boot path over the same Postgres.
+///
+/// # Panics
+/// Panics when the replica fails to boot.
+async fn config_replica(
+    base: &WyrdTestServer,
+    bindings: Vec<WorkloadBindingEntry>,
+) -> WyrdTestServer {
+    base.start_replica(
+        WyrdTestServerBuilder::default()
+            .with_trusted_issuer_configs(vec![keycloak_workload_issuer()])
+            .with_workload_binding_configs(bindings),
+    )
+    .await
+    .expect("server boots config-driven")
 }
 
 /// Decode an unverified JWT payload into a JSON value.
@@ -408,8 +428,9 @@ async fn workload_token_wrong_aud_absent_keycloak() {
 
 /// Full config-driven workload journey:
 ///   1. Keycloak mints a `client_credentials` token (foreign OIDC JWT).
-///   2. Config-driven boot trusts the issuer and binds `(issuer, subject)` →
-///      a server-owned Service `card_ref`; a principal is seeded under it.
+///   2. The bound Service's family runtime account is seeded, then
+///      config-driven boot trusts the issuer and binds `(issuer, subject)` →
+///      that account with the Service as its default root.
 ///   3. `POST /auth/token {jwt-bearer}` exchanges the assertion for a Wyrd
 ///      Service token.
 ///   4. The Service token delegates and reaches a real `/v1/cards` `200`.
@@ -433,25 +454,25 @@ async fn workload_jwt_bearer_journey_keycloak() {
 
     let card_ref = binding_card_ref(CardKind::Service, "wyrd-workload-sa");
 
-    let srv = WyrdTestServerBuilder::default()
-        .with_trusted_issuer_configs(vec![keycloak_workload_issuer()])
-        .with_workload_binding_configs(vec![WorkloadBindingEntry {
-            issuer: keycloak_issuer(),
-            subject: subject.clone(),
-            audience: Some("wyrd-workload".to_owned()),
-            kind: "service".to_owned(),
-            name: "wyrd-workload-sa".to_owned(),
-            version: "1.0.0".to_owned(),
-        }])
-        .start_in_process()
+    // Seed the bound family account and its Service. It holds writer so the
+    // minted workload token can be the terminal's subject.
+    let base = WyrdTestServer::start_in_process()
         .await
-        .expect("server boots config-driven");
-
-    // Seed the bound principal under the exact server-owned card_ref. It holds
-    // writer so the minted workload token can be the terminal's subject.
-    srv.seed_card_principal(&card_ref, &["editor"])
+        .expect("base server starts");
+    let principal = base
+        .seed_card_principal(&card_ref, &["editor"])
         .await
         .expect("workload principal seeds");
+    let srv = config_replica(
+        &base,
+        vec![machine_binding(
+            &subject,
+            Some("wyrd-workload"),
+            principal,
+            card_ref.uid.clone(),
+        )],
+    )
+    .await;
 
     let resp = post_jwt_bearer(&srv, &assertion).await;
     assert_eq!(
@@ -489,19 +510,23 @@ async fn workload_jwt_bearer_unbound_subject_returns_404_keycloak() {
 
     // Registry is populated but bound to a different subject, so the live
     // subject misses the lookup → principal-not-found.
-    let srv = WyrdTestServerBuilder::default()
-        .with_trusted_issuer_configs(vec![keycloak_workload_issuer()])
-        .with_workload_binding_configs(vec![WorkloadBindingEntry {
-            issuer: keycloak_issuer(),
-            subject: "system:serviceaccount:unbound:other".to_owned(),
-            audience: Some("wyrd-workload".to_owned()),
-            kind: "service".to_owned(),
-            name: "unbound-sa".to_owned(),
-            version: "1.0.0".to_owned(),
-        }])
-        .start_in_process()
+    let base = WyrdTestServer::start_in_process()
         .await
-        .expect("server boots config-driven");
+        .expect("base server starts");
+    let other = base
+        .bootstrap_service("unbound-sa", &[])
+        .await
+        .expect("bound account bootstraps");
+    let srv = config_replica(
+        &base,
+        vec![machine_binding(
+            "system:serviceaccount:unbound:other",
+            Some("wyrd-workload"),
+            other.id(),
+            None,
+        )],
+    )
+    .await;
 
     assert_jwt_bearer_refused(
         post_jwt_bearer(&srv, &assertion).await,
@@ -513,9 +538,10 @@ async fn workload_jwt_bearer_unbound_subject_returns_404_keycloak() {
 /// The tenant's machine principals that record runtime activity, sorted.
 ///
 /// Activity is written only by a qualifying API-key or workload `jwt-bearer`
-/// exchange for a Card-bound Service or Agent, so naming the exact set — not a
-/// bare count — is what proves an excluded path recorded nothing: a grant that
-/// wrongly activated would add an id the caller never exchanged for.
+/// exchange of a family account at a validated root, so naming the exact set
+/// — not a bare count — is what proves an excluded path recorded nothing: a
+/// grant that wrongly activated would add an id the caller never exchanged
+/// for.
 ///
 /// # Panics
 /// Panics when the tenant connection or the query fails.
@@ -524,12 +550,11 @@ async fn activated_principals(srv: &WyrdTestServer) -> Vec<Uuid> {
         .tenant_conn_for(srv.data_tenant_id())
         .await
         .expect("tenant connection opens");
-    let mut ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM wyrd.auth_service_accounts WHERE last_authenticated_at IS NOT NULL",
-    )
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("activity ids read");
+    let mut ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT DISTINCT principal_id FROM wyrd.workload_activity")
+            .fetch_all(&mut **conn.transaction())
+            .await
+            .expect("activity ids read");
     conn.commit().await.expect("assertion transaction commits");
     ids.sort_unstable();
     ids
@@ -537,8 +562,7 @@ async fn activated_principals(srv: &WyrdTestServer) -> Vec<Uuid> {
 
 /// Register an empty Service `name` at 1.0.0 through the public route.
 ///
-/// Registration projects the Card-bound principal a workload binding selects;
-/// returns the Service's registered UID.
+/// Registration creates no principal; returns the Service's registered UID.
 ///
 /// # Panics
 /// Panics when the route fails to respond, refuses the Card, or returns no UID.
@@ -576,17 +600,18 @@ async fn declare_service(srv: &WyrdTestServer, jwt: &str, name: &str) -> Uuid {
     .expect("Service UID parses")
 }
 
-/// The last qualifying exchange of the principal the Service `owner` projects.
+/// The last qualifying exchange of any account at the exact root `owner`.
 ///
 /// # Panics
-/// Panics when the read fails or the owner projects no principal.
+/// Panics when the read fails.
 async fn owner_last_authenticated(srv: &WyrdTestServer, owner: Uuid) -> Option<DateTime<Utc>> {
     let mut conn = srv
         .tenant_conn_for(srv.data_tenant_id())
         .await
         .expect("tenant connection opens");
     let seen = sqlx::query_scalar(
-        "SELECT last_authenticated_at FROM wyrd.auth_service_accounts WHERE card_uid = $1",
+        "SELECT max(last_authenticated_at) FROM wyrd.workload_activity \
+          WHERE workload_card_uid = $1",
     )
     .bind(owner)
     .fetch_one(&mut **conn.transaction())
@@ -599,7 +624,8 @@ async fn owner_last_authenticated(srv: &WyrdTestServer, owner: Uuid) -> Option<D
 /// A configured workload `jwt-bearer` exchange activates only its exact owner.
 ///
 /// Registers the bound Service and an unbound sibling Service, binds the live
-/// Keycloak workload subject to the bound one, and exchanges the real assertion
+/// Keycloak workload subject to the bound family's runtime account with the
+/// bound Service as default root, and exchanges the real assertion
 /// twice. The first exchange activates exactly the bound owner; the second,
 /// re-presenting the platform assertion as a workload does to renew, renews
 /// that one timestamp. The sibling owner is never touched.
@@ -618,28 +644,36 @@ async fn workload_jwt_bearer_activates_only_its_exact_owner_keycloak() {
         .as_str()
         .expect("workload token carries a subject")
         .to_owned();
-    let srv = WyrdTestServerBuilder::default()
-        .with_trusted_issuer_configs(vec![keycloak_workload_issuer()])
-        .with_workload_binding_configs(vec![WorkloadBindingEntry {
-            issuer: keycloak_issuer(),
-            subject,
-            audience: Some("wyrd-workload".to_owned()),
-            kind: "service".to_owned(),
-            name: "wyrd-workload-live".to_owned(),
-            version: "1.0.0".to_owned(),
-        }])
-        .start_in_process()
+    let base = WyrdTestServer::start_in_process()
         .await
-        .expect("server boots config-driven");
-    let Bootstrap::User { jwt, .. } = srv
+        .expect("base server starts");
+    let Bootstrap::User { jwt, .. } = base
         .bootstrap_user("workload-live-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
         panic!("user bootstrap returned a non-user principal");
     };
-    let bound = declare_service(&srv, &jwt, "wyrd-workload-live").await;
-    let sibling = declare_service(&srv, &jwt, "wyrd-workload-sibling").await;
+    let bound = declare_service(&base, &jwt, "wyrd-workload-live").await;
+    let sibling = declare_service(&base, &jwt, "wyrd-workload-sibling").await;
+    let bound_ref = CardRef {
+        uid: Some(CardUid::from_uuid(bound).expect("registered UID is a Card UID")),
+        ..binding_card_ref(CardKind::Service, "wyrd-workload-live")
+    };
+    let account = base
+        .credential_registered_service(&bound_ref, &[])
+        .await
+        .expect("the family runtime account seeds");
+    let srv = config_replica(
+        &base,
+        vec![machine_binding(
+            &subject,
+            Some("wyrd-workload"),
+            account.id(),
+            bound_ref.uid.clone(),
+        )],
+    )
+    .await;
     assert_eq!(owner_last_authenticated(&srv, bound).await, None);
 
     let first = post_jwt_bearer(&srv, &assertion).await;
@@ -849,18 +883,18 @@ async fn revocation_requires_admin_permission() {
 
 /// Full-chain API-key journey with a **service-account** issuer:
 ///   1. Admin SA (`admin`) bootstrapped via harness SQL.
-///   2. Target SA bootstrapped via harness SQL (the key is issued for this card).
+///   2. Target SA bootstrapped via harness SQL (the key is issued for it).
 ///   3. Admin key → `POST /auth/token` → access token.
-///   4. `POST /auth/issue-key` authenticated as the admin SA; the key's `sub_principal_id`
-///      and `act_principal_id` are the SA's `service_account.id` — the direct assertion that the relaxed FK
-///      (commit 01) accepts a non-user issuer (pre-migration this would 500).
+///   4. `POST /v1/principals/{target}/credentials` authenticated as the admin
+///      SA; the credential's issuing attribution is a service account, not a
+///      user.
 ///   5. Issued key → `POST /auth/token` → access token.
 ///   6. `assert_v1_delegated_write_ok` → `POST /v1/cards 201`.
 ///
 /// # Panics
-/// Panics when bootstrap or either key exchange fails, `/auth/issue-key` does
-/// not return `200` with a non-nil `key_id`, or the issued key's token does not
-/// reach `/v1/cards` `200`.
+/// Panics when bootstrap or either key exchange fails, credential issuance
+/// does not return `200` with a non-nil id, or the issued key's token does
+/// not reach `/v1/cards` `200`.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn service_account_issuer_full_chain() {
@@ -882,54 +916,41 @@ async fn service_account_issuer_full_chain() {
         .await
         .expect("admin api key exchange succeeds");
 
-    // Target service card: the card a key will be issued for.
-    // Holds writer so the issued token can later be the terminal's subject.
+    // Target service account the credential is issued for. Holds writer so
+    // the issued token can later be the terminal's subject.
     let target = srv
         .bootstrap_service("sa-chain-target", &["editor"])
         .await
         .expect("target service account bootstraps");
-    let target_card_ref = target
-        .card_ref()
-        .expect("target carries a card_ref")
-        .clone();
 
-    // POST /auth/issue-key as the admin SA.
-    // The issuer principal is a service account (not a user), so the key's
-    // sub/act pair must resolve to `service_account.id` — the FK-relaxation path from commit 01.
-    let issue_req = IssueKeyRequest {
-        card_ref: target_card_ref,
-        label: Some("sa-chain".to_owned()),
-        expires_in_seconds: None,
-    };
+    // Issue an additional credential as the admin SA: the issuing attribution
+    // is a service account, not a user.
     let issue_resp = srv
         .oneshot_authenticated(
             &admin_token,
             Request::builder()
                 .method(Method::POST)
-                .uri("/auth/issue-key")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&issue_req).expect("issue-key request serializes"),
-                ))
-                .expect("issue-key request builds"),
+                .uri(format!("/v1/principals/{}/credentials", target.id()))
+                .body(Body::empty())
+                .expect("credential request builds"),
         )
         .await
-        .expect("issue-key call completes");
+        .expect("credential issuance completes");
     assert_eq!(
         issue_resp.status(),
         StatusCode::OK,
-        "service-account issuer: issue-key returns 200, got {}",
+        "service-account issuer: credential issuance returns 200, got {}",
         issue_resp.status()
     );
     let issue_bytes = to_bytes(issue_resp.into_body(), 65_536)
         .await
-        .expect("issue-key body reads");
-    let issue_body: IssueKeyResponse =
-        serde_json::from_slice(&issue_bytes).expect("issue-key response is valid JSON");
-    assert!(!issue_body.key_id.is_nil(), "issued key has a key_id");
+        .expect("credential body reads");
+    let issue_body: IssuedCredential =
+        serde_json::from_slice(&issue_bytes).expect("credential response is valid JSON");
+    assert!(!issue_body.id.is_nil(), "issued credential has an id");
 
     // Exchange the issued key → access token.
-    let issued_secret = SecretString::from(issue_body.key.expose().to_owned());
+    let issued_secret = SecretString::from(issue_body.credential.expose().to_owned());
     let issued_token = srv
         .exchange_api_key(&issued_secret)
         .await
@@ -5030,15 +5051,20 @@ async fn tenant_provider_switch_journey() {
     srv.shutdown().await.expect("server shuts down");
 }
 
-/// A workload binding entry for `subject` bound to the Service card `name`.
-fn machine_binding(subject: &str, audience: Option<&str>, name: &str) -> WorkloadBindingEntry {
+/// A Keycloak workload binding entry mapping `subject` to the Service account
+/// `principal_id`, optionally pinning `workload_uid` as its default root.
+fn machine_binding(
+    subject: &str,
+    audience: Option<&str>,
+    principal_id: PrincipalId,
+    workload_uid: Option<CardUid>,
+) -> WorkloadBindingEntry {
     WorkloadBindingEntry {
         issuer: keycloak_issuer(),
         subject: subject.to_owned(),
         audience: audience.map(ToOwned::to_owned),
-        kind: "service".to_owned(),
-        name: name.to_owned(),
-        version: "1.0.0".to_owned(),
+        principal_id,
+        workload_uid,
     }
 }
 
@@ -5103,24 +5129,34 @@ async fn tenant_machine_independence_journey() {
             .expect("workload token carries a subject")
             .to_owned()
     };
-    let srv = WyrdTestServerBuilder::default()
-        .with_trusted_issuer_configs(vec![keycloak_workload_issuer()])
-        .with_workload_binding_configs(vec![
-            machine_binding(&subject_of(&bound), Some("wyrd-workload"), "machine-sa"),
-            machine_binding(&subject_of(&foreign_audience), None, "foreign-sa"),
-        ])
-        .start_in_process()
+    let base = WyrdTestServer::start_in_process()
         .await
-        .expect("server boots");
-    let tenant = srv.data_tenant_id();
+        .expect("base server starts");
+    let machine_ref = binding_card_ref(CardKind::Service, "machine-sa");
+    let machine = base
+        .seed_card_principal(&machine_ref, &["editor"])
+        .await
+        .expect("workload principal seeds");
     // The foreign-audience token is refused at the audience check before any
-    // principal resolution, so only the accepted workload needs a principal.
-    srv.seed_card_principal(
-        &binding_card_ref(CardKind::Service, "machine-sa"),
-        &["editor"],
+    // principal resolution, so its account holds no grant.
+    let foreign = base
+        .bootstrap_service("foreign-sa", &[])
+        .await
+        .expect("foreign account bootstraps");
+    let srv = config_replica(
+        &base,
+        vec![
+            machine_binding(
+                &subject_of(&bound),
+                Some("wyrd-workload"),
+                machine,
+                machine_ref.uid.clone(),
+            ),
+            machine_binding(&subject_of(&foreign_audience), None, foreign.id(), None),
+        ],
     )
-    .await
-    .expect("workload principal seeds");
+    .await;
+    let tenant = srv.data_tenant_id();
     let admin = tenant_admin(&srv, tenant, "machine-admin").await;
     activate_keycloak_connection(&srv, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
 
@@ -5193,8 +5229,8 @@ async fn tenant_machine_independence_journey() {
 ///   1. an admin SA (`admin`) mints the access token the CLI presents,
 ///   2. the trusted issuer is authored via the CLI with a `SecretPost` client
 ///      secret, which must be sealed to ciphertext at rest (never plaintext),
-///   3. the `(issuer, subject)` binding is authored via the CLI, resolving to a
-///      server-owned Service card a principal is seeded under,
+///   3. the `(issuer, subject)` binding is authored via the CLI, resolving to
+///      a seeded family runtime account with its Service as default root,
 ///   4. `POST /auth/token {jwt-bearer}` exchanges the Keycloak assertion → 200,
 ///   5. the exchanged Service token reaches a real `/v1/cards` 200,
 ///   6. the production `wyrd-client` middleware caches one exchange, reuses the
@@ -5245,9 +5281,11 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
         .await
         .expect("admin api key exchange succeeds");
 
-    // The server-owned card the binding resolves to; seed its principal.
+    // The family runtime account the binding resolves to, rooted at its
+    // Service by default.
     let card_ref = binding_card_ref(CardKind::Service, "cloud-journey-sa");
-    srv.seed_card_principal(&card_ref, &["editor"])
+    let principal = srv
+        .seed_card_principal(&card_ref, &["editor"])
         .await
         .expect("workload principal seeds");
 
@@ -5269,7 +5307,7 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
     // Author the workload binding THROUGH the real CLI verb.
     assert_cli_succeeded(
         &wyrd_cli(
-            workload_binding_add_args(&server_url, &subject, &card_ref),
+            workload_binding_add_args(&server_url, &subject, principal, card_ref.uid.as_ref()),
             &[("WYRD_ACCESS_TOKEN", admin_token.clone())],
         )
         .await,
@@ -5467,19 +5505,20 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
         );
     }
 
-    // Bind the subject ONLY in tenant A (CLI), and seed its principal in A only.
+    // Seed the account in tenant A only, then bind the subject ONLY in A (CLI).
     let card_ref = binding_card_ref(CardKind::Service, "iso-sa");
+    let principal = srv
+        .seed_card_principal_in_tenant(tenant_a, &card_ref, &["workload"])
+        .await
+        .expect("tenant A workload principal seeds");
     assert_cli_succeeded(
         &wyrd_cli(
-            workload_binding_add_args(&server_url, &subject, &card_ref),
+            workload_binding_add_args(&server_url, &subject, principal, card_ref.uid.as_ref()),
             &[("WYRD_ACCESS_TOKEN", admin_token_a.clone())],
         )
         .await,
         "CLI workload-binding add (tenant A) succeeds",
     );
-    srv.seed_card_principal_in_tenant(tenant_a, &card_ref, &["workload"])
-        .await
-        .expect("tenant A workload principal seeds");
 
     // Storage cross-check via TWO distinct tenant connections (RLS, not a
     // shared filter): the binding is visible under A, absent under B.
@@ -5662,9 +5701,15 @@ fn trusted_issuer_add_args(server: &Url, client_auth: &str, principal_kind: &str
 }
 
 /// Arguments for `wyrd auth workload-binding add` binding `subject` of the
-/// Keycloak issuer to `card`.
-fn workload_binding_add_args(server: &Url, subject: &str, card: &CardRef) -> Vec<String> {
-    [
+/// Keycloak issuer to the Service account `principal`, optionally pinning
+/// `workload_uid` as its default root.
+fn workload_binding_add_args(
+    server: &Url,
+    subject: &str,
+    principal: PrincipalId,
+    workload_uid: Option<&CardUid>,
+) -> Vec<String> {
+    let mut args = [
         "auth",
         "workload-binding",
         "add",
@@ -5674,13 +5719,17 @@ fn workload_binding_add_args(server: &Url, subject: &str, card: &CardRef) -> Vec
         subject,
         "--audience",
         "wyrd-workload",
-        "--card",
-        &card.to_string(),
+        "--principal",
+        &principal.to_string(),
         "--server",
         server.as_str(),
     ]
     .map(str::to_owned)
-    .to_vec()
+    .to_vec();
+    if let Some(uid) = workload_uid {
+        args.extend(["--workload-uid".to_owned(), uid.to_string()]);
+    }
+    args
 }
 
 /// Assert the CLI exited successfully, reporting its stderr otherwise.

@@ -303,15 +303,23 @@ async fn user(server: &WyrdTestServer, name: &str, roles: &[&str]) -> (Uuid, Str
     }
 }
 
-/// Exchange a bootstrapped machine principal's API key for an access token.
+/// Exchange a bootstrapped machine principal's API key for an access token
+/// rooted at the Card it acts as.
 ///
 /// # Panics
-/// Panics when the principal has no API key or the exchange fails.
+/// Panics when the principal has no API key or Card UID, or the exchange
+/// fails.
 async fn machine_jwt(server: &WyrdTestServer, machine: &Bootstrap) -> String {
     server
-        .exchange_api_key(machine.api_key().expect("machine has an API key"))
+        .exchange_api_key_for_workload(
+            machine.api_key().expect("machine has an API key"),
+            machine
+                .card_ref()
+                .and_then(|card| card.uid.as_ref())
+                .expect("machine acts as a Card UID"),
+        )
         .await
-        .expect("API key exchanges")
+        .expect("rooted exchange succeeds")
 }
 
 /// Read one execution's frozen (origin, owner, binding, requester) identity
@@ -647,12 +655,12 @@ async fn enqueue_refusals_fail_before_staging() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// A Card-bound caller may enqueue only a subject its signed Card scope
-/// carries: holding `verifier:run` on exactly the selected Verifier, the
-/// subject's own Service principal is accepted, while an unrelated Card-bound
-/// Service, and an editor Service acting on its behalf, are refused with
-/// one audited denial each before anything is staged. A caller bound to no
-/// Card is decided by RBAC alone.
+/// A rooted caller may enqueue only a subject its signed Card scope carries:
+/// holding `verifier:run` on exactly the selected Verifier, the subject
+/// family's runtime account rooted at the subject is accepted, while an
+/// unrelated Service rooted at its own Card, and an editor Service acting on
+/// its behalf, are refused with one audited denial each before anything is
+/// staged. A rootless caller is decided by RBAC alone.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
@@ -676,7 +684,7 @@ async fn enqueue_admits_only_signed_scope_subjects() {
         .expect("role seeds");
 
     let subject_ref: CardRef = serde_json::from_value(json!({
-        "kind": "Service", "name": "vr-service", "version": "1.0.0"
+        "kind": "Service", "name": "vr-service", "version": "1.0.0", "uid": fixture.service
     }))
     .expect("subject ref decodes");
     let owner = server

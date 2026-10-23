@@ -184,7 +184,7 @@ impl Harness {
             .await
             .expect("binding projects");
         self.seed
-            .activate(principal)
+            .activate(principal, &owner)
             .await
             .expect("owner activates");
         self.make_due(binding).await;
@@ -1879,7 +1879,7 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
         .expect("binding projects");
     harness
         .seed
-        .activate(principal)
+        .activate(principal, &owner)
         .await
         .expect("owner activates");
     harness.make_due(binding).await;
@@ -1988,7 +1988,7 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
         .expect("binding projects");
     harness
         .seed
-        .activate(principal)
+        .activate(principal, &owner)
         .await
         .expect("owner activates");
     harness.make_due(binding).await;
@@ -2070,7 +2070,7 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         );
         harness
             .seed
-            .activate(principal)
+            .activate(principal, &owner)
             .await
             .expect("owner activates");
     }

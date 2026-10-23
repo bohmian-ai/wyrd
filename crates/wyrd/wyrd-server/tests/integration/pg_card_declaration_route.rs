@@ -2884,9 +2884,9 @@ async fn read_card(server: &WyrdTestServer, jwt: &str, kind: &str, uid: &str) ->
 /// schedule cursor.
 type BindingActivityRow = (Option<DateTime<Utc>>, String, Option<DateTime<Utc>>);
 
-/// Read every binding of `owner` with its principal's activity, ordered by
-/// subject occurrence key in byte order, so the owner's own `$owner` binding
-/// precedes every component alias.
+/// Read every binding of `owner` with its family account's activity at that
+/// exact root, ordered by subject occurrence key in byte order, so the
+/// owner's own `$owner` binding precedes every component alias.
 ///
 /// # Panics
 /// Panics when the tenant connection or the read fails.
@@ -2896,9 +2896,14 @@ async fn owner_activity(server: &WyrdTestServer, owner: Uuid) -> Vec<BindingActi
         .await
         .expect("tenant connection opens");
     let rows = sqlx::query_as(
-        "SELECT p.last_authenticated_at, b.subject_occurrence_key, b.next_run_at \
+        "SELECT a.last_authenticated_at, b.subject_occurrence_key, b.next_run_at \
            FROM wyrd.verification_bindings b \
-           JOIN wyrd.auth_service_accounts p ON p.card_uid = b.owner_card_uid \
+           JOIN wyrd.cards c ON c.card_uid = b.owner_card_uid \
+           LEFT JOIN wyrd.auth_service_accounts p \
+             ON p.restriction_kind = c.kind AND p.restriction_name = c.name \
+            AND p.status <> 'deleted' \
+           LEFT JOIN wyrd.workload_activity a \
+             ON a.workload_card_uid = b.owner_card_uid AND a.principal_id = p.id \
           WHERE b.owner_card_uid = $1 \
           ORDER BY b.subject_occurrence_key COLLATE \"C\"",
     )
@@ -2920,8 +2925,9 @@ async fn owner_activity(server: &WyrdTestServer, owner: Uuid) -> Vec<BindingActi
 /// through the public route, re-applies the identical graph, and checks the
 /// under-privileged and cross-tenant reads. Before any exchange it proves
 /// declaration wrote no `wyrd.verifier_executions` row for the owner.
-/// Finally it exchanges an API key for the Service's own projected principal
-/// through `/auth/token` and proves that exchange stamped the owner's activity
+/// Finally it exchanges an API key for the Service family's runtime account,
+/// selecting the Service as root, through `/auth/token` and proves that
+/// exchange stamped the owner's activity
 /// and armed both schedule cursors, the component's inherited from its owner. An unarmable schedule and a repeated component alias are refused
 /// before any write.
 ///
@@ -2931,7 +2937,8 @@ async fn owner_activity(server: &WyrdTestServer, owner: Uuid) -> Vec<BindingActi
 /// identity, execution-absence, or activity assertion does not hold.
 #[tokio::test(flavor = "current_thread")]
 async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
-    let server = WyrdTestServer::start_in_process()
+    let server = wyrd_testing::WyrdTestServerBuilder::default()
+        .start_bound()
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
@@ -3178,8 +3185,8 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
         "registration alone never enqueues an execution"
     );
 
-    server
-        .exchange_api_key(&api_key)
+    machine_auth(&server, &api_key, service_uid)
+        .bearer()
         .await
         .expect("owner API key exchanges");
     let rows = owner_activity(&server, service_uid).await;
@@ -3432,47 +3439,58 @@ fn live_ref(version: &str) -> CardRef {
     .expect("live ref decodes")
 }
 
-/// Read the machine principals whose id or bound Card UID is `value`.
+/// Read the recorded workload activity whose account or root is `value`.
 ///
-/// Returns each match's id and last qualifying exchange, so a caller can read
-/// one principal by id or every principal an owner Card projects and assert
-/// how many exist; principal ids and Card UIDs never collide.
+/// Returns each row's account id and last qualifying exchange, so a caller
+/// can read one account's activity or every account active at one root;
+/// principal ids and Card UIDs never collide.
 ///
 /// # Panics
 /// Panics when the tenant connection or the read fails.
-async fn principal_activity(
-    server: &WyrdTestServer,
-    value: Uuid,
-) -> Vec<(Uuid, Option<DateTime<Utc>>)> {
+async fn principal_activity(server: &WyrdTestServer, value: Uuid) -> Vec<(Uuid, DateTime<Utc>)> {
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
         .expect("tenant connection opens");
     let rows = sqlx::query_as(
-        "SELECT id, last_authenticated_at FROM wyrd.auth_service_accounts \
-          WHERE id = $1 OR card_uid = $1",
+        "SELECT principal_id, last_authenticated_at FROM wyrd.workload_activity \
+          WHERE principal_id = $1 OR workload_card_uid = $1",
     )
     .bind(value)
     .fetch_all(&mut **conn.transaction())
     .await
-    .expect("principal activity reads");
+    .expect("workload activity reads");
     conn.commit().await.expect("assertion transaction commits");
     rows
 }
 
-/// The one principal `owner` projects and its last qualifying exchange.
+/// The family runtime account of the exact root `owner` and its last
+/// qualifying exchange at that root.
 ///
 /// # Panics
-/// Panics when the read fails or the owner does not project exactly one
-/// principal.
+/// Panics when the tenant connection or the read fails, or the root's family
+/// has no live account.
 async fn owner_principal(server: &WyrdTestServer, owner: Uuid) -> (Uuid, Option<DateTime<Utc>>) {
-    let rows = principal_activity(server, owner).await;
-    assert_eq!(
-        rows.len(),
-        1,
-        "one exact owner version projects one principal"
-    );
-    rows[0]
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let row = sqlx::query_as(
+        "SELECT p.id, a.last_authenticated_at \
+           FROM wyrd.cards c \
+           JOIN wyrd.auth_service_accounts p \
+             ON p.restriction_kind = c.kind AND p.restriction_name = c.name \
+            AND p.status <> 'deleted' \
+           LEFT JOIN wyrd.workload_activity a \
+             ON a.workload_card_uid = c.card_uid AND a.principal_id = p.id \
+          WHERE c.card_uid = $1",
+    )
+    .bind(owner)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("one family account owns the root");
+    conn.commit().await.expect("assertion transaction commits");
+    row
 }
 
 /// The schedule cursor of `owner`'s Service-level binding.
@@ -3488,22 +3506,23 @@ async fn schedule_cursor(server: &WyrdTestServer, owner: Uuid) -> Option<DateTim
         .2
 }
 
-/// Move `principal`'s recorded activity past the default inactivity window,
-/// so the gate lapses on the database's own clock, and return the stamp it
-/// now carries.
+/// Move `principal`'s recorded activity at `root` past the default
+/// inactivity window, so the gate lapses on the database's own clock, and
+/// return the stamp it now carries.
 ///
 /// # Panics
 /// Panics when the tenant connection or the update fails.
-async fn lapse_activity(server: &WyrdTestServer, principal: Uuid) -> DateTime<Utc> {
+async fn lapse_activity(server: &WyrdTestServer, root: Uuid, principal: Uuid) -> DateTime<Utc> {
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
         .expect("tenant connection opens");
     let lapsed = sqlx::query_scalar(
-        "UPDATE wyrd.auth_service_accounts \
+        "UPDATE wyrd.workload_activity \
             SET last_authenticated_at = statement_timestamp() - INTERVAL '25 hours' \
-          WHERE id = $1 RETURNING last_authenticated_at",
+          WHERE workload_card_uid = $1 AND principal_id = $2 RETURNING last_authenticated_at",
     )
+    .bind(root)
     .bind(principal)
     .fetch_one(&mut **conn.transaction())
     .await
@@ -3542,11 +3561,13 @@ async fn owner_gates(server: &WyrdTestServer, owner: Uuid) -> Vec<bool> {
     gates
 }
 
-/// Build a real client over the bound server that authenticates with `key`.
+/// Build a real client over the bound server that authenticates with `key`
+/// and selects the exact workload root `root`.
 ///
 /// # Panics
-/// Panics when the server is not bound or the client auth cannot build.
-fn machine_auth(server: &WyrdTestServer, key: &SecretString) -> Arc<AuthMiddleware> {
+/// Panics when the server is not bound, `root` is not a Card UID, or the
+/// client auth cannot build.
+fn machine_auth(server: &WyrdTestServer, key: &SecretString, root: Uuid) -> Arc<AuthMiddleware> {
     let config = ClientConfig {
         http: HttpConfig {
             base_url: server
@@ -3562,12 +3583,14 @@ fn machine_auth(server: &WyrdTestServer, key: &SecretString) -> Arc<AuthMiddlewa
         ResolvedCredential::ApiKey(SecretString::clone(key)),
     )
     .expect("client auth builds")
+    .for_workload(CardUid::from_uuid(root).expect("root is a Card UID"))
 }
 
-/// Runtime activity follows only qualifying exchanges of the exact owner.
+/// Runtime activity follows only qualifying exchanges at the exact owner root.
 ///
-/// Declares two A/B versions of one bound Service and drives a real client
-/// through `/auth/token`. The first API-key exchange activates only the exact
+/// Declares two A/B versions of one bound Service, whose family has one
+/// runtime account, and drives a real client through `/auth/token` selecting
+/// each version as root. The first API-key exchange activates only the exact
 /// version, arms its schedule cursor, and — through the component binding —
 /// activates every binding of that Service. A cached-token request, an idle
 /// client whose token went stale, a Card-free automation principal's
@@ -3578,7 +3601,8 @@ fn machine_auth(server: &WyrdTestServer, key: &SecretString) -> Arc<AuthMiddlewa
 /// gated until its own exchange. Idle expiry after the default window closes
 /// the gate; reauthentication reopens it, and the occurrences missed during
 /// the lapse are skipped without backfill so the schedule resumes at the next
-/// future boundary. Suspension and Card deletion each close the gate.
+/// future boundary. Card deletion closes only that version's gate, and
+/// suspending the family account closes the rest.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, a fixture or route call
@@ -3604,23 +3628,30 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
     let credential = |version: &'static str| {
         let server = &server;
         async move {
-            let Bootstrap::Machine { api_key, .. } = server
+            let Bootstrap::Machine { id, api_key, .. } = server
                 .credential_registered_service(&live_ref(version), &["editor"])
                 .await
                 .expect("registered Service is credentialed")
             else {
                 panic!("credentialed Service returned a non-machine principal");
             };
-            api_key
+            (id, api_key)
         }
     };
-    let replica_one = credential("1.0.0").await;
-    let replica_two = credential("1.0.0").await;
-    let b_key = credential("2.0.0").await;
+    let (replica_one_id, replica_one) = credential("1.0.0").await;
+    let (replica_two_id, replica_two) = credential("1.0.0").await;
+    let (b_id, b_key) = credential("2.0.0").await;
     let (a_principal, seen) = owner_principal(&server, a_owner).await;
     assert_eq!(seen, None, "registration and credentialing never activate");
+    for id in [replica_one_id, replica_two_id, b_id] {
+        assert_eq!(
+            id.as_uuid(),
+            a_principal,
+            "every release and replica shares the family's one runtime account"
+        );
+    }
 
-    let client = machine_auth(&server, &replica_one);
+    let client = machine_auth(&server, &replica_one, a_owner);
     let token = client.bearer().await.expect("first exchange succeeds");
     let (_, first) = owner_principal(&server, a_owner).await;
     let first = first.expect("the exact owner's first exchange records activity");
@@ -3675,8 +3706,8 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         .expect("Card-free automation exchanges");
     assert_eq!(
         principal_activity(&server, automation_id).await,
-        vec![(automation_id, None)],
-        "a Card-free automation exchange records no activity"
+        Vec::new(),
+        "a rootless automation exchange records no activity"
     );
     server
         .delegate(&jwt, token.expose(), TokenAudience::Wyrd)
@@ -3693,12 +3724,12 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         "cached requests never activate an owner"
     );
 
-    let replica = machine_auth(&server, &replica_two);
+    let replica = machine_auth(&server, &replica_two, a_owner);
     replica.bearer().await.expect("replica exchange succeeds");
     assert_eq!(
         principal_activity(&server, a_owner).await.len(),
         1,
-        "replicas share the one exact principal"
+        "replicas share the one account's activity at the exact root"
     );
     let (principal, renewed) = owner_principal(&server, a_owner).await;
     assert_eq!(principal, a_principal);
@@ -3732,7 +3763,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         "renewal never moves an armed cursor"
     );
 
-    machine_auth(&server, &b_key)
+    machine_auth(&server, &b_key, b_owner)
         .bearer()
         .await
         .expect("the other version exchanges");
@@ -3745,7 +3776,7 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
 
     assert!(owner_gates(&server, a_owner).await.iter().all(|g| *g));
     assert!(owner_gates(&server, b_owner).await.iter().all(|g| *g));
-    let lapsed = lapse_activity(&server, a_principal).await;
+    let lapsed = lapse_activity(&server, a_owner, a_principal).await;
     assert!(
         owner_gates(&server, a_owner).await.iter().all(|g| !g),
         "the default inactivity window closes the gate"
@@ -3764,8 +3795,8 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
     .await
     .expect("cursor ages through the lapse");
     conn.commit().await.expect("cursor commits");
-    server
-        .exchange_api_key(&replica_one)
+    machine_auth(&server, &replica_one, a_owner)
+        .bearer()
         .await
         .expect("reauthentication after the lapse exchanges");
     let reactivated = owner_principal(&server, a_owner)
@@ -3785,8 +3816,8 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
     let mut outcomes = Vec::new();
     while let Some(due) = queue.claim_due(&mut conn).await.expect("scheduler claims") {
         let accepted = match due.owner() {
-            Some(owner) => authority
-                .resolve(&mut conn, owner)
+            Some((owner, root)) => authority
+                .resolve(&mut conn, owner, root)
                 .await
                 .expect("owner authority resolves")
                 .ok(),
@@ -3823,6 +3854,27 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
         "the schedule resumes at the next future daily boundary: {cursor_ahead}s"
     );
 
+    let delete = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/v1/cards/by-ref?kind=Service&name=vb-live&version=2.0.0")
+                .body(Body::empty())
+                .expect("delete request builds"),
+        )
+        .await
+        .expect("delete responds");
+    assert!(delete.status().is_success(), "{}", delete.status());
+    assert!(
+        owner_gates(&server, b_owner).await.iter().all(|g| !g),
+        "deleting the owner Card closes the gate"
+    );
+    assert!(
+        owner_gates(&server, a_owner).await.iter().all(|g| *g),
+        "deleting one release leaves the other release's gate open"
+    );
+
     let revoke = server
         .oneshot_authenticated(
             &jwt,
@@ -3844,23 +3896,6 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
     );
     assert!(server.exchange_api_key(&replica_one).await.is_err());
     assert_eq!(owner_principal(&server, a_owner).await.1, Some(reactivated));
-
-    let delete = server
-        .oneshot_authenticated(
-            &jwt,
-            Request::builder()
-                .method(Method::DELETE)
-                .uri("/v1/cards/by-ref?kind=Service&name=vb-live&version=2.0.0")
-                .body(Body::empty())
-                .expect("delete request builds"),
-        )
-        .await
-        .expect("delete responds");
-    assert!(delete.status().is_success(), "{}", delete.status());
-    assert!(
-        owner_gates(&server, b_owner).await.iter().all(|g| !g),
-        "deleting the owner Card closes the gate"
-    );
 
     server.shutdown().await.expect("test server shuts down");
 }

@@ -385,8 +385,9 @@ impl Support {
 }
 
 /// Declare the Service fixture at `fixture` under `fixtures/cards/` as
-/// `admin`, credential it as an editor, and exchange its API key, which
-/// records the Service's activity.
+/// `admin`, credential its family runtime account as an editor, and exchange
+/// its API key rooted at the declared Service, which records the Service's
+/// activity.
 ///
 /// Returns the declaration receipt and the Service's access token.
 ///
@@ -403,9 +404,16 @@ async fn declare(
         .await
         .expect("Service credentials");
     let token = server
-        .exchange_api_key(machine.api_key().expect("machine has an API key"))
+        .exchange_api_key_for_workload(
+            machine.api_key().expect("machine has an API key"),
+            receipt
+                .root
+                .uid
+                .as_ref()
+                .expect("the declared root has a UID"),
+        )
         .await
-        .expect("API key exchanges");
+        .expect("rooted exchange succeeds");
     (receipt, token)
 }
 
@@ -499,7 +507,7 @@ fn payload(
             run_id: None,
             verifier_version: &source.verifier_version,
             card_uid: &source.card_uid,
-            owner_card_uid: source.authority.principal.owner_service_uid(),
+            owner_card_uid: source.authority.owning_root(),
             group_id: Some(group),
             binding_id: None,
             trigger: None,
@@ -655,7 +663,7 @@ async fn incomplete_snapshots_retry_then_error() {
             run_id: None,
             verifier_version: &source.verifier_version,
             card_uid: &source.card_uid,
-            owner_card_uid: source.authority.principal.owner_service_uid(),
+            owner_card_uid: source.authority.owning_root(),
             group_id: Some(&group),
             binding_id: None,
             trigger: None,
@@ -832,6 +840,7 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
             .resolve(
                 &mut claimer,
                 due.owner.expect("the Service has a principal"),
+                &due.owner_card_uid,
             )
             .await
             .expect("authority resolves")
@@ -1009,9 +1018,8 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         .expect("Bifrost flushes");
     support
         .exec(
-            "UPDATE wyrd.auth_service_accounts
-                SET last_authenticated_at = statement_timestamp() - INTERVAL '400 days'
-              WHERE card_uid IS NOT NULL AND principal_kind <> 'system'",
+            "UPDATE wyrd.workload_activity
+                SET last_authenticated_at = statement_timestamp() - INTERVAL '400 days'",
         )
         .await;
     support.make_due().await;
@@ -1058,10 +1066,7 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
     assert!(again.is_empty(), "a refusal is not polled again: {again:?}");
     assert_eq!(support.errored("lapsed").await.len(), 1);
     support
-        .exec(
-            "UPDATE wyrd.auth_service_accounts SET last_authenticated_at = statement_timestamp()
-              WHERE card_uid IS NOT NULL AND principal_kind <> 'system'",
-        )
+        .exec("UPDATE wyrd.workload_activity SET last_authenticated_at = statement_timestamp()")
         .await;
 
     support.turn("retired", "one", None).await;
@@ -1101,7 +1106,10 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
     let mut conn = support.conn().await;
     sqlx::query(
         "DELETE FROM wyrd.auth_service_account_roles
-          WHERE service_account_id = (SELECT id FROM wyrd.auth_service_accounts WHERE card_uid = $1)",
+          WHERE service_account_id = (
+                SELECT p.id FROM wyrd.auth_service_accounts p
+                  JOIN wyrd.cards c ON p.restriction_kind = c.kind AND p.restriction_name = c.name
+                 WHERE c.card_uid = $1 AND p.status <> 'deleted')",
     )
     .bind(support.owner.as_uuid())
     .execute(&mut **conn.transaction())

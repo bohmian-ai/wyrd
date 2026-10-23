@@ -34,8 +34,6 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
         kind: PrincipalKindTag::User,
         tenant_id: tenant,
-        card_ref: None,
-        card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
     };
     state
         .auth
@@ -47,6 +45,8 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
                 principal,
                 roles: vec![],
                 permissions: wyrd_runtime::PermissionSet::new(),
+                card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
+                workload_uid: None,
                 credential_id: None,
                 act: None,
                 audience: wyrd_spec::auth::TokenAudience::Wyrd,

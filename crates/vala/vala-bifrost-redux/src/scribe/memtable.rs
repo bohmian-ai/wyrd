@@ -1444,7 +1444,7 @@ impl MemtableBucket {
             &self.batches,
             &self.statistics,
             &self.metas,
-            self.seal_key.partition.clone(),
+            self.seal_key.clone(),
             None,
             &self.charge,
         )
@@ -1674,7 +1674,7 @@ impl FrozenMemtable {
             &self.batches,
             &self.statistics,
             &self.metas,
-            self.seal_key.partition.clone(),
+            self.seal_key.clone(),
             Some(generation),
             &self.charge,
         )
@@ -1745,7 +1745,7 @@ impl LiveCapture {
         let staged = if let Some(registry) = registry {
             let served = memory
                 .iter()
-                .filter_map(|source| source.generation.map(|g| (source.partition.clone(), g)))
+                .filter_map(|source| source.generation.map(|g| (source.seal_key.clone(), g)))
                 .collect();
             let Some(capture) =
                 registry
@@ -1760,7 +1760,7 @@ impl LiveCapture {
                 source.generation.is_none_or(|generation| {
                     !capture
                         .superseded
-                        .contains(&(source.partition.clone(), generation))
+                        .contains(&(source.seal_key.clone(), generation))
                 })
             });
             publication_revision = capture.publication_revision;
@@ -1805,7 +1805,7 @@ impl LiveCapture {
         let memory = self
             .memory
             .iter()
-            .map(|source| (source.partition.time(), source.scoped_bytes(scope)));
+            .map(|source| (source.seal_key.partition.time(), source.scoped_bytes(scope)));
         let staged = self.staged.iter().flat_map(|lease| {
             lease.sources().iter().map(|source| {
                 (
@@ -1842,7 +1842,7 @@ impl LiveCapture {
         let mut batches = Vec::new();
         let mut charges = Vec::new();
         for source in &self.memory {
-            if partitions.contains(&source.partition.time()) {
+            if partitions.contains(&source.seal_key.partition.time()) {
                 source.project(required, &mut batches)?;
                 charges.push(Arc::clone(&source.charge));
             }
@@ -1909,8 +1909,9 @@ struct ReadableSource {
     statistics: Vec<Arc<Statistics>>,
     /// Maximum WAL LSN of each append, index-aligned with `batches`.
     wal_lsns: Vec<crate::scribe::wal::WalLsn>,
-    /// Exact partition owning every batch.
-    partition: crate::catalog::PhysicalPartition,
+    /// Complete seal key owning every batch; its generation ordinals are
+    /// unique only within it.
+    seal_key: SealKey,
     /// Serving immutable generation, or `None` for a writable bucket.
     generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
     /// Accounting owner of `batches`, shared with the bucket or generation
@@ -1926,7 +1927,7 @@ impl ReadableSource {
         batches: &[RecordBatch],
         statistics: &[Arc<Statistics>],
         metas: &[ScribeAppendMeta],
-        partition: crate::catalog::PhysicalPartition,
+        seal_key: SealKey,
         generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
         charge: &Arc<crate::scribe::memory::RetainedArrowCharge>,
     ) -> Self {
@@ -1935,7 +1936,7 @@ impl ReadableSource {
             batches: batches.to_vec(),
             statistics: statistics.to_vec(),
             wal_lsns: metas.iter().map(|meta| meta.wal_lsn_max).collect(),
-            partition,
+            seal_key,
             generation,
             charge: Arc::clone(charge),
         }
@@ -2028,7 +2029,7 @@ impl ReadableSource {
                 },
             ));
             output.push(ReadableBatch {
-                partition_day: self.partition.time(),
+                partition_day: self.seal_key.partition.time(),
                 wal_lsn_max,
                 batch,
                 statistics,
@@ -2942,6 +2943,105 @@ mod tests {
         let cohort = rotation.freeze_all_nonempty().expect("full rotation");
         assert_eq!(cohort.len(), 2);
         assert!(cohort.iter().all(|member| member.shard_id == SHARD));
+    }
+
+    /// Two revisions of one partition can hold the same generation ordinal:
+    /// recovery restores an old revision's staged member without advancing a
+    /// fresh lane's counter, and the new revision's first freeze reuses the
+    /// ordinal. Capture keys sources by their complete seal key, so both are
+    /// selected once, and publishing one suppresses only its own memory copy.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the freeze does not reuse the ordinal, a capture omits or
+    /// duplicates either source, or publication suppresses the other key.
+    #[test]
+    fn revisions_sharing_an_ordinal_are_captured_by_full_key() {
+        use crate::scribe::hot_source::{
+            GenerationOrdinal, HotAuthority, RunFooters, ScribeHotSourceRegistry,
+        };
+
+        let registry = Arc::new(ScribeHotSourceRegistry::new());
+        let old = make_test_seal_key();
+        let new = SealKey {
+            revision: crate::catalog::LayoutRevision {
+                sort_order_id: old.revision.sort_order_id + 1,
+                ..old.revision
+            },
+            ..old.clone()
+        };
+        let ordinal = GenerationOrdinal::new(0, 1);
+        registry
+            .restore_durable(
+                &old,
+                ordinal,
+                HotAuthority::StagedRun {
+                    member: crate::scribe::assembly::StagedMemberId::new(0, 1),
+                    runs: vec![std::path::PathBuf::from("/stage/old-run.parquet")],
+                    bytes: 1_024,
+                    footers: RunFooters::default(),
+                    wal: (WalLsn::new(1), WalLsn::new(9)),
+                },
+            )
+            .expect("the old revision's staged member restores");
+        let memtable = Memtable::new_with_config(usize::MAX, Duration::from_mins(1))
+            .with_hot_sources(0, Arc::clone(&registry));
+        memtable
+            .insert(&new, make_test_meta(10), make_test_batch(3))
+            .expect("the new revision inserts");
+        let frozen = memtable.freeze(&new).expect("the new revision freezes");
+        assert_eq!(
+            GenerationOrdinal::new(0, frozen.seal_id),
+            ordinal,
+            "the fresh lane reuses the restored ordinal"
+        );
+
+        let selected = |capture: &LiveCapture| {
+            let memory: Vec<_> = capture
+                .memory
+                .iter()
+                .map(|source| (source.seal_key.clone(), source.batches.len()))
+                .collect();
+            let staged: Vec<_> = capture
+                .staged
+                .as_ref()
+                .expect("a registry capture")
+                .sources()
+                .iter()
+                .map(|source| (source.key.clone(), source.generation))
+                .collect();
+            (memory, staged)
+        };
+        let capture = LiveCapture::take([&memtable], new.tenant, &new.table, Some(&registry))
+            .expect("locks")
+            .expect("no publication is unsettled");
+        assert_eq!(
+            selected(&capture),
+            (vec![(new.clone(), 1)], vec![(old.clone(), ordinal)]),
+            "the new memory rows and the old staged run are each selected once"
+        );
+        drop(capture);
+
+        registry
+            .begin_publication(&new, &[ordinal])
+            .expect("the new generation's publication is marked");
+        registry
+            .advance(
+                &new,
+                ordinal,
+                HotAuthority::Published {
+                    object_keys: vec!["objects/new.parquet".to_owned()],
+                },
+            )
+            .expect("the new generation publishes");
+        let capture = LiveCapture::take([&memtable], new.tenant, &new.table, Some(&registry))
+            .expect("locks")
+            .expect("the publication settled");
+        assert_eq!(
+            selected(&capture),
+            (Vec::new(), vec![(old, ordinal)]),
+            "publication suppresses only its own key's memory copy"
+        );
     }
 
     /// The age trigger fires exactly at `seal_max_age`, and size takes priority.

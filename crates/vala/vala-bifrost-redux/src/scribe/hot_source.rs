@@ -357,8 +357,7 @@ pub struct StagedCapture {
     pub lease: StagedSourceLease,
     /// Memory-served generations whose authority is already a published
     /// object; the capture must drop their memory copy.
-    pub superseded:
-        std::collections::HashSet<(crate::catalog::PhysicalPartition, GenerationOrdinal)>,
+    pub superseded: std::collections::HashSet<(SealKey, GenerationOrdinal)>,
     /// The table revision this node's last locally completed publication
     /// committed at, read in the same critical section: every generation
     /// the capture omits as published is covered by a cut at least this new.
@@ -869,7 +868,9 @@ impl ScribeHotSourceRegistry {
     /// Takes the staged half of one coherent whole-table live capture.
     ///
     /// The caller holds the memory half's memtable read guards and passes the
-    /// immutable generations that half serves, keyed by partition. In one
+    /// immutable generations that half serves, keyed by their complete seal
+    /// key, since generation ordinals restart per key and two revisions of one
+    /// partition can share one. In one
     /// registry critical section this then decides every generation's single
     /// source: a served generation whose authority is already a published
     /// object is reported as superseded so its memory copy is dropped; any
@@ -890,7 +891,7 @@ impl ScribeHotSourceRegistry {
         self: &Arc<Self>,
         tenant: wyrd_spec::ids::DataTenantId,
         table: &crate::catalog::TableRef,
-        served: &std::collections::HashSet<(crate::catalog::PhysicalPartition, GenerationOrdinal)>,
+        served: &std::collections::HashSet<(SealKey, GenerationOrdinal)>,
     ) -> Result<Option<StagedCapture>, HotSourceError> {
         let mut state = self.lock()?;
         let publication_revision = self
@@ -912,9 +913,9 @@ impl ScribeHotSourceRegistry {
                 continue;
             }
             for (generation, authority) in &authorities.by_generation {
-                if served.contains(&(key.partition.clone(), *generation)) {
+                if served.contains(&(key.clone(), *generation)) {
                     if matches!(authority, HotAuthority::Published { .. }) {
-                        superseded.insert((key.partition.clone(), *generation));
+                        superseded.insert((key.clone(), *generation));
                     }
                     continue;
                 }
@@ -1491,7 +1492,7 @@ mod tests {
                 },
             )
             .expect("generation publishes");
-        let served = std::collections::HashSet::from([(key.partition, generation)]);
+        let served = std::collections::HashSet::from([(key.clone(), generation)]);
         let capture = registry
             .capture_staged(key.tenant, &key.table, &served)
             .expect("locked")

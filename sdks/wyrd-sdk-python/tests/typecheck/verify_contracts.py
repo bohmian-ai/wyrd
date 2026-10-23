@@ -48,6 +48,7 @@ def typed_reads_carry_the_model(state: WyrdState, execution: Execution) -> None:
     assert_type(result, VerificationResult[Judge])
     assert_type(result.requirements, list[RequirementResult[Judge]])
     assert_type(result.requirements[0]["data"], Judge)
+    assert_type(result.requirements[0].get("data"), Judge | None)
     assert_type(execution.wait_typed(1.0, Judge), VerificationResult[Judge])
     typed = execution.status_typed(Judge)
     assert_type(typed["result"]["outcome"]["requirements"], list[RequirementResult[Judge]])

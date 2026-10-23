@@ -438,5 +438,3 @@ Limits and risks:
   without query-read is refused. The spec's "elevated payload-read
   protections" wording does not match this documented posture; spec authority
   should confirm or narrow it.
-- Python `ty` types `.get("data")` on a generic TypedDict as the default type;
-  subscripting is typed correctly.

@@ -36,7 +36,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
@@ -256,7 +256,7 @@ def keep_login(link: Path, original: Path) -> str | None:
 
 
 @contextmanager
-def shared_login(agent: Agent, codex_home: Path, notes: list[str]) -> Iterator[list[str]]:
+def shared_login(agent: Agent, codex_home: Path, notes: list[str]) -> Generator[list[str]]:
     """Link the owner's login into the agent's ``CODEX_HOME`` for the block.
 
     Yields the login's secret values for redaction; afterwards ``keep_login``
@@ -325,7 +325,7 @@ def wait_until(
 
 
 @contextmanager
-def docs_served(artifacts: Path, redact: Redactor, cancel: threading.Event) -> Iterator[str]:
+def docs_served(artifacts: Path, redact: Redactor, cancel: threading.Event) -> Generator[str]:
     """Build and serve this checkout's docs through ``docs:preview``; yield their base URL.
 
     Readiness is the built ``llms-full.txt`` answering. The serving process
@@ -366,7 +366,7 @@ def docs_served(artifacts: Path, redact: Redactor, cancel: threading.Event) -> I
 @contextmanager
 def wyrd_served(
     cli: Path, tenant: str, home: Path, env: dict[str, str], log: Path, cancel: threading.Event
-) -> Iterator[dict[str, Any]]:
+) -> Generator[dict[str, Any]]:
     """Run ``wyrd init --format json`` in the foreground; yield its readiness document.
 
     The harness owns the child: it waits for the one readiness line and stops

@@ -12,7 +12,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -271,7 +271,7 @@ def fresh_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @contextmanager
-def serving(delay: float = 0.0) -> Iterator[Receiver]:
+def serving(delay: float = 0.0) -> Generator[Receiver]:
     """Serve the local model provider and Operator hook endpoint until exit.
 
     With a ``delay``, each judge call is recorded on arrival and answered
@@ -402,7 +402,7 @@ def unfitted_assistant(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path
 @contextmanager
 def watching(
     tmp_path: Path, service: str, verifier: str, *, fitted: bool = True
-) -> Iterator[Watch]:
+) -> Generator[Watch]:
     """Deploy the scheduled-drift ``service`` on a server of its own until exit.
 
     The server's ``on-call-hooks`` connection points at a hook of its own,

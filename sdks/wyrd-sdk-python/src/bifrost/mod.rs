@@ -553,14 +553,26 @@ enum Binding {
     Native,
 }
 
+impl Binding {
+    /// The locally bound declaration that still needs a describe, if any.
+    fn unresolved(&self) -> Option<&TableConfig> {
+        match self {
+            Self::Local(Some(table)) if table.resolved().is_none() => Some(table),
+            _ => None,
+        }
+    }
+}
+
 impl Bifrost {
     /// Return the connected native client, connecting it on first use.
     ///
     /// The first caller after a successful connection moves the locally bound
     /// write target into the native client under the binding lock, so a
     /// target bound concurrently with the connection is never lost. A
-    /// declared target is described once first, outside the lock, so its
-    /// writer names the table's current version.
+    /// declared target is described first, outside the lock, so its writer
+    /// names the table's current version; a result is applied only while that
+    /// exact declaration is still bound, and a replacement bound during the
+    /// describe is described in turn.
     ///
     /// # Errors
     ///
@@ -581,37 +593,36 @@ impl Bifrost {
                 }
             })
             .map_err(client_error)?;
-        let declared = match &*self.binding() {
-            Binding::Local(Some(table)) if table.resolved().is_none() => {
-                Some(table.as_ref().clone())
-            }
-            _ => None,
-        };
-        // The describe runs with the binding unlocked: it releases the GIL, and
-        // a thread holding the GIL may be waiting on this lock.
-        let resolved = match declared {
-            Some(mut table) => {
+        loop {
+            let declared = self.binding().unresolved().cloned();
+            // The describe runs with the binding unlocked: it releases the GIL,
+            // and a thread holding the GIL may be waiting on this lock.
+            let resolved = declared.clone().map(|mut table| {
                 let resolution = crate::trace::block_on(py, native.resolve_table(&mut table));
-                Some((table, resolution))
+                (table, resolution)
+            });
+            let mut binding = self.binding();
+            // A describe answers only the exact declaration that asked: when
+            // `use_table` replaced it meanwhile, resolve the replacement instead.
+            if binding.unresolved() != declared.as_ref() {
+                continue;
             }
-            None => None,
-        };
-        let mut binding = self.binding();
-        let local = match std::mem::replace(&mut *binding, Binding::Native) {
-            Binding::Local(local) => local.map(|table| *table),
-            Binding::Native => None,
-        };
-        match (local, resolved) {
-            (Some(local), Some((table, resolution))) if local.fqn() == table.fqn() => {
-                native.use_table(table);
-                resolution.map_err(client_error)?;
+            let local = match std::mem::replace(&mut *binding, Binding::Native) {
+                Binding::Local(local) => local.map(|table| *table),
+                Binding::Native => None,
+            };
+            match (local, resolved) {
+                (Some(_), Some((table, resolution))) => {
+                    native.use_table(table);
+                    resolution.map_err(client_error)?;
+                }
+                (Some(local), None) => {
+                    native.use_table(local);
+                }
+                (None, _) => {}
             }
-            (Some(local), _) => {
-                native.use_table(local);
-            }
-            (None, _) => {}
+            return Ok(native);
         }
-        Ok(native)
     }
 
     /// The native client the binding moved into.

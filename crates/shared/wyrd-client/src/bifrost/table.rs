@@ -50,7 +50,7 @@ pub struct ResolvedTable {
 /// `act_principal_id`) are appended by the producer and the server
 /// respectively, so declaring one here is a reserved name error rather than a
 /// way to control it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(into = "TableConfigWire", try_from = "TableConfigWire")]
 pub struct TableConfig {
     /// Target namespace, the half of the FQN before the final dot.

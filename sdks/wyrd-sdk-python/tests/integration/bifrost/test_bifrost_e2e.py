@@ -6,6 +6,12 @@ the session ``WyrdTestServer`` exports; each story writes its own fixed
 """
 
 import asyncio
+import threading
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pyarrow
@@ -163,6 +169,93 @@ def test_describe_binds_an_existing_table_without_restating_its_schema(
     writer.shutdown()
     wyrd_server.flush_bifrost()
     assert items(bifrost, "vala.datasets.described") == [Item(id=6, value="described")]
+
+
+@contextmanager
+def holding_describe(
+    upstream: str, path: str, arrived: threading.Event, release: threading.Event
+) -> Iterator[str]:
+    """Proxy ``upstream`` until exit, holding the first ``GET path`` until ``release``."""
+    held = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def forward(self) -> None:
+            if self.command == "GET" and self.path == path and held.acquire(blocking=False):
+                arrived.set()
+                release.wait()
+            length = int(self.headers.get("content-length") or 0)
+            request = urllib.request.Request(
+                upstream + self.path,
+                data=self.rfile.read(length) if length else None,
+                headers={k: v for k, v in self.headers.items() if k.lower() != "host"},
+                method=self.command,
+            )
+            try:
+                response = urllib.request.urlopen(request)
+            except urllib.error.HTTPError as refused:
+                response = refused
+            with response:
+                body = response.read()
+                self.send_response(response.status)
+                for name, value in response.headers.items():
+                    if name.lower() not in {"transfer-encoding", "connection", "content-length"}:
+                        self.send_header(name, value)
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = forward
+
+        def log_message(self, format: str, *args: object) -> None:
+            """Keep per-request access lines out of the test output."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        release.set()
+        server.shutdown()
+
+
+class Renamed(BaseModel):
+    """A declaration of ``Item``'s table with a column the table does not have."""
+
+    id: int
+    note: str
+
+
+def test_a_binding_replaced_during_its_describe_stays_replaced(
+    wyrd_server: WyrdTestServer, bifrost: Bifrost
+) -> None:
+    table = "vala.datasets.rebound"
+    assert Bifrost(TableConfig(Item, table)).register() == "created"
+    described = TableConfig.describe(table)
+    arrived, release = threading.Event(), threading.Event()
+    with holding_describe(
+        wyrd_server.base_url, "/v1/bifrost/tables/vala.datasets/rebound", arrived, release
+    ) as proxy:
+        writer = Bifrost(
+            TableConfig(Renamed, table),
+            client=WyrdClient(
+                server_url=proxy, grpc_url=wyrd_server.grpc_url, credential=wyrd_server.api_key
+            ),
+        )
+        connecting = threading.Thread(target=writer.list_tables)
+        connecting.start()
+        assert arrived.wait(30)
+        writer.use_table(described)
+        release.set()
+        connecting.join(30)
+        assert not connecting.is_alive()
+
+        bound = writer.table
+        assert bound is not None
+        assert bound.arrow_schema.names == ["id", "value"]
+        writer.insert(Item(id=1, value="replacement"))
+        writer.shutdown()
+    wyrd_server.flush_bifrost()
+    assert items(bifrost, table) == [Item(id=1, value="replacement")]
 
 
 def test_uncorrelated_row_is_a_valid_write(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:

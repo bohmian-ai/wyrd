@@ -26,7 +26,6 @@ use iceberg::metadata_columns::{
 use iceberg::spec::{DataContentType, DataFile, FormatVersion, ManifestContentType, Operation};
 use iceberg::table::Table;
 use parquet_variant_compute::{VariantArray, variant_to_json};
-use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::{
     ForgeClock, ForgeError, ForgeObjectStore, ForgeTableKey, ForgeUnsettledOutput,
@@ -215,7 +214,7 @@ async fn drain_at_output(
 /// calls, never restarting per plan and never colliding.
 ///
 /// The last section is the reclassification proof: a produced object carries
-/// the current writer recipe, so re-running selection against a live set that
+/// the selected table version, so re-running selection against a live set that
 /// now contains it must not name it again.
 #[tokio::test]
 async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
@@ -255,8 +254,8 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
     );
     for path in &paths {
         assert!(
-            path.contains(&format!("/data/forge/{FORGE_WRITER_RECIPE}/")),
-            "a produced object carries the current writer recipe: {path}"
+            path.contains(&format!("/data/forge/1/")),
+            "a produced object carries the selected table version: {path}"
         );
         assert!(
             path.contains(&format!("{attempt_id}-00000-")),
@@ -302,7 +301,7 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
     for produced in &paths {
         assert!(
             !reselected.contains(produced),
-            "a current-recipe object must not be reselected: {produced}"
+            "a current-version object must not be reselected: {produced}"
         );
     }
 }
@@ -709,7 +708,7 @@ async fn assert_position_delete_applies_to_output_rows() {
 ///
 /// # Panics
 ///
-/// Panics when the fixture table declares a whole-file size property, the
+/// Panics when the fixture table does not persist the resolved target, the
 /// attempt fails, it rewrites fewer than both promoted files, the output does
 /// not carry every row exactly once, or a produced object is empty or reaches
 /// the erased 128 MiB ceiling.
@@ -720,8 +719,8 @@ async fn managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling() {
     let properties = table.metadata().properties();
     assert_eq!(
         properties.get("write.target-file-size-bytes"),
-        None,
-        "the fixture table declares no legacy whole-file ceiling"
+        Some(&(1024_u64 * 1024 * 1024).to_string()),
+        "the fixture table persists the resolved deployment target, not a legacy ceiling"
     );
 
     let object_store = CountingObjectStore::new(&fixture.fixture.storage);

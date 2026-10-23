@@ -524,44 +524,43 @@ pub fn table_version(
     })
 }
 
-/// Iceberg table property naming the base location every Iceberg writer uses.
+/// Iceberg table property naming the base location an Iceberg writer uses.
 ///
-/// Bifrost sets it at registration so the only Iceberg writer in the system —
-/// a Forge managed rewrite — lands its outputs under the Forge recipe segment
-/// rather than at the table's default `{location}/data` root. Scribe is
-/// unaffected: its hot objects are written directly and promoted at their own
-/// paths, never through an Iceberg location generator.
+/// Bifrost never stores it: the only Iceberg writer in the system — a Forge
+/// managed rewrite — hands the managed core a per-attempt table view whose
+/// value is [`forge_data_location`] for the selected table version, so the
+/// output path names that version. Scribe is unaffected: its hot objects are
+/// written directly and promoted at their own paths, never through an Iceberg
+/// location generator.
 pub const WRITE_DATA_PATH_PROPERTY: &str = "write.data.path";
 
-/// Current Forge writer-recipe segment stamped into every rewrite output path.
+/// Path segment separating version-tagged rewrite outputs from the data root.
 ///
-/// The segment is what makes a rewrite output self-describing: a later
-/// selection pass resolves it back out of the object path and compares it with
-/// the policy's expected recipe, so an output produced under a superseded
-/// recipe is reselected while an output produced under the current one is not.
-/// Advancing the recipe is therefore a deliberate act — bump this constant and
-/// every previously written object becomes obsolete by construction.
-pub const FORGE_WRITER_RECIPE: &str = "v2";
-
-/// Path segment separating recipe-tagged rewrite outputs from the data root.
-///
-/// The managed core's recipe resolver looks for exactly this marker and takes
-/// the segment that follows it as the recipe, so the marker and the property
-/// value below must stay in agreement.
+/// The segment after it is the canonical decimal table version whose
+/// definition the output was written under.
 pub const FORGE_DATA_MARKER: &str = "/data/forge/";
 
-/// Builds the Iceberg data location Forge rewrite outputs are written beneath.
+/// Builds the root every Forge rewrite output of a table sits beneath.
 ///
-/// Returned as `{table_location}/data/forge/{recipe}` with any trailing slash
-/// on the table location removed, which is the exact string
-/// [`WRITE_DATA_PATH_PROPERTY`] carries and the exact prefix a produced object
-/// path must start with.
+/// Returned as `{table_location}/data/forge` with any trailing slash on the
+/// table location removed; cleanup scans it across every version.
 #[must_use]
-pub fn forge_data_location(table_location: &str) -> String {
+pub fn forge_data_root(table_location: &str) -> String {
     format!(
-        "{}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}",
-        table_location.trim_end_matches('/')
+        "{}{}",
+        table_location.trim_end_matches('/'),
+        FORGE_DATA_MARKER.trim_end_matches('/')
     )
+}
+
+/// Builds the location one rewrite writes its outputs beneath.
+///
+/// Returned as `{table_location}/data/forge/{table_version}`, the exact
+/// prefix a produced object path under that selected output version starts
+/// with.
+#[must_use]
+pub fn forge_data_location(table_location: &str, table_version: TableVersion) -> String {
+    format!("{}/{table_version}", forge_data_root(table_location))
 }
 
 /// One canonical physical sort key.

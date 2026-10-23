@@ -2700,7 +2700,7 @@ async fn revoked_term_stops_promotion_dispatch_and_maintenance() {
         journey.await_promoted(&cold).await;
     }
     let orphan = format!(
-        "{}/data/forge/v2/{}-00000-{}.parquet",
+        "{}/data/forge/1/{}-00000-{}.parquet",
         cold.binding.object_prefix.trim_end_matches('/'),
         Uuid::now_v7(),
         Uuid::now_v7()
@@ -2939,7 +2939,7 @@ async fn empty_maintenance_restart_protects_orphans() {
     // A rowless output in the writer's canonical grammar: what a rewrite that
     // died before preparing leaves behind, and what only the sweep can reach.
     let orphan = format!(
-        "{}/data/forge/v2/{}-00000-{}.parquet",
+        "{}/data/forge/1/{}-00000-{}.parquet",
         table.binding.object_prefix.trim_end_matches('/'),
         Uuid::now_v7(),
         Uuid::now_v7()

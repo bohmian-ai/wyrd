@@ -53,7 +53,7 @@ use super::scribe_promotion::{
 use super::settings::ForgeCompactionType;
 use super::{Forge, ForgeRoleReadiness};
 use crate::catalog::TenantTableBinding;
-use crate::catalog::layout::forge_data_location;
+use crate::catalog::layout::forge_data_root;
 
 /// Parameter discriminator every durable small-file rewrite task carries.
 ///
@@ -6462,6 +6462,7 @@ impl ForgeCompactionPlanRunner {
                 ),
                 plan_hash: super::planner::plan_hash(&self.claim.plan)?,
                 evidence: self.shared.evidence.clone(),
+                table_version: self.shared.policy.table_version,
             },
             key: ForgeGroupKey {
                 tenant: self.binding.tenant,
@@ -7222,6 +7223,14 @@ impl ForgeCompactionPlanRunner {
             .current_head_holds_inputs(table, &handoff.rewritten_data_files)
             .await?;
         let metadata = table.metadata();
+        let selected = self
+            .forge
+            .retained_definition(
+                &context.binding.table_ref.fqn(),
+                table,
+                context.identity.table_version,
+            )
+            .await?;
         Ok(super::publication::RewriteCommitAuthority {
             fence: super::publication::RewriteFenceAuthority {
                 lease_held: lease.renew().await?,
@@ -7235,7 +7244,8 @@ impl ForgeCompactionPlanRunner {
             },
             table: super::publication::RewriteTableAuthority {
                 base_is_retained: metadata.snapshot_by_id(base_snapshot_id).is_some(),
-                schema_unchanged: context.planned_schema_id == metadata.current_schema_id(),
+                schema_unchanged: context.planned_schema_id == metadata.current_schema_id()
+                    && selected.schema.schema_id() == context.planned_schema_id,
             },
             files: super::publication::RewriteFileAuthority {
                 inputs_all_live,
@@ -7664,7 +7674,7 @@ impl ForgeWorker {
             table.metadata().location(),
             binding,
             &self.forge.core.warehouse,
-            &forge_data_location(table.metadata().location()),
+            &forge_data_root(table.metadata().location()),
         )?;
         if prefix != expected {
             return Err(ForgeError::Invariant {

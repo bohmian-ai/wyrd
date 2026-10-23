@@ -385,13 +385,40 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
         .map(|file| file.file_path().to_owned())
         .collect::<BTreeSet<_>>();
 
-    // One refusal: revalidate against the reloaded table and commit once more.
-    // Arming the seam also zeroes its counter, so the counts below are absolute.
-    catalog.reject_next_commits(1);
+    // One refusal after a Bloom-only table version landed between execution
+    // and commit: revalidate the retained selected version against the
+    // reloaded table and commit once more under it. Arming the seam also zeroes
+    // its counter, so the counts below are absolute.
+    catalog.reject_next_commits(0);
+    catalog.park_next_commit();
     let snapshots_before = promoted.snapshot_count().await;
+    let first_values = promoted
+        .object_values(&first_inputs.iter().cloned().collect::<Vec<_>>())
+        .await;
     supervisor.restart_worker();
-    supervisor.run_one_success().await;
+    supervisor
+        .run_one_success_while(async {
+            catalog.wait_for_parked_commit().await;
+            super::support::set_table_properties(
+                &promoted.fixture.catalog,
+                &promoted.fixture.binding,
+                &[
+                    (
+                        vala_bifrost_redux::catalog::layout::BLOOM_COLUMNS_PROPERTY,
+                        r#"["value"]"#,
+                    ),
+                    (
+                        vala_bifrost_redux::catalog::layout::TABLE_VERSION_PROPERTY,
+                        "2",
+                    ),
+                ],
+            )
+            .await;
+            catalog.reject_parked_commit();
+        })
+        .await;
     let published_plans = promoted.snapshot_count().await - snapshots_before;
+    assert_selected_version_survived_bloom_edit(&promoted, &first_values).await;
     assert_eq!(
         catalog.attempts(),
         published_plans + 1,
@@ -448,6 +475,69 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
     // in the only two ways it can end: entirely, and almost entirely.
     assert_expired_deadline_makes_no_second_call().await;
     assert_retry_inherits_only_the_remaining_budget().await;
+}
+
+/// Asserts every rewrite the table carries kept the selected version 1.
+///
+/// The Bloom-only edit landed while one plan was parked, so each output must
+/// still sit under the selected version's directory, each rewrite snapshot
+/// must name that version, the stored Forge objects must be exactly the live
+/// ones, and the rows must be exactly the replaced inputs' rows.
+///
+/// # Panics
+///
+/// Panics when an output, snapshot, object, or row contradicts the selected
+/// version.
+async fn assert_selected_version_survived_bloom_edit(
+    promoted: &PromotedRewriteFixture,
+    first_values: &[i64],
+) {
+    let prefix = &promoted.fixture.binding.object_prefix;
+    let live = live_data_paths(promoted).await;
+    let live_forge = live
+        .iter()
+        .filter_map(|path| path.split_once(&format!("{prefix}/")))
+        .map(|(_, key)| format!("{prefix}/{key}"))
+        .filter(|key| key.contains("/data/forge/"))
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !live_forge.is_empty() && live_forge.iter().all(|key| key.contains("/data/forge/1/")),
+        "every output sits under the selected table version: {live_forge:?}"
+    );
+    let stored_forge = promoted
+        .object_digests()
+        .await
+        .into_keys()
+        .filter(|key| key.contains("/data/forge/"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        stored_forge, live_forge,
+        "the retry wrote no output beyond the ones it published"
+    );
+    let table = promoted.load_table().await;
+    let versions = table
+        .metadata()
+        .snapshots()
+        .map(|snapshot| &snapshot.summary().additional_properties)
+        .filter(|properties| {
+            properties.get("forge.workflow").map(String::as_str) == Some("iceberg-rewrite")
+        })
+        .map(|properties| properties.get("forge.rewrite.table_version").cloned())
+        .collect::<Vec<_>>();
+    assert!(
+        !versions.is_empty()
+            && versions
+                .iter()
+                .all(|version| version.as_deref() == Some("1")),
+        "every rewrite snapshot names the selected table version: {versions:?}"
+    );
+    assert_eq!(
+        promoted
+            .object_values(&live.into_iter().collect::<Vec<_>>())
+            .await,
+        first_values,
+        "the rewrite kept exactly the replaced rows"
+    );
 }
 
 /// Everything the spent-retry phase needs from the run that preceded it.

@@ -1197,11 +1197,10 @@ impl BifrostCatalog {
     /// exists yet. The table is always Iceberg format v3, so appends assign
     /// row lineage through the first-row-id mechanism and Forge rewrites carry
     /// it forward. Every physical decision — schema ids, partition spec, sort
-    /// order, location, and the Bloom and Forge data-path properties — is
-    /// derived from `layout` and `binding`, so the canonical layout stays the
-    /// single authority for the table's shape. The Forge data path is written
-    /// as `write.data.path` so the managed rewrite core roots its outputs under
-    /// the recipe segment instead of the default data root. The file target
+    /// order, location, and the Bloom property — is derived from `layout` and
+    /// `binding`, so the canonical layout stays the single authority for the
+    /// table's shape. No data path is stored: Forge derives each rewrite's
+    /// output location from the version it selects. The file target
     /// `compaction` declares, or else this catalog's deployment default, is
     /// written as `write.target-file-size-bytes`, so the definition fixes it;
     /// a declared compaction type is written as its property and an omitted
@@ -1231,17 +1230,10 @@ impl BifrostCatalog {
             self.warehouse.trim_end_matches('/'),
             binding.object_prefix
         );
-        let forge_data_location = crate::catalog::layout::forge_data_location(&location);
-        let mut properties = std::collections::HashMap::from([
-            (
-                crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
-                layout.bloom_columns_property(),
-            ),
-            (
-                crate::catalog::layout::WRITE_DATA_PATH_PROPERTY.to_owned(),
-                forge_data_location,
-            ),
-        ]);
+        let mut properties = std::collections::HashMap::from([(
+            crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
+            layout.bloom_columns_property(),
+        )]);
         compaction.write_properties(&mut properties, self.default_target_file_size_bytes);
         let creation = TableCreation::builder()
             .name(binding.table_name.clone())

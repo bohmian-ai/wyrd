@@ -2351,6 +2351,44 @@ impl SupervisedPromotion {
         .expect("the worker settled no attempt");
     }
 
+    /// Schedule one pass and await exactly one successful worker attempt while
+    /// `during` drives the seam the attempt is parked on.
+    ///
+    /// The success sibling of [`Self::run_one_failure_while`]: the control
+    /// runs while the attempt is parked, and the attempt must still succeed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a deterministic bound is missed or the attempt failed.
+    pub(crate) async fn run_one_success_while<F>(&mut self, during: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let expected = self.worker_observer.completed().saturating_add(1);
+        let expected_errors = self.worker_observer.returned_errors().len();
+        self.worker_observer.hold_after_next_attempt_for_test();
+        self.start_armed_worker();
+        let pass = self.request_pass();
+        tokio::time::timeout(FIXTURE_BOUND, during)
+            .await
+            .expect("parked production commit seam bound");
+        tokio::time::timeout(
+            FIXTURE_BOUND,
+            self.worker_observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .expect("production Forge worker attempt bound");
+        assert_eq!(
+            self.worker_observer.returned_errors().len(),
+            expected_errors,
+            "the attempt was expected to succeed: {:?}",
+            self.worker_observer.returned_errors()
+        );
+        self.stop_worker().await;
+        self.await_pass(pass).await;
+        assert_eq!(self.worker_observer.completed(), expected);
+    }
+
     /// Schedule one pass and await exactly one returned worker error while
     /// `during` drives the seam the attempt is parked on.
     ///

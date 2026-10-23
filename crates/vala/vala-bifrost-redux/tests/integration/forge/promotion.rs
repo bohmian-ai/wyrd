@@ -476,8 +476,119 @@ async fn scribe_promotion_integration_rejects_physical_datafile_mismatch_before_
     ];
 
     for (index, (name, mutate)) in MUTATIONS.into_iter().enumerate() {
-        assert_mutation_is_refused_before_catalog_io(index, name, mutate).await;
+        let fixture =
+            PromotionIntegrationFixture::start(&format!("promotion_physical_{index}")).await;
+        assert_mutation_is_refused_before_catalog_io(&fixture, 0, name, mutate).await;
     }
+
+    // Partition-tuple contradictions only the durable row can see: the
+    // object's footer and time bounds are intact under every one of these.
+    // Each mutates the object of customer `alpha` or of the null customer.
+    type TupleMutation = (&'static str, bool, fn(&mut serde_json::Value));
+    const TUPLE_MUTATIONS: [TupleMutation; 4] = [
+        ("partition dimension value", false, |record| {
+            partition_values(record)[0] = serde_json::json!({ "utf8": "beta" });
+        }),
+        ("partition literal to null", false, |record| {
+            partition_values(record)[0] = serde_json::Value::Null;
+        }),
+        ("partition null to literal", true, |record| {
+            partition_values(record)[0] = serde_json::json!({ "utf8": "alpha" });
+        }),
+        ("partition time position", false, |record| {
+            record
+                .get_mut("partition")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("a partition value")
+                .insert("time_index".to_owned(), serde_json::Value::from(1));
+        }),
+    ];
+    for (index, (name, null_customer, mutate)) in TUPLE_MUTATIONS.into_iter().enumerate() {
+        let fixture = composite_fixture(&format!("promotion_tuple_{index}")).await;
+        let record = fixture
+            .promotion_records()
+            .await
+            .iter()
+            .position(|(_, record)| record["partition"]["values"][0].is_null() == null_customer)
+            .expect("the fixture sealed both customers");
+        assert_mutation_is_refused_before_catalog_io(&fixture, record, name, mutate).await;
+    }
+    let intact = composite_fixture("promotion_tuple_intact").await;
+    let mut forge = SupervisedPromotion::start(
+        &intact,
+        intact.catalog.iceberg_catalog(),
+        CountingObjectStore::new(&intact.storage) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    forge.run_one_success().await;
+    forge.shutdown().await;
+    assert_eq!(
+        intact.live_data_paths().await.len(),
+        2,
+        "intact composite evidence still promotes"
+    );
+}
+
+/// Borrows the dimension values of a promotion record's partition.
+///
+/// # Panics
+///
+/// Panics when the record carries no partition value list.
+fn partition_values(record: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+    record
+        .get_mut("partition")
+        .and_then(|partition| partition.get_mut("values"))
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("a partition value list")
+}
+
+/// Seals two objects into a table partitioned by day and then `customer`:
+/// one carries customer `alpha`, the other a null customer.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start or a batch cannot be built.
+async fn composite_fixture(table_name: &str) -> PromotionIntegrationFixture {
+    use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use wyrd_spec::vala::api::{PartitionFieldWire, PartitionTransformWire};
+
+    let user_fields = vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new("customer", DataType::Utf8, true),
+    ];
+    let mut fields = user_fields.clone();
+    fields.push(super::support::fixture_time_field());
+    let schema = Arc::new(Schema::new(fields));
+    let noon = super::support::fixture_day()
+        .and_hms_opt(12, 0, 0)
+        .expect("fixture timestamp")
+        .and_utc()
+        .timestamp_micros();
+    let batch = |value: i64, customer: Option<&str>| {
+        arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![value, value + 10])),
+                Arc::new(StringArray::from(vec![customer, customer])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![noon, noon + 1_000])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .expect("composite fixture batch")
+    };
+    PromotionIntegrationFixture::start_with_dimensions(
+        table_name,
+        user_fields,
+        vec![PartitionFieldWire::new(
+            "customer",
+            PartitionTransformWire::Identity,
+        )],
+        &[batch(0, Some("alpha")), batch(1, None)],
+    )
+    .await
 }
 
 /// Drives one mutated promotion record through the real scheduler and worker.
@@ -485,20 +596,21 @@ async fn scribe_promotion_integration_rejects_physical_datafile_mismatch_before_
 /// The fixture is per-mutation on purpose: a refused promotion is durably
 /// terminal and its Prepared operation evidence is append-only, so a second
 /// refusal over the same demand is not a thing production can produce.
+/// `record` is the position of the mutated record in durable order.
 ///
 /// # Panics
 ///
 /// Panics when the mutation does not change the evidence, when the refusal does
 /// not happen, or when the refusal left any catalog, object, or durable effect.
 async fn assert_mutation_is_refused_before_catalog_io(
-    index: usize,
+    fixture: &PromotionIntegrationFixture,
+    record: usize,
     name: &str,
     mutate: fn(&mut serde_json::Value),
 ) {
-    let fixture = PromotionIntegrationFixture::start(&format!("promotion_physical_{index}")).await;
     let records = fixture.promotion_records().await;
     let (row_id, original) = records
-        .first()
+        .get(record)
         .expect("the fixture sealed promotion evidence")
         .clone();
     let mut altered = original.clone();
@@ -512,7 +624,7 @@ async fn assert_mutation_is_refused_before_catalog_io(
         object_store.read_counter(),
     );
     let mut forge = SupervisedPromotion::start(
-        &fixture,
+        fixture,
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
         ForgeClock::system(),

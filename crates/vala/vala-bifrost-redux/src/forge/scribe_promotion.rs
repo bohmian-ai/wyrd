@@ -23,7 +23,7 @@ use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use uuid::Uuid;
-use vala_sql::queries::file_list::HotFileCatalog;
+use vala_sql::queries::file_list::{HotFileCatalog, PromotableHotFileRow};
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::row_types::forge_operations::{
     ForgeOperationFamily, ForgeOperationPhase, ForgeOperationTransition,
@@ -424,6 +424,51 @@ fn validate_promoted_object(
     Ok(())
 }
 
+/// Refuses promotion evidence whose partition is not its durable row's.
+///
+/// Scribe writes the row's partition columns and the evidence's partition in
+/// one statement, so they can only disagree when one was altered. The footer
+/// and time bounds cannot see a contradicting dimension value, and appending
+/// it would let equality pruning hide the file's rows.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the row's partition columns or the
+/// evidence's partition are malformed, or when the two differ in any part of
+/// the complete tuple.
+fn validate_durable_partition(
+    row: &PromotableHotFileRow,
+    record: &ScribePublishedHotFileV1,
+) -> Result<(), ForgeError> {
+    let durable = crate::catalog::TimePartition::from_durable_columns(
+        &row.partition_granularity,
+        row.partition_start,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|time| {
+        crate::catalog::PhysicalPartition::from_dimension_bytes(time, &row.partition_dimensions)
+            .map_err(|error| error.to_string())
+    })
+    .map_err(|error| ForgeError::Invariant {
+        detail: format!(
+            "hot object {} carries a malformed durable partition: {error}",
+            row.file_path
+        ),
+    })?;
+    let claimed = record.partition().map_err(|error| ForgeError::Invariant {
+        detail: error.to_string(),
+    })?;
+    if claimed != durable {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "hot object {} carries promotion evidence for another partition than its row",
+                row.file_path
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Reads and validates the exact promotion demand one table currently owes.
 ///
 /// Every eligible `file_list` row must carry decodable
@@ -431,7 +476,8 @@ fn validate_promoted_object(
 /// identity, path, and checksum the row itself records. A row that fails any
 /// of those checks invalidates the whole group rather than shrinking it: a
 /// partial promotion would publish a file set whose digest no longer matches
-/// the demand the scheduler observed.
+/// the demand the scheduler observed. Revalidating an `only` plan also
+/// requires each row's evidence to name the row's own complete partition.
 ///
 /// # Errors
 ///
@@ -496,6 +542,12 @@ pub(super) async fn read_promotion_demand(
                     row.file_path
                 ),
             });
+        }
+        // Only the worker's revalidation compares partitions: a refusal there
+        // ends as one terminal attempt, while a planning refusal would leave
+        // the table owed on every sweep with no recorded outcome.
+        if only.is_some() {
+            validate_durable_partition(row, &record)?;
         }
         let path =
             StoragePath::new(row.file_path.as_str()).map_err(|error| ForgeError::Invariant {

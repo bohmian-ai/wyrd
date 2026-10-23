@@ -996,6 +996,22 @@ impl PromotionIntegrationFixture {
         user_fields: Vec<Field>,
         batches: &[RecordBatch],
     ) -> Self {
+        Self::start_with_dimensions(table_name, user_fields, Vec::new(), batches).await
+    }
+
+    /// [`Self::start_with`] for a table partitioned by its day and then by
+    /// `dimensions`, in that spec order.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Self::start_with`] does, or when `dimensions` do not form
+    /// a valid layout over `user_fields`.
+    pub(crate) async fn start_with_dimensions(
+        table_name: &str,
+        user_fields: Vec<Field>,
+        dimensions: Vec<wyrd_spec::vala::api::PartitionFieldWire>,
+        batches: &[RecordBatch],
+    ) -> Self {
         ProcessTelemetry::shared();
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
@@ -1031,7 +1047,7 @@ impl PromotionIntegrationFixture {
         )
         .await;
 
-        let binding = create_table(&catalog, tenant, table_name, user_fields).await;
+        let binding = create_table(&catalog, tenant, table_name, user_fields, dimensions).await;
         let operator_pool = database.operator_pool().clone();
 
         let fixture = Self {
@@ -1389,7 +1405,7 @@ impl PromotionIntegrationFixture {
         name: &str,
         count: usize,
     ) {
-        let binding = create_table(&self.catalog, tenant, name, value_fields()).await;
+        let binding = create_table(&self.catalog, tenant, name, value_fields(), Vec::new()).await;
         let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
@@ -1413,7 +1429,7 @@ impl PromotionIntegrationFixture {
     /// # Panics
     /// Panics when registration, sealing, or eligibility aging fails.
     pub(crate) async fn register_and_seal_table(&self, name: &str, count: usize) {
-        let binding = create_table(&self.catalog, self.tenant, name, value_fields()).await;
+        let binding = create_table(&self.catalog, self.tenant, name, value_fields(), Vec::new()).await;
         let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
@@ -2985,8 +3001,8 @@ fn ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
 }
 
 /// Registers the fixture table with `user_fields` plus [`fixture_time_field`]
-/// through the real catalog, declaring that field its daily time column, and
-/// returns its binding.
+/// through the real catalog, declaring that field its daily time column
+/// followed by `dimensions`, and returns its binding.
 ///
 /// # Panics
 ///
@@ -2996,8 +3012,14 @@ async fn create_table(
     tenant: DataTenantId,
     table_name: &str,
     mut user_fields: Vec<Field>,
+    dimensions: Vec<wyrd_spec::vala::api::PartitionFieldWire>,
 ) -> TenantTableBinding {
     user_fields.push(fixture_time_field());
+    let mut partition_by = vec![wyrd_spec::vala::api::PartitionFieldWire::new(
+        FIXTURE_TIME_COLUMN,
+        wyrd_spec::vala::api::PartitionTransformWire::Day,
+    )];
+    partition_by.extend(dimensions);
     let binding =
         TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, table_name)))
             .expect("fixture table binding");
@@ -3009,10 +3031,7 @@ async fn create_table(
             attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutWire {
                 time_column: Some(FIXTURE_TIME_COLUMN.to_owned()),
-                partition_by: vec![wyrd_spec::vala::api::PartitionFieldWire::new(
-                    FIXTURE_TIME_COLUMN,
-                    wyrd_spec::vala::api::PartitionTransformWire::Day,
-                )],
+                partition_by,
                 sort_keys: Vec::new(),
                 bloom_columns: Vec::new(),
             }),

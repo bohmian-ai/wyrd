@@ -828,6 +828,10 @@ mod tests {
     /// A browser session's Bifrost handle is query-only: connecting dials no
     /// gRPC ingest channel, which would refuse a session that is not a
     /// bearer. Nothing listens on the derived gRPC port, so a dial would fail.
+    ///
+    /// # Panics
+    /// Panics when the session or client is refused, or when connecting the
+    /// Bifrost handle fails because it dialled the ingest channel.
     #[tokio::test]
     async fn browser_session_bifrost_connects_without_an_ingest_channel() {
         let session = BrowserSession::new(

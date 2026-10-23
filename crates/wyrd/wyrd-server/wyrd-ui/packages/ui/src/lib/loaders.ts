@@ -24,7 +24,7 @@ import {
   type CardHeaderInput,
   type ChartInput,
   type ComponentName,
-  type Range
+  resolveRange
 } from './schemas.js';
 
 export * from './contract.js';
@@ -64,18 +64,6 @@ export interface CardHeaderProps {
 export interface ComponentProps {
   Chart: ChartProps;
   CardHeader: CardHeaderProps;
-}
-
-const UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000 } as const;
-
-/**
- * Resolve `range` against `now`; a view resolves its relative range once per
- * load so every panel reads the same bounds.
- */
-export function resolveRange(range: Range, now: number = Date.now()): AbsoluteRange {
-  if ('from' in range) return range;
-  const amount = Number(range.last.slice(0, -1)) * UNIT_MS[range.last.slice(-1) as keyof typeof UNIT_MS];
-  return { from: new Date(now - amount).toISOString(), to: new Date(now).toISOString() };
 }
 
 /** Bucket intervals a chart may bind as `$3`, finest first. */

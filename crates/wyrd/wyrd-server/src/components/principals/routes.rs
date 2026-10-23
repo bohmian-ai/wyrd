@@ -28,10 +28,12 @@ use wyrd_spec::auth::{
     Attribution, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
     CredentialListResponse, CredentialMetadata, IssuedCredential, PrincipalId, PrincipalKindTag,
     PrincipalPage, PrincipalQuery, PrincipalRoles, PrincipalStatus, PrincipalSummary,
-    RoleAssignment, RoleAssignmentChange, RoleSource, SecretBearer,
+    RoleAssignment, RoleAssignmentChange, RoleSource, SecretBearer, WorkloadFamily,
+    WorkloadRestriction,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::AuditOutcome;
+use wyrd_sql::SqlError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     ApiKeyMetadataRow, AssignablePrincipalRow, PrincipalFilter, assignable_principal,
@@ -39,7 +41,7 @@ use wyrd_sql::queries::auth::{
     insert_service_account, list_api_key_metadata, list_assignable_principals,
     list_service_account_roles, list_user_role_assignments, revoke_api_key,
     revoke_role_from_service_account, revoke_role_from_user, role_by_name, service_account_by_id,
-    user_by_id,
+    set_workload_restriction, user_by_id,
 };
 
 use crate::audit;
@@ -66,8 +68,8 @@ const MAX_PAGE_SIZE: u32 = 200;
 /// Build the tenant principal-administration routes for the `/v1` group.
 ///
 /// Mounts principal discovery and creation, credential issue/list/revoke,
-/// whole-principal revocation (`POST /principals/{id}/revoke`), and Role
-/// assignment reads and writes.
+/// whole-principal revocation (`POST /principals/{id}/revoke`), Role
+/// assignment reads and writes, and workload-restriction replacement.
 pub fn principals_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(crate::auth::revoke::revoke_principal))
@@ -76,6 +78,7 @@ pub fn principals_router() -> OpenApiRouter<AppState> {
         .routes(routes!(grant_principal_role, revoke_principal_role))
         .routes(routes!(list_credentials, issue_credential))
         .routes(routes!(revoke_credential))
+        .routes(routes!(set_principal_workload_restriction))
 }
 
 /// Refuse a caller that lacks tenant principal-management authority.
@@ -225,11 +228,16 @@ async fn mint_credential(
     })
 }
 
-/// Create a Card-free machine principal and issue its first credential.
+/// Create a stable Service account and issue its first credential.
+///
+/// A family `workload_restriction` makes the account that family's unique
+/// scheduled runtime account and additionally requires tenant administration
+/// (`*`), checked and audited before anything is written.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, a requested
-/// role does not exist in the tenant, or a write fails.
+/// role does not exist in the tenant, the family already has a runtime
+/// account, or a write fails.
 #[utoipa::path(
     post,
     path = "/principals",
@@ -242,8 +250,11 @@ async fn mint_credential(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "Tenant principal administration required \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration required, and tenant \
+          administration for a family restriction (WYRD_PERMISSION_403_DENIED_RBAC)",
+         body = WyrdProblem),
+        (status = 409, description = "The family already has a runtime account \
+          (WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT)", body = WyrdProblem),
         (status = 500, description = "A tenant store read or write failed \
           (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "No verifier is configured for the access token (\
@@ -266,12 +277,26 @@ async fn create_service_principal(
         })?;
     }
 
+    let resource = format!("principal:{}", request.name);
+    let family = request
+        .workload_restriction
+        .as_ref()
+        .and_then(WorkloadRestriction::family);
+    if family.is_some() {
+        audit::authorize(
+            &state,
+            &caller,
+            &Permission::wildcard(),
+            "auth.principal.workload_restriction.set",
+            &resource,
+        )?;
+    }
     let mut conn = authorize(
         &state,
         &caller,
         "create tenant principals",
         "auth.principal.create",
-        &format!("principal:{}", request.name),
+        &resource,
     )
     .await?;
 
@@ -295,13 +320,13 @@ async fn create_service_principal(
         &mut conn,
         principal_id,
         "service",
-        None,
+        family,
         &request.name,
         request.description.as_deref(),
         caller.attribution(),
     )
     .await
-    .map_err(internal)?;
+    .map_err(|error| restriction_write_error(error, family))?;
 
     for role_id in role_ids {
         grant_role_to_service_account(&mut conn, principal_id, role_id)
@@ -809,6 +834,100 @@ async fn revoke_principal_role(
     change_direct_role(&state, &caller, principal_id, &role, RoleChange::Revoke)
         .await
         .map(Json)
+}
+
+/// Replace one Service account's workload restriction.
+///
+/// Requires tenant administration (`*`). Setting the stored value again is an
+/// idempotent success; acquiring a family another live account holds changes
+/// nothing. Roles, credentials, and the principal id are untouched, no token is
+/// issued, and a new family association needs fresh runtime activity by this
+/// account before it schedules anything.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` for a malformed id or a User target, the
+/// RBAC denial without tenant administration, the non-enumerating not-found
+/// error for a principal that is not assignable in this tenant,
+/// [`WyrdError::WorkloadBindingConflict`] when another account holds the
+/// family, and an internal error when the store fails.
+#[utoipa::path(
+    put,
+    path = "/principals/{principal_id}/workload-restriction",
+    params(("principal_id" = Uuid, Path, description = "Service account to restrict")),
+    request_body = WorkloadRestriction,
+    responses(
+        (status = 200, description = "The account carries exactly this restriction",
+         body = PrincipalSummary),
+        (status = 400, description = "The id is not a valid UUID, or names a User \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "Tenant administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No assignable principal with this id in the caller's \
+          tenant (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "Another account is the family's runtime account \
+          (WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
+        (status = 503, description = "No verifier is configured for the access token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Principals"
+)]
+#[tracing::instrument(level = "info", skip(state, caller, restriction))]
+async fn set_principal_workload_restriction(
+    State(state): State<AppState>,
+    caller: Caller,
+    target: Result<Path<Uuid>, PathRejection>,
+    Json(restriction): Json<WorkloadRestriction>,
+) -> Result<Json<PrincipalSummary>, WyrdErrorResponse> {
+    let Path(principal_id) = target.map_err(|rejection| path_rejection(&rejection))?;
+    audit::authorize(
+        &state,
+        &caller,
+        &Permission::wildcard(),
+        "auth.principal.workload_restriction.set",
+        &format!("principal:{principal_id}"),
+    )?;
+    let mut conn = tenant_conn(&state, &caller).await?;
+    let (_, kind) = require_assignable(&mut conn, principal_id).await?;
+    if kind != PrincipalKindTag::Service {
+        return Err(invalid(
+            "only a Service account carries a workload restriction",
+            serde_json::json!({ "principal_id": principal_id.to_string() }),
+        ));
+    }
+    let family = restriction.family();
+    set_workload_restriction(&mut conn, principal_id, family)
+        .await
+        .map_err(|error| restriction_write_error(error, family))?;
+    let (row, _) = require_assignable(&mut conn, principal_id).await?;
+    let summary = summary(row)?;
+    conn.commit().await.map_err(internal)?;
+    Ok(Json(summary))
+}
+
+/// Map an account write that may acquire `family` onto its stable refusal.
+///
+/// A unique violation of the one-account-per-family index is
+/// [`WyrdError::WorkloadBindingConflict`]; every other failure is internal.
+fn restriction_write_error(
+    error: sqlx::Error,
+    family: Option<&WorkloadFamily>,
+) -> WyrdErrorResponse {
+    match SqlError::from(error) {
+        SqlError::UniqueViolation { constraint }
+            if constraint == "auth_service_accounts_one_family" =>
+        {
+            WyrdErrorResponse::from(WyrdError::WorkloadBindingConflict {
+                message: "another Service account is this family's runtime account".to_owned(),
+                details: serde_json::json!({ "workload_family": family }),
+            })
+        }
+        other => internal(other),
+    }
 }
 
 /// Which direct-assignment write a Role route performs.

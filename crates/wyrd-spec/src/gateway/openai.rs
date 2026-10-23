@@ -136,18 +136,13 @@ pub struct GatewayFormFile;
 
 impl JsonSchema for GatewayFormFile {
     /// Names the shared binary part schema.
-    fn schema_name() -> String {
-        "GatewayFormFile".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "GatewayFormFile".into()
     }
 
     /// Publishes a binary string, the `OpenAPI` shape of a file part.
-    fn json_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        schemars::schema::SchemaObject {
-            instance_type: Some(schemars::schema::InstanceType::String.into()),
-            format: Some("binary".to_owned()),
-            ..Default::default()
-        }
-        .into()
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "format": "binary" })
     }
 }
 
@@ -528,14 +523,15 @@ openapi_schema!(
 
 /// Structural JSON Schema to `OpenAPI` schema conversion.
 ///
-/// Converting through the typed models, rather than deserializing JSON into
-/// `utoipa`'s untagged schema enum, keeps composite schemas: that enum would
-/// accept an `anyOf` as an empty object and silently drop its alternatives.
+/// Converting through the `utoipa` builders, rather than deserializing JSON
+/// into `utoipa`'s untagged schema enum, keeps composite schemas: that enum
+/// would accept an `anyOf` as an empty object and silently drop its
+/// alternatives.
 #[cfg(feature = "server")]
 pub(crate) mod openapi {
     use schemars::JsonSchema;
-    use schemars::r#gen::SchemaSettings;
-    use schemars::schema::{InstanceType, Schema as Json, SchemaObject, SingleOrVec};
+    use schemars::generate::SchemaSettings;
+    use serde_json::{Map, Value};
     use utoipa::openapi::schema::{
         AdditionalProperties, AllOfBuilder, AnyOfBuilder, ArrayBuilder, ObjectBuilder,
         OneOfBuilder, Schema, SchemaFormat, SchemaType, Type,
@@ -546,67 +542,87 @@ pub(crate) mod openapi {
     pub(crate) type Components = Vec<(String, RefOr<Schema>)>;
 
     /// Root schema of `T` and its named definitions, referenced as components.
+    ///
+    /// A `#[serde(transparent)]` root is generated as a reference to the type
+    /// it wraps; the root then publishes that definition's own schema.
     pub(crate) fn component<T: JsonSchema>() -> (RefOr<Schema>, Components) {
-        let mut settings = SchemaSettings::draft2019_09();
-        "#/components/schemas/".clone_into(&mut settings.definitions_path);
+        const PATH: &str = "/components/schemas";
+        let mut settings = SchemaSettings::draft2020_12();
+        settings.definitions_path = PATH.into();
         settings.meta_schema = None;
-        let root = settings.into_generator().into_root_schema_for::<T>();
-        let definitions = root
-            .definitions
+        let root = settings
+            .into_generator()
+            .into_root_schema_for::<T>()
+            .to_value();
+        let schemas = root
+            .pointer(PATH)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let wrapped = root
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|reference| reference.strip_prefix('#'))
+            .and_then(|pointer| root.pointer(pointer));
+        let definitions = schemas
             .iter()
             .map(|(name, schema)| (name.clone(), convert(schema)))
             .collect();
-        (object(&root.schema), definitions)
+        (convert(wrapped.unwrap_or(&root)), definitions)
     }
 
     /// Converts one schema; a boolean schema accepts any value.
-    fn convert(schema: &Json) -> RefOr<Schema> {
+    fn convert(schema: &Value) -> RefOr<Schema> {
         match schema {
-            Json::Bool(_) => ObjectBuilder::new()
+            Value::Object(schema) => object(schema),
+            _ => ObjectBuilder::new()
                 .schema_type(SchemaType::AnyValue)
                 .build()
                 .into(),
-            Json::Object(schema) => object(schema),
         }
     }
 
     /// Converts a schema object: a reference, a composite joined with its own
     /// constraints, or a plain schema.
-    fn object(schema: &SchemaObject) -> RefOr<Schema> {
-        if let Some(reference) = &schema.reference {
+    fn object(schema: &Map<String, Value>) -> RefOr<Schema> {
+        if let Some(Value::String(reference)) = schema.get("$ref") {
             return Ref::new(reference.clone()).into();
         }
-        let description = schema.metadata.as_ref().and_then(|m| m.description.clone());
-        let composite: Option<Schema> = schema.subschemas.as_ref().and_then(|sub| {
-            let items = |schemas: &Vec<Json>| schemas.iter().map(convert).collect::<Vec<_>>();
-            if let Some(one_of) = &sub.one_of {
-                Some(
-                    items(one_of)
-                        .into_iter()
-                        .fold(OneOfBuilder::new(), OneOfBuilder::item)
-                        .into(),
-                )
-            } else if let Some(any_of) = &sub.any_of {
-                Some(
-                    items(any_of)
-                        .into_iter()
-                        .fold(AnyOfBuilder::new(), AnyOfBuilder::item)
-                        .into(),
-                )
-            } else {
-                sub.all_of.as_ref().map(|all_of| {
-                    items(all_of)
-                        .into_iter()
-                        .fold(AllOfBuilder::new(), AllOfBuilder::item)
-                        .into()
-                })
-            }
-        });
-        let constrained = schema.instance_type.is_some()
-            || schema.object.is_some()
-            || schema.array.is_some()
-            || schema.enum_values.is_some()
-            || schema.const_value.is_some();
+        let description = schema
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let items = |keyword: &str| {
+            schema
+                .get(keyword)
+                .and_then(Value::as_array)
+                .map(|schemas| schemas.iter().map(convert).collect::<Vec<_>>())
+        };
+        let composite: Option<Schema> = if let Some(one_of) = items("oneOf") {
+            Some(
+                one_of
+                    .into_iter()
+                    .fold(OneOfBuilder::new(), OneOfBuilder::item)
+                    .into(),
+            )
+        } else if let Some(any_of) = items("anyOf") {
+            Some(
+                any_of
+                    .into_iter()
+                    .fold(AnyOfBuilder::new(), AnyOfBuilder::item)
+                    .into(),
+            )
+        } else {
+            items("allOf").map(|all_of| {
+                all_of
+                    .into_iter()
+                    .fold(AllOfBuilder::new(), AllOfBuilder::item)
+                    .into()
+            })
+        };
+        let constrained = ["type", "properties", "items", "enum", "const"]
+            .iter()
+            .any(|keyword| schema.contains_key(*keyword));
         match composite {
             Some(composite) if constrained => AllOfBuilder::new()
                 .item(plain(schema, None))
@@ -638,66 +654,86 @@ pub(crate) mod openapi {
     }
 
     /// Converts a schema's type, format, values, and array or object members.
-    fn plain(schema: &SchemaObject, description: Option<String>) -> Schema {
-        let schema_type = match &schema.instance_type {
-            None => SchemaType::AnyValue,
-            Some(SingleOrVec::Single(kind)) => SchemaType::Type(type_of(**kind)),
-            Some(SingleOrVec::Vec(kinds)) => {
-                SchemaType::Array(kinds.iter().copied().map(type_of).collect())
-            }
+    fn plain(schema: &Map<String, Value>, description: Option<String>) -> Schema {
+        let schema_type = match schema.get("type") {
+            Some(Value::String(kind)) => SchemaType::Type(type_of(kind)),
+            Some(Value::Array(kinds)) => SchemaType::Array(
+                kinds
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(type_of)
+                    .collect(),
+            ),
+            _ => SchemaType::AnyValue,
         };
-        if let Some(array) = &schema.array {
-            let items = match &array.items {
-                Some(SingleOrVec::Single(item)) => convert(item),
-                _ => convert(&Json::Bool(true)),
+        let count = |keyword: &str| {
+            schema
+                .get(keyword)
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+        };
+        if schema.get("type").and_then(Value::as_str) == Some("array")
+            || schema.contains_key("items")
+        {
+            let items = match schema.get("items") {
+                Some(item @ Value::Object(_)) => convert(item),
+                _ => convert(&Value::Bool(true)),
             };
             return ArrayBuilder::new()
                 .schema_type(schema_type)
                 .items(items)
-                .min_items(array.min_items.map(|n| n as usize))
-                .max_items(array.max_items.map(|n| n as usize))
+                .min_items(count("minItems"))
+                .max_items(count("maxItems"))
                 .description(description)
                 .into();
         }
         let values = schema
-            .enum_values
-            .clone()
-            .or_else(|| schema.const_value.clone().map(|value| vec![value]));
+            .get("enum")
+            .and_then(Value::as_array)
+            .cloned()
+            .or_else(|| schema.get("const").map(|value| vec![value.clone()]));
         let mut builder = ObjectBuilder::new()
             .schema_type(schema_type)
-            .format(schema.format.clone().map(SchemaFormat::Custom))
+            .format(
+                schema
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .map(|format| SchemaFormat::Custom(format.to_owned())),
+            )
             .description(description)
-            .enum_values(values);
-        if let Some(number) = &schema.number {
-            builder = builder.minimum(number.minimum).maximum(number.maximum);
-        }
-        if let Some(object) = &schema.object {
-            for (name, property) in &object.properties {
+            .enum_values(values)
+            .minimum(schema.get("minimum").and_then(Value::as_f64))
+            .maximum(schema.get("maximum").and_then(Value::as_f64));
+        if let Some(Value::Object(properties)) = schema.get("properties") {
+            for (name, property) in properties {
                 builder = builder.property(name, convert(property));
             }
-            for name in &object.required {
+        }
+        if let Some(Value::Array(required)) = schema.get("required") {
+            for name in required.iter().filter_map(Value::as_str) {
                 builder = builder.required(name);
             }
-            builder = builder.additional_properties(object.additional_properties.as_deref().map(
+        }
+        builder =
+            builder.additional_properties(schema.get("additionalProperties").map(
                 |extra| match extra {
-                    Json::Bool(allowed) => AdditionalProperties::FreeForm(*allowed),
-                    Json::Object(_) => AdditionalProperties::RefOr(convert(extra)),
+                    Value::Bool(allowed) => AdditionalProperties::FreeForm(*allowed),
+                    extra => AdditionalProperties::RefOr(convert(extra)),
                 },
             ));
-        }
         builder.into()
     }
 
     /// The `OpenAPI` type of a JSON Schema instance type.
-    fn type_of(kind: InstanceType) -> Type {
+    fn type_of(kind: &str) -> Type {
         match kind {
-            InstanceType::Null => Type::Null,
-            InstanceType::Boolean => Type::Boolean,
-            InstanceType::Object => Type::Object,
-            InstanceType::Array => Type::Array,
-            InstanceType::Number => Type::Number,
-            InstanceType::String => Type::String,
-            InstanceType::Integer => Type::Integer,
+            "null" => Type::Null,
+            "boolean" => Type::Boolean,
+            "object" => Type::Object,
+            "array" => Type::Array,
+            "number" => Type::Number,
+            "integer" => Type::Integer,
+            _ => Type::String,
         }
     }
 }

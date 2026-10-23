@@ -1875,8 +1875,8 @@ mod tests {
                 "response_format.data.properties.a.type",
             ),
             (
-                json!({"kind": "verdict", "data": {"type": "object", "definitions": {"Citation": {"type": "string"}}}}),
-                "response_format.data.definitions.Citation",
+                json!({"kind": "verdict", "data": {"type": "object", "$defs": {"Citation": {"type": "string"}}}}),
+                "response_format.data.$defs.Citation",
             ),
         ] {
             let body = with(

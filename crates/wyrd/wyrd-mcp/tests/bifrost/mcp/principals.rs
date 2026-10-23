@@ -26,13 +26,14 @@ mod pg_tests {
     /// The write tool only an administrative agent may use.
     const REVOKE_CREDENTIAL: &str = "principals.revoke_credential";
 
-    /// The property names one advertised schema declares required.
+    /// The property names one advertised schema declares required, sorted,
+    /// since JSON Schema gives `required` no order.
     ///
     /// Reading the catalog's own schema rather than restating it is the point:
     /// the assertion fails if the published contract stops matching the shared
     /// DTO the server parses and returns.
     fn required(schema: &JsonMap<String, JsonValue>) -> Vec<&str> {
-        schema
+        let mut required: Vec<&str> = schema
             .get("required")
             .and_then(serde_json::Value::as_array)
             .map(|values| {
@@ -41,7 +42,9 @@ mod pg_tests {
                     .filter_map(serde_json::Value::as_str)
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        required.sort_unstable();
+        required
     }
 
     /// Compile one advertised schema the way a strict agent-side validator

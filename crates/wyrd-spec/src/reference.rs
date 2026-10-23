@@ -150,6 +150,7 @@ impl From<CardRef> for Ref {
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", untagged)]
+#[schemars(rename = "InlineableRef_for_{T}")]
 pub enum InlineableRef<T> {
     /// A direct reference to a registered Card.
     Ref(CardRef),

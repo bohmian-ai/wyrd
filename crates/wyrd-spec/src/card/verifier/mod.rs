@@ -145,32 +145,19 @@ enum InputSlotSchema {}
 
 impl JsonSchema for InputSlotSchema {
     /// Names the authored slot schema in generated definitions.
-    fn schema_name() -> String {
-        "InputSlot".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "InputSlot".into()
     }
 
     /// One of the typed slot objects or the source reference string.
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{Metadata, SchemaObject, SubschemaValidation};
-
-        SchemaObject {
-            metadata: Some(Box::new(Metadata {
-                description: Some(
-                    "One named evidence slot. Slots are required unless `required: false`."
-                        .to_owned(),
-                ),
-                ..Metadata::default()
-            })),
-            subschemas: Some(Box::new(SubschemaValidation {
-                one_of: Some(vec![
-                    generator.subschema_for::<InputSlot>(),
-                    generator.subschema_for::<SourceText>(),
-                ]),
-                ..SubschemaValidation::default()
-            })),
-            ..SchemaObject::default()
-        }
-        .into()
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "One named evidence slot. Slots are required unless `required: false`.",
+            "oneOf": [
+                generator.subschema_for::<InputSlot>(),
+                generator.subschema_for::<SourceText>(),
+            ]
+        })
     }
 }
 
@@ -953,19 +940,19 @@ mod tests {
     fn input_slot_schema_matches_decoding() {
         let schema = serde_json::to_value(schemars::schema_for!(VerifierSpec))
             .expect("invariant: a schema serializes");
-        let definitions = &schema["definitions"];
+        let definitions = &schema["$defs"];
         assert_eq!(
             definitions["InputSlot"]["oneOf"],
             json!([
-                {"$ref": "#/definitions/TypedInputSlot"},
-                {"$ref": "#/definitions/SourceText"}
+                {"$ref": "#/$defs/TypedInputSlot"},
+                {"$ref": "#/$defs/SourceText"}
             ])
         );
-        let tags: Vec<&Value> = definitions["TypedInputSlot"]["oneOf"]
+        let tags: Vec<&Value> = definitions["TypedInputSlot"]["anyOf"]
             .as_array()
-            .expect("invariant: typed slots are a oneOf")
+            .expect("invariant: typed slots are an anyOf beside the untagged source")
             .iter()
-            .map(|variant| &variant["properties"]["type"]["enum"][0])
+            .map(|variant| &variant["properties"]["type"]["const"])
             .collect();
         assert_eq!(
             tags,

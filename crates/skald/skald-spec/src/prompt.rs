@@ -119,12 +119,12 @@ impl<'de> Deserialize<'de> for Prompt {
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for Prompt {
     /// Names the schema `Prompt`.
-    fn schema_name() -> String {
-        "Prompt".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Prompt".into()
     }
 
     /// Publishes the authored form's schema, which is the wire form.
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         AuthoredPrompt::json_schema(generator)
     }
 }

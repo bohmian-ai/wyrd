@@ -53,23 +53,12 @@ impl<'de> Deserialize<'de> for TaskId {
 }
 
 impl schemars::JsonSchema for TaskId {
-    fn schema_name() -> String {
-        "TaskId".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TaskId".into()
     }
 
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
-
-        SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            string: Some(Box::new(StringValidation {
-                max_length: Some(128),
-                min_length: Some(1),
-                pattern: Some(r"^[a-zA-Z_][a-zA-Z0-9_-]*$".to_string()),
-            })),
-            ..Default::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "minLength": 1, "maxLength": 128, "pattern": r"^[a-zA-Z_][a-zA-Z0-9_-]*$" })
     }
 }
 
@@ -175,23 +164,12 @@ impl<'de> Deserialize<'de> for JsonPath {
 }
 
 impl schemars::JsonSchema for JsonPath {
-    fn schema_name() -> String {
-        "JsonPath".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "JsonPath".into()
     }
 
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, SchemaObject, SingleOrVec, StringValidation};
-
-        SchemaObject {
-            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::String))),
-            string: Some(Box::new(StringValidation {
-                max_length: Some(1024),
-                min_length: Some(1),
-                pattern: Some(r"^\$.*$".to_string()),
-            })),
-            ..Default::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "minLength": 1, "maxLength": 1024, "pattern": r"^\$.*$" })
     }
 }
 

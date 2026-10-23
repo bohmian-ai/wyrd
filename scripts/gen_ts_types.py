@@ -216,8 +216,17 @@ class Lowering:
             raise SystemExit(
                 f"{owner}: object with both properties and typed additionalProperties"
             )
-        merged = {**shared.get("properties", {}), **schema.get("properties", {})}
-        required = set(schema.get("required", [])) | set(shared.get("required", []))
+        base = self.referenced(schema)
+        merged = {
+            **shared.get("properties", {}),
+            **base.get("properties", {}),
+            **schema.get("properties", {}),
+        }
+        required = (
+            set(schema.get("required", []))
+            | set(base.get("required", []))
+            | set(shared.get("required", []))
+        )
         if self.output:
             required |= {
                 key
@@ -233,6 +242,16 @@ class Lowering:
             )
             for key, value in sorted(merged.items())
         ]
+
+    def referenced(self, schema: dict) -> dict:
+        """Return the object a `$ref` beside an object's own properties names.
+
+        An internally tagged newtype variant is the tag property next to a
+        `$ref` to the wrapped struct, whose properties the variant also has.
+        """
+        if "$ref" not in schema or "properties" not in schema:
+            return {}
+        return self.definitions[schema["$ref"].split("/")[-1]]
 
     def serialized(self, schema: dict | bool) -> dict | bool:
         """Return a property's schema as lowered in the current mode."""
@@ -257,8 +276,10 @@ class Lowering:
 
     @staticmethod
     def tag(schema: dict) -> str | None:
-        """Return the single-value enum tag that names a union variant."""
+        """Return the single-value `const` or `enum` tag that names a union variant."""
         for value in schema.get("properties", {}).values():
+            if isinstance(value, dict) and "const" in value:
+                return value["const"]
             if isinstance(value, dict) and len(value.get("enum", [])) == 1:
                 return value["enum"][0]
         return None
@@ -276,7 +297,7 @@ class Lowering:
             return ("prim", "any")
         if not isinstance(schema, dict):
             raise SystemExit(f"{owner}: unsupported schema {schema!r}")
-        if "$ref" in schema:
+        if "$ref" in schema and not self.is_object(schema):
             return ("ref", self.require(schema["$ref"].split("/")[-1]))
         if "allOf" in schema:
             if len(schema["allOf"]) != 1:
@@ -458,7 +479,7 @@ def lower(bundle: dict) -> dict[str, tuple]:
     `RegisteredUntypedCard`, so `RegisteredCard` covers every envelope the registry can return while
     exposing typed specs only for the supported kinds.
     """
-    definitions = bundle["definitions"]
+    definitions = bundle["$defs"]
     roots = bundle["roots"]
     requests = [target(roots, root) for root in sorted(REQUEST_ROOTS)]
     lowering = Lowering(definitions, reachable(definitions, ["Card", *requests]))

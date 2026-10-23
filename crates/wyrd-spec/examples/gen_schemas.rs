@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-use schemars::r#gen::SchemaGenerator;
+use schemars::SchemaGenerator;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, CreateServicePrincipalRequest, CreateServicePrincipalResponse,
@@ -126,10 +126,11 @@ macro_rules! roots {
 
 /// Builds one JSON document holding every SDK-facing wire contract.
 ///
-/// All roots share a single draft-07 generator, so each Rust type appears once
-/// under `definitions` by its schema name, and `roots` maps each root's Rust
-/// type name (or its import alias) to its schema. Consumers resolve `#/definitions/<name>` within this
-/// one document. The bundle is transient: it is printed, never committed.
+/// All roots share a single JSON Schema 2020-12 generator, so each Rust type
+/// appears once under `$defs` by its schema name, and `roots` maps each root's
+/// Rust type name (or its import alias) to its schema. Consumers resolve
+/// `#/$defs/<name>` within this one document. The bundle is transient: it is
+/// printed, never committed.
 ///
 /// # Panics
 /// Panics if a derived schema fails to serialize, which a `JsonSchema` derive
@@ -306,15 +307,7 @@ fn contracts() -> Value {
     )
     .into_iter()
     .collect();
-    let definitions: Map<String, Value> = generator
-        .definitions()
-        .iter()
-        .map(|(name, schema)| {
-            let schema = serde_json::to_value(schema).expect("a derived schema serializes");
-            (name.clone(), schema)
-        })
-        .collect();
-    sort_keys(json!({ "roots": roots, "definitions": definitions }))
+    sort_keys(json!({ "roots": roots, "$defs": generator.definitions() }))
 }
 
 /// Emit the TypeScript `WyrdErrorCode` literal union from the derive-backed

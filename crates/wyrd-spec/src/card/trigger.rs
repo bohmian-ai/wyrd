@@ -175,27 +175,13 @@ impl<'de> Deserialize<'de> for TriggerDuration {
 
 impl schemars::JsonSchema for TriggerDuration {
     /// Names the duration schema in generated definitions.
-    fn schema_name() -> String {
-        "TriggerDuration".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "TriggerDuration".into()
     }
 
     /// Describes a duration as a patterned string.
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, Metadata, SchemaObject, StringValidation};
-
-        SchemaObject {
-            metadata: Some(Box::new(Metadata {
-                description: Some(DURATION_DESCRIPTION.to_owned()),
-                ..Metadata::default()
-            })),
-            instance_type: Some(InstanceType::String.into()),
-            string: Some(Box::new(StringValidation {
-                pattern: Some(DURATION_PATTERN.to_owned()),
-                ..StringValidation::default()
-            })),
-            ..SchemaObject::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "description": DURATION_DESCRIPTION, "type": "string", "pattern": DURATION_PATTERN })
     }
 }
 

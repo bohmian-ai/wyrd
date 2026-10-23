@@ -1224,7 +1224,7 @@ mod query_terminal_tests {
         .expect("an above-range deadline deserializes for validation");
         assert!(decoded.validate().is_err());
 
-        let schema = serde_json::to_value(schemars::schema_for!(BifrostQueryRequest).schema)
+        let schema = serde_json::to_value(schemars::schema_for!(BifrostQueryRequest))
             .expect("request schema serializes");
         let deadline = &schema["properties"]["deadline_ms"];
         assert_eq!(deadline["minimum"].as_f64(), Some(1.0));
@@ -2146,7 +2146,7 @@ mod tests {
     /// later field addition on either side has to break this test first.
     #[test]
     fn query_terminal_projects_path_without_request_selector() {
-        let request = serde_json::to_value(schemars::schema_for!(BifrostQueryRequest).schema)
+        let request = serde_json::to_value(schemars::schema_for!(BifrostQueryRequest))
             .expect("request schema serializes");
         let mut request_properties = request["properties"]
             .as_object()
@@ -2161,14 +2161,14 @@ mod tests {
             "the request must not accept a source, freshness, path, class, worker, or plan selector"
         );
 
-        let path = serde_json::to_value(schemars::schema_for!(QueryClass).schema)
+        let path = serde_json::to_value(schemars::schema_for!(QueryClass))
             .expect("path schema serializes");
         let path_variants = path["oneOf"]
             .as_array()
             .expect("the selected path is a closed enum")
             .iter()
             .map(|variant| {
-                variant["enum"][0]
+                variant["const"]
                     .as_str()
                     .expect("each variant is one string constant")
                     .to_owned()
@@ -2634,7 +2634,12 @@ mod bifrost_wire_tests {
             assert!(schema.contains(r#""files-with-delete""#), "{schema}");
             assert!(!schema.contains("small_files"), "{schema}");
             assert!(!schema.contains("files_with_delete"), "{schema}");
-            assert!(schema.contains("compacts it `small-files`"), "{schema}");
+            assert!(
+                schema
+                    .replace("\\n", " ")
+                    .contains("compacts it `small-files`"),
+                "{schema}"
+            );
         }
     }
 

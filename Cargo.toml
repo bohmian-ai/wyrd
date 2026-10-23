@@ -118,7 +118,7 @@ serde_urlencoded = "0.7"
 serde_yaml = "0.9"
 strum = { version = "0.27", features = ["derive"] }
 jsonschema = { version = "0.46.4", default-features = false }
-schemars = { version = "0.8", features = ["chrono", "uuid1"] }
+schemars = { version = "1.2", features = ["chrono04", "uuid1"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 utoipa-axum = { version = "0.2" }
 thiserror = "2.0"

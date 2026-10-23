@@ -671,15 +671,45 @@ test("custom_verdict_data_survives_readback", async ({ server, desk }) => {
   assertScored(waited);
   expect((await execution.status()).result).toEqual(waited);
 
-  server.flushBifrost();
-  const retained = await (await Bifrost.connect()).sql(
-    "SELECT to_json(outcome) AS outcome FROM vala.verification.results WHERE execution_id = $1",
-    [waited.execution_id],
-    z.object({ outcome: z.string() }),
-  );
-  expect(retained).toHaveLength(1);
-  expect(JSON.parse(retained[0]?.outcome ?? "null"), "the retained outcome keeps its data").toEqual(waited.outcome);
+  const retained = async (executionId: string): Promise<unknown> => {
+    server.flushBifrost();
+    const rows = await (await Bifrost.connect()).sql(
+      "SELECT to_json(outcome) AS outcome FROM vala.verification.results WHERE execution_id = $1",
+      [executionId],
+      z.object({ outcome: z.string() }),
+    );
+    expect(rows).toHaveLength(1);
+    return JSON.parse(rows[0]?.outcome ?? "null");
+  };
+  expect(await retained(waited.execution_id), "the retained outcome keeps its data").toEqual(waited.outcome);
+
+  for (const [marker, data] of Object.entries(EXACT_DATA)) {
+    const text = `${marker} refunds`;
+    const direct = await desk.state.run().observe.verify("scored-review", { text }, { positional: true });
+    expect(requirement(direct, "well-formed").data, `${marker}: direct`).toEqual(data);
+    const execution = await submitScored(desk, text);
+    const exact = await execution.wait({ timeoutMs: WAIT_MS });
+    expect(requirement(exact, "well-formed").data, `${marker}: wait`).toEqual(data);
+    expect((await execution.status()).result, `${marker}: status`).toEqual(exact);
+    expect(await retained(exact.execution_id), `${marker}: retained`).toEqual(exact.outcome);
+  }
 });
+
+/** A `tree` that, inside its data object, nests `containers` containers. */
+function deep(containers: number): unknown {
+  let tree: unknown = "s3cr3t";
+  for (let level = 1; level < containers; level += 1) {
+    tree = [tree];
+  }
+  return tree;
+}
+
+/** The `well-formed` code check's data at its inclusive bounds, by answer marker. */
+const EXACT_DATA: Record<string, unknown> = {
+  "EXACT-BYTES": { score: 0.5, category: `${"é".repeat(32_000)}\n"\u0001${"x".repeat(1_499)}` },
+  "EXACT-WIDE": { score: 0.5, category: "format", tree: Array<number>(32_747).fill(0) },
+  "DEEP-16": { score: 0.5, category: "format", tree: deep(16) },
+};
 
 test("invalid_custom_verdict_data_is_inconclusive", async ({ desk }) => {
   for (const marker of ["BAD-DATA", "HUGE-DATA"]) {
@@ -694,6 +724,26 @@ test("invalid_custom_verdict_data_is_inconclusive", async ({ desk }) => {
     }
     expect(requirement(result, "tally-counted").data, `${marker}: valid data elsewhere is kept`).toEqual({ words: 2 });
     expect(result.outcome.verdict).toBe("inconclusive");
+  }
+
+  for (const marker of [
+    "MISSING-DATA",
+    "NULL-DATA",
+    "EXTRA-DATA",
+    "EXTRA-FIELD",
+    "OVER-BYTES",
+    "OVER-WIDE",
+    "DEEP-17",
+  ]) {
+    const result = await desk.state
+      .run()
+      .observe.verify("scored-review", { text: `${marker} refunds` }, { positional: true });
+    const refused = requirement(result, "well-formed");
+    expect(refused.outcome, marker).toBe("inconclusive");
+    expect(refused.data, marker).toBeUndefined();
+    expect(refused.reason, marker).not.toMatch(/s3cr3t|xxxx/);
+    expect(requirement(result, "helpful").data, `${marker}: the Agent's valid data is kept`).toEqual(SCORED);
+    expect(requirement(result, "tally-counted").data, `${marker}: valid data elsewhere is kept`).toEqual({ words: 2 });
   }
 });
 

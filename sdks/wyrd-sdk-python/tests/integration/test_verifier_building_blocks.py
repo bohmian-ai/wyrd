@@ -616,13 +616,44 @@ def test_custom_verdict_data_survives_readback(
     status = execution.status()
     assert status["result"]["outcome"]["requirements"] == waited.requirements
 
+    assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"]
+
+    for marker, data in EXACT_DATA.items():
+        text = f"{marker} refunds"
+        assert requirement(scored_review(desk, text), "well-formed")["data"] == data, marker
+        execution = submit_scored(desk, text)
+        waited = execution.wait(WAIT_SECONDS)
+        assert requirement(waited, "well-formed")["data"] == data, marker
+        status = execution.status()
+        assert status["result"]["outcome"]["requirements"] == waited.requirements, marker
+        assert retained(wyrd_server, waited.execution_id) == status["result"]["outcome"], marker
+
+
+def retained(wyrd_server: WyrdTestServer, execution_id: str) -> object:
+    """The retained outcome of ``execution_id``, read back from Bifrost after publishing."""
     wyrd_server.flush_bifrost()
-    [retained] = Bifrost(client=client_of(wyrd_server)).sql(
+    [row] = Bifrost(client=client_of(wyrd_server)).sql(
         "SELECT to_json(outcome) AS outcome FROM vala.verification.results WHERE execution_id = $1",
-        [waited.execution_id],
+        [execution_id],
         model=RetainedOutcome,
     )
-    assert json.loads(retained.outcome) == status["result"]["outcome"]
+    return json.loads(row.outcome)
+
+
+def deep(containers: int) -> object:
+    """A ``tree`` that, inside its data object, nests ``containers`` containers."""
+    tree: object = "s3cr3t"
+    for _ in range(containers - 1):
+        tree = [tree]
+    return tree
+
+
+EXACT_DATA = {
+    "EXACT-BYTES": {"score": 0.5, "category": "é" * 32_000 + '\n"\u0001' + "x" * 1_499},
+    "EXACT-WIDE": {"score": 0.5, "category": "format", "tree": [0] * 32_747},
+    "DEEP-16": {"score": 0.5, "category": "format", "tree": deep(16)},
+}
+"""The ``well-formed`` code check's data at its inclusive bounds, by answer marker."""
 
 
 def test_invalid_custom_verdict_data_is_inconclusive(desk: WyrdState) -> None:
@@ -635,6 +666,23 @@ def test_invalid_custom_verdict_data_is_inconclusive(desk: WyrdState) -> None:
             assert "high" not in refused["reason"] and "xxxx" not in refused["reason"]
         assert requirement(result, "tally-counted")["data"] == {"words": 2}, marker
         assert result.verdict == "inconclusive"
+
+    for marker in (
+        "MISSING-DATA",
+        "NULL-DATA",
+        "EXTRA-DATA",
+        "EXTRA-FIELD",
+        "OVER-BYTES",
+        "OVER-WIDE",
+        "DEEP-17",
+    ):
+        result = scored_review(desk, f"{marker} refunds")
+        refused = requirement(result, "well-formed")
+        assert refused["outcome"] == "inconclusive", (marker, refused)
+        assert "data" not in refused, marker
+        assert "s3cr3t" not in refused["reason"] and "xxxx" not in refused["reason"], marker
+        assert requirement(result, "helpful")["data"] == SCORED_DATA["helpful"], marker
+        assert requirement(result, "tally-counted")["data"] == {"words": 2}, marker
 
 
 def test_custom_verdict_data_is_typed_on_return(desk: WyrdState) -> None:

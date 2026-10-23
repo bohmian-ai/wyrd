@@ -16,7 +16,7 @@ use wyrd_queue::{
 };
 use wyrd_testing::WyrdTestServer;
 
-use super::support::{register_table, sorted_values, unique_table, value_schema};
+use super::support::{register_table, sorted_values, unique_table};
 
 /// Real gRPC transport wrapper that records the batch identity at the sink seam.
 ///
@@ -119,7 +119,11 @@ async fn ambiguous_deadline_retains_then_deduplicates_one_batch() {
     });
     let bifrost = Bifrost::with_sink(
         &client,
-        Some(TableConfig::from_arrow(&fqn, value_schema()).expect("declared table")),
+        Some(
+            TableConfig::describe_with(&client, &fqn)
+                .await
+                .expect("describe the registered table"),
+        ),
         Arc::new(BifrostIngestSink::new(recording.clone())),
         QueueConfig {
             linger_ms: 60_000,

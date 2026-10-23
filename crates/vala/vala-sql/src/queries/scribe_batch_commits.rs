@@ -12,6 +12,7 @@
 
 use chrono::{DateTime, Utc};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::ids::TableVersion;
 
 use crate::{OperatorPool, SqlError, TenantConn};
 
@@ -24,6 +25,9 @@ pub struct ScribeBatchCommit {
     pub logical_table_fqn: String,
     /// Stable client batch identity.
     pub batch_id: uuid::Uuid,
+    /// Table version the batch was accepted under; a retry is compared under
+    /// this version, never the table's current one.
+    pub table_version: TableVersion,
     /// SHA-256 digest over the batch's ordered logical slice identities.
     ///
     /// This is a client-reproducible fact: it binds slice ordinals, the Arrow
@@ -58,6 +62,9 @@ struct ExistingScribeBatchCommit {
     logical_table_fqn: String,
     /// Persisted batch identity, the other half of the lookup key.
     batch_id: uuid::Uuid,
+    /// Persisted accepting table version; `None` for a fence recorded before
+    /// versions existed, which no offered version matches.
+    table_version: Option<i64>,
     /// Persisted ordered logical slice-set digest.
     slice_set_digest: Vec<u8>,
     /// Persisted closed-set cardinality.
@@ -82,8 +89,7 @@ impl ExistingScribeBatchCommit {
     /// Returns whether this exact tenant-scoped control row authorizes `commit`.
     #[must_use]
     fn matches(&self, commit: &ScribeBatchCommit) -> bool {
-        self.slice_set_digest == commit.slice_set_digest
-            && self.slice_count == commit.slice_count
+        self.matches_logical(commit)
             && self.wal_node_id == commit.wal_node_id
             && self.wal_writer_epoch == commit.wal_writer_epoch
             && self.wal_shard_id == commit.wal_shard_id
@@ -95,15 +101,19 @@ impl ExistingScribeBatchCommit {
 
     /// Returns whether this row holds the same logical batch as `commit`.
     ///
-    /// Logical identity is the rows themselves: the ordered slice-set digest
-    /// and the closed-set cardinality. WAL coordinates and the request
+    /// Logical identity is the rows themselves under the version that
+    /// accepted them: the table version, the ordered slice-set digest, and
+    /// the closed-set cardinality. A fence with no recorded version matches
+    /// no offered batch. WAL coordinates and the request
     /// correlation describe *which attempt* durably wrote the batch, not what
     /// the batch is, so a client that re-sends the same batch under a new
     /// request is logically identical here and contradictory only in
     /// [`Self::matches`].
     #[must_use]
     fn matches_logical(&self, commit: &ScribeBatchCommit) -> bool {
-        self.slice_set_digest == commit.slice_set_digest && self.slice_count == commit.slice_count
+        self.table_version == Some(commit.table_version.get())
+            && self.slice_set_digest == commit.slice_set_digest
+            && self.slice_count == commit.slice_count
     }
 
     /// Names the durable identity fields that diverge from `commit`.
@@ -116,6 +126,9 @@ impl ExistingScribeBatchCommit {
     #[must_use]
     fn divergent_fields(&self, commit: &ScribeBatchCommit) -> Vec<&'static str> {
         let mut divergent = Vec::new();
+        if self.table_version != Some(commit.table_version.get()) {
+            divergent.push("table_version");
+        }
         if self.slice_set_digest != commit.slice_set_digest {
             divergent.push("slice_set_digest");
         }
@@ -174,14 +187,15 @@ pub enum ScribeBatchReplayResolution {
 
 /// Resolves whether one replayed WAL commit is canonical or a later exact retry.
 ///
-/// The durable row remains authoritative. Matching logical digest/count at the
-/// original WAL coordinates restores; matching logical identity at different
+/// The durable row remains authoritative. Matching table version and logical
+/// digest/count at the original WAL coordinates restores; matching logical identity at different
 /// coordinates suppresses duplicate restoration. Any logical mismatch fails.
 ///
 /// # Errors
 ///
 /// Returns [`SqlError`] when the tenant differs from `conn`, PostgreSQL is
-/// unavailable, or an existing tenant/table/batch row contradicts digest/count.
+/// unavailable, or an existing tenant/table/batch row contradicts version,
+/// digest, or count.
 pub async fn resolve_replay(
     conn: &mut TenantConn<'_>,
     commit: &ScribeBatchCommit,
@@ -195,9 +209,7 @@ pub async fn resolve_replay(
     let Some(existing) = find(&existing, commit) else {
         return Ok(ScribeBatchReplayResolution::Restore);
     };
-    if existing.slice_set_digest != commit.slice_set_digest
-        || existing.slice_count != commit.slice_count
-    {
+    if !existing.matches_logical(commit) {
         return Err(invariant("scribe batch replay identity mismatch"));
     }
     if existing.matches(commit) {
@@ -230,6 +242,51 @@ pub async fn resolve<'a>(
             Some(existing) => classify(existing, commit),
         })
         .collect()
+}
+
+/// One batch's accepted logical identity, as a retry offers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedScribeBatch {
+    /// Canonical logical table FQN, half of the lookup key.
+    pub logical_table_fqn: String,
+    /// Stable client batch identity, the other half of the lookup key.
+    pub batch_id: uuid::Uuid,
+    /// Table version the retry was prepared under.
+    pub table_version: TableVersion,
+    /// Ordered logical slice-set digest of the retry.
+    pub slice_set_digest: [u8; 32],
+    /// Closed slice-set cardinality of the retry.
+    pub slice_count: i32,
+}
+
+/// Whether `batch` is exactly the logical batch a durable fence accepted.
+///
+/// The exceptional recovery read for a retry that cannot be admitted as a
+/// new batch, such as one naming a table version that is no longer current:
+/// it runs only after that refusal, never on fresh ingest. A fence with no
+/// recorded version, a different version, digest, or count, or no fence at
+/// all answers `false`, and the caller keeps its original refusal.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot execute the tenant-scoped read.
+pub async fn is_accepted(
+    conn: &mut TenantConn<'_>,
+    batch: &AcceptedScribeBatch,
+) -> Result<bool, SqlError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM vala.scribe_batch_commits \
+          WHERE logical_table_fqn = $1 AND batch_id = $2 AND table_version = $3 \
+            AND slice_set_digest = $4 AND slice_count = $5)",
+    )
+    .bind(&batch.logical_table_fqn)
+    .bind(batch.batch_id)
+    .bind(batch.table_version.get())
+    .bind(batch.slice_set_digest.to_vec())
+    .bind(batch.slice_count)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
 }
 
 /// Reads the `PostgreSQL` instant Scribe anchors its admission clock on.
@@ -284,11 +341,12 @@ pub async fn record(
         "INSERT INTO vala.scribe_batch_commits \
          (data_tenant_id, logical_table_fqn, batch_id, slice_set_digest, slice_count, \
           wal_node_id, wal_writer_epoch, wal_shard_id, wal_segment_sequence, \
-          wal_lsn_min, wal_lsn_max, request_id, ingested_at) \
+          wal_lsn_min, wal_lsn_max, request_id, ingested_at, table_version) \
          SELECT wyrd.current_tenant(), offered.* \
            FROM unnest($1::text[], $2::uuid[], $3::bytea[], $4::integer[], $5::uuid[], \
                        $6::bigint[], $7::smallint[], $8::bigint[], $9::bigint[], \
-                       $10::bigint[], $11::uuid[], $12::timestamptz[]) AS offered \
+                       $10::bigint[], $11::uuid[], $12::timestamptz[], \
+                       $13::bigint[]) AS offered \
          ON CONFLICT (data_tenant_id, logical_table_fqn, batch_id) DO NOTHING \
          RETURNING logical_table_fqn, batch_id",
     )
@@ -304,6 +362,7 @@ pub async fn record(
     .bind(column(commits, |c| c.wal_lsn_max))
     .bind(column(commits, |c| c.request_id))
     .bind(commits.iter().map(|(_, at)| *at).collect::<Vec<_>>())
+    .bind(column(commits, |c| c.table_version.get()))
     .fetch_all(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
@@ -386,7 +445,8 @@ async fn load<'a>(
     commits: impl Iterator<Item = &'a ScribeBatchCommit> + Clone,
 ) -> Result<Vec<ExistingScribeBatchCommit>, SqlError> {
     sqlx::query_as(
-        "SELECT logical_table_fqn, batch_id, slice_set_digest, slice_count, wal_node_id, \
+        "SELECT logical_table_fqn, batch_id, table_version, slice_set_digest, slice_count, \
+                wal_node_id, \
                 wal_writer_epoch, wal_shard_id, wal_segment_sequence, wal_lsn_min, \
                 wal_lsn_max, request_id \
            FROM vala.scribe_batch_commits \
@@ -484,6 +544,7 @@ mod tests {
             tenant: wyrd_spec::DataTenantId::new_v7(),
             logical_table_fqn: "vala.bifrost.events".to_owned(),
             batch_id: uuid::Uuid::now_v7(),
+            table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
             slice_set_digest: [7; 32],
             slice_count: 2,
             wal_node_id: uuid::Uuid::now_v7(),
@@ -497,6 +558,7 @@ mod tests {
         let existing = ExistingScribeBatchCommit {
             logical_table_fqn: commit.logical_table_fqn.clone(),
             batch_id: commit.batch_id,
+            table_version: Some(commit.table_version.get()),
             slice_set_digest: commit.slice_set_digest.to_vec(),
             slice_count: commit.slice_count,
             wal_node_id: commit.wal_node_id,
@@ -524,5 +586,20 @@ mod tests {
         existing.slice_set_digest = commit.slice_set_digest.to_vec();
         existing.request_id = uuid::Uuid::now_v7();
         assert!(!existing.matches(&commit));
+    }
+
+    /// A fence accepted under another table version, or under no recorded
+    /// version, is not the same logical batch even with identical rows.
+    #[test]
+    fn logical_identity_is_bound_to_the_accepting_table_version() {
+        let (commit, mut existing) = identities();
+        assert!(existing.matches_logical(&commit));
+
+        existing.table_version = Some(commit.table_version.get() + 1);
+        assert!(!existing.matches_logical(&commit));
+        assert!(!existing.matches(&commit));
+        existing.table_version = None;
+        assert!(!existing.matches_logical(&commit));
+        assert_eq!(existing.divergent_fields(&commit), vec!["table_version"]);
     }
 }

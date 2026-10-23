@@ -133,6 +133,16 @@ pub(crate) struct PreparedAppend {
 }
 
 impl PreparedAppend {
+    /// The table version every slice of this batch was prepared under, or
+    /// `None` for a batch with no slice.
+    ///
+    /// Preprocessing plans every slice from one partition scheme, so the
+    /// first slice's seal key speaks for the batch.
+    pub(crate) fn table_version(&self) -> Option<wyrd_spec::vala::ids::TableVersion> {
+        let PreparedSliceSet::Materialized(slices) = &self.slices;
+        slices.first().map(|slice| slice.seal_key.table_version)
+    }
+
     /// The batch's logical slice-set digest, slice count, and row count, as
     /// the shard computes them for the durable fence.
     ///

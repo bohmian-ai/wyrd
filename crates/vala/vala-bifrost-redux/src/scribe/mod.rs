@@ -330,6 +330,9 @@ pub struct ScribeImpl {
     /// The `PostgreSQL`-anchored clock every admitted batch is stamped from
     /// as `wyrd_ingested_at`.
     admission_clock: ingress::AdmissionClock,
+    /// Vala SQL pool holding the batch-control fence, read by ingress only to
+    /// recover an accepted retry the committed index no longer holds.
+    control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
     /// Test-tier barrier installed at the public ingest seam, if any.
     #[cfg(any(test, feature = "test-support"))]
     ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
@@ -1233,7 +1236,8 @@ impl ScribeImpl {
             recovery_ready: AtomicBool::new(true),
             recovery_cancelled: Arc::new(AtomicBool::new(false)),
             persistence,
-            admission_clock: ingress::AdmissionClock::new(control_postgres),
+            admission_clock: ingress::AdmissionClock::new(control_postgres.clone()),
+            control_postgres,
             fence_operator,
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),

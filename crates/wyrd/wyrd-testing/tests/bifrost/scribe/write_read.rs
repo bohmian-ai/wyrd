@@ -1423,8 +1423,10 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
 
 /// A batch accepted before a sort-order revision keeps that revision through
 /// staging, restart, and publication, while a batch admitted after it is
-/// written under the new one; a retry across the revision is acknowledged
-/// without a duplicate row and a changed payload under the same id is refused.
+/// written under the new one; a retry at its original table version across
+/// the revision, warm and after restart, is acknowledged without a duplicate
+/// row, a new batch at the superseded version is a typed version conflict,
+/// and a changed payload under the same id is refused.
 ///
 /// # Panics
 ///
@@ -1454,9 +1456,24 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
     drop(scribe);
 
     let revised = server.commit_sort_revision(tenant, &table_ref).await;
-    super::support::append_batch(&client, &table, accepted, &composite_batch())
+    let original = wyrd_spec::vala::ids::TableVersion::INITIAL;
+    super::support::append_batch_at(&client, &table, original, accepted, &composite_batch())
         .await
-        .expect("a retry across the revision is acknowledged");
+        .expect("a retry at its original version across the revision is acknowledged");
+    let stale = super::support::append_batch_at(
+        &client,
+        &table,
+        original,
+        uuid::Uuid::now_v7(),
+        &composite_batch(),
+    )
+    .await
+    .expect_err("a new batch at the superseded version is refused");
+    assert_eq!(
+        stale.code(),
+        "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT",
+        "{stale}"
+    );
     let later = shifted(&composite_batch(), COMPOSITE_ROWS);
     super::support::append_batch(&client, &table, uuid::Uuid::now_v7(), &later)
         .await
@@ -1487,9 +1504,9 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
         all,
         "restored rows read once"
     );
-    super::support::append_batch(&client, &table, accepted, &composite_batch())
+    super::support::append_batch_at(&client, &table, original, accepted, &composite_batch())
         .await
-        .expect("a retry after restart is acknowledged");
+        .expect("a retry at its original version after restart is acknowledged");
     server.flush_bifrost().await.expect("publishes");
     assert_eq!(
         read_all(client.clone()).await,
@@ -1519,9 +1536,15 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
         "each batch publishes under the sort order it was accepted under"
     );
     assert!(
-        super::support::append_batch(&client, &table, accepted, &shifted(&composite_batch(), 1))
-            .await
-            .is_err(),
+        super::support::append_batch_at(
+            &client,
+            &table,
+            original,
+            accepted,
+            &shifted(&composite_batch(), 1)
+        )
+        .await
+        .is_err(),
         "a changed payload under an accepted batch id is refused"
     );
     assert_eq!(read_all(client).await, all, "the refusal stores nothing");

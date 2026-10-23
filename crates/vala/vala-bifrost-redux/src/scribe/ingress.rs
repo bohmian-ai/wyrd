@@ -22,6 +22,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::error::BifrostError;
+use wyrd_spec::vala::ids::TableVersion;
 
 /// Validates that one decoded request fits the persistence bucket that must own it.
 ///
@@ -143,6 +144,11 @@ struct LogicalFrameContract {
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
     registered_schema: Option<Arc<Schema>>,
+    /// The table's current version when the frame named an older retained
+    /// one: the frame is prepared under its own version but may only be
+    /// acknowledged as an accepted retry, and is otherwise refused naming
+    /// this version.
+    retry_only: Option<TableVersion>,
 }
 
 /// Root admission state established before any scalable materialization.
@@ -156,6 +162,9 @@ struct RootAdmission {
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
     registered_schema: Option<Arc<Schema>>,
+    /// Current version a stale frame may only be acknowledged as a retry
+    /// against; see [`LogicalFrameContract::retry_only`].
+    retry_only: Option<TableVersion>,
     /// One authoritative receipt time shared by planning and projection.
     receipt_micros: i64,
     /// Complete immutable source-derived material plan.
@@ -219,33 +228,46 @@ impl ScribeImpl {
                     },
                 )?,
                 registered_schema: None,
+                retry_only: None,
             });
         };
         let (registered_fingerprint, _) = catalog
             .table_registration(&frame.table, frame.authenticated_tenant)
             .await
             .map_err(scribe_catalog_error)?;
-        let definition = catalog
+        let current = catalog
             .current_definition(&frame.table, frame.authenticated_tenant)
             .await
             .map_err(scribe_catalog_error)?;
-        if frame
-            .table_version
-            .is_some_and(|version| version != definition.table_version)
-        {
-            return Err(ScribeError::ContractViolation(
-                BifrostError::TableVersionConflict {
-                    table: frame.table.fqn(),
-                    table_version: definition.table_version,
-                },
-            ));
-        }
+        let (definition, retry_only) = match frame.table_version {
+            Some(version) if version != current.table_version => {
+                let conflict = || table_version_conflict(&frame.table, current.table_version);
+                if version > current.table_version {
+                    return Err(conflict());
+                }
+                let binding = crate::catalog::TenantTableBinding::resolve((
+                    frame.authenticated_tenant,
+                    frame.table.clone(),
+                ))
+                .map_err(|_| ScribeError::InvalidFrame)?;
+                let retained = catalog
+                    .retained_definition(&binding, version)
+                    .await
+                    .map_err(|error| match error {
+                        crate::catalog::BifrostCatalogError::MetadataMismatch(_) => conflict(),
+                        error => scribe_catalog_error(error),
+                    })?;
+                (retained, Some(current.table_version))
+            }
+            _ => (current, None),
+        };
         Ok(LogicalFrameContract {
             expected_schema_fingerprint: frame
                 .expected_schema_fingerprint
                 .unwrap_or(registered_fingerprint),
             partition_scheme: definition.partition_scheme.clone(),
             registered_schema: Some(Arc::clone(&definition.schema)),
+            retry_only,
         })
     }
 
@@ -414,6 +436,7 @@ impl ScribeImpl {
             expected_schema_fingerprint,
             partition_scheme,
             registered_schema,
+            retry_only,
         } = self.resolve_logical_frame(frame).await?;
         let receipt_micros = self.admission_instant(frame.principal.tenant_id).await?;
         let binding_facts =
@@ -441,6 +464,7 @@ impl ScribeImpl {
             expected_schema_fingerprint,
             partition_scheme,
             registered_schema,
+            retry_only,
             receipt_micros,
             material_plan,
             memory,
@@ -549,6 +573,7 @@ impl ScribeImpl {
             expected_schema_fingerprint,
             partition_scheme,
             registered_schema,
+            retry_only,
             receipt_micros,
             material_plan,
             mut memory,
@@ -603,7 +628,14 @@ impl ScribeImpl {
         };
         let preprocess = profile.preprocess.timer();
         let mut prepared = self.preprocess(admitted).await?;
-        let duplicate_rows = self.shards.committed_duplicate_rows(&prepared);
+        let mut duplicate_rows = self.shards.committed_duplicate_rows(&prepared);
+        if let (None, Some(current)) = (duplicate_rows, retry_only) {
+            duplicate_rows = Some(
+                self.accepted_retry_rows(&prepared)
+                    .await?
+                    .ok_or_else(|| table_version_conflict(&prepared.table, current))?,
+            );
+        }
         if duplicate_rows.is_none() {
             self.charge_prepared(&mut prepared)?;
         }
@@ -635,6 +667,49 @@ impl ScribeImpl {
             receipt_micros,
             first_commit: completion.first_commit,
         })
+    }
+
+    /// Rows of `append` when its durable fence accepted exactly this batch
+    /// under the table version it was prepared at.
+    ///
+    /// The exceptional recovery for a retry that may not be admitted as a new
+    /// batch and that the committed index no longer holds: one
+    /// tenant-scoped fence read, never on fresh ingest. `None` means no fence
+    /// accepted this version and logical identity, and the caller keeps its
+    /// refusal; so does a runtime with no control Postgres.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the tenant connection or the read fails.
+    async fn accepted_retry_rows(
+        &self,
+        append: &PreparedAppend,
+    ) -> Result<Option<u64>, ScribeError> {
+        let Some(postgres) = self.control_postgres.as_ref() else {
+            return Ok(None);
+        };
+        let (Some((slice_set_digest, slice_count, rows)), Some(table_version)) =
+            (append.logical_identity(), append.table_version())
+        else {
+            return Ok(None);
+        };
+        let Ok(slice_count) = i32::try_from(slice_count) else {
+            return Ok(None);
+        };
+        let mut conn = postgres.tenant_conn(append.tenant).await?;
+        let accepted = vala_sql::queries::scribe_batch_commits::is_accepted(
+            &mut conn,
+            &vala_sql::queries::scribe_batch_commits::AcceptedScribeBatch {
+                logical_table_fqn: append.table.fqn(),
+                batch_id: append.batch_id,
+                table_version,
+                slice_set_digest,
+                slice_count,
+            },
+        )
+        .await?;
+        conn.commit().await?;
+        Ok(accepted.then_some(rows))
     }
 
     /// Charges the bytes one prepared append actually holds before WAL/ACK.
@@ -794,6 +869,15 @@ fn scheme_of(
         ScribeError::Internal {
             detail: format!("registered partition layout is invalid: {error}"),
         }
+    })
+}
+
+/// The typed refusal for a frame whose table version is not the table's
+/// current one, naming `current` so the writer can describe again.
+fn table_version_conflict(table: &crate::catalog::TableRef, current: TableVersion) -> ScribeError {
+    ScribeError::ContractViolation(BifrostError::TableVersionConflict {
+        table: table.fqn(),
+        table_version: current,
     })
 }
 

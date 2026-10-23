@@ -245,15 +245,41 @@ impl RawIngest {
         batch_id: Uuid,
         arrow_ipc: Vec<u8>,
     ) -> Result<RequestId, WyrdError> {
-        let guard = self
-            .budget
-            .reserve_sealed(arrow_ipc.len())
-            .expect("harness frame fits the client byte budget");
         let table_version = self
             .describer
             .writer_table(table)
             .await
             .map_or(TableVersion::INITIAL, |described| described.table_version());
+        self.insert_at(table, table_version, batch_id, arrow_ipc)
+            .await
+    }
+
+    /// [`Self::insert`] under a caller-chosen table version.
+    ///
+    /// A writer retries an accepted batch at the version it was accepted
+    /// under, not whatever the table's current version is; a journey that
+    /// retries across a definition edit, or sends a stale new batch, names
+    /// that version here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the server's stable refusal, or the transport's stable error
+    /// once its retry budget is spent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the frame does not fit the harness byte budget.
+    pub async fn insert_at(
+        &self,
+        table: &str,
+        table_version: TableVersion,
+        batch_id: Uuid,
+        arrow_ipc: Vec<u8>,
+    ) -> Result<RequestId, WyrdError> {
+        let guard = self
+            .budget
+            .reserve_sealed(arrow_ipc.len())
+            .expect("harness frame fits the client byte budget");
         let request_id = RequestId::now_v7();
         let batch = SealedBatch {
             table: table.to_owned(),

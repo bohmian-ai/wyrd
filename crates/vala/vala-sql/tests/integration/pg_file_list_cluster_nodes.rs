@@ -81,6 +81,7 @@ mod pg_tests {
             ("forge_publication_operation_id", "uuid", "YES"),
             ("file_ordinal", "smallint", "NO"),
             ("file_checksum", "text", "YES"),
+            ("partition_dimensions", "bytea", "NO"),
         ];
 
         assert_eq!(

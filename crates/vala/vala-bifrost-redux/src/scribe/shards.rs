@@ -1121,8 +1121,8 @@ impl ScribeShardRuntime {
     /// already fenced and made visible, so the ingress can acknowledge it with
     /// no first commit instead of queueing it behind fresh writes.
     ///
-    /// The batch must match the recorded tenant, batch id, table, logical
-    /// slice-set digest, and slice count. Anything else returns `None` and the
+    /// The batch must match the recorded tenant, batch id, table, accepting
+    /// table version, logical slice-set digest, and slice count. Anything else returns `None` and the
     /// append takes the shard path, whose durable fence decides it; a fresh
     /// batch costs one map probe and no digest.
     pub(crate) fn committed_duplicate_rows(&self, append: &PreparedAppend) -> Option<u64> {
@@ -1132,6 +1132,7 @@ impl ScribeShardRuntime {
         let (logical_digest, slice_count, rows) = append.logical_identity()?;
         let batch = crate::scribe::committed_batches::CommittedBatch {
             table_fqn: append.table.fqn(),
+            table_version: append.table_version()?,
             logical_digest,
             slice_count,
         };
@@ -1924,6 +1925,7 @@ impl ShardOwner {
             tenant: replayed.seal_key.tenant,
             logical_table_fqn: replayed.seal_key.table.fqn(),
             batch_id: uuid::Uuid::from_bytes(commit.batch_id),
+            table_version: replayed.seal_key.table_version,
             slice_set_digest: commit.slice_set_digest,
             slice_count: i32::try_from(commit.slice_count).map_err(|_| ScribeError::Internal {
                 detail: "WAL replay slice count exceeds SQL integer range".to_owned(),
@@ -3029,10 +3031,12 @@ struct GroupWalState {
     /// A batch absent here was a replay: the fence spent it or the memtable
     /// already retained every slice, so its ACK reports no first commit.
     inserted_batch_ids: HashSet<[u8; 16]>,
-    /// Logical identity and slice count of each batch whose fence this group
-    /// committed or found spent, by index into `prepared`; recorded into the
-    /// pod-wide index once the group's rows are visible.
-    fenced: Vec<(usize, [u8; 32], u32)>,
+    /// Logical identity, slice count, and accepting table version of each
+    /// batch whose fence this group committed or found spent, by index into
+    /// `prepared`; recorded into the pod-wide index once the group's rows are
+    /// visible. The version is captured at fence time because insertion
+    /// moves the slices that carry it.
+    fenced: Vec<(usize, [u8; 32], u32, wyrd_spec::vala::ids::TableVersion)>,
 }
 
 /// Owns one WAL/SQL-committed group until every retained batch is query-visible.
@@ -3151,13 +3155,14 @@ impl ShardOwner {
     /// Only the successful path records: a group that failed after its sync
     /// stays retained for serial retry and records nothing until it settles.
     fn record_committed(&self, state: &GroupWalState) {
-        for &(index, logical_digest, slice_count) in &state.fenced {
+        for &(index, logical_digest, slice_count, table_version) in &state.fenced {
             let append = &state.prepared[index];
             self.committed.record(
                 append.tenant,
                 append.batch_id,
                 crate::scribe::committed_batches::CommittedBatch {
                     table_fqn: append.table.fqn(),
+                    table_version,
                     logical_digest,
                     slice_count,
                 },
@@ -3640,9 +3645,12 @@ impl ShardOwner {
             Vec<(ScribeBatchCommit, DateTime<Utc>)>,
         )>::new();
         for (index, identity, header, commit_lsn) in commits {
-            state
-                .fenced
-                .push((index, identity.logical_digest, identity.slice_count));
+            state.fenced.push((
+                index,
+                identity.logical_digest,
+                identity.slice_count,
+                state.durable[identity.first_index].seal_key.table_version,
+            ));
             let append = &state.prepared[index];
             let fence = Self::batch_commit_fence(
                 append,
@@ -3705,6 +3713,7 @@ impl ShardOwner {
             tenant: append.tenant,
             logical_table_fqn: append.table.fqn(),
             batch_id: append.batch_id,
+            table_version: first.seal_key.table_version,
             slice_set_digest: identity.logical_digest,
             slice_count: i32::try_from(identity.slice_count).map_err(|_| {
                 ScribeError::Internal {

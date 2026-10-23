@@ -113,6 +113,7 @@ mod pg_tests {
                 tenant,
                 logical_table_fqn: "bifrost.fenced".to_owned(),
                 batch_id: Uuid::now_v7(),
+                table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
                 slice_set_digest: [7; 32],
                 slice_count: 1,
                 wal_node_id: node_id,

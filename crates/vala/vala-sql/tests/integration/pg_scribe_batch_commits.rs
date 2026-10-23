@@ -8,7 +8,8 @@
 //! - a fence offered for another tenant is refused
 
 mod pg_tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Mutex, OnceLock};
+    use std::thread::ThreadId;
 
     use chrono::{DateTime, Utc};
     use tracing::field::{Field, Visit};
@@ -21,23 +22,59 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
 
-    /// Records the summary of every statement sqlx executes.
-    #[derive(Clone, Default)]
-    struct StatementLog(Arc<Mutex<Vec<String>>>);
+    /// Every statement sqlx executes in this binary, with its executing thread.
+    ///
+    /// Installed once as the global subscriber: a callsite caches one interest
+    /// for the whole process, so a thread-scoped subscriber misses statements
+    /// whose callsite another test's thread reached first.
+    static STATEMENTS: OnceLock<&'static StatementCapture> = OnceLock::new();
+
+    /// Global layer that records the summary of every sqlx statement.
+    #[derive(Default)]
+    struct StatementCapture(Mutex<Vec<(ThreadId, String)>>);
+
+    /// Summaries of the statements one captured future executed.
+    struct StatementLog(Vec<String>);
 
     impl StatementLog {
+        /// Runs `work` and returns its output with the statements it executed.
+        ///
+        /// `#[tokio::test]` polls on its own thread, so filtering by thread
+        /// keeps parallel tests' statements out.
+        ///
+        /// # Panics
+        ///
+        /// Panics when another global subscriber is already installed.
+        async fn capture<T>(work: impl Future<Output = T>) -> (T, Self) {
+            let capture = STATEMENTS.get_or_init(|| {
+                let capture: &'static StatementCapture = Box::leak(Box::default());
+                tracing::subscriber::set_global_default(
+                    tracing_subscriber::registry().with(capture),
+                )
+                .expect("install the statement capture");
+                capture
+            });
+            let start = capture.0.lock().expect("statement log lock").len();
+            let output = work.await;
+            let thread = std::thread::current().id();
+            let summaries = capture.0.lock().expect("statement log lock")[start..]
+                .iter()
+                .filter(|(executed_on, _)| *executed_on == thread)
+                .map(|(_, summary)| summary.clone())
+                .collect();
+            (output, Self(summaries))
+        }
+
         /// Counts executed statements whose summary starts with `prefix`.
         fn count(&self, prefix: &str) -> usize {
             self.0
-                .lock()
-                .expect("statement log lock")
                 .iter()
                 .filter(|summary| summary.starts_with(prefix))
                 .count()
         }
     }
 
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for StatementLog {
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for &'static StatementCapture {
         fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
             /// Extracts the `summary` field of one sqlx statement event.
             struct Summary(Option<String>);
@@ -59,7 +96,10 @@ mod pg_tests {
             let mut summary = Summary(None);
             event.record(&mut summary);
             if let Some(summary) = summary.0 {
-                self.0.lock().expect("statement log lock").push(summary);
+                self.0
+                    .lock()
+                    .expect("statement log lock")
+                    .push((std::thread::current().id(), summary));
             }
         }
     }
@@ -70,6 +110,7 @@ mod pg_tests {
             tenant,
             logical_table_fqn: table.to_owned(),
             batch_id,
+            table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
             slice_set_digest: [u8::try_from(lsn % 251).expect("digest byte"); 32],
             slice_count: 1,
             wal_node_id: Uuid::now_v7(),
@@ -134,12 +175,7 @@ mod pg_tests {
             (fresh_b.clone(), Utc::now()),
         ];
 
-        let log = StatementLog::default();
-        let subscriber = tracing_subscriber::registry().with(log.clone());
-        let resolved = {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            commit_group(&fixture, &offered).await
-        };
+        let (resolved, log) = StatementLog::capture(commit_group(&fixture, &offered)).await;
 
         assert_eq!(
             resolved,
@@ -196,12 +232,7 @@ mod pg_tests {
             })
             .collect();
 
-        let log = StatementLog::default();
-        let subscriber = tracing_subscriber::registry().with(log.clone());
-        let resolved = {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            commit_group(&fixture, &offered).await
-        };
+        let (resolved, log) = StatementLog::capture(commit_group(&fixture, &offered)).await;
 
         assert_eq!(resolved, [ScribeBatchCommitResolution::Committed; 8]);
         assert_eq!(log.count("INSERT INTO vala.scribe_batch_commits"), 1);

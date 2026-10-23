@@ -551,7 +551,8 @@ impl WyrdState {
     ///
     /// Identical to [`Self::from_path`], except that the state's identity is
     /// fixed now: Bifrost startup and every `observe.verify` call go through
-    /// `client`, and the ambient configuration is never read.
+    /// `client`, and the ambient configuration is never read. The client is
+    /// pinned to the bundle's root, as [`Self::client`] describes.
     ///
     /// # Arguments
     /// * `path` - The Card bundle directory.
@@ -562,7 +563,7 @@ impl WyrdState {
     /// As [`Self::from_path`].
     pub fn from_path_with(path: impl AsRef<Path>, client: WyrdClient) -> Result<Self, WyrdError> {
         let state = Self::from_path(path)?;
-        let _ = state.client.set(client);
+        let _ = state.client.set(state.pinned(client));
         Ok(state)
     }
 
@@ -720,6 +721,11 @@ impl WyrdState {
     /// every clone, as [`WyrdClient::from_global`] resolves it. Resolution
     /// performs no network IO.
     ///
+    /// Either way the client runs as the bundle's exact root
+    /// ([`WyrdClient::for_workload`]), so the state's evidence is attributed
+    /// to the Service it loaded; a component's [`Run`] view changes only the
+    /// subject, never this context.
+    ///
     /// # Errors
     /// Returns the client configuration error when the global config file
     /// cannot be read or parsed, or the credential resolution error.
@@ -727,8 +733,17 @@ impl WyrdState {
         if let Some(client) = self.client.get() {
             return Ok(client);
         }
-        let client = WyrdClient::from_global().map_err(WyrdError::from)?;
+        let client = self.pinned(WyrdClient::from_global().map_err(WyrdError::from)?);
         Ok(self.client.get_or_init(|| client))
+    }
+
+    /// `client` bound to this state's root UID, or unchanged when the bundle
+    /// carries none or the client already runs as that root.
+    fn pinned(&self, client: WyrdClient) -> WyrdClient {
+        match &self.root_ref().uid {
+            Some(uid) if client.workload_uid() != Some(uid) => client.for_workload(uid.clone()),
+            _ => client,
+        }
     }
 
     /// Resolve the Verifier named `name` bound in `verified_by` to `subject`.

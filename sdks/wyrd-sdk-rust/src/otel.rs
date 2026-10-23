@@ -4,7 +4,8 @@
 //! Each factory builds the stock `opentelemetry-otlp` exporter for one signal,
 //! pointed at the client's server, with an HTTP client that asks the
 //! [`WyrdClient`] for its current access token on every export and sends it
-//! as `x-wyrd-access-token`. The token comes from the client's one shared
+//! as `x-wyrd-access-token`, beside the client's workload root, when it has
+//! one, as `x-wyrd-workload-uid`. The token comes from the client's one shared
 //! refresh path, so a long-lived exporter keeps working after any single
 //! access token expires; this module holds no token, cache, retry, or
 //! refresher of its own.
@@ -234,7 +235,8 @@ impl TokenHttpClient {
         })
     }
 
-    /// Send one export with a freshly obtained access token.
+    /// Send one export with a freshly obtained access token and the client's
+    /// workload root, when it has one.
     ///
     /// # Errors
     /// Returns the client's error when no token can be obtained, and the
@@ -249,6 +251,12 @@ impl TokenHttpClient {
             ACCESS_TOKEN_HEADER,
             format!("Bearer {}", token.expose()).try_into()?,
         );
+        if let Some(uid) = client.workload_uid() {
+            request.headers_mut().insert(
+                wyrd_spec::auth::WORKLOAD_UID_HEADER,
+                uid.as_str().try_into()?,
+            );
+        }
         let response = http.execute(reqwest::Request::try_from(request)?).await?;
         let mut stock = Response::builder().status(response.status());
         if let Some(headers) = stock.headers_mut() {

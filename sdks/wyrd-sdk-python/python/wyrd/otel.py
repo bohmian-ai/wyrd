@@ -3,6 +3,7 @@
 ``span_exporter``, ``log_exporter``, and ``metric_exporter`` build the stock
 OTLP/HTTP protobuf exporters for one ``WyrdClient``: every export asks the
 client for its current access token and sends it as ``x-wyrd-access-token``,
+beside the client's workload root, when it has one, as ``x-wyrd-workload-uid``,
 so a long-lived exporter keeps working after any one token expires. They need
 the ``otel`` extra (``uv add 'wyrd-ai[otel]'``).
 
@@ -202,15 +203,19 @@ _EXPORTER_EXTRA = (
 )
 
 
-def _session(client: WyrdClient) -> Any:
-    """A ``requests`` session that authenticates every request as ``client``."""
+def _session(client: WyrdClient, workload_uid: str | None) -> Any:
+    """A ``requests`` session that authenticates every request as ``client``, run as ``workload_uid`` when given."""
     try:
         import requests
     except ImportError as missing:
         raise ImportError(_EXPORTER_EXTRA) from missing
+    if workload_uid is not None:
+        client = client.for_workload(workload_uid)
 
     def authenticate(request: Any) -> Any:
         request.headers["x-wyrd-access-token"] = f"Bearer {client.access_token()}"
+        if client.workload_uid is not None:
+            request.headers["x-wyrd-workload-uid"] = client.workload_uid
         return request
 
     session = requests.Session()
@@ -316,52 +321,67 @@ def _start_telemetry(client: WyrdClient) -> Any:
     return _ManagedTelemetry(provider)
 
 
-def span_exporter(client: WyrdClient) -> OTLPSpanExporter:
+def span_exporter(client: WyrdClient, *, workload_uid: str | None = None) -> OTLPSpanExporter:
     """Build a stock OTLP/HTTP span exporter that authenticates as ``client``.
 
     Args:
         client: The client whose access token authenticates every export.
+        workload_uid: Exact Service or Agent Card UID the exports run as;
+            omitted, the client's own workload root, if any.
 
     Raises:
         ImportError: naming the ``otel`` extra when the exporter is not installed.
+        WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``workload_uid`` is not a UUIDv7.
     """
     try:
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     except ImportError as missing:
         raise ImportError(_EXPORTER_EXTRA) from missing
-    return OTLPSpanExporter(endpoint=_endpoint(client, "traces"), session=_session(client))
+    return OTLPSpanExporter(
+        endpoint=_endpoint(client, "traces"), session=_session(client, workload_uid)
+    )
 
 
-def log_exporter(client: WyrdClient) -> OTLPLogExporter:
+def log_exporter(client: WyrdClient, *, workload_uid: str | None = None) -> OTLPLogExporter:
     """Build a stock OTLP/HTTP log exporter that authenticates as ``client``.
 
     Args:
         client: The client whose access token authenticates every export.
+        workload_uid: Exact Service or Agent Card UID the exports run as;
+            omitted, the client's own workload root, if any.
 
     Raises:
         ImportError: naming the ``otel`` extra when the exporter is not installed.
+        WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``workload_uid`` is not a UUIDv7.
     """
     try:
         from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
     except ImportError as missing:
         raise ImportError(_EXPORTER_EXTRA) from missing
-    return OTLPLogExporter(endpoint=_endpoint(client, "logs"), session=_session(client))
+    return OTLPLogExporter(
+        endpoint=_endpoint(client, "logs"), session=_session(client, workload_uid)
+    )
 
 
-def metric_exporter(client: WyrdClient) -> OTLPMetricExporter:
+def metric_exporter(client: WyrdClient, *, workload_uid: str | None = None) -> OTLPMetricExporter:
     """Build a stock OTLP/HTTP metric exporter that authenticates as ``client``.
 
     Args:
         client: The client whose access token authenticates every export.
+        workload_uid: Exact Service or Agent Card UID the exports run as;
+            omitted, the client's own workload root, if any.
 
     Raises:
         ImportError: naming the ``otel`` extra when the exporter is not installed.
+        WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``workload_uid`` is not a UUIDv7.
     """
     try:
         from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     except ImportError as missing:
         raise ImportError(_EXPORTER_EXTRA) from missing
-    return OTLPMetricExporter(endpoint=_endpoint(client, "metrics"), session=_session(client))
+    return OTLPMetricExporter(
+        endpoint=_endpoint(client, "metrics"), session=_session(client, workload_uid)
+    )
 
 
 class WyrdAgentsTraceProcessor(_AgentsTracingProcessor):

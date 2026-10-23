@@ -584,6 +584,16 @@ export declare class NativePrincipals {
    */
   revokePrincipal(principalId: string, requestJson: string): Promise<NativeLifecycleResult>
   /**
+   * Replaces a Service principal's workload restriction from a serialized
+   * `WorkloadRestriction`, resolving the updated `PrincipalSummary`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the summary cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  setWorkloadRestriction(principalId: string, restrictionJson: string): Promise<NativeLifecycleResult>
+  /**
    * Lists one page of assignable principals from a serialized
    * `PrincipalQuery`.
    *

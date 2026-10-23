@@ -80,6 +80,7 @@ import type {
   VerificationExecutionState as WireVerificationExecutionState,
   VerificationOutcome as WireVerificationOutcome,
   VerificationResult as WireVerificationResult,
+  WorkloadRestriction,
 } from "./card-types.js";
 
 import type {
@@ -1994,6 +1995,25 @@ export class Principals {
    */
   async revokePrincipal(principalId: string, request: RevokePrincipalRequest): Promise<void> {
     lifecycleValue<null>(await this.#native.revokePrincipal(principalId, JSON.stringify(request)));
+  }
+
+  /**
+   * Replace a Service principal's workload restriction. A family restriction
+   * makes the account that family's one runtime account and requires tenant
+   * administration (`*`).
+   *
+   * @param principalId - The Service principal to restrict.
+   * @param restriction - `{ mode: "unrestricted" }` or a family restriction.
+   * @returns The principal with its new restriction.
+   * @throws {@link WyrdError} `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` when the family already has a runtime account, or for an unknown principal or a transport or authorization failure.
+   */
+  async setWorkloadRestriction(
+    principalId: string,
+    restriction: WorkloadRestriction,
+  ): Promise<PrincipalSummary> {
+    return lifecycleValue(
+      await this.#native.setWorkloadRestriction(principalId, JSON.stringify(restriction)),
+    );
   }
 
   /**

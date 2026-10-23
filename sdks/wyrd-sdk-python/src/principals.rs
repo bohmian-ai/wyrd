@@ -10,7 +10,7 @@ use pyo3::types::PyModule;
 use serde_json::Value;
 use wyrd_client::principals::{
     CreateServicePrincipalRequest, PrincipalId, PrincipalQuery, Principals as NativePrincipals,
-    RevokePrincipalRequest,
+    RevokePrincipalRequest, WorkloadRestriction,
 };
 use wyrd_utils::py::{WyrdPyResult, pyobject_to_json};
 
@@ -174,6 +174,29 @@ impl Principals {
         let request: RevokePrincipalRequest = decode("request", pyobject_to_json(request)?)?;
         crate::trace::block_on(py, self.handle(py)?.revoke_principal(&id, &request))?;
         Ok(())
+    }
+
+    /// Replace a Service principal's workload restriction from a
+    /// `WorkloadRestriction` dict, returning the updated `PrincipalSummary`.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when an argument does not match the wire contract,
+    /// the caller lacks the required permission, the family already has a
+    /// runtime account, or the request fails.
+    fn set_workload_restriction(
+        &self,
+        py: Python<'_>,
+        principal_id: &str,
+        restriction: &Bound<'_, PyAny>,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let id = self::principal_id(principal_id)?;
+        let restriction: WorkloadRestriction =
+            decode("restriction", pyobject_to_json(restriction)?)?;
+        let summary = crate::trace::block_on(
+            py,
+            self.handle(py)?.set_workload_restriction(&id, &restriction),
+        )?;
+        to_python(py, &summary)
     }
 
     /// One page of assignable principals matching exact filters, ordered by

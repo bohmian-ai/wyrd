@@ -237,6 +237,30 @@ class Principals:
         """
         ...
 
+    def set_workload_restriction(
+        self, principal_id: str, restriction: WorkloadRestriction
+    ) -> PrincipalSummary:
+        """Replace a Service principal's workload restriction.
+
+        A family restriction makes the account that family's one runtime
+        account and requires tenant administration (``*``).
+
+        Args:
+            principal_id: the Service principal to restrict.
+            restriction: ``{"mode": "unrestricted"}`` or a family restriction.
+
+        Returns:
+            The principal with its new restriction.
+
+        Raises:
+            WyrdError: ``WYRD_PERMISSION_403_DENIED_RBAC`` without the required
+                permission, ``WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT`` when the
+                family already has a runtime account, or a not-found error for
+                an unknown principal.
+
+        """
+        ...
+
     def list(
         self,
         *,

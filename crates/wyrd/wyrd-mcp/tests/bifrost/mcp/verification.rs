@@ -2125,4 +2125,130 @@ mod pg_tests {
         agent_client.cancel().await?;
         Ok(())
     }
+
+    /// A Service's configured deployment environment reaches both of its
+    /// verification subjects over MCP, reconciled with each binding.
+    ///
+    /// Against `configured-service`, whose Service check is bound to `prod`
+    /// and whose Agent component's check is unscoped: an equal `prod` execute
+    /// and a sole (unrequested) enqueue of the Service check both run in
+    /// `prod` on the Service; a `staging` enqueue of the Agent check runs in
+    /// `staging` on the Agent; `verification.get_execution` reads each frozen
+    /// environment back. A `staging` request for the Service check conflicts
+    /// with its binding, is refused on both write tools, and stages nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport, flush,
+    /// or tool-call failures, or an error when an execution never settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a result names another subject or environment, or a
+    /// conflicting request is accepted or leaves staged input.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn configured_service_context_keeps_subject_and_environment()
+    -> Result<(), McpJourneyError> {
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-configured-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
+        let receipt = Box::pin(cards.declare_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/observe_a_run/configured-service.yaml"
+        ))))
+        .await?;
+        let uid = |name: &str| -> Result<String, McpJourneyError> {
+            Ok(receipt
+                .outcomes
+                .iter()
+                .find(|outcome| outcome.card_ref.name.as_str() == name)
+                .and_then(|outcome| outcome.card_ref.uid.as_ref())
+                .ok_or("the fixture registers the named Card")?
+                .to_string())
+        };
+        let (service, agent) = (uid("configured-service")?, uid("observed-agent")?);
+        let (service_check, agent_check) = (uid("service-check")?, uid("agent-check")?);
+        let caller = server
+            .credential_registered_service(&receipt.root, &["editor"])
+            .await?;
+        let caller_client = connect_rooted(&server, &caller).await?;
+        let request = |verifier: &str, subject: &str, environment: Option<&str>| {
+            let mut body = serde_json::json!({
+                "verifier_card_uid": verifier,
+                "card_uid": subject,
+                "inputs": { "answer": { "kind": "json", "value": "yes" } },
+            });
+            if let Some(environment) = environment {
+                body["deployment_environment"] = environment.into();
+            }
+            body
+        };
+
+        let equal = structured(
+            caller_client
+                .call_tool(call(
+                    EXECUTE,
+                    request(&service_check, &service, Some("prod")),
+                )?)
+                .await?,
+        )?;
+        assert_eq!(text(&equal, "/subject/uid")?, service, "{equal}");
+        assert_eq!(text(&equal, "/deployment_environment")?, "prod", "{equal}");
+        for (verifier, subject, requested, effective) in [
+            (&service_check, &service, None, "prod"),
+            (&agent_check, &agent, Some("staging"), "staging"),
+        ] {
+            let accepted = structured(
+                caller_client
+                    .call_tool(call(ENQUEUE, request(verifier, subject, requested))?)
+                    .await?,
+            )?;
+            let state = settle(&caller_client, text(&accepted, "/execution_id")?).await?;
+            assert_eq!(state["status"], "completed", "{state}");
+            assert_eq!(text(&state, "/result/subject/uid")?, subject.as_str());
+            assert_eq!(
+                text(&state, "/result/deployment_environment")?,
+                effective,
+                "{state}"
+            );
+        }
+
+        server.flush_bifrost().await?;
+        let staged = "SELECT count(*) FROM vala.verification.execution_inputs".to_owned();
+        let before = rows(&caller_client, staged.clone()).await?;
+        for tool in [EXECUTE, ENQUEUE] {
+            let refused = refusal(
+                caller_client
+                    .call_tool(call(
+                        tool,
+                        request(&service_check, &service, Some("staging")),
+                    )?)
+                    .await,
+            )?;
+            assert!(
+                refused.contains("WYRD_SPEC_400_VALIDATION")
+                    && refused.contains("deployment_environment"),
+                "{tool} refuses an environment its binding conflicts with: {refused}"
+            );
+        }
+        server.flush_bifrost().await?;
+        assert_eq!(
+            rows(&caller_client, staged).await?,
+            before,
+            "a refused call stages nothing"
+        );
+        caller_client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
 }

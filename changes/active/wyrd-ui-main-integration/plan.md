@@ -16,10 +16,10 @@ Conventional pages start after that gate and retain their own visual checkpoints
 
 | Task | Observable outcome | Real task dependencies | External completion dependency |
 |---|---|---|---|
-| [TASK-001](tasks/TASK-001-distribution-login.md) | Installed and container UI with existing login | None | None |
+| [TASK-001](tasks/TASK-001-distribution-login.md) | Installed and container UI with existing login — **complete** | None | None |
 | [TASK-001-R1](review/tasks-001-002-843484f6c/TASK-001-R1-installation-browser-sessions.md) | Correct installation eligibility, implement Rust-owned opaque browser sessions and prove official nginx login | TASK-001 and TASK-002 integrated at `843484f6c`; approved revision 10 | Supported native/Linux image runtime and human inspection remain required acceptance evidence |
-| [TASK-002](tasks/TASK-002-remove-old-ui.md) | Remove obsolete UI while retaining login | None | None |
-| [TASK-003](tasks/TASK-003-shared-ui-foundation.md) | Reusable UI foundation across the four hosts | TASK-002 | None |
+| [TASK-002](tasks/TASK-002-remove-old-ui.md) | Remove obsolete UI while retaining login — **complete** | None | None |
+| [TASK-003](tasks/TASK-003-shared-ui-foundation.md) | Reusable UI foundation across the four hosts — **complete** | TASK-002 | None |
 | [TASK-004](tasks/TASK-004-observe-components.md) | Observe component family | TASK-003 | REQ-023 service_card_uid ingest/schema/auth prerequisite for Service filters and Service-scoped variants. |
 | [TASK-005](tasks/TASK-005-card-components.md) | Card browsing and definition component family | TASK-003 | Only if required ArtifactTable actions lack a current SDK/MCP projection: obtain approved platform action contract before calling that action complete. |
 | [TASK-006](tasks/TASK-006-query-components.md) | Query component family | TASK-003, TASK-004 | None |
@@ -43,7 +43,13 @@ Conventional pages start after that gate and retain their own visual checkpoints
 | [TASK-024](tasks/TASK-024-home-page.md) | Home summary page | TASK-012, TASK-005, TASK-007, TASK-008, TASK-004 | REQ-023 and applicable REQ-029 attention contracts; all supporting library tasks complete. |
 | [TASK-025](tasks/TASK-025-change-pages.md) | Change Request collaboration pages | TASK-012, TASK-009 | REQ-029 platform contract and TASK-009 production-complete, including actual read/write host projections. |
 | [TASK-026](tasks/TASK-026-repositories-page.md) | Repository connections page | TASK-012, TASK-009 | REQ-029 repository/webhook/configuration platform contract and TASK-009 production-complete. |
-| [TASK-027](tasks/TASK-027-view-layout.md) | Placed, resizable view panels (revision 12) | TASK-003 | None |
+| [TASK-027](tasks/TASK-027-view-layout.md) | Placed, resizable view panels (revision 12) — **complete** | TASK-003 | None |
+
+TASK-001, TASK-002 (with TASK-001-R1 to R3), TASK-003 and TASK-027 are complete:
+the caller accepted them on 2026-10-23 after inspecting the gallery. The
+remaining TASK-003 review findings were either fixed (FIND-003-16/17 at
+`a9be77a51`) or dropped as unneeded complexity ([simplify record](review/simplify-2026-10-23.md)).
+Native/image runtime and nginx evidence for TASK-001 stay with final change review.
 
 ## Active remediation and revision authority
 

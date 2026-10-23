@@ -1,6 +1,6 @@
 # TASK-003 — Reusable UI foundation across the four hosts
 
-Spec: [revision 10, approved](../spec.md). Status: Proposed.
+Spec: [revision 10, approved](../spec.md). Status: Complete — accepted by the caller on 2026-10-23.
 Dependencies: [TASK-002](TASK-002-remove-old-ui.md).  
 Mapped obligations: REQ-030, REQ-020, AC-006, AC-008, AC-011, AC-010; all INV-001–INV-007 apply, with TASK-001-specific exclusions only in TASK-001.
 

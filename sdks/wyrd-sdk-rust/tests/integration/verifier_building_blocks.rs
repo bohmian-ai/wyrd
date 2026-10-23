@@ -1452,6 +1452,9 @@ async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> Verificatio
 /// The `well-formed` code check's data at its inclusive bounds, by answer
 /// marker: exactly 65,536 compact bytes of UTF-8 and escapes, the same of a
 /// wide array, and 16 nested containers.
+///
+/// # Panics
+/// Panics when either byte-bound value is not exactly 65,536 compact bytes.
 fn exact_data() -> [(&'static str, Value); 3] {
     let mut tree = json!("s3cr3t");
     for _ in 1..16 {
@@ -1482,7 +1485,8 @@ fn exact_data() -> [(&'static str, Value); 3] {
 /// a reason naming the location or limit rather than the payload. Hosted
 /// code also proves missing, null, and undeclared data, an unknown Verdict
 /// field, one byte over the bound (UTF-8 and escapes, and a wide array), and
-/// 17 containers, while valid sibling data survives.
+/// 17 containers, and a plain code check refuses data it never declared,
+/// while valid sibling data survives.
 ///
 /// # Panics
 /// Panics when invalid data is kept, judged, or echoed.
@@ -1575,6 +1579,30 @@ async fn invalid_custom_verdict_data_is_inconclusive() {
             "{marker}: valid data elsewhere is kept"
         );
     }
+
+    let result = desk
+        .state
+        .run()
+        .observe()
+        .verify("scored-review", json!({ "text": "ENVELOPE-DATA refunds" }))
+        .await
+        .expect("the review runs");
+    let refused = requirement(&result, "plainly-checked");
+    assert_eq!(
+        refused.outcome,
+        RequirementOutcome::Inconclusive,
+        "{refused:?}"
+    );
+    assert_eq!(refused.data, None);
+    assert!(!refused.reason.contains("s3cr3t"), "{}", refused.reason);
+    assert_eq!(
+        requirement(&result, "well-formed")
+            .data
+            .clone()
+            .map(Value::Object),
+        Some(json!({"score": 0.5, "category": "format"})),
+        "a declared sibling keeps its data"
+    );
     desk.deployment.shutdown().await;
 }
 

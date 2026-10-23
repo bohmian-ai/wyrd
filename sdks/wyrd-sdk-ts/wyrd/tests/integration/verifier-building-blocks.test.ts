@@ -745,6 +745,18 @@ test("invalid_custom_verdict_data_is_inconclusive", async ({ desk }) => {
     expect(requirement(result, "helpful").data, `${marker}: the Agent's valid data is kept`).toEqual(SCORED);
     expect(requirement(result, "tally-counted").data, `${marker}: valid data elsewhere is kept`).toEqual({ words: 2 });
   }
+
+  const result = await desk.state
+    .run()
+    .observe.verify("scored-review", { text: "ENVELOPE-DATA refunds" }, { positional: true });
+  const refused = requirement(result, "plainly-checked");
+  expect(refused.outcome).toBe("inconclusive");
+  expect(refused.data).toBeUndefined();
+  expect(refused.reason).not.toMatch(/s3cr3t/);
+  expect(requirement(result, "well-formed").data, "a declared sibling keeps its data").toEqual({
+    score: 0.5,
+    category: "format",
+  });
 });
 
 test("custom_verdict_data_is_typed_on_return", async ({ desk }) => {

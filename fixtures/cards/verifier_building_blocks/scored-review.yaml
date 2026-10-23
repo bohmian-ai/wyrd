@@ -8,6 +8,7 @@
 # `DEEP-17` nest that many containers, and `MISSING-DATA`, `NULL-DATA`,
 # `EXTRA-DATA`, and `EXTRA-FIELD` return no data, null data, an undeclared
 # data field, and an unknown Verdict field; refused values carry `s3cr3t`.
+# `ENVELOPE-DATA` makes the plain code check return data it never declared.
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
@@ -83,6 +84,23 @@ spec:
         kind: agent
         agent: ./scored-judge.yaml
         inputs: {answer: inputs.answer.text}
+    - id: plainly-checked
+      statement: The answer is checked by plain code
+      check:
+        kind: code
+        entrypoint: check
+        inputs: {answer: inputs.answer}
+        source:
+          inline: |
+            def check(answer):
+                response = {
+                    "outcome": "passed",
+                    "reason": "checked the answer",
+                    "citations": [{"slot": "answer", "locator": {"json_pointer": "/text"}}],
+                }
+                if "ENVELOPE-DATA" in answer["text"]:
+                    response["data"] = {"note": "s3cr3t"}
+                return response
     - id: well-formed
       statement: The answer is well formed
       check:

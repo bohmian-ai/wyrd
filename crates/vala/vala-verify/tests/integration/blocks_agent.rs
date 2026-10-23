@@ -572,11 +572,12 @@ fn named_judge(format: Value) -> AgentCall {
 }
 
 /// A check Agent's answer must satisfy its whole declared `verdict` format:
-/// valid custom data, including exact size and depth boundaries and failed
-/// judgments, is kept; missing, wrong, null, undeclared, oversized, or too
-/// deep data and unknown envelope members are terminal without echoing the
-/// answer; the plain format refuses any data; and a citation-less pass is
-/// still inconclusive.
+/// valid custom data, including exactly 65,536 compact bytes of escaped
+/// UTF-8 text or of a wide array, 16 nested containers, and failed
+/// judgments, is kept; missing, wrong, null, or undeclared data, one byte
+/// past either size boundary, 17 containers, and unknown envelope members
+/// are terminal without echoing the answer; the plain format refuses any
+/// data; and a citation-less pass is still inconclusive.
 ///
 /// # Panics
 /// Panics when an invalid answer is accepted, a valid one is refused, or a
@@ -601,8 +602,29 @@ async fn check_agent_validates_custom_data() {
         }
         tree
     };
-    let note = |bytes: usize| "é".repeat(bytes / 2);
-    let exact = 65_536 - json!({"score": 1, "note": ""}).to_string().len();
+    // {"score":1,"note":""} is 21 compact bytes; 32,000 two-byte characters,
+    // the escaped newline and quote (2 bytes each), and the escaped U+0001
+    // (6 bytes) leave 1,505. {"score":1,"note":"","tree":[]} is 31 bytes, and
+    // 32,753 one-digit items with their commas take the remaining 65,505.
+    let utf8 = format!("{}\n\"\u{1}", "é".repeat(32_000));
+    let text =
+        |pad: usize| json!({"data": {"score": 1, "note": format!("{utf8}{}", "x".repeat(pad))}});
+    let wide = |last: u8| {
+        let mut tree = vec![0; 32_752];
+        tree.push(last);
+        json!({"data": {"score": 1, "note": "", "tree": tree}})
+    };
+    let bytes = |extra: &Value| serde_json::to_vec(&extra["data"]).expect("json").len();
+    let (exact_text, over_text) = (text(1_505), text(1_506));
+    let (exact_wide, over_wide) = (wide(0), wide(10));
+    for (extra, expected) in [
+        (&exact_text, 65_536),
+        (&over_text, 65_537),
+        (&exact_wide, 65_536),
+        (&over_wide, 65_537),
+    ] {
+        assert_eq!(bytes(extra), expected, "boundary fixture size");
+    }
     let accepted = [
         (
             "passed",
@@ -612,7 +634,8 @@ async fn check_agent_validates_custom_data() {
             "failed",
             json!({"data": {"score": 0.1, "note": "\u{1}\n\"quoted\""}}),
         ),
-        ("failed", json!({"data": {"score": 1, "note": note(exact)}})),
+        ("failed", exact_text),
+        ("failed", exact_wide),
         (
             "failed",
             json!({"data": {"score": 1, "note": "", "tree": deep(16)}}),
@@ -638,7 +661,8 @@ async fn check_agent_validates_custom_data() {
         json!({"data": {"score": 1}}),
         json!({"data": {"score": 1, "note": secret, "extra": secret}}),
         json!({"data": {"score": 1, "note": secret}, "confidence": secret}),
-        json!({"data": {"score": 1, "note": format!("{secret}{}", note(exact))}}),
+        over_text,
+        over_wide,
         json!({"data": {"score": 1, "note": secret, "tree": deep(17)}}),
     ];
     for extra in refused {

@@ -684,6 +684,13 @@ def test_invalid_custom_verdict_data_is_inconclusive(desk: WyrdState) -> None:
         assert requirement(result, "helpful")["data"] == SCORED_DATA["helpful"], marker
         assert requirement(result, "tally-counted")["data"] == {"words": 2}, marker
 
+    result = scored_review(desk, "ENVELOPE-DATA refunds")
+    refused = requirement(result, "plainly-checked")
+    assert refused["outcome"] == "inconclusive", refused
+    assert "data" not in refused
+    assert "s3cr3t" not in refused["reason"]
+    assert requirement(result, "well-formed")["data"] == {"score": 0.5, "category": "format"}
+
 
 def test_custom_verdict_data_is_typed_on_return(desk: WyrdState) -> None:
     expected = {

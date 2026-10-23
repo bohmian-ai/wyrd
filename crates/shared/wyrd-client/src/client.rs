@@ -22,6 +22,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use wyrd_spec::auth::{SecretBearer, TokenAudience};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 #[cfg(feature = "internal")]
 use wyrd_spec::request_id::RequestId;
 
@@ -469,6 +470,37 @@ impl WyrdClient {
             auth,
             grpc_config: self.grpc_config.clone(),
         })
+    }
+
+    /// Return a client whose requests run as the exact Service or Agent root
+    /// `uid`, with this client's credential and connection pools.
+    ///
+    /// The returned client keeps its own token cache, so rootless and rooted
+    /// clients over one credential never share a token: an API key or
+    /// workload token requests `uid` in its exchange and every renewal, and
+    /// every request carries it on
+    /// [`WORKLOAD_UID_HEADER`](wyrd_spec::auth::WORKLOAD_UID_HEADER), which
+    /// selects context for a user bearer. No network call is made here; the
+    /// server validates the root on first use and refuses one the account may
+    /// not select.
+    ///
+    /// # Arguments
+    /// * `uid` - Exact Service or Agent Card UID the returned client runs as.
+    #[must_use]
+    pub fn for_workload(&self, uid: CardUid) -> Self {
+        let auth = self.auth.for_workload(uid);
+        Self {
+            http: self.http.with_auth(Arc::clone(&auth)),
+            auth,
+            grpc_config: self.grpc_config.clone(),
+        }
+    }
+
+    /// The exact root this client's requests run as, or `None` for rootless
+    /// work: the one [`Self::for_workload`] selected, else `WYRD_WORKLOAD_UID`.
+    #[must_use]
+    pub fn workload_uid(&self) -> Option<&CardUid> {
+        self.auth.workload_uid()
     }
 
     /// Return the shared [`AuthMiddleware`] handle.

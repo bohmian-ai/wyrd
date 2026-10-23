@@ -1570,17 +1570,25 @@ export class WyrdClient {
    * as-is (else `WYRD_ACCESS_TOKEN`, then `WYRD_WORKLOAD_TOKEN` with its
    * tenant, then `WYRD_API_KEY`, then a saved login). `grpcUrl`, the Bifrost
    * ingest endpoint (else `WYRD_GRPC_URL`, else the server's host on port
-   * `50051`).
+   * `50051`). `workloadUid`, the exact Service or Agent Card UID the client
+   * runs as, as {@link WyrdClient.forWorkload} selects it (else
+   * `WYRD_WORKLOAD_UID`, else rootless work).
    * @returns The client.
    * @throws {@link WyrdError}: `WYRD_CLIENT_401_NO_CREDENTIALS` when no
-   * credential resolves, and `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when a
+   * credential resolves, `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when a
    * `WYRD_TENANT` matches none of this server's saved logins or a saved login
-   * cannot be used.
+   * cannot be used, and `WYRD_SPEC_400_VALIDATION` when `workloadUid` is not
+   * a UUIDv7.
    */
   static connect(
-    options: { readonly serverUrl?: string; readonly credential?: string; readonly grpcUrl?: string } = {},
+    options: {
+      readonly serverUrl?: string;
+      readonly credential?: string;
+      readonly grpcUrl?: string;
+      readonly workloadUid?: string;
+    } = {},
   ): WyrdClient {
-    const result = connectWyrdClient(options.serverUrl, options.credential, options.grpcUrl);
+    const result = connectWyrdClient(options.serverUrl, options.credential, options.grpcUrl, options.workloadUid);
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
 
@@ -1595,6 +1603,30 @@ export class WyrdClient {
    */
   get grpcUrl(): string {
     return this.#native.grpcUrl;
+  }
+
+  /** The exact Service or Agent Card UID this client runs as, or `undefined` for rootless work. */
+  get workloadUid(): string | undefined {
+    return this.#native.workloadUid ?? undefined;
+  }
+
+  /**
+   * Return a client that runs as the exact Service or Agent root `workloadUid`.
+   *
+   * The returned client shares this client's credential and connection pools
+   * but keeps its own token cache: an API key or workload token requests the
+   * root in its exchange and every renewal, and every request carries it as
+   * `x-wyrd-workload-uid`. No network call is made; the server validates the
+   * root on first use.
+   *
+   * @param workloadUid - The exact Service or Agent Card UID to run as.
+   * @returns The rooted client.
+   * @throws {@link WyrdError}: `WYRD_SPEC_400_VALIDATION` when `workloadUid`
+   * is not a UUIDv7.
+   */
+  forWorkload(workloadUid: string): WyrdClient {
+    const result = this.#native.forWorkload(workloadUid);
+    return new WyrdClient(nativeHandle(result.client, result.error));
   }
 
   /**
@@ -1621,8 +1653,9 @@ export class WyrdClient {
    * or an MCP transport against `/mcp`. Each request drops `authorization`,
    * `x-api-key`, and `x-goog-api-key`, which on a client wired to Wyrd hold
    * only a placeholder provider key, and carries this client's current access
-   * token as `X-Wyrd-Access-Token: Bearer <token>`. The token is read per
-   * request, so a long-lived client keeps working after any one token expires.
+   * token as `X-Wyrd-Access-Token: Bearer <token>`, plus `x-wyrd-workload-uid`
+   * when the client runs as a workload root. The token is read per request,
+   * so a long-lived client keeps working after any one token expires.
    *
    * @returns The authenticating `fetch`; a request rejects with the client's
    * {@link WyrdError} when the credential is missing or refused.
@@ -1632,6 +1665,8 @@ export class WyrdClient {
       const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
       for (const name of ["authorization", "x-api-key", "x-goog-api-key"]) headers.delete(name);
       headers.set("x-wyrd-access-token", `Bearer ${await this.accessToken()}`);
+      const workloadUid = this.workloadUid;
+      if (workloadUid !== undefined) headers.set("x-wyrd-workload-uid", workloadUid);
       return fetch(input, { ...init, headers });
     };
   }

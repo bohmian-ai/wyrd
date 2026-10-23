@@ -34,6 +34,7 @@ use reqwest::header::{HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
+use wyrd_spec::auth::WORKLOAD_UID_HEADER;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::operator_connection::HttpsOrigin;
 use wyrd_spec::request_id::RequestId;
@@ -276,6 +277,13 @@ impl HttpTransport {
         O: Future<Output = Result<T, E>>,
     {
         custom_headers.insert(access_token_header(), self.bearer_header(false).await?);
+        if let Some(uid) = self.auth.workload_uid() {
+            custom_headers.insert(
+                HeaderName::from_static(WORKLOAD_UID_HEADER),
+                HeaderValue::from_str(uid.as_str())
+                    .map_err(|error| AuthenticatedReplayError::header(&error))?,
+            );
+        }
         if let Entry::Vacant(slot) = custom_headers.entry(request_id_header()) {
             slot.insert(
                 HeaderValue::from_str(&self.auth.request_id(None))
@@ -842,9 +850,10 @@ impl HttpTransport {
 
     /// Start a request to `url`, already resolved by
     /// [`Self::authenticated_url`], carrying `bearer` as
-    /// `x-wyrd-access-token`, `request_id` as `wyrd-request-id`, and the
-    /// caller's trace context from [`trace::outbound`] as `traceparent` and,
-    /// when non-empty, `tracestate`.
+    /// `x-wyrd-access-token`, `request_id` as `wyrd-request-id`, the
+    /// middleware's workload root, when it has one, as [`WORKLOAD_UID_HEADER`],
+    /// and the caller's trace context from [`trace::outbound`] as
+    /// `traceparent` and, when non-empty, `tracestate`.
     ///
     /// Every authenticated helper starts its requests here, so each request,
     /// including each retry attempt, carries the same headers.
@@ -860,6 +869,10 @@ impl HttpTransport {
             .request(method, url)
             .header(HEADER_WYRD_ACCESS_TOKEN, format!("Bearer {bearer}"))
             .header(HEADER_REQUEST_ID, request_id);
+        let request = match self.auth.workload_uid() {
+            Some(uid) => request.header(WORKLOAD_UID_HEADER, uid.as_str()),
+            None => request,
+        };
         trace::headers()
             .into_iter()
             .fold(request, |request, (name, value)| {

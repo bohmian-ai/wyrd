@@ -28,7 +28,8 @@ class HttpAuth(httpx.Auth, httpx2.Auth):
     either. Each request drops the provider key headers and carries
     ``X-Wyrd-Access-Token: Bearer <token>`` from ``client.access_token()``,
     asked for on that request, so a long-lived client keeps working after any
-    one access token expires. Obtain one from ``WyrdClient.http_auth``.
+    one access token expires, and ``x-wyrd-workload-uid`` when the client runs
+    as a workload root. Obtain one from ``WyrdClient.http_auth``.
     """
 
     def __init__(self, client: WyrdClient) -> None:
@@ -48,7 +49,7 @@ class HttpAuth(httpx.Auth, httpx2.Auth):
         Args:
             request: The outgoing ``httpx`` or ``httpx2`` request.
         """
-        _authenticate(request, self._client.access_token())
+        _authenticate(request, self._client.access_token(), self._client.workload_uid)
         yield request
 
     auth_flow = sync_auth_flow
@@ -61,11 +62,15 @@ class HttpAuth(httpx.Auth, httpx2.Auth):
         Args:
             request: The outgoing ``httpx`` or ``httpx2`` request.
         """
-        _authenticate(request, await asyncio.to_thread(self._client.access_token))
+        _authenticate(
+            request, await asyncio.to_thread(self._client.access_token), self._client.workload_uid
+        )
         yield request
 
 
-def _authenticate(request, token: str) -> None:
+def _authenticate(request, token: str, workload_uid: str | None) -> None:
     for name in _PROVIDER_KEY_HEADERS:
         request.headers.pop(name, None)
     request.headers["X-Wyrd-Access-Token"] = f"Bearer {token}"
+    if workload_uid is not None:
+        request.headers["x-wyrd-workload-uid"] = workload_uid

@@ -763,6 +763,18 @@ export declare class NativeWyrdClient {
    */
   onBehalfOf(subjectToken: string, audience: string): Promise<NativeWyrdClientResult>
   /**
+   * Returns the exact Service or Agent Card UID this client runs as, or
+   * `null` for rootless work.
+   */
+  get workloadUid(): string | null
+  /**
+   * Returns a client that runs as the exact Service or Agent root
+   * `workload_uid`, sharing this client's credential and connection pools
+   * but not its token cache. Performs no IO; a `workload_uid` that is not a
+   * UUIDv7 is a `WYRD_SPEC_400_VALIDATION` result.
+   */
+  forWorkload(workloadUid: string): NativeWyrdClientResult
+  /**
    * Connects one Bifrost client over this client's authentication and
    * transport, optionally already bound to a write target.
    *
@@ -1010,7 +1022,7 @@ export declare class NativeWyrdState {
  * metadata, including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server
  * has saved logins but none for `WYRD_TENANT`.
  */
-export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): NativeWyrdClientResult
+export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, workloadUid?: string | undefined | null): NativeWyrdClientResult
 
 /** Closed result of reading one client's current bearer: a token or a catalog error. */
 export interface NativeAccessTokenResult {

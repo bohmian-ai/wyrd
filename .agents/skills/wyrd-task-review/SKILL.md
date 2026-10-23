@@ -1,6 +1,6 @@
 ---
 name: wyrd-task-review
-description: Review one immutable cumulative Wyrd task through independent implementation, system-resilience, standards, and domain audits, source validation, and root-cause remediation.
+description: Review an immutable Wyrd task with adversarial discovery, independent source validation, materiality checks, and focused remediation review. Add specialists for affected boundaries.
 ---
 
 # Wyrd Task Review
@@ -24,15 +24,28 @@ An invalid private task instruction routes to task correction through
 `SPEC_REVISION_REQUIRED`. Do not strengthen replacement machinery merely
 because the task prescribed it.
 
-Keep the reviewed source immutable. Review the complete base-to-candidate range,
-not the implementation summary or only the latest fix diff. After remediation,
-include the original task, prior verdict and findings, remediation task, and
-cumulative candidate.
+Keep the reviewed source immutable. The first review covers the complete
+base-to-candidate range, not the implementation summary. After remediation,
+retain the original task, prior verdict and findings, remediation task, prior
+candidate, and cumulative candidate as the acceptance context.
 
-On a remediation round, use the latest fix diff to locate changed owners and
-check closure of prior findings, while retaining the complete cumulative
-acceptance audit. A previously closed finding stays closed only with source
-evidence. Do not rediscover the same defect one caller at a time.
+On a remediation round, review prior-finding closure, the diff from the prior
+candidate to the new candidate, and affected callers, consumers, invariants,
+and tests. Carry
+forward source-backed acceptance and closure evidence for unchanged behavior;
+check whether changed dependencies or authority invalidate it. Reopen an
+unchanged area only when new evidence establishes a material defect or a fix
+can affect its accepted behavior. Record that reason and the expanded scope.
+If prior coverage or evidence is missing, inspect the specific gap. Do not
+restart discovery across the whole task merely because another round began,
+or rediscover the same defect one caller at a time.
+
+After two unsuccessful remediation reviews, include a brief convergence
+assessment in the verdict before prescribing another round. Distinguish
+incomplete fixes, fix-induced regressions, missed original defects, and
+expanding expectations; identify their causes and the next bounded review
+scope. Reject scope expansion and consolidate shared causes. This is a
+calibration step, not an automatic PASS, round limit, or new approval gate.
 
 ## Establish the subject
 
@@ -45,9 +58,10 @@ Read `AGENTS.md`, the nested `AGENTS.md` files for every directory the diff touc
 [maintainer style](../../../agent_docs/maintainer-style.md),
 and only the architecture and testing references applicable to the task. Follow
 CodeGraph instructions. Build a compact navigation map of changed symbols,
-owners, likely callers and consumers, and relevant tests, and select the
-required `domain-rev` agents. Give every reviewer the same map as a starting
-point, not as complete coverage or a conclusion; reviewers must expand and
+owners, likely callers and consumers, and relevant tests. Record the round's
+review scope, carried-forward evidence, and specialist selection with reasons.
+Give every reviewer the same map as a starting point, not as complete coverage
+or a conclusion; reviewers must expand and
 verify it against source. Use existing repository navigation tools. Do not add
 a path or symbol script solely for this review.
 
@@ -57,8 +71,12 @@ prior attempt. Assign every reviewer its exact report path in that directory.
 
 The review directory holds reports only. Never write a diff, patch, or source archive into it:
 the base and candidate commits recorded in the review identify the subject, and
-every reviewer reads the range itself with `git diff <base>...<candidate>`
-(an external repository at its recorded commits).
+reviewers read the recorded range directly from Git. Use
+`git diff <base>...<candidate>` for the first review and
+`git diff <prior-candidate> <candidate>` for remediation, with the cumulative
+range available for context (an external repository at its recorded commits).
+If rebasing changes ancestry, establish patch correspondence before carrying
+forward evidence; inspect any differences that affect the reviewed behavior.
 
 ## Required agent topology
 
@@ -67,55 +85,97 @@ use the harness's agent-delegation capability to spawn separate fresh subagents;
 simulating multiple reviewer roles in one context does not satisfy this skill.
 No agent may fill more than one role.
 
-Run independent discovery, conditional follow-up, and validation:
+Select reviewers for the round's affected boundaries:
 
-1. **Independent discovery, in parallel:** always spawn two task implementation
-   reviewers (`behavior-rev` and `invariant-rev`), a repository-standards
-   reviewer (`repo-rev`), a maintainer specialist (`maintainer-rev`), and a
-   system-resilience reviewer (`system-rev`). Also spawn one domain reviewer
-   (`domain-rev`) for each materially changed sensitive domain, including
-   security/RBAC, tenancy, concurrency, durability, persistent data, or another
-   boundary whose correctness needs domain expertise.
-2. **Compare claims:** after discovery reports are complete, group findings by
-   violated behavior or invariant rather than line number. Agreement is useful
-   corroboration, not proof; unique findings still require validation. If
-   reports materially conflict, reveal an unreviewed reachable path, or repeat
-   remediation suggests a common source the reviewers did not trace, spawn one
-   fresh focused `followup-rev` to investigate only that uncertainty. Record
-   why it was or was not needed.
-3. **Independent validation:** after any follow-up, always spawn one fresh
-   structured Ponytail reviewer (`ponytail-rev`). It validates every proposed
-   finding against source and produces the final finding ledger and
-   decision-complete recommendations, even when the finding union is empty.
+1. **First review:** spawn one fresh `behavior-rev` for comprehensive adversarial
+   discovery. It covers behavior and invariants, applicable repository rules,
+   maintainability, and credible failure/recovery paths. These obligations
+   remain required when no specialist is selected.
+2. **Conditional specialists:** add `invariant-rev` for materially complex shared
+   state or lifecycle behavior, `repo-rev` for broad cross-tier rule coverage,
+   `maintainer-rev` for substantial ownership or abstraction changes, and
+   `system-rev` for material failure-propagation or recovery changes. Spawn a
+   `domain-rev` for each materially changed sensitive boundary requiring domain
+   expertise, such as security/RBAC, tenancy, concurrency, or persistent data.
+   Mere use of an established boundary does not require its own reviewer.
+   Scope specialists to that boundary and run independent discovery in parallel.
+3. **Remediation review:** default to one fresh `ponytail-rev` checking closure,
+   changed code, and affected paths. Add discovery or specialist reviewers only
+   for material changes or unresolved questions in that scope; do not recreate
+   the first round's team automatically.
+4. **Compare claims:** group proposals by violated behavior or invariant, not
+   line number. Agreement is corroboration, not proof. Use one focused
+   `followup-rev` only for a material conflict, an unresolved failing path, or
+   an untraced common cause. A unique finding alone does not require another
+   discovery pass. Record why follow-up was or was not needed.
+5. **Independent validation:** always use a fresh `ponytail-rev`, even when no
+   findings are proposed. It validates source, materiality, correction burden,
+   and closure, and produces the final ledger and recommendations. If it
+   discovers a new blocker itself, obtain separate focused source validation
+   before retaining it; no reviewer validates its own new finding.
 
-Discovery reviewers receive the immutable subject and inputs needed for their
-own scope, but not another reviewer's conclusions or an intended verdict. The
-`followup-rev`, when needed, receives the conflicting claims and source paths,
-without an intended verdict. The `ponytail-rev` receives the complete diff,
-applicable authorities, and every discovery and follow-up report. The
-orchestrator establishes the subject, routes inputs, compares claims, checks
-report completeness, and writes final artifacts from the validated ledger; it
-does not validate its own findings. If a required agent or report is missing,
-or the candidate changes during review, return `BLOCKED`.
+Discovery reviewers receive the immutable subject, assigned scope, and inputs
+needed for that scope, but not another reviewer's conclusions or an intended
+verdict. The `followup-rev` receives the specific uncertainty and source paths.
+The `ponytail-rev` receives applicable authorities, relevant diffs, prior
+acceptance/closure evidence, and every selected discovery and follow-up report,
+without an intended verdict. Full cumulative context remains available to all.
+The orchestrator routes inputs, records coverage and reviewer selection,
+compares claims, and writes artifacts from the validated ledger; it does not
+validate its own findings. A missing selected reviewer/report or a changed
+candidate returns `BLOCKED`; an unselected specialist requires no report.
+
+## Materiality and correction burden
+
+Apply this threshold to every role and every round. A blocker must identify an
+explicit approved obligation or a supported-use regression, a source-proven
+failing scenario, and a meaningful consequence. Explain why the scenario
+matters for supported use or a required boundary. Reachability, schema
+acceptance, and the existence of a conceivable input do not alone establish
+materiality. Broad promises such as “complete” or “all states” do not authorize
+unbounded hardening. An unusual input still blocks when it violates an explicit
+acceptance obligation or exposes a material security, tenancy, integrity,
+availability, accessibility, durability, or public-contract failure. Preserve
+mandatory repository gates, including changed-item rustdoc; do not waive them
+as low probability or inconvenient.
+
+For DRIFT, identify concretely unearned machinery and the deletion or existing
+owner that preserves the task. A different conventional implementation, a
+line-count preference, or a cheaper-looking alternative is not enough.
+Placement, naming, structure, and wording without a material consequence or an
+explicit mandatory gate remain non-blocking. Record genuine minor observations
+separately; omit optional improvements and speculative hardening.
+
+Challenge the correction as hard as the defect. Explain its implementation and
+maintenance burden and why deletion, reuse, or a smaller local correction is
+insufficient. If a marginal case would require substantial machinery, recheck
+its materiality and authority before retaining it. Do not use cost to waive a
+required safety boundary or explicit obligation; route a genuinely new material
+decision to specification revision. A rejected proposal creates no remediation
+work, and review does not need to exhaust every conceivable input to PASS.
 
 ## Independent task implementation reviews (`behavior-rev`, `invariant-rev`)
 
-Both reviewers must be fresh relative to implementation and independent of each
-other. Give each the original specification and task, actual cumulative diff,
-relevant repository rules, and available verification results—not the
-implementation agent's completion summary or an intended verdict. Both review
-the full task and candidate; their lenses guide investigation, not scope.
+Every selected discovery reviewer must be fresh relative to implementation
+and independent of the other reviewers. Give each the original specification
+and task, assigned review scope and actual diffs, relevant repository rules,
+and available verification results—not the implementation agent's completion
+summary or an intended verdict. The first behavior review covers the full task;
+remediation and specialists follow the recorded scope.
 
 Start unconvinced. The candidate earns acceptance through repository, diff, and
 verification evidence; intent, summaries, plausible code, and green checks
-alone do not establish completion. Try to falsify every acceptance criterion,
-constraint, non-goal, and claimed regression boundary through a realistic
-reachable path.
+alone do not establish completion. Within the assigned scope, try to falsify
+each acceptance criterion, constraint, non-goal, and claimed regression boundary
+through a realistic reachable path. Stop when credible acceptance evidence and
+material findings have been resolved; no finding quota or exhaustive input
+search is required.
 
 The `behavior-rev` follows realistic caller-to-result paths and challenges
 acceptance criteria, negative flows, and regression boundaries. The
 `invariant-rev` follows values and state from producer to sink across shared
-owners, sibling consumers, lifecycle transitions, and failure paths. Both trace
+owners, sibling consumers, lifecycle transitions, and failure paths. Without
+an invariant specialist, behavior-rev covers these paths too. Both trace
 a failure at a consumer back to its producer before locating the defect. On a
 repeat review, use prior findings as hypotheses: determine whether apparently
 separate failures share the same source, including one introduced by an earlier
@@ -128,12 +188,12 @@ standard-library, native-platform, or installed-dependency behavior before
 accepting new code. Require the smallest safe root-cause correction without
 weakening validation, error handling, security, accessibility, or durability.
 
-Reject unearned complexity. Where a standard and conventional way exists (a
-published standard such as an RFC, or the established practice of comparable
-widely used projects), the candidate must use it. Classify any mechanism,
-state, check, file, setting, option, or error beyond that standard as `DRIFT`
-unless approved authority explicitly requires it. Never require one in a
-finding or remediation; a correction follows the standard way too.
+Reject unearned complexity. Follow applicable published standards and prefer
+established repository and conventional mechanisms. Report additional machinery
+as `DRIFT` when it duplicates an existing owner or serves no approved outcome;
+show what can be removed while preserving required behavior. A departure from
+a common implementation is not itself a defect. Never prescribe speculative
+machinery in a finding or remediation.
 
 Treat each failure diagnosis in the task evidence as a claim to falsify: the
 recorded cause must explain the trace, and the fix must sit at that cause. A
@@ -167,29 +227,29 @@ Inspect specifically for:
 Do not report optional improvements, speculative hardening, preferences,
 unrelated pre-existing debt, or refactors not required by the task.
 
-A finding blocks only when it has a behavioral, security, tenancy,
-durability, or public-contract consequence, or when it deletes unearned code.
-Placement, naming, structure, and wording findings with no such consequence
-are non-blocking even when a style rule can be cited; record them under
-non-blocking notes and never let them alone produce `FIX_REQUIRED`. Missing
-rustdoc on a changed item stays blocking per `AGENTS.md`. Tests prove
+Apply the materiality and correction-burden threshold above. Tests prove
 behavior; they do not prove that the requested behavior was built. Rely on
-repository source and the diff, not agent summaries.
+repository source and the diff, not agent summaries. Carry forward unaffected
+acceptance-matrix rows with their prior evidence references; update rows whose
+behavior, dependencies, governing authority, or proof changed.
 
 Each reviewer returns its own `task-review-behavior.md` or
 `task-review-invariants.md` with the acceptance matrix, proposed findings, and
 one overall `PASS`, `FAIL`, or `BLOCKED` result. Each finding needs a
 source-local ID, classification, violated obligation, exact location, evidence,
-observable consequence, and required testable correction. For `DRIFT`, identify
-what can be deleted or which existing or native mechanism already covers the
+observable consequence, materiality rationale, and required testable correction.
+For `DRIFT`, identify what can be deleted or which existing or native mechanism already covers the
 outcome. Do not treat matching findings as automatically true or discard a
 finding because only one reviewer reported it.
 
 ## Independent repository standards review (`repo-rev`)
 
-Give the repository-standards specialist the immutable subject, complete diff,
-repository root, and available verification results. Do not provide either task
-reviewer's conclusions or an intended verdict.
+Use this specialist only when selected under the topology above. Inspect its
+assigned scope with cumulative context available; report coverage of that scope.
+
+Give the repository-standards specialist the immutable subject, scoped diff,
+repository root, and available verification results. Do not provide other
+reviewers' conclusions or an intended verdict.
 
 The specialist reads `AGENTS.md`, every nested `AGENTS.md` the diff touches,
 the applicable `agent_docs/` topic guides, and the owning sections of the
@@ -221,13 +281,17 @@ the review. Preserve its report as `standards-review.md`.
 
 ## Independent maintainer review (`maintainer-rev`)
 
-Give the specialist the immutable subject, complete diff, repository root,
+Use this specialist only when selected under the topology above. Inspect its
+assigned scope with cumulative context available; report coverage of that scope.
+
+Give the specialist the immutable subject, scoped diff, repository root,
 [maintainer style](../../../agent_docs/maintainer-style.md),
 applicable Wyrd authority, and available verification results. Do not provide
 other reviewers' conclusions or an intended verdict.
 
-The specialist reads each materially changed symbol in its owning module,
-traces its callers and relevant tests, and reviews layout, owner and method
+The specialist reads each materially changed symbol in its assigned scope and
+owning module, traces its callers and relevant tests, and reviews layout, owner
+and method
 shape, naming, argument and return types, test clarity, documentation, and
 generated declaration parity. It asks whether a maintainer
 can find, follow, and safely change the behavior. It applies the guide under
@@ -243,7 +307,10 @@ coverage blocks this review.
 
 ## Independent system-resilience review (`system-rev`)
 
-Give this specialist the immutable subject, complete diff, deployment and
+Use this specialist only when selected under the topology above. Inspect its
+assigned scope with cumulative context available; report coverage of that scope.
+
+Give this specialist the immutable subject, scoped diff, deployment and
 process topology from applicable architecture and source, and available
 verification results. Do not provide other reviewers' conclusions or an
 intended verdict. Its starting premise is that processes crash, dependencies
@@ -303,11 +370,16 @@ predetermined count or obtain agreement.
 
 ## Structured Ponytail validation (`ponytail-rev`)
 
-Always spawn a fresh `ponytail-rev` after discovery and any follow-up are
-complete, even when their proposed finding union is empty. Give it the
-immutable subject, applicable authorities, complete diff, both task-review
-reports, `standards-review.md`, `maintainer-review.md`, `system-review.md`, every
-`domain-review-<domain>.md`, and any `followup-review.md`, but no intended verdict.
+Always spawn a fresh `ponytail-rev` after any selected discovery and follow-up
+are complete, even when their proposed finding union is empty. Give it the
+immutable subject, applicable authorities, round scope and relevant diffs,
+all selected reviewer reports, prior verdicts and acceptance/closure evidence,
+and remediation tasks, but no intended verdict. On remediation it independently
+checks the fix and affected paths rather than merely accepting claimed closure;
+unaffected evidence carries forward under the scope rules above. Check that
+selected and carried-forward evidence cover the applicable acceptance and
+repository obligations, including when the proposed finding union is empty.
+Investigate a specific missing proof; do not repeat comprehensive discovery.
 
 The `ponytail-rev` independently inspects the actual source, validates every
 proposed finding and correction, including claims from only one reviewer. It
@@ -332,9 +404,10 @@ accessibility, durability, or another explicit requirement. For each proposed
 finding the `ponytail-rev` must:
 
 1. trace the failing state from its producer to the observed consumer,
-   including every caller, sibling consumer and writer of the same durable
-   authority, and existing helper; read the full body of each function the
-   correction would change or move;
+   including affected callers, sibling consumers and writers of the same
+   authority, and existing helpers; read the full body of each function the
+   correction would change or move. Expand tracing where shared state or
+   authority can propagate the defect, rather than inventorying unrelated code;
 2. prove the reported path is reachable and required by the approved task,
    rejecting dormant, test-only, speculative, or zero-caller surfaces unless
    the task explicitly requires them;
@@ -344,7 +417,8 @@ finding the `ponytail-rev` must:
    availability;
 4. ask whether the finding or remediation can be deleted, whether existing
    behavior already satisfies the task, and whether the proposed proof is the
-   smallest credible check without a new dependency or test harness;
+   smallest credible check without a new dependency or test harness; assess
+   materiality and implementation/maintenance burden before retaining either;
 5. compare prior findings and remediations for a shared source, consolidating
    related failures into one correction when the same invariant owns them; and
 6. return `CONFIRMED`, `REVISED`, or `REJECTED` with source evidence and the
@@ -354,8 +428,8 @@ finding the `ponytail-rev` must:
 The final deduplicated ledger records each retained finding's stable
 `FIND-<task>-<n>` ID, discovery source IDs, `CONFIRMED` or `REVISED` status,
 classification, violated obligation, exact location, evidence, observable
-consequence, decision-complete correction, and focused closure proof. Preserve
-prior `FIND-*` IDs during remediation and assign the next unused number only to
+consequence, materiality rationale, correction burden, decision-complete
+correction, and focused closure proof. Preserve prior `FIND-*` IDs during remediation and assign the next unused number only to
 new findings. Each correction selects the smallest safe approach, names the
 existing owner or mechanism to reuse, and preserves adjacent behavior. When
 discovery proposed no findings, return an explicitly validated empty ledger.
@@ -378,20 +452,21 @@ blocks the review. Preserve its final ledger and recommendations as
 
 ## Verdict and remediation task
 
-In the established review directory, preserve both task-review reports,
-`standards-review.md`, `maintainer-review.md`, `system-review.md`, every
-`domain-review-<domain>.md`,
-any `followup-review.md`, and `findings-validation.md`, then write `verdict.md`
-containing the immutable subject, reconciled acceptance matrix, independent
-review results, the follow-up decision, validated finding ledger, verification
-limits, prior-finding closure, and one verdict:
+In the established review directory, preserve the selected reviewers' reports
+and `findings-validation.md`, then write `verdict.md` containing the immutable
+subject, round scope and carried-forward evidence, reviewer selection and
+coverage, reconciled acceptance matrix, independent review results, follow-up
+decision, validated finding ledger, verification limits, prior-finding closure,
+any required convergence assessment, and one verdict:
 
 - `PASS` — all required reports are complete, the independently validated ledger
   is empty, every obligation passes after reconciling proposed findings with
-  source, non-goals remain excluded, verification is credible, and no unrelated
-  change entered the diff. A rejected proposal does not force failure merely
-  because its discovery reviewer reported `FAIL`;
-- `FIX_REQUIRED` — one or more bounded implementation findings remain;
+  source or carried-forward evidence, non-goals remain excluded, verification
+  is credible, and no unrelated change entered the diff. Exhaustive edge-case
+  discovery is not a PASS condition. A rejected proposal does not force failure
+  merely because its discovery reviewer reported `FAIL`;
+- `FIX_REQUIRED` — one or more independently validated material implementation
+  findings or explicit mandatory-gate violations remain;
 - `SPEC_REVISION_REQUIRED` — correction requires changing approved behavior or
   an expensive-to-reverse decision; or
 - `BLOCKED` — the immutable subject, authority, diff, or required independent
@@ -403,13 +478,14 @@ For `FIX_REQUIRED`, also write one self-contained remediation task named
 1. the approved spec path, original task path, and candidate identities;
 2. an issue diagnosis for each material finding: the violated obligation,
    current behavior, exact evidence, observable consequence, and why the
-   candidate or its existing proof falls short;
+   candidate or its existing proof falls short, including materiality;
 3. the intended correction outcome;
 4. a decision-complete recommendation within the approved behavior: select the
    minimal correction approach, name the existing owner or mechanism to reuse,
    identify the source of the invalid state and affected consumers, resolve
    alternatives that would change scope or proof, and explain why that approach
-   closes the diagnosed gap without relying on repeated downstream guards;
+   closes the diagnosed gap without relying on repeated downstream guards,
+   with the correction burden justified against smaller alternatives;
 5. constraints, preserved behavior, and explicit non-goals;
 6. acceptance criteria mapped to every finding; and
 7. focused proof that directly exercises the gap plus only the narrowest
@@ -433,8 +509,9 @@ cross-service, concurrency-semantics, or persistent-data decision, return
 The remediation task packages validated findings for a fresh implementation
 agent; it is not another design plan. Do not specify helpers, private methods,
 local control flow, fixture structure, or optional improvements. Route it
-directly to `$wyrd-implement`. A later review reassesses the complete cumulative
-candidate against the original task.
+directly to `$wyrd-implement`. A later review checks closure and affected paths
+under the remediation scope rules, retaining the original task and cumulative
+candidate as acceptance context.
 
 Return only the verdict, verdict path, remediation task path when present, and
 finding IDs. `PASS` is the task's completion gate. Review does not implement,

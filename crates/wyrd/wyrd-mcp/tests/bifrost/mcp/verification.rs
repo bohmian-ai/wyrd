@@ -22,8 +22,8 @@
 /// The Postgres-backed half of the verification journey.
 mod pg_tests {
     use crate::connectivity::{
-        McpJourneyError, client, discover, problem, refusal, structured, transport,
-        transport_with_headers,
+        McpJourneyError, client, client_transport, discover, problem, refusal, structured,
+        transport,
     };
 
     use std::collections::BTreeSet;
@@ -484,6 +484,44 @@ mod pg_tests {
         )
     }
 
+    /// The first-party client for a family runtime account, bound to the root
+    /// its registered Card names, since owned work needs that root selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `principal` names no Card uid or the client cannot
+    /// be constructed.
+    fn rooted_client(
+        server: &WyrdTestServer,
+        principal: &Bootstrap,
+    ) -> Result<wyrd_client::WyrdClient, McpJourneyError> {
+        let root = principal
+            .card_ref()
+            .and_then(|card| card.uid.clone())
+            .ok_or("a family runtime account names its registered root")?;
+        Ok(client(server, api_key(principal)?)?.for_workload(root))
+    }
+
+    /// Connect an MCP client as a family runtime account at its root.
+    ///
+    /// # Errors
+    ///
+    /// Returns client construction or MCP handshake failures.
+    async fn connect_rooted(
+        server: &WyrdTestServer,
+        principal: &Bootstrap,
+    ) -> Result<RunningService<RoleClient, ()>, McpJourneyError> {
+        let base_url = server
+            .base_url()
+            .ok_or("journey requires a bound test server")?;
+        Ok(()
+            .serve_with_lifecycle(
+                client_transport(base_url, &rooted_client(server, principal)?, []),
+                discover(),
+            )
+            .await?)
+    }
+
     /// Render a refused tool call, whether `rmcp` returned a transport error
     /// or a tool result carrying a problem.
     ///
@@ -531,7 +569,7 @@ mod pg_tests {
         let writer = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let writer_client = connect(&server, &writer).await?;
+        let writer_client = connect_rooted(&server, &writer).await?;
         let tools = writer_client.list_all_tools().await?;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         for tool in [CARDS_GET, GET_BINDING, GET_EXECUTION]
@@ -727,7 +765,7 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let agent_client = connect(&server, &agent).await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
         let verifier = structured(
             agent_client
                 .call_tool(call(
@@ -900,7 +938,7 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let agent_client = connect(&server, &agent).await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
         let tools = agent_client.list_all_tools().await?;
         for tool in [EXECUTE, ENQUEUE, GET_EXECUTION, QUERY] {
             assert!(
@@ -1044,7 +1082,7 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let agent_client = connect(&server, &agent).await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
         for (answer, verdict) in [(PASSING_ANSWER, "passed"), (FAILING_ANSWER, "failed")] {
             let judged = structured(
                 agent_client
@@ -1233,7 +1271,7 @@ mod pg_tests {
     /// Panics when the verdict is not `passed`.
     async fn execute_traced(
         server: &WyrdTestServer,
-        credential: ResolvedCredential,
+        caller: &wyrd_client::WyrdClient,
         request: &JsonValue,
         headers: [(&'static str, &str); 2],
     ) -> Result<(), McpJourneyError> {
@@ -1241,12 +1279,12 @@ mod pg_tests {
             .into_iter()
             .map(|(name, value)| Ok((http::HeaderName::from_static(name), value.parse()?)))
             .collect::<Result<Vec<_>, McpJourneyError>>()?;
-        let agent = ()
-            .serve_with_lifecycle(
-                transport_with_headers(server, credential, headers)?,
-                discover(),
-            )
-            .await?;
+        let base_url = server
+            .base_url()
+            .ok_or("journey requires a bound test server")?;
+        let agent =
+            ().serve_with_lifecycle(client_transport(base_url, caller, headers), discover())
+                .await?;
         let judged = structured(agent.call_tool(call(EXECUTE, request.clone())?).await?)?;
         assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
         agent.cancel().await?;
@@ -1279,42 +1317,48 @@ mod pg_tests {
         let (_telemetry, traces) =
             wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())?;
         let (server, _judge, agent, request) = judging_server().await?;
-        let credential = api_key(&agent)?;
+        let caller = rooted_client(&server, &agent)?;
         let actor = server
             .bootstrap_service("mcp-traced-actor", &["editor", "mcp_judge_invoker"])
             .await?;
-        let jwt = async |principal: &Bootstrap| -> Result<String, McpJourneyError> {
-            let key = principal
+        let key = |principal: &Bootstrap| {
+            principal
                 .api_key()
-                .ok_or("a service bootstraps with a machine key")?;
-            Ok(server.exchange_api_key(key).await?)
+                .cloned()
+                .ok_or("a service bootstraps with a machine key")
         };
+        // The subject is A's family runtime account at A's root; the actor is
+        // an unrestricted account acting rootless.
+        let root = agent
+            .card_ref()
+            .and_then(|card| card.uid.clone())
+            .ok_or("a family runtime account names its registered root")?;
+        let subject_jwt = server
+            .exchange_api_key_for_workload(&key(&agent)?, &root)
+            .await?;
+        let actor_jwt = server.exchange_api_key(&key(&actor)?).await?;
         let delegated = server
-            .delegate(
-                &jwt(&agent).await?,
-                &jwt(&actor).await?,
-                TokenAudience::Wyrd,
-            )
+            .delegate(&subject_jwt, &actor_jwt, TokenAudience::Wyrd)
             .await?;
         let checkpoint = traces.checkpoint();
         let parent = format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01");
         execute_traced(
             &server,
-            credential.clone(),
+            &caller,
             &request,
             [("traceparent", &parent), ("tracestate", "wyrd=caller")],
         )
         .await?;
         execute_traced(
             &server,
-            credential,
+            &caller,
             &request,
             [("traceparent", "00-not-a-trace-01"), ("tracestate", "@@")],
         )
         .await?;
         execute_traced(
             &server,
-            ResolvedCredential::BearerToken(delegated.into()),
+            &client(&server, ResolvedCredential::BearerToken(delegated.into()))?,
             &request,
             [
                 (
@@ -1583,7 +1627,7 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&receipt.root, &["editor"])
             .await?;
-        let agent_client = connect(&server, &agent).await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
 
         // Discover: the Service's Card names the binding whose status pins group_end.
         let binding_id = &group_binding(&agent_client, &service_uid).await?;
@@ -1883,8 +1927,8 @@ mod pg_tests {
                 .await?;
             agents.push((
                 FrameAgent {
-                    client: connect(&server, &principal).await?,
-                    http: client(&server, api_key(&principal)?)?,
+                    client: connect_rooted(&server, &principal).await?,
+                    http: rooted_client(&server, &principal)?,
                     base_url: server
                         .base_url()
                         .ok_or("a bound server has a URL")?
@@ -2059,7 +2103,7 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let agent_client = connect(&server, &agent).await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
         let offered = agent_client.list_all_tools().await?;
         for tool in [EXECUTE, ENQUEUE] {
             assert!(

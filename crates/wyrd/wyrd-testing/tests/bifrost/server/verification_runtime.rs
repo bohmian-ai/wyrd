@@ -202,7 +202,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
         .await?;
     // Activation arms the cursor at the next hour's boundary; the occurrence
     // is brought due in the database, which owns the schedule clock.
-    seed.activate(owner_principal).await?;
+    seed.activate(owner_principal, &owner).await?;
     seed.make_binding_due(binding).await?;
     let script = EngineScript::default();
     script.push(EngineOutcome::Completed(drift_outcome(Some(
@@ -333,7 +333,7 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
     let binding = seed
         .bind_schedule(&owner, &subject, &verifier, MONTHLY, Vec::new())
         .await?;
-    seed.activate(owner_principal).await?;
+    seed.activate(owner_principal, &owner).await?;
     seed.make_binding_due(binding).await?;
     // The runner node hosts no Oracle, so the peer that serves the read
     // stages its decision; the cluster barrier drains every Oracle first.
@@ -424,15 +424,23 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         .find(|server| server.bifrost_scribe().is_some())
         .ok_or("the cluster composed no Scribe")?;
     let seed = VerificationFixture::provision(oracle.state().postgres.wyrd(), tenant).await?;
+    let subject_ref = scribe
+        .bootstrap_service_in_tenant(tenant, "shared-subject", &[])
+        .await?
+        .card_ref()
+        .ok_or("a service bootstrap returned a user")?
+        .clone();
+    // The family's runtime account owns the scheduled bindings and writes the
+    // observations at the subject root.
     let Bootstrap::Machine {
         id: client,
         api_key,
-        card_ref: subject_ref,
+        ..
     } = scribe
-        .bootstrap_service_in_tenant(tenant, "shared-subject", &["admin"])
+        .credential_registered_service(&subject_ref, &["admin"])
         .await?
     else {
-        return Err("a service bootstrap returned a user".into());
+        return Err("a service credential returned a user".into());
     };
     let subject = subject_ref
         .uid
@@ -460,7 +468,8 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         scribe.base_url(),
         Some(api_key.expose_secret()),
         scribe.grpc_url().as_deref(),
-    )?;
+    )?
+    .for_workload(subject.clone());
     Bifrost::connect_with(&writer, BifrostOptions::default())
         .await?
         .write_batch(
@@ -468,7 +477,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
             &observation_batch(&record, &subject, observed_in_current_month(Utc::now())?)?,
         )
         .await?;
-    seed.activate(client).await?;
+    seed.activate(client, &subject).await?;
     for (_, binding) in &bindings {
         seed.make_binding_due(*binding).await?;
     }
@@ -3010,7 +3019,7 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
     let binding = seed
         .bind_schedule(&owner, &subject, &verifier, MONTHLY, Vec::new())
         .await?;
-    seed.activate(owner_principal).await?;
+    seed.activate(owner_principal, &owner).await?;
     seed.make_binding_due(binding).await?;
 
     let runtime = VerificationRuntime::builder(server.state())

@@ -74,6 +74,8 @@ fn journey_delegation_chain() -> Vec<wyrd_runtime::DelegationStep> {
             principal: wyrd_runtime::PrincipalRef {
                 id: PrincipalId::new(id),
                 kind: PrincipalKind::User,
+                workload_uid: None,
+                credential_id: None,
             },
         })
         .collect()

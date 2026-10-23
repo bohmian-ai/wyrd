@@ -49,9 +49,9 @@ impl BifrostWriter {
     /// [`WyrdClient`] built from it stays reachable through [`Self::client`] so
     /// a journey reads back through the same credential it wrote with.
     ///
-    /// `card_ref` is the Card the credential was minted against; every row this
-    /// writer enqueues is correlated to its UID, which is what the ingest route
-    /// admits.
+    /// `card_ref` is the Card this writer acts as: when it carries a UID the
+    /// client selects it as the exact workload root, and every row this writer
+    /// enqueues is correlated to that UID.
     ///
     /// # Errors
     ///
@@ -63,6 +63,10 @@ impl BifrostWriter {
     pub async fn connect(config: ClientConfig, card_ref: CardRef) -> Result<Self, WyrdError> {
         let client =
             WyrdClient::with_config(config).map_err(|error| harness_error(&error.to_string()))?;
+        let client = match &card_ref.uid {
+            Some(uid) => client.for_workload(uid.clone()),
+            None => client,
+        };
         let handle = Bifrost::connect_with(
             &client,
             BifrostOptions {

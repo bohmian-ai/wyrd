@@ -57,6 +57,8 @@ pub struct Deployment {
     server: WyrdTestServer,
     /// Key of the tenant administrator the deployment bootstraps.
     admin_key: String,
+    /// The administrator's own fixture Service root.
+    admin_root: CardRef,
 }
 
 impl Deployment {
@@ -74,13 +76,19 @@ impl Deployment {
     /// Panics when the server cannot start or bootstrap its administrator.
     pub async fn start_with(builder: WyrdTestServerBuilder) -> Self {
         let server = builder.start_bound().await.expect("test server starts");
-        let admin_key = api_key(
-            server
-                .bootstrap_service("journey_admin", &["admin"])
-                .await
-                .expect("administrator bootstraps"),
-        );
-        Self { server, admin_key }
+        let admin = server
+            .bootstrap_service("journey_admin", &["admin"])
+            .await
+            .expect("administrator bootstraps");
+        let admin_root = admin
+            .card_ref()
+            .expect("a bootstrapped Service has a root")
+            .clone();
+        Self {
+            server,
+            admin_key: api_key(admin),
+            admin_root,
+        }
     }
 
     /// The server, for its address and its documented test controls.
@@ -119,6 +127,21 @@ impl Deployment {
     /// A client of this deployment's administrator.
     pub fn admin(&self) -> WyrdClient {
         self.client(&self.admin_key)
+    }
+
+    /// A client that authenticates with `key` and runs as the exact
+    /// registered root `root`, as a delegating actor must.
+    ///
+    /// # Panics
+    /// Panics when the client cannot be assembled or `root` carries no uid.
+    pub fn rooted(&self, key: &str, root: &CardRef) -> WyrdClient {
+        self.client(key)
+            .for_workload(root.uid.clone().expect("a registered root carries a uid"))
+    }
+
+    /// The administrator's client run as its own fixture Service root.
+    pub fn rooted_admin(&self) -> WyrdClient {
+        self.rooted(&self.admin_key, &self.admin_root)
     }
 
     /// The administrator's Cards handle, connected eagerly so the
@@ -227,8 +250,7 @@ impl Deployment {
     /// Panics when the account cannot be provisioned or `card` carries no uid.
     pub async fn service_client(&self, card: &CardRef) -> WyrdClient {
         let (_, key) = runtime_account(&self.admin(), card).await;
-        self.client(&key)
-            .for_workload(card.uid.clone().expect("a registered root carries a uid"))
+        self.rooted(&key, card)
     }
 
     /// Bootstrap an administrator in a new tenant `slug` and return its key.
@@ -448,6 +470,7 @@ impl Deployment {
         Self {
             server,
             admin_key: self.admin_key,
+            admin_root: self.admin_root,
         }
     }
 

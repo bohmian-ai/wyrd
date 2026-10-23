@@ -1249,11 +1249,12 @@ async fn delegated_tools_keep_the_narrower_authority() {
         .expect("the subject's token exchanges");
     let delegated = desk
         .deployment
-        .client(
+        .rooted(
             actor
                 .api_key()
                 .expect("the delegate has a key")
                 .expose_secret(),
+            &desk.root,
         )
         .on_behalf_of(SecretString::from(token), TokenAudience::Wyrd)
         .await

@@ -1428,7 +1428,7 @@ impl NativeBifrostQueryStream {
     /// Drains the whole stream into one bounded `{columns, rows, terminal}` JSON text.
     ///
     /// An omitted ceiling takes the bounded-result default, 1000 rows or 4 MiB;
-    /// a supplied one must lie in the same admitted range the MCP tool enforces
+    /// a supplied one must be an exact integer in the same admitted range the MCP tool enforces
     /// ([`admit_ceilings`]).
     /// The projection is [`JsonResultBuilder`], the same owner the server's MCP
     /// `bifrost.query` tool builds through, so both surfaces return the same
@@ -1444,18 +1444,31 @@ impl NativeBifrostQueryStream {
     #[napi]
     pub async fn collect(
         &self,
-        max_rows: Option<u32>,
-        max_bytes: Option<u32>,
+        max_rows: Option<f64>,
+        max_bytes: Option<f64>,
     ) -> Result<NativeQueryStep> {
         let mut stream_slot = self.stream.lock().await;
         let mut stream = stream_slot
             .take()
             .ok_or_else(|| napi::Error::from_reason("query stream is closed".to_owned()))?;
+        // The stream is already taken, so every refusal below drops and releases it.
+        let (max_rows, max_bytes) = match (
+            max_rows
+                .map(|value| parse_ceiling(value, "max_rows"))
+                .transpose(),
+            max_bytes
+                .map(|value| parse_ceiling(value, "max_bytes"))
+                .transpose(),
+        ) {
+            (Ok(max_rows), Ok(max_bytes)) => (max_rows, max_bytes),
+            (Err(error), _) | (_, Err(error)) => {
+                return Ok(NativeQueryStep::failure(&WyrdError::from(&error)));
+            }
+        };
         let max_rows = max_rows.unwrap_or(DEFAULT_MAX_ROWS);
         let max_bytes = max_bytes
             .map_or(Ok(DEFAULT_MAX_BYTES), usize::try_from)
             .unwrap_or(usize::MAX);
-        // The stream is already taken, so a refusal drops and releases it.
         if let Err(refused) = admit_ceilings(max_rows, max_bytes) {
             return Ok(NativeQueryStep::failure(&WyrdError::Validation {
                 message: refused.reason.to_owned(),
@@ -1602,6 +1615,25 @@ fn parse_deadline_ms(value: f64) -> StdResult<i64, BifrostClientError> {
                 detail: "deadline_ms must be an integer between 1 and 4294967295".to_owned(),
             },
         })
+    })
+}
+
+/// Converts one JavaScript collection ceiling into the integer [`admit_ceilings`] takes.
+///
+/// Only exact integers in `0..=u32::MAX` pass through the lossless decimal round
+/// trip, so a fractional or wrapping number is refused instead of being narrowed
+/// into an admitted value; the admitted range itself stays with [`admit_ceilings`].
+///
+/// # Errors
+///
+/// Returns the catalog validation error naming `field` for a non-finite,
+/// fractional, negative, or beyond-`u32` number.
+fn parse_ceiling(value: f64, field: &str) -> StdResult<u32, BifrostClientError> {
+    value.to_string().parse().map_err(|_| {
+        validation_error(
+            format!("{field} must be an integer in its allowed range"),
+            field,
+        )
     })
 }
 

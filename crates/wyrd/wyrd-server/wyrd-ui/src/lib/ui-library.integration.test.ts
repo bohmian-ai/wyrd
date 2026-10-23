@@ -191,13 +191,23 @@ test('TASK-003: Identical authorized reads', async ({ server, seeded }) => {
       const [tool] = await mcp.executor.run([request]);
       expect(tool, JSON.stringify(tool)).toEqual({ ok: false, problem: expect.objectContaining({ detail: expect.stringContaining(reason) }) });
     }
+    // A wrapping or fractional original is refused, never narrowed into an admitted ceiling.
+    for (const limit of [{ max_rows: 4_294_977_296 }, { max_rows: 10_000.5 }, { max_bytes: 4_299_161_600 }, { max_bytes: 4_194_304.5 }]) {
+      const request: WireRequest = { ...reads[2], ...limit } as WireRequest;
+      const [direct] = await sdk.run([request]);
+      expect(direct, JSON.stringify(direct)).toEqual({ ok: false, problem: expect.objectContaining({ code: 'WYRD_SPEC_400_VALIDATION' }) });
+      const [tool] = await mcp.executor.run([request]);
+      expect(tool, JSON.stringify(tool)).toMatchObject({ ok: false });
+    }
     // The exact maxima answer, as the omitted defaults did above.
     expect(await both({ ...reads[2], max_rows: 10_000, max_bytes: 16_777_216 } as WireRequest)).toMatchObject({ ok: true });
     // A refused SDK collection releases its stream; later queries are unaffected.
     const bifrost = await Bifrost.connect({ client });
-    const refused = await bifrost.stream(LATENCY_CHART.sql, [RANGE.from, RANGE.to]);
-    await expect(refused.collect({ maxRows: 10_001 })).rejects.toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
-    await expect(refused.collect()).rejects.toThrow('query stream is closed');
+    for (const maxRows of [10_001, 4_294_977_296]) {
+      const refused = await bifrost.stream(LATENCY_CHART.sql, [RANGE.from, RANGE.to]);
+      await expect(refused.collect({ maxRows })).rejects.toMatchObject({ code: 'WYRD_SPEC_400_VALIDATION' });
+      await expect(refused.collect()).rejects.toThrow('query stream is closed');
+    }
     expect((await (await bifrost.stream(LATENCY_CHART.sql, [RANGE.from, RANGE.to])).collect()).terminal).toMatchObject({ row_count: 3 });
     // A cancelled read rejects on both surfaces rather than answering.
     const cancelled = AbortSignal.abort();

@@ -73,3 +73,36 @@ mise exec -- git diff --check
 ```
 
 The existing test/check tasks rebuild the package. This pure range and documentation correction needs no native rebuild, live-server suite, release matrix or broad aggregate. Final change review owns combined journey proof. A subsequent task review reassesses the complete cumulative TASK-003 candidate.
+
+## Implementation evidence
+
+Commit `6eb137e7b`. Status: **IMPLEMENTED**.
+
+Owner and gap: `RelativeRangeSchema` (`packages/ui/src/lib/schemas.ts`) is the single admission point for root and Chart ranges, and every consumer (WyrdView document parse, `validatePanel`/`loadPanel`, both POST endpoints) already maps its failure to `inputProblem` → canonical `validation`. The gap was that the schema admitted spans `resolveRange` could not convert. The `last` field now refines with native `Date` validity of the span measured back from epoch 0, so an admitted span resolves for any clock at or after 1970. `resolveRange` moved beside the schema (still exported through `wyrd-ai-ui/loaders`, public surface unchanged) so admission and resolution share one span computation. No host, endpoint, renderer or example code changed; the catalog JSON is unchanged (`--check` green).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-003-13 invalid root range: visible canonical field error, zero reads, initial and replacing a valid document | `schemas.ts` `RelativeRangeSchema` refine; existing WyrdView `!parsed.success` EmptyState | `TASK-003: Validated portable rendering` new block: `View input.range` + `WYRD_SPEC_400_VALIDATION`, call count stays 1 after valid→invalid | PASS |
+| FIND-003-13 invalid explicit Chart range: field error, sibling loads, no query | same refine via `validatePanel` | same block: `far` shows `Chart input.range` + code, `near` renders legend, 2 total reads (only valid panels) | PASS |
+| FIND-003-13 both HTTP hosts refuse rather than reject | same refine via `loadPanel` | `Canonical UI problem projections` new loop: BFF and example POST answer 400 `application/problem+json` `{...validation, detail: /^Chart input\.range/}`; `Bifrost.connect` spy never called | PASS |
+| FIND-003-13 regression boundary | `resolveRange` arithmetic unchanged | six-hour/fixed-clock, absolute, explicit precedence, binds and cancellation assertions in `TASK-003: Dependent loads and safe actions` green; `100000000d` boundary still admitted; example `24h` unaffected; full UI suite 40/40 | PASS |
+| FIND-003-14 `# Panics` rustdoc | `crates/shared/wyrd-client/src/client.rs` test rustdoc; body unchanged | static inspection; `fmt:check`, `lints`, focused nextest green | PASS |
+
+RED (before fix): `Validated portable rendering` 1 failed (`RangeError: Invalid time value in $effect in WyrdView.svelte`); `Canonical UI problem projections` 1 failed (`RangeError` escaping `POST src/routes/t/[tenantKey]/ui/load/+server.ts:24`). GREEN after fix; each selector selects 1 test (9 skipped).
+
+Commands (all PASS):
+
+```sh
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Validated portable rendering$'   # 1 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-003: Dependent loads and safe actions$' # 1 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^Canonical UI problem projections$'          # 1 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test     # 8 files, 40 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check    # 0 errors, 0 warnings
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec node packages/ui/scripts/catalog.ts --check
+mise run fmt:check
+mise run lints
+mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=client::tests::browser_session_bifrost_connects_without_an_ingest_channel)'  # 1 passed
+mise exec -- git diff --check
+```
+
+Non-goals held: no duration/retention cap beyond `Date` representability, no per-host checks, no new error family, parser, configuration, dependency, native/query change or public export. Real-server UI lane not rerun (pure TS range validation plus rustdoc; no native or server change). Changed files: `schemas.ts`, `loaders.ts`, `ui-library.test.ts`, `client.rs` only.

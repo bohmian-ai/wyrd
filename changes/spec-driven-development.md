@@ -324,8 +324,20 @@ Task readiness reviews one or more proposed tasks and returns `READY`,
 Task review inspects one immutable cumulative task candidate against the
 approved spec, original task, all remediation tasks, and available evidence. It
 returns `PASS`, `FIX_REQUIRED`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`.
-Post-remediation review always reassesses the original task's complete
-base-to-candidate range, not only the latest fix diff.
+The first review covers the complete base-to-candidate range. Post-remediation
+review checks finding closure, the latest fix diff, and affected paths against
+the original task, retaining the cumulative candidate as context. Carry forward
+source-backed evidence for unchanged behavior unless changed dependencies,
+authority, or new evidence invalidate it; record why any area is reopened.
+
+A blocker requires an explicit obligation or supported-use regression, a
+source-proven failing scenario, and a material consequence, or an explicit
+mandatory repository-gate violation. Reachability alone is insufficient.
+Corrections must justify their implementation and maintenance burden against
+deletion, reuse, and smaller alternatives without weakening required safety
+boundaries. After two unsuccessful remediation reviews, assess convergence
+and set the next bounded scope; do not restart the full audit automatically
+or grant an automatic PASS.
 
 Every actionable finding has a stable ID, exact location, mapped spec and task
 obligations, reachable scenario, concrete consequence, required outcome, and

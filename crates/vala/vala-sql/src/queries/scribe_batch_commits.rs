@@ -184,6 +184,13 @@ pub enum ScribeBatchCommitResolution {
     /// wrote are suppressed on replay by [`resolve_replay`] for the same
     /// reason.
     AlreadyCommitted,
+    /// The batch id is spent under another table version.
+    ///
+    /// The fence carries the version that accepted it; this attempt's rows
+    /// must not become visible, and whether they are the same logical batch
+    /// is decided by preparing them under that version, never by comparing a
+    /// digest computed under a different definition.
+    AcceptedUnder(TableVersion),
 }
 
 /// Durable replay decision for one tenant/table/batch identity.
@@ -338,8 +345,9 @@ pub async fn ingest_instant(conn: &mut TenantConn<'_>) -> Result<DateTime<Utc>, 
 /// [`ScribeBatchCommitResolution::Committed`]; on a primary-key conflict the
 /// same attempt is `Committed`, the same rows from a different attempt are
 /// [`ScribeBatchCommitResolution::AlreadyCommitted`] and the caller must not
-/// make them visible again, and different rows under the same batch identity
-/// are a contradiction. `Absent` is never returned.
+/// make them visible again, a fence of another table version is
+/// [`ScribeBatchCommitResolution::AcceptedUnder`] that version, and different
+/// rows under the same version are a contradiction. `Absent` is never returned.
 ///
 /// A fence is keyed by tenant, table, and batch id, never by its position:
 /// `RETURNING` does not preserve input order, and one batch id may name
@@ -500,9 +508,14 @@ fn find<'a>(
 
 /// Classifies `commit` against the durable fence holding its identity.
 ///
+/// A fence accepted under another recorded version answers that version
+/// rather than a contradiction, so the caller can compare the batch under
+/// the definition that accepted it.
+///
 /// # Errors
 ///
-/// Returns [`SqlError`] when the durable fence holds different rows.
+/// Returns [`SqlError`] when the durable fence holds different rows under
+/// the same version, or no recorded version.
 fn classify(
     existing: &ExistingScribeBatchCommit,
     commit: &ScribeBatchCommit,
@@ -512,6 +525,13 @@ fn classify(
     }
     if existing.matches_logical(commit) {
         return Ok(ScribeBatchCommitResolution::AlreadyCommitted);
+    }
+    if let Some(accepted) = existing
+        .table_version
+        .filter(|version| *version != commit.table_version.get())
+        .and_then(|version| TableVersion::new(version).ok())
+    {
+        return Ok(ScribeBatchCommitResolution::AcceptedUnder(accepted));
     }
     tracing::warn!(
         logical_table = %commit.logical_table_fqn,
@@ -612,7 +632,8 @@ mod tests {
     }
 
     /// A fence accepted under another table version, or under no recorded
-    /// version, is not the same logical batch even with identical rows.
+    /// version, is not the same logical batch even with identical rows; the
+    /// former answers its accepting version and the latter fails closed.
     #[test]
     fn logical_identity_is_bound_to_the_accepting_table_version() {
         let (commit, mut existing) = identities();
@@ -621,8 +642,19 @@ mod tests {
         existing.table_version = Some(commit.table_version.get() + 1);
         assert!(!existing.matches_logical(&commit));
         assert!(!existing.matches(&commit));
+        assert_eq!(
+            super::classify(&existing, &commit).expect("another version is not a contradiction"),
+            super::ScribeBatchCommitResolution::AcceptedUnder(
+                commit.table_version.next().expect("next version")
+            ),
+            "a fence of another version answers the version that accepted it"
+        );
         existing.table_version = None;
         assert!(!existing.matches_logical(&commit));
         assert_eq!(existing.divergent_fields(&commit), vec!["table_version"]);
+        assert!(
+            super::classify(&existing, &commit).is_err(),
+            "a fence with no recorded version stays a contradiction"
+        );
     }
 }

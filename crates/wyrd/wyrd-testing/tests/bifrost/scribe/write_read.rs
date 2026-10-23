@@ -1406,7 +1406,8 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
 /// written under the new one; a retry at its original table version across
 /// the revision, warm and after restart, is acknowledged without a duplicate
 /// row, a new batch at the superseded version is a typed version conflict,
-/// and a changed payload under the same id is refused. The accepted id sent
+/// and a changed payload under the same id is refused. A further Bloom-only
+/// revision keeps the original-version retry acknowledged. The accepted id sent
 /// under the current version writes a provisional WAL attempt the fence
 /// refuses; replay after restart suppresses it and the original retry still
 /// acknowledges.
@@ -1443,6 +1444,12 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
     super::support::append_batch_at(&client, &table, original, accepted, &composite_batch())
         .await
         .expect("a retry at its original version across the revision is acknowledged");
+    server
+        .commit_bloom_revision(tenant, &table_ref, &["customer"])
+        .await;
+    super::support::append_batch_at(&client, &table, original, accepted, &composite_batch())
+        .await
+        .expect("a retry at its original version across the Bloom revision is acknowledged");
     let stale = super::support::append_batch_at(
         &client,
         &table,
@@ -1536,7 +1543,10 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
         "the refusal stores nothing"
     );
 
-    let current = original.next().expect("the revision is version 2");
+    let current = original
+        .next()
+        .and_then(wyrd_spec::vala::ids::TableVersion::next)
+        .expect("the Bloom revision is version 3");
     assert!(
         super::support::append_batch_at(&client, &table, current, accepted, &composite_batch())
             .await

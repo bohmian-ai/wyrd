@@ -1151,6 +1151,18 @@ impl ScribeShardRuntime {
             .then_some(rows)
     }
 
+    /// Table version the pod-wide index recorded for `(tenant, batch_id)`
+    /// in `table_fqn`, so a request that states no version is prepared under
+    /// the one that accepted it.
+    pub(crate) fn committed_version(
+        &self,
+        tenant: DataTenantId,
+        batch_id: uuid::Uuid,
+        table_fqn: &str,
+    ) -> Option<wyrd_spec::vala::ids::TableVersion> {
+        self.committed.version(tenant, batch_id, table_fqn)
+    }
+
     /// Enqueue a prepared request onto its deterministic shard.
     ///
     /// The shard is selected by [`Self::lane_for`] so that
@@ -3055,6 +3067,11 @@ struct GroupWalState {
     /// time, so insertion releases them instead of inserting them and replay
     /// suppresses them on the same logical-identity rule.
     spent_batch_ids: HashSet<[u8; 16]>,
+    /// Spent batch identities whose fence names another accepting version.
+    ///
+    /// Their waiters learn that version instead of an acknowledgement, and
+    /// the pod-wide index never records the version they were prepared at.
+    accepted_under: HashMap<[u8; 16], wyrd_spec::vala::ids::TableVersion>,
     /// Batch identities at least one of whose slices this group made visible.
     ///
     /// A batch absent here was a replay: the fence spent it or the memtable
@@ -3186,6 +3203,12 @@ impl ShardOwner {
     fn record_committed(&self, state: &GroupWalState) {
         for &(index, logical_digest, slice_count, table_version) in &state.fenced {
             let append = &state.prepared[index];
+            if state
+                .accepted_under
+                .contains_key(append.batch_id.as_bytes())
+            {
+                continue;
+            }
             self.committed.record(
                 append.tenant,
                 append.batch_id,
@@ -3214,6 +3237,7 @@ impl ShardOwner {
                 let _ = sender.send(Ok(crate::scribe::preprocess::DurableCompletion {
                     rows,
                     first_commit: state.inserted_batch_ids.contains(batch_id),
+                    accepted_under: state.accepted_under.get(batch_id).copied(),
                 }));
             }
             drop(append.reservation);
@@ -3700,20 +3724,28 @@ impl ShardOwner {
             }
         }
         for (tenant, indices, offered) in fences {
-            let spent = self
+            let resolved = self
                 .commit_batch_control_fences(&postgres, tenant, &offered)
                 .await?;
-            for (index, already) in indices.into_iter().zip(spent) {
-                if already {
-                    let append = &state.prepared[index];
-                    tracing::debug!(
-                        tenant = %append.tenant,
-                        table = %append.table.fqn(),
-                        batch_id = %append.batch_id,
-                        "Scribe batch identity already committed; suppressing a second insertion"
-                    );
-                    state.spent_batch_ids.insert(*append.batch_id.as_bytes());
+            for (index, resolution) in indices.into_iter().zip(resolved) {
+                use vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution;
+                let append = &state.prepared[index];
+                let batch_id = *append.batch_id.as_bytes();
+                match resolution {
+                    ScribeBatchCommitResolution::AlreadyCommitted => {}
+                    ScribeBatchCommitResolution::AcceptedUnder(version) => {
+                        state.accepted_under.insert(batch_id, version);
+                    }
+                    ScribeBatchCommitResolution::Absent
+                    | ScribeBatchCommitResolution::Committed => continue,
                 }
+                tracing::debug!(
+                    tenant = %append.tenant,
+                    table = %append.table.fqn(),
+                    batch_id = %append.batch_id,
+                    "Scribe batch identity already committed; suppressing a second insertion"
+                );
+                state.spent_batch_ids.insert(batch_id);
             }
         }
         Ok(())
@@ -3779,8 +3811,9 @@ impl ShardOwner {
     /// all in one tenant transaction, so the group pays one INSERT and one
     /// COMMIT instead of one of each per batch. `ingested_at` is each batch's admission instant, the value
     /// stamped on its rows as `wyrd_ingested_at`; the fence stores it
-    /// unchanged. The result holds, per fence and in order, whether the batch
-    /// was already committed by an earlier attempt and must not become
+    /// unchanged. The result holds, per fence and in order, its durable
+    /// resolution: whether the batch was already committed by an earlier
+    /// attempt, possibly under another table version, and must not become
     /// visible again.
     ///
     /// A `PostgreSQL` COMMIT error is always ambiguous. The method then opens
@@ -3803,23 +3836,18 @@ impl ShardOwner {
         postgres: &ValaPostgres,
         tenant: DataTenantId,
         offered: &[(ScribeBatchCommit, DateTime<Utc>)],
-    ) -> Result<Vec<bool>, ScribeError> {
+    ) -> Result<
+        Vec<vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution>,
+        ScribeError,
+    > {
         use vala_sql::queries::scribe_batch_commits::{
             ScribeBatchCommitResolution, record, resolve,
-        };
-        let spent = |resolved: &[ScribeBatchCommitResolution]| {
-            resolved
-                .iter()
-                .map(|resolution| {
-                    matches!(resolution, ScribeBatchCommitResolution::AlreadyCommitted)
-                })
-                .collect::<Vec<_>>()
         };
         loop {
             let mut conn = postgres.tenant_conn(tenant).await?;
             let recorded = record(&mut conn, offered).await?;
             if conn.commit().await.is_ok() {
-                return Ok(spent(&recorded));
+                return Ok(recorded);
             }
 
             let mut reconciliation = match postgres.tenant_conn(tenant).await {
@@ -3842,7 +3870,7 @@ impl ShardOwner {
                 }
             };
             if !resolved.contains(&ScribeBatchCommitResolution::Absent) {
-                return Ok(spent(&resolved));
+                return Ok(resolved);
             }
         }
     }
@@ -3931,6 +3959,7 @@ impl ShardOwner {
             touched,
             rows_by_append,
             spent_batch_ids: HashSet::new(),
+            accepted_under: HashMap::new(),
             inserted_batch_ids: HashSet::new(),
             fenced: Vec::new(),
         })

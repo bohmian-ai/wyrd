@@ -37,6 +37,13 @@ pub(crate) struct DurableCompletion {
     /// Whether this append's group inserted the batch rather than suppressing
     /// a replay the fence or memtable identity showed was already committed.
     pub first_commit: bool,
+    /// Table version whose durable fence already spent this batch id when it
+    /// was not the version this append was prepared under.
+    ///
+    /// Such an append's rows were suppressed and nothing is acknowledged yet:
+    /// the caller decides whether it is that batch by preparing it under the
+    /// accepting version.
+    pub accepted_under: Option<wyrd_spec::vala::ids::TableVersion>,
 }
 
 /// A complete request accepted by pod-global admission.

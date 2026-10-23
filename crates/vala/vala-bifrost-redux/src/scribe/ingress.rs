@@ -566,6 +566,49 @@ impl ScribeImpl {
         &self,
         mut frame: ScribeIngressFrame,
     ) -> Result<FrameAdmission, ScribeError> {
+        if frame.table_version.is_none() {
+            frame.table_version = self.shards.committed_version(
+                frame.principal.tenant_id,
+                frame.batch_id,
+                &frame.table.fqn(),
+            );
+        }
+        let retry = frame
+            .table_version
+            .is_none()
+            .then(|| unclaimed_retry(&frame));
+        let table = frame.table.clone();
+        match self.prepare_and_dispatch_under(frame).await? {
+            Dispatched::Admitted(admission) => Ok(admission),
+            Dispatched::AcceptedUnder(version) => {
+                let Some(mut retry) = retry else {
+                    return Err(table_version_conflict(&table, version));
+                };
+                retry.table_version = Some(version);
+                match self.prepare_and_dispatch_under(retry).await? {
+                    Dispatched::Admitted(admission) => Ok(admission),
+                    Dispatched::AcceptedUnder(version) => {
+                        Err(table_version_conflict(&table, version))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prepares one request under the version it claims, or the current one,
+    /// and dispatches it to its fixed shard.
+    ///
+    /// [`Dispatched::AcceptedUnder`] reports a batch id the durable fence
+    /// already spent under another version: its rows were suppressed and
+    /// nothing was acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failures [`Self::prepare_and_dispatch`] documents.
+    async fn prepare_and_dispatch_under(
+        &self,
+        mut frame: ScribeIngressFrame,
+    ) -> Result<Dispatched, ScribeError> {
         let append_started = Instant::now();
         let profile = Arc::new(WriteProfile::default());
         let admission = profile.admission.timer();
@@ -646,12 +689,12 @@ impl ScribeImpl {
             drop(prepared);
             metrics::histogram!("bifrost_scribe_ack_seconds")
                 .record(append_started.elapsed().as_secs_f64());
-            return Ok(FrameAdmission {
+            return Ok(Dispatched::Admitted(FrameAdmission {
                 batch_id: frame.batch_id,
                 rows_accepted: rows,
                 receipt_micros,
                 first_commit: false,
-            });
+            }));
         }
         self.shards
             .try_send(prepared)
@@ -659,14 +702,17 @@ impl ScribeImpl {
         let completion = durable_rx.await.map_err(|_| ScribeError::Internal {
             detail: "shard owner dropped durable batch completion".to_owned(),
         })??;
+        if let Some(version) = completion.accepted_under {
+            return Ok(Dispatched::AcceptedUnder(version));
+        }
         metrics::histogram!("bifrost_scribe_ack_seconds")
             .record(append_started.elapsed().as_secs_f64());
-        Ok(FrameAdmission {
+        Ok(Dispatched::Admitted(FrameAdmission {
             batch_id: frame.batch_id,
             rows_accepted: completion.rows,
             receipt_micros,
             first_commit: completion.first_commit,
-        })
+        }))
     }
 
     /// Rows of `append` when its durable fence accepted exactly this batch
@@ -874,6 +920,44 @@ fn scheme_of(
 
 /// The typed refusal for a frame whose table version is not the table's
 /// current one, naming `current` so the writer can describe again.
+/// Outcome of one preparation and dispatch under one table version.
+enum Dispatched {
+    /// The batch is durable and acknowledged.
+    Admitted(FrameAdmission),
+    /// The durable fence spent this batch id under another table version.
+    AcceptedUnder(TableVersion),
+}
+
+/// Copies a frame that states no table version so it can be prepared again
+/// under the version a durable fence names.
+///
+/// Arrow IPC bytes and canonical batches are shared buffers, so this copies
+/// no payload; the retry is admitted and accounted like any frame.
+fn unclaimed_retry(frame: &ScribeIngressFrame) -> ScribeIngressFrame {
+    ScribeIngressFrame {
+        principal: frame.principal.clone(),
+        attribution: frame.attribution.clone(),
+        authenticated_tenant: frame.authenticated_tenant,
+        attributed_cards: frame.attributed_cards.clone(),
+        table: frame.table.clone(),
+        expected_schema_fingerprint: frame.expected_schema_fingerprint.clone(),
+        table_version: None,
+        request_id: frame.request_id.clone(),
+        batch_id: frame.batch_id,
+        measured_wire_bytes: frame.measured_wire_bytes,
+        payload: match &frame.payload {
+            IngressPayload::ArrowIpc(bytes) => IngressPayload::ArrowIpc(bytes.clone()),
+            IngressPayload::Canonical(canonical) => {
+                IngressPayload::Canonical(crate::contracts::CanonicalIngress {
+                    batches: canonical.batches.clone(),
+                    owner: None,
+                    logical_identity: canonical.logical_identity.clone(),
+                })
+            }
+        },
+    }
+}
+
 fn table_version_conflict(table: &crate::catalog::TableRef, current: TableVersion) -> ScribeError {
     ScribeError::ContractViolation(BifrostError::TableVersionConflict {
         table: table.fqn(),

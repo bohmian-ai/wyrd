@@ -383,6 +383,56 @@ mod pg_tests {
         journey.shutdown().await;
     }
 
+    /// A replay across a definition edit is recovered under its accepting version.
+    ///
+    /// The Gate states no table version for canonical OTLP rows, so an
+    /// exporter replaying after a Bloom-only edit reaches Scribe under a newer
+    /// current version than the one that accepted it. Warm, the pod's committed
+    /// index names that version; after a restart only the durable fence does.
+    /// Both replays must acknowledge without storing a second row set.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an export or replay is refused, or the spans are not stored
+    /// exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn otlp_replay_across_a_definition_edit_is_acknowledged_once() {
+        let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+        let builder = || {
+            wyrd_testing::WyrdTestServer::builder()
+                .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+        };
+        let journey = OtlpJourney::start_on(builder()).await;
+        let spans = negative_resource_spans(support::anchor_nanos(), &[]);
+        let accepted = |partial: Option<_>| assert!(partial.is_none(), "every span is accepted");
+        accepted(export_traces_over_grpc(&journey, spans.clone()).await);
+        let tenant = journey.server().data_tenant_id();
+        journey
+            .server()
+            .commit_bloom_revision(
+                tenant,
+                &vala_bifrost_redux::catalog::TableRef::new(
+                    vala_bifrost_redux::namespaces::BifrostNamespace::Traces,
+                    "spans",
+                ),
+                &["scope_name", "trace_state"],
+            )
+            .await;
+        accepted(export_traces_over_grpc(&journey, spans.clone()).await);
+        let journey = journey.restart(builder()).await;
+        accepted(export_traces_over_grpc(&journey, spans).await);
+        journey.publish().await;
+
+        let stored = journey
+            .query(&format!(
+                "SELECT trace_state FROM {SPANS_TABLE} WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}'"
+            ))
+            .await;
+        assert_accepted_subset(&sorted_markers(&stored, "trace_state"), &SPAN_MARKERS, "");
+        journey.shutdown().await;
+    }
+
     /// One publisher's replay is exactly once; two publishers are two row sets.
     ///
     /// Retry suppression derives `wyrd_batch_id` from the accepted rows rather

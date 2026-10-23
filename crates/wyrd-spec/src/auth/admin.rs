@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{IssuerUrl, SecretBearer};
-use crate::reference::CardRef;
+use crate::auth::{IssuerUrl, PrincipalId, SecretBearer};
+use crate::ids::CardUid;
 
 /// Serde mirror of the domain claim mapping, whose claim paths are not directly
 /// (de)serializable.
@@ -138,8 +138,12 @@ pub struct CreateWorkloadBindingRequest {
     /// Optional audience constraint.
     #[serde(default)]
     pub audience: Option<String>,
-    /// Card the bound workload acts as.
-    pub card_ref: CardRef,
+    /// Active stable Service account the verified workload authenticates as.
+    pub principal_id: PrincipalId,
+    /// Optional pinned default root; execution context, never account
+    /// identity, and always within the account's restriction.
+    #[serde(default)]
+    pub workload_uid: Option<CardUid>,
 }
 
 /// Workload-binding projection.
@@ -153,6 +157,8 @@ pub struct WorkloadBindingView {
     pub subject: String,
     /// Optional audience constraint.
     pub audience: Option<String>,
-    /// Card the bound workload acts as.
-    pub card_ref: CardRef,
+    /// Stable Service account the workload authenticates as.
+    pub principal_id: PrincipalId,
+    /// Pinned default root, when configured.
+    pub workload_uid: Option<CardUid>,
 }

@@ -6,14 +6,20 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalKindTag;
-use wyrd_spec::reference::{CardRef, CardRefScope};
+use wyrd_spec::auth::{CardAccess, PrincipalKindTag, WorkloadFamily};
+use wyrd_spec::ids::CardUid;
 
 use crate::permission::PermissionSet;
 
 pub use wyrd_spec::auth::PrincipalId;
 
 /// The authenticated identity behind a request.
+///
+/// Account identity (`id`, `kind`, `tenant_id`) is stable across releases.
+/// Which exact Service or Agent version the request runs as is execution
+/// context carried beside it in `workload_uid`, and which Cards it may
+/// attribute evidence to is the signed `card_access` limit; neither changes
+/// the account.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
     /// Stable principal id.
@@ -35,69 +41,53 @@ pub struct Principal {
     /// identity the server minted for itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_id: Option<Uuid>,
+    /// Effective limit on which Cards this request may attribute evidence to.
+    ///
+    /// Independent of `effective_permissions`: Card-attributed work needs both.
+    pub card_access: CardAccess,
+    /// The subject's exact Service or Agent root, when one was selected.
+    ///
+    /// Present exactly when the subject's own context is a validated root.
+    /// For delegated work the owning root is the current actor's instead; see
+    /// [`crate::request_context::owning_root`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_uid: Option<CardUid>,
 }
 
-/// Kind of authenticated identity.
+/// Kind of authenticated account.
 ///
 /// Every variant here is **tenant-scoped**: [`Principal`] carries a required
 /// tenant, so this enum is the tenant-plane projection of a principal.
 /// Platform-scope principals are a separate projection and are never
 /// representable as a [`Principal`], which is what keeps the two control planes
-/// from collapsing into one another by accident.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+/// from collapsing into one another by accident. The kind names the account
+/// only; execution context lives on [`Principal::workload_uid`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrincipalKind {
     /// Tenant administrative identity created during tenant provisioning.
-    ///
-    /// The tenant's headless root of trust. It binds no Card — an
-    /// administrative identity is not a registered AI-system component — and it
-    /// coexists with any human administrator the tenant later federates.
     TenantAdmin,
     /// Human user identity.
     User,
-    /// Machine service identity, optionally bound to a Service card.
-    ///
-    /// A deployed workload carries its Service card and the emit scope derived
-    /// from it. Tenant automation created by a tenant administrator carries no
-    /// Card and therefore no emit scope, because Card binding is a property of
-    /// a machine principal rather than a precondition for holding a credential.
-    Service {
-        /// Bound Service card, absent for a Card-free automation identity.
-        card_ref: Option<CardRef>,
-        /// Transitive card authorization set; contains `card_ref` when one is
-        /// bound and is empty otherwise.
-        card_ref_scope: CardRefScope,
-    },
-    /// Card-bound agent identity.
-    Agent {
-        /// Bound Agent card.
-        card_ref: CardRef,
-        /// Transitive card authorization set; always contains `card_ref`.
-        card_ref_scope: CardRefScope,
-    },
+    /// Stable machine Service account, independent of every Card version.
+    Service,
     /// Internal credentialless verification-result writer.
     ///
-    /// Exactly one exists per tenant. It binds no root Card, holds no roles or
-    /// credential, and has no public lifecycle; the server mints it a
-    /// short-lived token scoped to the single Verifier whose results it
-    /// writes, so ingest authorizes and stamps each result row against that
-    /// signed Verifier reference.
-    System {
-        /// Signed authorization set naming exactly one UID-bearing Verifier.
-        card_ref_scope: CardRefScope,
-    },
+    /// Exactly one exists per tenant. It holds no roles or credential and has
+    /// no public lifecycle; the server mints it a short-lived token scoped to
+    /// the single Verifier whose results it writes.
+    System,
 }
 
 impl PrincipalKind {
-    /// Projects to the card-free wire discriminator.
+    /// Projects to the wire discriminator.
     #[must_use]
-    pub fn tag(&self) -> PrincipalKindTag {
+    pub const fn tag(self) -> PrincipalKindTag {
         match self {
             Self::TenantAdmin => PrincipalKindTag::TenantAdmin,
             Self::User => PrincipalKindTag::User,
-            Self::Service { .. } => PrincipalKindTag::Service,
-            Self::Agent { .. } => PrincipalKindTag::Agent,
-            Self::System { .. } => PrincipalKindTag::System,
+            Self::Service => PrincipalKindTag::Service,
+            Self::System => PrincipalKindTag::System,
         }
     }
 }
@@ -151,12 +141,13 @@ impl FromStr for RoleRef {
 pub struct InvalidRoleName;
 
 impl Principal {
-    /// Construct a principal.
+    /// Construct a rootless principal.
     ///
-    /// The authenticating credential is attached separately with
-    /// [`Principal::with_credential_id`], because most callers — internal
-    /// service identities, federated humans, test fixtures — have no credential
-    /// to name and would otherwise all pass `None`.
+    /// The Card limit defaults to `any_registered` (the rootless User,
+    /// administrator, and unrestricted Service state), except the SYSTEM
+    /// writer, which starts with an empty scope. Context and credential are
+    /// attached separately with [`Principal::with_card_access`] and
+    /// [`Principal::with_credential_id`].
     #[must_use]
     pub fn new(
         id: PrincipalId,
@@ -165,6 +156,12 @@ impl Principal {
         roles: Vec<RoleRef>,
         effective_permissions: PermissionSet,
     ) -> Self {
+        let card_access = match kind {
+            PrincipalKind::System => CardAccess::Scoped { cards: Vec::new() },
+            PrincipalKind::TenantAdmin | PrincipalKind::User | PrincipalKind::Service => {
+                CardAccess::AnyRegistered
+            }
+        };
         Self {
             id,
             kind,
@@ -172,6 +169,8 @@ impl Principal {
             roles,
             effective_permissions,
             credential_id: None,
+            card_access,
+            workload_uid: None,
         }
     }
 
@@ -182,97 +181,66 @@ impl Principal {
         self
     }
 
-    /// Returns the bound card ref, when this principal has one.
-    ///
-    /// An agent always binds a Card. A service binds one only when it is a
-    /// deployed workload; Card-free tenant automation, tenant administrators,
-    /// humans, and the tenant SYSTEM principal return `None`.
+    /// Attach the signed Card limit and the subject's selected root.
     #[must_use]
-    pub fn card_ref(&self) -> Option<&CardRef> {
-        match &self.kind {
-            PrincipalKind::Service { card_ref, .. } => card_ref.as_ref(),
-            PrincipalKind::Agent { card_ref, .. } => Some(card_ref),
-            PrincipalKind::TenantAdmin | PrincipalKind::User | PrincipalKind::System { .. } => None,
-        }
+    pub fn with_card_access(
+        mut self,
+        card_access: CardAccess,
+        workload_uid: Option<CardUid>,
+    ) -> Self {
+        self.card_access = card_access;
+        self.workload_uid = workload_uid;
+        self
     }
 
-    /// The UID of the owner Service Card this principal is deployed as, when
-    /// one is available without IO.
-    ///
-    /// Only a Card-bound Service principal whose bound Card is a resolved
-    /// `Service` names an owner. An Agent's Card is never widened to a parent
-    /// Service, and Card-free, human, administrator and SYSTEM principals have
-    /// none, so their verifications record a null owner.
+    /// The exact signed Card UID scope, when access is `scoped`.
     #[must_use]
-    pub fn owner_service_uid(&self) -> Option<&wyrd_spec::ids::CardUid> {
-        match &self.kind {
-            PrincipalKind::Service {
-                card_ref: Some(card_ref),
-                ..
-            } if card_ref.kind == wyrd_spec::envelope::CardKind::Service => card_ref.uid.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// Returns the card scope for card-carrying machine principals.
-    ///
-    /// A Card-free service still reports its (empty) scope, so callers can
-    /// distinguish "no emit authority" from "not a machine principal". The
-    /// tenant SYSTEM principal reports its in-process scope: exactly the
-    /// Verifier a result frame is attributed to, or empty for an input read.
-    #[must_use]
-    pub fn card_ref_scope(&self) -> Option<&CardRefScope> {
-        match &self.kind {
-            PrincipalKind::Service { card_ref_scope, .. }
-            | PrincipalKind::Agent { card_ref_scope, .. }
-            | PrincipalKind::System { card_ref_scope } => Some(card_ref_scope),
-            PrincipalKind::TenantAdmin | PrincipalKind::User => None,
+    pub fn card_scope(&self) -> Option<&[CardUid]> {
+        match &self.card_access {
+            CardAccess::Scoped { cards } => Some(cards),
+            CardAccess::AnyRegistered | CardAccess::RootRequired { .. } => None,
         }
     }
 
     /// The Cards this principal may attribute observations and verifications to.
-    ///
-    /// A Card-bound Service or Agent and the tenant SYSTEM writer are limited
-    /// to their signed scope. A principal bound to no Card — a tenant
-    /// administrator, a human user, or Card-free tenant automation — may
-    /// attribute evidence to any registered observation-target Card in its own
-    /// tenant, which the write path resolves against the tenant registry.
     #[must_use]
     pub fn card_attribution(&self) -> CardAttribution<'_> {
-        match &self.kind {
-            PrincipalKind::Service {
-                card_ref: Some(_),
-                card_ref_scope,
+        match &self.card_access {
+            CardAccess::Scoped { cards } => CardAttribution::Scoped(cards),
+            CardAccess::AnyRegistered => CardAttribution::AnyRegistered,
+            CardAccess::RootRequired { restriction } => {
+                CardAttribution::RootRequired(restriction.family())
             }
-            | PrincipalKind::Agent { card_ref_scope, .. }
-            | PrincipalKind::System { card_ref_scope } => CardAttribution::Scoped(card_ref_scope),
-            PrincipalKind::Service { card_ref: None, .. }
-            | PrincipalKind::TenantAdmin
-            | PrincipalKind::User => CardAttribution::AnyRegistered,
         }
     }
 
-    /// True when this principal is authorized to emit for `card`.
+    /// True when the signed scope names `card`.
     #[must_use]
-    pub fn authorizes_card(&self, card: &CardRef) -> bool {
-        self.card_ref_scope()
-            .is_some_and(|scope| scope.authorizes(card))
+    pub fn authorizes_card_uid(&self, card: &CardUid) -> bool {
+        self.card_scope().is_some_and(|cards| cards.contains(card))
     }
 }
 
 /// Which Cards a principal may attribute observations and verifications to.
 ///
 /// Returned by [`Principal::card_attribution`]. The distinction is explicit so
-/// an unbound principal is never mistaken for one with an empty bounded scope.
+/// an unbound principal is never mistaken for one with an empty bounded scope,
+/// and an unresolved family-restricted account is never mistaken for either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CardAttribution<'a> {
-    /// Only the members of this signed Card scope.
-    Scoped(&'a CardRefScope),
+    /// Only the members of this signed Card UID scope.
+    Scoped(&'a [CardUid]),
     /// Any registered observation-target Card in the principal's tenant.
     AnyRegistered,
+    /// A family-restricted account with no validated root: no Card-attributed
+    /// authority until a root of this family is selected.
+    RootRequired(&'a WorkloadFamily),
 }
 
-/// Self-describing projection of a principal for request delegation chains.
+/// Projection of one delegation participant.
+///
+/// Account identity plus the participant's own root and non-secret credential
+/// provenance. Historical participants confer no authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrincipalRef {
@@ -280,6 +248,12 @@ pub struct PrincipalRef {
     pub id: PrincipalId,
     /// Principal kind.
     pub kind: PrincipalKind,
+    /// The participant's exact root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_uid: Option<CardUid>,
+    /// Non-secret id of the credential the participant authenticated with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<Uuid>,
 }
 
 impl PrincipalRef {
@@ -288,33 +262,9 @@ impl PrincipalRef {
     pub fn from_principal(principal: &Principal) -> Self {
         Self {
             id: principal.id,
-            kind: principal.kind.clone(),
-        }
-    }
-
-    /// Returns the bound card ref, when this principal has one.
-    ///
-    /// Mirrors [`Principal::card_ref`] for the delegation-chain projection.
-    #[must_use]
-    pub fn card_ref(&self) -> Option<&CardRef> {
-        match &self.kind {
-            PrincipalKind::Service { card_ref, .. } => card_ref.as_ref(),
-            PrincipalKind::Agent { card_ref, .. } => Some(card_ref),
-            PrincipalKind::TenantAdmin | PrincipalKind::User | PrincipalKind::System { .. } => None,
-        }
-    }
-
-    /// Returns the card scope for card-carrying machine principals.
-    ///
-    /// Mirrors [`Principal::card_ref_scope`] for the delegation-chain
-    /// projection.
-    #[must_use]
-    pub fn card_ref_scope(&self) -> Option<&CardRefScope> {
-        match &self.kind {
-            PrincipalKind::Service { card_ref_scope, .. }
-            | PrincipalKind::Agent { card_ref_scope, .. }
-            | PrincipalKind::System { card_ref_scope } => Some(card_ref_scope),
-            PrincipalKind::TenantAdmin | PrincipalKind::User => None,
+            kind: principal.kind,
+            workload_uid: principal.workload_uid.clone(),
+            credential_id: principal.credential_id,
         }
     }
 }
@@ -322,19 +272,22 @@ impl PrincipalRef {
 #[cfg(test)]
 mod tests {
     use super::{CardAttribution, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef};
-    use crate::permission::{Permission, PermissionSet};
-    use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::CardName;
-    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use crate::permission::PermissionSet;
+    use wyrd_spec::auth::{CardAccess, FamilyRestriction, WorkloadFamily, WorkloadKind};
+    use wyrd_spec::ids::{CardName, CardUid};
 
-    fn service_card_ref() -> CardRef {
-        CardRef {
-            kind: CardKind::Service,
-            name: CardName::new("billing").expect("static card name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            uid: None,
-        }
+    fn uid() -> CardUid {
+        CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 Card UID")
+    }
+
+    fn principal(kind: PrincipalKind) -> Principal {
+        Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            kind,
+            wyrd_spec::DataTenantId::new_v7(),
+            Vec::new(),
+            PermissionSet::new(),
+        )
     }
 
     #[test]
@@ -359,233 +312,54 @@ mod tests {
         assert_eq!(id.as_uuid(), uuid);
     }
 
-    #[test]
-    fn service_kind_carries_card_ref() {
-        let card_ref = service_card_ref();
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::Service {
-                card_ref: Some(card_ref.clone()),
-                card_ref_scope: CardRefScope::own(&card_ref),
-            },
-            tenant_id: wyrd_spec::DataTenantId::new_v7(),
-            roles: vec![RoleRef::new("agent").expect("static role is valid")],
-            effective_permissions: PermissionSet::from_iter([Permission::card_read()]),
-            credential_id: None,
-        };
-
-        assert_eq!(principal.card_ref(), Some(&card_ref));
-    }
-
-    /// Only a Card-bound Service principal with a resolved Service UID names
-    /// an owner; an unresolved Service ref and an Agent record none.
+    /// Rootless accounts attribute to any registered Card, SYSTEM starts
+    /// empty, a scope authorizes exactly its UIDs, and an unresolved family
+    /// account is neither.
     ///
     /// # Panics
-    /// Panics when an owner is reported for the wrong principal kind.
+    /// Panics when a state projects the wrong attribution.
     #[test]
-    fn owner_service_uid_copies_only_a_resolved_service_card() {
-        let principal = |kind| Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind,
-            tenant_id: wyrd_spec::DataTenantId::new_v7(),
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
-        };
-        let uid = wyrd_spec::ids::CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 Card UID");
-        let resolved = CardRef {
-            uid: Some(uid.clone()),
-            ..service_card_ref()
-        };
-        let service = |card_ref: CardRef| PrincipalKind::Service {
-            card_ref_scope: CardRefScope::own(&card_ref),
-            card_ref: Some(card_ref),
-        };
-        assert_eq!(
-            principal(service(resolved.clone())).owner_service_uid(),
-            Some(&uid)
-        );
-        assert_eq!(
-            principal(service(service_card_ref())).owner_service_uid(),
-            None
-        );
-        let agent = CardRef {
-            kind: CardKind::Agent,
-            ..resolved
-        };
-        assert_eq!(
-            principal(PrincipalKind::Agent {
-                card_ref_scope: CardRefScope::own(&agent),
-                card_ref: agent,
-            })
-            .owner_service_uid(),
-            None
-        );
-    }
-
-    #[test]
-    fn principal_ref_keeps_card_ref_projection() {
-        let card_ref = service_card_ref();
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::Service {
-                card_ref: Some(card_ref.clone()),
-                card_ref_scope: CardRefScope::own(&card_ref),
-            },
-            tenant_id: wyrd_spec::DataTenantId::new_v7(),
-            roles: vec![RoleRef::new("agent").expect("static role is valid")],
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
-        };
-
-        let principal_ref = PrincipalRef::from_principal(&principal);
-
-        assert_eq!(principal_ref.id, principal.id);
-        assert_eq!(principal_ref.card_ref(), Some(&card_ref));
-        assert_eq!(
-            principal_ref.card_ref_scope(),
-            Some(&CardRefScope::own(&card_ref))
-        );
-        assert_eq!(principal_ref.kind, principal.kind);
-    }
-
-    #[test]
-    fn principal_authorizes_cards_from_scope() {
-        let own = service_card_ref();
-        let mut composed = service_card_ref();
-        composed.name = CardName::new("composed").expect("static card name is valid");
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::Service {
-                card_ref: Some(own.clone()),
-                card_ref_scope: CardRefScope::from_root_and_members(&own, [composed.clone()]),
-            },
-            tenant_id: wyrd_spec::DataTenantId::new_v7(),
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
-        };
-
-        assert!(principal.authorizes_card(&own));
-        assert!(principal.authorizes_card(&composed));
-
-        let mut unrelated = service_card_ref();
-        unrelated.name = CardName::new("unrelated").expect("static card name is valid");
-        assert!(!principal.authorizes_card(&unrelated));
-    }
-
-    /// A Card-bound principal attributes only within its signed scope, while a
-    /// tenant administrator, a user, and Card-free automation may attribute to
-    /// any registered Card rather than to an empty bounded scope.
-    ///
-    /// # Panics
-    /// Panics when a principal kind projects the wrong attribution.
-    #[test]
-    fn only_unbound_principals_attribute_to_any_registered_card() {
-        let own = service_card_ref();
-        let scope = CardRefScope::own(&own);
-        let principal = |kind| {
-            Principal::new(
-                PrincipalId::new(uuid::Uuid::now_v7()),
-                kind,
-                wyrd_spec::DataTenantId::new_v7(),
-                Vec::new(),
-                PermissionSet::new(),
-            )
-        };
-
-        let bound = principal(PrincipalKind::Service {
-            card_ref: Some(own),
-            card_ref_scope: scope.clone(),
-        });
-        assert_eq!(bound.card_attribution(), CardAttribution::Scoped(&scope));
-        for unbound in [
+    fn card_attribution_follows_the_signed_access_state() {
+        for kind in [
             PrincipalKind::TenantAdmin,
             PrincipalKind::User,
-            PrincipalKind::Service {
-                card_ref: None,
-                card_ref_scope: CardRefScope::default(),
-            },
+            PrincipalKind::Service,
         ] {
             assert_eq!(
-                principal(unbound).card_attribution(),
+                principal(kind).card_attribution(),
                 CardAttribution::AnyRegistered
             );
         }
-    }
-
-    /// Build the UID-bearing Verifier reference a SYSTEM result frame is
-    /// scoped to.
-    ///
-    /// # Panics
-    /// Panics when a static identity component is invalid.
-    fn verifier_card_ref() -> CardRef {
-        CardRef {
-            kind: CardKind::Verifier,
-            name: CardName::new("drift").expect("static card name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            uid: Some(
-                wyrd_spec::ids::CardUid::from_uuid(uuid::Uuid::now_v7())
-                    .expect("UUIDv7 is a valid card UID"),
-            ),
-        }
-    }
-
-    /// The tenant SYSTEM principal binds no root Card, yet exposes the one
-    /// Verifier scope of a result frame so Scribe can stamp result rows.
-    ///
-    /// # Panics
-    /// Panics when the kind projects a root Card, loses its scope, authorizes
-    /// a Card outside that scope, or does not round-trip as `system`.
-    #[test]
-    fn system_kind_exposes_its_verifier_scope_without_a_root_card() {
-        let verifier = verifier_card_ref();
-        let principal = Principal::new(
-            PrincipalId::new(uuid::Uuid::now_v7()),
-            PrincipalKind::System {
-                card_ref_scope: CardRefScope::own(&verifier),
+        assert_eq!(
+            principal(PrincipalKind::System).card_attribution(),
+            CardAttribution::Scoped(&[])
+        );
+        let (root, member, outside) = (uid(), uid(), uid());
+        let scoped = principal(PrincipalKind::Service).with_card_access(
+            CardAccess::Scoped {
+                cards: vec![root.clone(), member.clone()],
             },
-            wyrd_spec::DataTenantId::new_v7(),
-            Vec::new(),
-            PermissionSet::from_iter([Permission::bifrost_record_write()]),
+            Some(root.clone()),
         );
-
-        assert_eq!(
-            principal.kind.tag(),
-            wyrd_spec::auth::PrincipalKindTag::System
-        );
-        assert_eq!(principal.card_ref(), None);
-        assert_eq!(
-            principal.card_ref_scope(),
-            Some(&CardRefScope::own(&verifier))
-        );
-        assert!(principal.authorizes_card(&verifier));
-        assert!(!principal.authorizes_card(&service_card_ref()));
-
-        let principal_ref = PrincipalRef::from_principal(&principal);
-        assert_eq!(principal_ref.card_ref(), None);
-        assert_eq!(principal_ref.card_ref_scope(), principal.card_ref_scope());
-
-        let wire = serde_json::to_value(&principal.kind).expect("kind serializes");
-        assert_eq!(wire["kind"], "system");
-        assert_eq!(
-            serde_json::from_value::<PrincipalKind>(wire).expect("kind deserializes"),
-            principal.kind
-        );
-    }
-
-    #[test]
-    fn user_principal_authorizes_no_cards() {
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::User,
-            tenant_id: wyrd_spec::DataTenantId::new_v7(),
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
+        assert!(scoped.authorizes_card_uid(&member));
+        assert!(!scoped.authorizes_card_uid(&outside));
+        let projected = PrincipalRef::from_principal(&scoped);
+        assert_eq!(projected.workload_uid, Some(root));
+        let family = WorkloadFamily {
+            kind: WorkloadKind::Service,
+            name: CardName::new("checkout").expect("static name"),
         };
-
-        assert!(!principal.authorizes_card(&service_card_ref()));
+        let unresolved = principal(PrincipalKind::Service).with_card_access(
+            CardAccess::RootRequired {
+                restriction: FamilyRestriction::Family(family.clone()),
+            },
+            None,
+        );
+        assert_eq!(
+            unresolved.card_attribution(),
+            CardAttribution::RootRequired(&family)
+        );
+        assert!(!unresolved.authorizes_card_uid(&member));
     }
 }
 

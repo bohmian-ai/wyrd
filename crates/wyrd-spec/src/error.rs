@@ -737,9 +737,66 @@ pub enum WyrdError {
         code = "WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE",
         status = 413,
         title = "Card scope too large",
-        remediation = "Reduce or split the principal's declared card-ref graph so its transitive observation-target scope fits the token size limit, or issue a narrower card-bound principal."
+        remediation = "Reduce or split the selected root's declared Card graph so its transitive observation-target scope fits the token size limit, or select a root with a smaller graph."
     )]
     CardScopeTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An explicitly selected workload root cannot be used by this account.
+    #[error("[WYRD_AUTH_401_WORKLOAD_UID_REFUSED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
+        status = 401,
+        title = "Workload root refused",
+        remediation = "`workload_uid` is optional. When supplied it must name an active, registered Service or Agent Card version in this tenant that the account's workload restriction allows; unknown and foreign roots are refused identically. Omit it to authenticate the account without workload context, or register the release and pass its exact Card UID."
+    )]
+    WorkloadUidRefused {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A family-restricted account attempted Card-attributed work without a
+    /// validated root.
+    #[error("[WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED",
+        status = 403,
+        title = "Workload context required",
+        remediation = "This account is restricted to one workload family, so Card-attributed emission and verification need the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root."
+    )]
+    WorkloadContextRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload; `reason` is `workload_context_required`.
+        details: serde_json::Value,
+    },
+    /// A request header tried to change the root a signed token already pins.
+    #[error("[WYRD_AUTH_400_SIGNED_WORKLOAD_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_SIGNED_WORKLOAD_MISMATCH",
+        status = 400,
+        title = "Workload context differs from the signed root",
+        remediation = "The bearer token already pins a workload root, which a request header cannot change. Send the same `x-wyrd-workload-uid` or none, or obtain a separate token for the other release."
+    )]
+    SignedWorkloadMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload; `reason` is `signed_workload_mismatch`.
+        details: serde_json::Value,
+    },
+    /// Another Service account already owns this workload family.
+    #[error("[WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT",
+        status = 409,
+        title = "Workload family already has a runtime account",
+        remediation = "Each Service or Agent family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`."
+    )]
+    WorkloadBindingConflict {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -3696,6 +3753,10 @@ impl WyrdError {
             | Self::ApiKeyInvalid { message, details }
             | Self::InvalidCardRef { message, details }
             | Self::CardScopeTooLarge { message, details }
+            | Self::WorkloadUidRefused { message, details }
+            | Self::WorkloadContextRequired { message, details }
+            | Self::SignedWorkloadMismatch { message, details }
+            | Self::WorkloadBindingConflict { message, details }
             | Self::DelegationDepthExceededVerify { message, details }
             | Self::PrincipalNotFound { message, details }
             | Self::AdminConflict { message, details }

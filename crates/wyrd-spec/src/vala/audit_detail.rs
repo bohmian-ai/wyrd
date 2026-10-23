@@ -500,8 +500,8 @@ pub enum CardScopeMintKind {
 ///
 /// The projection is deliberately identity-only: a delegation chain reaches
 /// audit from a token the verifier already accepted, so the record needs the
-/// delegator's identity and the card authority it was acting under, never the
-/// credential that carried them. Steps are stored in the same initiator-first
+/// delegator's identity and the exact workload root it was acting under,
+/// never the credential that carried them. Steps are stored in the same initiator-first
 /// order the verifier produced, because the order is the delegation, not an
 /// incidental encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -511,13 +511,10 @@ pub struct AuditDelegationStep {
     pub principal_id: PrincipalId,
     /// Card-free kind discriminator of the delegating principal.
     pub principal_kind: PrincipalKindTag,
-    /// Card bound to the delegator; absent for a `User` principal.
+    /// Exact Service or Agent root the delegator acted under; absent for a
+    /// rootless hop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub card_ref: Option<CardRef>,
-    /// Transitive card authorization the delegator acted under; empty for a
-    /// `User` principal.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub card_ref_scope: Vec<CardRef>,
+    pub workload_uid: Option<CardUid>,
 }
 
 /// Structured detail for one auditable operation.
@@ -1173,8 +1170,7 @@ mod tests {
         let step = super::AuditDelegationStep {
             principal_id: PrincipalId::new(uuid::Uuid::nil()),
             principal_kind: PrincipalKindTag::Service,
-            card_ref: None,
-            card_ref_scope: Vec::new(),
+            workload_uid: None,
         };
         let delegated = audit_detail_canonical_json(&read(vec![step.clone()]));
         assert_ne!(

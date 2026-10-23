@@ -1,9 +1,9 @@
 ---
 id: TASK-002
 kind: implementation
-status: proposed
+status: ready
 spec: SPEC-service-identity-and-telemetry
-spec_revision: 12
+spec_revision: 13
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-027, REQ-028, REQ-030, REQ-031, REQ-032, REQ-033, REQ-040, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, AC-001, AC-002, AC-003, AC-004, AC-005, AC-009, AC-010, AC-011, AC-014]
 depends_on: [TASK-001]
 ---
@@ -274,7 +274,7 @@ Run `mise run test:principals:unit` and `mise run test:principals:integration` f
 
 ## Authority Links
 
-- [Approved specification revision 12](../spec.md), [complete auth contracts](../supplements/auth-system.md),
+- [Approved specification revision 13](../spec.md), [complete auth contracts](../supplements/auth-system.md),
   [telemetry production](../supplements/telemetry-schemas.md), and
   [shared tables/origin](../supplements/table-storage-and-correlation.md).
 - [Runtime identity](../../../../architecture/wyrd-design.md#runtime-identity),

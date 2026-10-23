@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{AbsoluteUrl, SecretBearer};
-use crate::ids::TenantSlug;
+use crate::ids::{CardUid, TenantSlug};
 
 /// Parameters of `POST /auth/token`, discriminated by `grant_type`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -50,6 +50,10 @@ pub enum TokenRequest {
         actor_token_type: Option<ExchangeTokenType>,
         /// Wyrd resource a delegated token is issued for; delegation only.
         audience: Option<TokenAudience>,
+        /// Exact Service or Agent root selecting the API key owner's workload
+        /// context; API-key subject only. It selects context, never another
+        /// principal or tenant.
+        workload_uid: Option<CardUid>,
     },
     /// RFC 7523 §2.1: a platform-attested workload assertion.
     #[serde(rename = "urn:ietf:params:oauth:grant-type:jwt-bearer")]
@@ -58,6 +62,10 @@ pub enum TokenRequest {
         assertion: SecretBearer,
         /// Tenant selector fallback when the request host does not carry tenant.
         tenant: Option<TenantSlug>,
+        /// Exact root selecting workload context; overrides the mapping's
+        /// configured default and stays within the mapped account's
+        /// restriction.
+        workload_uid: Option<CardUid>,
     },
 }
 
@@ -235,6 +243,7 @@ mod tests {
         TokenRequest, TokenResponse, TokenType,
     };
     use crate::auth::SecretBearer;
+    use crate::ids::CardUid;
 
     /// Decode form-shaped parameters, as the token endpoint does.
     ///
@@ -272,7 +281,38 @@ mod tests {
                 actor_token: None,
                 actor_token_type: None,
                 audience: None,
+                workload_uid: None,
             }
+        );
+        let root = "019a7c00-0000-7000-8000-000000000001";
+        assert_eq!(
+            parse(&[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange"
+                ),
+                ("subject_token", "wyrd_sk_key"),
+                ("subject_token_type", "urn:wyrd:oauth:token-type:api_key"),
+                ("workload_uid", root),
+            ])
+            .expect("api-key exchange with a root decodes"),
+            TokenRequest::TokenExchange {
+                subject_token: SecretBearer::new("wyrd_sk_key".to_owned()),
+                subject_token_type: ExchangeTokenType::ApiKey,
+                actor_token: None,
+                actor_token_type: None,
+                audience: None,
+                workload_uid: Some(CardUid::new(root).expect("static v7 uid")),
+            }
+        );
+        assert!(
+            parse(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("assertion", "a"),
+                ("workload_uid", "not-a-uid"),
+            ])
+            .is_err(),
+            "a malformed root is refused, not ignored"
         );
         assert_eq!(
             parse(&[
@@ -352,6 +392,7 @@ mod tests {
         let request = TokenRequest::JwtBearer {
             assertion: SecretBearer::new("top-secret-assertion".to_owned()),
             tenant: None,
+            workload_uid: None,
         };
 
         let debug = format!("{request:?}");

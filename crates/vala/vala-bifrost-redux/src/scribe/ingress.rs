@@ -107,8 +107,10 @@ struct AdmittedRowContext {
     attribution: StampedAttribution,
     /// Card UIDs every row's `card_uid` is authorized against.
     card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
-    /// Catalog fingerprint required of the projected source schema.
-    expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the projected source schema;
+    /// `None` leaves the selected definition's conformance as the only
+    /// schema authority.
+    expected_schema_fingerprint: Option<crate::schema::fingerprint::SchemaFingerprint>,
     /// Stable request identity moved into managed-column stamping.
     request_id: wyrd_spec::request_id::RequestId,
     /// Stable logical batch identity.
@@ -135,8 +137,10 @@ struct AdmittedRowContext {
 /// Both halves come from the same control row: the schema the caller must
 /// match, and the canonical layout that fixes how the rows are partitioned.
 struct LogicalFrameContract {
-    /// Catalog fingerprint required of the caller-owned source schema.
-    expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the caller-owned source
+    /// schema; `None` leaves the selected definition's conformance as the
+    /// only schema authority.
+    expected_schema_fingerprint: Option<crate::schema::fingerprint::SchemaFingerprint>,
     /// Registered time axis every slice of this frame is bucketed by.
     partition_scheme: crate::catalog::PartitionScheme,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
@@ -153,8 +157,10 @@ struct LogicalFrameContract {
 
 /// Root admission state established before any scalable materialization.
 struct RootAdmission {
-    /// Catalog fingerprint required of the caller-owned source schema.
-    expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the caller-owned source
+    /// schema; `None` leaves the selected definition's conformance as the
+    /// only schema authority.
+    expected_schema_fingerprint: Option<crate::schema::fingerprint::SchemaFingerprint>,
     /// Registered time axis applied to every prepared slice.
     partition_scheme: crate::catalog::PartitionScheme,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
@@ -180,10 +186,11 @@ struct RootAdmission {
 impl ScribeImpl {
     /// Resolves one authenticated logical frame under the Scribe catalog owner.
     ///
-    /// The catalog owner is authoritative for both halves of the contract: a
-    /// caller-supplied fingerprint is honored as an override, but the time
-    /// axis always comes from the registered canonical layout so no ingest path
-    /// can invent one. The embedded engine seam has no catalog owner: it takes
+    /// The catalog owner is authoritative for both halves of the contract: the
+    /// selected table version's native schema is the schema authority every
+    /// batch conforms to, a caller-supplied fingerprint is additionally
+    /// required when present, and the time axis always comes from the
+    /// registered canonical layout so no ingest path can invent one. The embedded engine seam has no catalog owner: it takes
     /// a built-in table's axis from the built-in layout, falls back to hourly
     /// `wyrd_ingested_at` for any other table, and must supply its own
     /// fingerprint.
@@ -203,12 +210,11 @@ impl ScribeImpl {
     ) -> Result<LogicalFrameContract, ScribeError> {
         let builtin = Self::builtin_definition(&frame.table);
         let Some(catalog) = self.catalog.as_ref() else {
-            let expected_schema_fingerprint =
-                frame
-                    .expected_schema_fingerprint
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "Scribe logical ingress requires its catalog owner".to_owned(),
-                    })?;
+            let expected_schema_fingerprint = Some(frame.expected_schema_fingerprint.ok_or_else(
+                || ScribeError::Internal {
+                    detail: "Scribe logical ingress requires its catalog owner".to_owned(),
+                },
+            )?);
             return Ok(LogicalFrameContract {
                 expected_schema_fingerprint,
                 partition_scheme: builtin.map_or_else(
@@ -231,10 +237,6 @@ impl ScribeImpl {
                 retry_only: None,
             });
         };
-        let (registered_fingerprint, _) = catalog
-            .table_registration(&frame.table, frame.authenticated_tenant)
-            .await
-            .map_err(scribe_catalog_error)?;
         let current = catalog
             .current_definition(&frame.table, frame.authenticated_tenant)
             .await
@@ -262,9 +264,7 @@ impl ScribeImpl {
             _ => (current, None),
         };
         Ok(LogicalFrameContract {
-            expected_schema_fingerprint: frame
-                .expected_schema_fingerprint
-                .unwrap_or(registered_fingerprint),
+            expected_schema_fingerprint: frame.expected_schema_fingerprint,
             partition_scheme: definition.partition_scheme.clone(),
             registered_schema: Some(Arc::clone(&definition.schema)),
             retry_only,

@@ -465,8 +465,10 @@ pub(crate) struct IngressDecodeInputs {
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<CardUid>>,
-    /// Catalog fingerprint required of the caller-owned source schema.
-    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the caller-owned source
+    /// schema; `None` leaves conformance to the registered schema as the only
+    /// schema authority.
+    pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: RequestId,
     /// Admission instant stamped as `wyrd_ingested_at`.
@@ -491,8 +493,10 @@ pub(crate) struct DecodeContext<'a> {
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<&'a [CardUid]>,
-    /// Catalog fingerprint required of the caller-owned source schema.
-    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the caller-owned source
+    /// schema; `None` leaves conformance to the registered schema as the only
+    /// schema authority.
+    pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: &'a RequestId,
     /// Admission instant in epoch microseconds, read once per batch and
@@ -574,9 +578,10 @@ fn decode_rows(
     let conformed;
     let rows = match context.registered_schema {
         Some(registered) => {
+            let policy = correlation_policy(context);
             conformed = match context.conform {
-                Some(plans) => plans.conform(rows, registered)?,
-                None => conform_to_registered(rows, registered)?,
+                Some(plans) => plans.conform(rows, registered, policy)?,
+                None => conform_to_registered(rows, registered, policy)?,
             };
             &conformed
         }
@@ -585,9 +590,10 @@ fn decode_rows(
     if let Some(definition) = context.definition {
         enforce_builtin_source_contract(rows, definition, trusted)?;
     }
-    let actual_source_fingerprint =
-        source_schema_fingerprint(rows.schema().as_ref(), correlation_policy(context));
-    if actual_source_fingerprint != context.expected_schema_fingerprint {
+    if let Some(expected) = context.expected_schema_fingerprint
+        && source_schema_fingerprint(rows.schema().as_ref(), correlation_policy(context))
+            != expected
+    {
         return Err(ScribeError::FingerprintMismatch {
             table: "resolved ingress table".to_owned(),
         });
@@ -629,21 +635,27 @@ fn decode_rows(
 ///   marker with parameters, at any depth — is refused as an unsupported type
 ///   before any value is read, because the storage-only fingerprint cannot
 ///   see the extension;
-/// - any other column is kept as sent, so the fingerprint check refuses it.
+/// - any other matched column, a column `policy` does not reserve that the
+///   table does not register, and a registered column `policy` does not
+///   reserve that was not sent are refused, so the registered schema of the
+///   selected table version alone decides the caller-owned columns; reserved
+///   columns are left for managed stamping.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::ContractViolation`] carrying
 /// [`BifrostError::UnsupportedType`] for a Variant identity mismatch,
-/// [`ScribeError::FingerprintMismatch`] when the registered schema has no
-/// Arrow form or Arrow cannot cast an equivalent column, and
+/// [`ScribeError::FingerprintMismatch`] for a column the registered schema
+/// does not accept, a missing registered column, a registered schema with no
+/// Arrow form, or an equivalent column Arrow cannot cast, and
 /// [`ScribeError::InvalidFrame`] when Arrow refuses the conformed batch, which
 /// duplicate-free input cannot cause.
 fn conform_to_registered(
     rows: &RecordBatch,
     registered: &IcebergSchema,
+    policy: CorrelationPolicy,
 ) -> Result<RecordBatch, ScribeError> {
-    ConformPlan::build(&rows.schema(), registered)?.apply(rows)
+    ConformPlan::build(&rows.schema(), registered, policy)?.apply(rows)
 }
 
 /// How every batch of one sent Arrow schema conforms to one registered
@@ -669,14 +681,25 @@ impl ConformPlan {
     ///
     /// Returns [`ScribeError::ContractViolation`] carrying
     /// [`BifrostError::UnsupportedType`] for a Variant identity mismatch and
-    /// [`ScribeError::FingerprintMismatch`] when the registered schema has no
-    /// Arrow form.
-    fn build(sent: &Schema, registered: &IcebergSchema) -> Result<Self, ScribeError> {
-        let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| {
-            ScribeError::FingerprintMismatch {
-                table: "resolved ingress table".to_owned(),
-            }
-        })?;
+    /// [`ScribeError::FingerprintMismatch`] for a column the registered schema
+    /// does not accept, a missing registered column, or a registered schema
+    /// with no Arrow form.
+    fn build(
+        sent: &Schema,
+        registered: &IcebergSchema,
+        policy: CorrelationPolicy,
+    ) -> Result<Self, ScribeError> {
+        let mismatch = || ScribeError::FingerprintMismatch {
+            table: "resolved ingress table".to_owned(),
+        };
+        let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| mismatch())?;
+        if target
+            .fields()
+            .iter()
+            .any(|wanted| !policy.reserves(wanted.name()) && sent.index_of(wanted.name()).is_err())
+        {
+            return Err(mismatch());
+        }
         let registered_columns = target
             .fields()
             .iter()
@@ -704,7 +727,9 @@ impl ConformPlan {
                         },
                     ));
                 }
-                _ => None,
+                Some(_) => return Err(mismatch()),
+                None if !policy.reserves(field.name()) => return Err(mismatch()),
+                None => None,
             };
             fields.push(match &cast {
                 Some(data_type) => {
@@ -792,6 +817,7 @@ impl ConformPlans {
         &self,
         rows: &RecordBatch,
         registered: &Arc<IcebergSchema>,
+        policy: CorrelationPolicy,
     ) -> Result<RecordBatch, ScribeError> {
         let sent = rows.schema();
         let key = Arc::as_ptr(registered).addr();
@@ -808,7 +834,7 @@ impl ConformPlans {
         if let Some(plan) = remembered {
             return plan.apply(rows);
         }
-        let plan = Arc::new(ConformPlan::build(&sent, registered)?);
+        let plan = Arc::new(ConformPlan::build(&sent, registered, policy)?);
         self.plans
             .write()
             .expect("the conform plan lock is never poisoned")
@@ -2283,7 +2309,7 @@ mod tests {
             definition: None,
             attribution: Attribution::direct(principal.id).into(),
             card_scope,
-            expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
+            expected_schema_fingerprint: Some(SchemaFingerprint([0_u8; 32])),
             request_id,
             receipt_micros: receipt_now(),
             registered_schema: None,
@@ -2396,10 +2422,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     &Schema::new(cast_table_columns()),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -2474,16 +2500,28 @@ mod tests {
         let plans = super::ConformPlans::default();
 
         let first = plans
-            .conform(&narrow_spellings(Some("UTC")), &registered)
+            .conform(
+                &narrow_spellings(Some("UTC")),
+                &registered,
+                CorrelationPolicy::Observation,
+            )
             .expect("the first batch conforms");
         let second = plans
-            .conform(&narrow_spellings(Some("UTC")), &registered)
+            .conform(
+                &narrow_spellings(Some("UTC")),
+                &registered,
+                CorrelationPolicy::Observation,
+            )
             .expect("the second batch conforms");
 
         assert_eq!(
             first,
-            super::conform_to_registered(&narrow_spellings(Some("UTC")), &registered)
-                .expect("a fresh plan conforms")
+            super::conform_to_registered(
+                &narrow_spellings(Some("UTC")),
+                &registered,
+                CorrelationPolicy::Observation
+            )
+            .expect("a fresh plan conforms")
         );
         assert!(
             Arc::ptr_eq(&first.schema(), &second.schema()),
@@ -2614,7 +2652,9 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
+                expected_schema_fingerprint: Some(SchemaFingerprint((definition
+                    .schema_fingerprint)(
+                ))),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: Some(definition),
@@ -2673,7 +2713,9 @@ mod tests {
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
                 card_scope: None,
-                expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
+                expected_schema_fingerprint: Some(SchemaFingerprint((definition
+                    .schema_fingerprint)(
+                ))),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: Some(definition),
@@ -2769,8 +2811,9 @@ mod tests {
         let principal = principal();
         let request_id = RequestId::now_v7();
         let mut context = stamping_context(&principal, None, &request_id);
-        context.expected_schema_fingerprint =
-            crate::contracts::projected_source_schema_fingerprint(attributed.schema().as_ref());
+        context.expected_schema_fingerprint = Some(
+            crate::contracts::projected_source_schema_fingerprint(attributed.schema().as_ref()),
+        );
         assert!(
             matches!(
                 decode_rows(&attributed, &context, false),
@@ -3174,10 +3217,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3226,10 +3269,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     schema,
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3361,10 +3404,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3414,10 +3457,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3459,10 +3502,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3518,10 +3561,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3630,10 +3673,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3685,10 +3728,10 @@ mod tests {
                         .card_ref_scope()
                         .map(CardRefScope::uids)
                         .as_deref(),
-                    expected_schema_fingerprint: source_schema_fingerprint(
+                    expected_schema_fingerprint: Some(source_schema_fingerprint(
                         rows.schema().as_ref(),
                         CorrelationPolicy::Observation,
-                    ),
+                    )),
                     request_id: &RequestId::now_v7(),
                     receipt_micros: receipt_now(),
                     definition: None,
@@ -3960,14 +4003,18 @@ mod tests {
             "{\"shredded\":true}".to_owned(),
         );
 
-        conform_to_registered(&send(variant.clone()), &registered)
-            .expect("the canonical Variant conforms");
+        conform_to_registered(
+            &send(variant.clone()),
+            &registered,
+            CorrelationPolicy::Observation,
+        )
+        .expect("the canonical Variant conforms");
         for sent in [
             Field::new("payload", variant.data_type().clone(), true),
             variant.with_metadata(parameters),
         ] {
             assert!(matches!(
-                conform_to_registered(&send(sent), &registered),
+                conform_to_registered(&send(sent), &registered, CorrelationPolicy::Observation),
                 Err(ScribeError::ContractViolation(BifrostError::UnsupportedType { ref field, .. }))
                     if field == "payload"
             ));
@@ -4006,7 +4053,9 @@ mod tests {
         ])
         .expect("batch builds");
 
-        let ordered = conform_to_registered(&rows, &registered_ab()).expect("names all match");
+        let ordered =
+            conform_to_registered(&rows, &registered_ab(), CorrelationPolicy::Observation)
+                .expect("names all match");
 
         let names = ordered
             .schema()

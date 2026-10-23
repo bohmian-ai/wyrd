@@ -86,8 +86,9 @@ pub(crate) struct NativeAdmittedRows {
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
-    /// Catalog fingerprint validated independently for every source batch.
-    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
+    /// Caller-supplied fingerprint validated independently for every source
+    /// batch, when one was supplied.
+    pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
     /// Request identity stamped into every source batch.
     pub(crate) request_id: RequestId,
     /// Stable batch identity keying every produced slice.
@@ -1112,7 +1113,7 @@ mod tests {
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,
             attribution: Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())).into(),
-            expected_schema_fingerprint: fingerprint,
+            expected_schema_fingerprint: Some(fingerprint),
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
             receipt_micros: 0,

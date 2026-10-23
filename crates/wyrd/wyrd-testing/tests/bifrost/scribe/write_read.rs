@@ -1562,12 +1562,17 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
 /// rename and a nullable addition: every source — published, staged, active,
 /// and restored — answers exact time, equality, null, and membership filters
 /// by stable field id, reads the added column as null, and stays invisible to
-/// another tenant.
+/// another tenant. After the revision the description names the new columns,
+/// a batch spelled with them is written, and a spec-1 batch retried at its
+/// original version is still acknowledged once; the replaced column name, a
+/// mistyped added column, and changed content under the accepted id are
+/// refused.
 ///
 /// # Panics
 ///
-/// Panics when any read differs, the added column is not null, or another
-/// tenant reads the table.
+/// Panics when any read differs, the added column is not null, another
+/// tenant reads the table, the evolved batch or the original retry is
+/// refused, or a refusal stores a row.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn mixed_runtime_specifications_preserve_rows_and_pins() {
@@ -1600,14 +1605,11 @@ async fn mixed_runtime_specifications_preserve_rows_and_pins() {
     scribe.flush_writable_for_test().await.expect("freezes");
     super::support::await_persistence_drained(&scribe).await;
     drop(scribe);
-    super::support::append_batch(
-        &client,
-        &table,
-        uuid::Uuid::now_v7(),
-        &shifted(&composite_batch(), 2 * COMPOSITE_ROWS),
-    )
-    .await
-    .expect("the active spec-1 batch is acknowledged");
+    let active = uuid::Uuid::now_v7();
+    let active_batch = shifted(&composite_batch(), 2 * COMPOSITE_ROWS);
+    super::support::append_batch(&client, &table, active, &active_batch)
+        .await
+        .expect("the active spec-1 batch is acknowledged");
 
     server.commit_schema_revision(tenant, &table_ref).await;
     assert_mixed_reads(&client, &table, "published, staged, and active").await;
@@ -1618,6 +1620,95 @@ async fn mixed_runtime_specifications_preserve_rows_and_pins() {
     assert_mixed_reads(&client, &table, "restored").await;
     server.flush_bifrost().await.expect("publishes");
     assert_mixed_reads(&client, &table, "published").await;
+
+    let described = wyrd_client::Bifrost::query_only(&client)
+        .describe_table("vala.datasets", &name)
+        .await
+        .expect("the evolved table describes");
+    let spec_revision = wyrd_spec::vala::ids::TableVersion::INITIAL
+        .next()
+        .expect("the spec revision is version 2");
+    let current = spec_revision
+        .next()
+        .expect("the schema revision is version 3");
+    assert_eq!(described.table_version, current);
+    assert_eq!(
+        described
+            .user_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["event_time", "client", "shard", "value", "note"],
+        "the description is the selected version's native schema"
+    );
+    let evolved = evolved_batch(&shifted(&composite_batch(), 3 * COMPOSITE_ROWS));
+    super::support::append_batch_at(&client, &table, current, uuid::Uuid::now_v7(), &evolved)
+        .await
+        .expect("a new batch under the renamed and added columns is acknowledged");
+    super::support::append_batch_at(&client, &table, spec_revision, active, &active_batch)
+        .await
+        .expect("the spec-1 batch retried at its original version is acknowledged");
+    for (refused, why) in [
+        (
+            &shifted(&composite_batch(), 4 * COMPOSITE_ROWS),
+            "the replaced column name",
+        ),
+        (
+            &mistyped_note(&evolved),
+            "a value of the wrong type for the added column",
+        ),
+    ] {
+        let error = super::support::append_batch_at(
+            &client,
+            &table,
+            current,
+            uuid::Uuid::now_v7(),
+            refused,
+        )
+        .await
+        .expect_err(why);
+        assert_eq!(
+            error.code(),
+            "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+            "{why}: {error}"
+        );
+    }
+    assert!(
+        super::support::append_batch_at(
+            &client,
+            &table,
+            spec_revision,
+            active,
+            &shifted(&active_batch, 1)
+        )
+        .await
+        .is_err(),
+        "changed content under the accepted spec-1 id is refused"
+    );
+    server.flush_bifrost().await.expect("publishes");
+    let evolved_rows: Vec<i64> = (3 * COMPOSITE_ROWS..4 * COMPOSITE_ROWS).collect();
+    for (filter, expected) in [
+        ("TRUE", (0..4 * COMPOSITE_ROWS).collect::<Vec<_>>()),
+        ("note IS NOT NULL", evolved_rows.clone()),
+        (
+            "note = 'evolved' AND client = 'a'",
+            evolved_rows
+                .iter()
+                .copied()
+                .filter(|value| value % COMPOSITE_ROWS % 3 == 0)
+                .collect(),
+        ),
+    ] {
+        assert_eq!(
+            super::support::read_sql(
+                &client,
+                &format!("SELECT value FROM {table} WHERE {filter} ORDER BY value")
+            )
+            .await,
+            expected,
+            "evolved: `{filter}` returns each matching row once"
+        );
+    }
 
     let neighbour = server
         .seed_tenant("mixed-specs-neighbour")
@@ -1640,6 +1731,56 @@ async fn mixed_runtime_specifications_preserve_rows_and_pins() {
         }
     };
     assert!(refused, "another tenant never reads the table");
+}
+
+/// Re-spells a composite batch under the schema revision: `customer` sent as
+/// `client` and the added `note` set to `evolved` on every row.
+///
+/// # Panics
+///
+/// Panics when `batch` is not a composite batch.
+fn evolved_batch(batch: &RecordBatch) -> RecordBatch {
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "customer" => field.as_ref().clone().with_name("client"),
+            _ => field.as_ref().clone(),
+        })
+        .collect();
+    fields.push(Field::new("note", DataType::Utf8, true));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(arrow::array::StringArray::from(vec![
+        "evolved";
+        batch
+            .num_rows(
+            )
+    ])));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("evolved batch")
+}
+
+/// Replaces an evolved batch's `note` with an `Int64` column, a type the
+/// revision did not add.
+///
+/// # Panics
+///
+/// Panics when `batch` is not an evolved batch.
+fn mistyped_note(batch: &RecordBatch) -> RecordBatch {
+    let note = batch
+        .schema()
+        .index_of("note")
+        .expect("evolved batch has note");
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields[note] = Field::new("note", DataType::Int64, true);
+    let mut columns = batch.columns().to_vec();
+    columns[note] = Arc::new(Int64Array::from(vec![0_i64; batch.num_rows()]));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("mistyped batch")
 }
 
 /// Requires the three mixed-spec batches once each, by their renamed column,

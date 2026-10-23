@@ -45,7 +45,8 @@ async function appBridgeView(doc: unknown, answer: (name: string, args: Record<s
     void setTimeout(() => target.dispatchEvent(new target.MessageEvent('message', { data, source })));
   view.postMessage = deliver(view, host);
   // jsdom has no ResizeObserver; ext-apps observes the body to report its size.
-  Object.assign(view, { ResizeObserver: class { observe() {} disconnect() {} } });
+  // Its windows also lack structuredClone, which every real host provides.
+  Object.assign(view, { ResizeObserver: class { observe() {} disconnect() {} }, structuredClone });
   // ext-apps traces every message at debug level on both sides.
   for (const each of [view.console, console]) vi.spyOn(each, 'debug').mockImplementation(() => {});
   host.postMessage = deliver(host, view);

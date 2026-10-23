@@ -133,9 +133,13 @@
         : []
     )
   );
-  /** Panels in reading order: document order on the grid, `(y, x)` when stacked. */
+  /**
+   * Panels in reading order: document order on the grid, `(y, x)` when stacked.
+   * Stacking keeps only panels of the current document: a replaced document's
+   * panels stay loaded until the load effect starts the new ones.
+   */
   const ordered = $derived(
-    narrow ? panels.toSorted((a, b) => { const [p, q] = [placements.get(a.id)!, placements.get(b.id)!]; return p.y - q.y || p.x - q.x; }) : panels
+    narrow ? panels.filter((each) => placements.has(each.id)).sort((a, b) => { const [p, q] = [placements.get(a.id)!, placements.get(b.id)!]; return p.y - q.y || p.x - q.x; }) : panels
   );
 
   function boxStyle(id: string) {

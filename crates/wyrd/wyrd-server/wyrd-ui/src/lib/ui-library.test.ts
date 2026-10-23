@@ -72,7 +72,7 @@ import { mcpExecutor } from 'wyrd-ai-ui/mcp';
 import { nodeExecutor } from 'wyrd-ai-ui/node';
 import { Bifrost, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
-import { place as placeAll } from '../../packages/ui/src/lib/layout';
+import { place as placeAll, rowsHeight } from '../../packages/ui/src/lib/layout';
 import { card, denied, fixtureExecutor, RANGE, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
 import { reactive } from '$lib/ui-fixtures.svelte';
 
@@ -1027,17 +1027,66 @@ test('TASK-027: Pointer edit cancellation', async () => {
   host.unmount();
 });
 
-test('TASK-027: Narrow views', () => {
+test('TASK-027: Narrow views', async () => {
   const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(500);
   try {
     const chart = recording(() => ({ ok: true, value: series }));
     const doc = laidOut({ a: { x: 6, y: 0, w: 6, h: 4 }, b: { x: 0, y: 0, w: 6, h: 4 }, c: { x: 0, y: 4, w: 12, h: 2 } });
     const view = render(WyrdView, { doc, executor: chart.executor, onlayout: vi.fn() });
-    expect([...view.container.querySelectorAll('[data-panel]')].map((each) => each.getAttribute('data-panel'))).toEqual(['b', 'a', 'c']);
+    const ids = (container: Element) => [...container.querySelectorAll('[data-panel]')].map((each) => each.getAttribute('data-panel'));
+    expect(ids(view.container)).toEqual(['b', 'a', 'c']);
     expect(panel(view.container, 'a').style.gridColumn).toBe('1 / -1');
     expect(panel(view.container, 'a').style.height).not.toBe('');
     expect(view.queryByRole('button', { name: /Move or resize/ })).toBeNull();
     view.unmount();
+
+    // A host passing a document with other panels while narrow shows only those, in reading order.
+    const pending: ((result: WireResult) => void)[] = [];
+    const held = recording((request) =>
+      (request as { sql?: string }).sql === 'SELECT failing' ? { ok: false, problem: denied } : new Promise<WireResult>((resolve) => pending.push(resolve))
+    );
+    const onlayout = vi.fn();
+    const host = render(WyrdView, { doc: laidOut({ a: { x: 0, y: 4, w: 6, h: 4 }, b: { x: 0, y: 0, w: 6, h: 4 } }), executor: held.executor, onlayout });
+    await waitFor(() => expect(held.calls).toHaveLength(2));
+    const replaced = laidOut({ c: { x: 6, y: 0, w: 6, h: 4 }, d: { x: 0, y: 0, w: 6, h: 3 } });
+    replaced.panels[0].input = { ...replaced.panels[0].input, sql: 'SELECT failing' };
+    await host.rerender({ doc: replaced, executor: held.executor, onlayout });
+    await waitFor(() => expect(held.calls).toHaveLength(4));
+    expect(ids(host.container)).toEqual(['d', 'c']);
+    expect(held.calls[0].signal?.aborted).toBe(true);
+    expect(held.calls[1].signal?.aborted).toBe(true);
+    expect(panel(host.container, 'd').style.gridColumn).toBe('1 / -1');
+    expect(panel(host.container, 'd').style.height).toBe(rowsHeight(3));
+    expect(host.queryByRole('button', { name: /Move or resize/ })).toBeNull();
+    // The current panels keep their loading and failed states; a late outgoing result never returns.
+    expect(panel(host.container, 'd')).toHaveTextContent('Running query');
+    await waitFor(() => expect(panel(host.container, 'c')).toHaveTextContent('Forbidden'));
+    pending[0]({ ok: true, value: series });
+    await tick();
+    expect(host.container.querySelector('[data-panel="a"]')).toBeNull();
+    expect(panel(host.container, 'd')).toHaveTextContent('Running query');
+
+    // Fewer panels drop the removed ones; invalid input then valid input recovers.
+    await host.rerender({ doc: laidOut({ d: { x: 0, y: 0, w: 6, h: 3 } }), executor: held.executor, onlayout });
+    expect(ids(host.container)).toEqual(['d']);
+    await host.rerender({ doc: { version: 'wyrd.view/v1' }, executor: held.executor, onlayout });
+    expect(host.container.querySelector('[data-panel]')).toBeNull();
+    await host.rerender({ doc: laidOut({ e: { x: 6, y: 0, w: 6, h: 2 }, f: { x: 0, y: 0, w: 6, h: 2 } }), executor: held.executor, onlayout });
+    expect(ids(host.container)).toEqual(['f', 'e']);
+
+    // Same panels with changed input reload; a layout-only change reorders without reading.
+    const reads = held.calls.length;
+    const renamed = laidOut({ e: { x: 6, y: 0, w: 6, h: 2 }, f: { x: 0, y: 0, w: 6, h: 2 } });
+    renamed.panels[0].input = { ...renamed.panels[0].input, title: 'renamed' };
+    await host.rerender({ doc: renamed, executor: held.executor, onlayout });
+    await waitFor(() => expect(held.calls).toHaveLength(reads + 2));
+    renamed.panels[0].layout = { x: 0, y: 0, w: 6, h: 2 };
+    renamed.panels[1].layout = { x: 0, y: 2, w: 6, h: 2 };
+    await host.rerender({ doc: structuredClone(renamed), executor: held.executor, onlayout });
+    expect(ids(host.container)).toEqual(['e', 'f']);
+    await tick();
+    expect(held.calls).toHaveLength(reads + 2);
+    host.unmount();
   } finally {
     width.mockRestore();
   }

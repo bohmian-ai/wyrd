@@ -187,8 +187,9 @@ pub trait CheckExecutor: Send + Sync {
 ///
 /// The whole response must satisfy the exact declared schema, decode as a
 /// [`Verdict`], and keep its custom `data` within the fixed bounds. Agent
-/// and code checks share this rule; a refusal names the failing location
-/// or limit, never the response contents.
+/// and code checks share this rule; a refusal names the failing schema
+/// location or limit, never the response contents or a path into them,
+/// since returned dictionary keys are response contents.
 ///
 /// # Errors
 /// Returns [`BlockError::Terminal`], which makes the requirement
@@ -200,8 +201,7 @@ pub fn verdict_from(schema: &Value, response: Value) -> Result<Verdict, BlockErr
         .map_err(|_| terminal("the declared Verdict format is not a valid schema".to_owned()))?;
     if let Some(error) = validator.iter_errors(&response).next() {
         return Err(terminal(format!(
-            "the check response violates its declared Verdict format at `{}` (schema `{}`)",
-            error.instance_path(),
+            "the check response violates its declared Verdict format at schema `{}`",
             error.schema_path()
         )));
     }
@@ -369,6 +369,31 @@ mod tests {
                     "{bad}"
                 );
             }
+        }
+    }
+
+    /// A refusal names where the declared schema failed, never where the
+    /// returned data did, so a dictionary key the check returned stays out
+    /// of the retained reason.
+    ///
+    /// # Panics
+    /// Panics when the refusal is not terminal or echoes the returned key.
+    #[test]
+    fn verdict_refusal_omits_returned_keys() {
+        let format: skald_spec::NamedResponseFormat = serde_json::from_value(json!({
+            "kind": "verdict",
+            "data": {"type": "object", "additionalProperties": {"type": "integer"}}
+        }))
+        .expect("format");
+        let schema = Value::Object(Verdict::response_format(&format).expect("resolves"));
+        let secret = "customer-secret@example.test";
+        let response = json!({"outcome": "passed", "reason": "judged", "citations": [],
+            "data": {"nested": 1, secret: "wrong"}});
+        match verdict_from(&schema, response) {
+            Err(BlockError::Terminal { reason }) => {
+                assert!(!reason.contains("customer-secret"), "{reason}");
+            }
+            other => panic!("expected a terminal refusal, got {other:?}"),
         }
     }
 }

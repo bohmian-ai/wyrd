@@ -151,8 +151,8 @@ class Observe:
         Raises:
             WyrdError: As ``verify``;
                 ``WYRD_SDK_422_VERIFICATION_DATA_INVALID`` naming the first
-                requirement and field path ``data_type`` refuses, never the
-                data; ``WYRD_SPEC_400_VALIDATION`` when ``data_type`` has no
+                requirement ``data_type`` refuses, with the data root's
+                empty ``path``, never the data; ``WYRD_SPEC_400_VALIDATION`` when ``data_type`` has no
                 ``model_validate``.
         """
         ...

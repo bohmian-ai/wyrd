@@ -1530,7 +1530,7 @@ async fn custom_verdict_data_is_typed_on_return() {
 
 /// A caller type the data does not fit fails every typed read with
 /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the requirement and
-/// path, never the payload, while the ordinary read keeps the original
+/// the data root, never the payload or a returned key, while the ordinary read keeps the original
 /// result and nothing is judged again.
 ///
 /// # Panics
@@ -1546,7 +1546,7 @@ async fn typed_verdict_data_mismatch_keeps_original_result() {
         let problem = error.problem();
         assert_eq!(problem.code, "WYRD_SDK_422_VERIFICATION_DATA_INVALID");
         assert_eq!(problem.details["requirement"], "helpful");
-        assert_eq!(problem.details["path"], "category");
+        assert_eq!(problem.details["path"], "", "the safe data root");
         assert!(!problem.detail.contains("refund"), "{}", problem.detail);
     };
 

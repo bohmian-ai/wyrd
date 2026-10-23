@@ -477,8 +477,9 @@ impl VerificationResult {
     ///
     /// # Errors
     /// Returns `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the first
-    /// requirement whose data does not decode and the failing field path,
-    /// never the data itself.
+    /// requirement whose data does not decode, with the empty `path` of the
+    /// data root and never the data itself: a decoder cannot tell a declared
+    /// field name from a returned dictionary key, so no deeper path is safe.
     pub fn decode_data<T: DeserializeOwned>(self) -> Result<VerificationResult<T>, WyrdError> {
         let Self {
             execution_id,
@@ -512,22 +513,19 @@ impl RequirementResult {
     ///
     /// # Errors
     /// Returns `WYRD_SDK_422_VERIFICATION_DATA_INVALID` with the requirement
-    /// ID and failing field path, never the data.
+    /// ID and the data root's empty path, never the data.
     fn decode_data<T: DeserializeOwned>(self) -> Result<RequirementResult<T>, WyrdError> {
         let data = match self.data {
             None => None,
-            Some(data) => Some(
-                serde_path_to_error::deserialize(Value::Object(data)).map_err(|error| {
-                    let path = error.path().to_string();
-                    WyrdError::SdkVerificationDataInvalid {
-                        message: format!(
-                            "requirement `{}` data does not match the requested type at `{path}`",
-                            self.id.as_str()
-                        ),
-                        details: serde_json::json!({"requirement": self.id, "path": path}),
-                    }
-                })?,
-            ),
+            Some(data) => Some(serde_json::from_value(Value::Object(data)).map_err(|_| {
+                WyrdError::SdkVerificationDataInvalid {
+                    message: format!(
+                        "requirement `{}` data does not match the requested type",
+                        self.id.as_str()
+                    ),
+                    details: serde_json::json!({"requirement": self.id, "path": ""}),
+                }
+            })?),
         };
         Ok(RequirementResult {
             id: self.id,
@@ -838,8 +836,11 @@ mod tests {
     /// Panics when a conversion succeeds or fails on the wrong side.
     #[test]
     fn typed_data_decodes_whole_results() {
+        /// The caller's model of a scoring check's custom data, the type
+        /// the typed read decodes each requirement's `data` into.
         #[derive(Debug, PartialEq, Deserialize)]
         struct Judge {
+            /// The judge's score; a string here is the mismatch under test.
             score: f64,
         }
         let requirement = |id: &str, data: Value| {
@@ -881,9 +882,18 @@ mod tests {
         assert_eq!(error.code(), "WYRD_SDK_422_VERIFICATION_DATA_INVALID");
         assert_eq!(
             error.problem().details,
-            json!({"requirement": "secretive", "path": "score"})
+            json!({"requirement": "secretive", "path": ""})
         );
         assert!(!error.to_string().contains("hunter2"), "{error}");
+        let error = result(vec![requirement(
+            "keyed",
+            json!({"outer": {"customer-secret@example.test": "wrong"}}),
+        )])
+        .decode_data::<std::collections::BTreeMap<String, std::collections::BTreeMap<String, u8>>>()
+        .expect_err("mismatch under a returned key");
+        let problem = serde_json::to_string(&error.problem()).expect("problem");
+        assert!(!problem.contains("customer-secret"), "{problem}");
+        assert!(!error.to_string().contains("customer-secret"), "{error}");
     }
 
     /// Custom Verdict data obeys the inclusive size and depth bounds: exact

@@ -1351,7 +1351,8 @@ Verifier and step requirements, retained in the sensitive outcome. SDK
 typed siblings (`verify_typed`, `wait_typed`, `status_typed`, and Rust
 `wait_until_typed`) decode every present `data` as the caller's type after the
 ordinary call; a mismatch is `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the
-requirement and field path, and never reruns or changes the result.
+requirement with the data root's empty `path` (a deeper path could hold a
+returned dictionary key), and never reruns or changes the result.
 
 A citation names an original input slot and a typed locator (`page`, `slide`,
 `lines`, `json_pointer`, or page `region`); workspace paths map back to their

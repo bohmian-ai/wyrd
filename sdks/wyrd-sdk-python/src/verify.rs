@@ -315,9 +315,10 @@ impl PyVerificationResult {
 ///
 /// # Errors
 /// Raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the first refused
-/// requirement and the validator's failing location, never the data or the
-/// validator's message, and `WYRD_SPEC_400_VALIDATION` when `data_type` has
-/// no `model_validate`.
+/// requirement with the data root's empty path, never the data, the
+/// validator's message, or its location (which may hold a returned
+/// dictionary key), and `WYRD_SPEC_400_VALIDATION` when `data_type` has no
+/// `model_validate`.
 fn decode_data(requirements: &Bound<'_, PyAny>, data_type: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     let validate = data_type
         .getattr("model_validate")
@@ -328,40 +329,19 @@ fn decode_data(requirements: &Bound<'_, PyAny>, data_type: &Bound<'_, PyAny>) ->
         let Some(data) = requirement.get_item("data")? else {
             continue;
         };
-        match validate.call1((data,)) {
-            Ok(model) => requirement.set_item("data", model)?,
-            Err(error) => {
-                let id: String = requirement
-                    .get_item("id")?
-                    .map_or(Ok(String::new()), |id| id.extract())?;
-                let path = error_path(&error, requirements.py());
-                return Err(WyrdError::SdkVerificationDataInvalid {
-                    message: format!(
-                        "requirement `{id}` data does not match the requested type at `{path}`"
-                    ),
-                    details: serde_json::json!({"requirement": id, "path": path}),
-                }
-                .into());
+        let Ok(model) = validate.call1((data,)) else {
+            let id: String = requirement
+                .get_item("id")?
+                .map_or(Ok(String::new()), |id| id.extract())?;
+            return Err(WyrdError::SdkVerificationDataInvalid {
+                message: format!("requirement `{id}` data does not match the requested type"),
+                details: serde_json::json!({"requirement": id, "path": ""}),
             }
-        }
+            .into());
+        };
+        requirement.set_item("data", model)?;
     }
     Ok(())
-}
-
-/// The first failing location of a validator `error` that reports one as
-/// Pydantic's `errors()[0]["loc"]`, dotted; empty otherwise.
-fn error_path(error: &PyErr, py: Python<'_>) -> String {
-    error
-        .value(py)
-        .call_method0("errors")
-        .and_then(|errors| errors.get_item(0)?.get_item("loc"))
-        .and_then(|loc| {
-            loc.try_iter()?
-                .map(|part| Ok(part?.str()?.to_string()))
-                .collect::<PyResult<Vec<_>>>()
-        })
-        .map(|parts| parts.join("."))
-        .unwrap_or_default()
 }
 
 #[pymethods]

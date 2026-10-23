@@ -266,9 +266,11 @@ export interface VerdictDataParser<T> {
 /**
  * Decode every present requirement `data` of `result` with `parser`.
  *
- * Absent data stays absent; failed requirements decode too. The first
- * mismatch throws without returning a partly typed result, and its message
- * names the requirement and field path, never the data.
+ * Absent data stays absent; failed requirements decode too. Whatever the
+ * parser throws, the first mismatch raises `WYRD_SDK_422_VERIFICATION_DATA_INVALID`
+ * without returning a partly typed result. It names the requirement and the
+ * data root's empty `path`, never the data, the thrown value, or a deeper
+ * path, which may hold a returned dictionary key.
  */
 function typedResult<T>(result: VerificationResult, parser: VerdictDataParser<T>): VerificationResult<T> {
   const requirements = result.outcome.requirements.map((requirement): RequirementResult<T> => {
@@ -278,16 +280,14 @@ function typedResult<T>(result: VerificationResult, parser: VerdictDataParser<T>
     }
     try {
       return { ...rest, data: parser.parse(data) };
-    } catch (error) {
-      const issue = (error as { issues?: readonly { path?: readonly PropertyKey[] }[] }).issues?.[0];
-      const path = (issue?.path ?? []).map(String).join(".");
+    } catch {
       throw new WyrdError(
         "WYRD_SDK_422_VERIFICATION_DATA_INVALID",
         422,
         "Verification data does not match the requested type",
-        `requirement \`${requirement.id}\` data does not match the requested type at \`${path}\``,
+        `requirement \`${requirement.id}\` data does not match the requested type`,
         "Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type.",
-        { requirement: requirement.id, path },
+        { requirement: requirement.id, path: "" },
       );
     }
   });

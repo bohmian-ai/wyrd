@@ -57,6 +57,45 @@ describe("internal native run wrapper", () => {
     });
   });
 
+  test.each([
+    ["null", null],
+    ["undefined", undefined],
+    ["an Error", new Error("customer-secret@example.test is not a number")],
+    ["malformed issues", { issues: "customer-secret@example.test" }],
+    ["issues at a returned key", { issues: [{ path: ["outer", "customer-secret@example.test"] }] }],
+  ])("a parser rejecting with %s raises the data error at the safe root", async (_, thrown) => {
+    const data = { outer: { "customer-secret@example.test": "wrong" } };
+    const result = {
+      execution_id: "0190f5e8-7c1a-7000-8000-000000000001",
+      verifier: { kind: "Verifier", name: "judge", version: "1.0.0" },
+      subject: { kind: "Agent", name: "drafter", version: "1.0.0" },
+      outcome: {
+        verdict: "failed",
+        requirements: [{ id: "keyed", statement: "s", outcome: "failed", reason: "r", data }],
+        steps: [],
+        evidence: {},
+      },
+    };
+    const { observe, calls } = fakeRun({ valueJson: JSON.stringify(result) });
+    const parser = {
+      parse(): never {
+        throw thrown;
+      },
+    };
+
+    const error = await observe.verifyTyped("judge", { answer: "yes" }, parser).then(
+      () => undefined,
+      (refused: unknown) => refused,
+    );
+
+    expect(error).toBeInstanceOf(wyrd.WyrdError);
+    const refused = error as wyrd.WyrdError;
+    expect(refused.code).toBe("WYRD_SDK_422_VERIFICATION_DATA_INVALID");
+    expect(refused.details).toEqual({ requirement: "keyed", path: "" });
+    expect(JSON.stringify(refused.details) + refused.message).not.toContain("customer-secret");
+    expect(calls).toHaveLength(1);
+  });
+
   test("slot values cross as JSON, lazy files, and Artifact references", async () => {
     const { observe, calls } = fakeRun();
     const bytes = new Uint8Array([0, 37, 80, 68, 70]).subarray(1);

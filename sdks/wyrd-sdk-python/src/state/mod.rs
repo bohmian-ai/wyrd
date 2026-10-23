@@ -687,6 +687,7 @@ impl PyCardEnvelope {
     ///
     /// Returns a validation error when the server Card has no resolved
     /// version pin.
+    #[cfg(feature = "testing")]
     pub(crate) fn from_registry_card(card: Card) -> CardPyResult<Self> {
         let version = card.metadata.resolved_pin().cloned().ok_or_else(|| {
             WyrdPyError::validation("server Card response requires a resolved version")

@@ -727,7 +727,7 @@ test("typed_verdict_data_mismatch_keeps_original_result", async ({ provider, des
     expect(error).toBeInstanceOf(WyrdError);
     const refused = error as WyrdError;
     expect(refused.code).toBe("WYRD_SDK_422_VERIFICATION_DATA_INVALID");
-    expect(refused.details).toEqual({ requirement: "helpful", path: "category" });
+    expect(refused.details).toEqual({ requirement: "helpful", path: "" });
     expect(refused.message).not.toContain("refund");
   };
   const scoredCalls = (): number => provider.received.filter((request) => request.body.includes("SCORE:")).length;

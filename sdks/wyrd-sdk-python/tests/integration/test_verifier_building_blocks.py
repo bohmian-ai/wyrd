@@ -666,7 +666,7 @@ def test_typed_verdict_data_mismatch_keeps_original_result(
 ) -> None:
     def assert_mismatch(raised: pytest.ExceptionInfo[WyrdError]) -> None:
         assert raised.value.code == "WYRD_SDK_422_VERIFICATION_DATA_INVALID"
-        assert raised.value.details == {"requirement": "helpful", "path": "category"}
+        assert raised.value.details == {"requirement": "helpful", "path": ""}
         assert "refund" not in raised.value.message
 
     with pytest.raises(WyrdError) as direct:

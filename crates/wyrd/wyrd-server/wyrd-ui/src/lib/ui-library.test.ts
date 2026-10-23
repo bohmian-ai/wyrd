@@ -73,6 +73,7 @@ import { Bifrost, type WyrdClient } from 'wyrd-ai';
 import catalog from 'wyrd-ai-ui/catalog.json';
 import { place as placeAll } from '../../packages/ui/src/lib/layout';
 import { card, denied, fixtureExecutor, RANGE, registered, series, summary, terminal, timeseries } from '$lib/ui-fixtures';
+import { reactive } from '$lib/ui-fixtures.svelte';
 
 /** An executor answering each read with `answer` and recording every request and signal. */
 function recording(answer: (request: WireRequest) => WireResult | Promise<WireResult>) {
@@ -812,6 +813,38 @@ test('TASK-027: Layout editing', async () => {
   expect(Object.hasOwn(last.panels[3], 'layout')).toBe(true);
   expect(named).toEqual(original);
   odd.unmount();
+
+  // A direct-Svelte host writing its own reactive document replaces local edits with its newer authored values.
+  const live = reactive(laidOut({ a: { x: 0, y: 0, w: 8, h: 6 }, b: { x: 8, y: 0, w: 4, h: 6 } }));
+  const heard = vi.fn();
+  const reads = recording(() => ({ ok: true, value: series }));
+  const host = render(WyrdView, { doc: live, executor: reads.executor, onlayout: heard });
+  await waitFor(() => expect(reads.calls).toHaveLength(2));
+  const finish = async (id: string) => {
+    const grip = host.getByRole('button', { name: `Move or resize ${id}` });
+    grip.focus();
+    await fireEvent.keyDown(grip, { key: 'ArrowDown' });
+    await fireEvent.keyDown(grip, { key: 'Enter' });
+  };
+  const rows = () => [panel(host.container, 'a').style.gridRow, panel(host.container, 'b').style.gridRow];
+  await finish('a');
+  expect(rows()).toEqual(['2 / span 6', '1 / span 6']);
+  live.panels[0].layout!.y = 7;
+  await tick();
+  expect(rows()).toEqual(['8 / span 6', '1 / span 6']);
+  await finish('b');
+  expect(heard.mock.lastCall![0].panels.map((each: { layout?: unknown }) => each.layout)).toEqual([{ x: 0, y: 7, w: 8, h: 6 }, { x: 8, y: 1, w: 4, h: 6 }]);
+  // The layout-only write loads nothing, and editing never writes the host's document.
+  expect(reads.calls).toHaveLength(2);
+  const hostValues = laidOut({ a: { x: 0, y: 7, w: 8, h: 6 }, b: { x: 8, y: 0, w: 4, h: 6 } });
+  expect(JSON.parse(JSON.stringify(live))).toEqual(hostValues);
+  // Re-rendering the unchanged document keeps the completed edit; an equal-content new document drops it.
+  await host.rerender({ onlayout: undefined });
+  await host.rerender({ onlayout: heard });
+  expect(rows()).toEqual(['8 / span 6', '2 / span 6']);
+  await host.rerender({ doc: structuredClone(hostValues) });
+  expect(rows()).toEqual(['8 / span 6', '1 / span 6']);
+  host.unmount();
 });
 
 test('TASK-027: Pointer edit cancellation', async () => {
@@ -946,6 +979,35 @@ test('TASK-027: Pointer edit cancellation', async () => {
     width.mockRestore();
   }
   held.unmount();
+
+  // A host writing a new range or panel input into its reactive document mid-gesture ends the gesture unreported.
+  const live = reactive(laidOut({ a: { x: 0, y: 0, w: 8, h: 6 } }));
+  const told = vi.fn();
+  const host = render(WyrdView, { doc: live, executor: chart.executor, onlayout: told });
+  const hostBox = () => [panel(host.container, 'a').style.gridColumn, panel(host.container, 'a').style.gridRow];
+  const authored = hostBox();
+  const writes = [() => (live.range = { ...RANGE, to: '2026-10-20T06:00:00Z' }), () => (live.panels[0].input.title = 'renamed')];
+  for (const [index, write] of writes.entries()) {
+    const handle = index === 0 ? host.getByRole('button', { name: 'Move or resize a' }) : panel(host.container, 'a').querySelector('.corner')!;
+    await fireEvent.pointerDown(handle, { button: 0, clientX: 0, clientY: 0, pointerId: 50 + index });
+    await fireEvent.pointerMove(handle, { clientX: 2, clientY: 104, pointerId: 50 + index });
+    expect(hostBox()).not.toEqual(authored);
+    write();
+    await tick();
+    expect(hostBox()).toEqual(authored);
+    await fireEvent.pointerMove(handle, { clientX: 3, clientY: 156, pointerId: 50 + index });
+    await fireEvent.pointerUp(handle, { clientX: 3, clientY: 156, pointerId: 50 + index });
+    expect(hostBox()).toEqual(authored);
+    expect(told).not.toHaveBeenCalled();
+  }
+  // A fresh gesture still completes once, carrying the host's newer values.
+  const fresh = panel(host.container, 'a').querySelector('.corner')!;
+  await fireEvent.pointerDown(fresh, { button: 0, clientX: 0, clientY: 0, pointerId: 60 });
+  await fireEvent.pointerMove(fresh, { clientX: 0, clientY: 52, pointerId: 60 });
+  await fireEvent.pointerUp(fresh, { clientX: 0, clientY: 52, pointerId: 60 });
+  expect(told).toHaveBeenCalledOnce();
+  expect(told.mock.calls[0][0]).toMatchObject({ range: { to: '2026-10-20T06:00:00Z' }, panels: [{ input: { title: 'renamed' }, layout: { x: 0, y: 0, w: 8, h: 7 } }] });
+  host.unmount();
 });
 
 test('TASK-027: Narrow views', () => {

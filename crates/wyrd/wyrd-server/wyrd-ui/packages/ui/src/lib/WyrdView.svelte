@@ -101,9 +101,12 @@
 
   /** The document itself; a host re-passing the same one keeps local edits. */
   const given = $derived(doc);
-  // A new document drops local edits; leaving ends a held gesture.
+  /** Its authored values, layout included; re-parsing or re-rendering unchanged values keeps local edits. */
+  const authored = $derived(parsed.success ? JSON.stringify(parsed.data) : undefined);
+  // A new document, or new authored values in the same one, drops local edits; leaving ends a held gesture.
   $effect.pre(() => {
     void given;
+    void authored;
     untrack(() => {
       cancel();
       kept = {};

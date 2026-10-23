@@ -64,3 +64,27 @@ mise exec -- git diff --check
 ```
 
 Record exact RED/GREEN and final results/limits, including an anchored selector if any new named test is chosen. No schema/catalog change is needed, so do not prescribe codegen, release/Linux builds, repository aggregates or whole user-journey suites for this renderer/test-only correction. Later review reassesses the full cumulative original task and all prior rounds with stable IDs.
+
+## Implementation evidence
+
+Status `IMPLEMENTED` on base `ff895d159` (post-PR #205 rebase; pre-rebase candidate `a0a5f177f` code unchanged).
+
+Existing owner reused: the single document-reset `$effect.pre` in `packages/ui/src/lib/WyrdView.svelte`. Gap: it observed only `given = $derived(doc)` (replacement identity). Extension: it now also observes `authored`, the `JSON.stringify` of the existing `parsed.data` (layout, title, range, panels, inputs; `undefined` on an invalid parse), mirroring the existing `content` key pattern. `given` stays as the identity filter: reading the `doc` prop directly in the effect re-ran it on handler-only rerenders and reopened R2's bug (seen in GREEN iteration, fixed before commit). The loading `content` key and every other owner are unchanged. The only new file is `src/lib/ui-fixtures.svelte.ts`, a 4-line `reactive()` helper, because a `.ts` test cannot create a native `$state` proxy.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Complete A, host writes A y7 through the same proxy, display shows y7; completing B preserves A y7; layout-only write loads nothing; host input not mutated | `WyrdView.svelte` `authored` + reset effect | `TASK-027: Layout editing` reactive-host block (RED: `['2 / span 6', …]` vs expected `['8 / span 6', …]`; GREEN) | PASS |
+| Held grip move / corner resize ended by host range or panel-input write; old move/up inert, no callback; fresh gesture completes with the newer values | same reset effect (shared `cancel`/`release`) | `TASK-027: Pointer edit cancellation` reactive-host block (RED: `['3 / span 8','3 / span 6']` vs authored; GREEN) | PASS |
+| Handler removal/restoration and unchanged-object rerenders keep completed edits; equal-content new document still resets | `given` identity derived kept beside `authored` | reactive-host rerender assertions in `Layout editing`; existing handler-drop loop in `Pointer edit cancellation` | PASS |
+| Existing terminal, own-ID, geometry cases stay green | no change outside the reset derivation | full `src/lib/ui-library.test.ts`: 10/10 pass | PASS |
+
+Commands (from repo root unless noted):
+
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Layout editing$'`: PASS (RED before the fix, as above)
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts -t '^TASK-027: Pointer edit cancellation$'`: PASS (RED before the fix, as above)
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test src/lib/ui-library.test.ts`: PASS, 10/10
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build`: PASS
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check`: FAIL, only the 6 known post-#205 `space` errors in `packages/ui/src/lib/loaders.ts` and `components/CardHeader.svelte` (owned by the parallel identity remediation). Because the package check stops first, the app-level check was run directly: `./node_modules/.bin/svelte-check --tsconfig ./tsconfig.json` in the UI dir reports 3 more errors of the same `space` family in `src/lib/ui-fixtures.ts:47` and `src/lib/ui-library.integration.test.ts:149,281`, which are untouched here. No errors in the changed files.
+- `git diff --check`: PASS. Run directly because the worktree isolation guard refuses `mise exec -- git …`.
+
+Limits: fresh-worktree setup also needed `svelte-kit sync` in `examples/ui-app` (the vitest transform reads its `.svelte-kit/tsconfig.json`). Non-goals stayed out: no parser, validator, store, update API, dependency, schema, or public-contract change, and `plot.ts`, `loaders.ts`, and `CardHeader.svelte` were not touched. Test edits stay inside the two TASK-027 scenarios, plus one fixture import line.

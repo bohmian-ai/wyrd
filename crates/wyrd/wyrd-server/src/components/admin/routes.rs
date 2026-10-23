@@ -35,12 +35,13 @@ use wyrd_auth_oidc::{
 use wyrd_runtime::builtin_roles::DEFAULT_ISSUER_ROLE;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
-    IssuerTokenPolicy, IssuerUrl, TrustedIssuerView, WorkloadBindingView,
+    IssuerTokenPolicy, IssuerUrl, PrincipalId, TrustedIssuerView, WorkloadBindingView,
     refuse_human_trusted_issuer,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
+use wyrd_spec::ids::CardUid;
 use wyrd_sql::queries::auth::{
-    TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
+    TrustedIssuerWrite, delete_trusted_issuer, delete_workload_binding,
     delete_workload_bindings_for_issuer, insert_trusted_issuer, insert_workload_binding,
     trusted_issuers_for_tenant, workload_bindings_for_tenant,
 };
@@ -190,30 +191,25 @@ fn from_stored_json<T: DeserializeOwned>(stored: &JsonValue) -> Result<T, WyrdEr
     serde_json::from_value(stored.clone()).map_err(internal_error)
 }
 
-/// Workload-binding projection from a write row.
+/// Workload-binding projection from a stored row.
 ///
 /// # Errors
-/// Returns [`WyrdError::Internal`] when the stored card reference does not
-/// decode into a [`CardRef`](wyrd_spec::reference::CardRef).
-fn workload_binding_view_from_write(
-    write: &WorkloadBindingWrite,
+/// Returns [`WyrdError::Internal`] when the stored default root is not a
+/// Card UID.
+fn workload_binding_view_from_row(
+    row: WorkloadBindingRow,
 ) -> Result<WorkloadBindingView, WyrdErrorResponse> {
     Ok(WorkloadBindingView {
-        issuer: write.issuer_url.clone(),
-        subject: write.subject.clone(),
-        audience: write.audience.clone(),
-        card_ref: from_stored_json(&write.card_ref)?,
-    })
-}
-
-/// Workload-binding projection from a stored row.
-fn workload_binding_view_from_row(row: WorkloadBindingRow) -> WorkloadBindingView {
-    WorkloadBindingView {
         issuer: row.issuer_url,
         subject: row.subject,
         audience: row.audience,
-        card_ref: row.card_ref,
-    }
+        principal_id: PrincipalId::new(row.principal_id),
+        workload_uid: row
+            .workload_uid
+            .map(CardUid::from_uuid)
+            .transpose()
+            .map_err(internal_error)?,
+    })
 }
 
 /// Query for deleting one issuer, with the cascade flag.
@@ -558,20 +554,35 @@ async fn create_workload_binding(
 
     let binding = WorkloadBinding {
         tenant_id: caller.principal.tenant_id,
-        issuer: request.issuer.clone(),
-        subject: request.subject.clone(),
-        audience: request.audience.clone(),
-        card_ref: request.card_ref.clone(),
+        issuer: request.issuer,
+        subject: request.subject,
+        audience: request.audience,
+        principal_id: request.principal_id,
+        workload_uid: request.workload_uid,
     };
-    let write = binding_write_from_binding(&binding).map_err(internal_error)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
-    insert_workload_binding(&mut conn, &write)
+    let written = insert_workload_binding(&mut conn, &binding_write_from_binding(&binding))
         .await
         .map_err(|error| map_binding_write_error(error, &binding.issuer))?;
+    if !written {
+        return Err(WyrdErrorResponse::from(WyrdError::AdminNotFound {
+            message: format!(
+                "principal {} is not an active Service account in this tenant",
+                binding.principal_id
+            ),
+            details: serde_json::json!({ "principal_id": binding.principal_id }),
+        }));
+    }
     conn.commit().await.map_err(sql_unavailable)?;
 
-    Ok(Json(workload_binding_view_from_write(&write)?))
+    Ok(Json(WorkloadBindingView {
+        issuer: binding.issuer.as_str().to_owned(),
+        subject: binding.subject,
+        audience: binding.audience,
+        principal_id: binding.principal_id,
+        workload_uid: binding.workload_uid,
+    }))
 }
 
 /// `GET /v1/admin/workload-bindings?issuer=&subject=` — list the caller tenant's
@@ -637,7 +648,7 @@ async fn list_workload_bindings(
     let views = rows
         .into_iter()
         .map(workload_binding_view_from_row)
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(views))
 }
 

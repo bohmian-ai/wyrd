@@ -6,7 +6,7 @@ use serde_json::json;
 use wyrd_auth::issuance::ExchangedToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::TenantSlug;
+use wyrd_spec::ids::{CardUid, TenantSlug};
 
 use crate::auth::{auth_not_configured, invalid_token, tenant_slug_from_host};
 use crate::http::error::WyrdErrorResponse;
@@ -15,7 +15,8 @@ use crate::state::AppState;
 /// Exchange a platform-attested workload assertion for a Wyrd access token.
 ///
 /// Resolves the tenant from the request host (or the caller's fallback slug),
-/// then hands the assertion to the workload exchange, which verifies it with
+/// then hands the assertion and optional `workload_uid` root selector to the
+/// workload exchange, which verifies it with
 /// the issuance-side external verifier and mints through the shared tenant
 /// issuer.
 ///
@@ -28,6 +29,7 @@ pub async fn exchange_jwt_bearer(
     headers: &HeaderMap,
     assertion: SecretString,
     tenant: Option<TenantSlug>,
+    workload_uid: Option<CardUid>,
     request_id: &str,
 ) -> Result<ExchangedToken, WyrdErrorResponse> {
     let tenant_id = resolve_workload_tenant(state, headers, tenant).await?;
@@ -48,7 +50,13 @@ pub async fn exchange_jwt_bearer(
             .ok_or_else(auth_not_configured)?,
     };
     service
-        .execute(state.postgres.wyrd(), tenant_id, assertion, request_id)
+        .execute(
+            state.postgres.wyrd(),
+            tenant_id,
+            assertion,
+            workload_uid,
+            request_id,
+        )
         .await
         .map_err(WyrdErrorResponse::from)
 }

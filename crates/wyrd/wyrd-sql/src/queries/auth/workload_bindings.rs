@@ -27,7 +27,10 @@ const WORKLOAD_BINDING_BY_SUBJECT_SQL: &str = r"
 const UPSERT_WORKLOAD_BINDING_SQL: &str = r"
     INSERT INTO wyrd.auth_workload_bindings (
         data_tenant_id, issuer_url, subject, audience, principal_id, workload_uid
-    ) VALUES ($1, $2, $3, $4, $5, $6)
+    )
+    SELECT $1, $2, $3, $4, id, $6
+      FROM wyrd.auth_service_accounts
+     WHERE id = $5 AND principal_kind = 'service' AND status = 'active'
     ON CONFLICT (data_tenant_id, issuer_url, subject) DO UPDATE SET
         audience = EXCLUDED.audience,
         principal_id = EXCLUDED.principal_id,
@@ -38,7 +41,10 @@ const UPSERT_WORKLOAD_BINDING_SQL: &str = r"
 const INSERT_WORKLOAD_BINDING_SQL: &str = r"
     INSERT INTO wyrd.auth_workload_bindings (
         data_tenant_id, issuer_url, subject, audience, principal_id, workload_uid
-    ) VALUES ($1, $2, $3, $4, $5, $6)
+    )
+    SELECT $1, $2, $3, $4, id, $6
+      FROM wyrd.auth_service_accounts
+     WHERE id = $5 AND principal_kind = 'service' AND status = 'active'
 ";
 
 const WORKLOAD_BINDING_BY_KEY_SQL: &str = r"
@@ -141,6 +147,8 @@ pub async fn workload_bindings_for_tenant(
 /// `(data_tenant_id, issuer_url, subject)` conflict the audience, account,
 /// and default root are overwritten so re-seeding from config is idempotent. The
 /// referenced trusted issuer row must already exist (FK `ON DELETE RESTRICT`).
+/// Returns `Ok(false)` and writes nothing when `principal_id` is not an active
+/// Service account, so federation never maps to an administrator or SYSTEM.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the upsert (including FK
@@ -148,7 +156,7 @@ pub async fn workload_bindings_for_tenant(
 pub async fn upsert_workload_binding(
     conn: &mut TenantConn<'_>,
     binding: &WorkloadBindingWrite,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     sqlx::query(UPSERT_WORKLOAD_BINDING_SQL)
         .bind(conn.data_tenant_id().as_uuid())
         .bind(&binding.issuer_url)
@@ -158,7 +166,7 @@ pub async fn upsert_workload_binding(
         .bind(binding.workload_uid)
         .execute(&mut **conn.transaction())
         .await
-        .map(|_| ())
+        .map(|result| result.rows_affected() > 0)
 }
 
 /// Insert a workload binding for the current tenant, failing on conflict.
@@ -167,7 +175,9 @@ pub async fn upsert_workload_binding(
 /// `(data_tenant_id, issuer_url, subject)` raises a unique-violation (`23505`)
 /// so the admin CRUD path can map it to a `409` conflict. The referenced
 /// trusted issuer must already exist or Postgres raises a foreign-key violation
-/// (`23503`). `data_tenant_id` is bound from the [`TenantConn`].
+/// (`23503`). `data_tenant_id` is bound from the [`TenantConn`]. Returns
+/// `Ok(false)` and writes nothing when `principal_id` is not an active Service
+/// account.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert (unique violation on a
@@ -175,7 +185,7 @@ pub async fn upsert_workload_binding(
 pub async fn insert_workload_binding(
     conn: &mut TenantConn<'_>,
     binding: &WorkloadBindingWrite,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     sqlx::query(INSERT_WORKLOAD_BINDING_SQL)
         .bind(conn.data_tenant_id().as_uuid())
         .bind(&binding.issuer_url)
@@ -185,7 +195,7 @@ pub async fn insert_workload_binding(
         .bind(binding.workload_uid)
         .execute(&mut **conn.transaction())
         .await
-        .map(|_| ())
+        .map(|result| result.rows_affected() > 0)
 }
 
 /// Fetch one workload binding by its `(issuer, subject)` key for the tenant.

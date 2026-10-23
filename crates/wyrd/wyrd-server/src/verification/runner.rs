@@ -860,7 +860,7 @@ fn result(
             owner_card_uid: run
                 .owner_card_uid
                 .as_ref()
-                .or_else(|| run.authority.principal.owner_service_uid()),
+                .or_else(|| run.authority.owning_root()),
             group_id: run.group_id.as_ref(),
             binding_id: run.binding_id,
             trigger: run.trigger.as_ref(),

@@ -617,13 +617,10 @@ async fn list_principals(
         ));
     }
     if let Some(kind) = query.kind
-        && !matches!(
-            kind,
-            PrincipalKindTag::User | PrincipalKindTag::Service | PrincipalKindTag::Agent
-        )
+        && !matches!(kind, PrincipalKindTag::User | PrincipalKindTag::Service)
     {
         return Err(invalid(
-            "kind must be user, service, or agent",
+            "kind must be user or service",
             serde_json::json!({ "kind": kind.as_str() }),
         ));
     }
@@ -962,13 +959,17 @@ fn summary(row: AssignablePrincipalRow) -> Result<PrincipalSummary, WyrdErrorRes
         "suspended" => PrincipalStatus::Suspended,
         other => return Err(internal(format!("unexpected principal status {other:?}"))),
     };
+    let workload_restriction = match kind {
+        PrincipalKindTag::Service => Some(row.workload_family().map_err(internal)?.into()),
+        _ => None,
+    };
     Ok(PrincipalSummary {
         principal_id: PrincipalId::new(row.id),
         kind,
         status,
         email: row.email,
         name: row.name,
-        card_ref: row.card_ref.map(|card_ref| card_ref.0),
+        workload_restriction,
     })
 }
 
@@ -980,7 +981,6 @@ fn assignable_kind(kind: &str) -> Result<PrincipalKindTag, WyrdErrorResponse> {
     match kind {
         "user" => Ok(PrincipalKindTag::User),
         "service" => Ok(PrincipalKindTag::Service),
-        "agent" => Ok(PrincipalKindTag::Agent),
         other => Err(internal(format!("unexpected principal kind {other:?}"))),
     }
 }

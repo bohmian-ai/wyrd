@@ -9,7 +9,9 @@ use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::WORKLOAD_UID_HEADER;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 
 use super::AuthenticatedPrincipal;
@@ -21,6 +23,42 @@ pub(crate) const WYRD_ACCESS_TOKEN_HEADER: HeaderName =
 /// Header a stock OTLP exporter sends its Wyrd API key in. Only the OTLP
 /// routes, HTTP and gRPC, accept it.
 pub(crate) const WYRD_API_KEY_HEADER: HeaderName = HeaderName::from_static("x-wyrd-api-key");
+
+/// Header and gRPC metadata key that selects workload context; see
+/// [`WORKLOAD_UID_HEADER`].
+pub(crate) const WYRD_WORKLOAD_UID_HEADER: HeaderName =
+    HeaderName::from_static(WORKLOAD_UID_HEADER);
+
+/// Parse the optional workload-context selector from every value a request
+/// sent under [`WYRD_WORKLOAD_UID_HEADER`].
+///
+/// HTTP headers and gRPC metadata both route through here, so a selector is
+/// refused identically on every surface. It selects context only, never a
+/// principal or tenant.
+///
+/// # Errors
+/// Returns [`WyrdError::WorkloadUidRefused`] when the selector is repeated or
+/// is not a Card UID, the same refusal an unusable root earns.
+pub(crate) fn workload_uid_selector<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<Option<CardUid>, WyrdError> {
+    let refused = || WyrdError::WorkloadUidRefused {
+        message: format!("{WORKLOAD_UID_HEADER} must be sent at most once as one Card UID"),
+        details: serde_json::json!({ "header": WORKLOAD_UID_HEADER }),
+    };
+    let mut values = values.into_iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(refused());
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|value| CardUid::new(value).ok())
+        .map(Some)
+        .ok_or_else(refused)
+}
 
 pub(crate) fn extract_wyrd_access_token(
     headers: &HeaderMap,
@@ -274,7 +312,7 @@ mod tests {
     use secrecy::ExposeSecret;
     use wyrd_spec::error::WyrdError;
 
-    use super::{ANTHROPIC_API_KEY_HEADER, extract_gateway_access_token};
+    use super::{ANTHROPIC_API_KEY_HEADER, extract_gateway_access_token, workload_uid_selector};
 
     /// Extracts from `headers` on an Anthropic route whose only accepted query
     /// parameter is `alt`.
@@ -331,6 +369,30 @@ mod tests {
                 ),
                 "{headers:?} {query:?}"
             );
+        }
+    }
+
+    /// No selector is rootless; one Card UID selects it; a repeated or
+    /// malformed selector is refused like an unusable root.
+    #[test]
+    fn workload_uid_selector_accepts_one_card_uid() {
+        let uid: &[u8] = b"01890a5d-ac96-774b-bcce-b302099a8057";
+        assert_eq!(workload_uid_selector([]).expect("absent"), None);
+        assert_eq!(
+            workload_uid_selector([uid])
+                .expect("one uid")
+                .map(|uid| uid.to_string()),
+            Some("01890a5d-ac96-774b-bcce-b302099a8057".to_owned())
+        );
+        for values in [
+            vec![uid, uid],
+            vec![b"not-a-uid".as_slice()],
+            vec![b"\xff".as_slice()],
+        ] {
+            assert!(matches!(
+                workload_uid_selector(values),
+                Err(WyrdError::WorkloadUidRefused { .. })
+            ));
         }
     }
 }

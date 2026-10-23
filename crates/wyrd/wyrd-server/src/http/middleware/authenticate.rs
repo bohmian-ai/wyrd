@@ -3,7 +3,7 @@
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::uri::Authority;
-use axum::http::{Method, Request};
+use axum::http::{HeaderValue, Method, Request};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -20,7 +20,8 @@ use crate::auth::exchange_api_key::api_key_invalid;
 use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::routes::TokenGrants;
 use crate::components::auth::token_extract::{
-    WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER, verify_authenticated_principal,
+    WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER, WYRD_WORKLOAD_UID_HEADER,
+    verify_authenticated_principal, workload_uid_selector,
 };
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -152,9 +153,10 @@ async fn authenticate_browser_session(
 ///
 /// Identical to [`require_authenticated`], except that a request with no
 /// access token may carry its exporter's Wyrd API key in `x-wyrd-api-key`,
-/// since a stock OpenTelemetry exporter sends only static headers. The key is
-/// verified on every request through [`TokenGrants::api_key_principal`] and
-/// yields the principal its exchanged token would carry. An access token, when
+/// since a stock OpenTelemetry exporter sends only static headers, with an
+/// optional `x-wyrd-workload-uid` root. The key is verified on every request
+/// through [`TokenGrants::api_key_principal`] and yields the principal its
+/// exchanged token would carry under that root. An access token, when
 /// present, always wins.
 pub async fn require_otlp_authenticated(
     State(state): State<AppState>,
@@ -171,6 +173,16 @@ pub async fn require_otlp_authenticated(
         return WyrdErrorResponse(api_key_invalid()).into_response();
     };
     let api_key = SecretString::from(presented.to_owned());
+    let workload_uid = match workload_uid_selector(
+        request
+            .headers()
+            .get_all(WYRD_WORKLOAD_UID_HEADER)
+            .iter()
+            .map(HeaderValue::as_bytes),
+    ) {
+        Ok(workload_uid) => workload_uid,
+        Err(error) => return WyrdErrorResponse(error).into_response(),
+    };
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -180,7 +192,7 @@ pub async fn require_otlp_authenticated(
         state: &state,
         request_id: request_id.as_str(),
     };
-    match grants.api_key_principal(&api_key).await {
+    match grants.api_key_principal(&api_key, workload_uid).await {
         Ok(verified) => {
             request
                 .extensions_mut()

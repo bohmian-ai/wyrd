@@ -59,7 +59,7 @@ use wyrd_sql::queries::cards::{
     persist_outbound_relationships, query_cards, recheck_active_card_refs, record_blob_failure,
     record_card_blob, record_card_reconciliation_failure, reschedule_card_reconciliation,
     resolve_version, schedule_card_reconciliation, soft_delete_card_by_ref,
-    soft_delete_card_with_kind, upsert_service_account_from_card,
+    soft_delete_card_with_kind,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
@@ -1262,7 +1262,6 @@ async fn persist_node(
     persist_outbound_relationships(conn, &row.card_uid, &outbound_refs).await?;
     insert_artifact_manifest_rows(conn, &row.card_uid, &submission.artifacts).await?;
     if matches!(card.kind, CardKind::Service | CardKind::Agent) {
-        upsert_service_account_from_card(conn, &row.card_uid, &card, caller.attribution()).await?;
         BindingProjector::new(conn)
             .project(&row.card_uid, &card.kind, &card.spec)
             .await?;
@@ -1287,9 +1286,8 @@ async fn persist_node(
 /// Transaction-scoped projector of one owner Card's verification bindings.
 ///
 /// Declaration builds one per bound Service or Agent inside its own
-/// caller-owned [`TenantConn`], after the owner Card and its Card-bound
-/// principal are written, so the Card, principal, and binding rows commit or
-/// roll back together. It never commits.
+/// caller-owned [`TenantConn`], after the owner Card is written, so the Card
+/// and binding rows commit or roll back together. It never commits.
 struct BindingProjector<'a, 'c> {
     /// The declaration transaction; sibling Cards persisted earlier in it,
     /// such as a referenced Trigger, are visible here.

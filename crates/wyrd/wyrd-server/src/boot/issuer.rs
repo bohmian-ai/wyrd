@@ -184,14 +184,13 @@ async fn seed_one_trusted_issuer(
 
 /// Seed `[[workload_bindings]]` domain bindings into Postgres for `tenant_id`.
 ///
-/// Each binding's structured `card_ref` is encoded to JSONB and upserted
-/// (`ON CONFLICT DO UPDATE`). The referenced trusted issuer must already be
+/// Each binding is upserted (`ON CONFLICT DO UPDATE`). The referenced trusted issuer must already be
 /// seeded (FK), so callers seed issuers first. All writes share one tenant
 /// transaction opened through [`WyrdPostgres::tenant_conn`].
 ///
 /// # Errors
-/// Returns [`ServerBootError::InvalidWorkloadBinding`] when a binding's
-/// `card_ref` cannot be serialized, and [`ServerBootError::Sql`] on a write
+/// Returns [`ServerBootError::InvalidWorkloadBinding`] when a binding names
+/// no active Service account, and [`ServerBootError::Sql`] on a write
 /// failure (including an FK violation when the issuer was not seeded).
 pub async fn seed_workload_bindings(
     postgres: &WyrdPostgres,
@@ -203,15 +202,18 @@ pub async fn seed_workload_bindings(
     }
     let mut conn = postgres.tenant_conn(tenant_id).await?;
     for (index, binding) in bindings.iter().enumerate() {
-        let write = binding_write_from_binding(binding).map_err(|error| {
-            ServerBootError::InvalidWorkloadBinding {
-                index,
-                message: error.to_string(),
-            }
-        })?;
-        upsert_workload_binding(&mut conn, &write)
+        let written = upsert_workload_binding(&mut conn, &binding_write_from_binding(binding))
             .await
             .map_err(|error| ServerBootError::Sql(error.into()))?;
+        if !written {
+            return Err(ServerBootError::InvalidWorkloadBinding {
+                index,
+                message: format!(
+                    "principal_id {} is not an active Service account",
+                    binding.principal_id
+                ),
+            });
+        }
     }
     conn.commit().await?;
     Ok(())

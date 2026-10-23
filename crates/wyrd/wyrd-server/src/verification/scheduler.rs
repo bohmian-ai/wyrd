@@ -325,7 +325,9 @@ impl VerificationScheduler {
                     return Ok::<_, SqlError>(None);
                 };
                 let authority = match due.owner() {
-                    Some(owner) => self.authority.resolve(&mut conn, owner).await?.ok(),
+                    Some((owner, root)) => {
+                        self.authority.resolve(&mut conn, owner, root).await?.ok()
+                    }
                     None => None,
                 };
                 let tick = self.queue.schedule_due(&mut conn, due, authority).await?;
@@ -461,7 +463,7 @@ impl VerificationScheduler {
         let Some(owner) = due.owner else {
             return Ok(pending(
                 "no_owner_principal",
-                &"the owner has no Card-bound principal",
+                &"the owner family has no runtime account",
             ));
         };
         let Some(system) = system_principal_id(conn)
@@ -481,7 +483,11 @@ impl VerificationScheduler {
                     details: serde_json::json!({}),
                 };
             }
-            let authority = match self.authority.resolve(conn, owner).await? {
+            let authority = match self
+                .authority
+                .resolve(conn, owner, &due.owner_card_uid)
+                .await?
+            {
                 Ok(authority) => authority,
                 Err(AuthorityRefusal::Rejected(error)) => break 'refusal error,
                 Err(AuthorityRefusal::Unavailable) => {

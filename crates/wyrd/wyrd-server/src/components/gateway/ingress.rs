@@ -14,7 +14,7 @@
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, RawQuery, Request, State};
-use axum::http::{HeaderMap, HeaderName, Method};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -48,8 +48,8 @@ use super::routes::{self, PUBLIC_CALL_TIMEOUT, openai_error, relay, token_bound,
 use super::telemetry::IngressClock;
 use crate::components::auth::Caller;
 use crate::components::auth::token_extract::{
-    ANTHROPIC_API_KEY_HEADER, GOOGLE_API_KEY_HEADER, extract_gateway_access_token,
-    verify_access_token,
+    ANTHROPIC_API_KEY_HEADER, GOOGLE_API_KEY_HEADER, WYRD_WORKLOAD_UID_HEADER,
+    extract_gateway_access_token, verify_access_token, workload_uid_selector,
 };
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::metrics::RequestArrival;
@@ -148,11 +148,22 @@ impl GatewayIngress {
                     .get::<RequestId>()
                     .cloned()
                     .unwrap_or_else(RequestId::now_v7);
-                state
-                    .gateway
-                    .api_keys()
-                    .authenticate(&state, &api_key, request_id.as_str())
-                    .await
+                match workload_uid_selector(
+                    request
+                        .headers()
+                        .get_all(WYRD_WORKLOAD_UID_HEADER)
+                        .iter()
+                        .map(HeaderValue::as_bytes),
+                ) {
+                    Ok(workload_uid) => {
+                        state
+                            .gateway
+                            .api_keys()
+                            .authenticate(&state, &api_key, workload_uid, request_id.as_str())
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
             }
             Err(error) => Err(error),
         };

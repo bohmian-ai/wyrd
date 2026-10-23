@@ -8,8 +8,9 @@
 //!
 //! [`GatewayApiKeys`] reuses the minted token for the identical key for at
 //! most [`TOKEN_REUSE`] after the exchange began, so retiring a key takes
-//! effect within that window however late an in-flight exchange completes. Entries are keyed by the SHA-256 of the complete key,
-//! never the key itself, so no key's authority is ever reused for another. A
+//! effect within that window however late an in-flight exchange completes. Entries are keyed by the SHA-256 of the complete key and
+//! its optional workload root, never the key itself, so no key's authority,
+//! and no release's context, is ever reused for another. A
 //! read never renews an entry, a failed exchange is never cached, and the
 //! process keeps at most [`CAPACITY`] entries.
 
@@ -22,6 +23,7 @@ use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use wyrd_spec::auth::SecretBearer;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 
 use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::routes::TokenGrants;
@@ -49,8 +51,8 @@ struct CachedToken {
 /// The process's short-lived reuse of tokens exchanged for API keys presented
 /// to gateway ingress.
 pub(crate) struct GatewayApiKeys {
-    /// Tokens by SHA-256 of the complete key, behind one short synchronous
-    /// lock; no await happens under it.
+    /// Tokens by [`Self::entry`], behind one short synchronous lock; no
+    /// await happens under it.
     tokens: Mutex<LruCache<[u8; 32], CachedToken>>,
 }
 
@@ -70,9 +72,9 @@ impl GatewayApiKeys {
     }
 
     /// Authenticates a request that presented `api_key` as the key's own
-    /// principal.
+    /// principal, under the workload root `workload_uid` selects, if any.
     ///
-    /// A reusable token for the identical key is verified and used; otherwise,
+    /// A reusable token for the identical key and root is verified and used; otherwise,
     /// or when that token no longer verifies, the key is exchanged through
     /// [`TokenGrants`] under `request_id`, the minted token verified for the
     /// Wyrd audience, and only then cached by [`Self::reuse_or_exchange`].
@@ -94,11 +96,16 @@ impl GatewayApiKeys {
         &self,
         state: &AppState,
         api_key: &SecretString,
+        workload_uid: Option<CardUid>,
         request_id: &str,
     ) -> Result<AuthenticatedPrincipal, WyrdError> {
+        let entry = Self::entry(api_key, workload_uid.as_ref());
         let exchange = async {
             let exchanged = TokenGrants { state, request_id }
-                .api_key(&SecretBearer::new(api_key.expose_secret().to_owned()))
+                .api_key(
+                    &SecretBearer::new(api_key.expose_secret().to_owned()),
+                    workload_uid,
+                )
                 .await?;
             Ok((
                 exchanged.access_token.into_secret_string(),
@@ -113,11 +120,11 @@ impl GatewayApiKeys {
             )
             .map_err(|WyrdErrorResponse(error)| error)
         };
-        self.reuse_or_exchange(api_key, Instant::now, verify, exchange)
+        self.reuse_or_exchange(entry, Instant::now, verify, exchange)
             .await
     }
 
-    /// Reuses the token cached for `api_key` when it still verifies, and
+    /// Reuses the token cached under `entry` when it still verifies, and
     /// otherwise awaits `exchange` and caches its verified token.
     ///
     /// `clock` is read on every lookup and once before `exchange` is polled.
@@ -131,12 +138,12 @@ impl GatewayApiKeys {
     /// Returns the error of `exchange`, or of `verify` for the minted token.
     async fn reuse_or_exchange<T>(
         &self,
-        api_key: &SecretString,
+        entry: [u8; 32],
         clock: impl Fn() -> Instant,
         verify: impl Fn(SecretString) -> Result<T, WyrdError>,
         exchange: impl Future<Output = Result<(SecretString, Duration), WyrdError>>,
     ) -> Result<T, WyrdError> {
-        if let Some(token) = self.get(api_key, clock())
+        if let Some(token) = self.get(entry, clock())
             && let Ok(principal) = verify(token)
         {
             return Ok(principal);
@@ -145,37 +152,44 @@ impl GatewayApiKeys {
         let (token, lifetime) = exchange.await?;
         let principal = verify(token.clone())?;
         if clock() < origin + TOKEN_REUSE.min(lifetime) {
-            self.insert(api_key, token, lifetime, origin);
+            self.insert(entry, token, lifetime, origin);
         }
         Ok(principal)
     }
 
-    /// The SHA-256 of the complete `api_key`, the only form a key is kept in.
-    fn hash(api_key: &SecretString) -> [u8; 32] {
-        Sha256::digest(api_key.expose_secret().as_bytes()).into()
+    /// The SHA-256 of the complete `api_key` and its optional workload root,
+    /// the only form a key is kept in. A rootless entry and each root's entry
+    /// of one key are distinct.
+    fn entry(api_key: &SecretString, workload_uid: Option<&CardUid>) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(api_key.expose_secret().as_bytes());
+        if let Some(uid) = workload_uid {
+            digest.update([0]);
+            digest.update(uid.as_str().as_bytes());
+        }
+        digest.finalize().into()
     }
 
-    /// The token exchanged for `api_key` when it is still reusable at `now`.
+    /// The token cached under `entry` when it is still reusable at `now`.
     ///
     /// A hit does not move its deadline; an entry past it is removed.
     ///
     /// # Panics
     /// Panics when the cache lock is poisoned, which no holder can cause
     /// because nothing under it panics.
-    fn get(&self, api_key: &SecretString, now: Instant) -> Option<SecretString> {
-        let hash = Self::hash(api_key);
+    fn get(&self, entry: [u8; 32], now: Instant) -> Option<SecretString> {
         let mut tokens = self.tokens.lock().expect("gateway api key cache lock");
-        match tokens.get(&hash) {
+        match tokens.get(&entry) {
             Some(cached) if now < cached.deadline => Some(cached.token.clone()),
             Some(_) => {
-                tokens.pop(&hash);
+                tokens.pop(&entry);
                 None
             }
             None => None,
         }
     }
 
-    /// Caches `token`, whose exchange for `api_key` began at `origin` and
+    /// Caches `token` under `entry`, whose exchange began at `origin` and
     /// which is valid for `lifetime`, until the earlier of `origin` plus
     /// [`TOKEN_REUSE`] and `origin` plus that lifetime.
     ///
@@ -184,18 +198,12 @@ impl GatewayApiKeys {
     ///
     /// # Panics
     /// Panics when the cache lock is poisoned.
-    fn insert(
-        &self,
-        api_key: &SecretString,
-        token: SecretString,
-        lifetime: Duration,
-        origin: Instant,
-    ) {
+    fn insert(&self, entry: [u8; 32], token: SecretString, lifetime: Duration, origin: Instant) {
         let deadline = origin + TOKEN_REUSE.min(lifetime);
         self.tokens
             .lock()
             .expect("gateway api key cache lock")
-            .put(Self::hash(api_key), CachedToken { token, deadline });
+            .put(entry, CachedToken { token, deadline });
     }
 }
 
@@ -208,6 +216,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use secrecy::{ExposeSecret, SecretString};
+    use wyrd_spec::ids::CardUid;
 
     use super::{GatewayApiKeys, TOKEN_REUSE};
 
@@ -216,10 +225,15 @@ mod tests {
         SecretString::from(value.to_owned())
     }
 
+    /// The rootless cache entry of `key`.
+    fn entry(key: &str) -> [u8; 32] {
+        GatewayApiKeys::entry(&secret(key), None)
+    }
+
     /// The token cached for `key` at `now`, exposed for comparison.
     fn cached(cache: &GatewayApiKeys, key: &str, now: Instant) -> Option<String> {
         cache
-            .get(&secret(key), now)
+            .get(entry(key), now)
             .map(|token| token.expose_secret().to_owned())
     }
 
@@ -245,7 +259,7 @@ mod tests {
 
         let first = cache
             .reuse_or_exchange(
-                &secret("wyrd_sk_slow"),
+                entry("wyrd_sk_slow"),
                 || now.get(),
                 verify,
                 exchange("jwt-slow", Duration::from_secs(2)),
@@ -267,7 +281,7 @@ mod tests {
         now.set(start);
         let late = cache
             .reuse_or_exchange(
-                &secret("wyrd_sk_late"),
+                entry("wyrd_sk_late"),
                 || now.get(),
                 verify,
                 exchange("jwt-late", Duration::from_secs(61)),
@@ -299,8 +313,17 @@ mod tests {
         let cache = GatewayApiKeys::with_capacity(NonZeroUsize::new(2).expect("non-zero"));
         let start = Instant::now();
         let hour = Duration::from_secs(3600);
-        cache.insert(&secret("wyrd_sk_a"), secret("jwt-a"), hour, start);
+        cache.insert(entry("wyrd_sk_a"), secret("jwt-a"), hour, start);
         assert_eq!(cached(&cache, "wyrd_sk_a", start).as_deref(), Some("jwt-a"));
+        let root = CardUid::new("01890a5d-ac96-774b-bcce-b302099a8057").expect("static uid");
+        assert_eq!(
+            cache.get(
+                GatewayApiKeys::entry(&secret("wyrd_sk_a"), Some(&root)),
+                start
+            ),
+            None,
+            "a root's entry is not the rootless entry of the same key"
+        );
         assert_eq!(cached(&cache, "wyrd_sk_b", start), None);
         assert_eq!(cached(&cache, "wyrd_sk_a_", start), None);
         for elapsed in [1, 30, 59] {
@@ -320,7 +343,7 @@ mod tests {
         );
 
         cache.insert(
-            &secret("wyrd_sk_short"),
+            entry("wyrd_sk_short"),
             secret("jwt-short"),
             Duration::from_secs(10),
             start,
@@ -338,7 +361,7 @@ mod tests {
         assert_eq!(cached(&cache, "wyrd_sk_short", ten), None);
 
         for key in ["wyrd_sk_1", "wyrd_sk_2", "wyrd_sk_3"] {
-            cache.insert(&secret(key), secret(key), hour, start);
+            cache.insert(entry(key), secret(key), hour, start);
         }
         assert_eq!(cached(&cache, "wyrd_sk_1", start), None, "evicted");
         assert_eq!(

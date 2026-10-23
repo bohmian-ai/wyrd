@@ -1080,7 +1080,7 @@ pub enum ScheduleSkip {
 
 /// What a claimed due occurrence calls for, decided before any authority is
 /// resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DueDecision {
     /// The stored schedule no longer parses; disarm the cursor.
     InvalidSchedule,
@@ -1095,8 +1095,10 @@ enum DueDecision {
     Run {
         /// The occurrence's fixed window.
         window: DriftWindow,
-        /// The owner's Card-bound principal the execution serves.
+        /// The owner family's runtime account the execution serves.
         owner: PrincipalId,
+        /// The binding's exact owner root the account runs under.
+        owner_root: CardUid,
         /// The next cursor.
         next_run_at: DateTime<Utc>,
     },
@@ -1107,10 +1109,10 @@ enum DueDecision {
 ///
 /// The occurrence, owner activity, and missed-boundary rule are already
 /// decided. When the occurrence needs an execution, [`Self::owner`] names the
-/// owner principal whose current authority the caller resolves, on the same
-/// transaction, before [`VerifierExecutionQueue::schedule_due`] settles the
-/// tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// family runtime account and exact root whose current authority the caller
+/// resolves, on the same transaction, before
+/// [`VerifierExecutionQueue::schedule_due`] settles the tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueBinding {
     /// The claimed binding.
     pub binding_id: BindingId,
@@ -1121,12 +1123,15 @@ pub struct DueBinding {
 }
 
 impl DueBinding {
-    /// The owner principal an execution would serve, or `None` when the
-    /// occurrence creates none and needs no authority.
+    /// The family runtime account and exact owner root an execution would
+    /// serve, or `None` when the occurrence creates none and needs no
+    /// authority.
     #[must_use]
-    pub const fn owner(&self) -> Option<PrincipalId> {
-        match self.decision {
-            DueDecision::Run { owner, .. } => Some(owner),
+    pub const fn owner(&self) -> Option<(PrincipalId, &CardUid)> {
+        match &self.decision {
+            DueDecision::Run {
+                owner, owner_root, ..
+            } => Some((*owner, owner_root)),
             DueDecision::InvalidSchedule | DueDecision::Skip { .. } => None,
         }
     }
@@ -1169,8 +1174,8 @@ pub struct DueGroup {
     pub owner_card_uid: CardUid,
     /// The pinned Trigger duration and source bindings.
     pub settings: GroupEndSettings,
-    /// The owner's stored Card-bound principal, whatever its status; `None`
-    /// when the owner has none, so nothing can be attributed to it.
+    /// The owner family's runtime account, whatever its status; `None` when
+    /// the family has none, so nothing can be attributed to it.
     pub owner: Option<PrincipalId>,
     /// Whether the owner is runtime-active, so its group may be admitted.
     pub active: bool,
@@ -1920,12 +1925,13 @@ impl VerifierExecutionQueue {
                 Some(window) => match binding_activity(conn, binding_id, self.inactivity)
                     .await?
                     .filter(|activity| activity.active)
-                    .and_then(|activity| activity.principal_id)
+                    .and_then(|activity| Some((activity.principal_id?, activity.owner_card_uid)))
                 {
                     None => skip(ScheduleSkip::Inactive),
-                    Some(owner) => DueDecision::Run {
+                    Some((owner, owner_root)) => DueDecision::Run {
                         window,
                         owner,
+                        owner_root,
                         next_run_at,
                     },
                 },

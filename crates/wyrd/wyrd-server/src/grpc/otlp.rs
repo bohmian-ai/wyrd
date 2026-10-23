@@ -32,7 +32,9 @@ use wyrd_tonic::tonic::{Request, Response, Status};
 use crate::AppState;
 use crate::auth::exchange_api_key::api_key_invalid;
 use crate::components::auth::routes::TokenGrants;
-use crate::components::auth::token_extract::{WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER};
+use crate::components::auth::token_extract::{
+    WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER, WYRD_WORKLOAD_UID_HEADER, workload_uid_selector,
+};
 use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
 use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
 use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_protobuf};
@@ -275,12 +277,19 @@ impl OtlpGrpcAuthentication {
         let api_key = api_key
             .to_str()
             .map_err(|_| wyrd_error_to_status(api_key_invalid(), None))?;
+        let workload_uid = workload_uid_selector(
+            metadata
+                .get_all(WYRD_WORKLOAD_UID_HEADER.as_str())
+                .iter()
+                .map(|value| value.as_bytes()),
+        )
+        .map_err(|error| wyrd_error_to_status(error, None))?;
         let request_id = read_or_mint_request_id(metadata);
         let verified = TokenGrants {
             state: &self.state,
             request_id: request_id.as_str(),
         }
-        .api_key_principal(&SecretString::from(api_key.to_owned()))
+        .api_key_principal(&SecretString::from(api_key.to_owned()), workload_uid)
         .await
         .map_err(|error| wyrd_error_to_status(error, None))?;
         gate.admit_otlp_verified(verified, metadata)

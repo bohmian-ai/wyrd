@@ -2532,8 +2532,8 @@ pub struct IssuerEntry {
 
 /// Config DTO for one `[[workload_bindings]]` entry.
 ///
-/// Maps to `wyrd_auth_oidc::WorkloadBinding` minus boot-derived fields
-/// (`tenant_id`, resolved `card_ref`). Boot commit 03 converts this DTO.
+/// Maps to `wyrd_auth_oidc::WorkloadBinding` minus the boot-derived
+/// `tenant_id`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadBindingEntry {
@@ -2543,13 +2543,13 @@ pub struct WorkloadBindingEntry {
     pub subject: String,
     /// Optional audience constraint for additional lookup precision.
     pub audience: Option<String>,
-    /// Card kind backing the workload principal — `service` or `agent`. Any
-    /// other kind is rejected at boot (it can never resolve a principal).
-    pub kind: String,
-    /// Card name.
-    pub name: String,
-    /// Exact card version (no version range).
-    pub version: String,
+    /// Active stable Service account the verified workload authenticates
+    /// as; any other principal is refused at boot.
+    pub principal_id: wyrd_spec::auth::PrincipalId,
+    /// Optional pinned default root, used when a jwt-bearer request names
+    /// none; execution context, never account identity.
+    #[serde(default)]
+    pub workload_uid: Option<wyrd_spec::ids::CardUid>,
 }
 
 /// `[gateway]` operator configuration for tenant provider credentials.
@@ -3562,16 +3562,13 @@ impl WyrdServerConfig {
                 }
             }
 
-            // 17. Each workload_bindings entry must have all card-target fields non-empty.
+            // 17. Each workload_bindings entry must name its issuer and subject.
             for (idx, binding) in self.workload_bindings.iter().enumerate() {
                 let loc = |field: &str| format!("workload_bindings[{idx}].{field}");
 
                 for (field, value) in [
                     ("issuer", binding.issuer.as_str()),
                     ("subject", binding.subject.as_str()),
-                    ("kind", binding.kind.as_str()),
-                    ("name", binding.name.as_str()),
-                    ("version", binding.version.as_str()),
                 ] {
                     if value.is_empty() {
                         return Err(ConfigError::Invalid {

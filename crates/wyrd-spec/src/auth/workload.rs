@@ -114,6 +114,14 @@ impl WorkloadRestriction {
     }
 }
 
+impl From<Option<WorkloadFamily>> for WorkloadRestriction {
+    /// A stored restricting family, or its absence, as the explicit
+    /// restriction every Service account reports.
+    fn from(family: Option<WorkloadFamily>) -> Self {
+        family.map_or(Self::Unrestricted, Self::Family)
+    }
+}
+
 /// The family restriction carried by a `root_required` Card-access state.
 ///
 /// A one-variant union so the signed claim keeps the exact

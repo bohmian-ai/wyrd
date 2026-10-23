@@ -697,7 +697,10 @@ impl<'a> VerificationControl<'a> {
                 // The inputs row records no Verifier version.
                 verifier_version: "",
                 card_uid: &submission.request.card_uid,
-                owner_card_uid: caller.principal.owner_service_uid(),
+                owner_card_uid: wyrd_runtime::owning_root(
+                    &caller.principal,
+                    &caller.delegation_chain,
+                ),
                 group_id: submission.request.group_id.as_ref(),
                 binding_id: None,
                 trigger: None,
@@ -755,7 +758,10 @@ impl<'a> VerificationControl<'a> {
                 run_id: request.run_id.as_ref(),
                 verifier_version: &verifier_version,
                 card_uid: &request.card_uid,
-                owner_card_uid: caller.principal.owner_service_uid(),
+                owner_card_uid: wyrd_runtime::owning_root(
+                    &caller.principal,
+                    &caller.delegation_chain,
+                ),
                 group_id: request.group_id.as_ref(),
                 binding_id: None,
                 trigger: None,
@@ -905,9 +911,12 @@ impl<'a> VerificationControl<'a> {
             .into_result()
             .map_err(permission_deny_reason_to_wyrd)
             .and_then(|()| match (subject, caller.principal.card_attribution()) {
-                (Some(subject), CardAttribution::Scoped(scope))
-                    if !scope.uids().contains(subject) =>
-                {
+                (Some(_), CardAttribution::RootRequired(_)) => {
+                    Err(WyrdError::workload_context_required(
+                        "the caller is restricted to one workload family and selected no root",
+                    ))
+                }
+                (Some(subject), CardAttribution::Scoped(scope)) if !scope.contains(subject) => {
                     Err(WyrdError::PermissionDeniedRbac {
                         message: "the caller's Card scope does not cover the verified subject"
                             .to_owned(),

@@ -48,12 +48,8 @@ use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_runtime::{PermissionCheck, RbacCheck};
-use wyrd_semver::VersionBlock;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
-use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::CardName;
-use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::{
     NodeId as ClusterNodeId, OracleCapabilitiesV1, QueryClass, ScribeCapabilitiesV1,
 };
@@ -181,10 +177,9 @@ pub enum ServerBootError {
         /// The slug that failed to resolve.
         slug: String,
     },
-    /// A `[[workload_bindings]]` entry's card target could not be built into a
-    /// [`CardRef`]. This is config malformation (bad kind/name/version or
-    /// issuer URL), caught at boot so the server fails closed rather than
-    /// starting with a mis-built binding. It is not a card-existence check.
+    /// A `[[workload_bindings]]` entry is malformed (bad issuer URL) or names
+    /// no active Service account, caught at boot so the server fails closed
+    /// rather than starting with a binding that can never authenticate.
     #[error("workload_bindings[{index}] is invalid: {message}")]
     InvalidWorkloadBinding {
         /// Index of the offending `[[workload_bindings]]` entry.
@@ -2034,9 +2029,8 @@ async fn seed_federation(
     // Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
     // the implicit tenant. Both resolve the slug through the same
     // `WyrdPostgres::resolve_tenant_slug` the request handlers use, so the bound
-    // tenant matches request-time lookups by construction. Each binding's card
-    // target is built into a server-owned `CardRef` (F04, never from token
-    // claims); building the ref is not a card-existence check.
+    // tenant matches request-time lookups by construction. Each binding names
+    // its stable Service account, never one derived from token claims.
     if !config.trusted_issuers.is_empty() || !config.workload_bindings.is_empty() {
         let slug = config.auth.tenant_slug.as_ref().ok_or_else(|| {
             ServerBootError::TenantSlugUnresolved {
@@ -2141,42 +2135,8 @@ fn build_workload_binding(
         issuer,
         subject: entry.subject.clone(),
         audience: entry.audience.clone(),
-        card_ref: build_binding_card_ref(index, entry)?,
-    })
-}
-
-/// Build the server-owned [`CardRef`] for a binding from its config card target.
-///
-/// `uid` is always `None` and no DB/existence lookup is performed (N2, F04):
-/// building the ref is not validating that the card exists.
-fn build_binding_card_ref(
-    index: usize,
-    entry: &WorkloadBindingEntry,
-) -> Result<CardRef, ServerBootError> {
-    let invalid = |message: String| ServerBootError::InvalidWorkloadBinding { index, message };
-
-    let kind = CardKind::native()
-        .into_iter()
-        .find(|kind| kind.wire_name().eq_ignore_ascii_case(&entry.kind))
-        .ok_or_else(|| invalid(format!("unknown card kind {:?}", entry.kind)))?;
-    // Only Service and Agent cards back a workload principal; any other kind
-    // parses but never resolves at jwt-bearer exchange. Fail fast at boot.
-    if !matches!(kind, CardKind::Service | CardKind::Agent) {
-        return Err(invalid(format!(
-            "workload binding card kind must be \"service\" or \"agent\", got {:?}",
-            entry.kind
-        )));
-    }
-    let name = CardName::new(entry.name.clone())
-        .map_err(|error| invalid(format!("invalid card name {:?}: {error}", entry.name)))?;
-    let version = VersionBlock::parse(entry.version.clone())
-        .map_err(|error| invalid(format!("invalid card version {:?}: {error}", entry.version)))?;
-
-    Ok(CardRef {
-        kind,
-        name,
-        version,
-        uid: None,
+        principal_id: entry.principal_id,
+        workload_uid: entry.workload_uid.clone(),
     })
 }
 

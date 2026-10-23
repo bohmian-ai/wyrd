@@ -110,6 +110,7 @@ async fn platform_token(
         actor_token: None,
         actor_token_type: None,
         audience: None,
+        workload_uid: None,
     } = form.token_request()?
     else {
         return Err(OAuthError(OAuthErrorCode::InvalidRequest));

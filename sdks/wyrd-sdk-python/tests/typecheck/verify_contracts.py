@@ -143,6 +143,18 @@ def every_check_kind_is_accepted() -> list[Check]:
             "entrypoint": "check",
         },
         {
+            "kind": "code",
+            "source": {"inline": "def check(): ..."},
+            "entrypoint": "check",
+            "response_format": "verdict",
+        },
+        {
+            "kind": "code",
+            "source": {"inline": "def check(): ..."},
+            "entrypoint": "check",
+            "response_format": {"kind": "verdict", "data": {"type": "object"}},
+        },
+        {
             "kind": "drift",
             "on": "inputs.latency",
             "method": "Spc",
@@ -151,6 +163,12 @@ def every_check_kind_is_accepted() -> list[Check]:
             "profile": {"kind": "Spc", "sample_size": 5},
         },
     ]
+
+
+def code_check_formats_are_optional(check: Check) -> object:
+    if check["kind"] == "code" and "response_format" in check:
+        return check["response_format"]
+    return None
 
 
 def checks_narrow_on_kind(check: Check) -> str:

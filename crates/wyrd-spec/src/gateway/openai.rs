@@ -546,6 +546,9 @@ pub(crate) mod openapi {
     /// A `#[serde(transparent)]` root is generated as a reference to the type
     /// it wraps; the root then publishes that definition's own schema.
     pub(crate) fn component<T: JsonSchema>() -> (RefOr<Schema>, Components) {
+        /// Where schemars places definitions and where they are read back:
+        /// the `OpenAPI` components pointer, so generated `$ref`s already
+        /// name the published components.
         const PATH: &str = "/components/schemas";
         let mut settings = SchemaSettings::draft2020_12();
         settings.definitions_path = PATH.into();

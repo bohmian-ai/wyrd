@@ -215,14 +215,23 @@ class ArtifactCodeSource(TypedDict):
 
     artifact: _ArtifactFile
 
+class _VerdictFormat(TypedDict):
+    kind: Literal["verdict"]
+    data: NotRequired[dict[str, JsonValue]]
+
 class CodeCheck(TypedDict):
-    """Sandboxed code returning the Verdict schema."""
+    """Sandboxed code returning the Verdict schema.
+
+    ``response_format`` is the declared ``verdict`` format, with ``data`` the
+    JSON Schema of its required custom data; absent means plain ``verdict``.
+    """
 
     kind: Literal["code"]
     runtime: NotRequired[Literal["python"]]
     source: InlineCodeSource | ArtifactCodeSource
     entrypoint: str
     inputs: NotRequired[dict[str, str]]
+    response_format: NotRequired[Literal["verdict"] | _VerdictFormat]
 
 class DriftCheck(TypedDict):
     """Statistical drift over a samples slot, with the drift spec flattened."""

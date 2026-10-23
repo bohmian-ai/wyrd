@@ -9,7 +9,7 @@ import asyncio
 import threading
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -174,7 +174,7 @@ def test_describe_binds_an_existing_table_without_restating_its_schema(
 @contextmanager
 def holding_describe(
     upstream: str, path: str, arrived: threading.Event, release: threading.Event
-) -> Iterator[str]:
+) -> Generator[str]:
     """Proxy ``upstream`` until exit, holding the first ``GET path`` until ``release``."""
     held = threading.Lock()
 
@@ -192,11 +192,12 @@ def holding_describe(
             )
             try:
                 response = urllib.request.urlopen(request)
+                status = response.status
             except urllib.error.HTTPError as refused:
-                response = refused
+                response, status = refused, refused.code
             with response:
                 body = response.read()
-                self.send_response(response.status)
+                self.send_response(status)
                 for name, value in response.headers.items():
                     if name.lower() not in {"transfer-encoding", "connection", "content-length"}:
                         self.send_header(name, value)

@@ -936,11 +936,11 @@ enum Dispatched {
 fn unclaimed_retry(frame: &ScribeIngressFrame) -> ScribeIngressFrame {
     ScribeIngressFrame {
         principal: frame.principal.clone(),
-        attribution: frame.attribution.clone(),
+        attribution: frame.attribution,
         authenticated_tenant: frame.authenticated_tenant,
         attributed_cards: frame.attributed_cards.clone(),
         table: frame.table.clone(),
-        expected_schema_fingerprint: frame.expected_schema_fingerprint.clone(),
+        expected_schema_fingerprint: frame.expected_schema_fingerprint,
         table_version: None,
         request_id: frame.request_id.clone(),
         batch_id: frame.batch_id,

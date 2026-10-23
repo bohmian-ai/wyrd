@@ -254,7 +254,7 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
     );
     for path in &paths {
         assert!(
-            path.contains(&format!("/data/forge/1/")),
+            path.contains("/data/forge/1/"),
             "a produced object carries the selected table version: {path}"
         );
         assert!(

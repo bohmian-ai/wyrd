@@ -1485,14 +1485,13 @@ impl BifrostCatalog {
                     "{fqn} retains no table version {table_version}"
                 ))
             })?;
-        let metadata = match self.metadata_cache.get(&location) {
-            Some(metadata) => metadata,
-            None => {
-                let metadata = Arc::new(TableMetadata::read_from(&self.file_io, &location).await?);
-                self.metadata_cache
-                    .insert(location.clone(), Arc::clone(&metadata));
-                metadata
-            }
+        let metadata = if let Some(metadata) = self.metadata_cache.get(&location) {
+            metadata
+        } else {
+            let metadata = Arc::new(TableMetadata::read_from(&self.file_io, &location).await?);
+            self.metadata_cache
+                .insert(location.clone(), Arc::clone(&metadata));
+            metadata
         };
         let definition = TableDefinition::of_metadata(&fqn, &metadata)?;
         if definition.table_version != table_version {

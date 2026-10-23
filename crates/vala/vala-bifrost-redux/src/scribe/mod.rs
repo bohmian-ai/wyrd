@@ -725,6 +725,7 @@ impl ScribeImpl {
                 principal: frame.principal,
                 table: frame.table,
                 expected_schema_fingerprint: Some(frame.expected_schema_fingerprint),
+                table_version: None,
                 request_id: frame.request_id,
                 batch_id: frame.batch_id,
                 measured_wire_bytes,

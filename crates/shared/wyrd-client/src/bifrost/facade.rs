@@ -410,7 +410,9 @@ impl Bifrost {
             return Ok(table);
         }
         let config = TableConfig::describe_with(self.query.client(), fqn).await?;
-        let described = WriterTable::new(fqn, config.user_schema().clone());
+        let described = config
+            .writer_table()
+            .expect("a described config is resolved");
         self.described
             .lock()
             .expect("described table lock poisoned")
@@ -478,13 +480,7 @@ impl Bifrost {
         correlation: Correlation,
     ) -> Result<(), BifrostClientError> {
         self.writer
-            .insert(
-                table.fqn(),
-                table.user_schema(),
-                row,
-                correlation.card_uid,
-                correlation.run_id,
-            )
+            .insert(table, row, correlation.card_uid, correlation.run_id)
             .map_err(Into::into)
     }
 
@@ -540,13 +536,7 @@ impl Bifrost {
         correlation: Correlation,
     ) -> Result<(), BifrostClientError> {
         self.writer
-            .insert_rows(
-                table.fqn(),
-                table.user_schema(),
-                rows,
-                correlation.card_uid,
-                correlation.run_id,
-            )
+            .insert_rows(table, rows, correlation.card_uid, correlation.run_id)
             .map_err(Into::into)
     }
 
@@ -577,27 +567,25 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostClientError::NoActiveTable`] when no table is bound, or
-    /// [`BifrostClientError::Queue`] with `WYRD_CLIENT_429_QUEUE_FULL` when the
-    /// producer channel, its staging ring, and the byte budget are all occupied.
+    /// Returns [`BifrostClientError::NoActiveTable`] when no table is bound or
+    /// the bound table was neither registered nor described, so it names no
+    /// table version, or [`BifrostClientError::Queue`] with
+    /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer channel, its staging
+    /// ring, and the byte budget are all occupied.
     ///
     /// # Panics
     ///
     /// Panics if the active-table lock is poisoned.
     pub fn insert(&self, row: Vec<u8>, correlation: Correlation) -> Result<(), BifrostClientError> {
-        let (table, schema) = {
-            let active = self.active.lock().expect("active table lock poisoned");
-            let table = active.as_ref().ok_or(BifrostClientError::NoActiveTable)?;
-            (table.fqn(), table.user_schema().clone())
-        };
+        let table = self
+            .active
+            .lock()
+            .expect("active table lock poisoned")
+            .as_ref()
+            .and_then(TableConfig::writer_table)
+            .ok_or(BifrostClientError::NoActiveTable)?;
         self.writer
-            .insert(
-                &table,
-                &schema,
-                row,
-                correlation.card_uid,
-                correlation.run_id,
-            )
+            .insert(&table, row, correlation.card_uid, correlation.run_id)
             .map_err(Into::into)
     }
 
@@ -613,6 +601,8 @@ impl Bifrost {
     /// The table is named explicitly instead of taken from the bound active
     /// table: a batch of this kind targets one specific existing table, and
     /// binding one would invite a registration this caller does not want.
+    /// The first write to a table describes it once and caches the
+    /// description, whose table version every later batch names.
     ///
     /// The batch is sent verbatim. Whether its columns satisfy the destination
     /// table's contract is the server's judgement: it matches columns to the
@@ -629,16 +619,19 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostClientError::Queue`] when the batch cannot be encoded,
-    /// exceeds the accepted frame ceiling, or cannot fit this client's byte
-    /// envelope, and the server's stable refusal when the batch is rejected.
+    /// Returns the errors of [`TableConfig::describe_with`] the first time
+    /// this writer sees `table`, [`BifrostClientError::Queue`] when the batch
+    /// cannot be encoded, exceeds the accepted frame ceiling, or cannot fit
+    /// this client's byte envelope, and the server's stable refusal when the
+    /// batch is rejected.
     pub async fn write_batch(
         &self,
         table: &str,
         batch: &RecordBatch,
     ) -> Result<(), BifrostClientError> {
+        let table = self.resolve_writer_table(table).await?;
         self.writer
-            .write_batch(table, batch)
+            .write_batch(&table, batch)
             .await
             .map_err(Into::into)
     }
@@ -656,7 +649,7 @@ impl Bifrost {
     /// [`Self::flush`], or [`Self::shutdown`] settles it.
     ///
     /// # Arguments
-    /// * `table` - The destination table's `<namespace>.<name>`.
+    /// * `table` - The described destination returned by `writer_table`.
     /// * `batch` - The owned Arrow batch, sealed alone in the table's writable schema.
     /// * `request_id` - The request the batch publishes under, or `None` for a
     ///   fresh one.
@@ -669,7 +662,7 @@ impl Bifrost {
     #[cfg(feature = "internal")]
     pub fn enqueue_batch(
         &self,
-        table: &str,
+        table: &WriterTable,
         batch: RecordBatch,
         request_id: Option<RequestId>,
     ) -> Result<(), BifrostClientError> {

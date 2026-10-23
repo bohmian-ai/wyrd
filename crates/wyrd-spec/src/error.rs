@@ -5067,6 +5067,14 @@ mod error_vala_tests {
                 409u16,
             ),
             (
+                BifrostError::TableVersionConflict {
+                    table: "tenant.events".to_owned(),
+                    table_version: crate::vala::ids::TableVersion::INITIAL,
+                },
+                "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT",
+                409,
+            ),
+            (
                 BifrostError::QueryInvalidSql {
                     detail: "not a SELECT".to_owned(),
                 },

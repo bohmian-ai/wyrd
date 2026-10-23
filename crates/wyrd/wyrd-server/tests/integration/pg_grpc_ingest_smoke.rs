@@ -217,6 +217,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             expected_schema_fingerprint: Some(ReduxSchemaFingerprint::from_arrow_schema(
                 &Schema::new(vec![Field::new("value", DataType::Int64, false)]),
             )),
+            table_version: None,
             request_id,
             batch_id: uuid::Uuid::now_v7(),
             measured_wire_bytes,
@@ -235,6 +236,7 @@ fn empty_request() -> InsertBatchRequest {
         table: String::new(),
         arrow_ipc: Bytes::default(),
         wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+        table_version: 1,
         producer_trace_contexts: Vec::new(),
     }
 }
@@ -632,6 +634,7 @@ async fn ingest_logical_batch(
         table: format!("vala.datasets.{table_name}"),
         arrow_ipc: valid_arrow_ipc().into(),
         wyrd_batch_id: batch_id.as_bytes().to_vec().into(),
+        table_version: 1,
         producer_trace_contexts: producers,
     });
     request.metadata_mut().insert(
@@ -925,6 +928,7 @@ async fn insert_as(
         table: table.to_owned(),
         arrow_ipc: arrow_ipc.into(),
         wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+        table_version: 1,
         producer_trace_contexts: Vec::new(),
     });
     request.metadata_mut().insert(

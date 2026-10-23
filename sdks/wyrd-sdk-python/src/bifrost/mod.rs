@@ -1333,7 +1333,9 @@ impl PyBifrostQueryStream {
 /// active binding: an instrumented process writes its signals alongside
 /// whatever the application is writing, and must not disturb the table the
 /// application has bound. Queue saturation is swallowed and counted on the
-/// client's drop counter instead of being raised.
+/// client's drop counter instead of being raised. The first row for a table
+/// this client has not described waits for one describe, which supplies the
+/// table version every batch names; a failed describe is counted the same way.
 ///
 /// The Python facade serializes the caller's schema mapping and row before
 /// this call, so `schema` and `row` arrive as JSON text.
@@ -1368,14 +1370,29 @@ fn record(
         serde_json::from_str(schema).map_err(|error| invalid_argument("schema", error))?;
     let schema = wyrd_types::json_schema_to_arrow(&schema_value)
         .map_err(|error| client_error(error.into()))?;
+    let schema = std::sync::Arc::new(schema);
+    let correlation = correlation(card_uid, run_id)?;
     let bifrost = bifrost.borrow();
-    wyrd_client::bifrost::observe::record(
-        bifrost.handle(py)?,
-        table,
-        &std::sync::Arc::new(schema),
-        row.as_bytes().to_vec(),
-        correlation(card_uid, run_id)?,
-    );
+    let handle = bifrost.handle(py)?;
+    let row = row.as_bytes().to_vec();
+    match handle.cached_writer_table(table) {
+        Some(described) => wyrd_client::bifrost::observe::record(
+            handle,
+            &described.with_schema(schema),
+            row,
+            correlation,
+        ),
+        None => crate::trace::block_on(
+            py,
+            wyrd_client::bifrost::observe::describe_and_record(
+                handle,
+                table,
+                schema,
+                row,
+                correlation,
+            ),
+        ),
+    }
     Ok(())
 }
 

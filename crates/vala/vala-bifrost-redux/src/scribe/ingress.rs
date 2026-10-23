@@ -21,6 +21,7 @@ use iceberg::spec::Schema;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_spec::reference::CardRefScope;
+use wyrd_spec::vala::error::BifrostError;
 
 /// Validates that one decoded request fits the persistence bucket that must own it.
 ///
@@ -182,7 +183,9 @@ impl ScribeImpl {
     ///
     /// Returns [`ScribeError`] when no logical-ingress catalog exists and the
     /// frame carries no fingerprint, [`ScribeError::TableNotFound`] when the
-    /// table — built-in or caller — is not registered for the tenant, and the
+    /// table — built-in or caller — is not registered for the tenant,
+    /// [`BifrostError::TableVersionConflict`] when the frame names a version
+    /// other than the table's current one, and the
     /// mapped catalog failure when the lookup fails or the registered layout is
     /// undecodable.
     async fn resolve_logical_frame(
@@ -226,6 +229,17 @@ impl ScribeImpl {
             .current_definition(&frame.table, frame.authenticated_tenant)
             .await
             .map_err(scribe_catalog_error)?;
+        if frame
+            .table_version
+            .is_some_and(|version| version != definition.table_version)
+        {
+            return Err(ScribeError::ContractViolation(
+                BifrostError::TableVersionConflict {
+                    table: frame.table.fqn(),
+                    table_version: definition.table_version,
+                },
+            ));
+        }
         Ok(LogicalFrameContract {
             expected_schema_fingerprint: frame
                 .expected_schema_fingerprint
@@ -1071,6 +1085,7 @@ mod tests {
             principal: principal.clone(),
             table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(schema.as_ref())),
+            table_version: None,
             request_id: request_id.clone(),
             batch_id: uuid::Uuid::now_v7(),
             measured_wire_bytes: 0,

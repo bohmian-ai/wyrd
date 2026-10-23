@@ -459,6 +459,24 @@ pub enum BifrostError {
         table: String,
     },
 
+    /// A new batch names a table version other than the table's current one.
+    ///
+    /// The batch was refused before any durable work. An accepted retry is
+    /// never refused this way: it keeps the version it was accepted under.
+    #[error("table version conflict for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT",
+        status = 409,
+        title = "Stale table version",
+        remediation = "The table's definition changed. Describe the table again and build a new batch from the returned table_version."
+    )]
+    TableVersionConflict {
+        /// Fully-qualified table name the batch was written to.
+        table: String,
+        /// The table's current version, which a new batch must name.
+        table_version: crate::vala::ids::TableVersion,
+    },
+
     /// A batch with this ID was previously attempted but failed permanently.
     #[error("duplicate failed batch: {batch_id}")]
     #[wyrd_error(
@@ -584,7 +602,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_412_NO_ACTIVE_TABLE",
         status = 412,
         title = "No active Bifrost table",
-        remediation = "Bind a table with use_table or use_table_by_name before inserting rows."
+        remediation = "Bind a registered table with register or use_table_by_name before inserting rows."
     )]
     NoActiveTable,
 

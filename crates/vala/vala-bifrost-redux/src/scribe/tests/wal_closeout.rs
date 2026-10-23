@@ -156,6 +156,7 @@ async fn ingest_as(
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
                 rows.schema().as_ref(),
             )),
+            table_version: None,
             request_id,
             batch_id,
             measured_wire_bytes: 0,
@@ -192,6 +193,7 @@ async fn ingest_value(
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
                 rows.schema().as_ref(),
             )),
+            table_version: None,
             request_id,
             batch_id,
             measured_wire_bytes: 0,
@@ -228,6 +230,7 @@ async fn ingest_measured(
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
                 rows.schema().as_ref(),
             )),
+            table_version: None,
             request_id,
             batch_id,
             measured_wire_bytes,

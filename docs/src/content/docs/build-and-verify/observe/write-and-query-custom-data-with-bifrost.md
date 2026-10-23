@@ -288,7 +288,7 @@ Only `vala.datasets` accepts writes from you.
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | The table exists with a different schema | Use a new table name |
 | `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` | A field is named `card_uid`, `run_id`, or `wyrd_*` | Rename the field |
 | `WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT` | `time_column` is missing, nullable, or not a timestamp | Point it at a required timestamp field |
-| `WYRD_VALA_412_NO_ACTIVE_TABLE` | `insert` before a table was set | Pass a `TableConfig` when connecting, or call `use_table` |
+| `WYRD_VALA_412_NO_ACTIVE_TABLE` | `insert` before a table was set | Register the table, or call `use_table_by_name` to bind a registered one |
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | Writing to a table that was never registered | Call `register` first |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | The credential lacks the permission for that step | See the prerequisites |
 | An empty result right after `flush` | The rows are stored but not yet queryable | Retry; see [Bifrost](/understand/bifrost/#written-versus-queryable) |

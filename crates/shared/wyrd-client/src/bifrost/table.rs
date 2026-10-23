@@ -18,7 +18,7 @@ use wyrd_spec::vala::api::{
     BifrostTableDescription, CompactionTypeWire, FieldSpec, PhysicalLayoutWire,
     RegisterTableRequest, RegisterTableResponse,
 };
-use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::ids::{RunId, TableVersion};
 
 use crate::bifrost::query::BifrostClientError;
 
@@ -34,6 +34,9 @@ pub struct ResolvedTable {
     pub table_uid: String,
     /// Lower-case hex of the 32-byte user-schema fingerprint.
     pub fingerprint: String,
+    /// The table version the server answered with; every batch written
+    /// through this binding names it.
+    pub table_version: TableVersion,
 }
 
 /// One Bifrost table a writer is bound to.
@@ -221,6 +224,7 @@ impl TableConfig {
             resolved: Some(ResolvedTable {
                 table_uid: description.entry.table_uid.clone(),
                 fingerprint: description.entry.fingerprint.clone(),
+                table_version: description.table_version,
             }),
         })
     }
@@ -337,7 +341,20 @@ impl TableConfig {
         self.resolved = Some(ResolvedTable {
             table_uid: response.table_uid.clone(),
             fingerprint: response.fingerprint.clone(),
+            table_version: response.table_version,
         });
+    }
+
+    /// The write destination this binding names, once register or describe
+    /// resolved it; an unresolved config has no table version to write at.
+    #[must_use]
+    pub(crate) fn writer_table(&self) -> Option<WriterTable> {
+        let resolved = self.resolved.as_ref()?;
+        Some(WriterTable::new(
+            &self.fqn(),
+            Arc::clone(&self.user_schema),
+            resolved.table_version,
+        ))
     }
 }
 
@@ -430,15 +447,18 @@ pub struct WriterTable {
     fqn: Arc<str>,
     /// The user schema the server described for this table.
     schema: SchemaRef,
+    /// The table version that description named.
+    table_version: TableVersion,
 }
 
 impl WriterTable {
     /// Build a described destination from its resolved config.
     #[must_use]
-    pub(crate) fn new(fqn: &str, schema: SchemaRef) -> Self {
+    pub(crate) fn new(fqn: &str, schema: SchemaRef, table_version: TableVersion) -> Self {
         Self {
             fqn: Arc::from(fqn),
             schema,
+            table_version,
         }
     }
 
@@ -452,6 +472,25 @@ impl WriterTable {
     #[must_use]
     pub fn user_schema(&self) -> &SchemaRef {
         &self.schema
+    }
+
+    /// The table version every batch written to this destination names.
+    #[must_use]
+    pub const fn table_version(&self) -> TableVersion {
+        self.table_version
+    }
+
+    /// The same destination and table version, with rows checked against
+    /// `schema` at seal instead of the described user schema.
+    ///
+    /// The server still matches every batch to the table's own schema.
+    #[must_use]
+    pub fn with_schema(&self, schema: SchemaRef) -> Self {
+        Self {
+            fqn: Arc::clone(&self.fqn),
+            schema,
+            table_version: self.table_version,
+        }
     }
 }
 

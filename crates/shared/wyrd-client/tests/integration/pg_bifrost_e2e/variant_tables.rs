@@ -575,6 +575,10 @@ mod pg_tests {
                 .expect("point rebuilds"),
         ) as ArrayRef;
         let unsupported = "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE";
+        let described = direct
+            .writer_table(&events.table)
+            .await
+            .expect("the table describes");
         for (batch, expected) in [
             (
                 with_column(
@@ -629,7 +633,7 @@ mod pg_tests {
             ),
         ] {
             direct
-                .enqueue_batch(&events.table, batch, None)
+                .enqueue_batch(&described, batch, None)
                 .expect("the SDK sends the batch unchanged");
             let refused = direct.flush().await.expect_err("the server refuses");
             events.server.flush_bifrost().await.expect("publish");
@@ -639,7 +643,7 @@ mod pg_tests {
         }
 
         direct
-            .enqueue_batch(&events.table, valid, None)
+            .enqueue_batch(&described, valid, None)
             .expect("valid batch sends");
         direct.flush().await.expect("valid batch is stored");
         events.server.flush_bifrost().await.expect("publish");

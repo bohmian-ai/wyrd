@@ -494,6 +494,7 @@ impl ScribeBatch {
             authenticated_tenant: self.tenant,
             table: self.table.table_ref(),
             expected_schema_fingerprint: None,
+            table_version: None,
             request_id: self.request_id,
             batch_id: self.batch_id,
             measured_wire_bytes: self.ipc.len(),

@@ -100,9 +100,7 @@ impl Isolated {
         phase: Phase,
         window: Duration,
     ) -> Result<Repetition, ExperimentError> {
-        let (Some(server), Some(bench), Some(collector)) =
-            (&self.server, &self.bench, &self.collector)
-        else {
+        let (Some(server), Some(collector)) = (&self.server, &self.collector) else {
             return Err(ExperimentError::workload("the workload was not prepared"));
         };
         let op = step.text("op").unwrap_or_default();
@@ -118,6 +116,10 @@ impl Isolated {
             .map_err(ExperimentError::workload)?;
         let read = read_op(op);
         let (outcome, write) = if let Some(read) = read {
+            let bench = self
+                .bench
+                .as_ref()
+                .ok_or_else(|| ExperimentError::workload("the read fixture was not loaded"))?;
             let deadline = Instant::now() + window;
             let outcome = match read {
                 Read::Events(case) => bench.drive(case, clients, deadline, &self.sequence).await,

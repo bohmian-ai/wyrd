@@ -993,9 +993,17 @@ than becoming its children.
 
 Server spans export twice from one tracer provider:
 
-- The operator's configured trace backend receives every server span under
-  the server's own sampler. No client-supplied field, including the inbound
-  sampled flag and `tracestate`, changes what the operator receives.
+- The operator's configured trace backend (`WYRD_OTLP_ENDPOINT`) receives
+  the server spans its own sampler samples: 1% of traces by default, or the
+  validated `WYRD_OTLP_SAMPLE_RATIO` in `[0, 1]`, where `0` exports none and
+  `1` exports all. Without an endpoint nothing is exported to an operator.
+  No client-supplied field, including the inbound sampled flag, trace id,
+  and `tracestate`, changes what the operator receives. The operator's span
+  verbosity is `WYRD_TRACE_FILTER` (default `info`), separate from the log
+  filter `WYRD_LOG`/`RUST_LOG`; neither filter nor the ratio can remove a
+  tenant copy, because catalog spans and events at `info` or above always
+  record. Logs are written whatever the sampling decision, so an error in
+  an unsampled request is still logged inside its request span.
 - A server span whose parent or one of whose links is a sampled client span
   also writes, with its catalog descendants, to the requesting tenant's
   `vala.traces.spans` on the process Scribe outbox, with the same trace,
@@ -1017,7 +1025,19 @@ Server spans export twice from one tracer provider:
   attributes (`wyrd.*`, `gen_ai.*`, and HTTP, RPC, and error semantic
   conventions); the tenant id is never a span attribute. The copy is
   non-blocking and never fails the request, and it works with or without an
-  operator endpoint.
+  operator endpoint and at operator ratio `0`.
+
+Operator export uses the stock OpenTelemetry batch processor and its bounded,
+non-blocking queue; a full queue drops spans rather than delaying requests.
+The SDK logs one `BatchSpanProcessor.SpanDroppingStarted` warning at the
+first drop and the exact lifetime `dropped_span_count` at orderly shutdown.
+There is no live dropped-span count; filtering `opentelemetry_sdk` warnings
+or abrupt termination removes these signals. Each export call that fails
+increments `wyrd_trace_export_failed_batches_total`; a failed batch is not a
+count of lost spans. Export failure, stall, or saturation never changes a
+request's result or its tenant copy, whose loss is counted separately by the
+Scribe outbox. Head sampling cannot promise a trace for every failing
+request.
 
 `Bifrost::trace_timeline` (and its Python and TypeScript projections) reads
 one trace's spans from `vala.traces.spans`, plus traces linking directly to

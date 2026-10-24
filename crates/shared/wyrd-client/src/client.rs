@@ -531,6 +531,14 @@ impl WyrdClient {
         self.auth.deployment_environment()
     }
 
+    /// Whether `other` shares this client's credential path: true for this
+    /// client, its clones, and a [`WyrdState`](crate::state::WyrdState)'s pinned client
+    /// on every clone of that state.
+    #[must_use]
+    pub fn shares_auth(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.auth, &other.auth)
+    }
+
     /// Return the shared [`AuthMiddleware`] handle.
     ///
     /// Use this to obtain the current bearer for a transport the façade does

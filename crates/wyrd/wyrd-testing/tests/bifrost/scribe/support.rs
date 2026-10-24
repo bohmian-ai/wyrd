@@ -161,7 +161,18 @@ pub(super) async fn tenant_client(
         .bootstrap_service_in_tenant(tenant, &unique_table("scribe_client"), &["admin"])
         .await
         .expect("tenant service bootstrap");
-    let api_key = bootstrap.api_key().expect("service API key").clone();
+    endpoint_client(server, bootstrap.api_key().expect("service API key"))
+}
+
+/// Builds one public SDK client that reaches `server`'s endpoints with
+/// `api_key`.
+///
+/// One identity may serve through several pods, so a multi-pod case mints the
+/// key once and builds one client per pod endpoint.
+pub(super) fn endpoint_client(
+    server: &WyrdTestServer,
+    api_key: &secrecy::SecretString,
+) -> wyrd_client::WyrdClient {
     wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
         grpc: wyrd_client::transport::GrpcConfig {
             endpoint: server.grpc_url().expect("bound gRPC URL"),
@@ -172,7 +183,7 @@ pub(super) async fn tenant_client(
             base_url: server.base_url().expect("bound HTTP URL").to_owned(),
             ..wyrd_client::transport::HttpConfig::default()
         },
-        credential: Some(api_key),
+        credential: Some(api_key.clone()),
         ..wyrd_client::config::ClientConfig::default()
     })
     .expect("tenant SDK client")

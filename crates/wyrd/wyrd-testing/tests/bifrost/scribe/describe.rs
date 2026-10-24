@@ -1043,3 +1043,246 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
     assert!(refused.to_string().contains("ProtectedColumn"), "{refused}");
     server.shutdown().await.expect("server shutdown");
 }
+
+/// A committed layout override reaches every pod, survives restarting every
+/// pod, and leaves accepted batches, old data, and other tenants untouched.
+///
+/// Two pods share one catalog. Pod B admits a batch at table version 1 and
+/// publishes it; a refused edit through pod A changes nothing either pod
+/// serves. The committed edit through pod A is then described by pod B at
+/// once, and pod B's admission follows it: new batches at the superseded
+/// version are refused once its cache hears the commit, and a batch at the
+/// committed version is accepted. A built-in table's Bloom override commits
+/// the same way, and another tenant's same-named table keeps its own
+/// definition. After every pod restarts, both overrides are still described,
+/// the version-1 batch still retries as acknowledged without duplicating its
+/// rows, a new version-1 batch is refused, and a filter over the new Bloom
+/// column reads rows from files written before and after the edit.
+///
+/// # Panics
+///
+/// Panics when a pod serves another definition than the committed one, an
+/// override is lost on restart, a stale batch is admitted after the refresh,
+/// an accepted retry is refused or duplicated, or rows read back otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres and object storage"]
+async fn tenant_layout_overrides_survive_restart_and_refresh() {
+    use wyrd_spec::vala::api::{NullOrderWire, PhysicalLayoutEdit, SortDirectionWire, SortKeyWire};
+    use wyrd_testing::bifrost::cluster::{BifrostClusterSpec, WyrdTestCluster};
+    use wyrd_testing::bifrost::revisions::{composite_batch, register_composite_table, shifted};
+
+    const CONFLICT: &str = "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT";
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
+        .await
+        .expect("the two-pod cluster starts");
+    fn pod(cluster: &WyrdTestCluster, index: usize) -> &wyrd_testing::WyrdTestServer {
+        cluster
+            .server(index)
+            .unwrap_or_else(|| panic!("the cluster owns pod {index}"))
+    }
+    let tenant = cluster.data_tenant_id();
+    let neighbour = cluster
+        .add_tenant("layout-override-neighbour")
+        .await
+        .expect("the neighbour tenant is seeded");
+    let name = unique_table("override");
+    let table = register_composite_table(pod(&cluster, 0), tenant, &name).await;
+    register_composite_table(pod(&cluster, 0), neighbour, &name).await;
+    let key = |tenant| {
+        let cluster = &cluster;
+        async move {
+            pod(cluster, 0)
+                .bootstrap_service_in_tenant(tenant, &unique_table("override_admin"), &["admin"])
+                .await
+                .expect("tenant service bootstrap")
+                .api_key()
+                .expect("service API key")
+                .clone()
+        }
+    };
+    let (api_key, neighbour_key) = (key(tenant).await, key(neighbour).await);
+    let clients = |cluster: &WyrdTestCluster| {
+        [0, 1].map(|index| super::support::endpoint_client(pod(cluster, index), &api_key))
+    };
+    async fn flush(cluster: &WyrdTestCluster) {
+        for index in [0, 1] {
+            pod(cluster, index)
+                .flush_bifrost()
+                .await
+                .expect("the pod publishes");
+        }
+    }
+
+    let [a, b] = clients(&cluster);
+    let base = composite_batch();
+    let accepted = uuid::Uuid::now_v7();
+    super::support::append_batch_at(&b, &table, TableVersion::INITIAL, accepted, &base)
+        .await
+        .expect("pod B admits a batch at version 1");
+    flush(&cluster).await;
+    let describe = |client: &wyrd_client::WyrdClient, name: &str| {
+        let bifrost = Bifrost::query_only(client);
+        let name = name.to_owned();
+        async move {
+            bifrost
+                .describe_table("vala.datasets", &name)
+                .await
+                .expect("describe the table")
+        }
+    };
+    let original = describe(&b, &name).await;
+
+    let refused = Bifrost::query_only(&a)
+        .alter_table("vala.datasets", &name, &bloom_edit(original.table_version, &["absent"]))
+        .await
+        .expect_err("an invalid edit is refused");
+    assert_eq!(code(&refused), "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT");
+    assert_eq!(describe(&a, &name).await, original);
+    assert_eq!(describe(&b, &name).await, original);
+
+    let committed = Bifrost::query_only(&a)
+        .alter_table(
+            "vala.datasets",
+            &name,
+            &layout_edit(
+                original.table_version,
+                PhysicalLayoutEdit {
+                    sort_keys: Some(vec![SortKeyWire {
+                        column: "value".to_owned(),
+                        direction: SortDirectionWire::Desc,
+                        null_order: NullOrderWire::Last,
+                    }]),
+                    bloom_columns: Some(vec!["customer".to_owned()]),
+                    partition_by: None,
+                },
+            ),
+        )
+        .await
+        .expect("pod A commits the override");
+    assert_eq!(describe(&b, &name).await, committed, "pod B describes the commit");
+
+    // Pod B's admission cache follows the commit when its listener hears it;
+    // until then a version-1 batch is still a valid version-1 batch.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut probes = Vec::new();
+    loop {
+        let probe = shifted(&base, 100 * (i64::try_from(probes.len()).expect("small") + 1));
+        match super::support::append_batch_at(
+            &b,
+            &table,
+            original.table_version,
+            uuid::Uuid::now_v7(),
+            &probe,
+        )
+        .await
+        {
+            Ok(()) => probes.push(probe),
+            Err(error) if error.code() == CONFLICT => break,
+            Err(error) => panic!("a stale batch is refused only as a conflict: {error}"),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pod B never heard the committed edit"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let after = shifted(&base, 10_000);
+    super::support::append_batch(&b, &table, uuid::Uuid::now_v7(), &after)
+        .await
+        .expect("pod B admits a batch at the committed version");
+
+    let spans = Bifrost::query_only(&a)
+        .describe_table("vala.traces", "spans")
+        .await
+        .expect("describe spans");
+    let blooms: &[&str] = if spans.physical_layout.bloom_columns.is_empty() {
+        &["span_id"]
+    } else {
+        &[]
+    };
+    let spans = Bifrost::query_only(&a)
+        .alter_table("vala.traces", "spans", &bloom_edit(spans.table_version, blooms))
+        .await
+        .expect("a built-in layout override commits");
+    let neighbour_original = describe(
+        &super::support::endpoint_client(pod(&cluster, 0), &neighbour_key),
+        &name,
+    )
+    .await;
+    assert_eq!(neighbour_original.table_version, TableVersion::INITIAL);
+    assert!(neighbour_original.physical_layout.bloom_columns.is_empty());
+    flush(&cluster).await;
+
+    for node in cluster.configured_node_ids() {
+        cluster.stop_node(node).await.expect("the pod stops");
+    }
+    for node in cluster.configured_node_ids() {
+        cluster.restart_node(node).await.expect("the pod restarts");
+    }
+    let [a, b] = clients(&cluster);
+    for client in [&a, &b] {
+        assert_eq!(describe(client, &name).await, committed, "restart keeps the override");
+        assert_eq!(
+            Bifrost::query_only(client)
+                .describe_table("vala.traces", "spans")
+                .await
+                .expect("describe spans after restart"),
+            spans,
+            "startup validates the built-in schema without reverting its layout"
+        );
+    }
+    assert_eq!(
+        describe(
+            &super::support::endpoint_client(pod(&cluster, 0), &neighbour_key),
+            &name
+        )
+        .await,
+        neighbour_original,
+        "the neighbour's same-named table keeps its definition"
+    );
+    super::support::append_batch_at(&b, &table, original.table_version, accepted, &base)
+        .await
+        .expect("the accepted batch retries at its original version");
+    let stale = super::support::append_batch_at(
+        &a,
+        &table,
+        original.table_version,
+        uuid::Uuid::now_v7(),
+        &shifted(&base, 50_000),
+    )
+    .await
+    .expect_err("a new batch at the superseded version is refused");
+    assert_eq!(stale.code(), CONFLICT, "{stale}");
+
+    let values = |batch: &arrow::record_batch::RecordBatch, customer: Option<&str>| {
+        let customers = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("customer is a string");
+        let values = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("value is Int64");
+        (0..batch.num_rows())
+            .filter(|&row| customer.is_none() || customers.is_valid(row) && Some(customers.value(row)) == customer)
+            .map(|row| values.value(row))
+            .collect::<Vec<_>>()
+    };
+    let written: Vec<_> = std::iter::once(&base)
+        .chain(&probes)
+        .chain([&after])
+        .collect();
+    for (filter, customer) in [("", None), (" WHERE customer = 'a'", Some("a"))] {
+        let mut expected: Vec<i64> = written
+            .iter()
+            .flat_map(|batch| values(batch, customer))
+            .collect();
+        expected.sort_unstable();
+        let mut read = super::support::read_sql(&a, &format!("SELECT value FROM {table}{filter}")).await;
+        read.sort_unstable();
+        assert_eq!(read, expected, "`{filter}` reads every file exactly once");
+    }
+    cluster.shutdown().await.expect("cluster shutdown");
+}

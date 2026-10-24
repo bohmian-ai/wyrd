@@ -781,3 +781,265 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
     }
     server.shutdown().await.expect("server shutdown");
 }
+
+/// Each described user field's name and stable field id, in order.
+fn field_ids(description: &wyrd_spec::vala::api::BifrostTableDescription) -> Vec<(String, String)> {
+    description
+        .user_fields
+        .iter()
+        .map(|field| {
+            (
+                field.name.clone(),
+                field.metadata[wyrd_spec::vala::api::PARQUET_FIELD_ID_KEY].clone(),
+            )
+        })
+        .collect()
+}
+
+/// An edit at `version` that only adds and renames columns.
+fn schema_edit(
+    version: TableVersion,
+    add: Vec<wyrd_spec::vala::api::FieldSpec>,
+    rename: &[(&str, &str)],
+) -> wyrd_spec::vala::api::AlterTableRequest {
+    wyrd_spec::vala::api::AlterTableRequest {
+        expected_table_version: version,
+        physical_layout: None,
+        add_columns: (!add.is_empty()).then_some(add),
+        rename_columns: (!rename.is_empty()).then(|| {
+            rename
+                .iter()
+                .map(|&(from, to)| wyrd_spec::vala::api::ColumnRename {
+                    from: from.to_owned(),
+                    to: to.to_owned(),
+                })
+                .collect()
+        }),
+    }
+}
+
+/// One nullable or required string column declaration.
+fn string_column(name: &str, nullable: bool) -> wyrd_spec::vala::api::FieldSpec {
+    wyrd_spec::vala::api::FieldSpec {
+        name: name.to_owned(),
+        data_type: wyrd_spec::vala::api::DataTypeSpec::Utf8,
+        nullable,
+        metadata: std::collections::BTreeMap::new(),
+    }
+}
+
+/// A nullable column addition and a rename of a layout-referenced column keep
+/// every stored value and field id, and new writes use the committed schema.
+///
+/// Rows written before the edit read back under the renamed column with their
+/// values and read the added column as null; the partition and Bloom entries
+/// over the renamed column follow it; describe reports the new names under
+/// the same field ids and the added column under a fresh one; and a batch in
+/// the edited shape is accepted. Every edit outside the safe-edit contract —
+/// unknown, protected, reserved, colliding, chained, no-op, or required — is
+/// refused with its violation, as is a request mixing a valid addition with an
+/// invalid rename and any schema edit of a built-in table, and each refusal
+/// leaves the description and rows unchanged.
+///
+/// # Panics
+///
+/// Panics when an edit loses a value or field id, a refusal carries another
+/// code or violation, or a refused edit changes the table.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn custom_schema_edits_preserve_field_ids_and_values() {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use wyrd_spec::vala::api::{PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire};
+
+    let server = start_scribe_server().await;
+    let client = tenant_client(&server, server.data_tenant_id()).await;
+    let bifrost = Bifrost::query_only(&client);
+    let table = unique_table("evolved");
+    let fqn = format!("vala.datasets.{table}");
+    Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(
+                wyrd_client::bifrost::TableConfig::from_arrow(
+                    &fqn,
+                    std::sync::Arc::new(Schema::new(vec![
+                        Field::new("value", DataType::Int64, false),
+                        Field::new("customer", DataType::Utf8, true),
+                    ])),
+                )
+                .expect("declared table")
+                .with_layout(PhysicalLayoutWire {
+                    time_column: None,
+                    partition_by: vec![
+                        PartitionFieldWire::new("wyrd_ingested_at", PartitionTransformWire::Hour),
+                        PartitionFieldWire::new("customer", PartitionTransformWire::Identity),
+                    ],
+                    sort_keys: Vec::new(),
+                    bloom_columns: vec!["customer".to_owned()],
+                }),
+            ),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("the writer connects")
+    .register()
+    .await
+    .expect("register the dynamic table");
+    let write = |schema: Vec<Field>, columns: Vec<arrow::array::ArrayRef>| {
+        let client = &client;
+        let fqn = &fqn;
+        async move {
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                std::sync::Arc::new(Schema::new(schema)),
+                columns,
+            )
+            .expect("batch");
+            super::support::append_batch(client, fqn, uuid::Uuid::now_v7(), &batch).await
+        }
+    };
+    write(
+        vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("customer", DataType::Utf8, true),
+        ],
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![1, 2])),
+            std::sync::Arc::new(StringArray::from(vec![Some("a"), None])),
+        ],
+    )
+    .await
+    .expect("rows under the registered schema are accepted");
+    let before = bifrost
+        .describe_table("vala.datasets", &table)
+        .await
+        .expect("describe before the edit");
+
+    let edited = bifrost
+        .alter_table(
+            "vala.datasets",
+            &table,
+            &schema_edit(
+                before.table_version,
+                vec![string_column("note", true)],
+                &[("customer", "client")],
+            ),
+        )
+        .await
+        .expect("a nullable addition and a rename commit together");
+    assert_eq!(edited.table_version, before.table_version.next().expect("next"));
+    let before_ids = field_ids(&before);
+    let edited_ids = field_ids(&edited);
+    assert_eq!(edited_ids[0], before_ids[0], "value keeps its name and id");
+    assert_eq!(
+        edited_ids[1],
+        ("client".to_owned(), before_ids[1].1.clone()),
+        "the renamed column keeps its field id"
+    );
+    assert_eq!(edited_ids[2].0, "note");
+    assert!(
+        before_ids.iter().all(|(_, id)| *id != edited_ids[2].1),
+        "the added column gets a fresh field id"
+    );
+    assert_eq!(
+        edited.physical_layout.partition_by[1],
+        PartitionFieldWire::new("client", PartitionTransformWire::Identity),
+        "the partition entry follows the rename"
+    );
+    assert_eq!(edited.physical_layout.bloom_columns, ["client"]);
+
+    write(
+        vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("client", DataType::Utf8, true),
+            Field::new("note", DataType::Utf8, true),
+        ],
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![3])),
+            std::sync::Arc::new(StringArray::from(vec![Some("c")])),
+            std::sync::Arc::new(StringArray::from(vec![Some("n")])),
+        ],
+    )
+    .await
+    .expect("a row in the edited shape is accepted");
+    let rows = || async {
+        bifrost
+            .sql_as::<serde_json::Value>(
+                &format!("SELECT value, client, note FROM {fqn} ORDER BY value"),
+                &[],
+            )
+            .await
+            .expect("read the edited table")
+    };
+    // A row projects a null column by omitting it.
+    let expected = vec![
+        serde_json::json!({"value": 1, "client": "a"}),
+        serde_json::json!({"value": 2}),
+        serde_json::json!({"value": 3, "client": "c", "note": "n"}),
+    ];
+    assert_eq!(rows().await, expected, "stored values survive the edit");
+
+    let version = edited.table_version;
+    let invalid = "WYRD_VALA_400_BIFROST_INVALID_TABLE_EDIT";
+    let refusals = [
+        (schema_edit(version, Vec::new(), &[("absent", "x")]), invalid, "UnknownColumn"),
+        (schema_edit(version, Vec::new(), &[("client", "value")]), invalid, "NameCollision"),
+        (
+            schema_edit(version, Vec::new(), &[("value", "client"), ("client", "c2")]),
+            invalid,
+            "AmbiguousRename",
+        ),
+        (schema_edit(version, Vec::new(), &[("value", "value")]), invalid, "NoEffectiveChange"),
+        (
+            schema_edit(version, Vec::new(), &[("wyrd_ingested_at", "t")]),
+            invalid,
+            "ProtectedColumn",
+        ),
+        (schema_edit(version, vec![string_column("value", true)], &[]), invalid, "NameCollision"),
+        (schema_edit(version, vec![string_column("tag", false)], &[]), invalid, "RequiredColumn"),
+        (
+            schema_edit(version, vec![string_column("card_uid", true)], &[]),
+            "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
+            "card_uid",
+        ),
+        (
+            schema_edit(version, vec![string_column("tag", true)], &[("absent", "x")]),
+            invalid,
+            "UnknownColumn",
+        ),
+    ];
+    for (edit, expected_code, expected) in refusals {
+        let refused = bifrost
+            .alter_table("vala.datasets", &table, &edit)
+            .await
+            .expect_err("the edit is refused");
+        assert_eq!(code(&refused), expected_code, "{refused}");
+        assert!(refused.to_string().contains(expected), "names {expected}: {refused}");
+        assert_eq!(
+            bifrost
+                .describe_table("vala.datasets", &table)
+                .await
+                .expect("describe after a refusal"),
+            edited,
+            "a refused edit changes nothing"
+        );
+    }
+    assert_eq!(rows().await, expected, "refusals change no rows");
+
+    let spans = bifrost
+        .describe_table("vala.traces", "spans")
+        .await
+        .expect("describe the span table");
+    let refused = bifrost
+        .alter_table(
+            "vala.traces",
+            "spans",
+            &schema_edit(spans.table_version, vec![string_column("tag", true)], &[]),
+        )
+        .await
+        .expect_err("a built-in schema is canonical");
+    assert_eq!(code(&refused), invalid);
+    assert!(refused.to_string().contains("ProtectedColumn"), "{refused}");
+    server.shutdown().await.expect("server shutdown");
+}

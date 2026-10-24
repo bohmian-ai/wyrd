@@ -122,3 +122,24 @@ answers.
 
 - `changes/active/benchmark-experiments/spec.md` revision 6
 - `AGENTS.md`, `TESTING.md`
+
+## Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Three experiments, own records and budgets | `query/mod.rs` `Experiment`, `l1_declaration` | `main::tests::level_one_declares_complete_engine_coverage`; 32/32 capacity tests | PASS |
+| Smoke without publication wait | `query/mod.rs` `smoke` | release smoke for writes, hot, parquet | PASS |
+| `writes` isolated per path | `isolated.rs` `closed` settles before each later path's first warmup; native runs last | `benchmarks/bifrost/writes/20261024T190917Z-3e1718b02.json`: valid, 372 s, every baseline passes | PASS |
+| `hot` rows stay in memtables | `isolated.rs` `hot` | `benchmarks/bifrost/hot/20261024T191549Z-3e1718b02.json`: valid, 190 s | PASS |
+| `parquet` shredding, pruning, storage ratio, scan facts | `telemetry.rs` judgments, `isolated.rs` `settled` | `benchmarks/bifrost/parquet/20261024T191916Z-3e1718b02.json`: valid, 393 s; 13/13 files shred the 13 expected keys; window scanned 1 of 13 files | PASS |
+
+Diagnosis, `writes` CPU contamination. Symptom: `otlp-spans-c1` 173 µs CPU/row against a 20 µs baseline. Evidence: 35.7 GB server RSS during that step, left by `native-write-c64`; the same step alone on a fresh server measured 61,672 rows/CPU-s. Cause: one server ran every write step back to back, so each window's server CPU paid the previous step's publication backlog. Fix site: `Isolated::closed`, which waits for earlier rows to publish before each later path's first warmup, outside every window. An independent read-only diagnosis agreed.
+
+Deviations awaiting approval:
+- The `writes` budget is 8 minutes, against 6 in the spec. Each settle has a floor of about 62 s, because the 30 s retention applies once to a memtable generation's age and again to a staged member's assembly.
+- The spans storage ratio comes from the 1M-span fixture, not a 200,000-row sample.
+
+Measured FAILs, criteria unchanged:
+- `writes`: `otlp-spans-peak-floor` 16.7 against ≥30 wire MiB/CPU-s. The approved spans baseline is 16.5.
+- `hot`: point c1 and small-aggregate c1 queries/CPU-s are 18–20% below their historical baselines, with throughput unchanged. Point c64 p99 is 7.8 ms against the <5 ms SLO.
+- `parquet`: point c1, point c64 and small-aggregate c1 queries/CPU-s are 21–29% below their historical baselines. Point c64 p99 is 14.4 ms against the <5 ms SLO. Not diagnosed.

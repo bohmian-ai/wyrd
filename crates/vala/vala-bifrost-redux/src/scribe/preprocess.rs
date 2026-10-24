@@ -1330,6 +1330,14 @@ mod tests {
     /// computed, or a volatile change alters it or a stable change does not.
     #[test]
     fn logical_identity_ignores_server_receipt_columns_only() {
+        /// One stamped row for the identity comparisons: `value` is the user
+        /// payload and `workload` the stable accepted correlation, both of
+        /// which the identity binds, while `request` and `receipt` fill the
+        /// volatile `wyrd_request_id` and `wyrd_ingested_at` columns it skips.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the arrays do not build a batch of the declared schema.
         fn rows(value: i64, workload: &str, request: &str, receipt: i64) -> RecordBatch {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("value", DataType::Int64, false),

@@ -1,7 +1,7 @@
 ---
 id: TASK-003-R2
 kind: remediation
-status: ready
+status: implemented
 spec: SPEC-service-identity-and-telemetry
 spec_revision: 16
 parent_task: TASK-003
@@ -57,3 +57,18 @@ git diff --check
 Retain the already independently passing exact identity/Rows test evidence in this review's `verification.md`. No codegen, Postgres, journey suite or broad aggregate is required for documentation-only closure. Apply an existing lint check only if the actual correction introduces an applicable lint concern; do not add another check script or waive any gate.
 
 The next review scope is this item-local documentation delta and closure of the existing FIND-TASK-003-6. Carry forward source-backed closure of FIND-TASK-003-1 through -5 and the accepted original task behavior unless the actual correction changes executable code or new material evidence invalidates that acceptance.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| The nested `rows` helper has purpose and accurate Panics rustdoc. The diff has no executable or assertion change and adds no undocumented item. | `crates/vala/vala-bifrost-redux/src/scribe/preprocess.rs`: the `rows` helper in `logical_identity_ignores_server_receipt_columns_only` documents its single-row fixture, its stable payload/workload and volatile request/receipt inputs, and a `# Panics` section for batch construction | Source inspection; every added diff line is `///`; `mise run fmt:check` passes; `git diff --check` is clean | PASS |
+
+Commands:
+
+```bash
+mise run fmt:check
+git diff --check
+```
+
+Non-goals: no change to signature, body, callers, assertions, test placement, test names or behavior. No new helper, check, test, dependency or suppression. FIND-TASK-003-1 to FIND-TASK-003-5 are untouched. No lint concern was introduced (docs only), so no lint run was needed.

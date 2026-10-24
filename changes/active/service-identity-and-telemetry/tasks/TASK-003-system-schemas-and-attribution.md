@@ -404,3 +404,50 @@ work to resolve using repository tooling, not permission to weaken proof.
   [implementation execution](../../../implementation-execution.md),
   [testing](../../../../TESTING.md), [agent guides](../../../../agent_docs/index.md),
   and the Python/TypeScript SDK directory rules.
+
+## Implementation Evidence
+
+### Diagnoses
+
+**Result Bloom floor.** Symptom:
+`verification_runtime::result_layout_partitions_blooms_and_prunes_by_result`
+failed with "bifrost.verification.results file … has no Bloom filter on
+sub_principal_id". Evidence: the journey hard-coded
+`[run_id, subject_card_uid, sub_principal_id, act_principal_id]` as the floor,
+while `tables/mod.rs::ATTRIBUTION_BLOOMS` and `attributed_layout` declare the
+revised ledger without principal Blooms (`bifrost-design.md`, "never a hidden
+validation floor"). Cause: a stale test expectation of the pre-revision floor.
+Fix site: the journey reads each table's `physical_layout().bloom_columns`. An
+independent read-only diagnostician confirmed the cause and found no other
+caller with the same hard-coded floor.
+
+**Observation batch fingerprint.** Symptom:
+`verification_runtime::two_bindings_share_one_client_observation` failed with
+`FingerprintMismatch { table: "resolved ingress table" }` from Gate
+`dispatch_native_frame` on `bifrost.drift.observations`. Evidence:
+`ObservationsTable::arrow_fields()` now wraps its authored fields in
+`with_shared_dimensions`, and `ConformPlan::build` refuses a registered column
+that is neither sent nor reserved; the journey's hand-built schema omitted the
+six dimensions. The SDK projection (`wyrd-client/src/observe/drift.rs`) already
+sends them null. Cause: a stale hand-built schema. Fix site: the journey builds
+its batch over `ObservationsTable::arrow_fields()`. The diagnostician found no
+other hand-built observation schema.
+
+**Lifecycle compaction.** The first run of the lifecycle journey matched the
+hot, recovered and published reads, but Forge planned no rewrite: each
+partition sealed one file. Cause: a single sealed file per partition leaves the
+small-files strategy nothing to rewrite. Fix site: the journey seeds two
+separately flushed datasets so each partition seals several files.
+
+### Decisions
+
+- Trusted outbox frames resolve the shared-dimension descriptors at delivery
+  (`CardRegistry::row_dimensions`), with no migration: a UID's descriptor never
+  changes, so a retried or recovered frame resolves exactly the context its
+  producer accepted.
+- A changed-content native batch replayed under the same `batch_id` is refused,
+  but as `WYRD_VALA_500_BIFROST_INTERNAL`; a 409 would change the error
+  catalog, so the refusal code is left as is.
+- Read proof runs in the Oracle cluster binary, beside the existing Forge
+  promotion/rewrite helpers:
+  `oracle distributed::canonical_signal_rows_survive_publication_recovery_and_compaction`.

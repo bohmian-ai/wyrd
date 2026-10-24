@@ -1332,14 +1332,28 @@ pub enum Phase {
 
 /// One engine's production work under the shared lifecycle.
 ///
-/// The runner calls [`Workload::prepare`] once inside the clock, then
-/// [`Workload::measure`] for each step's warmup and repetitions, then
-/// [`Workload::finish`]. A workload establishes equivalent declared state
-/// before each repetition (fresh write identities, a whole stateful
-/// sequence) and reads only its own server's evidence.
+/// The runner calls [`Workload::smoke`] and then [`Workload::prepare`] once
+/// inside the clock, then [`Workload::measure`] for each step's warmup and
+/// repetitions, then [`Workload::finish`]. A workload establishes
+/// equivalent declared state before each repetition (fresh write
+/// identities, a whole stateful sequence) and reads only its own server's
+/// evidence.
 #[async_trait]
 pub trait Workload: Send {
-    /// Starts the servers and loads fixtures.
+    /// Starts the servers and proves, before any fixture loads, that a
+    /// handful of real requests through every server timing boundary the
+    /// workload judges reach the harness as exact integer timings with
+    /// their excluded components, beside readable server CPU, provisioned
+    /// CPUs, and positive work counters. Returns what it proved, one line.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error naming the engine and every missing or
+    /// malformed boundary, component, resource reading, or counter, or the
+    /// start failure; the runner then admits no further work.
+    async fn smoke(&mut self) -> Result<String, ExperimentError>;
+
+    /// Loads fixtures into the servers [`Self::smoke`] started.
     async fn prepare(&mut self) -> Result<(), ExperimentError>;
 
     /// PIDs of the declared server processes, for optional profiling.
@@ -1544,7 +1558,9 @@ pub struct Record {
 ///
 /// The clock starts here. A refused declaration admits no workload. Each
 /// host sample comes from `host`, given the declared sample length. The
-/// workload is prepared, each selected measured step warms up and measures
+/// workload's smoke must prove measurement first; a failed smoke is an
+/// INVALID `smoke.failed` reason and admits no preparation or step. The
+/// workload is then prepared, each selected measured step warms up and measures
 /// its repetitions, the workload finishes, and the host is sampled again.
 /// An overrun, interruption, or workload failure stops admission, keeps the
 /// partial evidence, and marks every remaining step unmeasured; it never
@@ -1584,15 +1600,22 @@ where
     }
     let admitted = validity.is_empty();
     if admitted {
-        match bounded(deadline, &interrupt, workload.prepare()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                stopped = Some(Reason::new(
-                    "workload.failed",
-                    format!("preparation failed: {error}"),
-                ));
-            }
+        match bounded(deadline, &interrupt, workload.smoke()).await {
+            Ok(Ok(proved)) => eprintln!("smoke: {proved}"),
+            Ok(Err(error)) => stopped = Some(Reason::new("smoke.failed", error.to_string())),
             Err(reason) => stopped = Some(reason),
+        }
+        if stopped.is_none() {
+            match bounded(deadline, &interrupt, workload.prepare()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    stopped = Some(Reason::new(
+                        "workload.failed",
+                        format!("preparation failed: {error}"),
+                    ));
+                }
+                Err(reason) => stopped = Some(reason),
+            }
         }
         let mut profiler = match (&options.profiler, stopped.is_none()) {
             (Some(program), true) => Profiler::start(
@@ -3117,6 +3140,8 @@ mod tests {
         /// Real time the first measurement blocks, so an external profiler
         /// started just before it is running when the paused clock races on.
         settle: Option<Duration>,
+        /// What the smoke finds missing, when set.
+        smoke: Option<String>,
     }
 
     impl Scripted {
@@ -3128,12 +3153,20 @@ mod tests {
                 stall: Duration::ZERO,
                 interrupt: None,
                 settle: None,
+                smoke: None,
             }
         }
     }
 
     #[async_trait]
     impl Workload for Scripted {
+        async fn smoke(&mut self) -> Result<String, ExperimentError> {
+            self.smoke.take().map_or_else(
+                || Ok("scripted".to_owned()),
+                |missing| Err(ExperimentError::Workload(missing)),
+            )
+        }
+
         async fn prepare(&mut self) -> Result<(), ExperimentError> {
             self.seen.lock().expect("seen").prepared = true;
             Ok(())
@@ -3226,7 +3259,9 @@ mod tests {
     /// override, and an undeclared criterion metric each refuse the run as
     /// INVALID with no workload call; a dirty override stores the digest and
     /// still runs every other check; criteria the record keeps are the
-    /// sealed ones whatever the workload measured.
+    /// sealed ones whatever the workload measured; a failed smoke is
+    /// INVALID with its named missing evidence and admits no preparation or
+    /// step.
     ///
     /// # Panics
     ///
@@ -3333,6 +3368,24 @@ mod tests {
             "the override bypasses no other check"
         );
         assert_eq!(validity(&record), ["host.busy"]);
+
+        let mut workload = Scripted::always(&good());
+        workload.smoke = Some("bifrost: no `bifrost.query` timing observation".to_owned());
+        let record = execute(
+            declaration(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        let seen = workload.seen.lock().expect("seen");
+        assert_eq!(record.verdict, Verdict::Invalid);
+        assert_eq!(validity(&record), ["smoke.failed"]);
+        assert!(record.reasons[0].message.contains("`bifrost.query`"));
+        assert!(
+            !seen.prepared && seen.calls.is_empty() && seen.finished,
+            "a failed smoke admits no preparation or step, and still stops what it started"
+        );
     }
 
     /// V2: each validity case independently invalidates with a typed

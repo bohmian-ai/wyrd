@@ -6,6 +6,9 @@
 //!   through `mise run bench:l1`.
 //! - `l2 <engine>`: competing open-loop work through capacity, overload, and
 //!   recovery, through `mise run bench:l2:<engine>`.
+//! - `smoke [l1|l2 <engine>]`: only the release smoke every level runs
+//!   first, through `mise run bench:smoke`; alone it smokes every level and
+//!   engine, each under its own fresh Postgres, and records nothing.
 //! - `report <record.json>`: regenerates a persisted record's report.
 //!
 //! Every experiment shares one lifecycle ([`levels`] over
@@ -25,7 +28,7 @@ mod verification;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use wyrd_testing::experiment::{Engine, Level};
+use wyrd_testing::experiment::{Engine, Level, Verdict};
 
 use crate::levels::{Context, Plan};
 
@@ -67,6 +70,45 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
                 levels::spawn_engine(root, engine, forwarded)
             })
         }
+        (Some("smoke"), _) if arguments.len() == 2 => {
+            let codes: Vec<u8> = [Level::One, Level::Two]
+                .into_iter()
+                .flat_map(|level| levels::ENGINES.map(|engine| (level, engine)))
+                .map(|(level, engine)| {
+                    levels::spawn(
+                        root,
+                        &["smoke", &format!("l{}", u8::from(level)), engine.name()],
+                        &[],
+                    )
+                })
+                .collect();
+            Verdict::combine(&codes)
+        }
+        (Some("smoke"), _) if arguments.len() == 4 => {
+            let level = match arguments[2].as_str() {
+                "l1" => Some(Level::One),
+                "l2" => Some(Level::Two),
+                _ => None,
+            };
+            let (Some(level), Some(engine)) = (level, engine_at(arguments, 3)) else {
+                eprintln!(
+                    "capacity smoke: expected `smoke [l1|l2 <bifrost|verification|gateway>]`"
+                );
+                return 2;
+            };
+            let context = Context {
+                level,
+                arguments: &rest(4),
+                root,
+            };
+            match plan(engine, &context) {
+                Ok(plan) => Box::pin(levels::smoke(plan)).await,
+                Err(message) => {
+                    eprintln!("capacity smoke: {message}");
+                    2
+                }
+            }
+        }
         (Some("report"), _) if arguments.len() == 3 => {
             match levels::report(Path::new(&arguments[2])) {
                 Ok(report) => {
@@ -81,12 +123,17 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
         }
         _ => {
             eprintln!(
-                "capacity: expected `l1 [bifrost|verification|gateway]`, `l2 <bifrost|verification|gateway>`, or `report <record.json>`, got {:?}",
+                "capacity: expected `l1 [bifrost|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `smoke [l1|l2 <engine>]`, or `report <record.json>`, got {:?}",
                 &arguments[1.min(arguments.len())..]
             );
             2
         }
     }
+}
+
+/// The engine `arguments[index]` names, if any.
+fn engine_at(arguments: &[String], index: usize) -> Option<Engine> {
+    arguments.get(index).and_then(|name| engine(name))
 }
 
 /// The engine `name` selects.
@@ -282,6 +329,10 @@ mod tests {
 
     #[async_trait]
     impl Workload for Scripted {
+        async fn smoke(&mut self) -> Result<String, ExperimentError> {
+            Ok("scripted".to_owned())
+        }
+
         async fn prepare(&mut self) -> Result<(), ExperimentError> {
             Ok(())
         }

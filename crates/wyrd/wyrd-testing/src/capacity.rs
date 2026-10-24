@@ -476,6 +476,14 @@ pub const EXPORT_DELAY: Duration = Duration::from_millis(100);
 /// after its last request ended.
 const COLLECTION_WAIT: Duration = Duration::from_secs(30);
 
+/// How long a smoke's handful of timing observations may take to reach the
+/// collector: a few export delays, so missing evidence fails promptly.
+const SMOKE_WAIT: Duration = Duration::from_secs(3);
+
+/// The least time a smoke keeps sending, so its server CPU outgrows the
+/// process counters' tick resolution.
+pub const SMOKE_WINDOW: Duration = Duration::from_secs(1);
+
 /// One request's server timing at one boundary, decoded from a
 /// [`TIMING_SPAN`] the server exported.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -750,7 +758,20 @@ impl Collector {
         opened: SystemTime,
         expected: &[(&str, u64)],
     ) -> Population {
-        self.collect(label, opened, expected, true, &[]).await
+        self.collect(label, opened, expected, true, &[], COLLECTION_WAIT)
+            .await
+    }
+
+    /// [`Self::window`] for a smoke's handful of requests, waiting at most
+    /// [`SMOKE_WAIT`] for a short count.
+    pub async fn smoke(
+        &self,
+        label: &str,
+        opened: SystemTime,
+        expected: &[(&str, u64)],
+    ) -> Population {
+        self.collect(label, opened, expected, true, &[], SMOKE_WAIT)
+            .await
     }
 
     /// [`Self::window`] for a window whose boundaries also serve requests
@@ -767,12 +788,13 @@ impl Collector {
         least: &[(&str, u64)],
         traces: &[&str],
     ) -> Population {
-        self.collect(label, opened, least, false, traces).await
+        self.collect(label, opened, least, false, traces, COLLECTION_WAIT)
+            .await
     }
 
-    /// Waits for and takes a window's observations: `expected` counts per
-    /// boundary, exact when `exact` and lower bounds otherwise, and one
-    /// observation at least for each of `traces`.
+    /// Waits up to `wait` for and takes a window's observations: `expected`
+    /// counts per boundary, exact when `exact` and lower bounds otherwise,
+    /// and one observation at least for each of `traces`.
     async fn collect(
         &self,
         label: &str,
@@ -780,6 +802,7 @@ impl Collector {
         expected: &[(&str, u64)],
         exact: bool,
         traces: &[&str],
+        wait: Duration,
     ) -> Population {
         let from = unix_nanos(opened);
         let matching = |timing: &Timing| {
@@ -816,7 +839,7 @@ impl Collector {
                 .count()
         };
         let waiting = tokio::time::Instant::now();
-        while waiting.elapsed() < COLLECTION_WAIT {
+        while waiting.elapsed() < wait {
             let reached = {
                 let received = self.received.lock().unwrap_or_else(PoisonError::into_inner);
                 counts(&received)
@@ -1019,6 +1042,112 @@ impl Population {
     }
 }
 
+/// What one engine's release smoke proved and found missing, judged from
+/// the same windows, collector, and counters the experiment reads.
+#[derive(Debug)]
+pub struct Smoke {
+    /// The engine smoked.
+    engine: &'static str,
+    /// Each proved fact, for the success line.
+    proved: Vec<String>,
+    /// Each missing or malformed piece of evidence.
+    missing: Vec<String>,
+}
+
+impl Smoke {
+    /// An empty smoke of `engine`.
+    #[must_use]
+    pub const fn new(engine: &'static str) -> Self {
+        Self {
+            engine,
+            proved: Vec::new(),
+            missing: Vec::new(),
+        }
+    }
+
+    /// Requires `usage` to carry positive server CPU-seconds and readable
+    /// driver CPU, and this host to report its available logical CPUs.
+    pub fn usage(&mut self, usage: &Usage) {
+        match usage.server_cpu_seconds {
+            Some(cpu) if cpu > 0.0 => self.proved.push(format!("server CPU {cpu:.3}s")),
+            Some(_) => self.missing.push("server CPU-seconds were zero".to_owned()),
+            None => self
+                .missing
+                .push("server CPU-seconds are unavailable".to_owned()),
+        }
+        if usage.driver_cpu_seconds.is_none() {
+            self.missing
+                .push("driver CPU-seconds are unavailable".to_owned());
+        }
+        match std::thread::available_parallelism() {
+            Ok(cpus) => self.proved.push(format!("{cpus} logical CPUs")),
+            Err(_) => self
+                .missing
+                .push("provisioned logical CPUs are unavailable".to_owned()),
+        }
+    }
+
+    /// Requires `population` to be complete and each `(boundary, outcome,
+    /// component)` to have an observation with `outcome`, and, when
+    /// `component`, an excluded component no larger than its elapsed time.
+    pub fn timings(&mut self, population: &Population, boundaries: &[(&str, &str, bool)]) {
+        self.missing.extend(population.invalid.iter().cloned());
+        for (boundary, outcome, component) in boundaries {
+            let elapsed = population.elapsed(boundary, outcome);
+            if elapsed.is_empty() {
+                self.missing.push(format!(
+                    "no `{boundary}` timing observation has outcome `{outcome}`"
+                ));
+                continue;
+            }
+            if *component {
+                if population.excluded(boundary, outcome).len() != elapsed.len() {
+                    self.missing.push(format!(
+                        "a `{boundary}` timing observation has no `excluded_ns` component"
+                    ));
+                } else if let Err(reason) = population.residuals(boundary, outcome) {
+                    self.missing.push(reason);
+                }
+            }
+            self.proved
+                .push(format!("{} `{boundary}` timings", elapsed.len()));
+        }
+    }
+
+    /// Requires the counter or work reading `name` to be positive.
+    pub fn positive(&mut self, name: &str, value: f64) {
+        if value > 0.0 {
+            self.proved.push(format!("{name} {value}"));
+        } else {
+            self.missing
+                .push(format!("{name} was {value}, not positive"));
+        }
+    }
+
+    /// Records `evidence` as missing, such as a refused smoke request.
+    pub fn missing(&mut self, evidence: String) {
+        self.missing.push(evidence);
+    }
+
+    /// The proved line, or every missing piece of evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the engine and each missing or malformed
+    /// boundary, component, resource reading, or counter.
+    pub fn finish(self) -> Result<String, String> {
+        if self.missing.is_empty() {
+            Ok(format!("{}: {}", self.engine, self.proved.join(", ")))
+        } else {
+            Err(format!(
+                "{} measurement is broken: {}",
+                self.engine,
+                self.missing.join("; ")
+            ))
+        }
+    }
+}
+
 /// A fresh W3C trace context for one benchmark request, so its server
 /// timing can be matched to it by trace id: the server's request span
 /// continues it. It is unsampled, so the server never stages a tenant copy
@@ -1103,7 +1232,10 @@ pub fn install_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Collector, Percentiles, Readings, Selection, deltas, elapsed};
+    use super::{
+        Collector, Percentiles, Population, Readings, Selection, Smoke, Telemetry, Timing, Usage,
+        deltas, elapsed,
+    };
     use crate::release_server::Metrics;
 
     /// A two-point streaming selection over one family and a breakdown by
@@ -1234,6 +1366,74 @@ mod tests {
             (Some(50.0), Some(95.0), Some(99.0))
         );
         assert_eq!(Percentiles::raw(&[], 1.0).p50, None);
+    }
+
+    /// A smoke passes only on complete evidence and otherwise names its
+    /// engine and every missing boundary, component, resource, and counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a complete smoke fails or a broken one omits a piece.
+    #[test]
+    fn smoke_names_every_missing_piece() {
+        let timing = |boundary: &str, excluded_ns| Timing {
+            boundary: boundary.to_owned(),
+            outcome: "succeeded".to_owned(),
+            elapsed_ns: 10,
+            excluded_ns,
+            end_unix_ns: 1,
+            trace_id: "t".to_owned(),
+            span_id: "s".to_owned(),
+            instance: "i".to_owned(),
+        };
+        let usage = |server_cpu_seconds| Usage {
+            seconds: 1.0,
+            server_cpu_seconds,
+            peak_memory_bytes: None,
+            driver_cpu_seconds: Some(0.1),
+            telemetry: Telemetry::default(),
+        };
+        let judged = [
+            ("gateway.buffered", "succeeded", true),
+            ("gateway.stream.end", "succeeded", true),
+        ];
+        let mut complete = Smoke::new("gateway");
+        complete.usage(&usage(Some(0.5)));
+        complete.positive("staged captures", 4.0);
+        complete.timings(
+            &Population {
+                timings: vec![
+                    timing("gateway.buffered", Some(3)),
+                    timing("gateway.stream.end", Some(4)),
+                ],
+                ..Population::default()
+            },
+            &judged,
+        );
+        assert!(complete.finish().is_ok());
+
+        let mut broken = Smoke::new("gateway");
+        broken.usage(&usage(None));
+        broken.positive("staged captures", 0.0);
+        broken.timings(
+            &Population {
+                timings: vec![timing("gateway.buffered", None)],
+                invalid: vec!["1 of 2 `gateway.buffered` timings arrived".to_owned()],
+                ..Population::default()
+            },
+            &judged,
+        );
+        assert_eq!(
+            broken.finish(),
+            Err(
+                "gateway measurement is broken: server CPU-seconds are unavailable; \
+                 staged captures was 0, not positive; 1 of 2 `gateway.buffered` timings \
+                 arrived; a `gateway.buffered` timing observation has no `excluded_ns` \
+                 component; no `gateway.stream.end` timing observation has outcome \
+                 `succeeded`"
+                    .to_owned()
+            )
+        );
     }
 
     /// A timing span the server's own telemetry pipeline records and exports

@@ -30,7 +30,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_testing::capacity::{
     Collector, Histogram, HistogramKey, NANOS_PER_MS, Population, Readings, ResourceWindow,
-    Selection, Telemetry, Timing, Window, driver_cpu_seconds, elapsed, release_binary, unix_nanos,
+    SMOKE_WINDOW, Selection, Smoke, Telemetry, Timing, Window, driver_cpu_seconds, elapsed,
+    release_binary, unix_nanos,
 };
 use wyrd_testing::experiment::{
     ExperimentError, Level, Phase, Reading, Repetition, Step, Workload,
@@ -228,6 +229,48 @@ impl Bench {
         self.collector
             .as_ref()
             .ok_or_else(|| ExperimentError::workload("the timing collector is not running"))
+    }
+
+    /// Starts the collector and the release server through the guide and
+    /// provisions the tenant's applications for the level.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for a collector, server, or provisioning
+    /// failure.
+    async fn start(&mut self) -> Result<(), ExperimentError> {
+        std::fs::create_dir_all(&self.logs).map_err(ExperimentError::workload)?;
+        let binary = release_binary().map_err(ExperimentError::workload)?;
+        let collector = Collector::start(&self.logs)
+            .await
+            .map_err(ExperimentError::workload)?;
+        let tracing = collector.server_env();
+        let variables: Vec<(&str, &str)> = tracing
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let server = LocalServer::start(&binary, &["bench"], &variables)
+            .await
+            .map_err(ExperimentError::workload)?;
+        self.collector = Some(collector);
+        let [setup] = server.tenants() else {
+            return Err(ExperimentError::workload("setup provisioned one tenant"));
+        };
+        let applications = match self.level {
+            Level::One => CLIENTS.iter().copied().max().unwrap_or(0),
+            Level::Two => APPLICATIONS,
+        };
+        let applications = usize::try_from(applications).map_err(ExperimentError::workload)?;
+        let tenant = Box::pin(Tenant::provision(
+            setup,
+            &self.logs.join("tenants"),
+            applications,
+        ))
+        .await
+        .map_err(ExperimentError::workload)?;
+        self.states = tenant.states;
+        self.server = Some(server);
+        Ok(())
     }
 
     /// One L1 repetition: `step`'s clients each run closed-loop direct
@@ -529,42 +572,68 @@ impl Bench {
 
 #[async_trait]
 impl Workload for Bench {
-    /// Starts the release server through the guide and provisions the
-    /// tenant's applications: one per L1 client at the largest declared
-    /// count, or [`APPLICATIONS`] for the L2 rotation.
+    /// Starts the collector and the release server through the guide,
+    /// provisions the tenant's applications (one per L1 client at the
+    /// largest declared count, or [`APPLICATIONS`] for the L2 rotation),
+    /// then sends sequential direct `verify` calls from one application
+    /// for [`SMOKE_WINDOW`]. Each must answer with the expected verdict and reach
+    /// the collector as one completed `verification.direct` timing with its
+    /// Verifier component, beside positive server CPU and component
+    /// observations.
+    async fn smoke(&mut self) -> Result<String, ExperimentError> {
+        self.start().await?;
+        let (server, collector) = (self.server()?, self.collector()?);
+        let state = self
+            .states
+            .first()
+            .ok_or_else(|| ExperimentError::workload("no application was provisioned"))?;
+        let mut smoke = Smoke::new("verification");
+        let from = SystemTime::now();
+        let (window, _) = Window::open(server, SELECTION)
+            .await
+            .map_err(ExperimentError::workload)?;
+        let mut measured = Measured::default();
+        let started = Instant::now();
+        for sequence in 0.. {
+            if started.elapsed() >= SMOKE_WINDOW {
+                break;
+            }
+            let sent = Instant::now();
+            let outcome = call(state, Op::Verify, sequence).await;
+            measured.record(micros(sent), outcome);
+        }
+        let (usage, _) = window
+            .close(server)
+            .await
+            .map_err(ExperimentError::workload)?;
+        smoke.usage(&usage);
+        let right = measured.latencies_us.len() as u64 - measured.wrong;
+        smoke.positive(
+            "direct verifications with the expected verdict",
+            right as f64,
+        );
+        for (code, count) in &measured.errors {
+            smoke.missing(format!("{count} direct calls were refused with `{code}`"));
+        }
+        smoke.positive(
+            "verification runtime component observations",
+            usage
+                .telemetry
+                .breakdown
+                .values()
+                .map(|(_, count)| count)
+                .sum(),
+        );
+        let population = collector
+            .smoke("smoke", from, &[(DIRECT_TIMING, measured.answered())])
+            .await;
+        smoke.timings(&population, &[(DIRECT_TIMING, COMPLETED, true)]);
+        smoke.finish().map_err(ExperimentError::Workload)
+    }
+
+    /// Nothing beyond what [`Self::smoke`] started and provisioned.
     async fn prepare(&mut self) -> Result<(), ExperimentError> {
-        std::fs::create_dir_all(&self.logs).map_err(ExperimentError::workload)?;
-        let binary = release_binary().map_err(ExperimentError::workload)?;
-        let collector = Collector::start(&self.logs)
-            .await
-            .map_err(ExperimentError::workload)?;
-        let tracing = collector.server_env();
-        let variables: Vec<(&str, &str)> = tracing
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect();
-        let server = LocalServer::start(&binary, &["bench"], &variables)
-            .await
-            .map_err(ExperimentError::workload)?;
-        self.collector = Some(collector);
-        let [setup] = server.tenants() else {
-            return Err(ExperimentError::workload("setup provisioned one tenant"));
-        };
-        let applications = match self.level {
-            Level::One => CLIENTS.iter().copied().max().unwrap_or(0),
-            Level::Two => APPLICATIONS,
-        };
-        let applications = usize::try_from(applications).map_err(ExperimentError::workload)?;
-        let tenant = Box::pin(Tenant::provision(
-            setup,
-            &self.logs.join("tenants"),
-            applications,
-        ))
-        .await
-        .map_err(ExperimentError::workload)?;
-        self.states = tenant.states;
-        self.server = Some(server);
-        Ok(())
+        self.server().map(|_| ())
     }
 
     /// The server's PID, once it runs.

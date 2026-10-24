@@ -19,11 +19,9 @@ use wyrd_testing::capacity::{Collector, Selection, Window};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
 use wyrd_testing::release_server::LocalServer;
 
-use crate::query::logs::Logs;
-use crate::query::run::{Bench, Otlp, Outcome, Sender, WRONG_RESULT};
-use crate::query::telemetry::Telemetry;
-use crate::query::workload::{Case, Fixture, INGEST_TABLE, TABLE};
-use crate::query::{Residence, WRITE_FIXTURE_ROWS, WriteOp, client, read_case, start};
+use crate::query::run::{Bench, Outcome, Sender, WRONG_RESULT};
+use crate::query::workload::{Case, Fixture, TABLE};
+use crate::query::{Lane, Residence, WriteOp, client, lanes, read_case, smoke, start};
 
 /// Concurrent writers loading the read fixture.
 const LOADERS: usize = 16;
@@ -32,10 +30,10 @@ const LOADERS: usize = 16;
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Scribe's counter of Arrow bytes inserted into memtables.
-const INSERTED: &str = "bifrost_scribe_memtable_bytes_inserted_total";
+pub const INSERTED: &str = "bifrost_scribe_memtable_bytes_inserted_total";
 
 /// Oracle's counter of rows its executed plans scanned.
-const ROWS_SCANNED: &str = "oracle_query_rows_scanned_total";
+pub const ROWS_SCANNED: &str = "oracle_query_rows_scanned_total";
 
 /// Oracle's counter of bytes its executed plans scanned.
 const BYTES_SCANNED: &str = "oracle_query_bytes_scanned_total";
@@ -53,8 +51,8 @@ pub struct Isolated {
     server: Option<LocalServer>,
     /// The query handle and exact answers, once prepared.
     bench: Option<Arc<Bench>>,
-    /// Each write path's sender, in [`WriteOp::ALL`] order, once prepared.
-    senders: Vec<(WriteOp, Sender, Arc<AtomicI64>)>,
+    /// Each write path's sender, in [`WriteOp::ALL`] order, once smoked.
+    senders: Vec<Lane>,
     /// The statement sequence every read window continues.
     sequence: Arc<AtomicU64>,
 }
@@ -229,16 +227,32 @@ fn read_outcome(repetition: &mut Repetition, outcome: &Outcome, case: Option<Cas
 
 #[async_trait]
 impl Workload for Isolated {
-    /// Starts the server, writes the standard fixture, waits until every row
-    /// is published as Parquet, computes the exact answers, and registers
-    /// each write path.
-    async fn prepare(&mut self) -> Result<(), ExperimentError> {
+    /// Starts the collector and server, registers each write path, and
+    /// smokes every write path and the query boundary
+    /// ([`crate::query::smoke`]) before any fixture loads.
+    async fn smoke(&mut self) -> Result<String, ExperimentError> {
         let collector = Collector::start(&self.logs)
             .await
             .map_err(ExperimentError::workload)?;
         let server = start(&collector).await.map_err(ExperimentError::workload)?;
-        self.collector = Some(collector);
         let client = client(&server).map_err(ExperimentError::workload)?;
+        self.senders = lanes(&client, &WriteOp::ALL)
+            .await
+            .map_err(ExperimentError::workload)?;
+        let proved = smoke(&server, &collector, &client, &self.senders).await;
+        self.collector = Some(collector);
+        self.server = Some(server);
+        proved.map_err(ExperimentError::Workload)
+    }
+
+    /// Writes the standard fixture into the smoked server, waits until
+    /// every row is published as Parquet, and computes the exact answers.
+    async fn prepare(&mut self) -> Result<(), ExperimentError> {
+        let server = self
+            .server
+            .as_ref()
+            .ok_or_else(|| ExperimentError::workload("the workload was not smoked"))?;
+        let client = client(server).map_err(ExperimentError::workload)?;
         let fixture = Fixture::standard();
         let loader = Sender::native(&client, TABLE, fixture)
             .await
@@ -257,7 +271,7 @@ impl Workload for Isolated {
                 loaded.rows, fixture.rows, loaded.errors
             )));
         }
-        Residence::settle(&server, SETTLE_TIMEOUT)
+        Residence::settle(server, SETTLE_TIMEOUT)
             .await
             .map_err(ExperimentError::workload)?;
         self.bench = Some(Arc::new(Bench::new(
@@ -265,39 +279,6 @@ impl Workload for Isolated {
             fixture,
             &[Case::Selective, Case::SmallAggregate, Case::FullScan],
         )));
-        let writes = Fixture {
-            rows: WRITE_FIXTURE_ROWS,
-        };
-        let otlp = Otlp::connect(&client)
-            .await
-            .map_err(ExperimentError::workload)?;
-        let native = Sender::native(&client, INGEST_TABLE, writes)
-            .await
-            .map_err(ExperimentError::workload)?;
-        self.senders = vec![
-            (WriteOp::Native, native, Arc::new(AtomicI64::new(0))),
-            (
-                WriteOp::Spans,
-                Sender::Spans(
-                    otlp.clone(),
-                    Telemetry {
-                        spans: WRITE_FIXTURE_ROWS,
-                    },
-                ),
-                Arc::new(AtomicI64::new(0)),
-            ),
-            (
-                WriteOp::Logs,
-                Sender::Logs(
-                    otlp,
-                    Logs {
-                        records: WRITE_FIXTURE_ROWS,
-                    },
-                ),
-                Arc::new(AtomicI64::new(0)),
-            ),
-        ];
-        self.server = Some(server);
         Ok(())
     }
 

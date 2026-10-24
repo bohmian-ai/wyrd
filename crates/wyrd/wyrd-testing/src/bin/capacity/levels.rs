@@ -1,5 +1,6 @@
 //! The level commands every engine shares: `l1 <engine>`, the sequential
-//! `l1` aggregate, `l2 <engine>`, and `report <record.json>`.
+//! `l1` aggregate, `l2 <engine>`, `smoke [l1|l2 <engine>]`, and
+//! `report <record.json>`.
 //!
 //! An engine contributes only a [`Plan`]: its declaration (question, sweep,
 //! controls, metrics, criteria, steps) and the [`Workload`] that drives its
@@ -12,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -253,12 +255,19 @@ pub fn aggregate(arguments: &[String], mut run_engine: impl FnMut(Engine, &[Stri
 /// Runs one engine's `l1` as a child of this binary under the repository's
 /// test Postgres wrapper, so each engine starts from a fresh database.
 pub fn spawn_engine(root: &Path, engine: Engine, forwarded: &[String]) -> u8 {
+    spawn(root, &["l1", engine.name()], forwarded)
+}
+
+/// Runs this binary with `command` and `forwarded` as a child under the
+/// repository's test Postgres wrapper, so it starts from a fresh database,
+/// and returns its exit code capped at 2.
+pub fn spawn(root: &Path, command: &[&str], forwarded: &[String]) -> u8 {
     let status = std::env::current_exe().and_then(|program| {
         Command::new(root.join("scripts/postgres/with-test-postgres.sh"))
             .current_dir(root)
             .arg("--")
             .arg(program)
-            .args(["l1", engine.name()])
+            .args(command)
             .args(forwarded)
             .status()
     });
@@ -268,10 +277,51 @@ pub fn spawn_engine(root: &Path, engine: Engine, forwarded: &[String]) -> u8 {
             .and_then(|code| u8::try_from(code).ok())
             .map_or(Verdict::Invalid.exit_code(), |code| code.min(2)),
         Err(error) => {
-            eprintln!("l1 {}: could not start: {error}", engine.name());
+            eprintln!("{}: could not start: {error}", command.join(" "));
             Verdict::Invalid.exit_code()
         }
     }
+}
+
+/// How long a standalone smoke may take before it is a failure.
+const SMOKE_BUDGET: Duration = Duration::from_secs(120);
+
+/// Runs only a plan's release smoke ([`Workload::smoke`]) within
+/// [`SMOKE_BUDGET`], then stops its servers. Nothing is recorded or
+/// published; diagnostics stay under `target/benchmarks/`. Exits 0 when
+/// every boundary, component, resource, and counter was observed, and 2
+/// with the engine's missing evidence otherwise.
+pub async fn smoke(plan: Plan) -> u8 {
+    let Plan {
+        declaration,
+        mut workload,
+    } = plan;
+    let label = format!(
+        "smoke l{} {}",
+        u8::from(declaration.level),
+        declaration.engine.name()
+    );
+    let smoked = tokio::time::timeout(SMOKE_BUDGET, workload.smoke()).await;
+    let finished = workload.finish().await;
+    let code = match smoked {
+        Ok(Ok(proved)) => {
+            println!("{label}: PASS: {proved}");
+            0
+        }
+        Ok(Err(error)) => {
+            eprintln!("{label}: INVALID: {error}");
+            Verdict::Invalid.exit_code()
+        }
+        Err(_) => {
+            eprintln!("{label}: INVALID: the smoke overran {SMOKE_BUDGET:?}");
+            Verdict::Invalid.exit_code()
+        }
+    };
+    if let Err(error) = finished {
+        eprintln!("{label}: INVALID: the servers did not stop: {error}");
+        return Verdict::Invalid.exit_code();
+    }
+    code
 }
 
 /// Reads a persisted record and prints its report.

@@ -41,11 +41,9 @@ use wyrd_testing::release_server::LocalServer;
 
 use crate::client_queue::{self, Emitted, LANES};
 use crate::query::isolated::SUCCESS;
-use crate::query::logs::Logs;
-use crate::query::run::{Bench, Otlp, Overload, QUEUE_FULL, Sender, WRONG_RESULT, ask, micros};
-use crate::query::telemetry::Telemetry;
+use crate::query::run::{Bench, Overload, QUEUE_FULL, Sender, WRONG_RESULT, ask, micros};
 use crate::query::workload::{Case, Fixture, INGEST_TABLE, TABLE};
-use crate::query::{Residence, SPLIT, WRITE_FIXTURE_ROWS, WriteOp, client, start};
+use crate::query::{Lane, Residence, SPLIT, WriteOp, client, lanes, smoke, start};
 
 /// Closed-loop mixed query clients.
 pub const QUERY_CLIENTS: usize = 32;
@@ -184,7 +182,7 @@ pub struct Competing {
     /// The query handle and exact answers, once prepared.
     bench: Option<Arc<Bench>>,
     /// Each ingest path's sender and cursor, in [`SPLIT`] order.
-    senders: Vec<(WriteOp, Sender, Arc<AtomicI64>)>,
+    senders: Vec<Lane>,
     /// The client-queue tenant, once provisioned.
     tenant: Option<Arc<client_queue::Tenant>>,
     /// The server timing collector, once prepared.
@@ -786,20 +784,17 @@ async fn enable_compaction(
 }
 
 impl Competing {
-    /// Starts the server, loads and publishes the heavy fixture, computes the
-    /// exact answers, primes every ingest table with one request, enables
-    /// compaction on each, and provisions the client-queue tenant.
+    /// Loads and publishes the heavy fixture into the smoked server,
+    /// computes the exact answers, enables compaction on every ingest table
+    /// the smoke created, and provisions the client-queue tenant.
     ///
     /// # Errors
     ///
-    /// Returns a server, client, load, publication, catalog, or provisioning
-    /// failure.
+    /// Returns a missing smoke, or a client, load, publication, catalog, or
+    /// provisioning failure.
     async fn start(&mut self) -> crate::query::Result<()> {
-        std::fs::create_dir_all(&self.logs)?;
-        let collector = Collector::start(&self.logs).await?;
-        let server = start(&collector).await?;
-        self.collector = Some(collector);
-        let client = client(&server)?;
+        let server = self.server.as_ref().ok_or("the workload was not smoked")?;
+        let client = client(server)?;
         let fixture = Fixture::heavy();
         let loaded = Sender::native(&client, TABLE, fixture)
             .await?
@@ -817,7 +812,7 @@ impl Competing {
             )
             .into());
         }
-        Residence::settle(&server, SETTLE_TIMEOUT).await?;
+        Residence::settle(server, SETTLE_TIMEOUT).await?;
         self.bench = Some(Arc::new(Bench::new(
             &client,
             fixture,
@@ -829,36 +824,11 @@ impl Competing {
                 Case::FullScan,
             ],
         )));
-        let writes = Fixture {
-            rows: WRITE_FIXTURE_ROWS,
-        };
-        let otlp = Otlp::connect(&client).await?;
-        for (op, _) in SPLIT {
-            let sender = match op {
-                WriteOp::Native => Sender::native(&client, INGEST_TABLE, writes).await?,
-                WriteOp::Spans => Sender::Spans(
-                    otlp.clone(),
-                    Telemetry {
-                        spans: WRITE_FIXTURE_ROWS,
-                    },
-                ),
-                WriteOp::Logs => Sender::Logs(
-                    otlp.clone(),
-                    Logs {
-                        records: WRITE_FIXTURE_ROWS,
-                    },
-                ),
-            };
-            let primed = sender.request_rows();
-            sender.send(0, primed).await?;
-            self.senders
-                .push((op, sender, Arc::new(AtomicI64::new(primed))));
-        }
         let [setup] = server.tenants() else {
             return Err("setup provisioned one tenant".into());
         };
         let tenant: DataTenantId = setup.tenant_id.parse()?;
-        let catalog = operator_catalog(&server).await?;
+        let catalog = operator_catalog(server).await?;
         let ingest_table = INGEST_TABLE.rsplit('.').next().unwrap_or(INGEST_TABLE);
         for (namespace, name) in [
             (BifrostNamespace::Datasets, ingest_table),
@@ -874,14 +844,33 @@ impl Competing {
             ))
             .await?,
         ));
-        self.server = Some(server);
         Ok(())
     }
 }
 
 #[async_trait]
 impl Workload for Competing {
-    /// Starts and loads everything [`Competing::start`] names.
+    /// Starts the collector and server, registers each ingest path in
+    /// [`SPLIT`] order, and smokes every write path and the query boundary
+    /// ([`crate::query::smoke`]) before any fixture loads; the smoke's
+    /// writes also create every ingest table compaction is enabled on.
+    async fn smoke(&mut self) -> Result<String, ExperimentError> {
+        std::fs::create_dir_all(&self.logs).map_err(ExperimentError::workload)?;
+        let collector = Collector::start(&self.logs)
+            .await
+            .map_err(ExperimentError::workload)?;
+        let server = start(&collector).await.map_err(ExperimentError::workload)?;
+        let client = client(&server).map_err(ExperimentError::workload)?;
+        self.senders = lanes(&client, &SPLIT.map(|(op, _)| op))
+            .await
+            .map_err(ExperimentError::workload)?;
+        let proved = smoke(&server, &collector, &client, &self.senders).await;
+        self.collector = Some(collector);
+        self.server = Some(server);
+        proved.map_err(ExperimentError::Workload)
+    }
+
+    /// Loads everything [`Competing::start`] names.
     async fn prepare(&mut self) -> Result<(), ExperimentError> {
         Box::pin(self.start())
             .await

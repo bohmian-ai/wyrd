@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use tokio::task::JoinSet;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_testing::capacity::{Collector, Population, Selection, Usage, Window, release_binary};
+use wyrd_testing::capacity::{
+    Collector, Population, SMOKE_WINDOW, Selection, Smoke, Usage, Window, release_binary,
+};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
 use wyrd_testing::gateway_capture::GatewayCapture;
 use wyrd_testing::release_server::{LocalServer, Metrics};
@@ -407,6 +409,66 @@ impl Observed {
     }
 }
 
+/// The Gateway release smoke: sequential calls of every `(shape, capture)`
+/// pair, for an equal share of [`SMOKE_WINDOW`] each, from `tenant`'s first key, each pair under its capture
+/// policy, inside one window that then settles. Every call must be
+/// validated and reach `collector` as one succeeded timing at each of its
+/// boundaries with its provider wait excluded, beside positive server CPU,
+/// staged captures, and Scribe outbox writes.
+///
+/// # Errors
+///
+/// Returns a client, capture-policy, or scrape failure, or the [`Smoke`]
+/// message naming every missing piece of evidence.
+pub async fn smoke(
+    server: &LocalServer,
+    collector: &Collector,
+    tenant: &Tenant,
+    shapes: &[(Shape, CapturePolicy)],
+) -> Result<String> {
+    let mut smoke = Smoke::new("gateway");
+    let http = http()?;
+    let key = tenant
+        .keys
+        .first()
+        .ok_or("the tenant has no invoking key")?;
+    let mut expected: BTreeMap<&str, u64> = BTreeMap::new();
+    let from = SystemTime::now();
+    let (window, baseline) = Window::open(server, Selection::RESOURCES).await?;
+    let mut samples = Samples::default();
+    for (shape, policy) in shapes {
+        tenant.capture(*policy).await?;
+        let share = SMOKE_WINDOW / u32::try_from(shapes.len()).unwrap_or(u32::MAX);
+        let started = Instant::now();
+        let mut calls = 0;
+        while calls == 0 || started.elapsed() < share {
+            samples.record(&call(&http, key, shape, shape.body("smoke")).await);
+            calls += 1;
+        }
+        for boundary in boundaries(shape.stream) {
+            *expected.entry(boundary).or_default() += calls;
+        }
+    }
+    let (usage, _) = window.close(server).await?;
+    settle(server).await?;
+    let integrity = Integrity::between(&baseline, &server.metrics().await?);
+    smoke.usage(&usage);
+    smoke.positive("validated calls", samples.completion_us.len() as f64);
+    for (outcome, count) in &samples.errors {
+        smoke.missing(format!("{count} calls ended `{outcome}`"));
+    }
+    smoke.positive("staged captures", integrity.staged);
+    smoke.positive("Scribe outbox writes", integrity.written);
+    let expected: Vec<(&str, u64)> = expected.into_iter().collect();
+    let population = collector.smoke("smoke", from, &expected).await;
+    let judged: Vec<(&str, &str, bool)> = expected
+        .iter()
+        .map(|(boundary, _)| (*boundary, SUCCEEDED, true))
+        .collect();
+    smoke.timings(&population, &judged);
+    Ok(smoke.finish()?)
+}
+
 /// The L1 workload: one server, one tenant holding a key per client, and
 /// the instant upstream.
 pub struct Overhead {
@@ -529,13 +591,40 @@ impl Overhead {
 
 #[async_trait]
 impl Workload for Overhead {
-    /// Starts the server, upstream, and tenant.
+    /// Starts the server, upstream, and tenant, and smokes every case's
+    /// shape under its capture policy ([`smoke`]).
     ///
     /// # Errors
     ///
-    /// Returns a server, upstream, or provisioning failure.
+    /// Returns a server, upstream, or provisioning failure, or the smoke's
+    /// missing evidence.
+    async fn smoke(&mut self) -> std::result::Result<String, ExperimentError> {
+        self.start().await.map_err(ExperimentError::workload)?;
+        let (Some(server), Some(tenant), Some(collector)) =
+            (&self.server, &self.tenant, &self.collector)
+        else {
+            return Err(ExperimentError::workload("the workload did not start"));
+        };
+        let shapes: Vec<(Shape, CapturePolicy)> = Case::ALL
+            .iter()
+            .map(|case| (case.shape(), case.capture()))
+            .collect();
+        self.policy = shapes.last().map(|(_, policy)| *policy);
+        smoke(server, collector, tenant, &shapes)
+            .await
+            .map_err(ExperimentError::workload)
+    }
+
+    /// Nothing beyond what [`Self::smoke`] started.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error when the smoke did not start the server.
     async fn prepare(&mut self) -> std::result::Result<(), ExperimentError> {
-        self.start().await.map_err(ExperimentError::workload)
+        self.server
+            .as_ref()
+            .map(|_| ())
+            .ok_or_else(|| ExperimentError::workload("the workload was not smoked"))
     }
 
     /// The server's PID while it runs.

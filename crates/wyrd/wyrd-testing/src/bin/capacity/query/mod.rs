@@ -28,12 +28,14 @@ mod telemetry;
 mod workload;
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 use wyrd_client::config::ClientConfig;
-use wyrd_client::{GlobalConfig, WyrdClient};
-use wyrd_testing::capacity::Collector;
+use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
+use wyrd_testing::capacity::{Collector, Selection, Smoke, Window};
 use wyrd_testing::experiment::{
     Baselines, Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reason,
     Record, Status, Step, Verdict,
@@ -1000,6 +1002,149 @@ async fn start(collector: &Collector) -> Result<LocalServer> {
         .chain(tracing.iter().map(|(name, value)| (*name, value.as_str())))
         .collect();
     Ok(LocalServer::start(&binary, &["bench"], &variables).await?)
+}
+
+/// One write path's sender and the cursor every later window continues.
+pub type Lane = (WriteOp, run::Sender, Arc<AtomicI64>);
+
+/// Requests the release smoke sends through each write path.
+const SMOKE_WRITES: i64 = 2;
+
+/// Queries the release smoke may send before the smoked native rows answer
+/// exactly, [`SMOKE_POLL`] apart.
+const SMOKE_QUERIES: u64 = 50;
+
+/// How long the smoke waits for its rows to publish as Parquet: a write far
+/// below Scribe's size triggers waits out the declared
+/// `WYRD_MAX_FILE_RETENTION_TIME` of 30 s twice, once before its generation
+/// rotates and once before its staged members assemble, plus 30 s for the
+/// flush and publication.
+const SMOKE_SETTLE: Duration = Duration::from_secs(90);
+
+/// How long the release smoke waits between unanswered queries.
+const SMOKE_POLL: Duration = Duration::from_millis(100);
+
+/// Every write path of `ops`, in that order, over the public `client`, each
+/// cursor at zero.
+///
+/// # Errors
+///
+/// Returns the native writer's connection or registration failure, or the
+/// OTLP connection failure.
+async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
+    let otlp = run::Otlp::connect(client).await?;
+    let mut lanes = Vec::new();
+    for op in ops {
+        let sender = match op {
+            WriteOp::Native => {
+                run::Sender::native(
+                    client,
+                    workload::INGEST_TABLE,
+                    workload::Fixture {
+                        rows: WRITE_FIXTURE_ROWS,
+                    },
+                )
+                .await?
+            }
+            WriteOp::Spans => run::Sender::Spans(
+                otlp.clone(),
+                telemetry::Telemetry {
+                    spans: WRITE_FIXTURE_ROWS,
+                },
+            ),
+            WriteOp::Logs => run::Sender::Logs(
+                otlp.clone(),
+                logs::Logs {
+                    records: WRITE_FIXTURE_ROWS,
+                },
+            ),
+        };
+        lanes.push((*op, sender, Arc::new(AtomicI64::new(0))));
+    }
+    Ok(lanes)
+}
+
+/// The Bifrost release smoke over the started `server`: [`SMOKE_WRITES`]
+/// requests through every lane, advancing its cursor so later windows write
+/// fresh identities, a wait of at most [`SMOKE_SETTLE`] for their Parquet
+/// publication, since only physical scans count scanned rows, then exact
+/// `count(*)` queries over the smoked native
+/// rows until one answers, all inside one window. Every request must reach
+/// `collector` as exactly one successful timing at its boundary, with
+/// positive server CPU, inserted memtable bytes, and scanned rows.
+///
+/// # Errors
+///
+/// Returns the scrape failure, or the [`Smoke`] message naming every missing
+/// piece of evidence.
+async fn smoke(
+    server: &LocalServer,
+    collector: &Collector,
+    client: &WyrdClient,
+    lanes: &[Lane],
+) -> std::result::Result<String, String> {
+    let mut smoke = Smoke::new("bifrost");
+    let from = SystemTime::now();
+    let (window, before) = Window::open(server, Selection::RESOURCES)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut expected = Vec::new();
+    let mut native_rows = 0;
+    for (op, sender, cursor) in lanes {
+        let chunk = sender.request_rows();
+        for _ in 0..SMOKE_WRITES {
+            let first = cursor.fetch_add(chunk, Ordering::Relaxed);
+            match sender.send(first, first + chunk).await {
+                Ok(wire) if *op != WriteOp::Native => {
+                    smoke.positive(&format!("{} wire bytes", op.name()), wire as f64);
+                }
+                Ok(_) => native_rows += chunk,
+                Err(code) => {
+                    smoke.missing(format!("a `{}` write was refused with `{code}`", op.name()));
+                }
+            }
+        }
+        expected.push((op.boundary(), SMOKE_WRITES.cast_unsigned()));
+    }
+    if let Err(error) = Residence::settle(server, SMOKE_SETTLE).await {
+        smoke.missing(format!(
+            "the smoked rows were not published as Parquet: {error}"
+        ));
+    }
+    let queries = Bifrost::query_only(client);
+    let sql = format!("SELECT count(*) FROM {}", workload::INGEST_TABLE);
+    let mut asked = 0;
+    let mut answered = false;
+    while !answered && asked < SMOKE_QUERIES {
+        asked += 1;
+        answered = run::ask(&queries, sql.clone(), &vec![vec![native_rows]])
+            .await
+            .is_ok();
+        if !answered {
+            tokio::time::sleep(SMOKE_POLL).await;
+        }
+    }
+    if !answered {
+        smoke.missing(format!(
+            "none of {asked} `count(*)` queries answered the {native_rows} acknowledged native rows exactly"
+        ));
+    }
+    expected.push(("bifrost.query", asked));
+    let (usage, after) = window
+        .close(server)
+        .await
+        .map_err(|error| error.to_string())?;
+    smoke.usage(&usage);
+    let delta = |family: &str| after.sum(family, &[]) - before.sum(family, &[]);
+    smoke.positive(isolated::INSERTED, delta(isolated::INSERTED));
+    smoke.positive(isolated::ROWS_SCANNED, delta(isolated::ROWS_SCANNED));
+    let population = collector.smoke("smoke", from, &expected).await;
+    let boundaries: Vec<(&str, &str, bool)> = expected
+        .iter()
+        .map(|(boundary, _)| (*boundary, isolated::SUCCESS, false))
+        .collect();
+    smoke.timings(&population, &boundaries);
+    smoke.finish()
 }
 
 /// Where Scribe holds rows, from one `/metrics` scrape and the store.

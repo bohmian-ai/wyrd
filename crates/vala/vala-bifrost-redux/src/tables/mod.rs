@@ -196,22 +196,32 @@ pub struct CardDescriptor {
     pub version: String,
 }
 
-/// The accepted request context a public frame's [`SHARED_DIMENSIONS`] are
-/// stamped from.
+/// The accepted context a frame's [`SHARED_DIMENSIONS`] are stamped from.
 ///
-/// Gate resolves it once per frame, before Scribe admits the rows: the
-/// validated workload's Service descriptor, the request's accepted
-/// deployment environment, and the descriptor of every Card the frame's rows
-/// may name as subject. Labels in the rows never contribute to it.
+/// It is resolved once per frame, before Scribe admits the rows: Gate
+/// resolves a public frame's from its validated workload, request
+/// environment, and authorized subjects; a trusted row-attributed frame's
+/// comes from the workloads and subjects its producer carried. Labels in the
+/// rows never contribute to it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrameDimensions {
-    /// The validated workload Service; `None` for unowned rows, which keep
-    /// their observed Service promotions.
-    pub service: Option<CardDescriptor>,
     /// The accepted request environment; `None` keeps each row's own.
     pub environment: Option<String>,
-    /// Descriptors of the Cards the frame's rows may name as subject.
-    pub subjects: Vec<(wyrd_spec::ids::CardUid, CardDescriptor)>,
+    /// Descriptors of the Cards the frame's rows may name as workload or
+    /// subject. A row whose workload has none keeps its observed Service
+    /// values.
+    pub cards: Vec<(wyrd_spec::ids::CardUid, CardDescriptor)>,
+}
+
+impl FrameDimensions {
+    /// Returns the descriptor of the Card `uid` names, if the frame holds it.
+    #[must_use]
+    pub fn describe(&self, uid: &str) -> Option<&CardDescriptor> {
+        self.cards
+            .iter()
+            .find(|(owned, _)| owned.as_str() == uid)
+            .map(|(_, descriptor)| descriptor)
+    }
 }
 
 /// The attribution Bloom columns every attributable system table's creation

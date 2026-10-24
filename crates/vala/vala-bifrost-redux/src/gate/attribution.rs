@@ -18,7 +18,7 @@ use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::vala::SUBJECT_CARD_UID;
+use wyrd_spec::vala::{SUBJECT_CARD_UID, WORKLOAD_CARD_UID};
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_tonic::otlp::common::v1::KeyValue;
@@ -70,13 +70,13 @@ impl CardRegistry {
         }
     }
 
-    /// Resolves the shared-dimension context of one frame.
+    /// Resolves the shared-dimension context of one public frame.
     ///
     /// The validated workload Service and every Card in `subjects` are
     /// described from the tenant registry, each distinct UID read at most
     /// once per process; the request environment is carried unchanged. A UID
-    /// the registry does not hold is left out, so a row naming it cannot be
-    /// stamped and is refused downstream.
+    /// the registry does not hold is left out, so a row naming it as subject
+    /// cannot be stamped and is refused downstream.
     ///
     /// # Errors
     ///
@@ -88,20 +88,39 @@ impl CardRegistry {
         subjects: &[CardUid],
     ) -> Result<FrameDimensions, IngestError> {
         let workload = auth.principal.workload_uid.as_ref();
-        let mut described = self
-            .described(auth.tenant, workload.into_iter().chain(subjects))
-            .await?;
-        let service = workload.and_then(|root| {
-            described
-                .iter()
-                .find(|(uid, _)| uid == root)
-                .map(|(_, descriptor)| descriptor.clone())
-        });
-        described.retain(|(uid, _)| subjects.contains(uid));
         Ok(FrameDimensions {
-            service,
             environment: auth.deployment_environment.clone(),
-            subjects: described,
+            cards: self
+                .described(auth.tenant, workload.into_iter().chain(subjects))
+                .await?,
+        })
+    }
+
+    /// Resolves the shared-dimension context of one trusted row-attributed
+    /// frame.
+    ///
+    /// The producer already validated and authorized each row's workload and
+    /// subject, so every distinct UID the frame's `workload_card_uid` and
+    /// `subject_card_uid` columns name is described, and each row keeps its
+    /// own carried environment. A UID never changes its descriptor, so a
+    /// retried or recovered frame resolves exactly the context its producer
+    /// accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Internal`] when the tenant registry cannot be
+    /// read.
+    pub async fn row_dimensions(
+        &self,
+        tenant: DataTenantId,
+        ipc: &[u8],
+    ) -> Result<FrameDimensions, IngestError> {
+        let uids = native_uids(ipc, WORKLOAD_CARD_UID);
+        Ok(FrameDimensions {
+            environment: None,
+            cards: self
+                .described(tenant, uids.iter().chain(&native_card_uids(ipc)))
+                .await?,
         })
     }
 
@@ -252,15 +271,21 @@ fn is_unbound(principal: &Principal) -> bool {
 /// Collects the distinct parseable UIDs of a native frame's `card_uid`
 /// column.
 ///
-/// Only the correlation column is projected out of the stream. A frame that
-/// does not decode, lacks the column, or carries non-UTF-8 values yields no
-/// UIDs here; Scribe's full decode refuses it on its own terms.
+/// A frame that does not decode, lacks the column, or carries non-UTF-8
+/// values yields no UIDs here; Scribe's full decode refuses it on its own
+/// terms.
 #[must_use]
 pub fn native_card_uids(ipc: &[u8]) -> Vec<CardUid> {
+    native_uids(ipc, SUBJECT_CARD_UID)
+}
+
+/// Collects the distinct parseable UIDs of a native frame's `column`,
+/// projecting only that column out of the stream.
+fn native_uids(ipc: &[u8], column: &str) -> Vec<CardUid> {
     let Ok(reader) = StreamReader::try_new(Cursor::new(ipc), None) else {
         return Vec::new();
     };
-    let Ok(column) = reader.schema().index_of(SUBJECT_CARD_UID) else {
+    let Ok(column) = reader.schema().index_of(column) else {
         return Vec::new();
     };
     let Ok(reader) = StreamReader::try_new(Cursor::new(ipc), Some(vec![column])) else {

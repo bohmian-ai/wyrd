@@ -416,7 +416,10 @@ mod tests {
     /// verbatim, or a malformed value is not refused as `Validation`.
     #[test]
     fn deployment_environment_selector_accepts_one_value() {
-        assert_eq!(super::deployment_environment_selector([]).expect("absent"), None);
+        assert_eq!(
+            super::deployment_environment_selector([]).expect("absent"),
+            None
+        );
         assert_eq!(
             super::deployment_environment_selector([b"prod".as_slice()]).expect("one value"),
             Some("prod".to_owned())

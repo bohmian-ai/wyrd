@@ -542,9 +542,14 @@ pub fn build_peer_grpc(
             .add_service(GrpcTransportAdmissionService::new_peer(
                 // A peer outbox frame is bounded by the same configured
                 // request ceiling as public ingest, not tonic's default.
-                capture_peer::ScribeCapturePeerGrpc::new(Arc::clone(scribe.scribe()) as _)
-                    .into_server()
-                    .max_decoding_message_size(transport.message_limit_bytes()),
+                capture_peer::ScribeCapturePeerGrpc::new(
+                    Arc::clone(scribe.scribe()) as _,
+                    Some(vala_bifrost_redux::gate::attribution::CardRegistry::new(
+                        state.postgres.wyrd().clone(),
+                    )),
+                )
+                .into_server()
+                .max_decoding_message_size(transport.message_limit_bytes()),
                 transport.clone(),
             )),
         None => router,

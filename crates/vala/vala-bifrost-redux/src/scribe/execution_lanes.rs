@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use arrow::array::{Array, ArrayRef, StringArray, TimestampMicrosecondArray};
+use arrow::array::{Array, ArrayRef, AsArray, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -1146,11 +1146,7 @@ fn stamp_correlation_columns(
     let caller_run_id = caller_run_id_column(rows)?;
     let mut fields = user_fields(rows);
     let mut columns = user_columns(rows);
-    if let (Some(dimensions), Some(_)) = (context.dimensions, context.definition) {
-        stamp_dimensions(&fields, &mut columns, dimensions, &card_uids)?;
-    }
-    fields.extend(ensure_managed_columns(Vec::new()));
-    columns.extend(managed_arrays(
+    let managed = managed_arrays(
         rows,
         &ManagedValues {
             attribution,
@@ -1160,7 +1156,26 @@ fn stamp_correlation_columns(
             caller_run_id,
             workload: context.workload,
         },
-    )?);
+    )?;
+    if let (Some(dimensions), Some(_)) = (context.dimensions, context.definition) {
+        let stamped = |name: &str| {
+            MANAGED_COLUMNS
+                .iter()
+                .zip(&managed)
+                .find(|(column, _)| column.field.name == name)
+                .and_then(|(_, array)| array.as_string_opt::<i32>())
+                .ok_or(ScribeError::InvalidFrame)
+        };
+        stamp_dimensions(
+            &fields,
+            &mut columns,
+            dimensions,
+            stamped(WORKLOAD_CARD_UID)?,
+            stamped(SUBJECT_CARD_UID)?,
+        )?;
+    }
+    fields.extend(ensure_managed_columns(Vec::new()));
+    columns.extend(managed);
     // A canonical built-in constructs only the arrays here: every correlation
     // and managed `Field` — with its sensitivity metadata — is
     // cloned from the table's own physical schema, and the locally assembled
@@ -1210,60 +1225,65 @@ fn stamp_correlation_columns(
 /// context.
 ///
 /// Only a dimension the payload declares is replaced, and only from a value
-/// the context owns: the validated workload Service's name and version, the
+/// the context owns: each row's workload Service name and version, the
 /// accepted request environment, and each row's subject descriptor, null for
-/// a row without a subject. A Service or environment the context does not own
-/// keeps the row's observed value; subject columns never do.
+/// a row without a subject. A row whose workload is absent or undescribed, or
+/// a frame without an accepted environment, keeps the row's observed Service
+/// or environment value; subject columns never do.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::CardScopeDenied`] when a row's authorized subject
-/// has no registered descriptor in the context.
+/// has no descriptor in the context, and [`ScribeError::InvalidFrame`] when a
+/// declared Service column is not `Utf8`.
 fn stamp_dimensions(
     fields: &[Field],
     columns: &mut [ArrayRef],
     dimensions: &crate::tables::FrameDimensions,
-    subjects: &[Option<String>],
+    workloads: &StringArray,
+    subjects: &StringArray,
 ) -> Result<(), ScribeError> {
-    let descriptors = subjects
+    let subject_of = subjects
         .iter()
         .map(|uid| {
-            uid.as_deref()
-                .map(|uid| {
-                    dimensions
-                        .subjects
-                        .iter()
-                        .find(|(owned, _)| owned.as_str() == uid)
-                        .map(|(_, descriptor)| descriptor)
-                        .ok_or(ScribeError::CardScopeDenied)
-                })
+            uid.map(|uid| dimensions.describe(uid).ok_or(ScribeError::CardScopeDenied))
                 .transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let constant =
-        |value: &str| -> ArrayRef { Arc::new(StringArray::from(vec![value; subjects.len()])) };
-    let per_subject = |value: fn(&crate::tables::CardDescriptor) -> &str| -> ArrayRef {
+    let service_of: Vec<_> = workloads
+        .iter()
+        .map(|uid| uid.and_then(|uid| dimensions.describe(uid)))
+        .collect();
+    let subject = |value: fn(&crate::tables::CardDescriptor) -> &str| -> ArrayRef {
         Arc::new(
-            descriptors
+            subject_of
                 .iter()
                 .map(|descriptor| descriptor.map(value))
                 .collect::<StringArray>(),
         )
     };
+    let service = |observed: &ArrayRef, value: fn(&crate::tables::CardDescriptor) -> &str| {
+        let observed = observed
+            .as_string_opt::<i32>()
+            .ok_or(ScribeError::InvalidFrame)?;
+        Ok::<ArrayRef, ScribeError>(Arc::new(
+            service_of
+                .iter()
+                .zip(observed.iter())
+                .map(|(owned, observed)| owned.map(value).or(observed))
+                .collect::<StringArray>(),
+        ))
+    };
     for (field, column) in fields.iter().zip(columns.iter_mut()) {
         let stamped = match field.name().as_str() {
-            SERVICE_NAME => dimensions
-                .service
-                .as_ref()
-                .map(|service| constant(&service.name)),
-            SERVICE_VERSION => dimensions
-                .service
-                .as_ref()
-                .map(|service| constant(&service.version)),
-            DEPLOYMENT_ENVIRONMENT => dimensions.environment.as_deref().map(constant),
-            SUBJECT_KIND => Some(per_subject(|descriptor| descriptor.kind.wire_name())),
-            SUBJECT_NAME => Some(per_subject(|descriptor| &descriptor.name)),
-            SUBJECT_VERSION => Some(per_subject(|descriptor| &descriptor.version)),
+            SERVICE_NAME => Some(service(column, |descriptor| &descriptor.name)?),
+            SERVICE_VERSION => Some(service(column, |descriptor| &descriptor.version)?),
+            DEPLOYMENT_ENVIRONMENT => dimensions.environment.as_deref().map(|environment| {
+                Arc::new(StringArray::from(vec![environment; subjects.len()])) as ArrayRef
+            }),
+            SUBJECT_KIND => Some(subject(|descriptor| descriptor.kind.wire_name())),
+            SUBJECT_NAME => Some(subject(|descriptor| &descriptor.name)),
+            SUBJECT_VERSION => Some(subject(|descriptor| &descriptor.version)),
             _ => None,
         };
         if let Some(stamped) = stamped {
@@ -2387,8 +2407,8 @@ mod tests {
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::managed_columns::{
         ACT_PRINCIPAL_ID, DEPLOYMENT_ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION, SUB_PRINCIPAL_ID,
-        SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME, SUBJECT_VERSION, WYRD_INGESTED_AT,
-        WYRD_REQUEST_ID,
+        SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME, SUBJECT_VERSION, WORKLOAD_CARD_UID,
+        WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
 
     use bytes::Bytes;
@@ -2902,8 +2922,11 @@ mod tests {
     }
 
     /// A built-in table's shared dimensions are stamped from the frame's
-    /// accepted context over whatever the rows carried, a row without a subject
-    /// gets null subject columns, and a subject without a descriptor refuses.
+    /// accepted context over whatever the rows carried: each row's Service
+    /// from its own workload, so a mixed-origin frame keeps every origin, a
+    /// row without a described workload keeps its observed Service, a row
+    /// without a subject gets null subject columns, and a subject without a
+    /// descriptor refuses.
     ///
     /// # Panics
     ///
@@ -2926,16 +2949,11 @@ mod tests {
         let projected =
             crate::tables::audit::projection::project_audit_event(&event, chrono::Utc::now())
                 .expect("valid projection");
-        let subject = CardUid::new(Uuid::now_v7().to_string()).expect("card uid");
-        let labelled = |name: &str, value: Option<&str>| -> ArrayRef {
-            let forged = if name == SUBJECT_CARD_UID {
-                value
-            } else {
-                Some("forged")
-            };
-            Arc::new(StringArray::from(vec![forged, forged]))
-        };
-        let rows = |uid: Option<&str>| {
+        let uid = || CardUid::new(Uuid::now_v7().to_string()).expect("card uid");
+        let (subject, checkout, billing) = (uid(), uid(), uid());
+        // Two rows, each naming its own workload and subject; every other
+        // dimension the rows carry is a forged label.
+        let rows = |origins: [(Option<&str>, Option<&str>); 2]| {
             let schema = projected.schema();
             let mut fields: Vec<Field> =
                 schema.fields().iter().map(|f| f.as_ref().clone()).collect();
@@ -2944,36 +2962,53 @@ mod tests {
                 .zip(projected.columns())
                 .map(|(field, column)| {
                     if crate::tables::SHARED_DIMENSIONS.contains(&field.name().as_str()) {
-                        labelled(field.name(), uid)
+                        Arc::new(StringArray::from(vec!["forged"; 2])) as ArrayRef
                     } else {
                         arrow::compute::concat(&[column.as_ref(), column.as_ref()])
                             .expect("two rows")
                     }
                 })
                 .collect();
-            fields.push(Field::new(SUBJECT_CARD_UID, DataType::Utf8, true));
-            columns.push(labelled(SUBJECT_CARD_UID, uid));
+            for (name, column) in [
+                (WORKLOAD_CARD_UID, origins.map(|(workload, _)| workload)),
+                (SUBJECT_CARD_UID, origins.map(|(_, subject)| subject)),
+            ] {
+                fields.push(Field::new(name, DataType::Utf8, true));
+                columns.push(Arc::new(StringArray::from(column.to_vec())));
+            }
             batch(fields, columns)
         };
-        let descriptor = |name: &str| crate::tables::CardDescriptor {
-            kind: wyrd_spec::envelope::CardKind::Agent,
+        let descriptor = |kind, name: &str| crate::tables::CardDescriptor {
+            kind,
             name: name.to_owned(),
             version: "2".to_owned(),
         };
         let mut dimensions = crate::tables::FrameDimensions {
-            service: Some(descriptor("checkout")),
             environment: Some("prod".to_owned()),
-            subjects: vec![(subject.clone(), descriptor("planner"))],
+            cards: vec![
+                (
+                    subject.clone(),
+                    descriptor(wyrd_spec::envelope::CardKind::Agent, "planner"),
+                ),
+                (
+                    checkout.clone(),
+                    descriptor(wyrd_spec::envelope::CardKind::Service, "checkout"),
+                ),
+                (
+                    billing.clone(),
+                    descriptor(wyrd_spec::envelope::CardKind::Service, "billing"),
+                ),
+            ],
         };
         let scope = [subject.clone()];
         let request_id = RequestId::now_v7();
         let principal = principal();
-        let stamp = |uid: Option<&str>, dimensions: &crate::tables::FrameDimensions| {
+        let stamp = |origins, dimensions: &crate::tables::FrameDimensions| {
             let mut context = stamping_context(&principal, Some(&scope), &request_id);
             context.attribution = StampedAttribution::Rows;
             context.definition = Some(definition);
             context.dimensions = Some(dimensions);
-            stamp_correlation_columns(&rows(uid), &context)
+            stamp_correlation_columns(&rows(origins), &context)
         };
         let text = |stamped: &RecordBatch, name: &str| {
             stamped
@@ -2984,37 +3019,49 @@ mod tests {
                 .map(|value| value.map(str::to_owned))
                 .collect::<Vec<_>>()
         };
-        let both = |value: &str| vec![Some(value.to_owned()); 2];
+        let pair = |first: Option<&str>, second: Option<&str>| {
+            vec![first.map(str::to_owned), second.map(str::to_owned)]
+        };
+        let both = |value: &str| pair(Some(value), Some(value));
 
-        let stamped = stamp(Some(subject.as_str()), &dimensions).expect("attributed rows stamp");
-        assert_eq!(text(&stamped, SERVICE_NAME), both("checkout"));
+        let mixed = [
+            (Some(checkout.as_str()), Some(subject.as_str())),
+            (Some(billing.as_str()), Some(subject.as_str())),
+        ];
+        let stamped = stamp(mixed, &dimensions).expect("attributed rows stamp");
+        assert_eq!(
+            text(&stamped, SERVICE_NAME),
+            pair(Some("checkout"), Some("billing")),
+            "each row keeps its own workload's Service"
+        );
         assert_eq!(text(&stamped, SERVICE_VERSION), both("2"));
         assert_eq!(text(&stamped, DEPLOYMENT_ENVIRONMENT), both("prod"));
         assert_eq!(text(&stamped, SUBJECT_KIND), both("Agent"));
         assert_eq!(text(&stamped, SUBJECT_NAME), both("planner"));
         assert_eq!(text(&stamped, SUBJECT_VERSION), both("2"));
 
-        dimensions.service = None;
         dimensions.environment = None;
-        let unowned = stamp(None, &dimensions).expect("unattributed rows stamp");
+        let undescribed = uid();
+        let unowned = stamp(
+            [(None, None), (Some(undescribed.as_str()), None)],
+            &dimensions,
+        )
+        .expect("unattributed rows stamp");
         assert_eq!(
             text(&unowned, SERVICE_NAME),
             both("forged"),
-            "unowned rows keep their Service"
+            "rows without a described workload keep their Service"
         );
         assert_eq!(text(&unowned, DEPLOYMENT_ENVIRONMENT), both("forged"));
         assert_eq!(
             text(&unowned, SUBJECT_NAME),
-            vec![None, None],
+            pair(None, None),
             "no subject, no label"
         );
 
-        dimensions.subjects.clear();
+        dimensions.cards.retain(|(uid, _)| *uid != subject);
         assert!(
-            matches!(
-                stamp(Some(subject.as_str()), &dimensions),
-                Err(ScribeError::CardScopeDenied)
-            ),
+            matches!(stamp(mixed, &dimensions), Err(ScribeError::CardScopeDenied)),
             "a subject without a descriptor refuses"
         );
     }

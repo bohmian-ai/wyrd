@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::gate::IngestError;
+use vala_bifrost_redux::gate::attribution::CardRegistry;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::{Request, Response, Status};
@@ -30,13 +31,17 @@ use crate::scribe_outbox::{ScribeBatch, ScribeTable};
 pub struct ScribeCapturePeerGrpc {
     /// This pod's Scribe.
     scribe: Arc<dyn Scribe>,
+    /// The tenant registry each frame's Cards are described from; `None`
+    /// stamps no shared dimension.
+    cards: Option<CardRegistry>,
 }
 
 impl ScribeCapturePeerGrpc {
-    /// Creates the adapter around this pod's Scribe.
+    /// Creates the adapter around this pod's Scribe, describing frames from
+    /// `cards` when given.
     #[must_use]
-    pub fn new(scribe: Arc<dyn Scribe>) -> Self {
-        Self { scribe }
+    pub fn new(scribe: Arc<dyn Scribe>, cards: Option<CardRegistry>) -> Self {
+        Self { scribe, cards }
     }
 
     /// Returns the generated service wrapper for peer-router mounting.
@@ -98,7 +103,10 @@ impl ScribeCapturePeerService for ScribeCapturePeerGrpc {
         &self,
         request: Request<IngestCaptureRequest>,
     ) -> Result<Response<IngestCaptureResponse>, Status> {
-        let frame = Self::batch(request.into_inner())?.into_frame();
+        let frame = Self::batch(request.into_inner())?
+            .into_frame(self.cards.as_ref())
+            .await
+            .map_err(|_| Status::unavailable("the tenant registry is unavailable"))?;
         self.scribe
             .ingest_frame(frame)
             .await
@@ -204,7 +212,7 @@ mod tests {
         scribe.refuse_next(ScribeError::IngestBusy {
             table: "bifrost.gateway.calls".to_owned(),
         });
-        let service = ScribeCapturePeerGrpc::new(Arc::clone(&scribe) as _);
+        let service = ScribeCapturePeerGrpc::new(Arc::clone(&scribe) as _, None);
         let status = service
             .ingest_capture(Request::new(request(
                 DataTenantId::new_v7(),

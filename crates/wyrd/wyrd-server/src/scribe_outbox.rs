@@ -64,7 +64,7 @@ use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::contracts::{
     IngressPayload, Scribe, ScribeError, ScribeIngressFrame, StampedAttribution,
 };
-use vala_bifrost_redux::gate::attribution::native_card_uids;
+use vala_bifrost_redux::gate::attribution::{CardRegistry, native_card_uids};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::tables::audit::projection::project_audit_event;
@@ -476,11 +476,30 @@ impl ScribeBatch {
     /// authorized before staging. Every frame names the platform audit
     /// principal, the no-verified-caller marker, as its required tenant
     /// principal; it grants nothing, since every write here is server-internal
-    /// and evaluates no permission.
-    pub(crate) fn into_frame(self) -> ScribeIngressFrame {
-        ScribeIngressFrame {
+    /// and evaluates no permission. With `cards`, each row's shared dimensions
+    /// are stamped from the descriptors of its own carried workload and
+    /// subject, so a mixed-origin frame keeps every producer's context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeRefusal::Unavailable`] when the tenant registry cannot
+    /// be read, so the frame is retried.
+    pub(crate) async fn into_frame(
+        self,
+        cards: Option<&CardRegistry>,
+    ) -> Result<ScribeIngressFrame, ScribeRefusal> {
+        let dimensions = match cards {
+            Some(cards) => Some(
+                cards
+                    .row_dimensions(self.tenant, &self.ipc)
+                    .await
+                    .map_err(|_| ScribeRefusal::Unavailable)?,
+            ),
+            None => None,
+        };
+        Ok(ScribeIngressFrame {
             attributed_cards: Some(native_card_uids(&self.ipc)).filter(|uids| !uids.is_empty()),
-            dimensions: None,
+            dimensions,
             attribution: StampedAttribution::Rows,
             principal: Principal::new(
                 PLATFORM_AUDIT_PRINCIPAL,
@@ -497,7 +516,7 @@ impl ScribeBatch {
             batch_id: self.batch_id,
             measured_wire_bytes: self.ipc.len(),
             payload: IngressPayload::ArrowIpc(self.ipc),
-        }
+        })
     }
 }
 
@@ -594,8 +613,9 @@ impl ScribePeers {
 
 /// Where the sink submits.
 pub(crate) enum ScribeRoute {
-    /// Scribe runs in this pod and acknowledges in-process.
-    Local(Arc<dyn Scribe>),
+    /// Scribe runs in this pod and acknowledges in-process; frames are
+    /// described from the tenant registry when one is given.
+    Local(Arc<dyn Scribe>, Option<CardRegistry>),
     /// This pod runs no Scribe and submits over the peer plane.
     Peer(ScribePeers),
 }
@@ -610,9 +630,10 @@ impl ScribeRoute {
         local: Option<&Arc<vala_bifrost_redux::scribe::ScribeImpl>>,
         cluster: &Arc<ClusterRegistry>,
         tls: Option<&BifrostPeerTls>,
+        cards: Option<CardRegistry>,
     ) -> Option<Self> {
         match (local, tls) {
-            (Some(scribe), _) => Some(Self::Local(Arc::clone(scribe) as Arc<dyn Scribe>)),
+            (Some(scribe), _) => Some(Self::Local(Arc::clone(scribe) as Arc<dyn Scribe>, cards)),
             (None, Some(tls)) => Some(Self::Peer(ScribePeers {
                 cluster: Arc::clone(cluster),
                 tls: tls.clone(),
@@ -630,8 +651,8 @@ impl ScribeRoute {
     /// Returns the classified Scribe refusal.
     async fn submit(&self, batch: &ScribeBatch, attempt: usize) -> Result<(), ScribeRefusal> {
         match self {
-            Self::Local(scribe) => scribe
-                .ingest_frame(batch.clone().into_frame())
+            Self::Local(scribe, cards) => scribe
+                .ingest_frame(batch.clone().into_frame(cards.as_ref()).await?)
                 .await
                 .map(|_| ())
                 .map_err(|error| ScribeRefusal::from_scribe(&error)),
@@ -760,7 +781,8 @@ impl ScribeSink {
 
     /// Starts an outbox submitting in-process to `scribe`, standing in for a
     /// pod's own Scribe at the default request ceiling, and recording
-    /// acknowledged grouped activity through `groups`, when given.
+    /// acknowledged grouped activity through `groups` and describing each
+    /// frame's Cards from its registry, when given.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn local_outbox(
@@ -768,7 +790,10 @@ impl ScribeSink {
         groups: Option<WyrdPostgres>,
     ) -> Arc<ScribeOutbox> {
         Self::bounded_outbox(
-            Some(ScribeRoute::Local(scribe)),
+            Some(ScribeRoute::Local(
+                scribe,
+                groups.clone().map(CardRegistry::new),
+            )),
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
             Self::DEFAULT_LIMITS,
             groups,
@@ -1940,7 +1965,7 @@ mod tests {
             Vec::new(),
             secrecy::SecretString::from(String::new()),
         );
-        let route = ScribeRoute::select(None, &cluster, Some(&tls));
+        let route = ScribeRoute::select(None, &cluster, Some(&tls), None);
         assert!(matches!(route, Some(ScribeRoute::Peer(_))));
         ScribeSink::outbox(route, BIFROST_INGEST_REQUEST_LIMIT_BYTES)
     }
@@ -2216,7 +2241,10 @@ mod tests {
             lose: 1,
             seen: AtomicUsize::new(0),
         };
-        let outbox = route_outbox(ScribeRoute::Local(Arc::new(scribe)), SMALL_REQUEST_BYTES);
+        let outbox = route_outbox(
+            ScribeRoute::Local(Arc::new(scribe), None),
+            SMALL_REQUEST_BYTES,
+        );
         outbox.stage(
             DataTenantId::new_v7(),
             drift_result(&uid(), background(), DETAIL_FEATURES, 0),
@@ -2303,7 +2331,7 @@ mod tests {
         const JUDGMENTS: usize = 8;
         let scribe = Arc::new(Overlapping::default());
         let outbox = route_outbox(
-            ScribeRoute::Local(Arc::clone(&scribe) as _),
+            ScribeRoute::Local(Arc::clone(&scribe) as _, None),
             SMALL_REQUEST_BYTES,
         );
         let tenant = DataTenantId::new_v7();
@@ -2368,7 +2396,7 @@ mod tests {
             limit: SMALL_REQUEST_BYTES,
         });
         let outbox = route_outbox(
-            ScribeRoute::Local(Arc::clone(&scribe) as _),
+            ScribeRoute::Local(Arc::clone(&scribe) as _, None),
             SMALL_REQUEST_BYTES,
         );
         outbox.stage(
@@ -2498,7 +2526,7 @@ mod tests {
         let ready_address = serve_peer(
             &ca,
             &leaf,
-            ScribeCapturePeerGrpc::new(Arc::clone(&recording) as _).into_server(),
+            ScribeCapturePeerGrpc::new(Arc::clone(&recording) as _, None).into_server(),
         )
         .await;
         let pool = sqlx::postgres::PgPoolOptions::new()

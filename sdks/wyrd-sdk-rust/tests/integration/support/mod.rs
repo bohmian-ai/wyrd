@@ -16,8 +16,11 @@ use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+use wyrd_ai::auth::{
+    CreateServicePrincipalRequest, PrincipalId, PrincipalKindTag, PrincipalQuery, Principals,
+    WorkloadFamily, WorkloadKind, WorkloadRestriction,
+};
 use wyrd_ai::cards::{BundleMode, CardRef, CardSelector, Cards, DeclarationReceipt};
-use wyrd_ai::cli;
 use wyrd_ai::config::ClientConfig;
 use wyrd_ai::operator_connections::{
     ConnectionName, CreateOperatorConnectionRequest, HttpConnectionAuth, HttpsOrigin,
@@ -54,6 +57,8 @@ pub struct Deployment {
     server: WyrdTestServer,
     /// Key of the tenant administrator the deployment bootstraps.
     admin_key: String,
+    /// The administrator's own fixture Service root.
+    admin_root: CardRef,
 }
 
 impl Deployment {
@@ -71,13 +76,19 @@ impl Deployment {
     /// Panics when the server cannot start or bootstrap its administrator.
     pub async fn start_with(builder: WyrdTestServerBuilder) -> Self {
         let server = builder.start_bound().await.expect("test server starts");
-        let admin_key = api_key(
-            server
-                .bootstrap_service("journey_admin", &["admin"])
-                .await
-                .expect("administrator bootstraps"),
-        );
-        Self { server, admin_key }
+        let admin = server
+            .bootstrap_service("journey_admin", &["admin"])
+            .await
+            .expect("administrator bootstraps");
+        let admin_root = admin
+            .card_ref()
+            .expect("a bootstrapped Service has a root")
+            .clone();
+        Self {
+            server,
+            admin_key: api_key(admin),
+            admin_root,
+        }
     }
 
     /// The server, for its address and its documented test controls.
@@ -116,6 +127,21 @@ impl Deployment {
     /// A client of this deployment's administrator.
     pub fn admin(&self) -> WyrdClient {
         self.client(&self.admin_key)
+    }
+
+    /// A client that authenticates with `key` and runs as the exact
+    /// registered root `root`, as a delegating actor must.
+    ///
+    /// # Panics
+    /// Panics when the client cannot be assembled or `root` carries no uid.
+    pub fn rooted(&self, key: &str, root: &CardRef) -> WyrdClient {
+        self.client(key)
+            .for_workload(root.uid.clone().expect("a registered root carries a uid"))
+    }
+
+    /// The administrator's client run as its own fixture Service root.
+    pub fn rooted_admin(&self) -> WyrdClient {
+        self.rooted(&self.admin_key, &self.admin_root)
     }
 
     /// The administrator's Cards handle, connected eagerly so the
@@ -216,31 +242,15 @@ impl Deployment {
             .expect("principal bootstraps")
     }
 
-    /// Issue a key for the principal registration projected for the Service
-    /// `card`, as the administrator through the `wyrd auth issue-key` CLI
-    /// function, and return its plaintext.
-    ///
-    /// The key holds exactly the default `workload` Role every Service
-    /// principal starts with; nothing is granted beyond it.
+    /// A client of the Service `card`'s family runtime account, run as the
+    /// exact root `card`, as the administrator provisions it through
+    /// [`runtime_account`].
     ///
     /// # Panics
-    /// Panics when the CLI refuses to issue the key.
-    pub async fn service_key(&self, card: &CardRef) -> String {
-        let [kind, name, version, space] = coordinates(card);
-        cli::issue_key(
-            &kind,
-            &name,
-            &version,
-            &space,
-            None,
-            None,
-            Some(self.admin()),
-        )
-        .await
-        .expect("the CLI issues the Service key")
-        .key
-        .expose()
-        .to_owned()
+    /// Panics when the account cannot be provisioned or `card` carries no uid.
+    pub async fn service_client(&self, card: &CardRef) -> WyrdClient {
+        let (_, key) = runtime_account(&self.admin(), card).await;
+        self.rooted(&key, card)
     }
 
     /// Bootstrap an administrator in a new tenant `slug` and return its key.
@@ -460,6 +470,7 @@ impl Deployment {
         Self {
             server,
             admin_key: self.admin_key,
+            admin_root: self.admin_root,
         }
     }
 
@@ -525,17 +536,52 @@ pub fn ancestry<'a>(timeline: &'a [SpanRecord], span: &'a SpanRecord) -> Vec<&'a
     chain
 }
 
-/// The `kind`, `name`, `version`, and `space` arguments the card-selecting
-/// CLI functions take for `card`; an unpinned space is `default`.
-pub fn coordinates(card: &CardRef) -> [String; 4] {
-    [
-        card.kind.wire_name().to_owned(),
-        card.name.as_str().to_owned(),
-        card.version.to_string(),
-        card.space
-            .as_ref()
-            .map_or_else(|| "default".to_owned(), ToString::to_string),
-    ]
+/// The `card` family's runtime account in `admin`'s tenant and one new key
+/// for it.
+///
+/// Registration creates no principal, so the account restricted to `card`'s
+/// kind and name is created holding only `workload` on first use, and issued
+/// one more credential afterwards.
+///
+/// # Panics
+/// Panics when `card` is not a Service, or a principal call fails.
+pub async fn runtime_account(admin: &WyrdClient, card: &CardRef) -> (PrincipalId, String) {
+    let principals = Principals::connect_with(admin)
+        .await
+        .expect("handle connects");
+    let name = format!("{}-runtime", card.name);
+    let existing = principals
+        .list(&PrincipalQuery {
+            kind: Some(PrincipalKindTag::Service),
+            name: Some(name.clone()),
+            ..PrincipalQuery::default()
+        })
+        .await
+        .expect("principals list")
+        .principals
+        .into_iter()
+        .next();
+    if let Some(account) = existing {
+        let issued = principals
+            .issue_credential(&account.principal_id)
+            .await
+            .expect("the runtime account is issued a key");
+        return (account.principal_id, issued.credential.expose().to_owned());
+    }
+    let created = principals
+        .create_service_principal(&CreateServicePrincipalRequest {
+            name,
+            roles: vec!["workload".to_owned()],
+            description: None,
+            workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
+                kind: WorkloadKind::from_card_kind(&card.kind)
+                    .expect("a runtime account names a Service"),
+                name: card.name.clone(),
+            })),
+        })
+        .await
+        .expect("the runtime account is created");
+    (created.principal_id, created.credential.expose().to_owned())
 }
 
 /// Register the fixture at `relative` through `cards`.

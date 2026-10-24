@@ -17,6 +17,7 @@ use wyrd_client::bifrost::client_from_options;
 use wyrd_client::transport::trace::with_caller_trace;
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 /// Python-facing handle to one authenticated [`WyrdClient`].
@@ -243,22 +244,33 @@ impl PyWyrdClient {
     ///   (`wyrd_sk_…`), exchanged for a short-lived access token and renewed,
     ///   or an access token, presented as-is. `None` resolves the chain.
     /// * `grpc_url` - The gRPC endpoint, or `None` to derive it.
+    /// * `workload_uid` - Exact Service Card UID the client runs as,
+    ///   as [`Self::for_workload`] selects it, or `None` for
+    ///   `WYRD_WORKLOAD_UID`, else rootless work.
     ///
     /// # Errors
     /// Raises `WyrdError` carrying `WYRD_CLIENT_401_NO_CREDENTIALS` when no
     /// credential resolves, `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this
     /// server has saved logins but none for `WYRD_TENANT`, or the saved login
-    /// cannot be used, or a transport error when the client cannot be built.
+    /// cannot be used, `WYRD_SPEC_400_VALIDATION` when `workload_uid` is not a
+    /// UUIDv7, or a transport error when the client cannot be built.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None, grpc_url=None))]
+    #[pyo3(signature = (server_url=None, credential=None, grpc_url=None, *, workload_uid=None))]
     fn __new__(
         server_url: Option<&str>,
         credential: Option<&str>,
         grpc_url: Option<&str>,
+        workload_uid: Option<&str>,
     ) -> WyrdPyResult<Self> {
-        client_from_options(server_url, credential, grpc_url)
-            .map(|inner| Self { inner })
-            .map_err(|error| WyrdPyError::from(WyrdError::from(error)))
+        let workload_uid = workload_uid.map(parse_workload_uid).transpose()?;
+        let inner = client_from_options(server_url, credential, grpc_url)
+            .map_err(|error| WyrdPyError::from(WyrdError::from(error)))?;
+        Ok(Self {
+            inner: match workload_uid {
+                Some(uid) => inner.for_workload(uid),
+                None => inner,
+            },
+        })
     }
 
     /// The effective HTTP server URL this client sends requests to.
@@ -338,6 +350,50 @@ impl PyWyrdClient {
             .map(|inner| Self { inner })
             .map_err(WyrdPyError::from)
     }
+
+    /// The exact Service Card UID this client runs as, or `None`
+    /// for rootless work.
+    #[getter]
+    fn workload_uid(&self) -> Option<&str> {
+        self.inner.workload_uid().map(CardUid::as_str)
+    }
+
+    /// The deployment environment correlation tag this client's requests
+    /// carry, or `None` when none is configured.
+    #[getter]
+    fn deployment_environment(&self) -> Option<String> {
+        self.inner
+            .auth()
+            .deployment_environment()
+            .map(str::to_owned)
+    }
+
+    /// Return a client that runs as the exact Service root
+    /// `workload_uid`, sharing this client's credential and connection pools
+    /// but not its token cache. Performs no IO; the server validates the root
+    /// on first use.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SPEC_400_VALIDATION` when `workload_uid` is not a UUIDv7.
+    fn for_workload(&self, workload_uid: &str) -> WyrdPyResult<Self> {
+        Ok(Self {
+            inner: self.inner.for_workload(parse_workload_uid(workload_uid)?),
+        })
+    }
+}
+
+/// Parse a caller's workload root.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` naming `workload_uid` when `uid` is not a
+/// UUIDv7.
+fn parse_workload_uid(uid: &str) -> WyrdPyResult<CardUid> {
+    CardUid::new(uid).map_err(|error| {
+        WyrdPyError::from(WyrdError::Validation {
+            message: format!("workload_uid is invalid: {error}"),
+            details: serde_json::json!({ "field": "workload_uid" }),
+        })
+    })
 }
 
 /// Register [`PyWyrdClient`] on the `client` submodule.

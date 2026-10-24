@@ -29,7 +29,9 @@ use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, evidence_from_json};
 use wyrd_client::WyrdClient;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{NodeId, PhysicalLayoutWire, TimeGranularityWire};
+use wyrd_spec::vala::api::{
+    NodeId, PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire,
+};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::object_reads::ReadStall;
 use wyrd_testing::bifrost::write::RawIngest;
@@ -573,7 +575,10 @@ impl CloseoutJourney {
                     .map(|field| field.as_ref().clone())
                     .collect(),
                 physical_layout: Some(PhysicalLayoutWire {
-                    partition_granularity: TimeGranularityWire::Hour,
+                    partition_by: vec![PartitionFieldWire::new(
+                        EVENT_TIME,
+                        PartitionTransformWire::Hour,
+                    )],
                     time_column: Some(EVENT_TIME.to_owned()),
                     sort_keys: Vec::new(),
                     bloom_columns: Vec::new(),
@@ -2695,7 +2700,7 @@ async fn revoked_term_stops_promotion_dispatch_and_maintenance() {
         journey.await_promoted(&cold).await;
     }
     let orphan = format!(
-        "{}/data/forge/v2/{}-00000-{}.parquet",
+        "{}/data/forge/1/{}-00000-{}.parquet",
         cold.binding.object_prefix.trim_end_matches('/'),
         Uuid::now_v7(),
         Uuid::now_v7()
@@ -2934,7 +2939,7 @@ async fn empty_maintenance_restart_protects_orphans() {
     // A rowless output in the writer's canonical grammar: what a rewrite that
     // died before preparing leaves behind, and what only the sweep can reach.
     let orphan = format!(
-        "{}/data/forge/v2/{}-00000-{}.parquet",
+        "{}/data/forge/1/{}-00000-{}.parquet",
         table.binding.object_prefix.trim_end_matches('/'),
         Uuid::now_v7(),
         Uuid::now_v7()

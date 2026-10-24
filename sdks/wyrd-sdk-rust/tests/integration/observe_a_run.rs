@@ -8,7 +8,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use wyrd_ai::bifrost::BifrostOptions;
 use wyrd_ai::bifrost::QueryParam;
-use wyrd_ai::state::WyrdState;
+use wyrd_ai::state::{ConfigureOptions, WyrdState};
 use wyrd_ai::verify::Submission;
 use wyrd_ai::{Bifrost, QueueConfig, RequirementDetail, VerificationVerdict, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
@@ -63,14 +63,14 @@ fn state_as(dir: &TempDir, client: WyrdClient) -> WyrdState {
     WyrdState::from_path_with(dir.path().join("bundle"), client).expect("bundle loads offline")
 }
 
-/// The observed Service's own client, from a key the `issue_key` CLI
-/// function issues for the Service registered in `dir`'s bundle.
+/// The observed Service's own client: its family runtime account, run as the
+/// Service registered in `dir`'s bundle.
 ///
 /// # Panics
-/// Panics when the bundle does not load or the key is not issued.
+/// Panics when the bundle does not load or the account is not provisioned.
 async fn service_client(deployment: &Deployment, dir: &TempDir) -> WyrdClient {
     let service = state(dir).root_ref().clone();
-    deployment.client(&deployment.service_key(&service).await)
+    deployment.service_client(&service).await
 }
 
 /// Samples submitted for the `observed-drift` Verifier bound to the run's
@@ -216,15 +216,31 @@ async fn run_view_exposes_its_alias() {
     deployment.shutdown().await;
 }
 
-/// A key whose Card scope does not cover the Model cannot write the Model's
-/// samples; the refusal surfaces when the submission drains.
+/// A stale bundle whose `model` names a registered Card outside the Service's
+/// graph cannot write that Card's samples; the refusal surfaces when the
+/// submission drains.
 ///
 /// # Panics
-/// Panics when the drain succeeds or is refused with another code.
+/// Panics when the bundle cannot be rewritten, or the drain succeeds or is
+/// refused with another code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn card_scoped_key_cannot_write_another_cards_observations() {
+async fn stale_bundle_cannot_write_outside_its_service_graph() {
     let (deployment, dir) = observed().await;
+    let foreign = declare(
+        &deployment.cards().await,
+        "cards/observe_a_run/configured-service.yaml",
+    )
+    .await
+    .root
+    .uid
+    .expect("a registered Card has a UID");
+    let model = state(&dir)
+        .run_for_card("model")
+        .expect("model run opens")
+        .subject_uid()
+        .clone();
+    replace_in_tree(&dir.path().join("bundle"), model.as_str(), foreign.as_str());
     let state = state_as(&dir, deployment.admin());
     state.start_bifrost().await.expect("Bifrost starts");
 
@@ -259,4 +275,100 @@ async fn unsealable_byte_budget_is_refused_at_connect() {
 
     assert_eq!(refused.code(), "WYRD_CLIENT_400_CONFIG_INVALID");
     deployment.shutdown().await;
+}
+
+/// Two states of one Service, configured for `prod` and `staging`, verify the
+/// Service-bound `service-check` on the root and the Agent-bound
+/// `agent-check` on the Agent component. Both environments run every check
+/// with the same verdict; each result names its own subject and echoes the
+/// supplied environment tag unchanged, directly and queued; a late configure
+/// is refused.
+///
+/// # Panics
+/// Panics when a step fails or a result names another subject or
+/// environment.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn configured_service_context_reaches_both_verification_subjects() {
+    let deployment =
+        Deployment::start_with(WyrdTestServer::builder().with_verification_runtime_for_test())
+            .await;
+    let cards = deployment.cards().await;
+    let service = declare(&cards, "cards/observe_a_run/configured-service.yaml").await;
+    let dir = pull(&cards, &service.root).await;
+    let root = state(&dir).root_ref().clone();
+    let mut states = Vec::new();
+    for environment in ["prod", "staging"] {
+        let state = state_as(&dir, deployment.service_client(&root).await);
+        state
+            .configure(ConfigureOptions {
+                deployment_environment: Some(environment.to_owned()),
+                ..ConfigureOptions::default()
+            })
+            .expect("configure succeeds before use");
+        states.push((state, environment));
+    }
+
+    for (state, environment) in &states {
+        let run = state.run();
+        let agent = run.for_card("agent").expect("agent view resolves");
+        let result = agent
+            .observe()
+            .verify("agent-check", json!("yes"))
+            .await
+            .expect("the Agent check runs");
+        assert_eq!(&result.subject, agent.subject());
+        assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
+        assert_eq!(result.deployment_environment.as_deref(), Some(*environment));
+        let Submission::Queued(execution) = agent
+            .observe()
+            .submit("agent-check", json!("yes"))
+            .await
+            .expect("the Agent check enqueues")
+        else {
+            panic!("Run evidence queues an execution");
+        };
+        let queued = execution
+            .wait(Duration::from_mins(1))
+            .await
+            .expect("the queued Agent check completes");
+        assert_eq!(&queued.subject, agent.subject());
+        assert_eq!(queued.deployment_environment.as_deref(), Some(*environment));
+
+        let root = run
+            .observe()
+            .verify("service-check", json!("yes"))
+            .await
+            .expect("the Service check runs in every environment");
+        assert_eq!(&root.subject, state.root_ref());
+        assert_eq!(root.outcome.verdict, VerificationVerdict::Passed);
+        assert_eq!(root.deployment_environment.as_deref(), Some(*environment));
+        assert_eq!(
+            state
+                .configure(ConfigureOptions::default())
+                .expect_err("configure after use is refused")
+                .code(),
+            "WYRD_SDK_409_STATE_CONFIG_FROZEN"
+        );
+    }
+    deployment.shutdown().await;
+}
+
+/// Replace every `from` with `to` in each YAML file under `dir`.
+///
+/// # Panics
+/// Panics when a directory or file cannot be read or written.
+fn replace_in_tree(dir: &std::path::Path, from: &str, to: &str) {
+    for entry in std::fs::read_dir(dir).expect("bundle directory reads") {
+        let path = entry.expect("bundle entry reads").path();
+        if path.is_dir() {
+            replace_in_tree(&path, from, to);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "yaml")
+        {
+            let text = std::fs::read_to_string(&path).expect("bundle file reads");
+            std::fs::write(&path, text.replace(from, to)).expect("bundle file writes");
+        }
+    }
 }

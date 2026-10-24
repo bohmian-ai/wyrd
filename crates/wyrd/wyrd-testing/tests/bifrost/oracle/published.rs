@@ -1539,8 +1539,9 @@ const FIVE_HOURS_MICROS: i64 = 5 * 3_600_000_000;
 /// A range on a declared time column prunes hot and published files for every
 /// time-column type.
 ///
-/// One table per `timestamp`, `timestamptz`, `timestamp_ns`, and
-/// `timestamptz_ns` time column holds two rows five hours apart. Each table is
+/// One table per `timestamptz` and `timestamptz_ns` time column holds two
+/// rows five hours apart; a time column must be zoned, so these are every
+/// time-column type. Each table is
 /// read while its objects are hot, then again after Forge publishes them: a
 /// one-hour range returns exactly the row inside it, an unbounded read returns
 /// both, and a range no row overlaps returns nothing without reading any
@@ -1588,13 +1589,8 @@ async fn prove_time_column_pruning() -> Result<(), JourneyError> {
         .ok_or("the one-pod cluster runs one server")?;
     let tenant = cluster.data_tenant_id();
     let writer = writer_for_tenant(server, tenant, "time-column-pruning").await?;
-    for (unit, tz) in [
-        (TimeUnit::Microsecond, None),
-        (TimeUnit::Microsecond, Some("+00:00")),
-        (TimeUnit::Nanosecond, None),
-        (TimeUnit::Nanosecond, Some("+00:00")),
-    ] {
-        let time_type = DataType::Timestamp(unit, tz.map(Into::into));
+    for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+        let time_type = DataType::Timestamp(unit, Some("+00:00".into()));
         let table = unique_table("oracle_time_column");
         let fqn = format!("vala.bifrost.{table}");
         let schema = Arc::new(Schema::new(vec![

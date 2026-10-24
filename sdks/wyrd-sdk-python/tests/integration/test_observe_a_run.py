@@ -14,9 +14,18 @@ from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer, cli
+from wyrd.testing import WyrdTestServer
 
-from .support import BASELINE_TIMEOUT_SECONDS, binding_ids, hydrated, scheduled_result
+from .support import (
+    BASELINE_TIMEOUT_SECONDS,
+    binding_ids,
+    declare,
+    hydrated,
+    pull,
+    scheduled_result,
+    service_key,
+    stale_bundle,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -78,16 +87,17 @@ def test_run_view_exposes_its_alias(observed: WyrdState) -> None:
     assert agent_run.run_id != run.run_id
 
 
-def test_card_scoped_key_cannot_write_another_cards_observations(observed_bundle: Path) -> None:
-    agent_key = cli.issue_key(kind="Agent", name="observed-agent", version="1.0.0", space="default")
-    agent = hydrated(observed_bundle, WyrdClient(credential=agent_key.key))
-    agent.start_bifrost()
+def test_stale_bundle_cannot_write_outside_its_service_graph(
+    observed_bundle: Path, cards: Cards, tmp_path: Path
+) -> None:
+    stale = hydrated(stale_bundle(observed_bundle, cards, tmp_path), WyrdClient())
+    stale.start_bifrost()
 
-    agent.run("model").observe.submit("observed-drift", {"latency": 12.5})
+    stale.run("model").observe.submit("observed-drift", {"latency": 12.5})
 
     with pytest.raises(WyrdError) as refused:
-        agent.flush()
-    agent.shutdown()
+        stale.flush()
+    stale.shutdown()
     assert refused.value.code == "WYRD_VALA_403_BIFROST_CARD_SCOPE"
 
 
@@ -95,3 +105,35 @@ def test_unsealable_byte_budget_is_refused_at_connect(observed: WyrdState) -> No
     with pytest.raises(WyrdError) as refused:
         observed.start_bifrost(client_byte_limit_bytes=1024)
     assert refused.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
+
+
+def test_configured_service_context_reaches_both_verification_subjects(
+    wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path
+) -> None:
+    declare(cards, "cards/observe_a_run/configured-service.yaml")
+    bundle = pull(cards, "configured-service", tmp_path)
+    key = service_key("configured-service")
+    verdicts: set[str] = set()
+    for environment in ("prod", "staging"):
+        state = WyrdState.from_path(bundle, WyrdClient(credential=key))
+        state.configure(deployment_environment=environment)
+        run = state.run()
+        agent = run.for_card("agent")
+
+        result = agent.observe.verify("agent-check", "yes")
+        assert result.subject == state.card_ref("agent")
+        assert result.deployment_environment == environment
+        execution = agent.observe.submit("agent-check", "yes")
+        assert isinstance(execution, verify.Execution)
+        queued = execution.wait(60.0)
+        assert queued.subject == state.card_ref("agent")
+        assert queued.deployment_environment == environment
+
+        root = run.observe.verify("service-check", "yes")
+        assert root.subject == state.root_ref
+        assert root.deployment_environment == environment
+        verdicts.add(root.verdict)
+        with pytest.raises(WyrdError) as frozen:
+            state.configure()
+        assert frozen.value.code == "WYRD_SDK_409_STATE_CONFIG_FROZEN"
+    assert len(verdicts) == 1, "a differing correlation tag never changes the verdict"

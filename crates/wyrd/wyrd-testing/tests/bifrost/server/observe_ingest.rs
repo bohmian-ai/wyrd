@@ -87,7 +87,7 @@ impl Observed {
             &server,
             &api_key(
                 server
-                    .credential_registered_service(&receipt.root, &[])
+                    .credential_registered_service(&receipt.root, &["workload"])
                     .await
                     .expect("the Service is credentialed"),
             ),

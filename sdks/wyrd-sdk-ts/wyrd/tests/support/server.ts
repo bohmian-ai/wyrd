@@ -6,13 +6,15 @@ import { setTimeout as sleep } from "node:timers/promises";
 import {
   Bifrost,
   type CardRef,
-  type Cards,
+  Cards,
   type DeclarationReceipt,
+  Principals,
   type SpanRecord,
   verify,
   type VerificationExecutionState,
   type VerificationResult,
   WyrdClient,
+  type WorkloadKind,
 } from "wyrd-ai";
 import { type NativeWyrdTestServer, startTestServer } from "@wyrd/testing";
 import { test as base, vi } from "vitest";
@@ -69,6 +71,46 @@ export function declared(receipt: DeclarationReceipt, name: string = receipt.roo
     throw new Error(`the receipt declared no Card named ${name}`);
   }
   return { ...ref, uid: ref.uid };
+}
+
+/** A runtime account's principal id and one plaintext key. */
+export interface RuntimeAccount {
+  readonly principalId: string;
+  readonly key: string;
+}
+
+/**
+ * The `kind`/`name` family's runtime account in `client`'s tenant, the
+ * ambient administrator's by default, with one new key. Declaration creates
+ * no principal, so the account restricted to the family is created holding
+ * only `workload` on first use and issued one more key afterwards.
+ */
+export async function runtimeAccount(
+  card: { readonly kind: WorkloadKind; readonly name: string },
+  client?: WyrdClient,
+): Promise<RuntimeAccount> {
+  const principals = await Principals.connect({ client });
+  const name = `${card.name}-runtime`;
+  const [existing] = (await principals.list({ kind: "service", name })).principals;
+  if (existing !== undefined) {
+    const issued = await principals.issueCredential(existing.principal_id);
+    return { principalId: existing.principal_id, key: issued.credential };
+  }
+  const created = await principals.createServicePrincipal({
+    name,
+    roles: ["workload"],
+    workload_restriction: { mode: "family", kind: card.kind, name: card.name },
+  });
+  return { principalId: created.principal_id, key: created.credential };
+}
+
+/** A client acting as `credential`, run as the one registered `service` release. */
+export async function rooted(credential: string, service: string): Promise<WyrdClient> {
+  const [root, ...others] = (await (await Cards.connect()).list({ kind: "Service", name: service })).items;
+  if (root === undefined || others.length > 0) {
+    throw new Error(`expected one registered ${service} release`);
+  }
+  return WyrdClient.connect({ credential, workloadUid: root.card_uid });
 }
 
 /** The one verification binding `owner` declares, read from its served status. */

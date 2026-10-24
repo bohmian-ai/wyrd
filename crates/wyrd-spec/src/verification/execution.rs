@@ -11,9 +11,10 @@
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use skald_spec::MediaFormat;
+use serde_json::{Map, Value};
+use skald_spec::{MediaFormat, NamedResponseFormat, SkaldError, check_output_schema};
 
 use super::{
     DriftReport, DriftWindow, GroupSnapshot, OperatorDispatchState, VerificationError,
@@ -55,6 +56,12 @@ pub struct VerificationRequest {
     /// Whole execution-route replacements keyed by Agent block ID.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub execution_route_overrides: BTreeMap<TaskId, ExecutionRoute>,
+    /// The invoking workload's deployment environment: an optional,
+    /// non-empty correlation tag copied onto the accepted execution and its
+    /// result. It never selects, filters, or changes the execution and is
+    /// never permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_environment: Option<String>,
 }
 
 /// What a caller supplies for one input slot. Execution results echo the
@@ -154,7 +161,9 @@ pub struct EnqueueVerificationResponse {
 /// briefly lack a visible result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct VerificationExecutionState {
+#[schemars(rename = "VerificationExecutionState")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct VerificationExecutionState<T = Map<String, Value>> {
     /// The execution.
     pub execution_id: ExecutionId,
     /// Lifecycle status, independent of the verdict.
@@ -163,8 +172,10 @@ pub struct VerificationExecutionState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<VerificationError>,
     /// The result once completed and visible.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<VerificationResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(default)]
+    #[cfg_attr(feature = "server", schema(value_type = Option<VerificationResult>))]
+    pub result: Option<VerificationResult<T>>,
     /// Every Operator dispatch of a failed background binding execution or a
     /// changed group verdict, in identity order; empty otherwise. Delivery
     /// completes independently of the execution and never changes its verdict.
@@ -183,9 +194,14 @@ pub struct VerificationExecutionState {
 }
 
 /// The attributable result of one Verifier execution.
+///
+/// `T` is the type of each requirement's custom `data`: JSON objects on the
+/// wire, or a caller's type after a typed SDK read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct VerificationResult {
+#[schemars(rename = "VerificationResult")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct VerificationResult<T = Map<String, Value>> {
     /// Server-issued execution identity.
     pub execution_id: ExecutionId,
     /// The caller's application Run, when there is one.
@@ -195,18 +211,26 @@ pub struct VerificationResult {
     pub verifier: CardRef,
     /// The exact subject judged.
     pub subject: CardRef,
+    /// The deployment environment tag the execution was invoked with, or
+    /// absent when the invocation carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_environment: Option<String>,
     /// Verdict, breakdown, and evidence.
-    pub outcome: VerificationOutcome,
+    #[cfg_attr(feature = "server", schema(value_type = VerificationOutcome))]
+    pub outcome: VerificationOutcome<T>,
 }
 
 /// Overall verdict with its requirement and step breakdown.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct VerificationOutcome {
+#[schemars(rename = "VerificationOutcome")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct VerificationOutcome<T = Map<String, Value>> {
     /// The `decide` rule applied to every applicable requirement.
     pub verdict: VerificationVerdict,
     /// Every requirement, step requirements included.
-    pub requirements: Vec<RequirementResult>,
+    #[cfg_attr(feature = "server", schema(value_type = Vec<RequirementResult>))]
+    pub requirements: Vec<RequirementResult<T>>,
     /// Every step in plan order.
     pub steps: Vec<StepResult>,
     /// The pinned original evidence, by slot.
@@ -216,7 +240,9 @@ pub struct VerificationOutcome {
 /// The judgment of one requirement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct RequirementResult {
+#[schemars(rename = "RequirementResult")]
+#[cfg_attr(feature = "server", schema(bound = ""))]
+pub struct RequirementResult<T = Map<String, Value>> {
     /// Requirement ID.
     pub id: TaskId,
     /// Owning step of a step requirement.
@@ -234,6 +260,16 @@ pub struct RequirementResult {
     /// Validated original-evidence citations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub citations: Vec<Citation>,
+    /// Custom data an Agent or code check returned under its declared
+    /// `verdict` format; absent when none was declared or the output was
+    /// rejected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        default,
+        schema_with = "crate::schema::skipped_option::<Map<String, Value>>"
+    )]
+    #[cfg_attr(feature = "server", schema(value_type = Option<Object>))]
+    pub data: Option<T>,
     /// Check-specific detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<RequirementDetail>,
@@ -372,7 +408,26 @@ pub struct ToolCallRecord {
     pub error: Option<String>,
 }
 
+/// Most bytes of compact UTF-8 JSON one Verdict's custom `data` may take.
+pub const MAX_VERDICT_DATA_BYTES: usize = 65_536;
+
+/// Most nested containers one Verdict's custom `data` may hold; the root
+/// object counts as one.
+pub const MAX_VERDICT_DATA_DEPTH: usize = 16;
+
+/// The name of the generated Verdict response format.
+pub const VERDICT_FORMAT: &str = "verdict";
+
+/// The `$id` that makes a declared `data` schema its own resource inside the
+/// Verdict envelope, relative to the envelope's base: the data's `#` then
+/// names the data schema, not the envelope.
+const DATA_RESOURCE: &str = "verdict-data";
+
 /// The closed schema every Agent and code check returns.
+///
+/// `data` is present exactly when the check declares a custom-data schema
+/// through the `verdict` response format; the server validates the whole
+/// response against that declaration before decoding it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -384,6 +439,249 @@ pub struct Verdict {
     /// Original-evidence locations supporting it; a pass without a valid
     /// citation becomes inconclusive.
     pub citations: Vec<Citation>,
+    /// Custom data the check's declared format requires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "crate::schema::skipped_option::<Map<String, Value>>")]
+    pub data: Option<Map<String, Value>>,
+}
+
+impl VerificationExecutionState {
+    /// This state with its result's custom data decoded as `T`; a state
+    /// without a result converts unchanged.
+    ///
+    /// # Errors
+    /// Returns the [`VerificationResult::decode_data`] error.
+    pub fn decode_data<T: DeserializeOwned>(
+        self,
+    ) -> Result<VerificationExecutionState<T>, WyrdError> {
+        let Self {
+            execution_id,
+            status,
+            error,
+            result,
+            dispatches,
+            group_id,
+            owner_card_uid,
+            group,
+        } = self;
+        Ok(VerificationExecutionState {
+            execution_id,
+            status,
+            error,
+            result: result.map(VerificationResult::decode_data).transpose()?,
+            dispatches,
+            group_id,
+            owner_card_uid,
+            group,
+        })
+    }
+}
+
+impl VerificationResult {
+    /// This result with every present requirement `data` decoded as `T`.
+    ///
+    /// The SDKs' typed reads use it after the ordinary read: absent data
+    /// stays absent, failed requirements decode too, and the stored result is
+    /// never changed or re-executed. One mismatch fails the whole
+    /// conversion, so no partially typed result is returned.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the first
+    /// requirement whose data does not decode, with the empty `path` of the
+    /// data root and never the data itself: a decoder cannot tell a declared
+    /// field name from a returned dictionary key, so no deeper path is safe.
+    pub fn decode_data<T: DeserializeOwned>(self) -> Result<VerificationResult<T>, WyrdError> {
+        let Self {
+            execution_id,
+            run_id,
+            verifier,
+            subject,
+            deployment_environment,
+            outcome,
+        } = self;
+        let requirements = outcome
+            .requirements
+            .into_iter()
+            .map(RequirementResult::decode_data)
+            .collect::<Result<_, _>>()?;
+        Ok(VerificationResult {
+            execution_id,
+            run_id,
+            verifier,
+            subject,
+            deployment_environment,
+            outcome: VerificationOutcome {
+                verdict: outcome.verdict,
+                requirements,
+                steps: outcome.steps,
+                evidence: outcome.evidence,
+            },
+        })
+    }
+}
+
+impl RequirementResult {
+    /// This requirement with its present `data` decoded as `T`.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_422_VERIFICATION_DATA_INVALID` with the requirement
+    /// ID and the data root's empty path, never the data.
+    fn decode_data<T: DeserializeOwned>(self) -> Result<RequirementResult<T>, WyrdError> {
+        let data = match self.data {
+            None => None,
+            Some(data) => Some(serde_json::from_value(Value::Object(data)).map_err(|_| {
+                WyrdError::SdkVerificationDataInvalid {
+                    message: format!(
+                        "requirement `{}` data does not match the requested type",
+                        self.id.as_str()
+                    ),
+                    details: serde_json::json!({"requirement": self.id, "path": ""}),
+                }
+            })?),
+        };
+        Ok(RequirementResult {
+            id: self.id,
+            step: self.step,
+            statement: self.statement,
+            outcome: self.outcome,
+            reason: self.reason,
+            actual: self.actual,
+            citations: self.citations,
+            data,
+            detail: self.detail,
+            check: self.check,
+            provenance: self.provenance,
+        })
+    }
+}
+
+impl Verdict {
+    /// Resolves a `verdict` response format to the schema its responses
+    /// must satisfy.
+    ///
+    /// The plain form is the generated closed Verdict without `data`; an
+    /// expanded `data` schema becomes the required `data` member, embedded
+    /// as its own JSON Schema 2020-12 resource under a private `$id` so its
+    /// local `$ref`s resolve exactly as they do standalone. Data schemas are
+    /// 2020-12 only and carry no root `$id`: an older draft or an authored
+    /// identity could leave those references bound to the envelope. This is
+    /// the resolver Prompt compilation and code-check validation share.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkaldError::PromptInvalid`] at `response_format` for a name
+    /// other than `verdict`; at `response_format.data.$schema` for a data
+    /// schema declaring a draft other than 2020-12; at
+    /// `response_format.data.$id` for one with a root `$id`; and at
+    /// `response_format.data...` for one that is not a valid object JSON
+    /// Schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the generated Verdict schema has no `properties` object, an
+    /// invariant of the derived schema.
+    pub fn response_format(format: &NamedResponseFormat) -> Result<Map<String, Value>, SkaldError> {
+        let invalid = |field: &str, message: &str| SkaldError::PromptInvalid {
+            field: field.to_owned(),
+            message: message.to_owned(),
+        };
+        if format.name() != VERDICT_FORMAT {
+            return Err(invalid(
+                "response_format",
+                &format!(
+                    "unknown response format `{}`; the named format is `verdict`",
+                    format.name()
+                ),
+            ));
+        }
+        let Ok(Value::Object(mut schema)) =
+            serde_json::to_value(crate::schema::schema_for::<Self>())
+        else {
+            unreachable!("a generated root schema serializes to a JSON object");
+        };
+        let required = |schema: &mut Map<String, Value>| {
+            schema
+                .get_mut("required")
+                .and_then(Value::as_array_mut)
+                .map(|required| required.retain(|name| name != "data"))
+        };
+        required(&mut schema);
+        let properties = schema
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .expect("the generated Verdict schema declares properties");
+        properties.remove("data");
+        let Some(data) = format.data() else {
+            return Ok(schema);
+        };
+        if let Some(dialect) = data.get("$schema")
+            && !matches!(
+                dialect.as_str(),
+                Some(
+                    "https://json-schema.org/draft/2020-12/schema"
+                        | "https://json-schema.org/draft/2020-12/schema#"
+                )
+            )
+        {
+            return Err(invalid(
+                "response_format.data.$schema",
+                "a Verdict data schema is JSON Schema 2020-12; omit `$schema` or declare https://json-schema.org/draft/2020-12/schema",
+            ));
+        }
+        if data.contains_key("$id") {
+            return Err(invalid(
+                "response_format.data.$id",
+                "a Verdict data schema is embedded as its own resource; remove the root `$id`",
+            ));
+        }
+        check_output_schema(&Value::Object(data.clone()), "response_format.data", true)?;
+        let mut data = data.clone();
+        data.insert("$id".to_owned(), Value::from(DATA_RESOURCE));
+        schema["properties"]["data"] = Value::Object(data);
+        schema
+            .get_mut("required")
+            .and_then(Value::as_array_mut)
+            .expect("the generated Verdict schema requires fields")
+            .push(Value::from("data"));
+        Ok(schema)
+    }
+
+    /// Refuses custom `data` beyond the fixed size and depth bounds.
+    ///
+    /// Size is the compact UTF-8 JSON encoding of `data` alone, with only
+    /// the escapes JSON requires; depth counts every object and array, the
+    /// root included. The message names the violated limit, never the data.
+    ///
+    /// # Errors
+    ///
+    /// Returns the violated bound as a message when `data` exceeds
+    /// [`MAX_VERDICT_DATA_BYTES`] or [`MAX_VERDICT_DATA_DEPTH`].
+    pub fn check_data_bounds(&self) -> Result<(), String> {
+        /// Containers in the deepest path through `value`.
+        fn depth(value: &Value) -> usize {
+            match value {
+                Value::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
+                Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+                _ => 0,
+            }
+        }
+        let Some(data) = &self.data else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(data).map_or(usize::MAX, |encoded| encoded.len());
+        if bytes > MAX_VERDICT_DATA_BYTES {
+            return Err(format!(
+                "verdict data is {bytes} bytes; the limit is {MAX_VERDICT_DATA_BYTES} bytes of compact JSON"
+            ));
+        }
+        let nested = 1 + data.values().map(depth).max().unwrap_or(0);
+        if nested > MAX_VERDICT_DATA_DEPTH {
+            return Err(format!(
+                "verdict data nests {nested} containers; the limit is {MAX_VERDICT_DATA_DEPTH}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A location in an original input slot, never in scratch space.
@@ -464,7 +762,7 @@ mod tests {
             "inputs": {
                 "answer": {"kind": "json", "value": {"text": "yes"}},
                 "policy": {"kind": "file", "sha256": digest, "size_bytes": 10, "format": "pdf", "filename": "p.pdf"},
-                "deck": {"kind": "artifact", "artifact": {"kind": "Artifact", "space": "legal", "name": "decks", "version": "1.0.0"}, "path": "q3.pptx"},
+                "deck": {"kind": "artifact", "artifact": {"kind": "Artifact", "name": "decks", "version": "1.0.0"}, "path": "q3.pptx"},
                 "trace": {"kind": "trace", "trace_id": "0af7651916cd43dd8448eb211c80319c"}
             },
             "execution_route_overrides": {"judge": {"kind": "wyrd_gateway", "deployment": "eu-west"}}
@@ -495,8 +793,8 @@ mod tests {
     fn verification_result_round_trips_documented_outcome() {
         let result = json!({
             "execution_id": ExecutionId::new_v7(),
-            "verifier": {"kind": "Verifier", "space": "legal", "name": "msa-policy", "version": "1.0.0"},
-            "subject": {"kind": "Agent", "space": "legal", "name": "drafter", "version": "1.0.0"},
+            "verifier": {"kind": "Verifier", "name": "msa-policy", "version": "1.0.0"},
+            "subject": {"kind": "Agent", "name": "drafter", "version": "1.0.0"},
             "outcome": {
                 "verdict": "failed",
                 "requirements": [{
@@ -548,6 +846,155 @@ mod tests {
                 "{record}"
             );
         }
+    }
+
+    /// Typed decoding converts every present requirement `data`, leaves
+    /// absent data absent, and refuses a mismatch with the requirement and
+    /// field path but never the payload, returning no partial result.
+    ///
+    /// # Panics
+    /// Panics when a conversion succeeds or fails on the wrong side.
+    #[test]
+    fn typed_data_decodes_whole_results() {
+        /// The caller's model of a scoring check's custom data, the type
+        /// the typed read decodes each requirement's `data` into.
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct Judge {
+            /// The judge's score; a string here is the mismatch under test.
+            score: f64,
+        }
+        let requirement = |id: &str, data: Value| {
+            let mut requirement = json!({
+                "id": id, "statement": "s", "outcome": "failed", "reason": "r",
+                "check": {"kind": "assert", "path": "inputs.answer", "operator": "is_not_null"}
+            });
+            if !data.is_null() {
+                requirement["data"] = data;
+            }
+            requirement
+        };
+        let result = |requirements: Vec<Value>| -> VerificationResult {
+            serde_json::from_value(json!({
+                "execution_id": ExecutionId::new_v7(),
+                "verifier": {"kind": "Verifier", "name": "judge", "version": "1.0.0"},
+                "subject": {"kind": "Agent", "name": "drafter", "version": "1.0.0"},
+                "outcome": {"verdict": "failed", "requirements": requirements, "steps": [], "evidence": {}}
+            }))
+            .expect("result")
+        };
+        let typed = result(vec![
+            requirement("scored", json!({"score": 0.25})),
+            requirement("plain", Value::Null),
+        ])
+        .decode_data::<Judge>()
+        .expect("typed");
+        assert_eq!(
+            typed.outcome.requirements[0].data,
+            Some(Judge { score: 0.25 })
+        );
+        assert_eq!(typed.outcome.requirements[1].data, None);
+        let error = result(vec![
+            requirement("scored", json!({"score": 0.25})),
+            requirement("secretive", json!({"score": "hunter2"})),
+        ])
+        .decode_data::<Judge>()
+        .expect_err("mismatch");
+        assert_eq!(error.code(), "WYRD_SDK_422_VERIFICATION_DATA_INVALID");
+        assert_eq!(
+            error.problem().details,
+            json!({"requirement": "secretive", "path": ""})
+        );
+        assert!(!error.to_string().contains("hunter2"), "{error}");
+        let error = result(vec![requirement(
+            "keyed",
+            json!({"outer": {"customer-secret@example.test": "wrong"}}),
+        )])
+        .decode_data::<std::collections::BTreeMap<String, std::collections::BTreeMap<String, u8>>>()
+        .expect_err("mismatch under a returned key");
+        let problem = serde_json::to_string(&error.problem()).expect("problem");
+        assert!(!problem.contains("customer-secret"), "{problem}");
+        assert!(!error.to_string().contains("customer-secret"), "{error}");
+    }
+
+    /// Custom Verdict data obeys the inclusive size and depth bounds: exact
+    /// boundaries pass and one more byte or container fails, counting UTF-8
+    /// bytes, required JSON escapes, and wide arrays, with messages naming
+    /// the limit and never the data.
+    ///
+    /// # Panics
+    /// Panics when a boundary value is judged on the wrong side.
+    #[test]
+    fn custom_verdict_data_obeys_limits() {
+        let verdict = |data: Value| Verdict {
+            outcome: VerificationVerdict::Passed,
+            reason: "ok".to_owned(),
+            citations: Vec::new(),
+            data: Some(data.as_object().expect("object data").clone()),
+        };
+        let text = |unit: &str, count: usize, tail: &str| json!({"s": format!("{}{tail}", unit.repeat(count))});
+        let wide = |last: u32| {
+            let mut items = vec![json!(0); 32_763];
+            items.push(json!(last));
+            json!({"a": items})
+        };
+        let nested = |containers: usize| {
+            let mut value = json!(1);
+            for level in 1..containers {
+                value = if level % 2 == 0 {
+                    json!({"o": value})
+                } else {
+                    json!([value])
+                };
+            }
+            json!({"r": value})
+        };
+        for (data, fits) in [
+            (text("x", 65_528, ""), true),
+            (text("x", 65_529, ""), false),
+            (text("é", 32_764, ""), true),
+            (text("é", 32_764, "x"), false),
+            (text("\n", 32_764, ""), true),
+            (text("\n", 32_764, "x"), false),
+            (text("\u{1}", 10_921, "xx"), true),
+            (text("\u{1}", 10_921, "xxx"), false),
+            (wide(9), true),
+            (wide(10), true),
+            (wide(100), false),
+            (nested(16), true),
+            (nested(17), false),
+        ] {
+            let bytes = serde_json::to_vec(&data).expect("json").len();
+            match verdict(data).check_data_bounds() {
+                Ok(()) => assert!(fits, "{bytes} bytes must fail"),
+                Err(message) => {
+                    assert!(!fits, "{bytes} bytes must pass: {message}");
+                    assert!(
+                        message.contains("65536") || message.contains("16"),
+                        "{message}"
+                    );
+                    assert!(
+                        !message.contains("xxx") && !message.contains('é'),
+                        "{message}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::to_vec(&wide(10)).expect("json").len(),
+            MAX_VERDICT_DATA_BYTES
+        );
+        let plain = Verdict {
+            data: None,
+            ..verdict(json!({}))
+        };
+        assert_eq!(plain.check_data_bounds(), Ok(()));
+        assert!(
+            serde_json::to_value(&plain)
+                .expect("json")
+                .get("data")
+                .is_none(),
+            "absent data is omitted"
+        );
     }
 
     /// A delayed idempotency conflict is reported with the existing stable

@@ -3,7 +3,6 @@ kind: Service
 metadata:
   name: investigation-service
   version: 1.0.0
-  space: default
 spec:
   components:
     - alias: model
@@ -11,13 +10,11 @@ spec:
         kind: Model
         name: support-model
         version: 1.0.0
-        space: default
     - alias: agent
       ref:
         kind: Agent
         name: support-agent
         version: 1.0.0
-        space: default
   tables:
     - name: investigation_events
       schema:

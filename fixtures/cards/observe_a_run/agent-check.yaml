@@ -1,0 +1,13 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: agent-check
+  version: 1.0.0
+spec:
+  description: The Agent answers "yes".
+  inputs:
+    answer: {type: json}
+  requirements:
+    - id: says-yes
+      statement: The answer is "yes"
+      check: {kind: assert, path: inputs.answer, operator: equals, expected: "yes"}

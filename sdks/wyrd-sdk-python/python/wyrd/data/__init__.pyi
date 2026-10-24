@@ -727,7 +727,7 @@ class DataCard(Generic[_DataInterfaceT]):
 
     ```python
     cards = Cards()
-    card = cards.data.get(space="ml", name="training-data")
+    card = cards.data.get(name="training-data")
     ```
 
     ``get`` returns the validated envelope without data bytes. Pull a
@@ -737,7 +737,6 @@ class DataCard(Generic[_DataInterfaceT]):
     (``save``, ``model_dump``, ``as_card_ref``), not at construction.
     """
 
-    space: str
     name: str
     version: str
     uid: str
@@ -801,7 +800,6 @@ class DataCard(Generic[_DataInterfaceT]):
     def __init__(
         self,
         data: _DataInterfaceT,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
@@ -818,8 +816,6 @@ class DataCard(Generic[_DataInterfaceT]):
         Args:
             data: a built-in interface or subclass instance. An interface
                 class is rejected; pass classes to ``Cards.data.get``.
-            space: card space. Omitted, the nearest ``wyrd.toml`` default
-                applies, else ``"default"``.
             name: card name. Defaults to ``"data"``.
             version: semantic version. Defaults to ``"0.1.0"``.
             uid: card UID. Omitted, a new UUIDv7 is generated.
@@ -844,7 +840,6 @@ class DataCard(Generic[_DataInterfaceT]):
     def __init__(
         self: DataCard[DataInterface],
         data: PathLike | Mapping[str, Any],
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
@@ -863,7 +858,6 @@ class DataCard(Generic[_DataInterfaceT]):
 
         Args:
             data: the local path or query mapping.
-            space: as for the interface overload.
             name: as for the interface overload.
             version: as for the interface overload.
             uid: as for the interface overload.
@@ -884,7 +878,6 @@ class DataCard(Generic[_DataInterfaceT]):
     def __init__(
         self: DataCard[None],
         data: CardRef,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
@@ -902,7 +895,6 @@ class DataCard(Generic[_DataInterfaceT]):
         Args:
             data (CardRef): Reference with kind `Kind.Artifact` or
                 `kind="Artifact"`.
-            space (str | None): Optional card space. Defaults to `default`.
             name (str | None): Optional card name. Defaults to `data`.
             version (str | None): Optional semantic version. Defaults to
                 `0.1.0`.
@@ -928,7 +920,6 @@ class DataCard(Generic[_DataInterfaceT]):
     def __init__(
         self: DataCard[DataInterface],
         data: object,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
@@ -946,7 +937,6 @@ class DataCard(Generic[_DataInterfaceT]):
 
         Args:
             data: the data object.
-            space: as for the interface overload.
             name: as for the interface overload.
             version: as for the interface overload.
             uid: as for the interface overload.
@@ -1039,7 +1029,7 @@ class DataCard(Generic[_DataInterfaceT]):
         """Return a ``Data`` CardRef for this card's identity.
 
         Raises:
-            WyrdError: If name, version, space, or UID is invalid.
+            WyrdError: If name, version, or UID is invalid.
         """
         ...
 
@@ -1061,7 +1051,7 @@ class DataCard(Generic[_DataInterfaceT]):
         """Rebuild a DataCard from serialized card JSON.
 
         The JSON must be a complete ``Data`` envelope with a resolved
-        version, space, and UID. No data artifacts are downloaded or read.
+        version and UID. No data artifacts are downloaded or read.
 
         Args:
             json_string: the serialized envelope.

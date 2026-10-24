@@ -1,5 +1,5 @@
 //! PgFixture coverage for verification-binding projection and the runtime
-//! activity gate derived from Card-bound machine principals.
+//! activity gate derived from each exact root's family runtime account.
 //!
 //! Every test runs against the repository managed Postgres through tenant
 //! connections, so forced RLS applies.
@@ -8,19 +8,18 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PermissionSet;
-use wyrd_runtime::builtin_roles::{BUILTIN_ROLES, DEFAULT_CARD_ROLE, builtin_role_uuid};
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
+use wyrd_spec::auth::{Attribution, WorkloadFamily, WorkloadKind};
 use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid};
 use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    insert_role, list_service_account_roles, revoke_role_from_service_account,
+    family_account_id, insert_service_account, set_workload_restriction,
 };
 use wyrd_sql::queries::cards::{
     NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
-    upsert_service_account_from_card,
 };
 use wyrd_sql::queries::verification::{
     BindingActivation, BindingActivity, FrozenTarget, InactivityTimeout, NewBinding,
@@ -44,7 +43,7 @@ fn service_card(name: &str, version: &str) -> Card {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": "Service",
-        "metadata": { "name": name, "version": version, "space": "default" },
+        "metadata": { "name": name, "version": version },
         "spec": {},
         "relationships": { "outbound": [], "inbound": [] }
     }))
@@ -83,13 +82,14 @@ fn schedule_binding(occurrence: &str, verifier: &CardUid) -> NewBinding {
     }
 }
 
-/// Register one active Service Card and its principal; return (card UID, principal id).
+/// Register one active Service Card and return it beside its family's runtime
+/// account, creating that stable account on the family's first version.
 ///
 /// Activation is forced with a direct update because the full lifecycle
 /// requires a verified blob that this persistence-level test does not need.
 ///
 /// # Panics
-/// Panics when the operation, Card, principal, or activation write fails.
+/// Panics when the operation, Card, account, or activation write fails.
 async fn declare_service(
     conn: &mut TenantConn<'_>,
     actor: &Principal,
@@ -123,20 +123,48 @@ async fn declare_service(
     )
     .await
     .expect("card inserts");
-    let principal = upsert_service_account_from_card(
-        conn,
-        &row.card_uid,
-        card,
-        wyrd_spec::auth::Attribution::direct(actor.id),
-    )
-    .await
-    .expect("principal projects");
+    let family = WorkloadFamily {
+        kind: WorkloadKind::Service,
+        name: card.metadata.name.clone(),
+    };
+    let principal = match family_account_id(conn, &family)
+        .await
+        .expect("family account reads")
+    {
+        Some(id) => PrincipalId::new(id),
+        None => family_account(conn, actor, card.metadata.name.as_str(), Some(&family)).await,
+    };
     sqlx::query("UPDATE wyrd.cards SET status = 'active' WHERE card_uid = $1")
         .bind(row.card_uid.as_uuid())
         .execute(&mut **conn.transaction())
         .await
         .expect("card activates");
     (row.card_uid, principal)
+}
+
+/// Create one stable Service account named `name`, restricted to `family`.
+///
+/// # Panics
+/// Panics when the insert fails.
+async fn family_account(
+    conn: &mut TenantConn<'_>,
+    actor: &Principal,
+    name: &str,
+    family: Option<&WorkloadFamily>,
+) -> PrincipalId {
+    let id = Uuid::now_v7();
+    insert_service_account(
+        conn,
+        id,
+        "service",
+        family,
+        name,
+        None,
+        Attribution::direct(actor.id),
+    )
+    .await
+    .expect("account inserts");
+    PrincipalId::new(id)
 }
 
 /// Read one binding's schedule cursor.
@@ -158,79 +186,6 @@ async fn cursor(conn: &mut TenantConn<'_>, binding: Uuid) -> Option<DateTime<Utc
 ///
 /// # Panics
 /// Panics when any identity, ordering, or persisted-key expectation fails.
-/// A Card's first principal projection grants the built-in `workload` role
-/// once; re-applying the Card neither duplicates the grant nor restores it
-/// after an administrator revoked it.
-///
-/// # Panics
-///
-/// Panics when a write fails or the principal's roles differ.
-#[tokio::test]
-async fn first_projection_grants_default_role_once_and_revocation_stands() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(&fixture);
-    let tenant = fixture.data_tenant_id();
-    let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-    let default_role = BUILTIN_ROLES
-        .iter()
-        .find(|role| role.name == DEFAULT_CARD_ROLE)
-        .expect("the default role is built in");
-    let role_id = builtin_role_uuid(tenant, DEFAULT_CARD_ROLE);
-    insert_role(
-        &mut conn,
-        role_id,
-        DEFAULT_CARD_ROLE,
-        &serde_json::to_value(default_role.permissions).expect("permissions serialize"),
-        true,
-    )
-    .await
-    .expect("default role seeds");
-    let card = service_card("workload-svc", "1.0.0");
-    let (card_uid, principal) = declare_service(&mut conn, &actor, &card).await;
-    assert_eq!(
-        list_service_account_roles(&mut conn, principal.as_uuid())
-            .await
-            .expect("roles list"),
-        [DEFAULT_CARD_ROLE]
-    );
-
-    let reapplied = upsert_service_account_from_card(
-        &mut conn,
-        &card_uid,
-        &card,
-        wyrd_spec::auth::Attribution::direct(actor.id),
-    )
-    .await
-    .expect("principal re-projects");
-    assert_eq!(reapplied, principal);
-    assert_eq!(
-        list_service_account_roles(&mut conn, principal.as_uuid())
-            .await
-            .expect("roles list"),
-        [DEFAULT_CARD_ROLE]
-    );
-
-    assert!(
-        revoke_role_from_service_account(&mut conn, principal.as_uuid(), role_id)
-            .await
-            .expect("role revokes")
-    );
-    upsert_service_account_from_card(
-        &mut conn,
-        &card_uid,
-        &card,
-        wyrd_spec::auth::Attribution::direct(actor.id),
-    )
-    .await
-    .expect("principal re-projects");
-    assert!(
-        list_service_account_roles(&mut conn, principal.as_uuid())
-            .await
-            .expect("roles list")
-            .is_empty()
-    );
-}
-
 #[tokio::test]
 async fn projection_identity_is_stable_under_reapply_and_reorder() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -324,9 +279,9 @@ async fn agent_owner_occurrence_is_the_reserved_key() {
     let agent: Card = serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": "Agent",
-        "metadata": { "name": "helper", "version": "1.0.0", "space": "default" },
+        "metadata": { "name": "helper", "version": "1.0.0" },
         "spec": { "prompt": {
-            "kind": "Prompt", "name": "helper-prompt", "version": "1.0.0", "space": "default"
+            "kind": "Prompt", "name": "helper-prompt", "version": "1.0.0"
         }, "execution_route": {"kind": "native"}},
         "relationships": { "outbound": [], "inbound": [] }
     }))
@@ -471,7 +426,7 @@ async fn first_exchange_arms_schedule_and_renewal_keeps_cursor() {
     assert_eq!(before.next_run_at, None);
 
     let anchor = database_now(&mut conn).await;
-    record_machine_authentication(&mut conn, principal)
+    record_machine_authentication(&mut conn, principal, &owner)
         .await
         .expect("activation records");
     let armed = cursor(&mut conn, component.as_uuid())
@@ -486,16 +441,16 @@ async fn first_exchange_arms_schedule_and_renewal_keeps_cursor() {
         "the exchange arms every binding of the owner"
     );
 
-    record_machine_authentication(&mut conn, principal)
+    record_machine_authentication(&mut conn, principal, &owner)
         .await
         .expect("renewal records");
     assert_eq!(cursor(&mut conn, component.as_uuid()).await, Some(armed));
 
-    move_stamp(&mut conn, principal, "23 hours").await;
+    move_stamp(&mut conn, principal, &owner, "23 hours").await;
     assert!(gate(&mut conn, component).await.active);
-    move_stamp(&mut conn, principal, "25 hours").await;
+    move_stamp(&mut conn, principal, &owner, "25 hours").await;
     assert!(!gate(&mut conn, component).await.active);
-    move_stamp(&mut conn, principal, "1 hour").await;
+    move_stamp(&mut conn, principal, &owner, "1 hour").await;
     let service_gate = gate(&mut conn, service).await;
     assert!(
         service_gate.active,
@@ -516,10 +471,11 @@ async fn gate(conn: &mut TenantConn<'_>, binding: BindingId) -> BindingActivity 
         .expect("binding exists")
 }
 
-/// Card-free and suspended principals never record activity or arm cursors.
+/// An unrestricted account and a suspended family account never record
+/// activity or arm cursors.
 ///
 /// # Panics
-/// Panics when either excluded principal is stamped or a cursor is armed.
+/// Panics when either excluded account is stamped or a cursor is armed.
 #[tokio::test]
 async fn excluded_principals_record_nothing() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -528,17 +484,7 @@ async fn excluded_principals_record_nothing() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let cardless = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO wyrd.auth_service_accounts \
-             (id, data_tenant_id, principal_kind, name, status, sub_principal_id, act_principal_id) \
-         VALUES ($1, wyrd.current_tenant(), 'service', 'automation', 'active', $2, $2)",
-    )
-    .bind(cardless)
-    .bind(actor.id.as_uuid())
-    .execute(&mut **conn.transaction())
-    .await
-    .expect("card-free principal inserts");
+    let unrestricted = family_account(&mut conn, &actor, "automation", None).await;
     let (owner, principal) =
         declare_service(&mut conn, &actor, &service_card("paused", "1.0.0")).await;
     let ids = project_bindings(
@@ -549,50 +495,45 @@ async fn excluded_principals_record_nothing() {
     )
     .await
     .expect("binding projects");
+
+    record_machine_authentication(&mut conn, unrestricted, &owner)
+        .await
+        .expect("an unassociated account's exchange is a no-op");
     sqlx::query("UPDATE wyrd.auth_service_accounts SET status = 'suspended' WHERE id = $1")
         .bind(principal.as_uuid())
         .execute(&mut **conn.transaction())
         .await
         .expect("principal suspends");
-
-    record_machine_authentication(&mut conn, PrincipalId::new(cardless))
-        .await
-        .expect("card-free exchange is a no-op");
-    record_machine_authentication(&mut conn, principal)
+    record_machine_authentication(&mut conn, principal, &owner)
         .await
         .expect("suspended exchange is a no-op");
-    let stamped: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.auth_service_accounts WHERE last_authenticated_at IS NOT NULL",
-    )
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("count reads");
+    let stamped: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.workload_activity")
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("count reads");
     assert_eq!(stamped, 0);
     assert_eq!(cursor(&mut conn, ids[0].as_uuid()).await, None);
 }
 
-/// Suspension and Card deletion deactivate on the next read even inside the
-/// window, and two A/B versions have distinct, independently gated principals.
+/// One stable account spans releases, yet activity is per exact root: R1's
+/// exchange never activates R2. Suspension and Card deletion deactivate on the
+/// next read, and reassociating the family needs fresh activity from the new
+/// account while the old account's use no longer counts.
 ///
 /// # Panics
-/// Panics when A/B principals or bindings coincide or a gate ignores
-/// suspension, deletion, or the other version's activity.
+/// Panics when a release inherits another's activity, a gate ignores
+/// suspension or deletion, or a reassociated family keeps old activity.
 #[tokio::test]
-async fn activity_is_per_version_and_revoked_immediately() {
+async fn activity_is_per_root_and_follows_the_family_account() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let actor = actor(&fixture);
     let mut conn = fixture
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let (a, principal_a) =
-        declare_service(&mut conn, &actor, &service_card("ab-svc", "1.0.0")).await;
-    let (b, principal_b) =
-        declare_service(&mut conn, &actor, &service_card("ab-svc", "2.0.0")).await;
-    assert_ne!(
-        principal_a, principal_b,
-        "A/B versions are distinct principals"
-    );
+    let (a, account) = declare_service(&mut conn, &actor, &service_card("ab-svc", "1.0.0")).await;
+    let (b, same) = declare_service(&mut conn, &actor, &service_card("ab-svc", "2.0.0")).await;
+    assert_eq!(account, same, "one stable account spans both releases");
     let verifier = uid();
     let binding_a = project_bindings(
         &mut conn,
@@ -612,7 +553,7 @@ async fn activity_is_per_version_and_revoked_immediately() {
     .expect("B projects")[0];
     assert_ne!(binding_a, binding_b);
 
-    record_machine_authentication(&mut conn, principal_a)
+    record_machine_authentication(&mut conn, account, &a)
         .await
         .expect("A activates");
     assert!(gate(&mut conn, binding_a).await.active);
@@ -621,35 +562,68 @@ async fn activity_is_per_version_and_revoked_immediately() {
         "B is gated independently"
     );
 
-    sqlx::query("UPDATE wyrd.auth_service_accounts SET status = 'suspended' WHERE id = $1")
-        .bind(principal_a.as_uuid())
-        .execute(&mut **conn.transaction())
+    let family = WorkloadFamily {
+        kind: WorkloadKind::Service,
+        name: wyrd_spec::ids::CardName::new("ab-svc").expect("valid name"),
+    };
+    assert!(
+        set_workload_restriction(&mut conn, account.as_uuid(), None)
+            .await
+            .expect("old account releases the family")
+    );
+    let successor = family_account(&mut conn, &actor, "ab-svc-next", Some(&family)).await;
+    assert!(
+        !gate(&mut conn, binding_a).await.active,
+        "reassociation needs fresh activity from the new account"
+    );
+    record_machine_authentication(&mut conn, account, &b)
         .await
-        .expect("A suspends");
-    assert!(!gate(&mut conn, binding_a).await.active);
-
-    record_machine_authentication(&mut conn, principal_b)
-        .await
-        .expect("B activates");
-    assert!(gate(&mut conn, binding_b).await.active);
-    sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
-        .bind(b.as_uuid())
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("B deletes");
+        .expect("an unassociated account's exchange is a no-op");
     assert!(!gate(&mut conn, binding_b).await.active);
+    record_machine_authentication(&mut conn, successor, &a)
+        .await
+        .expect("successor activates A");
+    let gate_a = gate(&mut conn, binding_a).await;
+    assert!(gate_a.active);
+    assert_eq!(gate_a.principal_id, Some(successor));
+
+    sqlx::query("UPDATE wyrd.auth_service_accounts SET status = 'suspended' WHERE id = $1")
+        .bind(successor.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("successor suspends");
+    assert!(!gate(&mut conn, binding_a).await.active);
+    sqlx::query("UPDATE wyrd.auth_service_accounts SET status = 'active' WHERE id = $1")
+        .bind(successor.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("successor resumes");
+    sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
+        .bind(a.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("A deletes");
+    assert!(!gate(&mut conn, binding_a).await.active);
 }
 
-/// Read a principal's stored `last_authenticated_at` through the operator pool.
+/// Read one root/account activity stamp through the operator pool.
 ///
 /// # Panics
-/// Panics when the principal row cannot be read.
-async fn stamped_at(fixture: &PgFixture, principal: PrincipalId) -> Option<DateTime<Utc>> {
-    sqlx::query_scalar("SELECT last_authenticated_at FROM wyrd.auth_service_accounts WHERE id = $1")
-        .bind(principal.as_uuid())
-        .fetch_one(fixture.operator_pool().pool())
-        .await
-        .expect("activity reads")
+/// Panics when the read fails.
+async fn stamped_at(
+    fixture: &PgFixture,
+    principal: PrincipalId,
+    root: &CardUid,
+) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar(
+        "SELECT last_authenticated_at FROM wyrd.workload_activity \
+          WHERE principal_id = $1 AND workload_card_uid = $2",
+    )
+    .bind(principal.as_uuid())
+    .bind(root.as_uuid())
+    .fetch_optional(fixture.operator_pool().pool())
+    .await
+    .expect("activity reads")
 }
 
 /// A stored stamp ahead of the database's statement clock — what a newer
@@ -680,11 +654,11 @@ async fn out_of_order_exchanges_never_move_activity_backward() {
     conn.commit().await.expect("registration commits");
 
     let mut first = fixture.tenant_conn().await.expect("newer exchange opens");
-    record_machine_authentication(&mut first, principal)
+    record_machine_authentication(&mut first, principal, &owner)
         .await
         .expect("newer exchange records");
-    move_stamp(&mut first, principal, "-3 hours").await;
-    let newer = cursor_of_stamp(&mut first, principal)
+    move_stamp(&mut first, principal, &owner, "-3 hours").await;
+    let newer = cursor_of_stamp(&mut first, principal, &owner)
         .await
         .expect("the newer exchange stamped activity");
     let armed = cursor(&mut first, binding.as_uuid())
@@ -693,13 +667,13 @@ async fn out_of_order_exchanges_never_move_activity_backward() {
     first.commit().await.expect("newer exchange commits");
 
     let mut second = fixture.tenant_conn().await.expect("older exchange opens");
-    record_machine_authentication(&mut second, principal)
+    record_machine_authentication(&mut second, principal, &owner)
         .await
         .expect("older exchange records");
     second.commit().await.expect("older exchange commits");
 
     assert_eq!(
-        stamped_at(&fixture, principal).await,
+        stamped_at(&fixture, principal, &owner).await,
         Some(newer),
         "a stamp ahead of the database clock never steps backward"
     );
@@ -738,8 +712,8 @@ async fn non_v7_stored_identities_are_refused() {
     let v4_owner = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO wyrd.cards \
-            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
-         VALUES ($1, wyrd.current_tenant(), 'Service', 'default', 'v4-owner', '1.0.0', \
+            (card_uid, data_tenant_id, kind, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
+         VALUES ($1, wyrd.current_tenant(), 'Service', 'v4-owner', '1.0.0', \
                  '{}'::jsonb, 'spec-hash', 'active', '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
     )
     .bind(v4_owner)
@@ -815,11 +789,11 @@ async fn database_clock_owns_machine_activity_and_schedule_arming() {
         .await
         .expect("tenant connection opens");
     let before = database_now(&mut conn).await;
-    record_machine_authentication(&mut conn, principal)
+    record_machine_authentication(&mut conn, principal, &owner)
         .await
         .expect("activation records");
     let after = database_now(&mut conn).await;
-    let stamped = cursor_of_stamp(&mut conn, principal)
+    let stamped = cursor_of_stamp(&mut conn, principal, &owner)
         .await
         .expect("a qualifying exchange stamps activity");
     assert!(
@@ -836,15 +810,15 @@ async fn database_clock_owns_machine_activity_and_schedule_arming() {
         gate(&mut conn, binding).await.active,
         "a fresh database stamp is inside the window"
     );
-    move_stamp(&mut conn, principal, "25 hours").await;
+    move_stamp(&mut conn, principal, &owner, "25 hours").await;
     assert!(
         !gate(&mut conn, binding).await.active,
         "the cutoff is database statement time minus the window"
     );
-    move_stamp(&mut conn, principal, "23 hours").await;
+    move_stamp(&mut conn, principal, &owner, "23 hours").await;
     assert!(gate(&mut conn, binding).await.active);
 
-    record_machine_authentication(&mut conn, principal)
+    record_machine_authentication(&mut conn, principal, &owner)
         .await
         .expect("renewal records");
     assert_eq!(
@@ -865,34 +839,41 @@ async fn database_now(conn: &mut TenantConn<'_>) -> DateTime<Utc> {
         .expect("database time reads")
 }
 
-/// Read one principal's stored activity stamp on `conn`.
+/// Read one root/account activity stamp on `conn`.
 ///
 /// # Panics
 /// Panics when the read fails.
 async fn cursor_of_stamp(
     conn: &mut TenantConn<'_>,
     principal: PrincipalId,
+    root: &CardUid,
 ) -> Option<DateTime<Utc>> {
-    sqlx::query_scalar("SELECT last_authenticated_at FROM wyrd.auth_service_accounts WHERE id = $1")
-        .bind(principal.as_uuid())
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("activity reads")
+    sqlx::query_scalar(
+        "SELECT last_authenticated_at FROM wyrd.workload_activity \
+          WHERE principal_id = $1 AND workload_card_uid = $2",
+    )
+    .bind(principal.as_uuid())
+    .bind(root.as_uuid())
+    .fetch_optional(&mut **conn.transaction())
+    .await
+    .expect("activity reads")
 }
 
-/// Backdate one principal's stored activity stamp by the interval `ago`.
+/// Backdate one root/account activity stamp by the interval `ago`.
 ///
 /// The gate's subject is time, so the test places the stored row where the
 /// database predicate is exercised instead of moving any process clock.
 ///
 /// # Panics
 /// Panics when the update fails.
-async fn move_stamp(conn: &mut TenantConn<'_>, principal: PrincipalId, ago: &str) {
+async fn move_stamp(conn: &mut TenantConn<'_>, principal: PrincipalId, root: &CardUid, ago: &str) {
     sqlx::query(
-        "UPDATE wyrd.auth_service_accounts \
-            SET last_authenticated_at = statement_timestamp() - $2::interval WHERE id = $1",
+        "UPDATE wyrd.workload_activity \
+            SET last_authenticated_at = statement_timestamp() - $3::interval \
+          WHERE principal_id = $1 AND workload_card_uid = $2",
     )
     .bind(principal.as_uuid())
+    .bind(root.as_uuid())
     .bind(ago)
     .execute(&mut **conn.transaction())
     .await

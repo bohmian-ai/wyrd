@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: event-fact
   version: 1.0.0
-  space: default
 spec:
   description: The application detected the door event it reports.
   inputs:

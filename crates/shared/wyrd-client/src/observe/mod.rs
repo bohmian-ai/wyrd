@@ -22,6 +22,7 @@ mod tests;
 
 use arrow_schema::DataType;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, GroupId};
@@ -372,6 +373,32 @@ impl Observe<'_> {
         }
     }
 
+    /// [`Observe::verify`], with every requirement's custom `data` decoded
+    /// as `T`.
+    ///
+    /// The execution is the ordinary one; decoding happens after its result
+    /// arrives, so a mismatch neither changes the stored result nor reruns
+    /// the Verifier.
+    ///
+    /// # Arguments
+    /// * `verifier` - The `metadata.name` of a Verifier bound to this view's subject.
+    /// * `inputs` - Values named by slot, or one value for a single-slot Verifier.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Observe::verify`], then
+    /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` when present data does not
+    /// decode as `T`.
+    ///
+    /// # Cancellation
+    /// Dropping the future abandons the request; it is never retried.
+    pub async fn verify_typed<T: DeserializeOwned>(
+        &self,
+        verifier: &str,
+        inputs: impl Into<Inputs>,
+    ) -> Result<VerificationResult<T>, WyrdError> {
+        self.verify(verifier, inputs).await?.decode_data()
+    }
+
     /// Submit evidence for the Verifier named `verifier` on this view's
     /// subject without waiting for a judgment.
     ///
@@ -488,6 +515,7 @@ impl Observe<'_> {
             card_uid: bound.card_uid.clone(),
             run_id: self.run.run_id.clone(),
             group_id: self.group_id.clone(),
+            deployment_environment: self.run.state.deployment_environment().map(str::to_owned),
         }
     }
 }

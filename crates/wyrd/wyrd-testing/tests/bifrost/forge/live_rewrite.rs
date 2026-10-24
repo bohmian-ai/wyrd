@@ -255,7 +255,7 @@ async fn pending_tasks(cluster: &WyrdTestCluster) -> i64 {
 /// # Panics
 ///
 /// Panics when the backlog is still owed after the pass budget.
-async fn drain_forge_backlog(
+pub(crate) async fn drain_forge_backlog(
     cluster: &WyrdTestCluster,
     observer: &vala_bifrost_redux::forge::ForgeWorkerCompletionObserver,
     tenants: &[DataTenantId],
@@ -341,7 +341,7 @@ struct RewriteSnapshot {
 /// attachment is never counted as data and a replacement's inherited sequence
 /// stays inspectable from the same projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveFile {
+pub(crate) struct LiveFile {
     /// Iceberg content type the manifest entry declared for the object.
     content_type: iceberg::spec::DataContentType,
     /// Physical size in bytes the manifest recorded for the object.
@@ -350,6 +350,14 @@ struct LiveFile {
     sequence_number: Option<i64>,
     /// File sequence number the live entry carries, when the manifest has one.
     file_sequence_number: Option<i64>,
+    /// Partition spec the manifest recorded the object under.
+    pub(crate) partition_spec_id: i32,
+    /// Partition tuple the manifest recorded for the object.
+    pub(crate) partition: iceberg::spec::Struct,
+    /// Sort order the manifest recorded for the object, when it has one.
+    pub(crate) sort_order_id: Option<i32>,
+    /// Rows the manifest recorded for the object.
+    pub(crate) record_count: u64,
 }
 
 /// Every file one snapshot holds live, split by content and keyed by path.
@@ -358,9 +366,9 @@ struct LiveFile {
 /// byte total below is derived from two of these, so the two can never
 /// disagree about which entries they described.
 #[derive(Debug, Clone, Default)]
-struct SnapshotFiles {
+pub(crate) struct SnapshotFiles {
     /// Live data entries of the snapshot, keyed by canonical storage path.
-    data: BTreeMap<String, LiveFile>,
+    pub(crate) data: BTreeMap<String, LiveFile>,
     /// Live position- and equality-delete entries, keyed by canonical path.
     deletes: BTreeMap<String, LiveFile>,
 }
@@ -404,7 +412,7 @@ impl SnapshotFiles {
 /// without the journey reconstructing a storage layout it does not own. A path
 /// that does not contain the prefix is foreign to this table and is returned
 /// unchanged so a comparison against it fails loudly rather than silently.
-fn canonical_path(path: &str, binding: &TenantTableBinding) -> String {
+pub(crate) fn canonical_path(path: &str, binding: &TenantTableBinding) -> String {
     let prefix = binding.object_prefix.as_str();
     path.find(prefix)
         .map_or_else(|| path.to_owned(), |start| path[start..].to_owned())
@@ -423,7 +431,7 @@ fn canonical_path(path: &str, binding: &TenantTableBinding) -> String {
 /// # Panics
 ///
 /// Panics when the manifest list or any manifest it names cannot be read.
-async fn snapshot_files(
+pub(crate) async fn snapshot_files(
     table: &iceberg::table::Table,
     snapshot: &iceberg::spec::SnapshotRef,
     binding: &TenantTableBinding,
@@ -448,6 +456,10 @@ async fn snapshot_files(
                 size_bytes: data_file.file_size_in_bytes(),
                 sequence_number: entry.sequence_number(),
                 file_sequence_number: entry.file_sequence_number,
+                partition_spec_id: data_file.partition_spec_id(),
+                partition: data_file.partition().clone(),
+                sort_order_id: data_file.sort_order_id(),
+                record_count: data_file.record_count(),
             };
             if content_type == iceberg::spec::DataContentType::Data {
                 files.data.insert(path, live);
@@ -801,7 +813,7 @@ async fn rewrite_operation_phase(cluster: &WyrdTestCluster, operation: Uuid) -> 
 /// # Panics
 ///
 /// Panics when the public read differs from the acknowledged rows in any way.
-async fn assert_public_rows(
+pub(crate) async fn assert_public_rows(
     client: &WyrdClient,
     table: &JourneyTable,
     expected: &[ManagedRow],
@@ -2066,7 +2078,7 @@ async fn rewrite_targets(cluster: &WyrdTestCluster, binding: &TenantTableBinding
 /// # Panics
 ///
 /// Panics when a table still has no committed rewrite after the pass budget.
-async fn await_committed_rewrites(
+pub(crate) async fn await_committed_rewrites(
     cluster: &WyrdTestCluster,
     observer: &vala_bifrost_redux::forge::ForgeWorkerCompletionObserver,
     bindings: &[&TenantTableBinding],
@@ -2122,9 +2134,9 @@ async fn declared_file_target(
 /// by Forge, while an undeclared table compacts toward the deployment default.
 ///
 /// Both tables are registered through the public client. The declared table
-/// carries its target as its only explicit Iceberg property; re-registering it
-/// with the same value or with none is idempotent, and a different value is
-/// refused without changing it. Each table then receives two flushed public
+/// stores its target and the undeclared table stores the deployment default
+/// resolved at creation; re-registering with the same value or with none is
+/// idempotent, and a different value is refused without changing it. Each table then receives two flushed public
 /// appends, and the pod's own Forge promotes and rewrites them: the declared
 /// table's committed rewrite records the declared target, the undeclared
 /// table's records the approximately 1 GiB deployment default, the rewrite
@@ -2148,6 +2160,7 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     let tenant = cluster.data_tenant_id();
     let client = tenant_client(server, tenant).await;
     let target = 256 * 1024 * 1024_u64;
+    let default = vala_bifrost_redux::forge::ForgeConfig::default().default_target_file_size_bytes;
     let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
     ]));
@@ -2213,15 +2226,15 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
         }
     };
     assert_eq!(described(&declared).await, Some(target));
-    assert_eq!(described(&undeclared).await, None);
+    assert_eq!(described(&undeclared).await, Some(default));
     assert_eq!(
         declared_file_target(&cluster, &declared.binding).await,
         Some(target)
     );
     assert_eq!(
         declared_file_target(&cluster, &undeclared.binding).await,
-        None,
-        "an omitted target writes no Iceberg property"
+        Some(default),
+        "an omitted target stores the deployment default resolved at creation"
     );
     assert_eq!(
         register(&declared, Some(target))
@@ -2249,8 +2262,8 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     assert_eq!(described(&declared).await, Some(target));
     assert_eq!(
         described(&undeclared).await,
-        None,
-        "omission on an existing table leaves it undeclared"
+        Some(default),
+        "omission on an existing table leaves its stored target unchanged"
     );
 
     let mut expected = BTreeMap::new();
@@ -2282,15 +2295,9 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     )
     .await;
 
-    for ((table, recorded), promoted) in [
-        (&declared, target),
-        (
-            &undeclared,
-            vala_bifrost_redux::forge::ForgeConfig::default().default_target_file_size_bytes,
-        ),
-    ]
-    .into_iter()
-    .zip(promoted)
+    for ((table, recorded), promoted) in [(&declared, target), (&undeclared, default)]
+        .into_iter()
+        .zip(promoted)
     {
         let targets = rewrite_targets(&cluster, &table.binding).await;
         assert!(

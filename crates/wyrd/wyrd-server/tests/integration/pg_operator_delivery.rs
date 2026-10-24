@@ -213,7 +213,7 @@ impl Delivery {
     async fn operator(&self, name: &str, spec: Value) -> CardUid {
         let body = json!({ "submissions": [{
             "apiVersion": "wyrd/v1", "kind": "Operator",
-            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "metadata": { "name": name, "version": "1.0.0" },
             "spec": spec, "artifacts": []
         }] });
         let (status, body) = self.call(Method::POST, "/v1/cards", Some(&body)).await;
@@ -243,7 +243,7 @@ impl Delivery {
             .await
             .expect("binding projects");
         self.seed
-            .activate(principal)
+            .activate(principal, &owner)
             .await
             .expect("owner activates");
         self.seed
@@ -312,7 +312,9 @@ impl Delivery {
             )
             .await
             .expect("binding projects");
-        seed.activate(principal).await.expect("owner activates");
+        seed.activate(principal, &owner)
+            .await
+            .expect("owner activates");
         seed.make_binding_due(binding)
             .await
             .expect("binding is due");
@@ -557,6 +559,7 @@ fn failing_script(runs: usize) -> EngineScript {
             reason: "latency drifted".to_owned(),
             actual: None,
             citations: Vec::new(),
+            data: None,
             detail: Some(RequirementDetail::Drift(report)),
             check: serde_json::from_value::<Check>(json!({
                 "kind": "drift", "on": "inputs.samples", "method": "Custom",

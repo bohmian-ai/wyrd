@@ -3404,8 +3404,9 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     use arrow::array::AsArray as _;
+    use wyrd_spec::auth::CardAccess;
     use wyrd_spec::ids::CardUid;
-    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use wyrd_spec::reference::CardRef;
     use wyrd_spec::vala::ids::RunId;
 
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -3423,13 +3424,12 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
         )
         .await
         .expect("metadata policy stores");
-    let agent: CardRef = "prod/Agent/support-agent@1.0.0".parse().expect("agent ref");
+    let agent: CardRef = "Agent/support-agent@1.0.0".parse().expect("agent ref");
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
     wyrd_dev_fixtures::cards::seed_backing_card(&mut conn, &agent, Uuid::now_v7()).await;
     let uid = wyrd_sql::queries::cards::get_card_by_ref(
         &mut conn,
         agent.kind.clone(),
-        agent.space.as_ref().expect("space"),
         &agent.name,
         &agent.version,
     )
@@ -3482,21 +3482,23 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     assert_eq!(text("card_uid"), uid.as_str());
     assert_eq!(text("run_id"), run.as_str());
 
-    let unregistered: CardRef = "prod/Agent/ghost@1.0.0".parse().expect("ghost ref");
+    let ghost = CardUid::new(Uuid::now_v7().to_string()).expect("a UUID is a Card UID");
     let scoped = Caller {
         principal: Principal::new(
             principal(2),
-            PrincipalKind::Agent {
-                card_ref: unregistered.clone(),
-                card_ref_scope: CardRefScope::own(&unregistered),
-            },
+            PrincipalKind::Service,
             tenant,
             Vec::<RoleRef>::new(),
             PermissionSet::from_iter([open_access()]),
+        )
+        .with_card_access(
+            CardAccess::Scoped {
+                cards: vec![ghost.clone()],
+            },
+            Some(ghost.clone()),
         ),
         ..invoker(tenant, 2, [])
     };
-    let ghost = CardUid::new(Uuid::now_v7().to_string()).expect("a UUID is a Card UID");
     for (caller, card_uid) in [(&unbound, &ghost), (&scoped, &uid)] {
         let refused = invocation
             .invoke(caller, call(card_uid))

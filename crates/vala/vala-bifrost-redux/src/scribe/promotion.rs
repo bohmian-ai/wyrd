@@ -26,13 +26,14 @@
 use std::collections::{BTreeMap, HashMap};
 
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, PrimitiveType, Struct,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, PrimitiveType,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::catalog::layout::{TimeGranularity, TimePartition};
+use crate::catalog::PhysicalPartition;
 use crate::contracts::ScribeError;
+use wyrd_spec::vala::api::PhysicalPartitionWire;
 
 /// Version stamped into every promotion record this writer produces.
 ///
@@ -85,50 +86,6 @@ impl ScribeColumnBoundV1 {
             ScribeError::Internal {
                 detail: format!("promotion bound does not decode as its type: {error}"),
             }
-        })
-    }
-}
-
-/// The exact partition value one published object belongs to.
-///
-/// Scribe partitions on one time transform, so the durable form is the same
-/// granularity/boundary pair `vala.file_list` stores; the Iceberg literal is
-/// derived from it rather than persisted, which keeps the record readable and
-/// makes a non-canonical boundary unrepresentable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScribePartitionValueV1 {
-    /// Durable lowercase granularity token (`hour` or `day`).
-    pub granularity: String,
-    /// Exact UTC partition start boundary.
-    pub start_utc: chrono::DateTime<chrono::Utc>,
-}
-
-impl ScribePartitionValueV1 {
-    /// Projects one physical partition into its persisted form.
-    fn from_partition(partition: TimePartition) -> Self {
-        Self {
-            granularity: partition.granularity_str().to_owned(),
-            start_utc: partition.start_utc(),
-        }
-    }
-
-    /// Rebuilds the exact partition this value was projected from.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the granularity token is unknown
-    /// or the boundary is not canonical for it.
-    fn to_partition(&self) -> Result<TimePartition, ScribeError> {
-        let granularity = TimeGranularity::from_str_token(&self.granularity).ok_or_else(|| {
-            ScribeError::Internal {
-                detail: format!(
-                    "promotion partition granularity is unknown: {}",
-                    self.granularity
-                ),
-            }
-        })?;
-        TimePartition::new(granularity, self.start_utc).map_err(|error| ScribeError::Internal {
-            detail: format!("promotion partition boundary is not canonical: {error}"),
         })
     }
 }
@@ -227,14 +184,14 @@ pub struct PublishedHotFileIdentity<'a> {
     pub object_key: &'a str,
     /// Lowercase SHA-256 of the sealed object bytes.
     pub file_checksum: &'a str,
-    /// Physical partition the object belongs to.
-    pub partition: TimePartition,
+    /// Physical partition the object belongs to, spec id included.
+    pub partition: &'a PhysicalPartition,
     /// Wyrd schema fingerprint the footer was sealed with, as lowercase hex.
     pub schema_fingerprint: String,
-    /// Iceberg partition-spec identity the object was written under.
-    pub partition_spec_id: i32,
     /// Iceberg sort-order identity the object was written under.
     pub sort_order_id: i32,
+    /// Table version whose definition accepted and sealed the rows.
+    pub table_version: wyrd_spec::vala::ids::TableVersion,
 }
 
 /// What a reader observed about the uploaded object, for revalidation.
@@ -274,12 +231,17 @@ pub struct ScribePublishedHotFileV1 {
     pub file_checksum: String,
     /// Wyrd schema fingerprint the footer was sealed with, as lowercase hex.
     pub schema_fingerprint: String,
-    /// Iceberg partition-spec identity the object was written under.
-    pub partition_spec_id: i32,
     /// Iceberg sort-order identity the object was written under.
     pub sort_order_id: i32,
-    /// Physical partition value the object belongs to.
-    pub partition: ScribePartitionValueV1,
+    /// Table version whose retained definition accepted and sealed the rows.
+    ///
+    /// Promotion resolves exactly this definition to revalidate the object,
+    /// because two versions can share schema, spec, and sort ids and differ
+    /// only in Bloom policy.
+    pub table_version: wyrd_spec::vala::ids::TableVersion,
+    /// Physical partition the object belongs to, including the Iceberg
+    /// partition-spec id it was written under.
+    pub partition: PhysicalPartitionWire,
     /// Iceberg-ready projection of the object's `DataFile`.
     pub data_file: ScribeDataFileV1,
 }
@@ -292,7 +254,8 @@ impl ScribePublishedHotFileV1 {
     /// about column metrics is exactly what that footer carried. Partition,
     /// spec, and sort identity come from `identity` rather than from the
     /// writer because they are publication facts — the writer seals an object
-    /// before anything decides which fenced row will name it.
+    /// before anything decides which fenced row will name it. The table
+    /// version is the assembly key's accepting version.
     pub fn from_metrics(
         identity: &PublishedHotFileIdentity<'_>,
         data_file: ScribeDataFileV1,
@@ -306,9 +269,9 @@ impl ScribePublishedHotFileV1 {
             object_key: identity.object_key.to_owned(),
             file_checksum: identity.file_checksum.to_owned(),
             schema_fingerprint: identity.schema_fingerprint.clone(),
-            partition_spec_id: identity.partition_spec_id,
             sort_order_id: identity.sort_order_id,
-            partition: ScribePartitionValueV1::from_partition(identity.partition),
+            table_version: identity.table_version,
+            partition: identity.partition.to_wire(),
             data_file,
         }
     }
@@ -322,15 +285,13 @@ impl ScribePublishedHotFileV1 {
     /// builder refuses the assembled file.
     pub fn data_file(&self) -> Result<DataFile, ScribeError> {
         self.validate_version()?;
-        let partition = self.partition.to_partition()?;
+        let partition = self.partition()?;
         let mut builder = DataFileBuilder::default();
         builder
             .content(DataContentType::Data)
             .file_path(self.object_key.clone())
             .file_format(DataFileFormat::Parquet)
-            .partition(Struct::from_iter([Some(
-                partition.iceberg_partition_literal(),
-            )]))
+            .partition(partition.iceberg_struct())
             .record_count(self.data_file.record_count)
             .file_size_in_bytes(self.data_file.file_size_in_bytes)
             .column_sizes(counts_map(&self.data_file.column_sizes))
@@ -340,7 +301,7 @@ impl ScribePublishedHotFileV1 {
             .lower_bounds(bounds_map(&self.data_file.lower_bounds)?)
             .upper_bounds(bounds_map(&self.data_file.upper_bounds)?)
             .split_offsets(Some(self.data_file.split_offsets.clone()))
-            .partition_spec_id(self.partition_spec_id)
+            .partition_spec_id(partition.spec_id())
             .sort_order_id(self.sort_order_id);
         builder.build().map_err(|error| ScribeError::Internal {
             detail: format!("promotion evidence does not rebuild a data file: {error}"),
@@ -398,6 +359,18 @@ impl ScribePublishedHotFileV1 {
             })?;
         record.validate_version()?;
         Ok(record)
+    }
+
+    /// Restores the physical partition the record names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the recorded partition is
+    /// malformed.
+    pub fn partition(&self) -> Result<PhysicalPartition, ScribeError> {
+        PhysicalPartition::from_wire(&self.partition).map_err(|error| ScribeError::Internal {
+            detail: format!("promotion evidence names an invalid partition: {error}"),
+        })
     }
 
     /// Refuses any record that is not this writer's one shipped version.
@@ -458,7 +431,7 @@ mod tests {
     use super::*;
 
     use crate::catalog::layout::{
-        BIFROST_PARTITION_SPEC_ID, BIFROST_SORT_ORDER_ID, TimeGranularity,
+        BIFROST_PARTITION_SPEC_ID, BIFROST_SORT_ORDER_ID, TimeGranularity, TimePartition,
     };
 
     /// Builds one record over a two-column object with real bounds.
@@ -467,8 +440,10 @@ mod tests {
     /// form is type-directed bytes rather than a number, so a round trip that
     /// keeps them is a round trip that keeps everything.
     fn record() -> ScribePublishedHotFileV1 {
-        let partition = TimePartition::new(TimeGranularity::Day, chrono::DateTime::UNIX_EPOCH)
-            .expect("canonical fixture partition");
+        let partition = PhysicalPartition::from(
+            TimePartition::new(TimeGranularity::Day, chrono::DateTime::UNIX_EPOCH)
+                .expect("canonical fixture partition"),
+        );
         ScribePublishedHotFileV1::from_metrics(
             &PublishedHotFileIdentity {
                 data_tenant_id: Uuid::now_v7(),
@@ -477,10 +452,10 @@ mod tests {
                 file_list_id: Uuid::now_v7(),
                 object_key: "tenant/table/day=1970-01-01/scribe-0-00000.parquet",
                 file_checksum: &"ab".repeat(32),
-                partition,
+                partition: &partition,
                 schema_fingerprint: "cd".repeat(32),
-                partition_spec_id: BIFROST_PARTITION_SPEC_ID,
                 sort_order_id: BIFROST_SORT_ORDER_ID,
+                table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
             },
             ScribeDataFileV1 {
                 record_count: 4,

@@ -66,16 +66,16 @@ pub use skald_spec::{MessageNum, Prompt, ProviderRequest, ProviderResponse, Resp
 #[cfg(test)]
 mod foundation_contracts_tests {
     use crate::error::WyrdError;
-    use crate::ids::{BindingId, CardUid, DataTenantId, SpaceName, TenantSlug};
+    use crate::ids::{BindingId, CardName, CardUid, DataTenantId, TenantSlug};
     use crate::request_id::RequestId;
     use crate::trace::TraceContext;
     use wyrd_semver::{VersionBlock, VersionBump, VersionRange};
 
     #[test]
     fn ids_enforce_type_specific_canonical_forms() {
-        assert!(SpaceName::new("prod_space").is_ok());
-        assert!(SpaceName::new("ProdSpace").is_err());
-        assert!(SpaceName::new("ab").is_err());
+        assert!(CardName::new("prod_space").is_ok());
+        assert!(CardName::new("ProdSpace").is_err());
+        assert!(CardName::new("ab").is_err());
 
         assert!(CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").is_ok());
         assert!(CardUid::new("550e8400-e29b-41d4-a716-446655440000").is_err());

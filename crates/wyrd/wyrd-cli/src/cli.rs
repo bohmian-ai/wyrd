@@ -83,7 +83,7 @@ pub enum Command {
     List(ListArgs),
     /// Soft-delete one exact card.
     Delete(DeleteArgs),
-    /// Authenticate with a Wyrd server (login, refresh, issue-key).
+    /// Authenticate with a Wyrd server (login, refresh, trusted issuers, workload bindings).
     #[command(subcommand)]
     Auth(AuthCommand),
     /// Administer the platform control plane (credentials).
@@ -195,7 +195,7 @@ mod tests {
     fn the_root_parser_refuses_every_former_secret_option_without_echo() {
         let secret = "wyrd-cli-sentinel-secret";
         let server = ["--server", "https://wyrd.example"];
-        let cases: [&[&str]; 15] = [
+        let cases: [&[&str]; 14] = [
             &["operator-connection", "create", "--bot-token"],
             &["operator-connection", "create", "--integration-key"],
             &[
@@ -206,7 +206,6 @@ mod tests {
                 "--token",
             ],
             &["operator-connection", "create", "--password"],
-            &["auth", "issue-key", "--token"],
             &["auth", "trusted-issuer", "add", "--token"],
             &["auth", "trusted-issuer", "add", "--client-secret"],
             &["auth", "trusted-issuer", "list", "--token"],

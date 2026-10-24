@@ -84,17 +84,23 @@ impl DomainTable for AuditLogTable {
     }
 
     /// Daily partitions on the decision instant `created_at`, sorted newest
-    /// first, Bloom-pruned on `sub_principal_id`, `resource`, and `operation`.
+    /// first, Bloom-pruned on `sub_principal_id`, `act_principal_id`,
+    /// `resource`, and `operation`.
     ///
     /// Partitioning by decision time rather than Scribe receipt keeps a
-    /// retained decision in the day it was made; the Bloom columns serve the
-    /// "who did what to which resource" audit lookups, and the catalog unions
-    /// the managed Bloom floor when it resolves the declaration.
+    /// retained decision in the day it was made; the Bloom columns are the
+    /// complete set and serve the "who did what to which resource" audit
+    /// lookups.
     fn physical_layout() -> PhysicalLayoutWire {
         daily_layout(
             CREATED_AT,
             vec![sort_desc(CREATED_AT)],
-            &["sub_principal_id", "resource", "operation"],
+            &[
+                "sub_principal_id",
+                "act_principal_id",
+                "resource",
+                "operation",
+            ],
         )
     }
 }

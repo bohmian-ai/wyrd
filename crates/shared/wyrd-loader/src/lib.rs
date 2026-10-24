@@ -218,7 +218,7 @@ mod tests {
     /// written to temporary workspaces by the loader tests.
     fn prompt(name: &str, version: &str) -> String {
         format!(
-            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: {name}\n  space: default\n  version: \"{version}\"\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n"
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: {name}\n  version: \"{version}\"\nspec:\n  provider: openai\n  model: gpt-5\n  system: Be brief.\n"
         )
     }
 
@@ -231,7 +231,7 @@ mod tests {
             .expect("first card writes");
         std::fs::write(
             temp.path().join("root.yaml"),
-            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: root-service\n  space: default\n  version: \"1.0.0\"\nspec:\n  service_type: api\n  components:\n    - alias: a\n      ref: a.yaml\n    - alias: b\n      ref: b.yaml\n",
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: root-service\n  version: \"1.0.0\"\nspec:\n  service_type: api\n  components:\n    - alias: a\n      ref: a.yaml\n    - alias: b\n      ref: b.yaml\n",
         )
         .expect("root card writes");
 
@@ -250,7 +250,7 @@ mod tests {
         let source = temp.path().join("model.yaml");
         std::fs::write(
             &source,
-            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: model\n  space: default\n  version: \"1.0.0\"\nartifacts:\n  - relative_path: weights.bin\n    sha256: digest\n    size_bytes: 4\n    content_type: application/octet-stream\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs: []\n    outputs: []\n",
+            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: model\n  version: \"1.0.0\"\nartifacts:\n  - relative_path: weights.bin\n    sha256: digest\n    size_bytes: 4\n    content_type: application/octet-stream\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs: []\n    outputs: []\n",
         )
         .expect("model writes");
         std::fs::write(temp.path().join("weights.bin"), b"data").expect("artifact writes");
@@ -290,7 +290,7 @@ mod tests {
         let source = temp.path().join("model.yaml");
         std::fs::write(
             &source,
-            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: model\n  space: default\n  version: \"1.0.0\"\nartifacts:\n  - relative_path: weights.bin\n    sha256: digest\n    size_bytes: 4\n    content_type: application/octet-stream\n  - relative_path: weights.bin\n    sha256: digest\n    size_bytes: 4\n    content_type: application/octet-stream\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs: []\n    outputs: []\n",
+            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: model\n  version: \"1.0.0\"\nartifacts:\n  - relative_path: weights.bin\n    sha256: digest\n    size_bytes: 4\n    content_type: application/octet-stream\n  - relative_path: weights.bin\n    sha256: digest\n    size_bytes: 4\n    content_type: application/octet-stream\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs: []\n    outputs: []\n",
         )
         .expect("model writes");
 
@@ -307,7 +307,7 @@ mod tests {
         std::fs::write(
             source,
             format!(
-                "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: model\n  space: default\n  version: \"1.0.0\"\nartifacts:\n  - relative_path: {artifact_path}\n    sha256: digest\n    size_bytes: 4\n    content_type: application/octet-stream\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs: []\n    outputs: []\n"
+                "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: model\n  version: \"1.0.0\"\nartifacts:\n  - relative_path: {artifact_path}\n    sha256: digest\n    size_bytes: 4\n    content_type: application/octet-stream\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs: []\n    outputs: []\n"
             ),
         )
         .expect("model writes");
@@ -355,7 +355,7 @@ mod tests {
         let temp = TempDir::new().expect("temp directory creates");
         std::fs::write(
             temp.path().join("service.yaml"),
-            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service\n  space: default\n  version: \"1.0.0\"\nspec:\n  service_type: api\n  components:\n    - alias: prompt\n      ref:\n        kind: Prompt\n        name: prompt\n        space: default\n        version: \"1.0.0\"\n        uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00\n",
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service\n  version: \"1.0.0\"\nspec:\n  service_type: api\n  components:\n    - alias: prompt\n      ref:\n        kind: Prompt\n        name: prompt\n        version: \"1.0.0\"\n        uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00\n",
         )
         .expect("service writes");
 
@@ -376,7 +376,7 @@ mod tests {
             .expect("prompt writes");
         std::fs::write(
             temp.path().join("service.yaml"),
-            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service\n  space: default\n  version: \"1.0.0\"\nspec:\n  service_type: api\n  components:\n    - alias: external\n      ref:\n        kind: Prompt\n        name: prompt\n        space: default\n        version: \"1.0.0\"\n    - alias: sibling\n      ref: prompt.yaml\n",
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service\n  version: \"1.0.0\"\nspec:\n  service_type: api\n  components:\n    - alias: external\n      ref:\n        kind: Prompt\n        name: prompt\n        version: \"1.0.0\"\n    - alias: sibling\n      ref: prompt.yaml\n",
         )
         .expect("service writes");
 

@@ -22,6 +22,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use wyrd_spec::auth::{SecretBearer, TokenAudience};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 #[cfg(feature = "internal")]
 use wyrd_spec::request_id::RequestId;
 
@@ -469,6 +470,65 @@ impl WyrdClient {
             auth,
             grpc_config: self.grpc_config.clone(),
         })
+    }
+
+    /// Return a client whose requests run as the exact Service root
+    /// `uid`, with this client's credential and connection pools.
+    ///
+    /// The returned client keeps its own token cache, so rootless and rooted
+    /// clients over one credential never share a token: an API key or
+    /// workload token requests `uid` in its exchange and every renewal, and
+    /// every request carries it on
+    /// [`WORKLOAD_UID_HEADER`](wyrd_spec::auth::WORKLOAD_UID_HEADER), which
+    /// selects context for a user bearer. No network call is made here; the
+    /// server validates the root on first use and refuses one the account may
+    /// not select.
+    ///
+    /// # Arguments
+    /// * `uid` - Exact Service Card UID the returned client runs as.
+    #[must_use]
+    pub fn for_workload(&self, uid: CardUid) -> Self {
+        let auth = self.auth.for_workload(uid);
+        Self {
+            http: self.http.with_auth(Arc::clone(&auth)),
+            auth,
+            grpc_config: self.grpc_config.clone(),
+        }
+    }
+
+    /// Return a client whose requests run as the exact Service root `uid` in
+    /// `deployment_environment`, as [`Self::for_workload`] does.
+    ///
+    /// Every request also carries the environment on
+    /// [`DEPLOYMENT_ENVIRONMENT_HEADER`](wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER)
+    /// as descriptive context; it never changes the grant.
+    ///
+    /// # Arguments
+    /// * `uid` - Exact Service Card UID the returned client runs as.
+    /// * `deployment_environment` - The non-empty configured environment, or
+    ///   `None` when unknown.
+    #[must_use]
+    pub fn for_service(&self, uid: CardUid, deployment_environment: Option<String>) -> Self {
+        let auth = self.auth.for_service(uid, deployment_environment);
+        Self {
+            http: self.http.with_auth(Arc::clone(&auth)),
+            auth,
+            grpc_config: self.grpc_config.clone(),
+        }
+    }
+
+    /// The exact root this client's requests run as, or `None` for rootless
+    /// work: the one [`Self::for_workload`] selected, else `WYRD_WORKLOAD_UID`.
+    #[must_use]
+    pub fn workload_uid(&self) -> Option<&CardUid> {
+        self.auth.workload_uid()
+    }
+
+    /// The deployment environment this client's requests declare, or `None`
+    /// when none is configured: the one [`Self::for_service`] selected.
+    #[must_use]
+    pub fn deployment_environment(&self) -> Option<&str> {
+        self.auth.deployment_environment()
     }
 
     /// Return the shared [`AuthMiddleware`] handle.

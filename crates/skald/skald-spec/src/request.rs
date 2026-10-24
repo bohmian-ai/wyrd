@@ -171,12 +171,12 @@ impl<'de> Deserialize<'de> for ProviderName {
 #[cfg(feature = "schemars")]
 impl schemars::JsonSchema for ProviderName {
     /// Names the schema `ProviderName`.
-    fn schema_name() -> String {
-        "ProviderName".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ProviderName".into()
     }
 
     /// Publishes the name as a plain string schema.
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         String::json_schema(generator)
     }
 }

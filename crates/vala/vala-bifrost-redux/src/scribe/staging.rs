@@ -15,7 +15,7 @@ use crate::scribe::stream_identity::StreamIdentity;
 use wyrd_spec::DataTenantId;
 
 /// Version of the durable Scribe publication-manifest contract.
-const PUBLICATION_MANIFEST_VERSION: u8 = 2;
+const PUBLICATION_MANIFEST_VERSION: u8 = 3;
 /// Maximum durable metadata accepted during fail-closed startup recovery.
 const MAX_PUBLICATION_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -89,12 +89,11 @@ struct DurableFileListRow {
     min_event_time: chrono::DateTime<chrono::Utc>,
     /// Maximum event time.
     max_event_time: chrono::DateTime<chrono::Utc>,
-    /// Exact typed time partition of the staged artifact.
+    /// Exact physical partition of the staged artifact.
     ///
-    /// Stored as the public wire value so the manifest carries the same
-    /// granularity/start pair the WAL, object path, and file-list row carry,
-    /// and so deserialization re-validates the canonical boundary.
-    partition: wyrd_spec::vala::api::TimePartitionWire,
+    /// Stored as the wire value so the manifest carries the same identity the
+    /// WAL and file-list row carry, and so recovery re-validates it.
+    partition: wyrd_spec::vala::api::PhysicalPartitionWire,
     /// Producing node.
     node_id: Uuid,
     /// Producing fenced epoch.
@@ -143,13 +142,19 @@ impl From<&FileListArtifactInsert> for DurableFileListRow {
     }
 }
 
-impl From<DurableFileListRow> for FileListArtifactInsert {
+impl TryFrom<DurableFileListRow> for FileListArtifactInsert {
+    type Error = ScribeError;
+
     /// Restores one typed file-list insert from a validated staging row.
     ///
     /// The conversion is field-for-field and performs no normalization, leaving
     /// publication validation responsible for rejecting contradictory manifests.
-    fn from(row: DurableFileListRow) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the recorded partition is invalid.
+    fn try_from(row: DurableFileListRow) -> Result<Self, ScribeError> {
+        Ok(Self {
             id: row.id,
             data_tenant_id: row.data_tenant_id,
             namespace: row.namespace,
@@ -159,7 +164,11 @@ impl From<DurableFileListRow> for FileListArtifactInsert {
             row_count: row.row_count,
             min_event_time: row.min_event_time,
             max_event_time: row.max_event_time,
-            partition: crate::catalog::layout::TimePartition::from_wire(row.partition),
+            partition: crate::catalog::PhysicalPartition::from_wire(&row.partition).map_err(
+                |error| ScribeError::Internal {
+                    detail: format!("publication manifest partition is invalid: {error}"),
+                },
+            )?,
             node_id: row.node_id,
             writer_epoch: row.writer_epoch,
             wal_lsn_min: row.wal_lsn_min,
@@ -167,7 +176,7 @@ impl From<DurableFileListRow> for FileListArtifactInsert {
             file_ordinal: row.file_ordinal,
             file_checksum: row.file_checksum,
             promotion_record: row.promotion_record,
-        }
+        })
     }
 }
 
@@ -635,15 +644,15 @@ impl ScribeStaging {
                 crate::scribe::stream_identity::NodeId::new(manifest.actor_node_id),
                 crate::scribe::stream_identity::WriterEpoch::new(manifest.actor_writer_epoch),
             );
+            let rows = manifest
+                .rows
+                .into_iter()
+                .map(FileListArtifactInsert::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
             validate_publication(
                 &manifest.logical_identity,
                 actor_stream,
-                &manifest
-                    .rows
-                    .iter()
-                    .cloned()
-                    .map(FileListArtifactInsert::from)
-                    .collect::<Vec<_>>(),
+                &rows,
                 &manifest.claims,
             )?;
             for claim in &manifest.claims {
@@ -653,11 +662,7 @@ impl ScribeStaging {
             recovered.push(RecoveredPublication {
                 logical_identity: manifest.logical_identity,
                 actor_stream,
-                rows: manifest
-                    .rows
-                    .into_iter()
-                    .map(FileListArtifactInsert::from)
-                    .collect(),
+                rows,
                 claims: manifest.claims,
             });
         }
@@ -1134,10 +1139,10 @@ pub(crate) mod tests {
                 file_list_id,
                 object_key,
                 file_checksum: checksum,
-                partition,
+                partition: &crate::catalog::PhysicalPartition::from(partition),
                 schema_fingerprint: "00".repeat(32),
-                partition_spec_id: crate::catalog::layout::BIFROST_PARTITION_SPEC_ID,
                 sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
+                table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
             },
             crate::scribe::promotion::ScribeDataFileV1 {
                 record_count: 1,
@@ -1449,7 +1454,8 @@ pub(crate) mod tests {
             max_event_time: now,
             partition: crate::catalog::TimeGranularity::Hour
                 .bucket(now)
-                .expect("fixture instant buckets"),
+                .expect("fixture instant buckets")
+                .into(),
             node_id,
             writer_epoch: 11,
             wal_lsn_min: 1,

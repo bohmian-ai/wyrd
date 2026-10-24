@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use wyrd_config::{WyrdConfig, apply_defaults as apply_config_defaults};
-use wyrd_spec::ids::SpaceName;
 
 use super::error::{Diagnostic, LoadError};
 use super::parse::AuthoredCard;
@@ -14,7 +13,7 @@ use super::parse::AuthoredCard;
 /// a file, not a directory), stopping at the first `wyrd.toml` found or at the
 /// nearest `.git` ancestor or `$HOME`, whichever comes first.
 ///
-/// Returns empty config (space = "default", empty maps) when no config is found;
+/// Returns empty config (empty maps) when no config is found;
 /// this is not an error.
 ///
 /// # Errors
@@ -39,24 +38,12 @@ pub fn discover(entry_path: &Path) -> Result<WyrdConfig, LoadError> {
 /// Merges config values using authority precedence:
 /// 1. Value explicit in the card YAML (highest)
 /// 2. `[kind.<Kind>]` table value
-/// 3. `[defaults]` table value
-/// 4. System fallback (lowest)
+/// 3. `[defaults]` table value (lowest)
 ///
 /// Runs before resolve/validate/order.
-///
-/// # Panics
-///
-/// Panics only if the hard-coded system fallback space violates the `SpaceName`
-/// invariant.
 pub fn apply_defaults(cards: &mut [AuthoredCard], config: &WyrdConfig) {
     for card in cards {
         apply_config_defaults(&mut card.metadata, &card.kind, config);
-        if card.metadata.space.is_none() {
-            card.metadata.space = Some(
-                SpaceName::new("default")
-                    .expect("invariant: system fallback space is a valid SpaceName"),
-            );
-        }
     }
 }
 
@@ -67,6 +54,12 @@ mod tests {
     use tempfile::TempDir;
     use wyrd_spec::envelope::CardKind;
 
+    /// With no `wyrd.toml` above the entry file, discovery yields empty map
+    /// defaults.
+    ///
+    /// # Panics
+    /// Panics when the temporary entry file cannot be written, discovery
+    /// fails, or a default is present.
     #[test]
     fn config_absent_uses_system_defaults() {
         let temp = TempDir::new().unwrap();
@@ -74,11 +67,16 @@ mod tests {
         std::fs::write(&entry_file, "").unwrap();
 
         let config = discover(&entry_file).unwrap();
-        assert!(config.defaults.space.is_none());
         assert!(config.defaults.labels.is_empty());
         assert!(config.defaults.annotations.is_empty());
     }
 
+    /// Discovery loads both workspace and kind label maps; their precedence is
+    /// applied later by `apply_defaults`.
+    ///
+    /// # Panics
+    /// Panics when the temporary files cannot be written, discovery fails, or
+    /// either map is missing.
     #[test]
     fn config_precedence_is_handled_by_apply_defaults() {
         // This is tested in wyrd-config's own tests; loader just calls through
@@ -89,11 +87,11 @@ mod tests {
         writeln!(
             file,
             r#"
-[defaults]
-space = "prod"
+[defaults.labels]
+team = "platform"
 
-[kind.Model]
-space = "ml-prod"
+[kind.Model.labels]
+team = "ml"
 "#
         )
         .unwrap();
@@ -103,7 +101,7 @@ space = "ml-prod"
         std::fs::write(&entry_file, "").unwrap();
 
         let config = discover(&entry_file).unwrap();
-        assert!(config.defaults.space.is_some());
+        assert!(!config.defaults.labels.is_empty());
         assert!(config.kind_overrides.contains_key(&CardKind::Model));
     }
 

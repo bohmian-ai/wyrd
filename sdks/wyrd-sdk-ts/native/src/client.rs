@@ -13,6 +13,7 @@ use wyrd_client::bifrost::BifrostOptions;
 use wyrd_client::bifrost::{Bifrost, TableConfig};
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 
 use crate::{NativeBifrostConnection, NativeTableConfig, NativeTableConfigResult, NativeWyrdError};
 
@@ -62,24 +63,51 @@ pub struct NativeAccessTokenResult {
 /// Omitted arguments resolve through `client_from_options`: the environment,
 /// then the saved `wyrd auth login` for this server (the one for
 /// `WYRD_TENANT` when set, otherwise the newest), then
-/// `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
-/// metadata, including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server
-/// has saved logins but none for `WYRD_TENANT`.
+/// `~/.config/wyrd/credentials.toml`. A `workload_uid` runs the client as
+/// that exact root, as [`NativeWyrdClient::for_workload`] does; omitted,
+/// `WYRD_WORKLOAD_UID` is read. Failures are returned as catalog metadata,
+/// including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server has saved
+/// logins but none for `WYRD_TENANT` and `WYRD_SPEC_400_VALIDATION` for a
+/// `workload_uid` that is not a UUIDv7.
 #[napi]
 pub fn connect_wyrd_client(
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
+    workload_uid: Option<String>,
 ) -> NativeWyrdClientResult {
-    let client = wyrd_client::bifrost::client_from_options(
-        server_url.as_deref(),
-        credential.as_deref(),
-        grpc_url.as_deref(),
-    );
+    let client = workload_uid
+        .as_deref()
+        .map(parse_workload_uid)
+        .transpose()
+        .and_then(|workload_uid| {
+            let client = wyrd_client::bifrost::client_from_options(
+                server_url.as_deref(),
+                credential.as_deref(),
+                grpc_url.as_deref(),
+            )
+            .map_err(|error| WyrdError::from(&error))?;
+            Ok(match workload_uid {
+                Some(uid) => client.for_workload(uid),
+                None => client,
+            })
+        });
     drop(server_url);
     drop(credential);
     drop(grpc_url);
-    NativeWyrdClientResult::from_outcome(client.map_err(|error| WyrdError::from(&error)))
+    NativeWyrdClientResult::from_outcome(client)
+}
+
+/// Parse a caller's workload root.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` naming `workload_uid` when `uid` is not a
+/// UUIDv7.
+fn parse_workload_uid(uid: &str) -> Result<CardUid, WyrdError> {
+    CardUid::new(uid).map_err(|error| WyrdError::Validation {
+        message: format!("workload_uid is invalid: {error}"),
+        details: serde_json::json!({ "field": "workload_uid" }),
+    })
 }
 
 #[napi]
@@ -157,6 +185,36 @@ impl NativeWyrdClient {
                     .await,
             ))
         })
+    }
+
+    /// Returns the exact Service Card UID this client runs as, or
+    /// `null` for rootless work.
+    #[napi(getter)]
+    pub fn workload_uid(&self) -> Option<String> {
+        self.client
+            .workload_uid()
+            .map(|uid| uid.as_str().to_owned())
+    }
+
+    /// Returns the deployment environment correlation tag this client's
+    /// requests carry, or `null` when none is configured.
+    #[napi(getter)]
+    pub fn deployment_environment(&self) -> Option<String> {
+        self.client
+            .auth()
+            .deployment_environment()
+            .map(str::to_owned)
+    }
+
+    /// Returns a client that runs as the exact Service root
+    /// `workload_uid`, sharing this client's credential and connection pools
+    /// but not its token cache. Performs no IO; a `workload_uid` that is not a
+    /// UUIDv7 is a `WYRD_SPEC_400_VALIDATION` result.
+    #[napi]
+    pub fn for_workload(&self, workload_uid: String) -> NativeWyrdClientResult {
+        NativeWyrdClientResult::from_outcome(
+            parse_workload_uid(&workload_uid).map(|uid| self.client.for_workload(uid)),
+        )
     }
 
     /// Connects one Bifrost client over this client's authentication and

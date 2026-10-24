@@ -24,6 +24,8 @@ from wyrd.gateway import Gateway
 from wyrd.operators import OperatorConnections
 from wyrd.testing import WyrdTestServer
 
+from .support import rooted
+
 pytestmark = pytest.mark.integration
 
 ACCESS_TTL_SECONDS = 35
@@ -40,7 +42,7 @@ DENIED = "WYRD_PERMISSION_403_DENIED_RBAC"
 
 HANDLES: list[tuple[Any, Callable[[Any], object]]] = [
     (Bifrost, lambda bifrost: bifrost.list_tables()),
-    (Cards, lambda cards: cards.prompt.list(space="default")),
+    (Cards, lambda cards: cards.prompt.list()),
     (Gateway, lambda gateway: gateway.deployments()),
     (OperatorConnections, lambda connections: connections.list()),
     (Principals, lambda principals: principals.list()),
@@ -142,10 +144,10 @@ def test_local_state_survives_the_first_connection(
     assert "vala.datasets.lazy_bound" in [
         f"{entry['namespace']}.{entry['name']}" for entry in bifrost.list_tables()
     ]
-    prompts.list(space="default")
+    prompts.list()
     monkeypatch.setenv("WYRD_SERVER_URL", UNREACHABLE)
     monkeypatch.delenv("WYRD_API_KEY")
-    cards.prompt.list(space="default")
+    cards.prompt.list()
 
 
 def test_connect_and_lazy_first_call_share_the_no_credentials_error(
@@ -171,7 +173,7 @@ def test_credential_paths_preserve_exchange_and_bearer_behavior(server: WyrdTest
             handle.connect(client=forged)
         with pytest.raises(WyrdError) as lazy:
             call(handle(client=forged))
-        assert eager.value.code == lazy.value.code == "WYRD_SPEC_400_VALIDATION"
+        assert eager.value.code == lazy.value.code == "WYRD_AUTH_401_API_KEY_INVALID"
         with pytest.raises(WyrdError) as refused:
             call(handle.connect(client=bearer))
         assert refused.value.status == 401
@@ -181,10 +183,9 @@ def test_delegated_connect_uses_the_subject_principal(server: WyrdTestServer) ->
     subject = WyrdClient(
         credential=server.scoped_api_key("instantiation_subject", ["bifrost_query:read"])
     )
-    actor = WyrdClient(
-        credential=server.scoped_api_key(
-            "instantiation_actor", ["bifrost_query:read", "bifrost_table:read"]
-        )
+    actor = rooted(
+        server.scoped_api_key("instantiation_actor", ["bifrost_query:read", "bifrost_table:read"]),
+        "instantiation_actor",
     )
     delegated = actor.on_behalf_of(subject.access_token())
     principals = Principals.connect()

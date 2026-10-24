@@ -12,6 +12,7 @@ use uuid::{Uuid, Version};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
+use wyrd_spec::vala::ids::TableVersion;
 use wyrd_tonic::tonic::{Code, Request, Status, metadata::MetadataValue};
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceClient;
 use wyrd_tonic::wyrd::v1::{InsertBatchRequest, ProducerTraceContext};
@@ -211,6 +212,7 @@ impl BifrostGrpcTransport {
     async fn send_owned_bytes(
         &self,
         table: &str,
+        table_version: TableVersion,
         batch_id: [u8; 16],
         request_id: Option<&RequestId>,
         arrow_ipc: Bytes,
@@ -232,6 +234,7 @@ impl BifrostGrpcTransport {
                 arrow_ipc: arrow_ipc.clone(),
                 wyrd_batch_id: Bytes::copy_from_slice(&batch_id),
                 producer_trace_contexts: producer_trace_contexts.to_vec(),
+                table_version: table_version.get(),
             };
             match self.send_once(request, request_id).await {
                 Ok(()) => return Ok(()),
@@ -253,8 +256,9 @@ impl BifrostGrpcTransport {
         }
     }
 
-    /// Attaches the bearer token, `wyrd-request-id`, and the caller's W3C
-    /// trace context to one attempt.
+    /// Attaches the bearer token, the middleware's workload root when it has
+    /// one, `wyrd-request-id`, and the caller's W3C trace context to one
+    /// attempt.
     ///
     /// A supplied `request_id` is forwarded unchanged through the shared
     /// [`crate::auth::AuthMiddleware::request_id`]; otherwise one is minted.
@@ -285,6 +289,27 @@ impl BifrostGrpcTransport {
         request
             .metadata_mut()
             .insert("x-wyrd-access-token", access_token);
+        if let Some(uid) = self.connection.auth().workload_uid() {
+            let uid = MetadataValue::try_from(uid.as_str()).map_err(|_| WyrdError::Internal {
+                message: "bifrost workload UID cannot be represented as gRPC metadata".to_owned(),
+                details: serde_json::json!({}),
+            })?;
+            request
+                .metadata_mut()
+                .insert(wyrd_spec::auth::WORKLOAD_UID_HEADER, uid);
+        }
+        if let Some(environment) = self.connection.auth().deployment_environment() {
+            let environment =
+                MetadataValue::try_from(environment).map_err(|_| WyrdError::Internal {
+                    message:
+                        "bifrost deployment environment cannot be represented as gRPC metadata"
+                            .to_owned(),
+                    details: serde_json::json!({}),
+                })?;
+            request
+                .metadata_mut()
+                .insert(wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER, environment);
+        }
 
         let request_id = self
             .connection
@@ -345,6 +370,7 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
             .collect();
         let send = self.send_owned_bytes(
             &batch.table,
+            batch.table_version,
             batch.batch_id,
             batch.request_id.as_ref(),
             bytes,
@@ -631,6 +657,7 @@ mod tests {
             .expect("test frame fits the budget");
         SealedBatch {
             table: "events".to_owned(),
+            table_version: TableVersion::INITIAL,
             batch_id: Uuid::now_v7().into_bytes(),
             frame: OwnedIpcBytes::new(bytes, guard),
             rows: 1,
@@ -879,10 +906,14 @@ mod tests {
         });
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
             .expect("test batch builds");
         bifrost
-            .enqueue_batch("events", batch, None)
+            .enqueue_batch(
+                &crate::bifrost::table::WriterTable::new("events", schema, TableVersion::INITIAL),
+                batch,
+                None,
+            )
             .expect("batch admitted");
         match bifrost.flush().await {
             Ok(())

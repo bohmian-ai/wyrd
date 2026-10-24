@@ -61,9 +61,10 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_400_INVALID_NONCE` | 400 | Invalid OIDC nonce | Restart the login flow. The ID token nonce must match the server-stored login nonce. |
 | `WYRD_AUTH_400_INVALID_STATE` | 400 | Invalid OIDC state | Restart the login flow. The callback state is single-use and must match the server-stored login state. |
 | `WYRD_AUTH_400_PRINCIPAL_KIND_CARD_KIND_MISMATCH` | 400 | CardRef cannot be bound to a non-human principal | Only Service and Agent cards bind to non-human principals. Re-issue the request with a `card_ref` referencing a Service or Agent card. |
+| `WYRD_AUTH_400_SIGNED_WORKLOAD_MISMATCH` | 400 | Workload context differs from the signed root | The bearer token already pins a workload root, which a request header cannot change. Send the same `x-wyrd-workload-uid` or none, or obtain a separate token for the other release. |
 | `WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH` | 400 | Unsupported OIDC client authentication | Use `SecretBasic` or `SecretPost` with a client secret, or `Public` without one. `private_key_jwt` is not supported for tenant connections. |
 | `WYRD_AUTH_400_UNSUPPORTED_GRANT_TYPE` | 400 | Unsupported grant_type | Use one of the supported grants listed in `details.supported_grant_types`. |
-| `WYRD_AUTH_401_API_KEY_INVALID` | 401 | API key not found, revoked, or hash mismatch | Re-issue a key with `wyrd auth issue-key &lt;card_ref&gt;` and update the deployment secret. |
+| `WYRD_AUTH_401_API_KEY_INVALID` | 401 | API key not found, revoked, or hash mismatch | Issue a new credential with `wyrd principal credential issue --principal &lt;id&gt;` and update the deployment secret. |
 | `WYRD_AUTH_401_CREDENTIAL_REVOKED` | 401 | Credential revoked | The credential was explicitly revoked. Re-authenticate or request a new credential. |
 | `WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED` | 401 | Delegation chain in token exceeds maximum depth | The presented JWT's `act` chain exceeds the verifier's maximum delegation depth. Re-issue from a shorter chain. |
 | `WYRD_AUTH_401_INVALID_CARD_REF` | 401 | Non-User token card_ref claim absent or malformed | Re-issue the token via `POST /auth/token`; ensure the bound non-human principal has a valid structured card_ref. |
@@ -72,15 +73,18 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_AUTH_401_REFRESH_REVOKED` | 401 | Refresh token revoked | Re-authenticate to obtain a new refresh token. |
 | `WYRD_AUTH_401_TOKEN_EXPIRED` | 401 | Token expired | Re-authenticate to obtain a fresh token. |
 | `WYRD_AUTH_401_UNAUTHENTICATED` | 401 | Not authenticated | Present a valid Wyrd token as `X-Wyrd-Access-Token: Bearer &lt;token&gt;`. |
+| `WYRD_AUTH_401_WORKLOAD_UID_REFUSED` | 401 | Workload root refused | `workload_uid` is optional. When supplied it must name an active, registered Service Card version in this tenant that the account's workload restriction allows; unknown and foreign roots are refused identically. Omit it to authenticate the account without workload context, or register the release and pass its exact Card UID. |
 | `WYRD_AUTH_403_ORIGIN_REFUSED` | 403 | Request origin refused | Send browser-session requests from the Wyrd application's own origin; cross-site and origin-less browser-session mutations are refused. |
 | `WYRD_AUTH_403_PRINCIPAL_ORPHANED` | 403 | The backing Service or Agent card has been soft-deleted | Re-declare the card or use a different principal to obtain a token. |
 | `WYRD_AUTH_403_UNREPRESENTABLE_DELEGATION` | 403 | Delegated permissions cannot be represented | The subject's and actor's shared permissions cannot be represented by token scopes, so the exchange issued no token. Exchange with grants whose exact shared authority fits the supported scopes, such as both parties holding the same explicit gateway deployment or model grant. |
+| `WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED` | 403 | Workload context required | This account is restricted to one workload family, so Card-attributed emission and verification need the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root. |
 | `WYRD_AUTH_404_ADMIN_NOT_FOUND` | 404 | Admin resource not found in tenant | Confirm the issuer URL (and subject for bindings) and that the resource exists in the current tenant. |
 | `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` | 404 | Requested principal not found in tenant | The principal named by the `subject_token` or `actor_token` no longer exists in the current tenant. Re-authenticate both parties and retry the exchange. |
 | `WYRD_AUTH_409_ADMIN_CONFLICT` | 409 | Admin resource already exists or is still referenced | A trusted issuer or workload binding with this key already exists, or the issuer still has live bindings. Use a distinct key, or delete the bindings first (or with --cascade). |
 | `WYRD_AUTH_409_CONNECTION_CONFLICT` | 409 | Tenant OIDC connection conflict | Re-read GET /v1/identity/oidc/connections and retry with the current `expected_revision`. Activation also requires a valid recovery API key for a headless principal of this tenant that holds `identity_connections:write`. |
 | `WYRD_AUTH_409_CONNECTION_NOT_TESTED` | 409 | Tenant OIDC candidate is not freshly tested | Run POST /v1/identity/oidc/candidate/test against this exact candidate revision, complete the provider sign-in at the returned authorization_url, and activate within 15 minutes of that successful test. |
-| `WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE` | 413 | Card scope too large | Reduce or split the principal's declared card-ref graph so its transitive observation-target scope fits the token size limit, or issue a narrower card-bound principal. |
+| `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` | 409 | Workload family already has a runtime account | Each Service family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`. |
+| `WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE` | 413 | Card scope too large | Reduce or split the selected root's declared Card graph so its transitive observation-target scope fits the token size limit, or select a root with a smaller graph. |
 | `WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` | 503 | OIDC discovery unavailable | Retry with backoff. Do not re-authenticate; this is an infrastructure or issuer-discovery failure. |
 | `WYRD_AUTH_503_VERIFY_UNAVAILABLE` | 503 | Auth verify backend unavailable | Retry with backoff. Do not re-authenticate; this is an infrastructure failure, not a credential failure. |
 
@@ -111,7 +115,7 @@ This page is generated from the error definitions in the Wyrd source.
 | --- | ---: | --- | --- |
 | `WYRD_CLI_400_CARD_LOAD` | 400 | Card load failed | Fix the card files and local references, then retry. |
 | `WYRD_CLI_400_CLIENT_CONFIG` | 400 | Client configuration failed | Pass a valid server URL and configure a Wyrd credential. |
-| `WYRD_CLI_400_DELETE_SELECTOR_EXACT` | 400 | Delete selector is not exact | Pass --uid, or pass --kind, --space, --name, and --version. |
+| `WYRD_CLI_400_DELETE_SELECTOR_EXACT` | 400 | Delete selector is not exact | Pass --uid, or pass --kind, --name, and --version. |
 | `WYRD_CLI_400_INVALID_ARGUMENT` | 400 | Invalid CLI argument | Fix the argument and retry. |
 | `WYRD_CLI_400_MCP_HOST_SELECTION` | 400 | MCP host selection required | Pass --host for each host to connect (codex, claude-code, copilot-cli, vscode, cursor, pi, hermes); install and open the host first if none is detected. |
 | `WYRD_CLI_400_QUERY_CONFIG` | 400 | Query configuration missing | Pass --server or set WYRD_SERVER_URL; the credential comes from the ambient chain. |
@@ -266,7 +270,7 @@ This page is generated from the error definitions in the Wyrd source.
 
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
-| `WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE` | 400 | `card_ref.uid` was populated for a registry lookup that resolves by (space, name, version) | Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`. |
+| `WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE` | 400 | `card_ref.uid` was populated for a registry lookup that resolves by (kind, name, version) | Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`. |
 | `WYRD_REGISTRY_400_CURSOR_MISMATCH` | 400 | Cursor does not match filters | Discard the cursor and restart pagination with the current filters. |
 | `WYRD_REGISTRY_400_DEPENDENCY_CYCLE` | 400 | Card dependency cycle | Remove the cyclic CardRef dependency and submit an acyclic card graph. |
 | `WYRD_REGISTRY_400_HEAVY_ARTIFACT_NOT_SOLE_SUBMISSION` | 400 | Heavy artifact submission must be standalone | Register the artifact-bearing card alone, then reference it from a later composite request. |
@@ -283,7 +287,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF` | 400 | Unresolved path CardRef | Expand path references in the loader before submitting the card. |
 | `WYRD_REGISTRY_400_UPLOAD_INTERRUPTED` | 400 | Upload interrupted | Retry the upload while the declaration operation remains pending. |
 | `WYRD_REGISTRY_400_VERSION_REQUIRED` | 400 | `metadata.version` is present but empty | Provide a valid semver string (e.g. `"1.0.0"`) or omit `metadata.version` entirely to let the server auto-assign the next version. |
-| `WYRD_REGISTRY_404_CARD_NOT_FOUND` | 404 | No card matches the supplied identity | Check (space, kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant. |
+| `WYRD_REGISTRY_404_CARD_NOT_FOUND` | 404 | No card matches the supplied identity | Check (kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant. |
 | `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT` | 409 | Idempotency key conflict | Use the original request with this key or choose a new key for different content. |
 | `WYRD_REGISTRY_409_SPEC_DRIFT` | 409 | Re-declare with the same identity but a different spec_hash; same-version cards are immutable | Bump `metadata.version` to publish a new spec, or revert your spec to match the declared version. |
 | `WYRD_REGISTRY_410_OPERATION_EXPIRED` | 410 | Declaration operation expired | Start a new declaration with a new idempotency key. |
@@ -313,7 +317,9 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_SDK_404_UNKNOWN_VERIFIER` | 404 | Verifier is not bound to this subject | Name a Verifier bound in `verified_by` to the view's subject Card, or open the view on the Card that binds it. |
 | `WYRD_SDK_409_BIFROST_ALREADY_STARTED` | 409 | WyrdState Bifrost writer is already started | Reuse the state's existing writer, or shut it down and create a new WyrdState to start again. |
 | `WYRD_SDK_409_BIFROST_CLOSED` | 409 | WyrdState Bifrost writer is closed | Create a new WyrdState and start its Bifrost writer; a shut-down state stays closed to writes. |
-| `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | A tracer provider is already installed | Add the Wyrd span exporter to the application's existing provider instead of calling start_telemetry. |
+| `WYRD_SDK_409_STATE_CONFIG_FROZEN` | 409 | WyrdState configuration is already fixed | Call configure once, before startup and before opening a Run, or construct another WyrdState for a different configuration. |
+| `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` | 409 | A tracer provider is already installed | Add each state's Wyrd span exporter to the application's own provider instead of calling start_telemetry. |
+| `WYRD_SDK_422_VERIFICATION_DATA_INVALID` | 422 | Verification data does not match the requested type | Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type. |
 | `WYRD_SDK_503_TELEMETRY_FLUSH_FAILED` | 503 | Telemetry flush failed | Check the OpenTelemetry exporter's logs and the state's credentials, then retry flush or shutdown. |
 | `WYRD_SDK_504_TELEMETRY_FLUSH_TIMEOUT` | 504 | Telemetry flush timed out | Check that the Wyrd server's OTLP endpoint is reachable, raise the OpenTelemetry SDK export timeout if spans are large, and retry flush or shutdown. |
 | `WYRD_SDK_504_VERIFICATION_WAIT_TIMEOUT` | 504 | Verification execution did not settle in time | Wait again with the same execution ID, or read its status; a submission lost before queue acceptance never settles and must be submitted again. |
@@ -344,7 +350,7 @@ This page is generated from the error definitions in the Wyrd source.
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
 | `WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR` | 400 | Duplicate binding Operator | Remove the duplicate on_failure Operator from this binding. |
-| `WYRD_SPEC_400_DUPLICATE_SUBMISSION` | 400 | Duplicate card submission | Submit each (kind, space, name, version) identity at most once per request. |
+| `WYRD_SPEC_400_DUPLICATE_SUBMISSION` | 400 | Duplicate card submission | Submit each (kind, name, version) identity at most once per request. |
 | `WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING` | 400 | Duplicate verification binding | Remove the duplicate verified_by entry; one subject occurrence binds each Verifier version once. |
 | `WYRD_SPEC_400_INVALID_BINDING_REF_KIND` | 400 | Invalid verification binding reference kind | Set runs_on to a Trigger CardRef or inline TriggerSpec, and each on_failure entry to an Operator CardRef or inline OperatorSpec. |
 | `WYRD_SPEC_400_INVALID_OPERATOR` | 400 | Invalid Operator | Reference only failure-context fields in `{{field}}` templates, keep the URL origin literal https, and do not author server-owned headers. |
@@ -431,7 +437,7 @@ This page is generated from the error definitions in the Wyrd source.
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
 | `WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET` | 400 | Invalid Bifrost compaction target | Omit compaction_target_file_size_bytes to follow the deployment default, or supply at least 134217728 bytes. |
-| `WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT` | 400 | Invalid Bifrost physical layout | Declare hour or day granularity, an optional non-null timestamp time column, at most four unique schema columns as sort keys, and supported sort/null values. |
+| `WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT` | 400 | Invalid Bifrost physical layout | Declare a non-null UTC timestamp time column partitioned by hour or day plus at most two identity, bucket (2 to 1024), or truncate dimensions over string or integer columns, at most four unique scalar sort keys, and at most sixteen string, integer, or binary Bloom columns. |
 | `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` | 400 | Reserved system column name | Rename the column; run_id, card_uid, principal_id, wyrd_request_id, and wyrd_ingested_at are reserved. |
 | `WYRD_VALA_400_BIFROST_TENANT_ISOLATION_COLUMN_MISSING` | 400 | Tenant isolation column missing | Add the server-managed data_tenant_id Utf8 column to the physical table schema. |
 | `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD` | 400 | Undeclared Bifrost field | Remove the key or declare it on the table; store open data in a Variant field. |
@@ -463,10 +469,11 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_409_BIFROST_DUPLICATE_FAILED_BATCH` | 409 | Duplicate batch previously failed | This batch_id was committed but the write failed. Use a new batch_id to retry. |
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | 409 | Schema fingerprint mismatch | The Arrow schema does not match the registered table schema. Evolve the schema explicitly. |
 | `WYRD_VALA_409_BIFROST_LAYOUT_MISMATCH` | 409 | Bifrost physical layout mismatch | Retry with the table's registered physical layout or register a different table. |
+| `WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT` | 409 | Stale table version | The table's definition changed. Describe the table again and build a new batch from the returned table_version. |
 | `WYRD_VALA_409_RUNNING_QUERY_CONFLICT` | 409 | Running query ownership conflict | Do not retry cancellation automatically; investigate the contradictory Oracle owners. |
 | `WYRD_VALA_409_STREAM_MISMATCH` | 409 | Live-tail stream identity mismatch | Refresh the Scribe stream identity from the cluster catalog and retry the tail-fetch against the current writer stream. |
 | `WYRD_VALA_410_PAGE_SNAPSHOT_EXPIRED` | 410 | Page snapshot expired | restart the query from page 1 |
-| `WYRD_VALA_412_NO_ACTIVE_TABLE` | 412 | No active Bifrost table | Bind a table with use_table or use_table_by_name before inserting rows. |
+| `WYRD_VALA_412_NO_ACTIVE_TABLE` | 412 | No active Bifrost table | Bind a registered table with register or use_table_by_name before inserting rows. |
 | `WYRD_VALA_413_PAYLOAD_TOO_LARGE` | 413 | Ingest payload too large | Reduce the request below the enforced limit reported in this problem and retry. |
 | `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` | 413 | Query result too large | Add a LIMIT or narrower filters for large result sets. |
 | `WYRD_VALA_413_VARIANT_TOO_LARGE` | 413 | Variant value too large | Keep each Variant value at most 8388608 encoded bytes (metadata plus value); split large payloads across rows. |

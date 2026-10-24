@@ -217,18 +217,22 @@ impl WyrdTestServer {
             br#"{"id": 1, "value": "first"}"#.to_vec(),
             br#"{"id": 2, "value": "second"}"#.to_vec(),
         ] {
-            writer.enqueue(&table_fqn, &schema, row, Some(&shared))?;
+            writer
+                .enqueue(&table_fqn, &schema, row, Some(&shared))
+                .await?;
         }
         writer.flush().await?;
         if !fused {
             self.flush_bifrost().await.map_err(WyrdError::from)?;
         }
-        writer.enqueue(
-            &table_fqn,
-            &schema,
-            br#"{"id": 3, "value": "live"}"#.to_vec(),
-            Some(&other),
-        )?;
+        writer
+            .enqueue(
+                &table_fqn,
+                &schema,
+                br#"{"id": 3, "value": "live"}"#.to_vec(),
+                Some(&other),
+            )
+            .await?;
         writer.flush().await?;
         let token = self
             .exchange_api_key(api_key)

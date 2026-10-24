@@ -5,34 +5,30 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::Error as SqlxError;
-use sqlx::types::{Json, Uuid};
-use wyrd_spec::auth::Attribution;
-use wyrd_spec::reference::CardRef;
+use sqlx::types::Uuid;
+use wyrd_spec::auth::{Attribution, WorkloadFamily, WorkloadKind};
+use wyrd_spec::ids::CardName;
 
 use crate::TenantConn;
 
-/// Resolve an active Card-bound principal from the Card identity a client can
-/// express.
-///
-/// Containment, not equality: registering a Card-bound principal stores a
-/// `uid`-bearing `card_ref` — the projection at `queries::cards::auth_projection`
-/// writes `space: Some(..)` and `uid: Some(..)` — while a caller can only name
-/// `space/Kind/name@version`, so `card_ref = $2` matched no registered principal
-/// at all.
-///
-/// Containment relaxes *every* optional `CardRef` field, `space` included: a ref
-/// with no space matches a row in any space, and Card-bound principals are not
-/// name-unique (two exact Card versions, or one name in two spaces, are distinct
-/// principals). The predicate can therefore match several rows, so it fetches at
-/// most two and [`service_account_by_card_ref`] accepts only a single match; an
-/// ambiguous reference resolves no principal rather than an arbitrary one.
-const SERVICE_ACCOUNT_BY_CARD_REF_SQL: &str = r"
-        SELECT id, principal_kind, card_ref, status
+/// The one active account restricted to a family: the family's scheduled
+/// runtime account.
+const FAMILY_ACCOUNT_SQL: &str = r"
+        SELECT id
           FROM wyrd.auth_service_accounts
-         WHERE principal_kind = $1
-           AND card_ref @> $2
+         WHERE restriction_kind = $1
+           AND restriction_name = $2
            AND status = 'active'
-         LIMIT 2
+        ";
+
+/// Replace one Service account's restriction; the partial unique index
+/// refuses a second account for the same family.
+const SET_RESTRICTION_SQL: &str = r"
+        UPDATE wyrd.auth_service_accounts
+           SET restriction_kind = $2, restriction_name = $3, updated_at = now()
+         WHERE id = $1
+           AND principal_kind = 'service'
+           AND status <> 'deleted'
         ";
 
 const INSERT_REFRESH_TOKEN_SQL: &str = r"
@@ -44,19 +40,33 @@ const INSERT_REFRESH_TOKEN_SQL: &str = r"
 /// Active tenant-scope machine principal row.
 ///
 /// Covers every kind `wyrd.auth_service_accounts` holds: a tenant
-/// administrator, a Card-free automation identity, and a Card-bound Service or
-/// Agent workload.
+/// administrator, a stable Service account, and the internal SYSTEM writer.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ServiceAccountPrincipalRow {
     /// Principal id.
     pub id: Uuid,
-    /// Principal kind label: `tenant_admin`, `service`, `agent`, or the
-    /// internal `system` writer.
+    /// Principal kind label: `tenant_admin`, `service`, or the internal
+    /// `system` writer.
     pub principal_kind: String,
-    /// Structured card reference, absent for a principal that binds no Card.
-    pub card_ref: Option<Json<CardRef>>,
+    /// Restricting family kind, for a family-restricted Service account.
+    pub restriction_kind: Option<String>,
+    /// Restricting family name, for a family-restricted Service account.
+    pub restriction_name: Option<String>,
     /// Status.
     pub status: String,
+}
+
+impl ServiceAccountPrincipalRow {
+    /// The account's restricting family, when it has one.
+    ///
+    /// # Errors
+    /// Returns [`sqlx::Error::Decode`] when the stored pair is malformed.
+    pub fn workload_family(&self) -> Result<Option<WorkloadFamily>, sqlx::Error> {
+        workload_family(
+            self.restriction_kind.as_deref(),
+            self.restriction_name.as_deref(),
+        )
+    }
 }
 
 /// API-key lookup row joined to its principal.
@@ -68,12 +78,52 @@ pub struct ApiKeyLookupRow {
     pub key_hash: String,
     /// Service account id.
     pub principal_id: Uuid,
-    /// Principal kind, `service` or `agent`.
+    /// Principal kind label.
     pub principal_kind: String,
-    /// Structured card reference, absent for principals that bind no Card.
-    pub card_ref: Option<Json<CardRef>>,
+    /// Restricting family kind, for a family-restricted Service account.
+    pub restriction_kind: Option<String>,
+    /// Restricting family name, for a family-restricted Service account.
+    pub restriction_name: Option<String>,
     /// Principal status.
     pub status: String,
+}
+
+impl ApiKeyLookupRow {
+    /// The owning account's restricting family, when it has one.
+    ///
+    /// # Errors
+    /// Returns [`sqlx::Error::Decode`] when the stored pair is malformed.
+    pub fn workload_family(&self) -> Result<Option<WorkloadFamily>, sqlx::Error> {
+        workload_family(
+            self.restriction_kind.as_deref(),
+            self.restriction_name.as_deref(),
+        )
+    }
+}
+
+/// Decode a stored `(restriction_kind, restriction_name)` pair.
+///
+/// # Errors
+/// Returns [`sqlx::Error::Decode`] when exactly one half is present, the kind
+/// is not `Service`, or the name is not a Card name; the table's
+/// check constraints rule all of these out.
+pub fn workload_family(
+    kind: Option<&str>,
+    name: Option<&str>,
+) -> Result<Option<WorkloadFamily>, sqlx::Error> {
+    let decode = |message: String| sqlx::Error::Decode(message.into());
+    match (kind, name) {
+        (None, None) => Ok(None),
+        (Some(kind), Some(name)) => {
+            let kind = match kind {
+                "Service" => WorkloadKind::Service,
+                other => return Err(decode(format!("unknown restriction kind {other:?}"))),
+            };
+            let name = CardName::new(name).map_err(|error| decode(error.to_string()))?;
+            Ok(Some(WorkloadFamily { kind, name }))
+        }
+        _ => Err(decode("half-stored workload restriction".to_owned())),
+    }
 }
 
 /// API-key status derived from row presence and lifecycle timestamps.
@@ -90,69 +140,84 @@ pub enum ApiKeyStatus {
     Missing,
 }
 
-/// Insert a Service or Agent principal row.
+/// Insert a tenant-scope machine principal row.
 ///
-/// The database check constraint enforces the allowed `principal_kind` and
-/// `card_kind` combinations. `attribution` is the verified subject and actor
-/// creating the principal.
+/// `family` is the durable workload restriction of a Service account, `None`
+/// for an unrestricted Service account or a tenant administrator. The partial
+/// unique index refuses a second live account for one family (`23505`).
+/// `attribution` is the verified subject and actor creating the principal.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
-///
-/// # Panics
-///
-/// Panics if a stored `CardUid` is not a UUID, which the type invariant rules out.
 pub async fn insert_service_account(
     conn: &mut TenantConn<'_>,
     id: Uuid,
     principal_kind: &str,
-    card_ref: Option<&CardRef>,
+    family: Option<&WorkloadFamily>,
     name: &str,
     description: Option<&str>,
     attribution: Attribution,
 ) -> Result<(), sqlx::Error> {
-    // Card binding is a property of a deployable machine principal, so every
-    // Card-derived column travels with the Card or is absent with it. A tenant
-    // administrator or Card-free automation principal stores none of them.
-    let card_kind = card_ref.map(|card_ref| card_ref.kind.wire_name());
-    let card_uid = card_ref.map(|card_ref| {
-        card_ref.uid.as_ref().map_or_else(Uuid::nil, |uid| {
-            Uuid::parse_str(uid.as_str()).expect("CardUid invariant: stored value is a valid UUID")
-        })
-    });
-    let space = card_ref.map(|card_ref| {
-        card_ref
-            .space
-            .as_ref()
-            .expect("invariant: card-bound principal CardRef has resolved space")
-            .as_str()
-    });
-    let version = card_ref.map(|card_ref| card_ref.version.as_str());
-
     sqlx::query(
         r"
         INSERT INTO wyrd.auth_service_accounts (
-            id, data_tenant_id, principal_kind, card_kind, card_uid,
-            card_ref, space, name, version, description, status,
-            sub_principal_id, act_principal_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11, $12)
+            id, data_tenant_id, principal_kind, restriction_kind, restriction_name,
+            name, description, status, sub_principal_id, act_principal_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9)
         ",
     )
     .bind(id)
     .bind(conn.data_tenant_id().as_uuid())
     .bind(principal_kind)
-    .bind(card_kind)
-    .bind(card_uid)
-    .bind(card_ref.map(Json))
-    .bind(space)
+    .bind(family.map(|family| family.kind.as_str()))
+    .bind(family.map(|family| family.name.as_str()))
     .bind(name)
-    .bind(version)
     .bind(description)
     .bind(attribution.sub_principal_id.as_uuid())
     .bind(attribution.act_principal_id.as_uuid())
     .execute(&mut **conn.transaction())
     .await?;
     Ok(())
+}
+
+/// Replace one live Service account's workload restriction.
+///
+/// `None` makes the account unrestricted. Setting the stored value again is a
+/// no-op success. Returns `Ok(false)` when no live Service account has `id`.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the update, including a unique
+/// violation (`23505`) when another live account already holds `family`.
+pub async fn set_workload_restriction(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+    family: Option<&WorkloadFamily>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(SET_RESTRICTION_SQL)
+        .bind(id)
+        .bind(family.map(|family| family.kind.as_str()))
+        .bind(family.map(|family| family.name.as_str()))
+        .execute(&mut **conn.transaction())
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The active account restricted to `family`, when one exists.
+///
+/// The family's unique scheduled runtime account. Tenant scope comes solely
+/// from the forced RLS policy `conn` activates.
+///
+/// # Errors
+/// Returns the database error when the read fails.
+pub async fn family_account_id(
+    conn: &mut TenantConn<'_>,
+    family: &WorkloadFamily,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(FAMILY_ACCOUNT_SQL)
+        .bind(family.kind.as_str())
+        .bind(family.name.as_str())
+        .fetch_optional(&mut **conn.transaction())
+        .await
 }
 
 /// Soft-delete a service account by marking `status = 'deleted'`.
@@ -179,40 +244,6 @@ pub async fn delete_service_account(
     Ok(result.rows_affected() > 0)
 }
 
-/// Find the one active Service/Agent principal a card ref names.
-///
-/// Binds the caller's ref as JSONB for a `card_ref @> $2` containment
-/// predicate, so a ref carrying no `uid` matches a stored ref that has one and
-/// a ref carrying no space matches a row in any space. A credential, workload
-/// assertion, or delegation must target exactly one principal, so the lookup
-/// returns a row only when the predicate matches exactly one: an explicit-space
-/// or `uid`-bearing ref stays exact, while a partial ref matching principals in
-/// several spaces returns `None` and the caller's not-found refusal applies.
-/// The durable key remains `(card_kind, card_uid)`; this is the lookup for the
-/// identity a client can express, and the GIN index on `card_ref` serves it.
-/// Tenant scope comes solely from the forced RLS policy `conn` activates, so
-/// the query carries no tenant predicate of its own.
-///
-/// # Errors
-/// Returns the database error when the read fails.
-pub async fn service_account_by_card_ref(
-    conn: &mut TenantConn<'_>,
-    principal_kind: &str,
-    card_ref: &CardRef,
-) -> Result<Option<ServiceAccountPrincipalRow>, sqlx::Error> {
-    let mut matches =
-        sqlx::query_as::<_, ServiceAccountPrincipalRow>(SERVICE_ACCOUNT_BY_CARD_REF_SQL)
-            .bind(principal_kind)
-            .bind(Json(card_ref))
-            .fetch_all(&mut **conn.transaction())
-            .await?;
-    Ok(if matches.len() == 1 {
-        matches.pop()
-    } else {
-        None
-    })
-}
-
 /// Find an active public tenant machine principal by id.
 ///
 /// Every public surface that names a principal by id — credential issuance,
@@ -228,7 +259,7 @@ pub async fn service_account_by_id(
 ) -> Result<Option<ServiceAccountPrincipalRow>, sqlx::Error> {
     sqlx::query_as::<_, ServiceAccountPrincipalRow>(
         r"
-        SELECT id, principal_kind, card_ref, status
+        SELECT id, principal_kind, restriction_kind, restriction_name, status
           FROM wyrd.auth_service_accounts
          WHERE data_tenant_id = $1
            AND id = $2
@@ -374,7 +405,8 @@ pub async fn api_key_by_prefix(
                k.key_hash,
                sa.id AS principal_id,
                sa.principal_kind,
-               sa.card_ref,
+               sa.restriction_kind,
+               sa.restriction_name,
                sa.status
           FROM wyrd.auth_api_keys k
           JOIN wyrd.auth_service_accounts sa
@@ -470,71 +502,51 @@ pub async fn insert_refresh_token(
 
 #[cfg(test)]
 mod tests {
-    use sqlx::types::Json;
-    use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::auth::WorkloadKind;
 
-    use super::{ApiKeyStatus, INSERT_REFRESH_TOKEN_SQL, SERVICE_ACCOUNT_BY_CARD_REF_SQL};
+    use super::{
+        ApiKeyStatus, FAMILY_ACCOUNT_SQL, INSERT_REFRESH_TOKEN_SQL, SET_RESTRICTION_SQL,
+        workload_family,
+    };
 
-    #[test]
-    fn api_key_lookup_filters_all_public_invalid_key_cases() {
-        let sql = r"
-        SELECT k.id AS api_key_id,
-               k.key_hash,
-               sa.id AS principal_id,
-               sa.principal_kind,
-               sa.card_ref,
-               sa.status
-          FROM wyrd.auth_api_keys k
-          JOIN wyrd.auth_service_accounts sa
-            ON sa.data_tenant_id = k.data_tenant_id
-           AND sa.id = k.principal_id
-         WHERE k.data_tenant_id = $1
-           AND k.prefix = $2
-           AND k.revoked_at IS NULL
-           AND (k.expires_at IS NULL OR k.expires_at > statement_timestamp())
-         LIMIT 1
-        ";
-
-        assert!(sql.contains("k.prefix = $2"));
-        assert!(sql.contains("k.revoked_at IS NULL"));
-        assert!(sql.contains("(k.expires_at IS NULL OR k.expires_at > statement_timestamp())"));
-        assert!(sql.contains("sa.id = k.principal_id"));
-        assert!(sql.contains("sa.data_tenant_id = k.data_tenant_id"));
-    }
-
-    /// The shipped predicate matches a Card identity and can detect ambiguity.
-    ///
-    /// Pinned as text because the widening this guards is invisible at the call
-    /// site: `=` would match no registered principal, and restoring an ordered
-    /// `LIMIT 1` would silently pick one of several matching principals instead
-    /// of fetching two so [`service_account_by_card_ref`] fails closed. A manual
-    /// tenant predicate would duplicate the forced RLS authority `TenantConn`
-    /// already applies.
+    /// The stored restriction pair decodes only as a complete, valid family.
     ///
     /// # Panics
-    /// Panics when the fixture ref is invalid or the query text drifts.
+    /// Panics when a malformed pair decodes or a valid one does not.
     #[test]
-    fn service_account_by_card_ref_uses_jsonb_card_ref_binding() {
-        let card_ref = CardRef {
-            kind: CardKind::Agent,
-            name: CardName::new("runtime").expect("static name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
-            uid: None,
-        };
-        let Json(bound) = Json(card_ref.clone());
+    fn stored_restriction_decodes_only_complete_families() {
+        assert!(workload_family(None, None).expect("unrestricted").is_none());
+        let family = workload_family(Some("Service"), Some("planner"))
+            .expect("valid pair")
+            .expect("restricted");
+        assert_eq!(family.kind, WorkloadKind::Service);
+        assert_eq!(family.name.as_str(), "planner");
+        for (kind, name) in [
+            (Some("Model"), Some("m")),
+            (Some("Agent"), Some("planner")),
+            (Some("Service"), None),
+            (None, Some("checkout")),
+            (Some("Service"), Some("Not A Name")),
+        ] {
+            assert!(workload_family(kind, name).is_err(), "{kind:?}/{name:?}");
+        }
+    }
 
-        assert_eq!(bound, card_ref);
-        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("principal_kind = $1"));
-        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("card_ref @> $2"));
-        assert!(!SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("data_tenant_id"));
-        assert!(!SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("$3"));
-        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("LIMIT 2"));
-        assert!(!SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("ORDER BY"));
-        assert!(!SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("card_ref::text"));
+    /// Family lookups and replacement rely on forced RLS, never a manual
+    /// tenant predicate, and replacement never revives a deleted account.
+    ///
+    /// # Panics
+    /// Panics when either statement names `data_tenant_id`, the family lookup
+    /// drops its `status = 'active'` guard, or the replacement drops its
+    /// `status <> 'deleted'` or `principal_kind = 'service'` guard.
+    #[test]
+    fn restriction_statements_stay_tenant_implicit() {
+        for sql in [FAMILY_ACCOUNT_SQL, SET_RESTRICTION_SQL] {
+            assert!(!sql.contains("data_tenant_id"));
+        }
+        assert!(FAMILY_ACCOUNT_SQL.contains("status = 'active'"));
+        assert!(SET_RESTRICTION_SQL.contains("status <> 'deleted'"));
+        assert!(SET_RESTRICTION_SQL.contains("principal_kind = 'service'"));
     }
 
     #[test]

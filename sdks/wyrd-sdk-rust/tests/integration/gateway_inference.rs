@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::BifrostOptions;
-use wyrd_ai::cards::{CardKind, DeclarationReceipt};
+use wyrd_ai::cards::{CardRef, DeclarationReceipt};
 use wyrd_ai::cli;
 use wyrd_ai::gateway::{
     DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
@@ -22,11 +22,13 @@ use wyrd_ai::gateway::{
 };
 use wyrd_ai::operator_connections::SecretBearer;
 use wyrd_ai::{Gateway, WyrdClient};
+use wyrd_spec::auth::TokenAudience;
+use wyrd_testing::Bootstrap;
 use wyrd_testing::server::WyrdTestServer;
 
 use wyrd_ai::state::WyrdState;
 
-use crate::support::{Deployment, ancestry, declare, declared, pull};
+use crate::support::{Deployment, ancestry, declare, declared, pull, runtime_account};
 
 /// The provider key the operator submits; only the upstream may see it.
 const PROVIDER_KEY: &str = "sk-native-upstream";
@@ -92,6 +94,32 @@ impl Inference {
             upstream,
             ask,
         }
+    }
+
+    /// Every retained `vala.gateway.calls` row's attribution, sorted, after
+    /// publishing captured rows.
+    ///
+    /// # Panics
+    /// Panics when the flush or the read fails.
+    async fn calls(&self) -> Vec<CallAttribution> {
+        self.deployment
+            .server()
+            .flush_bifrost()
+            .await
+            .expect("rows publish");
+        let mut calls: Vec<CallAttribution> =
+            wyrd_ai::Bifrost::connect_with(&self.deployment.admin(), BifrostOptions::default())
+                .await
+                .expect("Bifrost connects")
+                .sql_as(
+                    "SELECT sub_principal_id, act_principal_id, run_id, card_uid \
+                     FROM vala.gateway.calls",
+                    &[],
+                )
+                .await
+                .expect("calls read back");
+        calls.sort();
+        calls
     }
 
     /// The `authorization` header of every request the upstream received.
@@ -467,8 +495,8 @@ struct CallAttribution {
 
 /// Every direct call records its caller as both subject and actor plus whichever of `wyrd-run-id` and
 /// `wyrd-card-uid` it carried: neither, the Card alone, the Run alone, or
-/// both, each absent one as null. The caller holds `ask-agent`'s own
-/// card-scoped key, whose scope admits that Card.
+/// both, each absent one as null. The caller is the owning Service's runtime
+/// account run at that Service, whose scope admits its `ask-agent` component.
 ///
 /// # Panics
 /// Panics when a call, flush, or read fails or a row's attribution differs.
@@ -476,21 +504,21 @@ struct CallAttribution {
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn gateway_call_records_whichever_attribution_it_carries() {
     let inference = Inference::start().await;
-    let agent = declared(&inference.ask, "ask-agent");
-    let issued = cli::issue_key(
-        "Agent",
-        "ask-agent",
-        "1.0.0",
-        "default",
-        None,
-        None,
-        Some(inference.deployment.admin()),
+    let service = declare(
+        &inference.deployment.cards().await,
+        "cards/gateway_inference/ask-service.yaml",
     )
     .await
-    .expect("the CLI issues the agent's key");
-    let id = issued.principal_id;
-    let caller = inference.deployment.client(issued.key.expose());
-    let card = agent.uid.expect("a registered Card has a UID").to_string();
+    .root;
+    let (id, key) = runtime_account(&inference.deployment.admin(), &service).await;
+    let caller = inference
+        .deployment
+        .client(&key)
+        .for_workload(service.uid.expect("a registered Card has a UID"));
+    let card = declared(&inference.ask, "ask-agent")
+        .uid
+        .expect("a registered Card has a UID")
+        .to_string();
 
     for headers in [
         vec![],
@@ -505,25 +533,7 @@ async fn gateway_call_records_whichever_attribution_it_carries() {
         assert_eq!(status, 200, "{headers:?}: {reply}");
     }
 
-    inference
-        .deployment
-        .server()
-        .flush_bifrost()
-        .await
-        .expect("rows publish");
-    let mut calls: Vec<CallAttribution> = wyrd_ai::Bifrost::connect_with(
-        &inference.deployment.admin(),
-        BifrostOptions::default(),
-    )
-    .await
-    .expect("Bifrost connects")
-    .sql_as(
-        "SELECT sub_principal_id, act_principal_id, run_id, card_uid FROM vala.gateway.calls",
-        &[],
-    )
-    .await
-    .expect("calls read back");
-    calls.sort();
+    let calls = inference.calls().await;
     let call = |run_id: Option<&str>, card_uid: Option<&str>| CallAttribution {
         sub_principal_id: id.to_string(),
         act_principal_id: id.to_string(),
@@ -565,46 +575,19 @@ async fn caller_without_gateway_invoke_is_refused() {
     inference.deployment.shutdown().await;
 }
 
-/// The CLI issues a key scoped to the `ask-agent` Card and writes a managed
-/// provider credential whose view never carries the secret.
+/// The CLI writes a managed provider credential whose view never carries the
+/// secret.
 ///
 /// # Panics
-/// Panics when a CLI command fails, the key is not bound to the Agent, or the
-/// view differs or leaks the secret.
+/// Panics when the CLI command fails, or the view differs or leaks the secret.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn cli_issues_a_card_scoped_key_and_writes_a_provider_credential() {
+async fn cli_writes_a_provider_credential() {
     let inference = Inference::start().await;
     let admin = inference.deployment.admin();
 
-    let issued = cli::issue_key(
-        "Agent",
-        "ask-agent",
-        "1.0.0",
-        "default",
-        None,
-        None,
-        Some(admin.clone()),
-    )
-    .await
-    .expect("the CLI issues a key");
     let view = put_managed(admin, "openai", "managed-openai-key", "sk-managed").await;
 
-    assert_eq!(
-        (
-            issued.card_ref.kind,
-            issued.card_ref.name.as_str(),
-            issued.card_ref.version.to_string(),
-            issued.card_ref.space.as_ref().map(ToString::to_string)
-        ),
-        (
-            CardKind::Agent,
-            "ask-agent",
-            "1.0.0".to_owned(),
-            Some("default".to_owned())
-        )
-    );
-    assert!(issued.key.expose().starts_with(&issued.prefix));
     assert_eq!(
         (&view["name"], &view["provider"], &view["state"]),
         (
@@ -638,9 +621,7 @@ async fn run_invokes_its_agent_through_the_gateway() {
             .expect("bundle loads offline")
     };
 
-    let service_client = inference
-        .deployment
-        .client(&inference.deployment.service_key(&service.root).await);
+    let service_client = inference.deployment.service_client(&service.root).await;
     let (status, reply) = inference
         .ask_agent(&state(service_client), "agent", "openai")
         .await;
@@ -716,9 +697,7 @@ async fn agent_routes_and_pre_run_overrides() {
     let cards = inference.deployment.cards().await;
     let service = declare(&cards, "cards/gateway_inference/ask-service.yaml").await;
     let bundle = pull(&cards, &service.root).await;
-    let client = inference
-        .deployment
-        .client(&inference.deployment.service_key(&service.root).await);
+    let client = inference.deployment.service_client(&service.root).await;
     let state = WyrdState::from_path_with(bundle.path().join("bundle"), client)
         .expect("bundle loads offline");
 
@@ -837,9 +816,7 @@ async fn agent_routes_reach_named_native_ingress() {
     let cards = inference.deployment.cards().await;
     let service = declare(&cards, "cards/gateway_inference/routed-service.yaml").await;
     let bundle = pull(&cards, &service.root).await;
-    let client = inference
-        .deployment
-        .client(&inference.deployment.service_key(&service.root).await);
+    let client = inference.deployment.service_client(&service.root).await;
     let state = WyrdState::from_path_with(bundle.path().join("bundle"), client)
         .expect("bundle loads offline");
 
@@ -862,9 +839,7 @@ async fn agent_routes_reach_named_native_ingress() {
     let asks = declare(&cards, "cards/gateway_inference/ask-service.yaml").await;
     let asks = WyrdState::from_path_with(
         pull(&cards, &asks.root).await.path().join("bundle"),
-        inference
-            .deployment
-            .client(&inference.deployment.service_key(&asks.root).await),
+        inference.deployment.service_client(&asks.root).await,
     )
     .expect("bundle loads offline");
     for deployment in ["claude-prod", "vertex"] {
@@ -1216,6 +1191,139 @@ async fn native_ingress_preserves_named_deployments() {
             ),
             ("/v1/systemone".to_owned(), json!("jev-latest")),
         ]
+    );
+    inference.deployment.shutdown().await;
+}
+
+/// A Gateway with `ask-service` and the unrelated `observed-model`
+/// registered, the Service family's runtime account, and its key.
+///
+/// # Panics
+/// Panics when a setup step fails.
+async fn stable_account() -> (Inference, CardRef, CardRef, String, String) {
+    let inference = Inference::start().await;
+    let cards = inference.deployment.cards().await;
+    let service = declare(&cards, "cards/gateway_inference/ask-service.yaml").await;
+    let outside = declare(&cards, "cards/observe_a_run/observed-model.yaml").await;
+    let (id, key) = runtime_account(&inference.deployment.admin(), &service.root).await;
+    (inference, service.root, outside.root, id.to_string(), key)
+}
+
+/// The exact UID string of a registered `card`.
+///
+/// # Panics
+/// Panics when `card` carries no UID.
+fn uid(card: &CardRef) -> String {
+    card.uid
+        .as_ref()
+        .expect("a registered Card has a UID")
+        .to_string()
+}
+
+/// A family account's key alone invokes a model but attributes to no Card;
+/// run as its exact Service root it attributes to the root's Agent and to no
+/// Card outside the root's graph. Each answered call records the account as
+/// subject and actor.
+///
+/// # Panics
+/// Panics when a call's status or code, or a retained row, differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn stable_account_gateway_calls_keep_execution_identity() {
+    let (inference, root, outside, id, key) = stable_account().await;
+    let agent = uid(&declared(&inference.ask, "ask-agent"));
+    let key_only = inference.deployment.client(&key);
+    let rooted = key_only.for_workload(root.uid.clone().expect("a registered root has a UID"));
+    let outside = uid(&outside);
+
+    for (client, card, expected) in [
+        (&key_only, None, None),
+        (
+            &key_only,
+            Some(agent.as_str()),
+            Some("WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED"),
+        ),
+        (&rooted, Some(agent.as_str()), None),
+        (
+            &rooted,
+            Some(outside.as_str()),
+            Some("WYRD_VALA_403_BIFROST_CARD_SCOPE"),
+        ),
+    ] {
+        let headers: Vec<_> = card
+            .map(|card| ("wyrd-card-uid", card))
+            .into_iter()
+            .collect();
+        let (status, reply) = inference.ask_openai_with(client, &headers).await;
+        match expected {
+            None => assert_eq!(status, 200, "{card:?}: {reply}"),
+            Some(code) => assert_eq!(reply["error"]["code"], code, "{card:?}: {reply}"),
+        }
+    }
+
+    let call = |card_uid: Option<&str>| CallAttribution {
+        sub_principal_id: id.clone(),
+        act_principal_id: id.clone(),
+        run_id: None,
+        card_uid: card_uid.map(str::to_owned),
+    };
+    let mut expected = vec![call(None), call(Some(&agent))];
+    expected.sort();
+    assert_eq!(inference.calls().await, expected);
+    inference.deployment.shutdown().await;
+}
+
+/// A User acting through the Service's rooted account reaches only the
+/// intersection of the User's Card access with the root's graph: the root's
+/// Agent is answered and recorded with the User as subject and the account as
+/// actor, and a Card outside the graph is refused.
+///
+/// # Panics
+/// Panics when the delegation fails or a call's outcome or retained row
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn user_through_service_gateway_delegation_keeps_the_intersection() {
+    let (inference, root, outside, id, key) = stable_account().await;
+    let agent = uid(&declared(&inference.ask, "ask-agent"));
+    let Bootstrap::User { id: user, jwt, .. } = inference
+        .deployment
+        .server()
+        .bootstrap_user("gateway-user", &["workload"])
+        .await
+        .expect("user signs in")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let delegated = inference
+        .deployment
+        .client(&key)
+        .for_workload(root.uid.clone().expect("a registered root has a UID"))
+        .on_behalf_of(secrecy::SecretString::from(jwt), TokenAudience::Wyrd)
+        .await
+        .expect("the account acts for the User");
+
+    let (status, reply) = inference
+        .ask_openai_with(&delegated, &[("wyrd-card-uid", agent.as_str())])
+        .await;
+    assert_eq!(status, 200, "{reply}");
+    let outside = uid(&outside);
+    let (_, refused) = inference
+        .ask_openai_with(&delegated, &[("wyrd-card-uid", outside.as_str())])
+        .await;
+    assert_eq!(
+        refused["error"]["code"], "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+        "{refused}"
+    );
+
+    assert_eq!(
+        inference.calls().await,
+        [CallAttribution {
+            sub_principal_id: user.to_string(),
+            act_principal_id: id,
+            run_id: None,
+            card_uid: Some(agent),
+        }]
     );
     inference.deployment.shutdown().await;
 }

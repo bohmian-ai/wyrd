@@ -413,11 +413,11 @@ pub struct OperatorFailureContext {
     pub binding_id: BindingId,
     /// Exact Verifier Card UID.
     pub verifier_card_uid: CardUid,
-    /// Exact Verifier identity as `space/name@version`.
+    /// Exact Verifier identity as canonical `Kind/name@version` text.
     pub verifier_ref: String,
     /// Exact subject Card UID.
     pub subject_uid: CardUid,
-    /// Exact subject identity as `space/name@version`.
+    /// Exact subject identity as canonical `Kind/name@version` text.
     pub subject_ref: String,
     /// `failed` for an `on_failure` dispatch; the new verdict of a group
     /// `on_verdict_change` dispatch.
@@ -716,7 +716,7 @@ mod tests {
             serde_json::json!({
                 "id": id, "statement": "stable",
                 "check": {"kind": "drift", "on": "inputs.current", "method": "Spc",
-                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["latency"]},
+                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "name": "train", "version": "1.0.0"}, "features": ["latency"]},
                     "condition": {"kind": "Statistical"},
                     "profile": {"kind": "Spc", "sample_size": 5}}
             })

@@ -27,7 +27,7 @@ use wyrd_spec::graph::{
     relationships_from_spec, spec_binding_errors, topo_sort, validate_composition,
 };
 use wyrd_spec::ids::IdempotencyKey;
-use wyrd_spec::ids::{CardName, CardUid, SlotName, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid, SlotName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, scope_child_card_refs};
 use wyrd_spec::registry::{
@@ -59,7 +59,7 @@ use wyrd_sql::queries::cards::{
     persist_outbound_relationships, query_cards, recheck_active_card_refs, record_blob_failure,
     record_card_blob, record_card_reconciliation_failure, reschedule_card_reconciliation,
     resolve_version, schedule_card_reconciliation, soft_delete_card_by_ref,
-    soft_delete_card_with_kind, upsert_service_account_from_card,
+    soft_delete_card_with_kind,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
@@ -128,14 +128,10 @@ pub async fn get_card_by_ref(
     caller: &Caller,
     card_ref: &CardRef,
 ) -> Result<GetCardResponse, WyrdError> {
-    let space = card_ref.space.as_ref().ok_or_else(|| {
-        WyrdError::registry_invalid_card_spec("CardRef.space is required for a card read")
-    })?;
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let row = wyrd_sql::queries::cards::get_card_by_ref(
         &mut conn,
         card_ref.kind.clone(),
-        space,
         &card_ref.name,
         &card_ref.version,
     )
@@ -161,12 +157,11 @@ pub async fn get_latest_card(
     state: &AppState,
     caller: &Caller,
     kind: CardKind,
-    space: SpaceName,
     name: CardName,
 ) -> Result<GetCardResponse, WyrdError> {
     let range = VersionRange::default();
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let row = get_latest_card_by_range(&mut conn, kind, &space, &name, &range).await?;
+    let row = get_latest_card_by_range(&mut conn, kind, &name, &range).await?;
     let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
     let inventory = artifact_metadata::list_for_card(&mut conn, row.card_uid.as_str())
         .await
@@ -177,21 +172,40 @@ pub async fn get_latest_card(
 }
 
 /// List versions in one card identity line, excluding deleted rows.
+///
+/// The line is the caller tenant's flat `kind`/`name`; the read runs in one
+/// tenant transaction that commits before the response is built.
+///
+/// # Errors
+/// Returns registry unavailability when the tenant connection, version read,
+/// or commit fails, and `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for a stored
+/// version that no longer parses.
 pub async fn list_card_versions(
     state: &AppState,
     caller: &Caller,
     kind: CardKind,
-    space: SpaceName,
     name: CardName,
     include_prerelease: bool,
 ) -> Result<ListVersionsResponse, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let versions = list_versions(&mut conn, kind, &space, &name, include_prerelease).await?;
+    let versions = list_versions(&mut conn, kind, &name, include_prerelease).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(ListVersionsResponse { versions })
 }
 
 /// List metadata-only Cards with deterministic tenant-scoped keyset pagination.
+///
+/// A `Deleted` status filter answers empty without a read. Otherwise one
+/// tenant transaction reads the page and commits before each row is projected
+/// through [`summary_from_row`].
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_LIST_LIMIT_OUT_OF_RANGE` for a negative or
+/// oversized limit, `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an undecodable
+/// cursor, `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for an invalid version
+/// range, the query errors of an invalid metadata filter or cursor mismatch,
+/// registry unavailability when the connection, read, or commit fails, and
+/// the decode errors of [`summary_from_row`].
 pub async fn list_cards(
     state: &AppState,
     caller: &Caller,
@@ -211,7 +225,6 @@ pub async fn list_cards(
     let cursor = decode_list_cursor(request.cursor.as_deref(), limit)?;
     let query = CardQuery {
         kind: request.kind,
-        space: request.space,
         name: request.name,
         version_range: request
             .version_range
@@ -457,6 +470,16 @@ fn verify_card_hashes(
     Ok(())
 }
 
+/// Project one stored registry row onto its metadata-only list summary.
+///
+/// The summary carries the flat `kind`/`name`/`version` identity, its UID,
+/// hashes, lifecycle, and timestamps; it never reads the Card blob.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the stored status, kind,
+/// or name no longer decodes, `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for a
+/// stored version that no longer parses, and the Card UID error for an invalid
+/// stored UID.
 fn summary_from_row(row: &CardRow) -> Result<CardSummary, WyrdError> {
     let status = CardStatus::from_db_str(&row.status)
         .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
@@ -464,8 +487,6 @@ fn summary_from_row(row: &CardRow) -> Result<CardSummary, WyrdError> {
         card_uid: CardUid::from_uuid(row.card_uid).map_err(WyrdError::from_card_uid_error)?,
         kind: CardKind::from_wire_name(&row.kind)
             .ok_or_else(|| WyrdError::registry_invalid_card_spec("stored Card kind is invalid"))?,
-        space: SpaceName::new(row.space.clone())
-            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?,
         name: CardName::new(row.name.clone())
             .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?,
         version: row
@@ -808,7 +829,6 @@ async fn initialize_uploads(
             .kind
             .wire_name()
             .cmp(right.card_ref.kind.wire_name())
-            .then_with(|| left.card_ref.space.cmp(&right.card_ref.space))
             .then_with(|| left.card_ref.name.cmp(&right.card_ref.name))
     });
     response.upload_plans = plans;
@@ -1207,12 +1227,7 @@ async fn persist_node(
         .canonical_hash()
         .map_err(WyrdError::from_spec_canonicalization)?;
     let artifact_hash = canonical_artifact_manifest_hash(&submission.artifacts)?;
-    let space = card
-        .metadata
-        .space
-        .clone()
-        .ok_or_else(|| WyrdError::registry_invalid_card_spec("metadata.space is required"))?;
-    lock_version_line(conn, card.kind.clone(), &space, &card.metadata.name).await?;
+    lock_version_line(conn, card.kind.clone(), &card.metadata.name).await?;
     if let Some(existing) = resolve_existing(
         conn,
         operation_id,
@@ -1247,7 +1262,6 @@ async fn persist_node(
     persist_outbound_relationships(conn, &row.card_uid, &outbound_refs).await?;
     insert_artifact_manifest_rows(conn, &row.card_uid, &submission.artifacts).await?;
     if matches!(card.kind, CardKind::Service | CardKind::Agent) {
-        upsert_service_account_from_card(conn, &row.card_uid, &card, caller.attribution()).await?;
         BindingProjector::new(conn)
             .project(&row.card_uid, &card.kind, &card.spec)
             .await?;
@@ -1272,9 +1286,8 @@ async fn persist_node(
 /// Transaction-scoped projector of one owner Card's verification bindings.
 ///
 /// Declaration builds one per bound Service or Agent inside its own
-/// caller-owned [`TenantConn`], after the owner Card and its Card-bound
-/// principal are written, so the Card, principal, and binding rows commit or
-/// roll back together. It never commits.
+/// caller-owned [`TenantConn`], after the owner Card is written, so the Card
+/// and binding rows commit or roll back together. It never commits.
 struct BindingProjector<'a, 'c> {
     /// The declaration transaction; sibling Cards persisted earlier in it,
     /// such as a referenced Trigger, are visible here.
@@ -1486,8 +1499,7 @@ fn inline_digest(body: &Spec) -> Result<FrozenTarget, WyrdError> {
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_409_SPEC_DRIFT` when the pinned row's content differs,
-/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` without a space, and the version
-/// resolution or registry error otherwise.
+/// and the version resolution or registry error otherwise.
 async fn resolve_existing(
     conn: &mut TenantConn<'_>,
     operation_id: DeclarationOperationId,
@@ -1495,21 +1507,10 @@ async fn resolve_existing(
     spec_hash: &str,
     artifact_hash: Option<&str>,
 ) -> Result<Option<ExistingNode>, WyrdError> {
-    let space = card
-        .metadata
-        .space
-        .as_ref()
-        .ok_or_else(|| WyrdError::registry_invalid_card_spec("metadata.space is required"))?;
     match card.metadata.version.clone() {
         Some(VersionSpec::Pin(version)) => {
-            let existing = find_card_by_ref(
-                conn,
-                card.kind.clone(),
-                space,
-                &card.metadata.name,
-                &version,
-            )
-            .await?;
+            let existing =
+                find_card_by_ref(conn, card.kind.clone(), &card.metadata.name, &version).await?;
             if let Some(row) = &existing
                 && (row.spec_hash != spec_hash || row.artifact_hash.as_deref() != artifact_hash)
             {
@@ -1527,7 +1528,6 @@ async fn resolve_existing(
         authored => match resolve_version(
             conn,
             card.kind.clone(),
-            space,
             &card.metadata.name,
             authored.as_ref(),
             card.metadata.bump.as_ref(),
@@ -1543,20 +1543,16 @@ async fn resolve_existing(
                 card.metadata.version = Some(VersionSpec::Pin(version));
                 Ok(None)
             }
-            Resolution::Deduplicated { version } => find_card_by_ref(
-                conn,
-                card.kind.clone(),
-                space,
-                &card.metadata.name,
-                &version,
-            )
-            .await
-            .map(|row| {
-                row.map(|row| ExistingNode {
-                    row,
-                    outcome: DeclarationOutcomeKind::Deduplicated,
-                })
-            }),
+            Resolution::Deduplicated { version } => {
+                find_card_by_ref(conn, card.kind.clone(), &card.metadata.name, &version)
+                    .await
+                    .map(|row| {
+                        row.map(|row| ExistingNode {
+                            row,
+                            outcome: DeclarationOutcomeKind::Deduplicated,
+                        })
+                    })
+            }
         },
     }
 }
@@ -1663,7 +1659,7 @@ fn replay_seed(
 
 /// Build the Prompt Card submission an Agent's inline Prompt declares as.
 ///
-/// The Prompt is named `<agent-name>-prompt` in the Agent's space and carries
+/// The Prompt is named `<agent-name>-prompt` and carries
 /// no version intent, so [`persist_node`] reuses an identical existing version
 /// or allocates the next one on the Prompt's own line. The Agent then pins the
 /// exact UID-bearing reference [`persist_node`] returns.
@@ -1684,7 +1680,6 @@ fn inline_prompt_submission(
             name,
             version: None,
             bump: None,
-            space: agent.metadata.space.clone(),
             uid: None,
             labels: Labels::new(),
             annotations: Annotations::new(),
@@ -1715,12 +1710,11 @@ async fn pin_existing_inline_prompt(
     agent: &CardSubmission,
     prompt: &mut CardSubmission,
 ) -> Result<(), WyrdError> {
-    let (Some(version), Some(space)) = (agent.metadata.resolved_pin(), &agent.metadata.space)
-    else {
+    let Some(version) = agent.metadata.resolved_pin() else {
         return Ok(());
     };
     let Some(existing) =
-        find_card_by_ref(conn, CardKind::Agent, space, &agent.metadata.name, version).await?
+        find_card_by_ref(conn, CardKind::Agent, &agent.metadata.name, version).await?
     else {
         return Ok(());
     };
@@ -1728,7 +1722,6 @@ async fn pin_existing_inline_prompt(
         && let InlineableRef::Ref(pinned) = stored.prompt
         && pinned.kind == CardKind::Prompt
         && pinned.name == prompt.metadata.name
-        && pinned.space.as_ref() == prompt.metadata.space.as_ref()
     {
         prompt.metadata.version = Some(VersionSpec::Pin(pinned.version));
     }
@@ -1751,6 +1744,14 @@ fn submission_card(submission: &CardSubmission) -> Result<Card, WyrdError> {
 }
 
 /// Find the authored submission represented by a graph node.
+///
+/// A submission matches on flat `kind` and `name`, and on `version` only when
+/// it authored an exact pin; an unpinned submission matches the node's
+/// allocated version.
+///
+/// # Errors
+/// Returns an internal error when no submission matches, which means graph
+/// construction lost the node's authored submission.
 fn find_submission<'a>(
     submissions: &'a [CardSubmission],
     node: &CardRef,
@@ -1760,7 +1761,6 @@ fn find_submission<'a>(
         .find(|submission| {
             submission.kind == node.kind
                 && submission.metadata.name == node.name
-                && submission.metadata.space.as_ref() == node.space.as_ref()
                 && submission
                     .metadata
                     .resolved_pin()
@@ -1787,9 +1787,6 @@ fn graph_error(error: GraphError) -> WyrdError {
             details: serde_json::json!({ "cycle": cycle }),
         },
         GraphError::Empty => WyrdError::registry_invalid_card_spec("submissions must not be empty"),
-        GraphError::MissingSpace => {
-            WyrdError::registry_invalid_card_spec("metadata.space is required")
-        }
         GraphError::MultipleRoots { candidates } => {
             WyrdError::internal(format!("multiple graph roots: {candidates:?}"))
         }
@@ -2675,7 +2672,6 @@ async fn write_card_blob(
             name: card.name.clone(),
             version: Some(VersionSpec::Pin(card.version.clone())),
             bump: None,
-            space: Some(card.space.clone()),
             uid: Some(card.card_uid.clone()),
             labels: card.labels.clone(),
             annotations: card.annotations.clone(),
@@ -2737,7 +2733,7 @@ mod tests {
         serde_json::json!({
             "apiVersion": "wyrd/v1",
             "kind": "Prompt",
-            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "metadata": { "name": name, "version": "1.0.0" },
             "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
             "artifacts": []
         })
@@ -2748,7 +2744,7 @@ mod tests {
         serde_json::json!({
             "apiVersion": "wyrd/v1",
             "kind": "Service",
-            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "metadata": { "name": name, "version": "1.0.0" },
             "spec": spec,
             "artifacts": []
         })
@@ -2759,7 +2755,7 @@ mod tests {
         serde_json::json!({
             "apiVersion": "wyrd/v1",
             "kind": "Verifier",
-            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "metadata": { "name": name, "version": "1.0.0" },
             "spec": {
                 "inputs": { "x": { "type": "json" } },
                 "requirements": [{
@@ -2792,7 +2788,7 @@ mod tests {
         let mut card: wyrd_spec::envelope::Card = serde_json::from_value(serde_json::json!({
             "apiVersion": "wyrd/v1",
             "kind": "Prompt",
-            "metadata": { "name": "integrity", "version": "1.0.0", "space": "default" },
+            "metadata": { "name": "integrity", "version": "1.0.0" },
             "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] }
         }))
         .expect("test_setup: blob card fixture is valid");
@@ -2818,8 +2814,7 @@ mod tests {
                     "ref": {
                         "kind": "Verifier",
                         "name": "quality",
-                        "version": "1.0.0",
-                        "space": "default"
+                        "version": "1.0.0"
                     }
                 }]
             }))]
@@ -2948,7 +2943,7 @@ mod tests {
         let mut card: wyrd_spec::envelope::Card = serde_json::from_value(serde_json::json!({
             "apiVersion": "wyrd/v1",
             "kind": "Prompt",
-            "metadata": { "name": "blob", "version": "1.0.0", "space": "default" },
+            "metadata": { "name": "blob", "version": "1.0.0" },
             "spec": { "provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}] },
             "relationships": { "outbound": [], "inbound": ["live-edge"] },
             "status": { "phase": "pending" }

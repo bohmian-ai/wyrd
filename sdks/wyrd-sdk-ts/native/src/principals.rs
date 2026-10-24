@@ -11,6 +11,7 @@ use napi::bindgen_prelude::PromiseRaw;
 use napi_derive::napi;
 use wyrd_client::principals::{
     CreateServicePrincipalRequest, PrincipalId, PrincipalQuery, Principals, RevokePrincipalRequest,
+    WorkloadRestriction,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -192,6 +193,35 @@ impl NativePrincipals {
                 decode::<RevokePrincipalRequest>("request", &request_json),
             ) {
                 (Ok(id), Ok(request)) => principals.revoke_principal(&id, &request).await,
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Replaces a Service principal's workload restriction from a serialized
+    /// `WorkloadRestriction`, resolving the updated `PrincipalSummary`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the summary cannot be serialized; a
+    /// malformed argument or server refusal is returned in the result.
+    #[napi]
+    pub fn set_workload_restriction<'env>(
+        &self,
+        env: &'env Env,
+        principal_id: String,
+        restriction_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let principals = self.principals.clone();
+        crate::trace::spawn(env, async move {
+            let result = match (
+                self::principal_id(principal_id),
+                decode::<WorkloadRestriction>("restriction", &restriction_json),
+            ) {
+                (Ok(id), Ok(restriction)) => {
+                    principals.set_workload_restriction(&id, &restriction).await
+                }
                 (Err(error), _) | (_, Err(error)) => Err(error),
             };
             NativeLifecycleResult::outcome(result)

@@ -40,7 +40,13 @@ impl DomainTable for ObservationsTable {
         daily_layout(
             "created_at",
             vec![sort_desc("created_at"), sort_asc_nulls_first("series")],
-            &["series"],
+            &[
+                "run_id",
+                "card_uid",
+                "sub_principal_id",
+                "act_principal_id",
+                "series",
+            ],
         )
     }
 }

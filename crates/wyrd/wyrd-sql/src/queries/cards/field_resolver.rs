@@ -7,14 +7,7 @@ use wyrd_spec::query::{FieldRef, QueryFieldErrorDetail, ValueType};
 use crate::query::{FieldColumn, FieldResolver};
 
 /// Reserved columns the card query surface accepts.
-const CARD_RESERVED_FIELDS: &[&str] = &[
-    "created_at",
-    "updated_at",
-    "status",
-    "name",
-    "space",
-    "kind",
-];
+const CARD_RESERVED_FIELDS: &[&str] = &["created_at", "updated_at", "status", "name", "kind"];
 
 /// Resolves reserved card columns for metadata-query compilation.
 pub struct CardFieldResolver;
@@ -45,10 +38,6 @@ impl FieldResolver for CardFieldResolver {
                 }),
                 "name" => Ok(FieldColumn::Typed {
                     column: "name",
-                    ty: ValueType::Str,
-                }),
-                "space" => Ok(FieldColumn::Typed {
-                    column: "space",
                     ty: ValueType::Str,
                 }),
                 "kind" => Ok(FieldColumn::Typed {

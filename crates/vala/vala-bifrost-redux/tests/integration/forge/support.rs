@@ -667,6 +667,16 @@ impl Catalog for PromotionCatalogSeam {
         self.inner.table_exists(table).await
     }
 
+    async fn list_table_version_locations(
+        &self,
+        table: &TableIdent,
+        table_uuid: &str,
+    ) -> iceberg::Result<Vec<String>> {
+        self.inner
+            .list_table_version_locations(table, table_uuid)
+            .await
+    }
+
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
         self.inner.rename_table(src, dest).await
     }
@@ -996,6 +1006,22 @@ impl PromotionIntegrationFixture {
         user_fields: Vec<Field>,
         batches: &[RecordBatch],
     ) -> Self {
+        Self::start_with_dimensions(table_name, user_fields, Vec::new(), batches).await
+    }
+
+    /// [`Self::start_with`] for a table partitioned by its day and then by
+    /// `dimensions`, in that spec order.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Self::start_with`] does, or when `dimensions` do not form
+    /// a valid layout over `user_fields`.
+    pub(crate) async fn start_with_dimensions(
+        table_name: &str,
+        user_fields: Vec<Field>,
+        dimensions: Vec<wyrd_spec::vala::api::PartitionFieldWire>,
+        batches: &[RecordBatch],
+    ) -> Self {
         ProcessTelemetry::shared();
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
@@ -1031,7 +1057,7 @@ impl PromotionIntegrationFixture {
         )
         .await;
 
-        let binding = create_table(&catalog, tenant, table_name, user_fields).await;
+        let binding = create_table(&catalog, tenant, table_name, user_fields, dimensions).await;
         let operator_pool = database.operator_pool().clone();
 
         let fixture = Self {
@@ -1058,6 +1084,116 @@ impl PromotionIntegrationFixture {
         };
         fixture.seal(batches).await;
         fixture
+    }
+
+    /// The fixture's own real Scribe.
+    pub(crate) fn scribe(&self) -> &ScribeImpl {
+        &self.scribe
+    }
+
+    /// Starts a second real Scribe over the fixture's catalog, object store,
+    /// and database, with its own node, WAL, and empty committed index, as a
+    /// restarted pod meets the durable state.
+    ///
+    /// The returned directories hold its WAL and scratch and must outlive it.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions [`start_scribe`] documents.
+    pub(crate) async fn start_cold_scribe(
+        &self,
+    ) -> (Arc<ScribeImpl>, tempfile::TempDir, tempfile::TempDir) {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let scratch_root = tempfile::tempdir().expect("scratch directory");
+        let roles = fixture_roles(scratch_root.path(), wal_root.path());
+        let scribe = start_scribe(
+            &self.database,
+            Arc::clone(&self.catalog),
+            Arc::clone(self.storage.objects()),
+            wal_root.path(),
+            roles.scribe().expect("fixture Scribe capability"),
+        )
+        .await;
+        (scribe, wal_root, scratch_root)
+    }
+
+    /// Commits a partition spec that keeps the current fields and adds an
+    /// identity partition on `column`, advancing the table version by one,
+    /// then evicts the cached definition so the next admission reads it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table cannot be loaded, `column` is not a column, or
+    /// the revision does not commit.
+    pub(crate) async fn commit_identity_partition(&self, column: &str) {
+        let iceberg = self.catalog.iceberg_catalog();
+        let table = iceberg
+            .load_table(&self.binding.table_ident())
+            .await
+            .expect("fixture table load");
+        let metadata = table.metadata();
+        let version: i64 = metadata
+            .properties()
+            .get(vala_bifrost_redux::catalog::TABLE_VERSION_PROPERTY)
+            .expect("a Bifrost table carries its version")
+            .parse()
+            .expect("the version is canonical");
+        let source = metadata
+            .current_schema()
+            .field_by_name(column)
+            .expect("the partition source is a column")
+            .id;
+        let spec = metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .try_fold(
+                iceberg::spec::UnboundPartitionSpec::builder(),
+                |builder, field| {
+                    builder.add_partition_field(
+                        field.source_id,
+                        field.name.clone(),
+                        field.transform,
+                    )
+                },
+            )
+            .and_then(|builder| {
+                builder.add_partition_field(
+                    source,
+                    column.to_owned(),
+                    iceberg::spec::Transform::Identity,
+                )
+            })
+            .expect("spec builds")
+            .build();
+        let transaction = Transaction::new(&table);
+        let action = [
+            iceberg::TableUpdate::AddSpec { spec },
+            iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
+            iceberg::TableUpdate::SetProperties {
+                updates: [(
+                    vala_bifrost_redux::catalog::TABLE_VERSION_PROPERTY.to_owned(),
+                    (version + 1).to_string(),
+                )]
+                .into(),
+            },
+        ]
+        .into_iter()
+        .fold(
+            transaction.apply_updates().requirement(
+                iceberg::TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: metadata.default_partition_spec_id(),
+                },
+            ),
+            iceberg::transaction::ApplyUpdatesAction::update,
+        );
+        ApplyTransactionAction::apply(action, transaction)
+            .expect("revision applies")
+            .commit(iceberg.as_ref())
+            .await
+            .expect("revision commits");
+        self.catalog
+            .evict_current_definition(&self.binding.table_ref, self.tenant);
     }
 
     /// Build one production Forge owner over explicit catalog and store seams.
@@ -1389,7 +1525,7 @@ impl PromotionIntegrationFixture {
         name: &str,
         count: usize,
     ) {
-        let binding = create_table(&self.catalog, tenant, name, value_fields()).await;
+        let binding = create_table(&self.catalog, tenant, name, value_fields(), Vec::new()).await;
         let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
@@ -1413,7 +1549,8 @@ impl PromotionIntegrationFixture {
     /// # Panics
     /// Panics when registration, sealing, or eligibility aging fails.
     pub(crate) async fn register_and_seal_table(&self, name: &str, count: usize) {
-        let binding = create_table(&self.catalog, self.tenant, name, value_fields()).await;
+        let binding =
+            create_table(&self.catalog, self.tenant, name, value_fields(), Vec::new()).await;
         let seeded_at = Utc::now();
         let schema = ingress_schema();
         for number in 0..count {
@@ -2324,6 +2461,44 @@ impl SupervisedPromotion {
         .expect("the worker settled no attempt");
     }
 
+    /// Schedule one pass and await exactly one successful worker attempt while
+    /// `during` drives the seam the attempt is parked on.
+    ///
+    /// The success sibling of [`Self::run_one_failure_while`]: the control
+    /// runs while the attempt is parked, and the attempt must still succeed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a deterministic bound is missed or the attempt failed.
+    pub(crate) async fn run_one_success_while<F>(&mut self, during: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let expected = self.worker_observer.completed().saturating_add(1);
+        let expected_errors = self.worker_observer.returned_errors().len();
+        self.worker_observer.hold_after_next_attempt_for_test();
+        self.start_armed_worker();
+        let pass = self.request_pass();
+        tokio::time::timeout(FIXTURE_BOUND, during)
+            .await
+            .expect("parked production commit seam bound");
+        tokio::time::timeout(
+            FIXTURE_BOUND,
+            self.worker_observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .expect("production Forge worker attempt bound");
+        assert_eq!(
+            self.worker_observer.returned_errors().len(),
+            expected_errors,
+            "the attempt was expected to succeed: {:?}",
+            self.worker_observer.returned_errors()
+        );
+        self.stop_worker().await;
+        self.await_pass(pass).await;
+        assert_eq!(self.worker_observer.completed(), expected);
+    }
+
     /// Schedule one pass and await exactly one returned worker error while
     /// `during` drives the seam the attempt is parked on.
     ///
@@ -2973,7 +3148,7 @@ fn fixture_column(field: &Field, file_number: i64, noon: i64, offsets: &[i64]) -
 /// # Panics
 ///
 /// Panics when the batch cannot be written to an IPC stream.
-fn ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
+pub(crate) fn ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
     let mut ipc = Vec::new();
     {
         let mut writer =
@@ -2985,8 +3160,8 @@ fn ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
 }
 
 /// Registers the fixture table with `user_fields` plus [`fixture_time_field`]
-/// through the real catalog, declaring that field its daily time column, and
-/// returns its binding.
+/// through the real catalog, declaring that field its daily time column
+/// followed by `dimensions`, and returns its binding.
 ///
 /// # Panics
 ///
@@ -2996,8 +3171,14 @@ async fn create_table(
     tenant: DataTenantId,
     table_name: &str,
     mut user_fields: Vec<Field>,
+    dimensions: Vec<wyrd_spec::vala::api::PartitionFieldWire>,
 ) -> TenantTableBinding {
     user_fields.push(fixture_time_field());
+    let mut partition_by = vec![wyrd_spec::vala::api::PartitionFieldWire::new(
+        FIXTURE_TIME_COLUMN,
+        wyrd_spec::vala::api::PartitionTransformWire::Day,
+    )];
+    partition_by.extend(dimensions);
     let binding =
         TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, table_name)))
             .expect("fixture table binding");
@@ -3008,8 +3189,8 @@ async fn create_table(
             tenant,
             attribution: wyrd_spec::auth::Attribution::unresolved(),
             physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutWire {
-                partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
                 time_column: Some(FIXTURE_TIME_COLUMN.to_owned()),
+                partition_by,
                 sort_keys: Vec::new(),
                 bloom_columns: Vec::new(),
             }),
@@ -3141,29 +3322,60 @@ async fn append_only(
     binding: &TenantTableBinding,
     batch: &RecordBatch,
 ) {
+    ingest_unclaimed(
+        scribe,
+        catalog,
+        tenant,
+        binding,
+        uuid::Uuid::now_v7(),
+        batch,
+    )
+    .await
+    .expect("fixture Scribe ingest");
+}
+
+/// Drives one real native Scribe append that states no table version.
+///
+/// The frame carries the table's registered fingerprint and `batch_id`, so a
+/// second call with the same batch is an honest retry of the first.
+///
+/// # Errors
+///
+/// Returns the Scribe refusal of the frame.
+///
+/// # Panics
+///
+/// Panics when the registration lookup fails.
+pub(crate) async fn ingest_unclaimed(
+    scribe: &ScribeImpl,
+    catalog: &BifrostCatalog,
+    tenant: DataTenantId,
+    binding: &TenantTableBinding,
+    batch_id: Uuid,
+    batch: &RecordBatch,
+) -> Result<vala_bifrost_redux::contracts::FrameAdmission, vala_bifrost_redux::contracts::ScribeError>
+{
     let (fingerprint, _) = catalog
         .table_registration(&binding.table_ref, tenant)
         .await
         .expect("fixture table registration");
-    let principal = wyrd_runtime::principal::Principal {
-        id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: wyrd_runtime::principal::PrincipalKind::User,
-        tenant_id: tenant,
-        roles: Vec::new(),
-        effective_permissions: wyrd_runtime::PermissionSet::new(),
-        credential_id: None,
-    };
+    let principal = wyrd_runtime::principal::Principal::new(
+        wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+        wyrd_runtime::principal::PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        wyrd_runtime::PermissionSet::new(),
+    );
     scribe
         .ingest_native_for_test(NativeIngressTestFrame {
             principal,
             table: binding.table_ref.clone(),
             expected_schema_fingerprint: fingerprint,
             request_id: wyrd_spec::request_id::RequestId::now_v7(),
-            batch_id: uuid::Uuid::now_v7(),
+            batch_id,
             payload: ingress_ipc(batch),
         })
         .await
-        .expect("fixture Scribe ingest");
 }
 
 /// Ages every `file_list` row the fixture just sealed.

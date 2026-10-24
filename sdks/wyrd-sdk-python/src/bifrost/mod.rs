@@ -553,18 +553,32 @@ enum Binding {
     Native,
 }
 
+impl Binding {
+    /// The locally bound declaration that still needs a describe, if any.
+    fn unresolved(&self) -> Option<&TableConfig> {
+        match self {
+            Self::Local(Some(table)) if table.resolved().is_none() => Some(table),
+            _ => None,
+        }
+    }
+}
+
 impl Bifrost {
     /// Return the connected native client, connecting it on first use.
     ///
     /// The first caller after a successful connection moves the locally bound
     /// write target into the native client under the binding lock, so a
-    /// target bound concurrently with the connection is never lost.
+    /// target bound concurrently with the connection is never lost. A
+    /// declared target is described first, outside the lock, so its writer
+    /// names the table's current version; a result is applied only while that
+    /// exact declaration is still bound, and a replacement bound during the
+    /// describe is described in turn.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` with the stable configuration, credential, refused
     /// exchange, byte-budget, or ingest-dial error of the shared Rust
-    /// `Bifrost::connect`.
+    /// `Bifrost::connect`, or the declared target's describe error.
     fn handle(&self, py: Python<'_>) -> WyrdPyResult<&NativeBifrost> {
         let options = BifrostOptions {
             table: None,
@@ -579,11 +593,36 @@ impl Bifrost {
                 }
             })
             .map_err(client_error)?;
-        let mut binding = self.binding();
-        if let Binding::Local(Some(table)) = std::mem::replace(&mut *binding, Binding::Native) {
-            native.use_table(*table);
+        loop {
+            let declared = self.binding().unresolved().cloned();
+            // The describe runs with the binding unlocked: it releases the GIL,
+            // and a thread holding the GIL may be waiting on this lock.
+            let resolved = declared.clone().map(|mut table| {
+                let resolution = crate::trace::block_on(py, native.resolve_table(&mut table));
+                (table, resolution)
+            });
+            let mut binding = self.binding();
+            // A describe answers only the exact declaration that asked: when
+            // `use_table` replaced it meanwhile, resolve the replacement instead.
+            if binding.unresolved() != declared.as_ref() {
+                continue;
+            }
+            let local = match std::mem::replace(&mut *binding, Binding::Native) {
+                Binding::Local(local) => local.map(|table| *table),
+                Binding::Native => None,
+            };
+            match (local, resolved) {
+                (Some(_), Some((table, resolution))) => {
+                    native.use_table(table);
+                    resolution.map_err(client_error)?;
+                }
+                (Some(local), None) => {
+                    native.use_table(local);
+                }
+                (None, _) => {}
+            }
+            return Ok(native);
         }
-        Ok(native)
     }
 
     /// The native client the binding moved into.
@@ -1333,7 +1372,9 @@ impl PyBifrostQueryStream {
 /// active binding: an instrumented process writes its signals alongside
 /// whatever the application is writing, and must not disturb the table the
 /// application has bound. Queue saturation is swallowed and counted on the
-/// client's drop counter instead of being raised.
+/// client's drop counter instead of being raised. The first row for a table
+/// this client has not described waits for one describe, which supplies the
+/// table version every batch names; a failed describe is counted the same way.
 ///
 /// The Python facade serializes the caller's schema mapping and row before
 /// this call, so `schema` and `row` arrive as JSON text.
@@ -1368,14 +1409,30 @@ fn record(
         serde_json::from_str(schema).map_err(|error| invalid_argument("schema", error))?;
     let schema = wyrd_types::json_schema_to_arrow(&schema_value)
         .map_err(|error| client_error(error.into()))?;
+    let schema = std::sync::Arc::new(schema);
+    let correlation = correlation(card_uid, run_id)?;
     let bifrost = bifrost.borrow();
-    wyrd_client::bifrost::observe::record(
-        bifrost.handle(py)?,
-        table,
-        &std::sync::Arc::new(schema),
-        row.as_bytes().to_vec(),
-        correlation(card_uid, run_id)?,
-    );
+    let handle = bifrost.handle(py)?;
+    let row = row.as_bytes().to_vec();
+    match handle.cached_writer_table(table) {
+        Some(described) => wyrd_client::bifrost::observe::record(
+            handle,
+            &described.with_schema(schema),
+            row,
+            correlation,
+        ),
+        None => crate::trace::block_on(
+            py,
+            wyrd_client::bifrost::observe::describe_and_record(
+                handle,
+                table,
+                schema,
+                row,
+                correlation,
+                handle.admit_record(),
+            ),
+        ),
+    }
     Ok(())
 }
 

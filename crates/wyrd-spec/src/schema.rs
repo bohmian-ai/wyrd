@@ -1,10 +1,8 @@
 //! JSON schema helpers.
 
-use schemars::schema::RootSchema;
-
 /// Generate a root schema for a type.
 #[must_use]
-pub fn schema_for<T: schemars::JsonSchema>() -> RootSchema {
+pub fn schema_for<T: schemars::JsonSchema>() -> schemars::Schema {
     schemars::schema_for!(T)
 }
 
@@ -22,21 +20,15 @@ pub const SERIALIZED_EXTENSION: &str = "x-wyrd-serialized";
 /// and holds a `T` otherwise, never null unless `T` itself admits null. Output
 /// projections such as the TypeScript wire-type generator read the extension
 /// instead of the input schema.
-///
-/// # Panics
-///
-/// Panics only if a schemars schema fails to serialize to JSON, which its
-/// plain-data `Serialize` implementation cannot do.
 pub fn skipped_option<T: schemars::JsonSchema>(
-    generator: &mut schemars::r#gen::SchemaGenerator,
-) -> schemars::schema::Schema {
-    let serialized = serde_json::to_value(generator.subschema_for::<T>())
-        .expect("a schemars schema always serializes to JSON");
-    let mut schema = generator.subschema_for::<Option<T>>().into_object();
+    generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    let serialized = generator.subschema_for::<T>().to_value();
+    let mut schema = generator.subschema_for::<Option<T>>();
     schema
-        .extensions
+        .ensure_object()
         .insert(SERIALIZED_EXTENSION.to_owned(), serialized);
-    schema.into()
+    schema
 }
 
 #[cfg(test)]

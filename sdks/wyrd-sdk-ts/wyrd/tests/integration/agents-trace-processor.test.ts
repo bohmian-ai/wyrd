@@ -133,10 +133,11 @@ function ambientState(bundle: string, serviceKey: string): WyrdState {
   return WyrdState.fromPath(bundle);
 }
 
-/** Install an application-owned provider exporting to Wyrd with Run correlation. */
-function ownedProvider(): BasicTracerProvider {
+/** Install an application-owned provider exporting to Wyrd as `state`'s root, with Run correlation. */
+function ownedProvider(state: WyrdState): BasicTracerProvider {
+  const exporter = spanExporter(WyrdClient.connect(), { workloadUid: state.rootRef.uid ?? "" });
   const provider = new BasicTracerProvider({
-    spanProcessors: [runCorrelationProcessor(), new BatchSpanProcessor(spanExporter(WyrdClient.connect()))],
+    spanProcessors: [runCorrelationProcessor(), new BatchSpanProcessor(exporter)],
   });
   trace.setGlobalTracerProvider(provider);
   context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
@@ -257,7 +258,7 @@ test("managed framework telemetry", async ({ server, provider, bundle, serviceKe
 
 test("owned provider framework telemetry", async ({ server, provider, bundle, serviceKey }) => {
   const state = ambientState(bundle, serviceKey);
-  const owned = ownedProvider();
+  const owned = ownedProvider(state);
 
   const result = await turn(state, direct(provider.url));
   await owned.shutdown();
@@ -347,15 +348,13 @@ test("framework sampling privacy and authorization", async ({ server, provider, 
   expect(denied.refusal).toMatchObject({ code: "WYRD_SDK_503_TELEMETRY_FLUSH_FAILED" });
   expect(await timeline(server, denied.traceId)).toEqual([]);
 
-  // Another tenant's credential cannot attribute spans to this tenant's
-  // Card: the server rejects each one, so only that tenant's uncorrelated
-  // `request` span lands, and only there.
+  // Another tenant's credential cannot run as this tenant's Service root:
+  // the server refuses the export, so neither tenant reads any span.
   const elsewhere = server.bootstrapServiceInTenant(server.seedTenant("agents-elsewhere"), ["admin"], "agents-app");
   const rejected = await exported(elsewhere);
-  expect(rejected.refusal).toBeUndefined();
+  expect(rejected.refusal).toMatchObject({ code: "WYRD_SDK_503_TELEMETRY_FLUSH_FAILED" });
   expect(await timeline(server, rejected.traceId)).toEqual([]);
-  const landed = await timeline(server, rejected.traceId, elsewhere);
-  expect(landed.map((span) => [span.name, span.attributes["wyrd.card_uid"]])).toEqual([["request", undefined]]);
+  expect(await timeline(server, rejected.traceId, elsewhere)).toEqual([]);
 
   const allowed = await exported(serviceKey);
   expect(allowed.refusal).toBeUndefined();

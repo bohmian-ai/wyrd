@@ -2,9 +2,13 @@ use std::sync::Arc;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use wyrd_auth::issuance::select_request_root;
 use wyrd_auth_verify::VerifiedToken;
-use wyrd_runtime::{DelegationStep, Principal};
+use wyrd_runtime::{DelegationStep, Principal, needs_root_resolution};
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 
+use crate::components::auth::routes::store_unavailable;
 use crate::components::auth::token_extract::verify_authenticated_principal;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -58,6 +62,47 @@ impl AuthenticatedPrincipal {
     #[must_use]
     pub fn delegation_chain(&self) -> &[DelegationStep] {
         &self.verified.delegation_chain
+    }
+
+    /// The verified token, for an owner that takes it by value.
+    #[must_use]
+    pub(crate) fn into_verified(self) -> VerifiedToken {
+        Arc::unwrap_or_clone(self.verified)
+    }
+
+    /// Apply a request's optional `x-wyrd-workload-uid` selector.
+    ///
+    /// A bearer already signing `root` is returned unchanged without a store
+    /// read; a rootless bearer is narrowed to `root` under its signed Card
+    /// access by [`select_request_root`], in a read-only tenant transaction
+    /// that records no activity. Every bearer ingress that accepts the
+    /// selector routes through here.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::SignedWorkloadMismatch`] for a different signed
+    /// root, [`WyrdError::WorkloadUidRefused`] for an unusable root, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the tenant store is
+    /// unavailable.
+    pub(crate) async fn select_root(
+        self,
+        state: &AppState,
+        root: Option<&CardUid>,
+    ) -> Result<Self, WyrdError> {
+        let Some(root) = root else {
+            return Ok(self);
+        };
+        let principal = &self.verified.principal;
+        if !needs_root_resolution(principal, &self.verified.delegation_chain, root)? {
+            return Ok(self);
+        }
+        let mut conn = state
+            .postgres
+            .tenant_conn(principal.tenant_id)
+            .await
+            .map_err(store_unavailable)?;
+        Ok(select_request_root(&mut conn, &self.verified, root)
+            .await?
+            .map_or(self, |selected| Self::from_verified(Arc::new(selected))))
     }
 }
 
@@ -123,7 +168,7 @@ mod pg_tests {
     use wyrd_runtime::{PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_spec::reference::CardRefScope;
+    use wyrd_spec::ids::CardUid;
 
     use super::AuthenticatedPrincipal;
 
@@ -157,20 +202,25 @@ mod pg_tests {
         assert_error_code(error, "WYRD_AUTH_401_UNAUTHENTICATED");
     }
 
+    /// A principal already stored in the request extensions is returned as-is,
+    /// without a bearer header and without invoking the token verifier.
+    ///
+    /// # Panics
+    /// Panics when extraction fails or the extracted principal's id or tenant
+    /// differs from the stored principal.
     #[tokio::test]
     async fn extension_hit_returns_stored_principal_without_invoking_verifier() {
         let tenant = DataTenantId::new_v7();
         let state = test_state(tenant).await;
         let principal_id = PrincipalId::new(uuid::Uuid::now_v7());
         let stored = AuthenticatedPrincipal::from_verified(Arc::new(VerifiedToken {
-            principal: wyrd_runtime::Principal {
-                id: principal_id,
-                kind: PrincipalKind::User,
-                tenant_id: tenant,
-                roles: Vec::new(),
-                effective_permissions: PermissionSet::default(),
-                credential_id: None,
-            },
+            principal: wyrd_runtime::Principal::new(
+                principal_id,
+                PrincipalKind::User,
+                tenant,
+                Vec::new(),
+                PermissionSet::default(),
+            ),
             delegation_chain: Vec::new(),
             exp: chrono::Utc::now() + chrono::Duration::minutes(5),
         }));
@@ -286,8 +336,6 @@ mod pg_tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         };
         state
             .auth
@@ -299,6 +347,8 @@ mod pg_tests {
                     principal,
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
+                    card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
+                    workload_uid: None,
                     credential_id: None,
                     act: None,
                     audience: wyrd_spec::auth::TokenAudience::Wyrd,
@@ -308,8 +358,9 @@ mod pg_tests {
             .expect("test jwt mints")
     }
 
-    /// Mint an access token whose outer `act` names `initiator` as the sole
-    /// actor working for `subject`, the token's principal.
+    /// Mint an access token whose outer `act` names the Service `initiator`,
+    /// running under its own root, as the sole actor working for `subject`;
+    /// the delegated Card access is the empty exact intersection.
     ///
     /// # Panics
     /// Panics when `state` has no issuing key or the token fails to mint.
@@ -323,11 +374,12 @@ mod pg_tests {
             sub: initiator.to_string(),
             principal: TokenPrincipalRef {
                 id: initiator,
-                kind: PrincipalKindTag::User,
+                kind: PrincipalKindTag::Service,
                 tenant_id: tenant,
-                card_ref: None,
-                card_ref_scope: CardRefScope::default(),
             },
+            workload_uid: CardUid::new(uuid::Uuid::now_v7().to_string())
+                .expect("generated UUIDv7 is a valid CardUid"),
+            cid: None,
             act: None,
         };
         state
@@ -341,11 +393,11 @@ mod pg_tests {
                         id: subject,
                         kind: PrincipalKindTag::User,
                         tenant_id: tenant,
-                        card_ref: None,
-                        card_ref_scope: CardRefScope::default(),
                     },
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
+                    card_access: wyrd_spec::auth::CardAccess::Scoped { cards: Vec::new() },
+                    workload_uid: None,
                     credential_id: None,
                     act: Some(Box::new(actor)),
                     audience: wyrd_spec::auth::TokenAudience::Wyrd,

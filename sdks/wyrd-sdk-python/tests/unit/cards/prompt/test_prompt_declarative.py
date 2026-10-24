@@ -14,15 +14,14 @@ def lead_scoring(fixtures_dir: Path) -> Path:
 
 @pytest.fixture
 def support_agent(fixtures_dir: Path) -> Path:
-    """A declarative Anthropic Prompt Card file that omits apiVersion and space."""
+    """A declarative Anthropic Prompt Card file that omits apiVersion."""
     return fixtures_dir / "authoring" / "prompt" / "support-agent.yaml"
 
 
 def test_promptcard_constructor_with_python_prompt() -> None:
     prompt = Prompt("Summarize {{doc}}.", "gpt-4o", provider="openai")
-    card = PromptCard(prompt, space="growth", name="lead-scoring", version="0.1.0")
+    card = PromptCard(prompt, name="lead-scoring", version="0.1.0")
 
-    assert card.space == "growth"
     assert card.name == "lead-scoring"
     assert card.version == "0.1.0"
     assert card.prompt.provider == "openai"
@@ -32,8 +31,7 @@ def test_promptcard_constructor_with_python_prompt() -> None:
 def test_declarative_openai_card_loads_its_identity_and_model(lead_scoring: Path) -> None:
     card = PromptCard.from_path(lead_scoring)
 
-    assert (card.space, card.name, card.prompt.provider, card.prompt.model) == (
-        "growth",
+    assert (card.name, card.prompt.provider, card.prompt.model) == (
         "lead-scoring",
         "openai",
         "gpt-4o",

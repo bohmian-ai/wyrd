@@ -1131,7 +1131,10 @@ impl crate::WyrdTestServer {
                         tenant,
                         attribution: wyrd_spec::auth::Attribution::unresolved(),
                         physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutWire {
-                            partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Hour,
+                            partition_by: vec![wyrd_spec::vala::api::PartitionFieldWire::new(
+                                WORKLOAD_TIME_COLUMN,
+                                wyrd_spec::vala::api::PartitionTransformWire::Hour,
+                            )],
                             time_column: Some(WORKLOAD_TIME_COLUMN.to_owned()),
                             sort_keys: Vec::new(),
                             bloom_columns: Vec::new(),
@@ -1694,8 +1697,9 @@ fn running_pod(
 
 #[cfg(test)]
 mod tests {
+    use vala_bifrost_redux::catalog::PhysicalPartition;
     use vala_bifrost_redux::catalog::layout::{
-        BIFROST_PARTITION_SPEC_ID, BIFROST_SORT_ORDER_ID, TimeGranularity, TimePartition,
+        BIFROST_SORT_ORDER_ID, TimeGranularity, TimePartition,
     };
     use vala_bifrost_redux::scribe::promotion::{PublishedHotFileIdentity, ScribeDataFileV1};
 
@@ -2310,10 +2314,10 @@ mod tests {
                 file_list_id: Uuid::nil(),
                 object_key: "scribe/workload/000.parquet",
                 file_checksum: &"0".repeat(64),
-                partition,
+                partition: &PhysicalPartition::from(partition),
                 schema_fingerprint: "0".repeat(64),
-                partition_spec_id: BIFROST_PARTITION_SPEC_ID,
                 sort_order_id: BIFROST_SORT_ORDER_ID,
+                table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
             },
             ScribeDataFileV1 {
                 record_count: 1,

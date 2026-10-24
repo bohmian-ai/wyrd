@@ -709,7 +709,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_401_API_KEY_INVALID",
         status = 401,
         title = "API key not found, revoked, or hash mismatch",
-        remediation = "Re-issue a key with `wyrd auth issue-key <card_ref>` and update the deployment secret."
+        remediation = "Issue a new credential with `wyrd principal credential issue --principal <id>` and update the deployment secret."
     )]
     ApiKeyInvalid {
         /// Human-readable error message.
@@ -737,9 +737,66 @@ pub enum WyrdError {
         code = "WYRD_AUTH_413_CARD_SCOPE_TOO_LARGE",
         status = 413,
         title = "Card scope too large",
-        remediation = "Reduce or split the principal's declared card-ref graph so its transitive observation-target scope fits the token size limit, or issue a narrower card-bound principal."
+        remediation = "Reduce or split the selected root's declared Card graph so its transitive observation-target scope fits the token size limit, or select a root with a smaller graph."
     )]
     CardScopeTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An explicitly selected workload root cannot be used by this account.
+    #[error("[WYRD_AUTH_401_WORKLOAD_UID_REFUSED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
+        status = 401,
+        title = "Workload root refused",
+        remediation = "`workload_uid` is optional. When supplied it must name an active, registered Service Card version in this tenant that the account's workload restriction allows; unknown and foreign roots are refused identically. Omit it to authenticate the account without workload context, or register the release and pass its exact Card UID."
+    )]
+    WorkloadUidRefused {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A family-restricted account attempted Card-attributed work without a
+    /// validated root.
+    #[error("[WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED",
+        status = 403,
+        title = "Workload context required",
+        remediation = "This account is restricted to one workload family, so Card-attributed emission and verification need the exact release root. Exchange the key with `workload_uid`, send `x-wyrd-workload-uid`, or use the WyrdState loaded for that release. Generic authorized calls do not need a root."
+    )]
+    WorkloadContextRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload; `reason` is `workload_context_required`.
+        details: serde_json::Value,
+    },
+    /// A request header tried to change the root a signed token already pins.
+    #[error("[WYRD_AUTH_400_SIGNED_WORKLOAD_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_SIGNED_WORKLOAD_MISMATCH",
+        status = 400,
+        title = "Workload context differs from the signed root",
+        remediation = "The bearer token already pins a workload root, which a request header cannot change. Send the same `x-wyrd-workload-uid` or none, or obtain a separate token for the other release."
+    )]
+    SignedWorkloadMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload; `reason` is `signed_workload_mismatch`.
+        details: serde_json::Value,
+    },
+    /// Another Service account already owns this workload family.
+    #[error("[WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT",
+        status = 409,
+        title = "Workload family already has a runtime account",
+        remediation = "Each Service family has at most one family-restricted runtime account. Issue another credential on that account for rotation or concurrent releases, or first set the existing account's restriction to `unrestricted`."
+    )]
+    WorkloadBindingConflict {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -1240,6 +1297,24 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A typed verification read could not decode a requirement's custom
+    /// `data` as the caller's type.
+    ///
+    /// Raised locally after the result arrived; the stored result is
+    /// unchanged, nothing reruns, and the payload is never echoed.
+    #[error("[WYRD_SDK_422_VERIFICATION_DATA_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_422_VERIFICATION_DATA_INVALID",
+        status = 422,
+        title = "Verification data does not match the requested type",
+        remediation = "Match the requested type to the check's declared data schema, use a union or decoder for mixed shapes, or read the result without a type."
+    )]
+    SdkVerificationDataInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload: the `requirement` ID and safe `path`.
+        details: serde_json::Value,
+    },
     /// A verification execution did not settle within the caller's wait.
     ///
     /// The execution may still be queued or running, or its staged
@@ -1278,18 +1353,41 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// `start_telemetry` found a tracer provider Wyrd did not install.
+    /// `start_telemetry` found a process-global tracer provider Wyrd did not
+    /// install for this state: the application's own, or one bound to
+    /// another state's configured Service.
     ///
     /// Replacing an application's own provider would silently redirect or
-    /// drop its spans, so Wyrd refuses instead of taking over.
+    /// drop its spans, and reusing another state's would export under the
+    /// wrong Service, so Wyrd refuses instead.
     #[error("[WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS] {message}")]
     #[wyrd_error(
         code = "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS",
         status = 409,
         title = "A tracer provider is already installed",
-        remediation = "Add the Wyrd span exporter to the application's existing provider instead of calling start_telemetry."
+        remediation = "Add each state's Wyrd span exporter to the application's own provider instead of calling start_telemetry."
     )]
     SdkTelemetryProviderExists {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// `configure` was called on a state whose Service context is already
+    /// fixed.
+    ///
+    /// The first explicit `configure` or the first Run, client, writer,
+    /// telemetry, or adapter use freezes a state's configured Service name,
+    /// version, and deployment environment, so every later `configure`
+    /// conflicts, including after shutdown.
+    #[error("[WYRD_SDK_409_STATE_CONFIG_FROZEN] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_409_STATE_CONFIG_FROZEN",
+        status = 409,
+        title = "WyrdState configuration is already fixed",
+        remediation = "Call configure once, before startup and before opening a Run, or construct another WyrdState for a different configuration."
+    )]
+    SdkStateConfigFrozen {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -1452,12 +1550,12 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// `card_ref.uid` was populated for a registry lookup that resolves by (space, name, version).
+    /// `card_ref.uid` was populated for a registry lookup that resolves by (kind, name, version).
     #[error("[WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE] {message}")]
     #[wyrd_error(
         code = "WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE",
         status = 400,
-        title = "`card_ref.uid` was populated for a registry lookup that resolves by (space, name, version)",
+        title = "`card_ref.uid` was populated for a registry lookup that resolves by (kind, name, version)",
         remediation = "Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`."
     )]
     RegistryCardRefUidNotResolvableHere {
@@ -1486,7 +1584,7 @@ pub enum WyrdError {
         code = "WYRD_REGISTRY_404_CARD_NOT_FOUND",
         status = 404,
         title = "No card matches the supplied identity",
-        remediation = "Check (space, kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant."
+        remediation = "Check (kind, name, version) or the `card_uid` is correct and the card is declared in the current tenant."
     )]
     RegistryCardNotFound {
         /// Human-readable error message.
@@ -1640,7 +1738,7 @@ pub enum WyrdError {
         code = "WYRD_SPEC_400_DUPLICATE_SUBMISSION",
         status = 400,
         title = "Duplicate card submission",
-        remediation = "Submit each (kind, space, name, version) identity at most once per request."
+        remediation = "Submit each (kind, name, version) identity at most once per request."
     )]
     SpecDuplicateSubmission {
         /// Human-readable error message.
@@ -3678,6 +3776,10 @@ impl WyrdError {
             | Self::ApiKeyInvalid { message, details }
             | Self::InvalidCardRef { message, details }
             | Self::CardScopeTooLarge { message, details }
+            | Self::WorkloadUidRefused { message, details }
+            | Self::WorkloadContextRequired { message, details }
+            | Self::SignedWorkloadMismatch { message, details }
+            | Self::WorkloadBindingConflict { message, details }
             | Self::DelegationDepthExceededVerify { message, details }
             | Self::PrincipalNotFound { message, details }
             | Self::AdminConflict { message, details }
@@ -3774,8 +3876,10 @@ impl WyrdError {
             | Self::SdkUnknownAlias { message, details }
             | Self::SdkUnknownVerifier { message, details }
             | Self::SdkVerificationWaitTimedOut { message, details }
+            | Self::SdkVerificationDataInvalid { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
             | Self::SdkTelemetryProviderExists { message, details }
+            | Self::SdkStateConfigFrozen { message, details }
             | Self::SdkTelemetryFlushTimeout { message, details }
             | Self::SdkTelemetryFlushFailed { message, details }
             | Self::SdkBifrostNotStarted { message, details }
@@ -4023,6 +4127,35 @@ impl WyrdError {
                 "stored_hash": stored,
                 "submitted_hash": submitted,
             }),
+        }
+    }
+
+    /// Construct [`WyrdError::SignedWorkloadMismatch`] for a request selector
+    /// naming `selected` on a bearer that already pins `signed`.
+    #[must_use]
+    pub fn signed_workload_mismatch(
+        signed: &crate::ids::CardUid,
+        selected: &crate::ids::CardUid,
+    ) -> Self {
+        Self::SignedWorkloadMismatch {
+            message: format!(
+                "the bearer pins workload root {signed}; the request selected {selected}"
+            ),
+            details: serde_json::json!({
+                "reason": "signed_workload_mismatch",
+                "signed_workload_uid": signed,
+                "workload_uid": selected,
+            }),
+        }
+    }
+
+    /// Construct [`WyrdError::WorkloadContextRequired`] with its stable
+    /// `workload_context_required` reason; `message` names what lacked a root.
+    #[must_use]
+    pub fn workload_context_required(message: impl Into<String>) -> Self {
+        Self::WorkloadContextRequired {
+            message: message.into(),
+            details: serde_json::json!({ "reason": "workload_context_required" }),
         }
     }
 
@@ -4378,8 +4511,15 @@ mod tests {
         assert_eq!(problem["details"]["required"]["action"], "write");
     }
 
+    /// An invalid API key's problem document carries its stable 401 code and a
+    /// remediation that points the caller at `wyrd principal credential issue`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the code differs or the remediation is missing, not a
+    /// string, or does not name the credential-issue command.
     #[test]
-    fn api_key_invalid_remediation_names_issue_key() {
+    fn api_key_invalid_remediation_names_credential_issue() {
         let error = WyrdError::ApiKeyInvalid {
             message: "api key rejected".to_owned(),
             details: serde_json::json!({}),
@@ -4391,7 +4531,7 @@ mod tests {
             problem["remediation"]
                 .as_str()
                 .expect("remediation is string")
-                .contains("wyrd auth issue-key")
+                .contains("wyrd principal credential issue")
         );
     }
 
@@ -5065,6 +5205,14 @@ mod error_vala_tests {
                 },
                 "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
                 409u16,
+            ),
+            (
+                BifrostError::TableVersionConflict {
+                    table: "tenant.events".to_owned(),
+                    table_version: crate::vala::ids::TableVersion::INITIAL,
+                },
+                "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT",
+                409,
             ),
             (
                 BifrostError::QueryInvalidSql {

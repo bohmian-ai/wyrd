@@ -8,7 +8,6 @@ kind: Verifier
 metadata:
   name: follows-policy
   version: 1.0.0
-  space: support
 spec:
   description: A refund decision letter follows the refund policy.
   inputs:

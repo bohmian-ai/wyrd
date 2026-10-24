@@ -67,10 +67,9 @@ pub fn relationships_from_spec(spec: &Spec) -> Relationships {
     }
 }
 
-/// Return submission indices sorted by `(kind, space, name, version)`.
+/// Return submission indices sorted by `(kind, name, version)`.
 ///
-/// The kind key is its stable wire name. Missing authored spaces sort before
-/// named spaces; normal registration requests have a resolved space. The
+/// The kind key is its stable wire name. The
 /// source slice is never mutated, so callers can use the indices to construct
 /// a reordered request or to feed a canonical hash input.
 #[must_use]
@@ -81,20 +80,10 @@ pub fn canonical_order(submissions: &[CardSubmission]) -> Vec<usize> {
         let right_submission = &submissions[*right];
         (
             left_submission.kind.wire_name(),
-            left_submission
-                .metadata
-                .space
-                .as_ref()
-                .map_or("", |space| space.as_str()),
             left_submission.metadata.name.as_str(),
         )
             .cmp(&(
                 right_submission.kind.wire_name(),
-                right_submission
-                    .metadata
-                    .space
-                    .as_ref()
-                    .map_or("", |space| space.as_str()),
                 right_submission.metadata.name.as_str(),
             ))
             .then_with(|| {
@@ -137,7 +126,6 @@ mod tests {
                     "kind": "Prompt",
                     "name": "prompt",
                     "version": "1.0.0",
-                    "space": "default",
                     "uid": "018f0000-0000-7000-8000-000000000001"
                 },
                 "execution_route": {"kind": "native"}
@@ -149,17 +137,21 @@ mod tests {
 
         assert_eq!(
             relationships.outbound,
-            vec!["default/Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"]
+            vec!["Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"]
         );
         assert_eq!(relationships.outbound_refs.len(), 1);
         assert_eq!(
             relationships.outbound_refs[0].card_ref.to_string(),
-            "default/Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"
+            "Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"
         );
         assert!(relationships.inbound.is_empty());
     }
 
-    fn submission(kind: CardKind, space: &str, name: &str) -> CardSubmission {
+    /// Build an unpinned, spec-free submission fixture named by flat kind and name.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid Card name.
+    fn submission(kind: CardKind, name: &str) -> CardSubmission {
         CardSubmission {
             api_version: ApiVersion::v1(),
             kind,
@@ -167,7 +159,6 @@ mod tests {
                 name: name.parse().expect("test card name is valid"),
                 version: None,
                 bump: None,
-                space: Some(space.parse().expect("test space is valid")),
                 uid: None,
                 labels: BTreeMap::default(),
                 annotations: BTreeMap::default(),
@@ -180,14 +171,12 @@ mod tests {
         }
     }
 
-    fn key(submission: &CardSubmission) -> (&str, &str, &str, &str) {
+    /// Project a submission onto its comparable `(kind, name, version)` order key.
+    ///
+    /// An unpinned version projects as the empty string.
+    fn key(submission: &CardSubmission) -> (&str, &str, &str) {
         (
             submission.kind.wire_name(),
-            submission
-                .metadata
-                .space
-                .as_ref()
-                .map_or("", |space| space.as_str()),
             submission.metadata.name.as_str(),
             submission
                 .metadata
@@ -196,13 +185,17 @@ mod tests {
         )
     }
 
+    /// Repeated canonical ordering of one flat submission set is identical.
+    ///
+    /// # Panics
+    /// Panics when a fixture name is invalid or any run differs from the first.
     #[test]
     fn canonical_order_is_deterministic() {
         let submissions = vec![
-            submission(CardKind::Service, "prod", "gateway"),
-            submission(CardKind::Agent, "shared", "triage"),
-            submission(CardKind::Agent, "prod", "triage"),
-            submission(CardKind::Prompt, "prod", "system"),
+            submission(CardKind::Service, "gateway"),
+            submission(CardKind::Agent, "triage"),
+            submission(CardKind::Agent, "planner"),
+            submission(CardKind::Prompt, "system"),
         ];
         let expected = canonical_order(&submissions)
             .into_iter()
@@ -218,20 +211,25 @@ mod tests {
         }
     }
 
+    /// Canonical order follows flat `(kind, name, version)` keys, not wire order.
+    ///
+    /// # Panics
+    /// Panics when a fixture name is invalid or any permutation does not
+    /// produce the expected key order.
     #[test]
     fn canonical_order_ignores_wire_order() {
         let entries = [
-            submission(CardKind::Service, "prod", "gateway"),
-            submission(CardKind::Agent, "shared", "triage"),
-            submission(CardKind::Agent, "prod", "triage"),
-            submission(CardKind::Prompt, "prod", "system"),
+            submission(CardKind::Service, "gateway"),
+            submission(CardKind::Agent, "triage"),
+            submission(CardKind::Agent, "planner"),
+            submission(CardKind::Prompt, "system"),
         ];
         let permutations = [vec![0, 1, 2, 3], vec![3, 2, 1, 0], vec![1, 3, 0, 2]];
         let expected = vec![
-            ("Agent", "prod", "triage", ""),
-            ("Agent", "shared", "triage", ""),
-            ("Prompt", "prod", "system", ""),
-            ("Service", "prod", "gateway", ""),
+            ("Agent", "planner", ""),
+            ("Agent", "triage", ""),
+            ("Prompt", "system", ""),
+            ("Service", "gateway", ""),
         ];
 
         for permutation in permutations {

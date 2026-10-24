@@ -363,6 +363,13 @@ mod tests {
             (BifrostError::TableNotFound { table: table() }, 404),
             (BifrostError::FingerprintMismatch { table: table() }, 409),
             (
+                BifrostError::TableVersionConflict {
+                    table: table(),
+                    table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
+                },
+                409,
+            ),
+            (
                 BifrostError::CompactionTargetMismatch { table: table() },
                 409,
             ),

@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -97,7 +97,7 @@ class DeskUpstream(BaseHTTPRequestHandler):
 
 
 @contextmanager
-def upstream_answering(answers: tuple[tuple[str, str], ...]) -> Iterator[Receiver]:
+def upstream_answering(answers: tuple[tuple[str, str], ...]) -> Generator[Receiver]:
     """Serve a recording local model provider that answers by body marker."""
     handler = type("Answering", (DeskUpstream,), {"answers": answers})
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -391,7 +391,7 @@ def test_published_quickstart_declares_observes_and_verifies(
         # The shared test tenant keeps earlier runs' rows, so only this run's
         # Run and execution identify it.
         observer = Observer(WyrdClient())
-        desk_ref = Cards(WyrdClient()).resolve_latest("Service", "default", "support-desk")
+        desk_ref = Cards(WyrdClient()).resolve_latest("Service", "support-desk")
         evidence = poll(
             lambda: observer.service(desk_ref), lambda evidence: evidence.failure_point() is None
         )
@@ -436,7 +436,7 @@ def test_quickstart_deploy_keeps_the_prior_bundle_until_pull_replaces_it(
     pulls = [refused, replaced]
 
     class Declared:
-        root = "default/Service/support-desk@1.0.0"
+        root = "Service/support-desk@1.0.0"
 
     class StandInCards:
         def __init__(self, client: object) -> None: ...

@@ -128,6 +128,18 @@ impl Fixture {
         })
     }
 
+    /// The exact reference of the Service every request judges.
+    ///
+    /// # Panics
+    /// Panics when the reference does not decode, which a registered UID
+    /// never causes.
+    fn subject_ref(&self) -> CardRef {
+        serde_json::from_value(json!({
+            "kind": "Service", "name": "vr-service", "version": "1.0.0", "uid": self.service
+        }))
+        .expect("subject ref decodes")
+    }
+
     /// Count the tenant's queued executions.
     ///
     /// # Panics
@@ -303,15 +315,23 @@ async fn user(server: &WyrdTestServer, name: &str, roles: &[&str]) -> (Uuid, Str
     }
 }
 
-/// Exchange a bootstrapped machine principal's API key for an access token.
+/// Exchange a bootstrapped machine principal's API key for an access token
+/// rooted at the Card it acts as.
 ///
 /// # Panics
-/// Panics when the principal has no API key or the exchange fails.
+/// Panics when the principal has no API key or Card UID, or the exchange
+/// fails.
 async fn machine_jwt(server: &WyrdTestServer, machine: &Bootstrap) -> String {
     server
-        .exchange_api_key(machine.api_key().expect("machine has an API key"))
+        .exchange_api_key_for_workload(
+            machine.api_key().expect("machine has an API key"),
+            machine
+                .card_ref()
+                .and_then(|card| card.uid.as_ref())
+                .expect("machine acts as a Card UID"),
+        )
         .await
-        .expect("API key exchanges")
+        .expect("rooted exchange succeeds")
 }
 
 /// Read one execution's frozen (origin, owner, binding, requester) identity
@@ -647,12 +667,12 @@ async fn enqueue_refusals_fail_before_staging() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// A Card-bound caller may enqueue only a subject its signed Card scope
-/// carries: holding `verifier:run` on exactly the selected Verifier, the
-/// subject's own Service principal is accepted, while an unrelated Card-bound
-/// Service, and an editor Service acting on its behalf, are refused with
-/// one audited denial each before anything is staged. A caller bound to no
-/// Card is decided by RBAC alone.
+/// A rooted caller may enqueue only a subject its signed Card scope carries:
+/// holding `verifier:run` on exactly the selected Verifier, the subject
+/// family's runtime account rooted at the subject is accepted, while an
+/// unrelated Service rooted at its own Card, and an editor Service acting on
+/// its behalf, are refused with one audited denial each before anything is
+/// staged. A rootless caller is decided by RBAC alone.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
@@ -675,12 +695,8 @@ async fn enqueue_admits_only_signed_scope_subjects() {
         .await
         .expect("role seeds");
 
-    let subject_ref: CardRef = serde_json::from_value(json!({
-        "kind": "Service", "name": "vr-service", "version": "1.0.0", "space": "default"
-    }))
-    .expect("subject ref decodes");
     let owner = server
-        .credential_registered_service(&subject_ref, &["vq_exact_verifier"])
+        .credential_registered_service(&fixture.subject_ref(), &["vq_exact_verifier"])
         .await
         .expect("subject Service is credentialed");
     let owner_jwt = machine_jwt(&server, &owner).await;
@@ -965,7 +981,8 @@ async fn status_reads_audit_cards_read_decisions() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Another tenant's administrator cannot read this tenant's binding or
+/// Another tenant's rootless administrator, which Card admission lets
+/// attribute to any Card it can find, cannot read this tenant's binding or
 /// execution, nor execute its Verifier: each is indistinguishable from an
 /// absent one.
 ///
@@ -990,7 +1007,10 @@ async fn verification_state_is_tenant_isolated() {
         .bootstrap_service_in_tenant(other, "vr-other-admin", &["admin"])
         .await
         .expect("foreign admin bootstraps");
-    let foreign_jwt = machine_jwt(&server, &foreign).await;
+    let foreign_jwt = server
+        .exchange_api_key(foreign.api_key().expect("foreign admin has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
     let reads = [
         (
             format!("/v1/verification/bindings/{}", fixture.ready_binding),
@@ -1064,8 +1084,8 @@ async fn direct_execution_judges_inline_without_enqueueing() {
 /// Verifier, which judges only scheduled windows, are refused with stable
 /// codes. A caller without `verifier:run`, holding only an unrelated `operators:invoke`, or
 /// granted only an unrelated Verifier UID is refused with one audited denial,
-/// while a Card-bound principal granted exactly that Verifier UID is allowed
-/// whatever its observation scope; nothing is ever enqueued.
+/// while the subject's runtime account granted exactly that Verifier UID is
+/// allowed; nothing is ever enqueued.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
@@ -1162,9 +1182,9 @@ async fn direct_execution_refusals_are_stable() {
         .await
         .expect("role seeds");
     let machine = server
-        .bootstrap_service("vx-foreign-service", &["vx_exact_verifier"])
+        .credential_registered_service(&fixture.subject_ref(), &["vx_exact_verifier"])
         .await
-        .expect("card-bound service bootstraps");
+        .expect("subject Service is credentialed");
     let machine_token = machine_jwt(&server, &machine).await;
     let (status, judged) = execute(&server, &machine_token, allowed).await;
     assert_eq!(status, StatusCode::OK, "{judged}");
@@ -1174,6 +1194,77 @@ async fn direct_execution_refusals_are_stable() {
         vec![run_decision("allowed")]
     );
     assert_eq!(fixture.queued_before_sentinel(&server, &jwt).await, 0);
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Direct execution admits the verified subject through the caller's signed
+/// Card limit before any input is staged or the engine runs, exactly as
+/// enqueue does: the subject's runtime account rooted at the subject judges
+/// it, while the same account without a root is refused as needing workload
+/// context, and an unrelated Service rooted at its own Card is refused as out
+/// of scope, each with one audited denial. Rootless callers that may attribute
+/// to any registered Card, an editor user and an unrestricted Service, still
+/// judge it.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, code, verdict, input, queue, or audit
+/// expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_execution_enforces_card_access() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let body = fixture.request(&fixture.assertion, json!(1)).to_string();
+    let owner = server
+        .credential_registered_service(&fixture.subject_ref(), &["editor"])
+        .await
+        .expect("subject Service is credentialed");
+    let rootless_owner = server
+        .exchange_api_key(owner.api_key().expect("owner has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
+    let foreign = server
+        .bootstrap_service("vx-scope-foreign", &["editor"])
+        .await
+        .expect("unrelated Card-bound Service bootstraps");
+    let unrestricted = server
+        .exchange_api_key(foreign.api_key().expect("foreign Service has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
+    let (_, editor) = user(&server, "vx-scope-editor", &["editor"]).await;
+
+    let refusals = [
+        (&rootless_owner, "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED"),
+        (
+            &machine_jwt(&server, &foreign).await,
+            "WYRD_PERMISSION_403_DENIED_RBAC",
+        ),
+    ];
+    for (jwt, code) in refusals {
+        let (status, problem) = execute(&server, jwt, body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+        assert_eq!(problem["code"], code, "{problem}");
+    }
+    let (staged, _) = input_rows(&server, ExecutionId::new_v7()).await;
+    assert_eq!(staged, 0, "a refused execution stages no inputs");
+
+    for jwt in [machine_jwt(&server, &owner).await, unrestricted, editor] {
+        let (status, judged) = execute(&server, &jwt, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{judged}");
+        assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+    }
+    assert_eq!(
+        decisions(&server, "verification.execute", owner.id().as_uuid()).await,
+        vec![run_decision("allowed"), run_decision("denied")]
+    );
+    assert_eq!(
+        decisions(&server, "verification.execute", foreign.id().as_uuid()).await,
+        vec![run_decision("allowed"), run_decision("denied")],
+        "the rooted refusal and the rootless judgment"
+    );
+    assert_eq!(fixture.queued().await, 0, "direct execution never enqueues");
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -1408,5 +1499,249 @@ async fn system_writer_is_unreachable_through_public_principal_routes() {
         (system, name, status, 0),
         "no public route changed or credentialed the SYSTEM writer"
     );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A code-check Verifier spec over the inline `answer` slot whose check
+/// declares `response_format`, returning a cited Verdict with `data`.
+fn scored(response_format: &Value, data: &Value) -> Value {
+    let source = format!(
+        "def check(answer):\n    return {{\"outcome\": \"failed\", \"reason\": \"scored\", \"citations\": [{{\"slot\": \"answer\", \"locator\": {{\"json_pointer\": \"\"}}}}], \"data\": {data}}}\n"
+    );
+    json!({
+        "inputs": { "answer": { "type": "json" } },
+        "requirements": [{
+            "id": "scored",
+            "statement": "The answer is scored.",
+            "check": {
+                "kind": "code", "entrypoint": "check", "inputs": { "answer": "inputs.answer" },
+                "source": { "inline": source }, "response_format": response_format
+            }
+        }]
+    })
+}
+
+/// The `{kind: verdict}` format whose custom data is one numeric `score`.
+fn score_format() -> Value {
+    json!({ "kind": "verdict", "data": {
+        "type": "object", "properties": { "score": { "type": "number" } },
+        "required": ["score"], "additionalProperties": false
+    } })
+}
+
+/// A check Agent judging `inputs.answer` with an inline Prompt answering in
+/// `response_format`, or, when `native` is set, with a native Responses body
+/// that also sets its own text format.
+fn judged(response_format: &Value, native: bool) -> Value {
+    let prompt = if native {
+        json!({
+            "provider": "openai", "model": "gpt-4o", "format": "responses",
+            "body": {
+                "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "Judge {{answer}}" }] }],
+                "text": { "format": { "type": "json_object" } }
+            },
+            "response_format": response_format
+        })
+    } else {
+        json!({
+            "provider": "openai", "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "Judge {{answer}}" }],
+            "response_format": response_format
+        })
+    };
+    json!({
+        "inputs": { "answer": { "type": "json" } },
+        "requirements": [{
+            "id": "judged",
+            "statement": "The answer is judged.",
+            "check": {
+                "kind": "agent", "inputs": { "answer": "inputs.answer" },
+                "agent": {
+                    "execution_route": { "kind": "wyrd_gateway", "deployment": "openai" },
+                    "run_config": { "max_iterations": 1 },
+                    "prompt": prompt
+                }
+            }
+        }]
+    })
+}
+
+/// Register one Verifier named `name` with `spec` through `POST /v1/cards`
+/// as `jwt`.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn declare_verifier(
+    server: &WyrdTestServer,
+    jwt: &str,
+    name: &str,
+    spec: &Value,
+) -> (StatusCode, Value) {
+    let body = json!({ "submissions": [{
+        "apiVersion": "wyrd/v1", "kind": "Verifier",
+        "metadata": { "name": name, "version": "1.0.0" },
+        "spec": spec, "artifacts": []
+    }] });
+    post(
+        server,
+        jwt,
+        "/v1/cards",
+        body.to_string(),
+        Some(&format!("vr-declare-{name}")),
+    )
+    .await
+}
+
+/// Unknown format names, invalid or non-object data schemas, data schemas
+/// declaring another draft or a root `$id`, Prompts that
+/// cannot produce a Verdict (including a composed handwritten schema whose
+/// data is optional), and native bodies that set their own response format
+/// are refused with a structured validation error naming the field,
+/// and the refused Verifier does not exist afterwards; the valid code and
+/// Agent declarations register.
+///
+/// # Panics
+/// Panics when a refused declaration registers or a valid one is refused.
+#[tokio::test(flavor = "current_thread")]
+async fn verdict_declarations_validate_before_persistence() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let (_, jwt) = user(&server, "vr-declarer", &["editor"]).await;
+    let plain = json!({ "outcome": "passed" });
+    let mut optional_data = Value::Object(
+        wyrd_spec::verification::execution::Verdict::response_format(
+            &serde_json::from_value(json!("verdict")).expect("plain format"),
+        )
+        .expect("the plain format resolves"),
+    );
+    optional_data["properties"]["data"] = json!({ "type": "object" });
+    let refused = [
+        ("vr-unknown-name", scored(&json!("score"), &plain)),
+        (
+            "vr-scalar-data",
+            scored(
+                &json!({ "kind": "verdict", "data": { "type": "string" } }),
+                &plain,
+            ),
+        ),
+        (
+            "vr-invalid-data",
+            scored(
+                &json!({ "kind": "verdict", "data": { "type": "object", "properties": { "x": { "type": "nope" } } } }),
+                &plain,
+            ),
+        ),
+        (
+            "vr-not-a-verdict",
+            judged(
+                &json!({ "type": "object", "properties": { "score": { "type": "number" } },
+                         "required": ["score"], "additionalProperties": false }),
+                false,
+            ),
+        ),
+        (
+            "vr-older-draft-data",
+            scored(
+                &json!({ "kind": "verdict", "data": { "$schema": "http://json-schema.org/draft-04/schema#", "type": "object" } }),
+                &plain,
+            ),
+        ),
+        (
+            "vr-authored-id-data",
+            judged(
+                &json!({ "kind": "verdict", "data": { "$id": "#", "type": "object" } }),
+                false,
+            ),
+        ),
+        ("vr-native-conflict", judged(&json!("verdict"), true)),
+        (
+            "vr-composed-optional-data",
+            judged(
+                &json!({ "type": "object", "allOf": [optional_data] }),
+                false,
+            ),
+        ),
+    ];
+    for (name, spec) in refused {
+        let (status, problem) = declare_verifier(&server, &jwt, name, &spec).await;
+        assert!(status.is_client_error(), "{name}: {status} {problem}");
+        assert!(
+            problem["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("WYRD_")),
+            "{name}: {problem}"
+        );
+        assert!(
+            problem.to_string().contains("response_format"),
+            "{name} names the field: {problem}"
+        );
+        let (status, _) = get(&server, &jwt, &format!("/v1/cards/Verifier/{name}/latest")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{name} was not persisted");
+    }
+    for (name, spec) in [
+        (
+            "vr-scored-code",
+            scored(&score_format(), &json!({ "score": 1 })),
+        ),
+        ("vr-scored-agent", judged(&score_format(), false)),
+        ("vr-plain-agent", judged(&json!("verdict"), false)),
+    ] {
+        let (status, body) = declare_verifier(&server, &jwt, name, &spec).await;
+        assert!(status.is_success(), "{name}: {status} {body}");
+        let (status, card) = get(&server, &jwt, &format!("/v1/cards/Verifier/{name}/latest")).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {card}");
+    }
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A direct execution returns its code check's custom data to the home
+/// tenant, through the execution read too, while another tenant's rootless
+/// administrator can neither execute the Verifier nor read the execution.
+///
+/// # Panics
+/// Panics when data is lost at home or any foreign read succeeds.
+#[tokio::test(flavor = "current_thread")]
+async fn custom_verdict_data_is_tenant_isolated() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let verifier = fixture
+        .seed
+        .verifier(
+            "vr-scored",
+            &scored(&score_format(), &json!({ "score": 0.5 })),
+        )
+        .await
+        .expect("scored Verifier registers");
+    let (_, jwt) = user(&server, "vr-scorer", &["editor"]).await;
+    let body = fixture.request(&verifier, json!({ "text": "one" }));
+
+    let (status, result) = execute(&server, &jwt, body.to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let requirement = &result["outcome"]["requirements"][0];
+    assert_eq!(requirement["outcome"], "failed", "{result}");
+    assert_eq!(requirement["data"], json!({ "score": 0.5 }), "{result}");
+
+    let other: DataTenantId = server.seed_tenant("vr-other").await.expect("tenant seeds");
+    let foreign = server
+        .bootstrap_service_in_tenant(other, "vr-other-admin", &["admin"])
+        .await
+        .expect("foreign admin bootstraps");
+    let foreign_jwt = server
+        .exchange_api_key(foreign.api_key().expect("foreign admin has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
+    let (status, problem) = execute(&server, &foreign_jwt, body.to_string()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
+    assert!(!problem.to_string().contains("score"), "{problem}");
+    let uri = format!(
+        "/v1/verification/executions/{}",
+        result["execution_id"].as_str().expect("id")
+    );
+    let (status, problem) = get(&server, &foreign_jwt, &uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{problem}");
+    assert!(!problem.to_string().contains("score"), "{problem}");
     server.shutdown().await.expect("test server shuts down");
 }

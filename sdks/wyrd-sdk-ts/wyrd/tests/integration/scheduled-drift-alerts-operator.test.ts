@@ -14,10 +14,10 @@ import {
   type WyrdError,
   WyrdState,
 } from "wyrd-ai";
-import { cli, type NativeWyrdTestServer } from "@wyrd/testing";
+import type { NativeWyrdTestServer } from "@wyrd/testing";
 
 import { Receiver } from "../support/http-receiver.js";
-import { binding, fixture, declared, scheduledResult, serverTest } from "../support/server.js";
+import { binding, fixture, declared, runtimeAccount, scheduledResult, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 240_000 });
 
@@ -110,7 +110,7 @@ async function record(
 ) {
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-latency-watch-"));
   await cards.pull(watch.root, bundle);
-  const watchKey = await cli.issueKey({ ...watch.root, space: watch.root.space ?? "default" });
+  const watchKey = await runtimeAccount({ kind: "Service", name: watch.root.name });
   const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: watchKey.key }) });
   await state.startBifrost();
   const run = state.run();
@@ -236,7 +236,7 @@ test.for([
     (error: unknown) => error,
   );
   expect(JSON.stringify((refused as WyrdError | undefined)?.details)).toContain(field);
-  await expect(cards.resolveLatest(kind, "default", name)).rejects.toMatchObject({
+  await expect(cards.resolveLatest(kind, name)).rejects.toMatchObject({
     code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
   });
 });

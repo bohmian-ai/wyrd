@@ -1,11 +1,14 @@
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
+import { cpSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { Cards, WyrdClient, WyrdState } from "wyrd-ai";
-import { cli } from "@wyrd/testing";
 
 import { observedService } from "../support/observed-service.js";
-import { binding, scheduledResult } from "../support/server.js";
+import { binding, fixture, runtimeAccount, scheduledResult } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -76,9 +79,19 @@ test("run view exposes its alias", ({ state }) => {
   expect(agentRun.runId).not.toBe(run.runId);
 });
 
-test("card scoped key cannot write another cards observations", async ({ bundle }) => {
-  const agentKey = await cli.issueKey({ kind: "Agent", name: "observed-agent", version: "1.0.0", space: "default" });
-  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: agentKey.key }) });
+test("stale bundle cannot write outside its service graph", async ({ bundle }) => {
+  const model = WyrdState.fromPath(bundle).cardRef("model").uid ?? "";
+  const cards = await Cards.connect();
+  const { root } = await cards.declareFromPath(fixture("cards/observe_a_run/configured-service.yaml"));
+  const stale = mkdtempSync(join(tmpdir(), "wyrd-ts-stale-"));
+  cpSync(bundle, stale, { recursive: true });
+  for (const file of readdirSync(stale, { recursive: true, encoding: "utf8" })) {
+    if (file.endsWith(".yaml")) {
+      const path = join(stale, file);
+      writeFileSync(path, readFileSync(path, "utf8").replaceAll(model, root.uid ?? ""));
+    }
+  }
+  const state = WyrdState.fromPath(stale, { client: WyrdClient.connect() });
   await state.startBifrost();
 
   expect(await state.run().forCard("model").observe.submit("observed-drift", { latency: 12.5 })).toEqual({
@@ -93,4 +106,39 @@ test("unsealable byte budget is refused at connect", async ({ state }) => {
   await expect(state.startBifrost({ clientByteLimitBytes: 1024 })).rejects.toMatchObject({
     code: "WYRD_CLIENT_400_CONFIG_INVALID",
   });
+});
+
+test("configured service context reaches both verification subjects", async ({ server: _ }) => {
+  const cards = await Cards.connect();
+  const { root } = await cards.declareFromPath(fixture("cards/observe_a_run/configured-service.yaml"));
+  const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-configured-"));
+  await cards.pull(root, bundle);
+  const { key } = await runtimeAccount({ kind: "Service", name: "configured-service" });
+
+  const verdicts = new Set<string>();
+  for (const environment of ["prod", "staging"]) {
+    const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
+    state.configure({ deploymentEnvironment: environment });
+    const run = state.run();
+    const agent = run.forCard("agent");
+
+    const result = await agent.observe.verify("agent-check", "yes");
+    expect(result.subject).toEqual(state.cardRef("agent"));
+    expect(result.deployment_environment).toBe(environment);
+    const submitted = await agent.observe.submit("agent-check", "yes");
+    if (submitted.kind !== "queued") {
+      throw new Error("Run evidence queues an execution");
+    }
+    const queued = await submitted.execution.wait({ timeoutMs: 60_000 });
+    expect(queued.subject).toEqual(state.cardRef("agent"));
+    expect(queued.deployment_environment).toBe(environment);
+
+    const checked = await run.observe.verify("service-check", "yes");
+    expect(checked.subject).toEqual(state.rootRef);
+    expect(checked.deployment_environment).toBe(environment);
+    verdicts.add(checked.outcome.verdict);
+    expect(() => state.configure()).toThrow(expect.objectContaining({ code: "WYRD_SDK_409_STATE_CONFIG_FROZEN" }));
+  }
+  // A differing correlation tag never changes the verdict.
+  expect(verdicts.size).toBe(1);
 });

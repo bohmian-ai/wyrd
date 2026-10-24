@@ -14,7 +14,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, InlineableRef};
 
-use crate::identity::{card_name, optional_card_uid, space_name, validation_error, version_block};
+use crate::identity::{card_name, optional_card_uid, validation_error, version_block};
 
 /// PromptCard filesystem IO helpers.
 pub mod io;
@@ -97,8 +97,6 @@ impl PromptCardMetadata {
 )]
 #[derive(Serialize, Deserialize)]
 pub struct PromptCard {
-    /// `PromptCard` space.
-    pub space: String,
     /// `PromptCard` name.
     pub name: String,
     /// `PromptCard` version.
@@ -125,17 +123,10 @@ impl PromptCard {
     /// Create a local `PromptCard` holder around a native prompt.
     #[must_use]
     pub fn from_native_prompt(prompt: skald_spec::Prompt) -> Self {
-        let mut space = None;
         let mut labels = Labels::default();
         let mut annotations = Annotations::default();
-        crate::identity::apply_repo_defaults(
-            &CardKind::Prompt,
-            &mut space,
-            &mut labels,
-            &mut annotations,
-        );
+        crate::identity::apply_repo_defaults(&CardKind::Prompt, &mut labels, &mut annotations);
         Self {
-            space: space.unwrap_or_else(|| "default".to_owned()),
             name: "prompt".to_owned(),
             version: "0.1.0".to_owned(),
             uid: wyrd_utils::uuid7(),
@@ -200,7 +191,6 @@ impl PromptCard {
             kind: CardKind::Prompt,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -227,12 +217,6 @@ impl PromptCard {
             ));
         };
 
-        let space = card.metadata.space.as_ref().ok_or_else(|| {
-            validation_error(
-                "PromptCard envelope missing space in metadata",
-                serde_json::Value::Null,
-            )
-        })?;
         let uid = card.metadata.uid.as_ref().ok_or_else(|| {
             validation_error(
                 "PromptCard envelope missing uid in metadata",
@@ -241,7 +225,6 @@ impl PromptCard {
         })?;
 
         Ok(Self {
-            space: space.to_string(),
             name: card.metadata.name.to_string(),
             version: card
                 .metadata
@@ -273,12 +256,19 @@ impl PromptCard {
         Ok(())
     }
 
+    /// Convert the holder's flat identity and maps into envelope metadata.
+    ///
+    /// The version becomes an exact pin and an empty UID is absent; server
+    /// derived hashes and origin are left unset.
+    ///
+    /// # Errors
+    /// Returns a validation error when the name, version, or non-empty UID is
+    /// not well formed.
     fn to_envelope_metadata(&self) -> Result<EnvelopeMetadata, WyrdError> {
         Ok(EnvelopeMetadata {
             name: card_name("name", &self.name)?,
             version: Some(version_block(&self.version)?.into()),
             bump: None,
-            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
             labels: self.labels.clone(),
             annotations: self.annotations.clone(),
@@ -297,13 +287,12 @@ impl PromptReference {
     /// # Errors
     /// Returns a Wyrd error when the card identity fields are invalid.
     #[staticmethod]
-    #[pyo3(signature = (name, version, *, space, uid=None))]
-    pub fn card(name: &str, version: &str, space: &str, uid: Option<&str>) -> CardPyResult<Self> {
+    #[pyo3(signature = (name, version, *, uid=None))]
+    pub fn card(name: &str, version: &str, uid: Option<&str>) -> CardPyResult<Self> {
         let card_ref = CardRef {
             kind: CardKind::Prompt,
             name: card_name("name", name)?,
             version: version_block(version)?,
-            space: Some(space_name(space)?),
             uid: uid.map_or(Ok(None), optional_card_uid)?,
         };
         Ok(Self::from_native(InlineableRef::Ref(card_ref)))
@@ -438,7 +427,6 @@ impl PromptCard {
     ///
     /// # Arguments
     /// * `prompt` - A `wyrd.prompt.Prompt` builder.
-    /// * `space` - Optional card space. Defaults to `default`.
     /// * `name` - Optional card name. Defaults to `prompt`.
     /// * `version` - Optional semantic version. Defaults to `0.1.0`.
     /// * `uid` - Optional `UUIDv7` card UID. Defaults to a generated UID.
@@ -450,7 +438,7 @@ impl PromptCard {
     /// # Errors
     /// Returns a Wyrd error when the prompt, settings, or metadata labels are invalid.
     #[new]
-    #[pyo3(signature = (prompt, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None, model_settings=None))]
+    #[pyo3(signature = (prompt, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None, model_settings=None))]
     #[allow(
         clippy::too_many_arguments,
         reason = "pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the PromptCard() Python constructor"
@@ -458,7 +446,6 @@ impl PromptCard {
     pub fn __new__(
         py: Python<'_>,
         prompt: &Bound<'_, PyAny>,
-        space: Option<&str>,
         name: Option<&str>,
         version: Option<&str>,
         uid: Option<&str>,
@@ -478,18 +465,15 @@ impl PromptCard {
             Some(runtime_prompt_from_py(prompt)?)
         };
 
-        let mut resolved_space = space.map(str::to_owned);
         let mut resolved_labels = labels_from_user(labels.unwrap_or_default())?;
         let mut resolved_annotations = annotations_from_user(annotations.unwrap_or_default())?;
         crate::identity::apply_repo_defaults(
             &CardKind::Prompt,
-            &mut resolved_space,
             &mut resolved_labels,
             &mut resolved_annotations,
         );
 
         Ok(Self {
-            space: resolved_space.unwrap_or_else(|| "default".to_owned()),
             name: name.unwrap_or("prompt").to_owned(),
             version: version.unwrap_or("0.1.0").to_owned(),
             uid: uid.map_or_else(wyrd_utils::uuid7, str::to_owned),
@@ -526,18 +510,6 @@ impl PromptCard {
     #[getter]
     pub fn model_settings(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
         Ok(skald_prompt::model_settings_py(&self.metadata.prompt, py)?)
-    }
-
-    /// Return the `PromptCard` space.
-    #[getter]
-    pub fn space(&self) -> &str {
-        &self.space
-    }
-
-    /// Set the `PromptCard` space.
-    #[setter]
-    pub fn set_space(&mut self, value: String) {
-        self.space = value;
     }
 
     /// Return the `PromptCard` name.
@@ -909,7 +881,6 @@ mod tests {
     #[test]
     fn builds_prompt_card_ref_from_holder_identity() {
         let mut card = PromptCard::from_native_prompt(default_prompt());
-        card.space = "growth".to_owned();
         card.name = "lead-scoring".to_owned();
         card.version = "1.2.3".to_owned();
 
@@ -918,9 +889,5 @@ mod tests {
         assert_eq!(card_ref.kind, CardKind::Prompt);
         assert_eq!(card_ref.name.to_string(), "lead-scoring");
         assert_eq!(card_ref.version.to_string(), "1.2.3");
-        assert_eq!(
-            card_ref.space.as_ref().map(ToString::to_string).as_deref(),
-            Some("growth")
-        );
     }
 }

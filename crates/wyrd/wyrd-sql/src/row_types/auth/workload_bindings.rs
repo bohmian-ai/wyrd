@@ -2,12 +2,8 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
-use wyrd_spec::reference::CardRef;
 
 /// SQL row for `wyrd.auth_workload_bindings`.
-///
-/// `card_ref` is stored as JSONB and decoded to the full structured [`CardRef`]
-/// (kind, name, version, space, uid) — never a flattened string.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct WorkloadBindingRow {
     /// Tenant isolation UUID as stored by Postgres.
@@ -18,9 +14,10 @@ pub struct WorkloadBindingRow {
     pub subject: String,
     /// Optional audience override; `None` acts as a wildcard fallback.
     pub audience: Option<String>,
-    /// Structured Card reference decoded from JSONB.
-    #[sqlx(json)]
-    pub card_ref: CardRef,
+    /// Stable Service account the subject authenticates as.
+    pub principal_id: Uuid,
+    /// Optional pinned default root.
+    pub workload_uid: Option<Uuid>,
     /// Row creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Row update timestamp.

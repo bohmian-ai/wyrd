@@ -314,7 +314,7 @@ where
         let prefix = format!("{prefix}[{i}].check");
         match &mut requirement.check {
             Check::Agent(call) => visit_agent_call(call, &prefix, f),
-            Check::Code(call) => visit_code_call(call, &prefix, f),
+            Check::Code(check) => visit_code_call(&mut check.call, &prefix, f),
             Check::Drift(drift) => drift.spec.visit_at(&prefix, f),
             Check::Assert { .. } | Check::Trace(_) => {}
         }
@@ -483,20 +483,19 @@ mod blocks_tests {
     /// Panics when a slot is missing or yielded at the wrong path.
     #[test]
     fn blocks_verifier_yields_every_reference_slot() {
-        let agent =
-            json!({"kind": "Agent", "space": "support", "name": "judge", "version": "1.0.0"});
+        let agent = json!({"kind": "Agent", "name": "judge", "version": "1.0.0"});
         let inline = json!({
-            "prompt": {"kind": "Prompt", "space": "support", "name": "judge-prompt", "version": "1.0.0"},
+            "prompt": {"kind": "Prompt", "name": "judge-prompt", "version": "1.0.0"},
             "execution_route": {"kind": "wyrd_gateway", "deployment": "openai-primary"}
         });
         let mut spec: VerifierSpec = serde_json::from_value(json!({
             "steps": [{"id": "a", "action": {"kind": "agent", "agent": inline},
                 "requirements": [{"id": "b", "statement": "s", "check": {"kind": "code", "entrypoint": "f",
-                    "source": {"artifact": {"card": {"kind": "Artifact", "space": "support", "name": "checks", "version": "1.0.0"}}}}}]}],
+                    "source": {"artifact": {"card": {"kind": "Artifact", "name": "checks", "version": "1.0.0"}}}}}]}],
             "requirements": [
                 {"id": "c", "statement": "s", "check": {"kind": "agent", "agent": agent}},
                 {"id": "d", "statement": "s", "check": {"kind": "drift", "on": "inputs.x", "method": "Spc",
-                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "space": "risk", "name": "train", "version": "1.0.0"}, "features": ["x"]},
+                    "signal": {"kind": "Distribution", "baseline_ref": {"kind": "Data", "name": "train", "version": "1.0.0"}, "features": ["x"]},
                     "condition": {"kind": "Statistical"}}}
             ]
         }))
@@ -555,7 +554,7 @@ mod completeness_tests {
         VerifierSpec,
     };
     use crate::envelope::{CardKind, Spec};
-    use crate::ids::{CardName, ColumnName, SpaceName};
+    use crate::ids::{CardName, ColumnName};
     use crate::reference::{CardRef, InlineableRef, Ref};
     use crate::verification::TaskId;
     use wyrd_semver::VersionBlock;
@@ -565,7 +564,6 @@ mod completeness_tests {
             kind,
             name: CardName::new(name).expect("fixture card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("fixture version is valid"),
-            space: Some(SpaceName::new("default").expect("fixture space is valid")),
             uid: None,
         }
     }

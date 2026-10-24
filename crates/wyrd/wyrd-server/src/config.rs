@@ -2532,8 +2532,8 @@ pub struct IssuerEntry {
 
 /// Config DTO for one `[[workload_bindings]]` entry.
 ///
-/// Maps to `wyrd_auth_oidc::WorkloadBinding` minus boot-derived fields
-/// (`tenant_id`, resolved `card_ref`). Boot commit 03 converts this DTO.
+/// Maps to `wyrd_auth_oidc::WorkloadBinding` minus the boot-derived
+/// `tenant_id`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadBindingEntry {
@@ -2543,15 +2543,13 @@ pub struct WorkloadBindingEntry {
     pub subject: String,
     /// Optional audience constraint for additional lookup precision.
     pub audience: Option<String>,
-    /// Card kind backing the workload principal — `service` or `agent`. Any
-    /// other kind is rejected at boot (it can never resolve a principal).
-    pub kind: String,
-    /// Card name.
-    pub name: String,
-    /// Space that pins the card identity.
-    pub space: String,
-    /// Exact card version (no version range).
-    pub version: String,
+    /// Active stable Service account the verified workload authenticates
+    /// as; any other principal is refused at boot.
+    pub principal_id: wyrd_spec::auth::PrincipalId,
+    /// Optional pinned default root, used when a jwt-bearer request names
+    /// none; execution context, never account identity.
+    #[serde(default)]
+    pub workload_uid: Option<wyrd_spec::ids::CardUid>,
 }
 
 /// `[gateway]` operator configuration for tenant provider credentials.
@@ -3564,17 +3562,13 @@ impl WyrdServerConfig {
                 }
             }
 
-            // 17. Each workload_bindings entry must have all card-target fields non-empty.
+            // 17. Each workload_bindings entry must name its issuer and subject.
             for (idx, binding) in self.workload_bindings.iter().enumerate() {
                 let loc = |field: &str| format!("workload_bindings[{idx}].{field}");
 
                 for (field, value) in [
                     ("issuer", binding.issuer.as_str()),
                     ("subject", binding.subject.as_str()),
-                    ("kind", binding.kind.as_str()),
-                    ("name", binding.name.as_str()),
-                    ("space", binding.space.as_str()),
-                    ("version", binding.version.as_str()),
                 ] {
                     if value.is_empty() {
                         return Err(ConfigError::Invalid {
@@ -5387,6 +5381,11 @@ minimum_slots = 2
 
     // ── 19. Populated [[workload_bindings]] round-trips through TOML ─────────
 
+    /// A populated `[[workload_bindings]]` entry parses with every field intact.
+    ///
+    /// # Panics
+    /// Panics when the TOML fails to parse or any parsed binding field differs
+    /// from the input.
     #[test]
     fn workload_binding_toml_round_trip() {
         let toml = r#"
@@ -5394,10 +5393,8 @@ minimum_slots = 2
             issuer = "https://idp.example.com"
             subject = "system:serviceaccount:default/my-sa"
             audience = "my-audience"
-            kind = "service"
-            name = "my-model"
-            space = "prod"
-            version = "1.0.0"
+            principal_id = "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
+            workload_uid = "01890f28-7c4a-7000-98e7-4f4a3c2d1b03"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         assert_eq!(cfg.workload_bindings.len(), 1);
@@ -5405,10 +5402,17 @@ minimum_slots = 2
         assert_eq!(binding.issuer, "https://idp.example.com");
         assert_eq!(binding.subject, "system:serviceaccount:default/my-sa");
         assert_eq!(binding.audience.as_deref(), Some("my-audience"));
-        assert_eq!(binding.kind, "service");
-        assert_eq!(binding.name, "my-model");
-        assert_eq!(binding.space, "prod");
-        assert_eq!(binding.version, "1.0.0");
+        assert_eq!(
+            binding.principal_id.to_string(),
+            "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
+        );
+        assert_eq!(
+            binding
+                .workload_uid
+                .as_ref()
+                .map(wyrd_spec::ids::CardUid::as_str),
+            Some("01890f28-7c4a-7000-98e7-4f4a3c2d1b03")
+        );
     }
 
     // ── 20. Unknown field in issuer entry rejected ────────────────────────────
@@ -5432,16 +5436,18 @@ minimum_slots = 2
 
     // ── 21. Unknown field in binding entry rejected ───────────────────────────
 
+    /// An unknown key in a `[[workload_bindings]]` entry fails TOML parsing.
+    ///
+    /// # Panics
+    /// Panics when the TOML parses or fails with an error other than
+    /// `ConfigError::ParseToml`.
     #[test]
     fn workload_binding_entry_unknown_field_rejected() {
         let toml = r#"
             [[workload_bindings]]
             issuer = "https://idp.example.com"
             subject = "system:serviceaccount:ns/sa"
-            kind = "model"
-            name = "my-model"
-            space = "prod"
-            version = "1.0.0"
+            principal_id = "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
             extra_field = "bad"
         "#;
         let err = from_toml_str_with_dev_oracle_opt_in(toml).expect_err("unknown field must fail");
@@ -5578,16 +5584,18 @@ minimum_slots = 2
 
     // ── 28. Empty issuer in workload binding → Invalid ────────────────────────
 
+    /// A workload binding with an empty issuer parses but fails validation.
+    ///
+    /// # Panics
+    /// Panics when the TOML fails to parse, or validation passes or fails
+    /// without an `Invalid` message naming the issuer.
     #[test]
     fn binding_entry_empty_issuer_invalid() {
         let toml = r#"
             [[workload_bindings]]
             issuer = ""
             subject = "system:serviceaccount:default/my-sa"
-            kind = "model"
-            name = "my-model"
-            space = "prod"
-            version = "1.0.0"
+            principal_id = "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("empty binding issuer must fail");
@@ -5599,16 +5607,18 @@ minimum_slots = 2
 
     // ── 29. Empty subject in workload binding → Invalid ───────────────────────
 
+    /// A workload binding with an empty subject parses but fails validation.
+    ///
+    /// # Panics
+    /// Panics when the TOML fails to parse, or validation passes or fails
+    /// without an `Invalid` message naming the subject.
     #[test]
     fn binding_entry_empty_subject_invalid() {
         let toml = r#"
             [[workload_bindings]]
             issuer = "https://idp.example.com"
             subject = ""
-            kind = "model"
-            name = "my-model"
-            space = "prod"
-            version = "1.0.0"
+            principal_id = "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("empty subject must fail");
@@ -5618,24 +5628,27 @@ minimum_slots = 2
         );
     }
 
-    // ── 30. Empty card-target field in workload binding → Invalid ─────────────
+    // ── 30. Malformed principal id in workload binding → ParseToml ────────────
 
+    /// A workload binding whose `principal_id` is not a principal id fails TOML
+    /// parsing.
+    ///
+    /// # Panics
+    /// Panics when the TOML parses or fails with an error other than
+    /// `ConfigError::ParseToml`.
     #[test]
-    fn binding_entry_empty_version_invalid() {
+    fn binding_entry_malformed_principal_id_rejected() {
         let toml = r#"
             [[workload_bindings]]
             issuer = "https://idp.example.com"
             subject = "system:serviceaccount:default/my-sa"
-            kind = "model"
-            name = "my-model"
-            space = "prod"
-            version = ""
+            principal_id = "not-a-principal"
         "#;
-        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
-        let err = cfg.validate().expect_err("empty version must fail");
+        let err = from_toml_str_with_dev_oracle_opt_in(toml)
+            .expect_err("a malformed principal id must fail");
         assert!(
-            matches!(err, ConfigError::Invalid { ref message } if message.contains("version")),
-            "expected Invalid(version), got {err:?}"
+            matches!(err, ConfigError::ParseToml { .. }),
+            "expected ParseToml, got {err:?}"
         );
     }
 
@@ -5679,16 +5692,19 @@ minimum_slots = 2
 
     // ── 33. workload_bindings present without tenant_slug → Invalid ───────────
 
+    /// Workload bindings configured without `auth.tenant_slug` fail validation,
+    /// because boot cannot resolve the tenant they bind to.
+    ///
+    /// # Panics
+    /// Panics when the TOML fails to parse, or validation passes or fails
+    /// without an `Invalid` message naming `tenant_slug`.
     #[test]
     fn bindings_without_tenant_slug_invalid() {
         let toml = r#"
             [[workload_bindings]]
             issuer = "https://idp.example.com"
             subject = "system:serviceaccount:default/my-sa"
-            kind = "model"
-            name = "my-model"
-            space = "prod"
-            version = "1.0.0"
+            principal_id = "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
         "#;
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("missing tenant_slug must fail");

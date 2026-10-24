@@ -3,7 +3,6 @@ kind: Operator
 metadata:
   name: refund-alert
   version: 1.0.0
-  space: default
 spec:
   description: Tell the refunds desk when an order conversation's group execution changes verdict.
   kind: http

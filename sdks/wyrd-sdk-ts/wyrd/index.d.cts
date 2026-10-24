@@ -111,11 +111,16 @@ export declare class NativeBifrost {
    * The row names its own `table` and JSON Schema rather than this client's
    * bound table, so instrumentation never disturbs the application's
    * binding. A producer refusal, such as a full queue, is counted on
-   * [`NativeBifrost::dropped`] instead of returned.
+   * [`NativeBifrost::dropped`] instead of returned. The first row for a
+   * table this client has not described records on a background task
+   * once the describe returns its table version; a failed describe is
+   * counted the same way. That record is admitted before the task starts,
+   * so a following `flush` or `shutdown` waits for it.
    *
    * # Errors
    *
-   * Returns a napi error only when the outcome cannot be encoded; an
+   * Returns a napi error only when the outcome cannot be encoded or the
+   * background describe cannot be scheduled; an
    * unparsable or unmappable schema and an invalid Card UID are
    * returned in [`NativeLifecycleResult`].
    */
@@ -286,16 +291,15 @@ export declare class NativeCards {
    * # Arguments
    *
    * * `kind` - The Card kind, such as `Model`.
-   * * `space` - The Card space.
    * * `name` - The Card name.
    *
    * # Errors
    *
    * Returns a napi error only when the reference cannot be serialized; a
-   * malformed kind, space, or name (`WYRD_SPEC_400_VALIDATION`), no Active
+   * malformed kind or name (`WYRD_SPEC_400_VALIDATION`), no Active
    * version, and registry failures are returned in the result.
    */
-  resolveLatest(kind: string, space: string, name: string): Promise<NativeLifecycleResult>
+  resolveLatest(kind: string, name: string): Promise<NativeLifecycleResult>
   /**
    * Pulls one Card graph into a published local bundle.
    *
@@ -580,6 +584,16 @@ export declare class NativePrincipals {
    */
   revokePrincipal(principalId: string, requestJson: string): Promise<NativeLifecycleResult>
   /**
+   * Replaces a Service principal's workload restriction from a serialized
+   * `WorkloadRestriction`, resolving the updated `PrincipalSummary`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the summary cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  setWorkloadRestriction(principalId: string, restrictionJson: string): Promise<NativeLifecycleResult>
+  /**
    * Lists one page of assignable principals from a serialized
    * `PrincipalQuery`.
    *
@@ -759,6 +773,23 @@ export declare class NativeWyrdClient {
    */
   onBehalfOf(subjectToken: string, audience: string): Promise<NativeWyrdClientResult>
   /**
+   * Returns the exact Service Card UID this client runs as, or
+   * `null` for rootless work.
+   */
+  get workloadUid(): string | null
+  /**
+   * Returns the deployment environment correlation tag this client's
+   * requests carry, or `null` when none is configured.
+   */
+  get deploymentEnvironment(): string | null
+  /**
+   * Returns a client that runs as the exact Service root
+   * `workload_uid`, sharing this client's credential and connection pools
+   * but not its token cache. Performs no IO; a `workload_uid` that is not a
+   * UUIDv7 is a `WYRD_SPEC_400_VALIDATION` result.
+   */
+  forWorkload(workloadUid: string): NativeWyrdClientResult
+  /**
    * Connects one Bifrost client over this client's authentication and
    * transport, optionally already bound to a write target.
    *
@@ -848,6 +879,25 @@ export declare class NativeWyrdClient {
  * on the first read instead of as an untyped constructor failure.
  */
 export declare class NativeWyrdState {
+  /**
+   * Fixes the state's Service release and deployment environment before
+   * first use, as `WyrdState::configure` does; local, with no IO.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the result cannot be serialized; the
+   * frozen and invalid-field refusals are returned in the result.
+   */
+  configure(options: NativeConfigureOptions): NativeLifecycleResult
+  /**
+   * The configured deployment environment correlation tag, or `null` when
+   * none is set; reading it fixes an unconfigured state's defaults.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the value cannot be serialized.
+   */
+  deploymentEnvironment(): NativeLifecycleResult
   /**
    * The client this state's server calls run as, resolving the ambient one
    * once on first use, so a telemetry exporter authenticates as the state.
@@ -1002,11 +1052,14 @@ export declare class NativeWyrdState {
  * Omitted arguments resolve through `client_from_options`: the environment,
  * then the saved `wyrd auth login` for this server (the one for
  * `WYRD_TENANT` when set, otherwise the newest), then
- * `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
- * metadata, including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server
- * has saved logins but none for `WYRD_TENANT`.
+ * `~/.config/wyrd/credentials.toml`. A `workload_uid` runs the client as
+ * that exact root, as [`NativeWyrdClient::for_workload`] does; omitted,
+ * `WYRD_WORKLOAD_UID` is read. Failures are returned as catalog metadata,
+ * including `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this server has saved
+ * logins but none for `WYRD_TENANT` and `WYRD_SPEC_400_VALIDATION` for a
+ * `workload_uid` that is not a UUIDv7.
  */
-export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): NativeWyrdClientResult
+export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, workloadUid?: string | undefined | null): NativeWyrdClientResult
 
 /** Closed result of reading one client's current bearer: a token or a catalog error. */
 export interface NativeAccessTokenResult {
@@ -1041,6 +1094,19 @@ export interface NativeCardsConnection {
   handle?: NativeCards
   /** Catalog failure otherwise. */
   error?: NativeWyrdError
+}
+
+/** The explicit fields `WyrdState.configure` fixes; omitted ones default. */
+export interface NativeConfigureOptions {
+  /** The loaded Service's name, which must match it. */
+  serviceName?: string
+  /** The loaded Service's exact version, which must match it. */
+  serviceVersion?: string
+  /**
+   * The deployment environment correlation tag copied onto rows; it never
+   * selects or refuses execution.
+   */
+  deploymentEnvironment?: string
 }
 
 /** A local file for a `media` slot, read only when the call pins it. */

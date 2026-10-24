@@ -21,7 +21,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
@@ -772,7 +772,7 @@ fn check_bindings(
         }
         Check::Trace(trace) => scope.resolve_all([("on", &trace.on)], current),
         Check::Agent(call) => scope.resolve_all(&call.inputs, current),
-        Check::Code(call) => scope.resolve_all(&call.inputs, current),
+        Check::Code(check) => scope.resolve_all(&check.call.inputs, current),
         Check::Drift(_) => Ok(BTreeMap::new()),
     }
 }
@@ -889,6 +889,8 @@ struct Judged {
     actual: Option<Value>,
     /// Citations of reachable original evidence.
     citations: Vec<Citation>,
+    /// Custom data an accepted Verdict carried.
+    data: Option<Map<String, Value>>,
     /// Check-specific detail.
     detail: Option<RequirementDetail>,
     /// What executed the check.
@@ -916,6 +918,7 @@ impl Judged {
             reason: self.reason,
             actual: capture_actual(self.actual, capture)?,
             citations: self.citations,
+            data: self.data,
             detail: self.detail,
             check: requirement.check.clone(),
             provenance: self.provenance,
@@ -939,6 +942,7 @@ impl Judged {
             reason,
             actual: None,
             citations: Vec::new(),
+            data: None,
             detail: None,
             provenance: None,
         }
@@ -978,6 +982,7 @@ impl Judged {
             reason: output.verdict.reason,
             actual: output.actual,
             citations: output.verdict.citations,
+            data: output.verdict.data,
             detail: output.detail,
             provenance: output.provenance,
         }

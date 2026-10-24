@@ -16,6 +16,8 @@ class WyrdClient:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        *,
+        workload_uid: str | None = None,
     ) -> None:
         """Build a client, resolving every omitted value locally.
 
@@ -37,12 +39,17 @@ class WyrdClient:
             grpc_url: the gRPC endpoint. Resolved from ``WYRD_GRPC_URL`` and
                 then the effective server URL's scheme and host on port
                 ``50051`` if omitted.
+            workload_uid: the exact Service Card UID the client runs
+                as, as ``for_workload`` selects it. Resolved from
+                ``WYRD_WORKLOAD_UID`` if omitted; without either, work is
+                rootless.
 
         Raises:
             WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no credential
                 resolves; ``WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`` when this
                 server has saved logins but none for ``WYRD_TENANT``, or the saved
-                login can no longer be renewed;
+                login can no longer be renewed; ``WYRD_SPEC_400_VALIDATION``
+                when ``workload_uid`` is not a UUIDv7;
                 ``WYRD_CLIENT_503_TRANSPORT_DOWN`` when the HTTP transport
                 cannot be built.
 
@@ -57,6 +64,34 @@ class WyrdClient:
     @property
     def grpc_url(self) -> str:
         """The effective gRPC endpoint, resolved as described in ``WyrdClient()``."""
+        ...
+
+    @property
+    def workload_uid(self) -> str | None:
+        """The exact Service Card UID this client runs as, or ``None`` for rootless work."""
+        ...
+
+    @property
+    def deployment_environment(self) -> str | None:
+        """The deployment environment correlation tag requests carry, or ``None``."""
+        ...
+
+    def for_workload(self, workload_uid: str) -> WyrdClient:
+        """Return a client that runs as the exact Service root ``workload_uid``.
+
+        The returned client shares this client's credential and connection
+        pools but keeps its own token cache: an API key or workload token
+        requests the root in its exchange and every renewal, and every request
+        carries it as ``x-wyrd-workload-uid``. No network call is made; the
+        server validates the root on first use.
+
+        Args:
+            workload_uid: the exact Service Card UID to run as.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``workload_uid`` is
+                not a UUIDv7.
+        """
         ...
 
     def access_token(self) -> str:

@@ -195,12 +195,15 @@ fn inputs(
 pub struct PyRun {
     /// The native view; cloning it is cloning the view, not the writer.
     inner: Run,
+    /// The token of the state this view was opened on, so only that state's
+    /// `http_auth` adopts it.
+    state: u64,
 }
 
 impl PyRun {
-    /// Wrap one native view for Python.
-    pub(crate) fn new(inner: Run) -> Self {
-        Self { inner }
+    /// Wrap one native view of the state identified by `state` for Python.
+    pub(crate) fn new(inner: Run, state: u64) -> Self {
+        Self { inner, state }
     }
 }
 
@@ -227,6 +230,7 @@ impl PyRun {
     fn for_card(&self, alias: &str) -> WyrdPyResult<Self> {
         Ok(Self::new(
             self.inner.for_card(alias).map_err(WyrdPyError::from)?,
+            self.state,
         ))
     }
 
@@ -249,6 +253,7 @@ impl PyRun {
                 (
                     run.inner.subject_uid().as_str(),
                     run.inner.run_id().as_str(),
+                    run.state,
                 ),
             )
         });
@@ -280,6 +285,7 @@ impl PyRun {
                 (
                     run.inner.subject_uid().as_str(),
                     run.inner.run_id().as_str(),
+                    run.state,
                 ),
             )
         });
@@ -350,8 +356,33 @@ impl PyObserveHandle {
         let inputs = inputs(py, value, named)?;
         let observe = self.observe().grouped(group_id)?;
         crate::trace::block_on(py, observe.verify(verifier, inputs))
-            .map(PyVerificationResult)
+            .map(PyVerificationResult::plain)
             .map_err(WyrdPyError::from)
+    }
+
+    /// [`PyObserveHandle::verify`], with every requirement's custom `data`
+    /// converted by `data_type.model_validate` before returning.
+    ///
+    /// `verifier` and `data_type` are positional-only, so an input slot named
+    /// `data_type` still passes as a keyword. A refused conversion leaves the
+    /// stored result unchanged and never reruns the Verifier.
+    ///
+    /// # Errors
+    /// As [`PyObserveHandle::verify`], then
+    /// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` for data `data_type`
+    /// refuses.
+    #[pyo3(signature = (verifier, data_type, /, *value, group_id=None, **named))]
+    fn verify_typed(
+        &self,
+        py: Python<'_>,
+        verifier: &str,
+        data_type: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyTuple>,
+        group_id: Option<&str>,
+        named: Option<&Bound<'_, PyDict>>,
+    ) -> WyrdPyResult<PyVerificationResult> {
+        let result = self.verify(py, verifier, value, group_id, named)?;
+        PyVerificationResult::typed(py, result.result, data_type)
     }
 
     /// Submit evidence for the bound Verifier `verifier` without waiting.

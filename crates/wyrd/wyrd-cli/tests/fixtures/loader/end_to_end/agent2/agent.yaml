@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Agent
 metadata:
-  space: wyrd-team
   name: retention-runbook
   version: "1.0.0"
 spec:
@@ -42,11 +41,9 @@ spec:
   verified_by:
     - verifier:
         kind: Verifier
-        space: wyrd-team
         name: retention-guardrail
         version: "1.0.0"
       on_failure:
         - kind: Operator
-          space: wyrd-team
           name: retention-pager
           version: "1.0.0"

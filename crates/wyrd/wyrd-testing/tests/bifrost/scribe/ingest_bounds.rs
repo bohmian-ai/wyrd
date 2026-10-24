@@ -303,3 +303,150 @@ async fn forty_mib_row_stages_publishes_and_reads_back_at_48_mib_wire() {
     )
     .await;
 }
+
+/// A composite-partitioned table bounds the distinct partition tuples of a
+/// whole request, not of each record batch: a 33rd tuple refuses the request
+/// whole before any row is durable, whether it arrives in one batch or in a
+/// second batch of the same stream, and the same batch id corrected to a
+/// 32-tuple union then lands even though its batches plan more than 32
+/// slices.
+///
+/// # Panics
+///
+/// Panics when a 33-tuple request is admitted or leaves a readable row or
+/// published object, or the corrected retry is refused or does not stage,
+/// publish, and read back.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn composite_partition_fanout_is_atomic() {
+    use arrow::array::{StringArray, TimestampMicrosecondArray};
+    use arrow::datatypes::TimeUnit;
+    use wyrd_spec::vala::api::{PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire};
+
+    let server = start_scribe_server().await;
+    let tenant = server.data_tenant_id();
+    let client = tenant_client(&server, tenant).await;
+    let name = unique_table("composite_fanout");
+    let fqn = format!("vala.datasets.{name}");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("customer", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let config = TableConfig::from_arrow(&fqn, Arc::clone(&schema))
+        .expect("declared table")
+        .with_layout(PhysicalLayoutWire {
+            time_column: Some("event_time".to_owned()),
+            partition_by: vec![
+                PartitionFieldWire::new("event_time", PartitionTransformWire::Hour),
+                PartitionFieldWire::new("customer", PartitionTransformWire::Identity),
+            ],
+            sort_keys: Vec::new(),
+            bloom_columns: Vec::new(),
+        });
+    wyrd_client::Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(config),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("the writer connects")
+    .register()
+    .await
+    .expect("the composite table registers");
+    // Two rows per tuple, all within one hour, so only the extra dimension
+    // fans out and repeated tuples count once. Customers start at `first`.
+    let batch = |first: i64, tuples: i64| {
+        let rows = first * 2..(first + tuples) * 2;
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(
+                    TimestampMicrosecondArray::from_iter_values(
+                        rows.clone().map(|row| 1_791_244_800_000_000 + row),
+                    )
+                    .with_timezone("UTC"),
+                ),
+                Arc::new(StringArray::from_iter_values(
+                    rows.clone().map(|row| format!("c{}", row / 2)),
+                )),
+                Arc::new(Int64Array::from_iter_values(rows)),
+            ],
+        )
+        .expect("fanout batch")
+    };
+    let stream = |batches: &[RecordBatch]| {
+        let mut ipc = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, schema.as_ref())
+            .expect("IPC writer");
+        for batch in batches {
+            writer.write(batch).expect("IPC batch");
+        }
+        writer.finish().expect("IPC terminal");
+        ipc
+    };
+    let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&client)
+        .await
+        .expect("public ingest transport connects");
+    let count = format!("SELECT count(*) AS value FROM {fqn}");
+
+    let retried = uuid::Uuid::now_v7();
+    let refusal = append_batch(&client, &fqn, retried, &batch(0, 33))
+        .await
+        .expect_err("a 33rd distinct tuple is refused");
+    assert_eq!(
+        (refusal.code(), refusal.status()),
+        ("WYRD_VALA_400_OTLP_REQUEST_MALFORMED", 400),
+        "the fanout refusal is a stable invalid request: {refusal:?}"
+    );
+    let refusal = ingest
+        .insert(&fqn, retried, stream(&[batch(0, 17), batch(17, 16)]))
+        .await
+        .expect_err("a 33rd distinct tuple in a later batch is refused");
+    assert_eq!(
+        (refusal.code(), refusal.status()),
+        ("WYRD_VALA_400_OTLP_REQUEST_MALFORMED", 400),
+        "the request-wide fanout refusal is the same invalid request: {refusal:?}"
+    );
+    let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
+    scribe
+        .flush_writable_for_test()
+        .await
+        .expect("every writable bucket freezes");
+    await_persistence_drained(&scribe).await;
+    server
+        .flush_bifrost()
+        .await
+        .expect("nothing is left to publish");
+    assert_eq!(
+        read_sql(&client, &count).await,
+        [0],
+        "no refused row is readable"
+    );
+    assert_eq!(
+        published_object_count(&server, tenant, BifrostNamespace::Datasets, &name).await,
+        0,
+        "the refusal publishes nothing"
+    );
+
+    ingest
+        .insert(&fqn, retried, stream(&[batch(0, 17), batch(15, 17)]))
+        .await
+        .expect("the corrected retry, 34 slices over 32 tuples, is acknowledged");
+    assert_stages_and_publishes(
+        &server,
+        &client,
+        tenant,
+        &name,
+        &format!("SELECT count(DISTINCT customer) AS value FROM {fqn}"),
+        &[32],
+    )
+    .await;
+    assert_eq!(read_sql(&client, &count).await, [68]);
+}

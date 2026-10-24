@@ -3,7 +3,6 @@
 apiVersion: wyrd/v1
 kind: Trigger
 metadata:
-  space: retention
   name: churn-drift-trigger
   version: 1.0.0
 

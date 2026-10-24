@@ -16,7 +16,7 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardUid, SpaceName};
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::registry::ListCardsRequest;
 
 /// One HTTP request captured by [`TestServer`] for assertion after the client call.
@@ -188,7 +188,7 @@ fn uid() -> CardUid {
 /// handle connects without a request, so the listing is the only request.
 ///
 /// # Panics
-/// Panics when the local server, a test space name, the handle, or the typed
+/// Panics when the local server, the handle, or the typed
 /// list fails, or when the page is not empty, the request is not a bodyless
 /// `GET /v1/cards`, or its query parameters differ from the filters.
 #[tokio::test]
@@ -208,7 +208,6 @@ async fn list_uses_typed_query_parameters_and_an_empty_get_body() {
     let page = cards
         .list(ListCardsRequest {
             kind: Some(CardKind::Prompt),
-            space: Some(SpaceName::new("prod").expect("test space is valid")),
             name: None,
             version_range: None,
             status: None,
@@ -235,8 +234,7 @@ async fn list_uses_typed_query_parameters_and_an_empty_get_body() {
             "cursor=opaque-next",
             "include_prerelease=false",
             "kind=Prompt",
-            "limit=20",
-            "space=prod"
+            "limit=20"
         ]
     );
     assert!(requests[0].body.is_empty());

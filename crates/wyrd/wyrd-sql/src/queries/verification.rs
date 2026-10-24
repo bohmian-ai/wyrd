@@ -3,11 +3,12 @@
 //! `wyrd.verification_bindings` holds one row per effective inline
 //! `verified_by` binding of an exact Service or standalone Agent Card version.
 //! Composite registration projects the rows through [`project_bindings`] on
-//! the registry's own [`TenantConn`], so the owner Card, its Card-bound
-//! principal, and its bindings commit or roll back together. Runtime activity
-//! is the owner principal's `last_authenticated_at`, which the tenant token
-//! issuer records through [`record_machine_authentication`]; admission reads
-//! it through [`binding_activity`]. Every function here runs on the caller's
+//! the registry's own [`TenantConn`], so the owner Card and its bindings
+//! commit or roll back together. Runtime activity is one
+//! `wyrd.workload_activity` row per exact root and account, which the tenant
+//! token issuer records through [`record_machine_authentication`]; admission
+//! reads the row of the family's associated account through
+//! [`binding_activity`]. Every function here runs on the caller's
 //! transaction under forced RLS and never commits.
 // raw-query grep allowlist: verification tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
@@ -56,22 +57,31 @@ const OWNER_BINDING_IDS_SQL: &str = r"
      ORDER BY binding_id
 ";
 
-/// Stamp a qualifying exchange on an active Card-bound Service or Agent.
+/// Stamp a qualifying direct exchange of one account under one exact root.
 ///
-/// The stamp is PostgreSQL's own `statement_timestamp()`, so activity is
-/// written and later evaluated on one clock. `GREATEST` keeps the later of the
-/// stored and database instants, so a database clock that steps backward never
-/// moves activity backward (`GREATEST` ignores a stored NULL). Returns the
-/// owner Card UID beside the database time that was stamped, or no row for a
-/// Card-free, inactive, or non-machine principal.
+/// Only the active account restricted to the active root's `(kind, name)`
+/// family counts: that association, not the credential, decides which account
+/// a schedule follows. The stamp is PostgreSQL's own `statement_timestamp()`,
+/// so activity is written and later evaluated on one clock. `GREATEST` keeps
+/// the later instant, so a database clock that steps backward never moves
+/// activity backward. Returns the root beside the stamped database time, or no
+/// row when the account is not the root's associated family account.
 const RECORD_AUTHENTICATION_SQL: &str = r"
-    UPDATE wyrd.auth_service_accounts
-       SET last_authenticated_at = GREATEST(last_authenticated_at, statement_timestamp())
-     WHERE id = $1
-       AND principal_kind IN ('service', 'agent')
-       AND card_uid IS NOT NULL
-       AND status = 'active'
-    RETURNING card_uid, statement_timestamp()
+    INSERT INTO wyrd.workload_activity
+        (data_tenant_id, workload_card_uid, principal_id, last_authenticated_at)
+    SELECT wyrd.current_tenant(), c.card_uid, p.id, statement_timestamp()
+      FROM wyrd.cards c
+      JOIN wyrd.auth_service_accounts p
+        ON p.restriction_kind = c.kind
+       AND p.restriction_name = c.name
+     WHERE c.card_uid = $2
+       AND c.status = 'active'
+       AND p.id = $1
+       AND p.status = 'active'
+    ON CONFLICT (data_tenant_id, workload_card_uid, principal_id)
+    DO UPDATE SET last_authenticated_at = GREATEST(
+        wyrd.workload_activity.last_authenticated_at, EXCLUDED.last_authenticated_at)
+    RETURNING workload_card_uid, statement_timestamp()
 ";
 
 /// Lock and list one owner's schedule bindings whose cursor is still null.
@@ -93,26 +103,32 @@ const ARM_SCHEDULE_SQL: &str = r"
        AND next_run_at IS NULL
 ";
 
-/// Read one binding's owner principal state and derived admission gate.
+/// Read one binding's family account state and derived admission gate.
 ///
 /// `$2` is the inactivity window in whole seconds; the cutoff is derived from
 /// PostgreSQL's own `statement_timestamp()`, the same clock the stamp was
-/// written on. The principal join is left so a binding whose owner has no
-/// Card-bound principal still reads as inactive.
+/// written on. Activity is the row of the account currently associated with
+/// the owner's family under this exact owner root, so a reassociated family
+/// needs fresh activity from its new account. Both joins are left so an owner
+/// without an associated account, or without activity, reads as inactive.
 const BINDING_ACTIVITY_SQL: &str = r"
     SELECT b.binding_id, b.owner_card_uid, p.id AS principal_id,
-           p.last_authenticated_at, b.next_run_at,
+           a.last_authenticated_at, b.next_run_at,
            (p.status = 'active'
             AND c.status = 'active'
-            AND p.last_authenticated_at IS NOT NULL
-            AND p.last_authenticated_at
+            AND a.last_authenticated_at IS NOT NULL
+            AND a.last_authenticated_at
                 > statement_timestamp() - ($2::bigint * INTERVAL '1 second')) AS active
       FROM wyrd.verification_bindings b
       JOIN wyrd.cards c
         ON c.card_uid = b.owner_card_uid
       LEFT JOIN wyrd.auth_service_accounts p
-        ON p.card_uid = b.owner_card_uid
-       AND p.card_kind = b.owner_card_kind
+        ON p.restriction_kind = c.kind
+       AND p.restriction_name = c.name
+       AND p.status <> 'deleted'
+      LEFT JOIN wyrd.workload_activity a
+        ON a.workload_card_uid = b.owner_card_uid
+       AND a.principal_id = p.id
      WHERE b.binding_id = $1
 ";
 
@@ -394,18 +410,20 @@ pub async fn owner_binding_ids(
     rows.into_iter().map(stored_binding_id).collect()
 }
 
-/// Record a qualifying machine exchange and arm the owner's unarmed schedules.
+/// Record a qualifying machine exchange and arm the root's unarmed schedules.
 ///
 /// The tenant token issuer calls this in the transaction that issues the
-/// token, only for an API-key or workload `jwt-bearer` grant. It advances the
-/// principal's `last_authenticated_at` to PostgreSQL's statement time — never
-/// backward — when the principal is an active Card-bound Service or Agent,
-/// then sets every still-null `schedule` cursor of that exact owner Card
-/// version to its first boundary after that same database instant. Arming and
+/// token, only for a direct API-key or workload `jwt-bearer` grant that names
+/// a validated `workload_uid` root. It advances the `(root, account)` activity
+/// to PostgreSQL's statement time — never backward — when the account is the
+/// active account associated with the root's family, then sets every
+/// still-null `schedule` cursor of that exact root to its first boundary
+/// after that same database instant. Arming and
 /// the later due predicate therefore share one clock, and the caller's wall
 /// clock decides nothing. An already armed cursor is never moved, so a later
-/// exchange renews activity without resetting or postponing the schedule. A
-/// Card-free or inactive principal is left untouched.
+/// exchange renews activity without resetting or postponing the schedule. An
+/// account that is not the root's associated family account, or is inactive,
+/// records nothing.
 ///
 /// A stored schedule that no longer parses leaves its cursor null — the
 /// binding creates no work — and is reported through tracing rather than
@@ -418,9 +436,11 @@ pub async fn owner_binding_ids(
 pub async fn record_machine_authentication(
     conn: &mut TenantConn<'_>,
     principal_id: PrincipalId,
+    workload_uid: &CardUid,
 ) -> Result<(), sqlx::Error> {
     let stamped: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(RECORD_AUTHENTICATION_SQL)
         .bind(principal_id.as_uuid())
+        .bind(workload_uid.as_uuid())
         .fetch_optional(&mut **conn.transaction())
         .await?;
     let Some((owner, at)) = stamped else {
@@ -484,9 +504,9 @@ impl Default for InactivityTimeout {
 pub struct BindingActivity {
     /// The binding.
     pub binding_id: BindingId,
-    /// Exact owner Card version whose principal gates the binding.
+    /// Exact owner Card version whose activity gates the binding.
     pub owner_card_uid: CardUid,
-    /// The owner's Card-bound principal, absent if none exists.
+    /// The account associated with the owner's family, absent if none is.
     pub principal_id: Option<PrincipalId>,
     /// Last qualifying machine exchange, absent before the first.
     pub last_authenticated_at: Option<DateTime<Utc>>,
@@ -504,7 +524,7 @@ struct BindingActivityRow {
     binding_id: Uuid,
     /// Stored owner Card UID; must be version 7.
     owner_card_uid: Uuid,
-    /// Owner principal id, absent without a Card-bound principal.
+    /// Associated family account id, absent without one.
     principal_id: Option<Uuid>,
     /// Last qualifying machine exchange.
     last_authenticated_at: Option<DateTime<Utc>>,
@@ -535,13 +555,13 @@ impl BindingActivityRow {
 
 /// Read one binding's admission gate at PostgreSQL's statement time.
 ///
-/// A binding is active only while its exact owner Card version is active,
-/// that version's Card-bound principal is active, and the principal's last
-/// qualifying exchange is newer than `timeout` before the database's own
-/// statement time — the same clock the stamp was written on. Component
-/// bindings resolve to their containing Service's principal, so they inherit
-/// its activity; replicas sharing one principal share this one row; two A/B
-/// Card versions have distinct principals and are gated independently.
+/// A binding is active only while its exact owner Card version is active, the
+/// account associated with that version's family is active, and that
+/// account's last qualifying exchange under this exact root is newer than
+/// `timeout` before the database's own statement time — the same clock the
+/// stamp was written on. Component bindings resolve to their containing
+/// Service root, so they inherit its activity; replicas share one row; two
+/// A/B versions sharing one account are gated independently by root.
 /// Suspension or deletion is visible on the very next read, regardless of any
 /// still-valid access token.
 ///

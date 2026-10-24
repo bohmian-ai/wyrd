@@ -75,7 +75,7 @@ mod discovery_tests {
         plant_git_marker(dir.path());
         fs::write(
             dir.path().join("wyrd.toml"),
-            "[defaults]\nspace = \"prod\"\n",
+            "[defaults.labels]\nteam = \"prod\"\n",
         )
         .unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
@@ -91,7 +91,7 @@ mod discovery_tests {
         plant_git_marker(dir.path());
         fs::write(
             dir.path().join("wyrd.toml"),
-            "[defaults]\nspace = \"prod\"\n",
+            "[defaults.labels]\nteam = \"prod\"\n",
         )
         .unwrap();
         let nested = dir.path().join("a").join("b").join("c");
@@ -165,7 +165,7 @@ mod discovery_tests {
     fn discovery_explicit_path_skips_walk() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("wyrd.toml");
-        fs::write(&path, "[defaults]\nspace = \"prod\"\n").unwrap();
+        fs::write(&path, "[defaults.labels]\nteam = \"prod\"\n").unwrap();
         let cfg = WyrdConfig::load(Some(&path)).unwrap();
         assert_eq!(cfg.root_path.as_deref(), Some(path.as_path()));
     }
@@ -210,7 +210,7 @@ mod discovery_tests {
         let home = TempDir::new().unwrap();
         fs::write(
             home.path().join("wyrd.toml"),
-            "[defaults]\nspace = \"home\"\n",
+            "[defaults.labels]\nteam = \"home\"\n",
         )
         .unwrap();
         let cwd = home.path().join("project");

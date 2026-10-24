@@ -4,7 +4,6 @@ kind: Data
 metadata:
   name: latency-baseline
   version: 1.0.0
-  space: default
 spec:
   interface:
     kind: Parquet

@@ -4,8 +4,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::{InstanceType, Metadata, Schema, SchemaObject, StringValidation};
+use schemars::SchemaGenerator;
+use schemars::{Schema, json_schema};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::Digest as _;
 #[cfg(feature = "server")]
@@ -63,8 +63,8 @@ impl<'de> Deserialize<'de> for AbsoluteUrl {
 }
 
 impl JsonSchema for AbsoluteUrl {
-    fn schema_name() -> String {
-        "AbsoluteUrl".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "AbsoluteUrl".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
@@ -146,8 +146,8 @@ impl<'de> Deserialize<'de> for IssuerUrl {
 }
 
 impl JsonSchema for IssuerUrl {
-    fn schema_name() -> String {
-        "IssuerUrl".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "IssuerUrl".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
@@ -275,26 +275,20 @@ impl<'de> Deserialize<'de> for Sha256Hex {
 impl JsonSchema for Sha256Hex {
     /// Name the schema `Sha256Hex` so generated contracts reference one shared
     /// definition.
-    fn schema_name() -> String {
-        "Sha256Hex".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Sha256Hex".into()
     }
 
     /// Describe the canonical wire form as a 64-character string constrained
     /// by [`SHA256_HEX_PATTERN`], mirroring the validation in
     /// [`Sha256Hex::new`] and the `OpenAPI` projection.
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        Schema::Object(SchemaObject {
-            metadata: Some(Box::new(Metadata {
-                description: Some(SHA256_HEX_DESCRIPTION.to_owned()),
-                ..Default::default()
-            })),
-            instance_type: Some(InstanceType::String.into()),
-            string: Some(Box::new(StringValidation {
-                min_length: Some(64),
-                max_length: Some(64),
-                pattern: Some(SHA256_HEX_PATTERN.to_owned()),
-            })),
-            ..Default::default()
+        json_schema!({
+            "description": SHA256_HEX_DESCRIPTION,
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": SHA256_HEX_PATTERN
         })
     }
 }
@@ -470,33 +464,16 @@ fn normalize_issuer(value: &str) -> String {
 }
 
 fn url_schema(description: &'static str, pattern: Option<&'static str>) -> Schema {
-    Schema::Object(SchemaObject {
-        metadata: Some(Box::new(Metadata {
-            description: Some(description.to_owned()),
-            ..Default::default()
-        })),
-        instance_type: Some(InstanceType::String.into()),
-        format: Some("uri".to_owned()),
-        string: pattern.map(|p| {
-            Box::new(StringValidation {
-                pattern: Some(p.to_owned()),
-                ..Default::default()
-            })
-        }),
-        ..Default::default()
-    })
+    let mut schema =
+        json_schema!({ "description": description, "type": "string", "format": "uri" });
+    if let Some(pattern) = pattern {
+        schema.insert("pattern".to_owned(), pattern.into());
+    }
+    schema
 }
 
 fn state_key_schema(_gen: &mut SchemaGenerator) -> Schema {
-    Schema::Object(SchemaObject {
-        instance_type: Some(InstanceType::String.into()),
-        string: Some(Box::new(StringValidation {
-            min_length: Some(1),
-            max_length: Some(512),
-            pattern: None,
-        })),
-        ..Default::default()
-    })
+    json_schema!({ "type": "string", "minLength": 1, "maxLength": 512 })
 }
 
 #[cfg(feature = "server")]

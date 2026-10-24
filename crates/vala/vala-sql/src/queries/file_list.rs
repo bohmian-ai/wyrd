@@ -33,6 +33,8 @@ pub struct HotFileCut {
 /// `DataFile` unchanged, so it needs the durable identity, the canonical object
 /// path, the checksum it revalidates against, and the writer's promotion
 /// evidence — and nothing that would tempt a promoter to re-derive geometry.
+/// The durable partition columns ride along so the promoter can refuse
+/// evidence whose partition tuple contradicts the row's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromotableHotFileRow {
     /// Durable file-list identity carried into the promoted-file-set digest.
@@ -45,6 +47,12 @@ pub struct PromotableHotFileRow {
     pub file_size: i64,
     /// The writer's `ScribePublishedHotFileV1` evidence for this exact object.
     pub promotion_record: serde_json::Value,
+    /// Durable partition granularity token: `hour` or `day`.
+    pub partition_granularity: String,
+    /// Durable exact UTC start boundary of the partition.
+    pub partition_start: chrono::DateTime<chrono::Utc>,
+    /// Durable canonical encoding of the spec id and dimension values.
+    pub partition_dimensions: Vec<u8>,
 }
 
 /// Durable settlement state of one exact planned hot object.
@@ -154,9 +162,20 @@ impl HotFileCatalog {
         &self,
         conn: &mut TenantConn<'_>,
     ) -> Result<Vec<PromotableHotFileRow>, SqlError> {
-        let rows: Vec<(Uuid, String, Option<String>, i64, serde_json::Value)> = sqlx::query_as(
+        type Row = (
+            Uuid,
+            String,
+            Option<String>,
+            i64,
+            serde_json::Value,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            Vec<u8>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
             r"
-            SELECT id, file_path, file_checksum, file_size, promotion_record
+            SELECT id, file_path, file_checksum, file_size, promotion_record,
+                   partition_granularity, partition_start, partition_dimensions
               FROM vala.file_list
              WHERE data_tenant_id = wyrd.current_tenant()
                AND namespace = $1
@@ -174,7 +193,16 @@ impl HotFileCatalog {
         .map_err(SqlError::from)?;
         rows.into_iter()
             .map(
-                |(id, file_path, file_checksum, file_size, promotion_record)| {
+                |(
+                    id,
+                    file_path,
+                    file_checksum,
+                    file_size,
+                    promotion_record,
+                    partition_granularity,
+                    partition_start,
+                    partition_dimensions,
+                )| {
                     let file_checksum =
                         file_checksum.ok_or_else(|| SqlError::InvariantViolation {
                             detail: format!(
@@ -187,6 +215,9 @@ impl HotFileCatalog {
                         file_checksum,
                         file_size,
                         promotion_record,
+                        partition_granularity,
+                        partition_start,
+                        partition_dimensions,
                     })
                 },
             )

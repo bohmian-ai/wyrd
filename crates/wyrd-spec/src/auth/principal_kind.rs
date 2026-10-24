@@ -1,24 +1,23 @@
 //! Principal-kind discriminator contract.
 //!
 //! [`PrincipalKindTag`] is the canonical **bare discriminator** — the kind label
-//! (`global_admin` / `tenant_admin` / `user` / `service` / `agent` /
-//! `system`) without a bound card. It is the single wire
+//! (`global_admin` / `tenant_admin` / `user` / `service` / `system`). It is the single wire
 //! encoding for every site that identifies a principal kind: the revoke-by-id
 //! request body, access- and refresh-token claims, the audit event, and the
 //! CLI.
 //!
-//! The **data-bearing** identity (the kind plus its bound `card_ref` and
-//! transitive `card_ref_scope`) is a runtime concept and lives on
-//! `wyrd_runtime::principal::PrincipalKind`, which projects to this tag via its
-//! `tag()` method. It is intentionally not duplicated here: `wyrd-spec` owns the
-//! wire discriminator, not the in-memory authorization payload.
+//! A principal kind names an account, never an execution root: the exact
+//! Service version a request runs as is separate workload context.
+//! The tenant-plane runtime projection is
+//! `wyrd_runtime::principal::PrincipalKind`, which maps to this tag through
+//! its `tag()` method.
 
 use serde::{Deserialize, Serialize};
 
-/// Principal-kind discriminator without a bound card.
+/// Principal-kind discriminator.
 ///
 /// Serializes as a bare snake_case string (`"global_admin"`, `"tenant_admin"`,
-/// `"user"`, `"service"`, `"agent"`, `"system"`); this is a stable wire
+/// `"user"`, `"service"`, `"system"`); this is a stable wire
 /// contract for the revoke request body, token claims, and the durable
 /// `principal_kind` columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -30,23 +29,19 @@ pub enum PrincipalKindTag {
     /// recovery. It is never implicitly authorized over a tenant's resources.
     GlobalAdmin,
     /// Tenant-scope administrative principal created during tenant
-    /// provisioning. It is the tenant's headless root of trust and is not bound
-    /// to a Card.
+    /// provisioning. It is the tenant's headless root of trust.
     TenantAdmin,
     /// Human user principal.
     User,
-    /// Service principal.
+    /// Stable nonhuman account for Services, Agents, CI, and automation.
     Service,
-    /// Agent principal.
-    Agent,
     /// Internal tenant verification-result writer.
     ///
     /// Exactly one credentialless principal of this kind exists per tenant,
-    /// created by tenant provisioning. It binds no Card, holds no role, and is
-    /// absent from every public principal-management and credential path; the
-    /// server alone mints its short-lived token, scoped to one exact Verifier
-    /// Card, to publish canonical verification results. It stays representable
-    /// here so token claims and audit records can attribute those writes.
+    /// created by tenant provisioning. It holds no role, is absent from every
+    /// public principal-management and credential path, and never appears in
+    /// a token. It stays representable here so audit records can attribute
+    /// internal execution to it.
     System,
 }
 
@@ -59,7 +54,6 @@ impl PrincipalKindTag {
             Self::TenantAdmin => "tenant_admin",
             Self::User => "user",
             Self::Service => "service",
-            Self::Agent => "agent",
             Self::System => "system",
         }
     }
@@ -75,11 +69,10 @@ mod tests {
         assert_eq!(PrincipalKindTag::TenantAdmin.as_str(), "tenant_admin");
         assert_eq!(PrincipalKindTag::User.as_str(), "user");
         assert_eq!(PrincipalKindTag::Service.as_str(), "service");
-        assert_eq!(PrincipalKindTag::Agent.as_str(), "agent");
         assert_eq!(PrincipalKindTag::System.as_str(), "system");
     }
 
-    /// The internal verification-result writer is the sixth wire value and
+    /// The internal verification-result writer is the fifth wire value and
     /// round-trips as the bare `system` label in token and audit contracts.
     ///
     /// # Panics
@@ -103,10 +96,9 @@ mod tests {
             serde_json::to_value(PrincipalKindTag::Service).expect("serializes"),
             serde_json::json!("service")
         );
-        assert_eq!(
-            serde_json::from_value::<PrincipalKindTag>(serde_json::json!("agent"))
-                .expect("deserializes"),
-            PrincipalKindTag::Agent
+        assert!(
+            serde_json::from_value::<PrincipalKindTag>(serde_json::json!("agent")).is_err(),
+            "the removed Agent account kind is not a wire value"
         );
         assert_eq!(
             serde_json::to_value(PrincipalKindTag::GlobalAdmin).expect("serializes"),

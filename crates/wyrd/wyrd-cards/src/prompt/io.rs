@@ -24,7 +24,17 @@ pub fn read_card_file(path: &Path) -> Result<Card, WyrdError> {
 ///
 /// This helper is intentionally separate from `read_card_file`: server hydration
 /// and `model_validate_json` require a complete persisted envelope, while local
-/// declarative files may omit API version, space, or UID.
+/// declarative files may omit API version, name, version, or UID.
+///
+/// Omitted fields default to `wyrd/v1`, kind `Prompt`, name `prompt`,
+/// version `0.1.0`, and a fresh local UID; authored values always win.
+///
+/// # Errors
+/// Returns a prompt loader error when the extension is unsupported or the file
+/// cannot be read, and a validation error when the bytes are not JSON or
+/// YAML, the document or its `metadata` is not an object, or the filled
+/// document does not decode as a Prompt Card envelope, such as one naming the
+/// removed `metadata.space`.
 pub fn read_local_card_file(path: &Path) -> Result<Card, WyrdError> {
     let format = format_from_path(path)?;
     let bytes = std::fs::read(path).map_err(|error| loader_io(path, &error))?;
@@ -60,9 +70,6 @@ pub fn read_local_card_file(path: &Path) -> Result<Card, WyrdError> {
             message: "prompt card metadata must be an object".to_owned(),
             details: serde_json::Value::Null,
         })?;
-    metadata
-        .entry("space")
-        .or_insert_with(|| serde_json::json!("default"));
     metadata
         .entry("name")
         .or_insert_with(|| serde_json::json!("prompt"));
@@ -136,11 +143,10 @@ mod prompt_io {
         ))
     }
 
-    /// The typed Prompt Card fixture renamed to `growth/lead-scoring` version
+    /// The typed Prompt Card fixture renamed to `lead-scoring` version
     /// `1.2.3`, which the file round-trip tests save and load.
     fn prompt_card() -> PromptCard {
         let mut card = typed_prompt_card();
-        "growth".clone_into(&mut card.space);
         "lead-scoring".clone_into(&mut card.name);
         "1.2.3".clone_into(&mut card.version);
         card
@@ -216,7 +222,6 @@ mod prompt_io {
 apiVersion: wyrd/v1
 kind: Prompt
 metadata:
-  space: test
   name: yaml-prompt
   version: 0.1.0
   uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00

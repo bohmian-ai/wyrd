@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Model
 metadata:
-  space: default
   name: model
   version: 1.0.0
   uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02

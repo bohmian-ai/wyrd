@@ -39,6 +39,12 @@ pub async fn build_catalog<S: std::hash::BuildHasher>(
     );
     // Snapshot preparation checks out a catalog connection on every query, so
     // only a connection idle long enough to have been dropped pays a ping.
+    // The catalog stamps, asserts and retains every table version itself, so
+    // a version and its definition always publish in one catalog transaction.
+    properties.insert(
+        iceberg_catalog_sql::SQL_CATALOG_PROP_TABLE_VERSION.to_owned(),
+        crate::catalog::layout::TABLE_VERSION_PROPERTY.to_owned(),
+    );
     properties.insert(
         CATALOG_POOL_TEST_IDLE_AFTER_MS.to_owned(),
         CATALOG_POOL_IDLE_PING_THRESHOLD_MS.to_owned(),

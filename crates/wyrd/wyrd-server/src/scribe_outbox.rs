@@ -494,6 +494,7 @@ impl ScribeBatch {
             authenticated_tenant: self.tenant,
             table: self.table.table_ref(),
             expected_schema_fingerprint: None,
+            table_version: None,
             request_id: self.request_id,
             batch_id: self.batch_id,
             measured_wire_bytes: self.ipc.len(),
@@ -1534,6 +1535,7 @@ mod tests {
                 reason: "x".repeat(reason_bytes),
                 actual: None,
                 citations: Vec::new(),
+                data: None,
                 detail: Some(RequirementDetail::Drift(DriftReport {
                     method: DriftMethod::Psi,
                     features,
@@ -1556,6 +1558,7 @@ mod tests {
                 card_uid: subject,
                 owner_card_uid: None,
                 group_id: None,
+                deployment_environment: None,
                 binding_id: None,
                 trigger: None,
                 window: Some(&window),

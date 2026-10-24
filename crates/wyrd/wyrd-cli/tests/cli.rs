@@ -1,5 +1,3 @@
-#[path = "auth_issue_key_journey.rs"]
-mod auth_issue_key_journey;
 #[path = "card_lifecycle.rs"]
 mod card_lifecycle;
 /// Provider-backed `wyrd auth login`, `status`, and `logout` journey.

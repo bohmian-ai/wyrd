@@ -25,17 +25,13 @@ pub fn validate_tree(cards: &[AuthoredCard]) -> Vec<Diagnostic> {
     diagnostics
 }
 
-/// Reject duplicate `(kind, space, name, version)` identities and report the
+/// Reject duplicate `(kind, name, version)` identities and report the
 /// first authored source path for each duplicate.
 fn check_duplicate_identities(cards: &[AuthoredCard], diagnostics: &mut Vec<Diagnostic>) {
     let mut seen: HashMap<_, &std::path::PathBuf> = HashMap::new();
     for card in cards {
         let identity = (
             &card.kind,
-            card.metadata
-                .space
-                .as_ref()
-                .map(wyrd_spec::ids::SpaceName::as_str),
             card.metadata.name.as_str(),
             card.metadata.version.as_ref().map(ToString::to_string),
         );
@@ -43,11 +39,7 @@ fn check_duplicate_identities(cards: &[AuthoredCard], diagnostics: &mut Vec<Diag
             diagnostics.push(Diagnostic::invalid_envelope(
                 card.source_path.clone(),
                 format!(
-                    "duplicate card identity for {}/{}/{} (first authored at {})",
-                    card.metadata
-                        .space
-                        .as_ref()
-                        .map_or("<missing-space>", |space| space.as_str()),
+                    "duplicate card identity for {}/{} (first authored at {})",
                     card.kind.wire_name(),
                     card.metadata.name,
                     first_path.display()
@@ -80,13 +72,10 @@ fn check_resolved_references(card: &AuthoredCard, diagnostics: &mut Vec<Diagnost
         let diagnostic = if slot.value.as_path().is_some() {
             Some(unresolved_path_diagnostic(card, &slot.path))
         } else if let Some(reference) = slot.value.as_card_ref() {
-            if reference.uid.is_some() {
-                Some(authored_uid_diagnostic(card, &slot.path))
-            } else if reference.space.is_none() {
-                Some(missing_space_diagnostic(card, &slot.path))
-            } else {
-                None
-            }
+            reference
+                .uid
+                .is_some()
+                .then(|| authored_uid_diagnostic(card, &slot.path))
         } else {
             None
         };
@@ -104,15 +93,6 @@ fn unresolved_path_diagnostic(card: &AuthoredCard, field: &str) -> Diagnostic {
             message: format!("unresolved path reference at {field}"),
             details: serde_json::json!({ "field": field }),
         },
-    )
-}
-
-/// Build the diagnostic emitted when a reference still lacks its inherited
-/// registration space.
-fn missing_space_diagnostic(card: &AuthoredCard, field: &str) -> Diagnostic {
-    Diagnostic::invalid_envelope(
-        card.source_path.clone(),
-        format!("reference has no resolved space at {field}"),
     )
 }
 
@@ -176,58 +156,8 @@ mod tests {
     use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
     use wyrd_spec::card::verifier::VerificationBinding;
     use wyrd_spec::envelope::{CardKind, Metadata, Spec};
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
-
-    #[test]
-    fn validate_rejects_reference_without_resolved_space() {
-        let card = AuthoredCard {
-            source_path: PathBuf::from("service.yaml"),
-            api_version: ApiVersion::v1(),
-            kind: CardKind::Service,
-            metadata: Metadata {
-                name: CardName::new("service").expect("test card name is valid"),
-                version: Some(
-                    VersionBlock::parse("1.0.0")
-                        .expect("test version is valid")
-                        .into(),
-                ),
-                bump: None,
-                space: Some(SpaceName::new("default").expect("test space is valid")),
-                uid: None,
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-                spec_hash: None,
-                artifact_hash: None,
-                origin: None,
-            },
-            spec: Spec::Service(ServiceSpec {
-                components: vec![ServiceComponent {
-                    alias: "child".to_owned(),
-                    card_ref: Ref::Ref(CardRef {
-                        kind: CardKind::Prompt,
-                        name: CardName::new("child").expect("test card name is valid"),
-                        version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-                        space: None,
-                        uid: None,
-                    }),
-                    verified_by: Vec::new(),
-                    source: None,
-                    config: BTreeMap::new(),
-                    credential_refs: Vec::new(),
-                }],
-                ..Default::default()
-            }),
-            artifacts: Vec::new(),
-        };
-
-        let diagnostics = validate_tree(&[card]);
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| { diagnostic.message.contains("no resolved space") })
-        );
-    }
 
     /// Reject two `verified_by` bindings to the same Verifier version on one
     /// Service component occurrence before anything is submitted.
@@ -237,7 +167,6 @@ mod tests {
             kind: CardKind::Verifier,
             name: CardName::new("quality").expect("test card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-            space: Some(SpaceName::new("default").expect("test space is valid")),
             uid: None,
         };
         let card = AuthoredCard {
@@ -252,7 +181,6 @@ mod tests {
                         .into(),
                 ),
                 bump: None,
-                space: Some(SpaceName::new("default").expect("test space is valid")),
                 uid: None,
                 labels: BTreeMap::new(),
                 annotations: BTreeMap::new(),
@@ -267,7 +195,6 @@ mod tests {
                         kind: CardKind::Model,
                         name: CardName::new("classifier").expect("test card name is valid"),
                         version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-                        space: Some(SpaceName::new("default").expect("test space is valid")),
                         uid: None,
                     }),
                     verified_by: vec![binding(&verifier_ref), binding(&verifier_ref)],

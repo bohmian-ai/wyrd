@@ -9,8 +9,8 @@ import { DISPATCH_STATES, RUN_STATES, VERDICTS, runLifecycle } from './verificat
 function schemaEnum(definition: string): string[] {
   const path = process.env.WYRD_CONTRACTS;
   if (!path) throw new Error('WYRD_CONTRACTS is unset; run the docs tests through `mise run docs:test`');
-  const def = JSON.parse(readFileSync(path, 'utf8')).definitions[definition];
-  return (def.oneOf ?? [def]).flatMap((v: { enum: string[] }) => v.enum).sort();
+  const def = JSON.parse(readFileSync(path, 'utf8')).$defs[definition];
+  return (def.oneOf ?? [def]).flatMap((v: { enum?: string[]; const?: string }) => v.enum ?? [v.const]).sort();
 }
 
 describe('run lifecycle diagram', () => {

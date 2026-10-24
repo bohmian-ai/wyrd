@@ -29,12 +29,12 @@ use wyrd_spec::ids::SlotName;
 use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::VerificationVerdict;
-use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Verdict};
+use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration};
 
 use super::tools::{AgentToolset, ToolSession, finished};
 use super::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallInput, CallValue, CheckExecutor,
-    CheckOutput, EngineError, Position,
+    CheckOutput, EngineError, Position, verdict_from,
 };
 
 /// Resolves a registered Agent Card into its pure Agent spec.
@@ -450,8 +450,8 @@ impl CheckExecutor for AgentExecutor {
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for a non-Agent check, a step-position
-    /// call, or an answer that is not a Verdict, plus [`Self::invoke`]
-    /// failures.
+    /// call, or an answer [`verdict_from`] refuses against the Prompt's
+    /// declared format, plus [`Self::invoke`] failures.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
         let Check::Agent(agent) = call.block else {
             return Err(terminal("the Agent executor runs only Agent checks"));
@@ -472,12 +472,12 @@ impl CheckExecutor for AgentExecutor {
         let answer = invoked
             .structured
             .ok_or_else(|| terminal("the check Agent returned no structured Verdict"))?;
-        let mut verdict =
-            serde_json::from_value::<Verdict>(Value::Object(answer)).map_err(|error| {
-                BlockError::Terminal {
-                    reason: format!("the check Agent's answer is not a Verdict: {error}"),
-                }
-            })?;
+        let ResponseType::JsonSchema { schema, .. } = &invoked.prompt.native().response_type else {
+            return Err(terminal(
+                "the check Agent's Prompt declares no Verdict format",
+            ));
+        };
+        let mut verdict = verdict_from(schema, Value::Object(answer))?;
         let reachable: BTreeSet<SlotName> = call
             .inputs
             .values()

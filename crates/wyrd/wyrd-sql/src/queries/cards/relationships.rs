@@ -29,8 +29,7 @@ const RELATION_OUTBOUND: &str = "outbound";
 /// lock taken here and persisting nothing.
 ///
 /// # Errors
-/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for a reference without a
-/// space, `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when the expected UID is
+/// Returns `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when the expected UID is
 /// no longer the Active row at that identity, and the mapped database error
 /// when the lookup fails. The caller's transaction rolls back on any error.
 pub async fn recheck_active_card_refs(
@@ -39,19 +38,13 @@ pub async fn recheck_active_card_refs(
 ) -> Result<Vec<(CardRef, CardUid)>, WyrdError> {
     let mut resolved = Vec::with_capacity(refs.len());
     for (card_ref, expected_uid) in refs {
-        let space = card_ref.space.as_ref().ok_or_else(|| {
-            WyrdError::registry_invalid_card_spec(
-                "CardRef.space is required at the registry boundary",
-            )
-        })?;
         let locked = sqlx::query_scalar::<_, Uuid>(
             "SELECT card_uid FROM wyrd.cards \
-             WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4 \
-               AND card_uid = $5 AND status = 'active' \
+             WHERE kind = $1 AND name = $2 AND version = $3 \
+               AND card_uid = $4 AND status = 'active' \
              FOR SHARE",
         )
         .bind(card_ref.kind.wire_name())
-        .bind(space.as_str())
         .bind(card_ref.name.as_str())
         .bind(card_ref.version.as_str())
         .bind(expected_uid.as_uuid())
@@ -69,32 +62,34 @@ pub async fn recheck_active_card_refs(
 }
 
 /// Persist exact UID-bearing outbound references in the caller's registration transaction.
+///
+/// Each edge stores the target's flat `kind`/`name`/`version` and its resolved
+/// UID; a repeated edge is a no-op. The helper never commits: the caller's
+/// declaration transaction owns atomicity.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` for a reference without a
+/// resolved UID, and registry unavailability when an insert fails.
 pub async fn persist_outbound_relationships(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
     refs: &[CardRef],
 ) -> Result<(), WyrdError> {
     for card_ref in refs {
-        let space = card_ref.space.as_ref().ok_or_else(|| {
-            WyrdError::registry_invalid_card_spec(
-                "CardRef.space is required at the registry boundary",
-            )
-        })?;
         let target_uid = card_ref
             .uid
             .as_ref()
             .ok_or_else(|| unresolved_dependency(card_ref))?;
         sqlx::query(
             "INSERT INTO wyrd.card_relationships \
-                (card_uid, data_tenant_id, relation_kind, target_kind, target_space, \
+                (card_uid, data_tenant_id, relation_kind, target_kind, \
                  target_name, target_version, target_uid) \
-             VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7) \
+             VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6) \
              ON CONFLICT DO NOTHING",
         )
         .bind(card_uid.as_uuid())
         .bind(RELATION_OUTBOUND)
         .bind(card_ref.kind.wire_name())
-        .bind(space.as_str())
         .bind(card_ref.name.as_str())
         .bind(card_ref.version.as_str())
         .bind(target_uid.as_uuid())
@@ -109,19 +104,26 @@ pub async fn persist_outbound_relationships(
 ///
 /// Deleted source cards are excluded so the returned inbound relationship
 /// projection reflects the live registry graph rather than tombstone history.
+/// Each source is returned as a flat, UID-bearing [`CardRef`]. The read runs in
+/// the caller's tenant transaction and never commits.
+///
+/// # Errors
+/// Returns registry unavailability when the query fails, the Card UID error
+/// for an invalid stored UID, and `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a
+/// stored source kind, name, or version no longer decodes.
 pub async fn inbound_relationships(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
 ) -> Result<Vec<CardRef>, WyrdError> {
-    let rows = sqlx::query_as::<_, (String, String, String, String, uuid::Uuid)>(
-        "SELECT source.kind, source.space, source.name, source.version, source.card_uid \
+    let rows = sqlx::query_as::<_, (String, String, String, uuid::Uuid)>(
+        "SELECT source.kind, source.name, source.version, source.card_uid \
            FROM wyrd.card_relationships relationship \
            JOIN wyrd.cards source \
              ON source.data_tenant_id = relationship.data_tenant_id \
             AND source.card_uid = relationship.card_uid \
           WHERE relationship.target_uid = $1 \
             AND source.status <> 'deleted' \
-          ORDER BY source.space, source.kind, source.name, source.version, source.card_uid",
+          ORDER BY source.kind, source.name, source.version, source.card_uid",
     )
     .bind(card_uid.as_uuid())
     .fetch_all(&mut **conn.transaction())
@@ -129,7 +131,7 @@ pub async fn inbound_relationships(
     .map_err(registry_db_error)?;
 
     rows.into_iter()
-        .map(|(kind, space, name, version, uid)| {
+        .map(|(kind, name, version, uid)| {
             let card_ref = CardRef {
                 kind: wyrd_spec::envelope::CardKind::from_wire_name(&kind).ok_or_else(|| {
                     WyrdError::registry_invalid_card_spec(format!(
@@ -143,11 +145,6 @@ pub async fn inbound_relationships(
                         "stored relationship source has invalid version: {error}"
                     ))
                 })?,
-                space: Some(
-                    wyrd_spec::ids::SpaceName::new(space).map_err(|error| {
-                        WyrdError::registry_invalid_card_spec(error.to_string())
-                    })?,
-                ),
                 uid: Some(CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?),
             };
             Ok(card_ref)

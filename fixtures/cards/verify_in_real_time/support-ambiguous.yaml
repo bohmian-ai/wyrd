@@ -4,7 +4,6 @@ kind: Service
 metadata:
   name: support-ambiguous
   version: 1.0.0
-  space: default
 spec:
   service_type: agent
   components:

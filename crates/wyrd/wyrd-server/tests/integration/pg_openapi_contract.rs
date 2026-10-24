@@ -231,8 +231,8 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/cards",
         "/v1/cards/by-uid/{kind}/{card_uid}",
         "/v1/cards/by-ref",
-        "/v1/cards/{kind}/{space}/{name}/latest",
-        "/v1/cards/{kind}/{space}/{name}/versions",
+        "/v1/cards/{kind}/{name}/latest",
+        "/v1/cards/{kind}/{name}/versions",
         "/v1/cards/{card_uid}/artifacts",
         "/v1/cards/{card_uid}/complete",
         "/v1/cards/download/init",
@@ -1434,7 +1434,6 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
         parameter_names,
         BTreeSet::from([
             "kind",
-            "space",
             "name",
             "version_range",
             "status",
@@ -1767,9 +1766,6 @@ async fn operator_connection_contract_publishes_five_typed_operations() {
 /// Issued and listed credential ids publish the same UUID contract the revoke
 /// path parameter and the MCP tools use, so no surface advertises free text.
 ///
-/// Covers the principal credential routes and the Card-bound
-/// `POST /auth/issue-key` response, whose `key_id` is the same credential id.
-///
 /// # Panics
 ///
 /// Panics when the server cannot start or a credential id is not published
@@ -1785,11 +1781,6 @@ async fn credential_ids_publish_their_uuid_contract() {
         let id = &document["components"]["schemas"][component]["properties"]["id"];
         assert_eq!(id["format"], "uuid", "{component}.id is a UUID: {id}");
     }
-    let key_id = &document["components"]["schemas"]["IssueKeyResponse"]["properties"]["key_id"];
-    assert_eq!(
-        key_id["format"], "uuid",
-        "IssueKeyResponse.key_id is a UUID: {key_id}"
-    );
 
     server.shutdown().await.expect("server shuts down");
 }
@@ -2309,8 +2300,7 @@ async fn agent_contracts_replace_workflow() {
             .json(&serde_json::json!({ "submissions": submissions }))
             .send()
     };
-    let metadata =
-        |name: &str| serde_json::json!({ "name": name, "version": "1.0.0", "space": "default" });
+    let metadata = |name: &str| serde_json::json!({ "name": name, "version": "1.0.0" });
 
     let workflow = register(
         "t12-workflow",
@@ -2324,10 +2314,11 @@ async fn agent_contracts_replace_workflow() {
     )
     .await
     .expect("Workflow registration answers");
-    assert_eq!(workflow.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(workflow.status(), StatusCode::BAD_REQUEST);
     let refusal = workflow.text().await.expect("refusal body reads");
     assert!(
-        refusal.contains("unknown card kind: Workflow"),
+        refusal.contains("WYRD_SPEC_400_VALIDATION")
+            && refusal.contains("unknown card kind: Workflow"),
         "Workflow is not a Card kind: {refusal}"
     );
 
@@ -2394,7 +2385,7 @@ async fn agent_contracts_replace_workflow() {
         "spec": {
             "prompt": {
                 "kind": "Prompt", "name": "t12-prompt",
-                "version": "1.0.0", "space": "default"
+                "version": "1.0.0"
             },
             "execution_route": { "kind": "native" }
         },

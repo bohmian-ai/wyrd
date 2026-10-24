@@ -1125,7 +1125,13 @@ pub(super) async fn published_files(
     if scan.snapshot_id().is_none() && scan.table().metadata().current_snapshot().is_none() {
         return Ok(Vec::new());
     }
-    let mut builder = scan.table().scan();
+    // The query is planned against the pinned table's current schema, so the
+    // pushed predicate binds there by field id even when the snapshot was
+    // committed under an older schema.
+    let mut builder = scan
+        .table()
+        .scan()
+        .with_schema_id(scan.table().metadata().current_schema_id());
     if let Some(snapshot_id) = scan.snapshot_id() {
         builder = builder.snapshot_id(snapshot_id);
     }
@@ -3580,14 +3586,13 @@ pub(super) mod tests {
         tenant: wyrd_spec::DataTenantId,
         live_routes: Option<crate::oracle::live::LiveTableRoutes>,
     ) -> (OracleTableProvider, RecordBatch) {
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: wyrd_runtime::PrincipalKind::User,
-            tenant_id: tenant,
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::default(),
-            credential_id: None,
-        };
+        let principal = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            wyrd_runtime::PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            PermissionSet::default(),
+        );
         let context = AuthorizedQueryContext::try_new(
             principal,
             tenant,

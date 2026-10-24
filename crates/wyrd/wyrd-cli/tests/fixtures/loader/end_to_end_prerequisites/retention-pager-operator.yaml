@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Operator
 metadata:
-  space: wyrd-team
   name: retention-pager
   version: "1.0.0"
 spec:

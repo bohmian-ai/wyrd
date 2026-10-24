@@ -18,7 +18,7 @@ use wyrd_spec::vala::api::{
     BifrostTableDescription, CompactionTypeWire, FieldSpec, PhysicalLayoutWire,
     RegisterTableRequest, RegisterTableResponse,
 };
-use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::ids::{RunId, TableVersion};
 
 use crate::bifrost::query::BifrostClientError;
 
@@ -34,6 +34,9 @@ pub struct ResolvedTable {
     pub table_uid: String,
     /// Lower-case hex of the 32-byte user-schema fingerprint.
     pub fingerprint: String,
+    /// The table version the server answered with; every batch written
+    /// through this binding names it.
+    pub table_version: TableVersion,
 }
 
 /// One Bifrost table a writer is bound to.
@@ -47,7 +50,7 @@ pub struct ResolvedTable {
 /// `act_principal_id`) are appended by the producer and the server
 /// respectively, so declaring one here is a reserved name error rather than a
 /// way to control it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(into = "TableConfigWire", try_from = "TableConfigWire")]
 pub struct TableConfig {
     /// Target namespace, the half of the FQN before the final dot.
@@ -66,6 +69,14 @@ pub struct TableConfig {
     compaction_type: Option<CompactionTypeWire>,
     /// Server-assigned once registered or described; `None` while inert.
     resolved: Option<ResolvedTable>,
+    /// The current table version a bind-time describe found for this
+    /// declaration, without claiming the server's identity for its columns.
+    ///
+    /// Local to this process and never serialized: a declaration whose
+    /// columns differ from the registered ones still writes at this version
+    /// and the server refuses its batches, while [`Self::resolved`] stays
+    /// `None` until register or describe answers this exact declaration.
+    bound_version: Option<TableVersion>,
 }
 
 impl TableConfig {
@@ -100,6 +111,7 @@ impl TableConfig {
             compaction_target_file_size_bytes: None,
             compaction_type: None,
             resolved: None,
+            bound_version: None,
         })
     }
 
@@ -221,14 +233,16 @@ impl TableConfig {
             resolved: Some(ResolvedTable {
                 table_uid: description.entry.table_uid.clone(),
                 fingerprint: description.entry.fingerprint.clone(),
+                table_version: description.table_version,
             }),
+            bound_version: None,
         })
     }
 
     /// Declare the physical layout the register call should request.
     ///
     /// Omitted, the server resolves `hour(wyrd_ingested_at)`,
-    /// `wyrd_ingested_at` descending nulls-last, and the managed Bloom floor.
+    /// `wyrd_ingested_at` descending nulls-last, and no Bloom columns.
     /// A layout's `time_column` names the non-null timestamp column that
     /// partitions the table and leads its default sort order.
     ///
@@ -337,7 +351,34 @@ impl TableConfig {
         self.resolved = Some(ResolvedTable {
             table_uid: response.table_uid.clone(),
             fingerprint: response.fingerprint.clone(),
+            table_version: response.table_version,
         });
+    }
+
+    /// Write at the table version `described` carries, keeping this
+    /// config's declared columns and leaving [`Self::resolved`] untouched.
+    pub(crate) fn bind_version(&mut self, described: &Self) {
+        self.bound_version = described
+            .resolved
+            .as_ref()
+            .map(|resolved| resolved.table_version);
+    }
+
+    /// The write destination this binding names, once register, describe,
+    /// or a bind-time describe gave it a table version; a config with none
+    /// has no version to write at.
+    #[must_use]
+    pub(crate) fn writer_table(&self) -> Option<WriterTable> {
+        let table_version = self
+            .resolved
+            .as_ref()
+            .map(|resolved| resolved.table_version)
+            .or(self.bound_version)?;
+        Some(WriterTable::new(
+            &self.fqn(),
+            Arc::clone(&self.user_schema),
+            table_version,
+        ))
     }
 }
 
@@ -408,6 +449,7 @@ impl TryFrom<TableConfigWire> for TableConfig {
             compaction_target_file_size_bytes: wire.compaction_target_file_size_bytes,
             compaction_type: wire.compaction_type,
             resolved: wire.resolved,
+            bound_version: None,
         })
     }
 }
@@ -430,15 +472,18 @@ pub struct WriterTable {
     fqn: Arc<str>,
     /// The user schema the server described for this table.
     schema: SchemaRef,
+    /// The table version that description named.
+    table_version: TableVersion,
 }
 
 impl WriterTable {
     /// Build a described destination from its resolved config.
     #[must_use]
-    pub(crate) fn new(fqn: &str, schema: SchemaRef) -> Self {
+    pub(crate) fn new(fqn: &str, schema: SchemaRef, table_version: TableVersion) -> Self {
         Self {
             fqn: Arc::from(fqn),
             schema,
+            table_version,
         }
     }
 
@@ -452,6 +497,25 @@ impl WriterTable {
     #[must_use]
     pub fn user_schema(&self) -> &SchemaRef {
         &self.schema
+    }
+
+    /// The table version every batch written to this destination names.
+    #[must_use]
+    pub const fn table_version(&self) -> TableVersion {
+        self.table_version
+    }
+
+    /// The same destination and table version, with rows checked against
+    /// `schema` at seal instead of the described user schema.
+    ///
+    /// The server still matches every batch to the table's own schema.
+    #[must_use]
+    pub fn with_schema(&self, schema: SchemaRef) -> Self {
+        Self {
+            fqn: Arc::clone(&self.fqn),
+            schema,
+            table_version: self.table_version,
+        }
     }
 }
 

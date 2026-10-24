@@ -468,6 +468,79 @@ impl Forge {
         })?
         .map_err(ForgeError::Catalog)
     }
+
+    /// Lists the metadata document every committed table version of `table`
+    /// retains, under Forge's bounded catalog timeout.
+    ///
+    /// Each one roots a definition accepted work may still be written or
+    /// retried under, so cleanup protects it after it leaves the native
+    /// metadata log. ponytail: every version is retained; prune a noncurrent
+    /// one once a retry-retention horizon is defined.
+    ///
+    /// # Errors
+    ///
+    /// Returns timeout or catalog errors, including a catalog that keeps no
+    /// version references; cleanup then fails closed.
+    pub(super) async fn retained_definitions(
+        &self,
+        table: &iceberg::table::Table,
+    ) -> Result<Vec<String>, ForgeError> {
+        tokio::time::timeout(
+            self.core.config.catalog_request_timeout,
+            self.core.catalog.list_table_version_locations(
+                table.identifier(),
+                &table.metadata().uuid().to_string(),
+            ),
+        )
+        .await
+        .map_err(|_| ForgeError::Timeout {
+            operation: "catalog table version listing",
+        })?
+        .map_err(ForgeError::Catalog)
+    }
+
+    /// Resolves the definition `table_version` of `table` declares.
+    ///
+    /// The loaded table answers its current version; an older one is read
+    /// from the documents [`Self::retained_definitions`] lists. ponytail:
+    /// an older version reads every retained document until it matches; key
+    /// the lookup by version once tables carry many versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns timeout, catalog, and metadata read errors, and
+    /// [`ForgeError::Invariant`] when a document does not rebuild a definition
+    /// or the table retains no such version.
+    pub(super) async fn retained_definition(
+        &self,
+        fqn: &str,
+        table: &iceberg::table::Table,
+        table_version: wyrd_spec::vala::ids::TableVersion,
+    ) -> Result<crate::catalog::TableDefinition, ForgeError> {
+        let rebuild = |metadata: &iceberg::spec::TableMetadata| {
+            crate::catalog::TableDefinition::of_metadata(fqn, metadata).map_err(|error| {
+                ForgeError::Invariant {
+                    detail: error.to_string(),
+                }
+            })
+        };
+        let current = rebuild(table.metadata())?;
+        if current.table_version == table_version {
+            return Ok(current);
+        }
+        for location in self.retained_definitions(table).await? {
+            let metadata = iceberg::spec::TableMetadata::read_from(table.file_io(), &location)
+                .await
+                .map_err(ForgeError::Catalog)?;
+            let definition = rebuild(&metadata)?;
+            if definition.table_version == table_version {
+                return Ok(definition);
+            }
+        }
+        Err(ForgeError::Invariant {
+            detail: format!("{fqn} retains no table version {table_version}"),
+        })
+    }
 }
 
 #[cfg(test)]

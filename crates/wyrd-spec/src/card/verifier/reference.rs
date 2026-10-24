@@ -206,23 +206,13 @@ impl SourceText {
 
 impl schemars::JsonSchema for SourceText {
     /// Names the source schema in generated definitions.
-    fn schema_name() -> String {
-        "SourceText".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SourceText".into()
     }
 
     /// Describes a source declaration as a string naming its two forms.
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, Metadata, SchemaObject};
-
-        SchemaObject {
-            metadata: Some(Box::new(Metadata {
-                description: Some(SOURCE_DESCRIPTION.to_owned()),
-                ..Metadata::default()
-            })),
-            instance_type: Some(InstanceType::String.into()),
-            ..SchemaObject::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "description": SOURCE_DESCRIPTION, "type": "string" })
     }
 }
 
@@ -477,30 +467,20 @@ impl<'de> Deserialize<'de> for Reference {
 
 impl schemars::JsonSchema for Reference {
     /// Names the reference schema in generated definitions.
-    fn schema_name() -> String {
-        "Reference".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Reference".into()
     }
 
     /// Describes a reference as a string, documenting the accepted roots
     /// and selectors.
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, Metadata, SchemaObject};
-
-        SchemaObject {
-            metadata: Some(Box::new(Metadata {
-                description: Some(
-                    "Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, \
-                     steps.<id>.requirements.<id>.outcome|reason, requirement.id, or \
-                     requirement.statement, with .field, [n], and (in assert each) [*] \
-                     selectors below inputs and step outputs."
-                        .to_owned(),
-                ),
-                ..Metadata::default()
-            })),
-            instance_type: Some(InstanceType::String.into()),
-            ..SchemaObject::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "Scope reference: inputs.<slot>, steps.<id>.output, steps.<id>.status, \
+                steps.<id>.requirements.<id>.outcome|reason, requirement.id, or \
+                requirement.statement, with .field, [n], and (in assert each) [*] \
+                selectors below inputs and step outputs.",
+            "type": "string"
+        })
     }
 }
 
@@ -595,23 +575,13 @@ impl<'de> Deserialize<'de> for OrderBy {
 
 impl schemars::JsonSchema for OrderBy {
     /// Names the order schema in generated definitions.
-    fn schema_name() -> String {
-        "OrderBy".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "OrderBy".into()
     }
 
     /// Describes an order as a string naming its two forms.
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        use schemars::schema::{InstanceType, Metadata, SchemaObject};
-
-        SchemaObject {
-            metadata: Some(Box::new(Metadata {
-                description: Some(ORDER_DESCRIPTION.to_owned()),
-                ..Metadata::default()
-            })),
-            instance_type: Some(InstanceType::String.into()),
-            ..SchemaObject::default()
-        }
-        .into()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "description": ORDER_DESCRIPTION, "type": "string" })
     }
 }
 

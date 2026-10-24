@@ -115,7 +115,6 @@ def test_prompt_cards_declare_get_list_resolve_latest_and_delete(cards: Cards) -
     name = "crud-prompt"
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="Hello {{name}}"),
-        space="python-e2e",
         name=name,
         version="0.1.0",
     )
@@ -129,11 +128,11 @@ def test_prompt_cards_declare_get_list_resolve_latest_and_delete(cards: Cards) -
     assert envelope.uid == card.uid
     assert isinstance(envelope.prompt, Prompt)
     assert envelope.prompt.model == "gpt-4o"
-    latest = cards.prompt.resolve_latest(space="python-e2e", name=name)
+    latest = cards.prompt.resolve_latest(name=name)
     assert latest.uid == card.uid
-    exact = cards.prompt.get(space="python-e2e", name=name, version=latest.version)
+    exact = cards.prompt.get(name=name, version=latest.version)
     assert exact.uid == card.uid
-    page = cards.prompt.list(space="python-e2e", name=name)
+    page = cards.prompt.list(name=name)
     assert any(item.uid == card.uid and item.status == "active" for item in page.items)
 
     cards.prompt.delete(uid=card.uid)
@@ -147,7 +146,7 @@ def test_data_card_custom_interface_get_requires_interface_and_downloads_no_arti
 ) -> None:
     name = "custom-data"
     interface = JsonDataInterface({"rows": 2})
-    card = DataCard(interface, space="python-e2e", name=name, version="0.1.0")
+    card = DataCard(interface, name=name, version="0.1.0")
 
     cards.data.declare(
         card,
@@ -178,7 +177,6 @@ def test_model_card_custom_interface_get_requires_interface_and_downloads_no_art
     interface = TextModelInterface("model-bytes")
     card = ModelCard(
         interface,
-        space="python-e2e",
         name=name,
         version="0.1.0",
         metadata=_model_metadata(),
@@ -214,7 +212,6 @@ def test_typed_registry_rejects_a_card_of_the_wrong_kind(cards: Cards) -> None:
 def test_card_declaration_replay_is_idempotent(cards: Cards) -> None:
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="Replay me"),
-        space="python-e2e",
         name="replay",
         version="0.1.0",
     )
@@ -233,7 +230,6 @@ def test_declaration_version_modes_match_server_contract(cards: Cards) -> None:
 
     omitted = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="version"),
-        space="python-e2e",
         name=name,
         version="1",
     )
@@ -242,7 +238,6 @@ def test_declaration_version_modes_match_server_contract(cards: Cards) -> None:
 
     patch = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="version changed"),
-        space="python-e2e",
         name=name,
         version="1",
     )
@@ -251,7 +246,6 @@ def test_declaration_version_modes_match_server_contract(cards: Cards) -> None:
 
     minor = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="version changed again"),
-        space="python-e2e",
         name=name,
         version="1",
     )
@@ -260,7 +254,6 @@ def test_declaration_version_modes_match_server_contract(cards: Cards) -> None:
 
     exact = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="exact"),
-        space="python-e2e",
         name=name,
         version="2.3.4",
     )
@@ -280,9 +273,7 @@ def test_declaration_releases_the_gil(cards: Cards) -> None:
 
     thread = threading.Thread(target=compete)
     thread.start()
-    card = DataCard(
-        LargeDataInterface(counter), space="python-e2e", name="gil-data", version="0.1.0"
-    )
+    card = DataCard(LargeDataInterface(counter), name="gil-data", version="0.1.0")
     try:
         cards.data.declare(card)
     finally:
@@ -294,7 +285,6 @@ def test_declaration_releases_the_gil(cards: Cards) -> None:
 def test_card_declaration_rejects_invalid_artifact_layout(cards: Cards) -> None:
     card = DataCard(
         SymlinkDataInterface({"rows": 1}),
-        space="python-e2e",
         name="symlink-data",
         version="0.1.0",
     )
@@ -307,7 +297,6 @@ def test_card_declaration_rejects_underprivileged_writer(wyrd_server: WyrdTestSe
     denied = Cards(WyrdClient(credential=wyrd_server.bootstrap_service([], name="no-roles")))
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="No write permission"),
-        space="python-e2e",
         name="forbidden",
         version="3.2.1",
     )
@@ -323,7 +312,6 @@ def test_card_registry_enforces_cross_tenant_isolation(
 ) -> None:
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="Tenant A"),
-        space="python-e2e",
         name="tenant-a-prompt",
         version="0.1.0",
     )

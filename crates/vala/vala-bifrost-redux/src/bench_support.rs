@@ -128,7 +128,7 @@ impl WalBenchSupport {
         })
     }
 
-    /// Prepare a v6 data record without filesystem work.
+    /// Prepare a v7 data record without filesystem work.
     pub fn prepare(
         &self,
         batch_id: [u8; 16],
@@ -137,11 +137,13 @@ impl WalBenchSupport {
         let seal_key = SealKey::new(
             self.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "bench"),
-            TimePartition::new(TimeGranularity::Day, chrono::DateTime::UNIX_EPOCH).map_err(
-                |error| ScribeError::Internal {
-                    detail: format!("benchmark WAL epoch partition is invalid: {error}"),
-                },
-            )?,
+            crate::catalog::PhysicalPartition::time_only(
+                TimePartition::new(TimeGranularity::Day, chrono::DateTime::UNIX_EPOCH).map_err(
+                    |error| ScribeError::Internal {
+                        detail: format!("benchmark WAL epoch partition is invalid: {error}"),
+                    },
+                )?,
+            ),
         );
         Ok(PreparedWalAppendFixture {
             append: PreparedWalAppend::new(

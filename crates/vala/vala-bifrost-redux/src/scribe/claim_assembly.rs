@@ -320,7 +320,7 @@ mod tests {
     fn assembly_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         )]))
     }
@@ -338,7 +338,8 @@ mod tests {
     fn frozen_member(tenant: DataTenantId, rows: i64, offset: i64, batch: u8) -> FrozenMemtable {
         let schema = assembly_schema();
         let times =
-            TimestampMicrosecondArray::from_iter_values((0..rows).map(|row| row * 2 + offset));
+            TimestampMicrosecondArray::from_iter_values((0..rows).map(|row| row * 2 + offset))
+                .with_timezone("+00:00");
         let record = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(times)])
             .expect("fixture member batch");
         let arrow_bytes = crate::scribe::memory::retained_arrow_bytes(&record);

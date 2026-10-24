@@ -10,7 +10,9 @@ shift
 
 readonly repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly compose_file="${WYRD_POSTGRES_COMPOSE_FILE:-$repo_root/docker-compose.yml}"
-readonly compose_project="$(printf 'wyrd-test-%s-%s-%s' "$(basename "$repo_root")" "${PPID:-0}" "${BASHPID:-$$}" | tr '[:upper:]_./ ' '[:lower:]----' | tr -cd 'a-z0-9-' | cut -c1-48)"
+# The process ids lead so the 48-character cut never drops them: worktrees with
+# long, shared name prefixes would otherwise collide on one project.
+readonly compose_project="$(printf 'wyrd-test-%s-%s-%s' "${PPID:-0}" "${BASHPID:-$$}" "$(basename "$repo_root")" | tr '[:upper:]_./ ' '[:lower:]----' | tr -cd 'a-z0-9-' | cut -c1-48)"
 readonly admin_password="${WYRD_TEST_POSTGRES_ADMIN_PASSWORD:-wyrd_test_admin_pw}"
 readonly tenant_password="${WYRD_TEST_POSTGRES_TENANT_PASSWORD:-wyrd_tenant_pw}"
 readonly platform_password="${WYRD_TEST_POSTGRES_PLATFORM_PASSWORD:-wyrd_platform_pw}"

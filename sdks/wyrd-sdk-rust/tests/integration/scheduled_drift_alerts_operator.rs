@@ -120,9 +120,7 @@ impl Watch {
     async fn record(&self, samples: impl IntoIterator<Item = Inputs>) {
         let cards = self.deployment.cards().await;
         let bundle = pull(&cards, &self.service.root).await;
-        let watcher = self
-            .deployment
-            .client(&self.deployment.service_key(&self.service.root).await);
+        let watcher = self.deployment.service_client(&self.service.root).await;
         let state =
             WyrdState::from_path_with(bundle.path().join("bundle"), watcher).expect("bundle loads");
         state.start_bifrost().await.expect("Bifrost starts");
@@ -401,7 +399,7 @@ async fn scheduled_binding_rejects_redundant_inputs() {
         .expect("the administrator token mints");
     let budget = json!({
         "verifier": { "kind": "Verifier", "name": "latency-error-budget",
-                      "version": "1.0.0", "space": "default" },
+                      "version": "1.0.0" },
         "runs_on": { "kind": "schedule", "cron": "0 0 * * *" },
     });
     let mut exact = budget.clone();
@@ -455,7 +453,7 @@ async fn scheduled_binding_rejects_redundant_inputs() {
             .json(&json!({ "submissions": [{
                 "apiVersion": "wyrd/v1",
                 "kind": kind,
-                "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+                "metadata": { "name": name, "version": "1.0.0" },
                 "spec": spec,
             }] }))
             .send()
@@ -479,11 +477,7 @@ async fn scheduled_binding_rejects_redundant_inputs() {
             CardKind::Verifier
         };
         let absent = cards
-            .resolve_latest(
-                kind,
-                "default".parse().expect("space parses"),
-                name.parse().expect("name parses"),
-            )
+            .resolve_latest(kind, name.parse().expect("name parses"))
             .await
             .expect_err("a refused Card does not persist");
         assert_eq!(absent.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");

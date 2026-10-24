@@ -9,7 +9,6 @@ pub(super) fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
     WyrdError::registry_unavailable("card registry unavailable")
 }
 
-mod auth_projection;
 mod declare;
 mod delete;
 mod field_resolver;
@@ -22,7 +21,6 @@ mod version_query;
 mod version_resolve;
 mod version_sql;
 
-pub use auth_projection::upsert_service_account_from_card;
 pub use declare::{
     CardArtifactManifestRow, CardDeclarationOperationRow, DeclaredCardRow, NewCardRow,
     NewDeclarationOperation, commit_declaration_operation, declaration_request_hash,
@@ -48,7 +46,7 @@ pub use lifecycle::{
 };
 pub use list::{
     CardQuery, ListCursor, ListPage, MAX_LIST_LIMIT, check_uid_exists, find_card_by_spec_hash,
-    get_unique_spaces, query_cards,
+    query_cards,
 };
 pub use relationships::{
     inbound_relationships, persist_outbound_relationships, recheck_active_card_refs,

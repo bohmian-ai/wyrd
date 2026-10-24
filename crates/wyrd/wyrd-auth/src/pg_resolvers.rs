@@ -34,7 +34,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::HUMAN_SUBJECT_CLAIM;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::auth::IssuerUrl;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::ids::CardUid;
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::auth::{
     TrustedIssuerWrite, WorkloadBindingWrite, trusted_issuer_by_url, trusted_issuers_for_tenant,
@@ -225,6 +226,17 @@ impl PgWorkloadBindingResolver {
 }
 
 impl WorkloadBindingResolver for PgWorkloadBindingResolver {
+    /// Read the tenant's workload binding for `issuer` and `subject`.
+    ///
+    /// Prefers a row whose audience equals `audience` and falls back to a
+    /// `NULL`-audience row; returns `Ok(None)` when neither exists so the
+    /// caller refuses the exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OidcError::JwksUnavailable`] when the tenant connection
+    /// cannot be acquired, the binding query fails, or the stored root
+    /// `workload_uid` is not a valid Card UID.
     #[tracing::instrument(skip(self), fields(tenant_id = %tenant, issuer = %issuer))]
     async fn binding(
         &self,
@@ -232,7 +244,7 @@ impl WorkloadBindingResolver for PgWorkloadBindingResolver {
         issuer: &IssuerUrl,
         subject: &str,
         audience: Option<&str>,
-    ) -> Result<Option<CardRef>, OidcError> {
+    ) -> Result<Option<WorkloadBinding>, OidcError> {
         let mut conn = self.postgres.tenant_conn(*tenant).await.map_err(|error| {
             tracing::warn!(error = %error, "binding resolver failed to acquire tenant connection");
             OidcError::JwksUnavailable {
@@ -249,7 +261,28 @@ impl WorkloadBindingResolver for PgWorkloadBindingResolver {
                     message: error.to_string(),
                 }
             })?;
-        Ok(row.map(|row| row.card_ref))
+        row.map(|row| {
+            let workload_uid = row
+                .workload_uid
+                .map(CardUid::from_uuid)
+                .transpose()
+                .map_err(|error| {
+                    tracing::warn!(error = %error, "stored binding root is not a Card UID");
+                    OidcError::JwksUnavailable {
+                        issuer: issuer.as_str().to_owned(),
+                        message: error.to_string(),
+                    }
+                })?;
+            Ok(WorkloadBinding {
+                tenant_id: *tenant,
+                issuer: issuer.clone(),
+                subject: row.subject,
+                audience: row.audience,
+                principal_id: PrincipalId::new(row.principal_id),
+                workload_uid,
+            })
+        })
+        .transpose()
     }
 }
 
@@ -707,19 +740,15 @@ pub fn issuer_write_from_trusted(
 }
 
 /// Encode a [`WorkloadBinding`] into a [`WorkloadBindingWrite`] for boot seeding.
-///
-/// # Errors
-/// Returns a [`serde_json::Error`] when the structured `card_ref` cannot be
-/// serialized to JSONB.
-pub fn binding_write_from_binding(
-    binding: &WorkloadBinding,
-) -> Result<WorkloadBindingWrite, serde_json::Error> {
-    Ok(WorkloadBindingWrite {
+#[must_use]
+pub fn binding_write_from_binding(binding: &WorkloadBinding) -> WorkloadBindingWrite {
+    WorkloadBindingWrite {
         issuer_url: binding.issuer.as_str().to_owned(),
         subject: binding.subject.clone(),
         audience: binding.audience.clone(),
-        card_ref: serde_json::to_value(&binding.card_ref)?,
-    })
+        principal_id: binding.principal_id.as_uuid(),
+        workload_uid: binding.workload_uid.as_ref().map(CardUid::as_uuid),
+    }
 }
 
 #[cfg(test)]
@@ -728,6 +757,8 @@ mod pg_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use uuid::Uuid;
+
     use secrecy::{ExposeSecret, SecretString};
     use wyrd_auth_oidc::{
         ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, TrustedIssuer, WorkloadBinding,
@@ -735,13 +766,10 @@ mod pg_tests {
     };
     use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::auth::PrincipalId;
     use wyrd_sql::queries::auth::{upsert_trusted_issuer, upsert_workload_binding};
 
     use super::{
@@ -749,6 +777,7 @@ mod pg_tests {
         binding_write_from_binding, human_connection_trusted_issuer, issuer_write_from_trusted,
         trusted_issuer_from_row,
     };
+    use crate::exchange_api_key::pg_tests::insert_test_service_account;
 
     const ISSUER_URL: &str = "https://idp.example.com/realms/wyrd";
 
@@ -841,13 +870,19 @@ mod pg_tests {
     /// A stored human connection row mapping `subject` as `email` fails closed
     /// at decode, while the same row mapping `sub` decodes with its email and
     /// group paths intact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the `email` subject row decodes, its error is not
+    /// `HumanSubject("email")`, or the `sub` row fails to decode with its
+    /// subject and email paths.
     #[test]
     fn stored_human_connection_requires_the_sub_subject_claim() {
         let tenant: DataTenantId = "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
             .parse()
             .expect("tenant id is valid");
         let row = |subject: &str| wyrd_sql::row_types::auth::HumanConnectionRow {
-            connection_id: uuid::Uuid::new_v4(),
+            connection_id: Uuid::new_v4(),
             data_tenant_id: tenant.as_uuid(),
             revision: 1,
             state: "Active".to_owned(),
@@ -970,6 +1005,14 @@ mod pg_tests {
         );
     }
 
+    /// A `NULL`-audience binding answers an audience-qualified lookup through
+    /// [`PgWorkloadBindingResolver`], and an unbound subject resolves to `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture or seed writes fail, a lookup errors, the
+    /// fallback lookup misses or returns another account or root, or the
+    /// unbound subject resolves.
     #[tokio::test]
     async fn binding_resolver_prefers_audience_then_falls_back() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -978,23 +1021,18 @@ mod pg_tests {
         let issuer = sample_issuer(tenant);
         let issuer_write = issuer_write_from_trusted(&issuer, Some(&key)).expect("encode succeeds");
 
-        let card_ref = CardRef {
-            kind: CardKind::Service,
-            name: CardName::new("my-model").expect("card name"),
-            version: VersionBlock::parse("1.0.0").expect("version"),
-            space: Some(SpaceName::new("prod").expect("space")),
-            uid: None,
-        };
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let account = insert_test_service_account(&mut conn, Uuid::now_v7(), None).await;
         let binding = WorkloadBinding {
             tenant_id: tenant,
             issuer: issuer.issuer.clone(),
             subject: "system:serviceaccount:default/my-sa".to_owned(),
             audience: None,
-            card_ref: card_ref.clone(),
+            principal_id: PrincipalId::new(account),
+            workload_uid: None,
         };
-        let binding_write = binding_write_from_binding(&binding).expect("binding encodes");
+        let binding_write = binding_write_from_binding(&binding);
 
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         upsert_trusted_issuer(&mut conn, &issuer_write)
             .await
             .expect("issuer upsert");
@@ -1016,7 +1054,8 @@ mod pg_tests {
             .await
             .expect("lookup ok")
             .expect("subject resolves via fallback");
-        assert_eq!(resolved_binding.name.to_string(), "my-model");
+        assert_eq!(resolved_binding.principal_id, binding.principal_id);
+        assert_eq!(resolved_binding.workload_uid, None);
 
         // An unbound subject resolves to None.
         let unbound = resolver

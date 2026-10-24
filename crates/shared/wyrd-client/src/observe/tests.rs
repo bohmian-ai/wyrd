@@ -175,6 +175,7 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
             registered_at: "2026-07-01T00:00:00Z".parse().expect("fixture timestamp"),
             updated_at: "2026-07-01T00:00:00Z".parse().expect("fixture timestamp"),
         },
+        table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
         user_fields: wyrd_types::arrow_schema_to_fieldspec(&schema)
             .expect("the fixture schema is representable"),
         correlation_fields: vec![
@@ -193,7 +194,10 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
         ],
         canonical_physical_fingerprint: None,
         physical_layout: wyrd_spec::vala::api::PhysicalLayoutWire {
-            partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
+            partition_by: vec![wyrd_spec::vala::api::PartitionFieldWire::new(
+                "wyrd_ingested_at",
+                wyrd_spec::vala::api::PartitionTransformWire::Day,
+            )],
             time_column: None,
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
@@ -735,6 +739,7 @@ fn target(spec: &wyrd_spec::card::verifier::VerifierSpec) -> crate::verify::Targ
             .expect("subject UID"),
         run_id: wyrd_spec::vala::ids::RunId::new(),
         group_id: None,
+        deployment_environment: None,
     }
 }
 
@@ -757,7 +762,7 @@ fn run_evidence(
 
 /// A passing result body for execution `id`.
 fn result_body(id: &wyrd_spec::ids::ExecutionId) -> Value {
-    let card = json!({ "kind": "Verifier", "space": "support", "name": "policy-check", "version": "1.0.0" });
+    let card = json!({ "kind": "Verifier", "name": "policy-check", "version": "1.0.0" });
     json!({
         "execution_id": id,
         "verifier": card,
@@ -887,10 +892,9 @@ async fn execute_pins_files_and_uploads_only_missing_digests() {
         .expect(1)
         .mount(&server)
         .await;
-    let artifact: wyrd_spec::reference::CardRef = serde_json::from_value(
-        json!({ "kind": "Artifact", "space": "support", "name": "decks", "version": "1.0.0" }),
-    )
-    .expect("Artifact ref decodes");
+    let artifact: wyrd_spec::reference::CardRef =
+        serde_json::from_value(json!({ "kind": "Artifact", "name": "decks", "version": "1.0.0" }))
+            .expect("Artifact ref decodes");
     let spec = run_verifier();
     let run = run_evidence(
         &spec,
@@ -944,7 +948,7 @@ async fn execute_pins_files_and_uploads_only_missing_digests() {
         body("/v1/verification/execute")["inputs"],
         json!({
             "answer": { "kind": "json", "value": { "text": "yes" } },
-            "archive": { "kind": "artifact", "artifact": { "kind": "Artifact", "space": "support", "name": "decks", "version": "1.0.0" }, "path": "q3.pdf" },
+            "archive": { "kind": "artifact", "artifact": { "kind": "Artifact", "name": "decks", "version": "1.0.0" }, "path": "q3.pdf" },
             "copy": { "kind": "file", "sha256": policy_sha, "size_bytes": 11, "format": "pdf" },
             "deck": { "kind": "file", "sha256": deck_sha, "size_bytes": 9, "format": "pdf" },
             "policy": { "kind": "file", "sha256": policy_sha, "size_bytes": 11, "format": "pdf", "filename": "Policy.pdf" },

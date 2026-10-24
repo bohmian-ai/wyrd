@@ -74,6 +74,7 @@ Gateway request and response payload columns also need `gateway_payload:read`.
 | --- | --- | --- | --- |
 | `principals.list_credentials` | `service_accounts:write` | `{principal_id}` → CredentialListResponse | List credentials, including expired and revoked |
 | `principals.revoke_credential` | `service_accounts:write` | `{principal_id, credential_id}` → CredentialRevoked | Stop token issuance from a credential |
+| `principals.set_workload_restriction` | `*` | `{principal_id, workload_restriction}` → PrincipalSummary | Replace a Service account's workload restriction; a family makes it that family's unique scheduled runtime account |
 
 A token already minted from a revoked credential lapses within five minutes.
 

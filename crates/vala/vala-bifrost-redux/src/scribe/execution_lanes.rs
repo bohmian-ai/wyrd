@@ -465,8 +465,10 @@ pub(crate) struct IngressDecodeInputs {
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<CardUid>>,
-    /// Catalog fingerprint required of the caller-owned source schema.
-    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the caller-owned source
+    /// schema; `None` leaves conformance to the registered schema as the only
+    /// schema authority.
+    pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: RequestId,
     /// Admission instant stamped as `wyrd_ingested_at`.
@@ -491,8 +493,10 @@ pub(crate) struct DecodeContext<'a> {
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<&'a [CardUid]>,
-    /// Catalog fingerprint required of the caller-owned source schema.
-    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the caller-owned source
+    /// schema; `None` leaves conformance to the registered schema as the only
+    /// schema authority.
+    pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: &'a RequestId,
     /// Admission instant in epoch microseconds, read once per batch and
@@ -574,9 +578,10 @@ fn decode_rows(
     let conformed;
     let rows = match context.registered_schema {
         Some(registered) => {
+            let policy = correlation_policy(context);
             conformed = match context.conform {
-                Some(plans) => plans.conform(rows, registered)?,
-                None => conform_to_registered(rows, registered)?,
+                Some(plans) => plans.conform(rows, registered, policy)?,
+                None => conform_to_registered(rows, registered, policy)?,
             };
             &conformed
         }
@@ -585,9 +590,10 @@ fn decode_rows(
     if let Some(definition) = context.definition {
         enforce_builtin_source_contract(rows, definition, trusted)?;
     }
-    let actual_source_fingerprint =
-        source_schema_fingerprint(rows.schema().as_ref(), correlation_policy(context));
-    if actual_source_fingerprint != context.expected_schema_fingerprint {
+    if let Some(expected) = context.expected_schema_fingerprint
+        && source_schema_fingerprint(rows.schema().as_ref(), correlation_policy(context))
+            != expected
+    {
         return Err(ScribeError::FingerprintMismatch {
             table: "resolved ingress table".to_owned(),
         });
@@ -622,28 +628,37 @@ fn decode_rows(
 ///   Arrow would refuse to relabel;
 /// - the same Iceberg type in another Arrow spelling (`Int8` for `int`, a
 ///   `UTC` zone for `+00:00`, a list element named `item`) is cast once with
-///   Arrow's `cast` to the registered type, keeping the sent field's name,
-///   nullability, and metadata;
+///   Arrow's `cast` to the registered type, keeping the sent field's name
+///   and metadata;
+/// - every matched column takes the registered top-level requiredness, so
+///   Arrow refuses a null in a required column even when the sender's field
+///   declared it nullable;
 /// - a column whose storage matches but whose Variant identity does not — a
 ///   Struct sent for a Variant, a Variant sent for a Struct, or a Variant
 ///   marker with parameters, at any depth — is refused as an unsupported type
 ///   before any value is read, because the storage-only fingerprint cannot
 ///   see the extension;
-/// - any other column is kept as sent, so the fingerprint check refuses it.
+/// - any other matched column, a column `policy` does not reserve that the
+///   table does not register, and a registered column `policy` does not
+///   reserve that was not sent are refused, so the registered schema of the
+///   selected table version alone decides the caller-owned columns; reserved
+///   columns are left for managed stamping.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::ContractViolation`] carrying
 /// [`BifrostError::UnsupportedType`] for a Variant identity mismatch,
-/// [`ScribeError::FingerprintMismatch`] when the registered schema has no
-/// Arrow form or Arrow cannot cast an equivalent column, and
-/// [`ScribeError::InvalidFrame`] when Arrow refuses the conformed batch, which
-/// duplicate-free input cannot cause.
+/// [`ScribeError::FingerprintMismatch`] for a column the registered schema
+/// does not accept, a missing registered column, a registered schema with no
+/// Arrow form, or an equivalent column Arrow cannot cast, and
+/// [`ScribeError::InvalidFrame`] when Arrow refuses the conformed batch, such
+/// as a null in a column the registered schema requires.
 fn conform_to_registered(
     rows: &RecordBatch,
     registered: &IcebergSchema,
+    policy: CorrelationPolicy,
 ) -> Result<RecordBatch, ScribeError> {
-    ConformPlan::build(&rows.schema(), registered)?.apply(rows)
+    ConformPlan::build(&rows.schema(), registered, policy)?.apply(rows)
 }
 
 /// How every batch of one sent Arrow schema conforms to one registered
@@ -669,14 +684,25 @@ impl ConformPlan {
     ///
     /// Returns [`ScribeError::ContractViolation`] carrying
     /// [`BifrostError::UnsupportedType`] for a Variant identity mismatch and
-    /// [`ScribeError::FingerprintMismatch`] when the registered schema has no
-    /// Arrow form.
-    fn build(sent: &Schema, registered: &IcebergSchema) -> Result<Self, ScribeError> {
-        let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| {
-            ScribeError::FingerprintMismatch {
-                table: "resolved ingress table".to_owned(),
-            }
-        })?;
+    /// [`ScribeError::FingerprintMismatch`] for a column the registered schema
+    /// does not accept, a missing registered column, or a registered schema
+    /// with no Arrow form.
+    fn build(
+        sent: &Schema,
+        registered: &IcebergSchema,
+        policy: CorrelationPolicy,
+    ) -> Result<Self, ScribeError> {
+        let mismatch = || ScribeError::FingerprintMismatch {
+            table: "resolved ingress table".to_owned(),
+        };
+        let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| mismatch())?;
+        if target
+            .fields()
+            .iter()
+            .any(|wanted| !policy.reserves(wanted.name()) && sent.index_of(wanted.name()).is_err())
+        {
+            return Err(mismatch());
+        }
         let registered_columns = target
             .fields()
             .iter()
@@ -704,13 +730,21 @@ impl ConformPlan {
                         },
                     ));
                 }
-                _ => None,
+                Some(_) => return Err(mismatch()),
+                None if !policy.reserves(field.name()) => return Err(mismatch()),
+                None => None,
             };
-            fields.push(match &cast {
-                Some(data_type) => {
-                    Arc::new(field.as_ref().clone().with_data_type(data_type.clone()))
-                }
-                None => Arc::clone(field),
+            // The selected schema owns top-level requiredness, so Arrow
+            // refuses a null the sender's own field would have allowed.
+            let nullable = wanted.map_or(field.is_nullable(), |wanted| wanted.is_nullable());
+            fields.push(if cast.is_none() && nullable == field.is_nullable() {
+                Arc::clone(field)
+            } else {
+                let conformed = field.as_ref().clone().with_nullable(nullable);
+                Arc::new(match &cast {
+                    Some(data_type) => conformed.with_data_type(data_type.clone()),
+                    None => conformed,
+                })
             });
             columns.push((index, cast));
         }
@@ -727,7 +761,7 @@ impl ConformPlan {
     ///
     /// Returns [`ScribeError::FingerprintMismatch`] when Arrow cannot cast an
     /// equivalent column and [`ScribeError::InvalidFrame`] when Arrow refuses
-    /// the conformed batch, which duplicate-free input cannot cause.
+    /// the conformed batch, such as a null in a required registered column.
     fn apply(&self, rows: &RecordBatch) -> Result<RecordBatch, ScribeError> {
         let columns = self
             .columns
@@ -792,6 +826,7 @@ impl ConformPlans {
         &self,
         rows: &RecordBatch,
         registered: &Arc<IcebergSchema>,
+        policy: CorrelationPolicy,
     ) -> Result<RecordBatch, ScribeError> {
         let sent = rows.schema();
         let key = Arc::as_ptr(registered).addr();
@@ -808,7 +843,7 @@ impl ConformPlans {
         if let Some(plan) = remembered {
             return plan.apply(rows);
         }
-        let plan = Arc::new(ConformPlan::build(&sent, registered)?);
+        let plan = Arc::new(ConformPlan::build(&sent, registered, policy)?);
         self.plans
             .write()
             .expect("the conform plan lock is never poisoned")
@@ -1364,8 +1399,8 @@ pub(crate) struct StageMemberOp {
     pub(crate) frozen: Box<FrozenMemtable>,
     /// Tenant-qualified physical table binding.
     pub(crate) binding: TenantTableBinding,
-    /// Registered physical write recipe resolved before the lane was entered.
-    pub(crate) layout: std::sync::Arc<crate::catalog::layout::PhysicalLayout>,
+    /// Physical write recipe resolved before the lane was entered.
+    pub(crate) recipe: crate::scribe::write_recipe::WriteRecipe,
     /// Shard, epoch, node, and WAL facts describing where the rows came from.
     pub(crate) origin: crate::scribe::member_stager::StagedMemberOrigin,
     /// Scribe capability charged for the batches the writer materializes.
@@ -1456,14 +1491,15 @@ fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, 
     let StageMemberOp {
         frozen,
         binding,
-        layout,
+        recipe,
         origin,
         memory,
         staging,
     } = operation;
     let context = crate::scribe::staging_runtime::ClaimContext {
         schema: std::sync::Arc::clone(&frozen.schema),
-        layout: (*layout).clone(),
+        layout: (*recipe.layout).clone(),
+        sort_order_id: recipe.sort_order_id,
         binding: binding.clone(),
     };
     staging
@@ -1471,7 +1507,7 @@ fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, 
             crate::scribe::member_stager::StageMemberRequest {
                 frozen: &frozen,
                 binding: &binding,
-                layout: &layout,
+                layout: &recipe.layout,
                 origin,
                 memory,
             },
@@ -2233,7 +2269,7 @@ mod tests {
     use wyrd_spec::auth::Attribution;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::CardUid;
-    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::managed_columns::{
@@ -2282,7 +2318,7 @@ mod tests {
             definition: None,
             attribution: Attribution::direct(principal.id).into(),
             card_scope,
-            expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
+            expected_schema_fingerprint: Some(SchemaFingerprint([0_u8; 32])),
             request_id,
             receipt_micros: receipt_now(),
             registered_schema: None,
@@ -2391,14 +2427,11 @@ mod tests {
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                card_scope: principal().card_scope(),
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     &Schema::new(cast_table_columns()),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -2473,21 +2506,91 @@ mod tests {
         let plans = super::ConformPlans::default();
 
         let first = plans
-            .conform(&narrow_spellings(Some("UTC")), &registered)
+            .conform(
+                &narrow_spellings(Some("UTC")),
+                &registered,
+                CorrelationPolicy::Observation,
+            )
             .expect("the first batch conforms");
         let second = plans
-            .conform(&narrow_spellings(Some("UTC")), &registered)
+            .conform(
+                &narrow_spellings(Some("UTC")),
+                &registered,
+                CorrelationPolicy::Observation,
+            )
             .expect("the second batch conforms");
 
         assert_eq!(
             first,
-            super::conform_to_registered(&narrow_spellings(Some("UTC")), &registered)
-                .expect("a fresh plan conforms")
+            super::conform_to_registered(
+                &narrow_spellings(Some("UTC")),
+                &registered,
+                CorrelationPolicy::Observation
+            )
+            .expect("a fresh plan conforms")
         );
         assert!(
             Arc::ptr_eq(&first.schema(), &second.schema()),
             "the second batch of one sent shape reuses the remembered plan"
         );
+    }
+
+    /// The selected schema's top-level requiredness decides which nulls a
+    /// scalar may carry, whatever the sender's Arrow field declares.
+    ///
+    /// A nullable sent field holding a null is refused for a required
+    /// registered column; the same field holding only values conforms as
+    /// required; an optional registered column keeps its null.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a registered schema does not convert, a required column
+    /// admits a null, valid values are refused or keep the sender's
+    /// nullability, or an optional column refuses its null.
+    #[test]
+    fn registered_requiredness_decides_scalar_nulls() {
+        let registered = |nullable| {
+            crate::tables::iceberg_schema_for(&Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                nullable,
+            )]))
+            .expect("the registered schema converts to Iceberg")
+        };
+        let sent = |values: Vec<Option<i64>>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    true,
+                )])),
+                vec![Arc::new(arrow::array::Int64Array::from(values))],
+            )
+            .expect("the sent batch satisfies its own schema")
+        };
+
+        assert!(matches!(
+            conform_to_registered(
+                &sent(vec![Some(1), None]),
+                &registered(false),
+                CorrelationPolicy::Observation
+            ),
+            Err(ScribeError::InvalidFrame)
+        ));
+        let valid = conform_to_registered(
+            &sent(vec![Some(1), Some(2)]),
+            &registered(false),
+            CorrelationPolicy::Observation,
+        )
+        .expect("non-null values conform to a required column");
+        assert!(!valid.schema().field(0).is_nullable());
+        let optional = conform_to_registered(
+            &sent(vec![Some(1), None]),
+            &registered(true),
+            CorrelationPolicy::Observation,
+        )
+        .expect("an optional column keeps its null");
+        assert_eq!(optional.column(0).null_count(), 1);
     }
 
     /// Spellings Iceberg stores as the registered column type are cast to it.
@@ -2609,11 +2712,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
-                expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
+                card_scope: principal().card_scope(),
+                expected_schema_fingerprint: Some(SchemaFingerprint((definition
+                    .schema_fingerprint)(
+                ))),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: Some(definition),
@@ -2672,7 +2774,9 @@ mod tests {
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
                 card_scope: None,
-                expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
+                expected_schema_fingerprint: Some(SchemaFingerprint((definition
+                    .schema_fingerprint)(
+                ))),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: Some(definition),
@@ -2768,8 +2872,9 @@ mod tests {
         let principal = principal();
         let request_id = RequestId::now_v7();
         let mut context = stamping_context(&principal, None, &request_id);
-        context.expected_schema_fingerprint =
-            crate::contracts::projected_source_schema_fingerprint(attributed.schema().as_ref());
+        context.expected_schema_fingerprint = Some(
+            crate::contracts::projected_source_schema_fingerprint(attributed.schema().as_ref()),
+        );
         assert!(
             matches!(
                 decode_rows(&attributed, &context, false),
@@ -3169,14 +3274,11 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                card_scope: principal().card_scope(),
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3221,14 +3323,11 @@ mod tests {
             payload,
             &DecodeContext {
                 attribution: Attribution::direct(principal.id).into(),
-                card_scope: principal
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                card_scope: principal.card_scope(),
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     schema,
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3240,21 +3339,22 @@ mod tests {
 
     /// Native payloads preserve one valid client run identifier while stamping
     /// exactly one authoritative nullable `run_id` column for the physical record.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture Card does not parse, decode rejects the valid
+    /// Utf8 `run_id`, the output does not carry exactly one nullable Utf8
+    /// `run_id` holding the client value, or an Int64 or duplicated `run_id`
+    /// is accepted or refused with anything other than `InvalidFrame`.
     #[test]
     fn native_run_id_is_replaced_by_one_authoritative_nullable_field() {
-        let card = CardRef::from_str("test/Service/python-integration-writer@1.0.0").expect("card");
+        let card = CardRef::from_str("Service/python-integration-writer@1.0.0").expect("card");
         let card = CardRef {
             uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("card uid")),
             ..card
         };
-        let principal = Principal::new(
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref: Some(card.clone()),
-                card_ref_scope: CardRefScope::own(&card),
-            },
-            crate::test_support::tenant(),
-            Vec::new(),
+        let principal = crate::test_support::scoped_service(
+            vec![card.uid.clone().expect("resolved card uid")],
             PermissionSet::new(),
         );
         let rows = batch(
@@ -3333,15 +3433,9 @@ mod tests {
     /// other than `CardScopeDenied`.
     #[test]
     fn card_scope_rejects_before_writer_admission() {
-        let card = resolved_card("prod/Service/billing@1.0.0");
-        let principal = Principal::new(
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref: Some(card.clone()),
-                card_ref_scope: CardRefScope::own(&card),
-            },
-            crate::test_support::tenant(),
-            Vec::new(),
+        let card = resolved_card("Service/billing@1.0.0");
+        let principal = crate::test_support::scoped_service(
+            vec![card.uid.clone().expect("resolved card uid")],
             PermissionSet::new(),
         );
         let rows = batch(
@@ -3356,14 +3450,11 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal.id).into(),
-                card_scope: principal
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                card_scope: principal.card_scope(),
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3409,14 +3500,11 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                card_scope: principal().card_scope(),
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3454,14 +3542,11 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                card_scope: principal().card_scope(),
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3513,14 +3598,11 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
-                card_scope: principal()
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                card_scope: principal().card_scope(),
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3550,20 +3632,18 @@ mod tests {
     }
 
     /// Builds a card-scoped service principal used by native ingest arms.
+    ///
+    /// # Panics
+    /// Panics when the static Card reference or the minted UUIDv7 Card UID
+    /// fails to parse.
     fn scoped_service_principal() -> (Principal, CardRef) {
-        let card = CardRef::from_str("test/Service/python-integration-writer@1.0.0").expect("card");
+        let card = CardRef::from_str("Service/python-integration-writer@1.0.0").expect("card");
         let card = CardRef {
             uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("card uid")),
             ..card
         };
-        let principal = Principal::new(
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref: Some(card.clone()),
-                card_ref_scope: CardRefScope::own(&card),
-            },
-            crate::test_support::tenant(),
-            Vec::new(),
+        let principal = crate::test_support::scoped_service(
+            vec![card.uid.clone().expect("resolved card uid")],
             PermissionSet::new(),
         );
         (principal, card)
@@ -3625,14 +3705,11 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 attribution: Attribution::direct(principal.id).into(),
-                card_scope: principal
-                    .card_ref_scope()
-                    .map(CardRefScope::uids)
-                    .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                card_scope: principal.card_scope(),
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3680,14 +3757,11 @@ mod tests {
                 ipc_payload(&rows),
                 &DecodeContext {
                     attribution: Attribution::direct(principal.id).into(),
-                    card_scope: principal
-                        .card_ref_scope()
-                        .map(CardRefScope::uids)
-                        .as_deref(),
-                    expected_schema_fingerprint: source_schema_fingerprint(
+                    card_scope: principal.card_scope(),
+                    expected_schema_fingerprint: Some(source_schema_fingerprint(
                         rows.schema().as_ref(),
                         CorrelationPolicy::Observation,
-                    ),
+                    )),
                     request_id: &RequestId::now_v7(),
                     receipt_micros: receipt_now(),
                     definition: None,
@@ -3740,18 +3814,15 @@ mod tests {
         }
     }
 
-    /// Build a service principal whose signed scope is exactly `scope`.
-    fn scoped_principal(root: &CardRef, scope: CardRefScope) -> Principal {
-        Principal::new(
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref: Some(root.clone()),
-                card_ref_scope: scope,
-            },
-            crate::test_support::tenant(),
-            Vec::new(),
-            PermissionSet::new(),
-        )
+    /// The signed UIDs of resolved `cards`, in order.
+    ///
+    /// # Panics
+    /// Panics when any of `cards` carries no UID.
+    fn member_uids(cards: &[&CardRef]) -> Vec<CardUid> {
+        cards
+            .iter()
+            .map(|card| card.uid.clone().expect("resolved card uid"))
+            .collect()
     }
 
     /// How a single-row fixture carries its optional `card_uid` correlation.
@@ -3784,10 +3855,9 @@ mod tests {
             fields.push(Field::new(CARD_UID, DataType::Utf8, true));
             columns.push(Arc::new(StringArray::from(vec![value])));
         }
-        let scope = principal.card_ref_scope().map(CardRefScope::uids);
         stamp_correlation_columns(
             &batch(fields, columns),
-            &stamping_context(principal, scope.as_deref(), &RequestId::now_v7()),
+            &stamping_context(principal, principal.card_scope(), &RequestId::now_v7()),
         )
     }
 
@@ -3814,15 +3884,15 @@ mod tests {
     ///
     /// Panics when an absent or null correlation does not stamp a null
     /// `card_uid`, when a scoped member's signed UID is not stamped unchanged,
-    /// or when a UID outside the scope, a UID-less membership's reference text,
-    /// or malformed text is admitted.
+    /// or when a UID outside the scope, a member's reference text, or
+    /// malformed text is admitted.
     #[test]
     fn optional_and_scoped_card_correlations_stamp_signed_uids() {
-        let root = resolved_card("prod/Service/checkout@1.0.0");
-        let secondary = resolved_card("prod/Agent/planner@2.0.0");
-        let principal = scoped_principal(
-            &root,
-            CardRefScope::from_root_and_members(&root, [secondary.clone()]),
+        let root = resolved_card("Service/checkout@1.0.0");
+        let secondary = resolved_card("Agent/planner@2.0.0");
+        let principal = crate::test_support::scoped_service(
+            member_uids(&[&root, &secondary]),
+            PermissionSet::new(),
         );
 
         for (label, supplied) in [
@@ -3860,29 +3930,12 @@ mod tests {
             );
         }
 
-        let unsigned = CardRef::from_str("prod/Service/unsigned@1.0.0").expect("card");
-        let unsigned_principal = scoped_principal(
-            &root,
-            CardRefScope::from_root_and_members(&root, [unsigned.clone()]),
-        );
-        for (label, principal, supplied) in [
-            (
-                "a UID-less signed membership's reference",
-                &unsigned_principal,
-                unsigned.to_string(),
-            ),
-            (
-                "malformed correlation text",
-                &principal,
-                "not-a-card-uid".to_owned(),
-            ),
-            (
-                "a UID outside the scope",
-                &principal,
-                Uuid::now_v7().to_string(),
-            ),
+        for (label, supplied) in [
+            ("a member's reference text", root.to_string()),
+            ("malformed correlation text", "not-a-card-uid".to_owned()),
+            ("a UID outside the scope", Uuid::now_v7().to_string()),
         ] {
-            let error = stamp_card_uid(principal, SuppliedCardUid::Text(&supplied))
+            let error = stamp_card_uid(&principal, SuppliedCardUid::Text(&supplied))
                 .expect_err("{label} fails closed");
             assert!(
                 matches!(error, ScribeError::CardScopeDenied),
@@ -3904,15 +3957,19 @@ mod tests {
     /// its signed one, or when a different Verifier's UID is admitted.
     #[test]
     fn system_writer_correlates_only_its_signed_verifier() {
-        let verifier = resolved_card("prod/Verifier/drift@1.0.0");
+        let verifier = resolved_card("Verifier/drift@1.0.0");
         let principal = Principal::new(
             PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::System {
-                card_ref_scope: CardRefScope::own(&verifier),
-            },
+            PrincipalKind::System,
             crate::test_support::tenant(),
             Vec::new(),
             PermissionSet::new(),
+        )
+        .with_card_access(
+            wyrd_spec::auth::CardAccess::Scoped {
+                cards: member_uids(&[&verifier]),
+            },
+            None,
         );
         let uid = uid_text(&verifier);
 
@@ -3920,7 +3977,7 @@ mod tests {
             .expect("the signed Verifier is admitted");
         assert_eq!(stamped_card_uid(&stamped), Some(uid));
 
-        let forged = uid_text(&resolved_card("prod/Verifier/other@1.0.0"));
+        let forged = uid_text(&resolved_card("Verifier/other@1.0.0"));
         assert!(matches!(
             stamp_card_uid(&principal, SuppliedCardUid::Text(&forged)),
             Err(ScribeError::CardScopeDenied)
@@ -3959,14 +4016,18 @@ mod tests {
             "{\"shredded\":true}".to_owned(),
         );
 
-        conform_to_registered(&send(variant.clone()), &registered)
-            .expect("the canonical Variant conforms");
+        conform_to_registered(
+            &send(variant.clone()),
+            &registered,
+            CorrelationPolicy::Observation,
+        )
+        .expect("the canonical Variant conforms");
         for sent in [
             Field::new("payload", variant.data_type().clone(), true),
             variant.with_metadata(parameters),
         ] {
             assert!(matches!(
-                conform_to_registered(&send(sent), &registered),
+                conform_to_registered(&send(sent), &registered, CorrelationPolicy::Observation),
                 Err(ScribeError::ContractViolation(BifrostError::UnsupportedType { ref field, .. }))
                     if field == "payload"
             ));
@@ -4005,7 +4066,9 @@ mod tests {
         ])
         .expect("batch builds");
 
-        let ordered = conform_to_registered(&rows, &registered_ab()).expect("names all match");
+        let ordered =
+            conform_to_registered(&rows, &registered_ab(), CorrelationPolicy::Observation)
+                .expect("names all match");
 
         let names = ordered
             .schema()

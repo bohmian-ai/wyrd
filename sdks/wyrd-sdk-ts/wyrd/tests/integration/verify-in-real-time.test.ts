@@ -20,7 +20,6 @@ import {
   verify,
 } from "wyrd-ai";
 import { spanExporter } from "wyrd-ai/otel";
-import { cli } from "@wyrd/testing";
 
 import {
   AGREES,
@@ -35,7 +34,7 @@ import {
   toolTurn,
 } from "../support/assistant.js";
 import { type ReceivedRequest, Receiver, type Reply } from "../support/http-receiver.js";
-import { ancestry, binding, fixture, groupExecution, declared, timeline } from "../support/server.js";
+import { ancestry, binding, fixture, groupExecution, declared, runtimeAccount, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -156,7 +155,9 @@ async function assertCalledAsSystem(executionId: string, principal: string, run:
  * return the result's `execution_id`.
  */
 async function verifyOverHttp(baseUrl: string, assistant: Assistant, traceparent: string): Promise<string> {
-  const token = await WyrdClient.connect({ credential: assistant.key }).accessToken();
+  const token = await WyrdClient.connect({ credential: assistant.key })
+    .forWorkload(assistant.service.uid)
+    .accessToken();
   const response = await fetch(`${baseUrl}/v1/verification/execute`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-wyrd-access-token": `Bearer ${token}`, traceparent },
@@ -309,7 +310,7 @@ test("submitted answer is judged in the background and resumes by id", async ({ 
   const waited = await submitted.execution.wait({ timeoutMs: WAIT_MS });
   const resumed = await (
     await verify.Execution.connect(submitted.execution.id, {
-      client: WyrdClient.connect({ credential: assistant.key }),
+      client: WyrdClient.connect({ credential: assistant.key }).forWorkload(assistant.service.uid),
     })
   ).wait({ timeoutMs: WAIT_MS });
 
@@ -353,8 +354,8 @@ test("unfitted baseline is skipped on schedule", async ({ server }) => {
   const { root } = await cards.declareFromPath(fixture("cards/verify_in_real_time/unfitted-assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-unfitted-"));
   await cards.pull(root, bundle);
-  const key = await cli.issueKey({ ...root, space: root.space ?? "default" });
-  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key.key }) });
+  const { key } = await runtimeAccount({ kind: "Service", name: root.name });
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
   await state.startBifrost();
   const observe = state.run("model").observe;
   for (let tier = 0; tier < 5; tier += 1) {
@@ -424,7 +425,7 @@ test("retired verification contracts are refused", async ({ server, assistant })
     const run = assistantAs(assistant, WyrdClient.connect({ credential })).run("agent");
 
     await expect(run.observe.verify("answer-check", { answer: "yes" })).rejects.toMatchObject({
-      code: "WYRD_SPEC_500_INTERNAL",
+      code: "WYRD_PERMISSION_500_ROLE_CORRUPT",
     });
   }
 
@@ -469,14 +470,19 @@ test("another tenant cannot verify the assistant", async ({ server, assistant })
 
   for (const verifier of ["answer-check", "answer-judged"]) {
     await expect(run.observe.verify(verifier, { answer: "yes" })).rejects.toMatchObject({
-      code: "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+      code: "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
     });
   }
 });
 
-/** Enqueue `body` over plain HTTP as `key` with `idempotencyKey`, returning the accepted execution. */
-async function enqueueOverHttp(baseUrl: string, key: string, idempotencyKey: string, body: object): Promise<string> {
-  const token = await WyrdClient.connect({ credential: key }).accessToken();
+/** Enqueue `body` over plain HTTP as `client` with `idempotencyKey`, returning the accepted execution. */
+async function enqueueOverHttp(
+  baseUrl: string,
+  client: WyrdClient,
+  idempotencyKey: string,
+  body: object,
+): Promise<string> {
+  const token = await client.accessToken();
   const response = await fetch(`${baseUrl}/v1/verification/enqueue`, {
     method: "POST",
     headers: {
@@ -492,16 +498,17 @@ async function enqueueOverHttp(baseUrl: string, key: string, idempotencyKey: str
 }
 
 /**
- * Register and hydrate the Service fixture at `path`, issue the Service's own
- * key and principal, start its state with that key, and find the one binding
- * whose status pins `group_end` settings.
+ * Register and hydrate the Service fixture at `path`, issue a key of the
+ * Service's runtime account, start its state with that key, and find the one
+ * binding whose status pins `group_end` settings. `client` runs as the
+ * Service for raw HTTP and span export.
  */
 async function grouped(baseUrl: string, path: string) {
   const cards = await Cards.connect();
   const receipt = await cards.declareFromPath(fixture(path));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
   await cards.pull(receipt.root, bundle);
-  const issued = await cli.issueKey({ ...receipt.root, space: receipt.root.space ?? "default" });
+  const { principalId, key } = await runtimeAccount({ kind: "Service", name: receipt.root.name });
   const token = await WyrdClient.connect().accessToken();
   const bindingIds: string[] = [];
   for (const id of (await cards.get(receipt.root)).status?.verification?.binding_ids ?? []) {
@@ -513,13 +520,14 @@ async function grouped(baseUrl: string, path: string) {
     }
   }
   expect(bindingIds).toHaveLength(1);
-  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: issued.key }) });
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
   await state.startBifrost();
-  return { cards, receipt, bundle, key: issued.key, principal: issued.principal_id, state, bindingId: bindingIds[0] };
+  const client = WyrdClient.connect({ credential: key }).forWorkload(declared(receipt).uid);
+  return { cards, receipt, bundle, client, principal: principalId, state, bindingId: bindingIds[0] };
 }
 
 test("grouped support resumes", async ({ server, assistant }) => {
-  const { cards, receipt, bundle, key, state, bindingId } = await grouped(
+  const { cards, receipt, bundle, client, state, bindingId } = await grouped(
     server.baseUrl,
     "cards/verify_in_real_time/support.yaml",
   );
@@ -543,19 +551,25 @@ test("grouped support resumes", async ({ server, assistant }) => {
     group_id: group,
     inputs: { turn: { kind: "json", value: turn } },
   });
-  const replayed = await enqueueOverHttp(server.baseUrl, key, "support-turn-0006", body(turns[5]));
-  expect(await enqueueOverHttp(server.baseUrl, key, "support-turn-0006", body(turns[5]))).toBe(replayed);
+  const replayed = await enqueueOverHttp(server.baseUrl, client, "support-turn-0006", body(turns[5]));
+  expect(await enqueueOverHttp(server.baseUrl, client, "support-turn-0006", body(turns[5]))).toBe(replayed);
   // An ungrouped conflicting body: a staged input the queue later refuses
   // would otherwise join the group.
   const { group_id: _, ...ungrouped } = body({ answer: "" });
-  const conflict = await enqueueOverHttp(server.baseUrl, key, "support-turn-0006", ungrouped);
+  const conflict = await enqueueOverHttp(server.baseUrl, client, "support-turn-0006", ungrouped);
   await expect((await verify.Execution.connect(conflict)).wait({ timeoutMs: WAIT_MS })).rejects.toMatchObject({
     code: "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
   });
   await (await verify.Execution.connect(replayed)).wait({ timeoutMs: WAIT_MS });
-  await WyrdState.fromPath(bundle, { client: WyrdClient.connect() })
-    .run("agent")
-    .observe.verify("turn-check", { answer: "" }, grouping);
+  // A WyrdState would carry its Service root for the administrator too, so
+  // the ownerless turn is the administrator's rootless enqueue.
+  const ownerless = await enqueueOverHttp(
+    server.baseUrl,
+    WyrdClient.connect(),
+    "support-turn-ownerless",
+    body({ answer: "" }),
+  );
+  await (await verify.Execution.connect(ownerless)).wait({ timeoutMs: WAIT_MS });
   const other = server.scopedApiKey("other_verifier", [
     { resource: "verifier", action: "run", scope: { verifier: assistant.answerCheck.uid } },
   ]);
@@ -673,7 +687,7 @@ test("grouped refund changes verdict", async ({ server }) => {
 }, 180_000);
 
 test("grouped coding uses declared sources", async ({ server, provider, assistant: _ }) => {
-  const { cards, principal, state, bindingId, key } = await grouped(
+  const { cards, principal, state, bindingId, client } = await grouped(
     server.baseUrl,
     "cards/verify_in_real_time/coding.yaml",
   );
@@ -681,7 +695,7 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
   const principals = await Principals.connect();
   await principals.grantRole(principal, "ts_live_reader");
   const spans = new BasicTracerProvider({
-    spanProcessors: [new SimpleSpanProcessor(spanExporter(WyrdClient.connect({ credential: key })))],
+    spanProcessors: [new SimpleSpanProcessor(spanExporter(client))],
   });
   const tracer = spans.getTracer("journey.coding");
   const session = tracer.startSpan("coding-session");
@@ -760,7 +774,7 @@ test("grouped coding uses declared sources", async ({ server, provider, assistan
     );
     expect(refused?.code, name).toBe(code);
     expect(`${refused?.message} ${JSON.stringify(refused?.details)}`, name).toContain(reason);
-    await expect(cards.resolveLatest(kind, "default", name), name).rejects.toMatchObject({
+    await expect(cards.resolveLatest(kind, name), name).rejects.toMatchObject({
       code: "WYRD_REGISTRY_404_CARD_NOT_FOUND",
     });
   }
@@ -798,7 +812,7 @@ test("grouped sampled frames use visible outcomes", async ({ server, provider, a
   const other = await cards.declareFromPath(fixture("cards/verify_in_real_time/frames-other.yaml"));
   const otherBundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
   await cards.pull(other.root, otherBundle);
-  const otherKey = await cli.issueKey({ ...other.root, space: other.root.space ?? "default" });
+  const otherKey = await runtimeAccount({ kind: "Service", name: other.root.name });
   const otherState = WyrdState.fromPath(otherBundle, { client: WyrdClient.connect({ credential: otherKey.key }) });
   await otherState.startBifrost();
   const reported = (event: string) =>
@@ -906,7 +920,7 @@ async function groupExecutions(server: { flushBifrost(): void }, bindingId: stri
 }
 
 test("grouped conversations coexist with drift", async ({ server, state: drift }) => {
-  const { receipt, key, state, bindingId } = await grouped(server.baseUrl, "cards/verify_in_real_time/support.yaml");
+  const { receipt, client, state, bindingId } = await grouped(server.baseUrl, "cards/verify_in_real_time/support.yaml");
   const turn = (answer: string) => ({ answer });
   const said = (group: string, answer: string) =>
     state.run("agent").observe.verify("turn-check", turn(answer), { positional: true, group_id: group });
@@ -926,7 +940,7 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
   await queued.execution.wait({ timeoutMs: WAIT_MS });
   const cards = await Cards.connect();
   const newer = await cards.declareFromPath(fixture("cards/verify_in_real_time/turn-check-newer.yaml"));
-  const late = await enqueueOverHttp(server.baseUrl, key, "support-newer-turn", {
+  const late = await enqueueOverHttp(server.baseUrl, client, "support-newer-turn", {
     verifier_card_uid: declared(newer).uid,
     card_uid: declared(receipt, "assistant-agent").uid,
     group_id: "conv-a",
@@ -940,7 +954,7 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
   const bReceipt = await bCards.declareFromPath(fixture("cards/verify_in_real_time/support.yaml"));
   const bBundle = mkdtempSync(join(tmpdir(), "wyrd-ts-grouped-"));
   await bCards.pull(bReceipt.root, bBundle);
-  const bKey = await cli.issueKey({ ...bReceipt.root, space: bReceipt.root.space ?? "default" }, { client: tenantB });
+  const bKey = await runtimeAccount({ kind: "Service", name: bReceipt.root.name }, tenantB);
   const bState = WyrdState.fromPath(bBundle, { client: WyrdClient.connect({ credential: bKey.key }) });
   await bState.startBifrost();
   await bState.run("agent").observe.verify("turn-check", turn("tenant b"), { positional: true, group_id: "conv-a" });

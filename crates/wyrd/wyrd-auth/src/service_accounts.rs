@@ -28,10 +28,17 @@ mod tests {
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_runtime::principal::{PrincipalId, PrincipalKind, RoleRef};
     use wyrd_runtime::{Permission, Principal};
+    use wyrd_spec::auth::CardAccess;
     use wyrd_spec::error::WyrdError;
 
     use super::require_service_accounts_write;
 
+    /// A `viewer` user principal holding exactly `permissions`, used to probe
+    /// the `service_accounts:write` guard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the static `viewer` role name is rejected.
     fn principal_with_permissions(permissions: impl IntoIterator<Item = Permission>) -> Principal {
         Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
@@ -40,6 +47,8 @@ mod tests {
             roles: vec![RoleRef::new("viewer").expect("static role is valid")],
             effective_permissions: PermissionSet::from_iter(permissions),
             credential_id: None,
+            card_access: CardAccess::AnyRegistered,
+            workload_uid: None,
         }
     }
 

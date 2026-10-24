@@ -160,11 +160,11 @@ impl<'de> serde::Deserialize<'de> for InlineSecret {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl schemars::JsonSchema for InlineSecret {
-    fn schema_name() -> String {
-        "InlineSecret".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "InlineSecret".into()
     }
 
-    fn json_schema(schema_gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(schema_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         // Opaque string. The `SecretRef::Inline` variant carries
         // `#[schemars(skip)]`, so this impl is never reached during schema
         // generation; it exists only to satisfy the `#[derive(JsonSchema)]` on

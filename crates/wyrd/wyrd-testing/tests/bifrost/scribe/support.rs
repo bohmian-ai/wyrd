@@ -10,7 +10,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::geometry::ScribeGeometry;
 use vala_bifrost_redux::scribe::telemetry::{ScribeBucketMemorySnapshot, ScribeInspectionSnapshot};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
+use wyrd_spec::vala::api::{PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire};
 use wyrd_testing::WyrdTestServer;
 
 use arrow::datatypes::{DataType, Field};
@@ -106,7 +106,10 @@ pub(super) async fn register_timed_table(
 /// this layout, so a case controls placement only through the value it writes.
 pub(super) fn timed_layout() -> PhysicalLayoutWire {
     PhysicalLayoutWire {
-        partition_granularity: TimeGranularityWire::Hour,
+        partition_by: vec![PartitionFieldWire::new(
+            EVENT_TIME,
+            PartitionTransformWire::Hour,
+        )],
         time_column: Some(EVENT_TIME.to_owned()),
         sort_keys: Vec::new(),
         bloom_columns: Vec::new(),
@@ -268,6 +271,32 @@ pub(super) async fn append_batch(
         .await
         .expect("public ingest transport connects")
         .insert(table, batch_id, encode_ipc(batch))
+        .await
+        .map(|_request_id| ())
+}
+
+/// [`append_batch`] at a caller-chosen table version, as a writer retrying
+/// an accepted batch, or still holding a stale binding, sends it.
+///
+/// # Errors
+///
+/// Returns the stable Wyrd error the public ingest route produced.
+///
+/// # Panics
+///
+/// Panics when the public ingest transport cannot connect or the batch
+/// cannot be IPC-encoded.
+pub(super) async fn append_batch_at(
+    client: &wyrd_client::WyrdClient,
+    table: &str,
+    table_version: wyrd_spec::vala::ids::TableVersion,
+    batch_id: uuid::Uuid,
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<(), wyrd_spec::error::WyrdError> {
+    wyrd_testing::bifrost::write::RawIngest::connect(client)
+        .await
+        .expect("public ingest transport connects")
+        .insert_at(table, table_version, batch_id, encode_ipc(batch))
         .await
         .map(|_request_id| ())
 }

@@ -5,7 +5,6 @@ kind: Verifier
 metadata:
   name: latency-control
   version: 1.0.0
-  space: default
 spec:
   description: Daily check that request latency stays inside the baseline's control limits.
   inputs:
@@ -19,7 +18,7 @@ spec:
         method: Spc
         signal:
           kind: Distribution
-          baseline_ref: {kind: Data, name: latency-baseline, version: 1.0.0, space: default}
+          baseline_ref: {kind: Data, name: latency-baseline, version: 1.0.0 }
           features: [latency]
         condition: {kind: Statistical}
         profile: {kind: Spc, sample_size: 5}

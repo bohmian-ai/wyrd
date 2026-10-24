@@ -119,7 +119,7 @@ const RELEASE_SQL: &str = r"
 /// identity: a failed fit first, then one still being fitted, then a ready one.
 const STATUS_SQL: &str = r"
     SELECT b.state, b.error,
-           jsonb_build_object('kind', d.kind, 'space', d.space, 'name', d.name,
+           jsonb_build_object('kind', d.kind, 'name', d.name,
                               'version', d.version, 'uid', d.card_uid) AS data
       FROM wyrd.drift_baselines b
       JOIN wyrd.cards d ON d.card_uid = b.data_card_uid

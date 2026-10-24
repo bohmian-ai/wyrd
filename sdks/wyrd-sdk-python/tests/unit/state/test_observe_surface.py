@@ -169,7 +169,7 @@ def test_file_construction_reads_nothing(tmp_path: Path) -> None:
 
 def test_artifact_ref_names_a_registered_artifact_file() -> None:
     """``ArtifactRef`` takes the exact Artifact reference and an optional path."""
-    artifact = wyrd.CardRef("Artifact", "decks", "1.0.0", space="support")
+    artifact = wyrd.CardRef("Artifact", "decks", "1.0.0")
     ArtifactRef(artifact)
     ArtifactRef(artifact, "q3.pdf")
 
@@ -1135,6 +1135,9 @@ class _ExportHeaders(BaseHTTPRequestHandler):
 
 class _RotatingClient:
     """A client stand-in returning a new access token on each request."""
+
+    workload_uid = None
+    deployment_environment = None
 
     def __init__(self, server_url: str) -> None:
         self.server_url = server_url

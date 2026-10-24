@@ -5,7 +5,7 @@ use sqlx::{Postgres, QueryBuilder};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec, seed_version};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, SpaceName};
+use wyrd_spec::ids::CardName;
 use wyrd_spec::registry::DeclarationOperationId;
 
 use crate::queries::cards::version_sql::push_bounds;
@@ -48,7 +48,7 @@ struct LatestInLine {
 // queries are ever exposed to unconstrained inputs.
 /// Read the highest stable version on one Card line, with its content hashes.
 ///
-/// The line is `kind`/`space`/`name` in the tenant bound to `conn`. Eligible
+/// The line is `kind`/`name` in the tenant bound to `conn`. Eligible
 /// rows are Active ones plus the Pending rows `operation_id` wrote earlier in
 /// this same registration transaction, so a composite selecting the line twice
 /// sees its own earlier choice; other operations' Pending rows, prereleases,
@@ -65,7 +65,6 @@ struct LatestInLine {
 async fn latest_stable_in_line(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
-    space: &SpaceName,
     name: &CardName,
     operation_id: DeclarationOperationId,
     bounds: Option<&wyrd_semver::VersionBounds>,
@@ -77,7 +76,6 @@ async fn latest_stable_in_line(
     qb.push_bind(operation_id.as_uuid());
     qb.push(")) AND NOT version_is_prerelease AND kind = ");
     qb.push_bind(kind.wire_name());
-    qb.push(" AND space = ").push_bind(space.as_str());
     qb.push(" AND name = ").push_bind(name.as_str());
     if let Some(bounds) = bounds {
         push_bounds(&mut qb, bounds)?;
@@ -122,7 +120,6 @@ async fn latest_stable_in_line(
 pub async fn resolve_version(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
-    space: &SpaceName,
     name: &CardName,
     version: Option<&VersionSpec>,
     bump: Option<&VersionBump>,
@@ -133,39 +130,32 @@ pub async fn resolve_version(
         Some(VersionSpec::Pin(_)) => {
             unreachable!("resolve_version is only called on the auto/scope path")
         }
-        None => match latest_stable_in_line(conn, kind, space, name, submitted.operation_id, None)
-            .await?
-        {
-            Some(latest)
-                if latest.spec_hash == submitted.spec_hash
-                    && latest.artifact_hash.as_deref() == submitted.artifact_hash =>
-            {
-                Ok(Resolution::Deduplicated {
-                    version: latest.version,
-                })
+        None => {
+            match latest_stable_in_line(conn, kind, name, submitted.operation_id, None).await? {
+                Some(latest)
+                    if latest.spec_hash == submitted.spec_hash
+                        && latest.artifact_hash.as_deref() == submitted.artifact_hash =>
+                {
+                    Ok(Resolution::Deduplicated {
+                        version: latest.version,
+                    })
+                }
+                Some(latest) => {
+                    let next = latest
+                        .version
+                        .bump(bump)
+                        .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?;
+                    Ok(Resolution::Fresh(next))
+                }
+                None => Ok(Resolution::Fresh(seed_version())),
             }
-            Some(latest) => {
-                let next = latest
-                    .version
-                    .bump(bump)
-                    .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?;
-                Ok(Resolution::Fresh(next))
-            }
-            None => Ok(Resolution::Fresh(seed_version())),
-        },
+        }
         Some(VersionSpec::Scope(range)) => {
             let bounds = range
                 .to_bounds()
                 .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?;
-            match latest_stable_in_line(
-                conn,
-                kind,
-                space,
-                name,
-                submitted.operation_id,
-                Some(&bounds),
-            )
-            .await?
+            match latest_stable_in_line(conn, kind, name, submitted.operation_id, Some(&bounds))
+                .await?
             {
                 Some(latest)
                     if latest.spec_hash == submitted.spec_hash

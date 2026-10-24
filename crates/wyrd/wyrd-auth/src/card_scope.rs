@@ -1,4 +1,4 @@
-//! Card-ref scope resolution for card-bound principals.
+//! Workload root and Card-scope resolution for selected execution context.
 
 use std::str::FromStr;
 
@@ -8,21 +8,22 @@ use uuid::Uuid;
 use wyrd_auth_issue::IssueError;
 use wyrd_runtime::audit::AuditStage;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
-use wyrd_spec::envelope::CardKind;
+use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag, WorkloadFamily, WorkloadKind};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::vala::ScopeHash;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::TenantConn;
+use wyrd_sql::row_types::cards::{CardStatus, ParsedCardRow};
 
 use crate::audit::{CARD_SCOPE_MINT_OPERATION, auth_event, auth_failure_code};
-use wyrd_sql::queries::cards::get_card_by_ref;
+use wyrd_sql::queries::cards::{fetch_card_row, get_card_by_ref};
 
 const MAX_SCOPE_DEPTH: usize = 16;
 /// Maximum number of cards that may appear in a minted card-ref scope.
-pub const MAX_SCOPE_CARDS: usize = 32;
+pub const MAX_SCOPE_CARDS: usize = wyrd_spec::auth::MAX_SCOPED_CARDS;
 const SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT: usize = 16;
 
 /// Audit mint kind for API-key token exchange scope minting.
@@ -32,71 +33,77 @@ pub const MINT_KIND_REFRESH: CardScopeMintKind = CardScopeMintKind::Refresh;
 /// Audit mint kind for JWT bearer workload scope minting.
 pub const MINT_KIND_JWT_BEARER: CardScopeMintKind = CardScopeMintKind::JwtBearer;
 
-/// Resolve the observation-target scope for a card-bound principal.
+/// Validate an explicitly selected workload root and resolve its graph.
 ///
-/// The walk is tenant-scoped, fail-closed, cycle-guarded, and capped. Only
-/// observation-target kinds are included and expanded. Every resolved member
-/// carries its registry `card_uid`, because ingest stamps `card_uid` from the
-/// signed claim alone.
+/// The root must be an active Service Card version in the caller's
+/// tenant that `restriction` allows; `None` is an unrestricted caller. The
+/// graph walk is tenant-scoped, fail-closed, cycle-guarded, and capped; only
+/// observation-target kinds are included and expanded, and every member
+/// carries its registry `card_uid`. The root is the first member.
 ///
 /// # Errors
 ///
-/// Returns [`WyrdError::CardScopeTooLarge`] when the walk exceeds its depth or
-/// member cap, and the mapped registry error when a referenced Card cannot be
-/// read in the caller's tenant.
+/// Returns [`WyrdError::WorkloadUidRefused`] for an unknown, foreign,
+/// inactive, wrong-kind, or disallowed root — unknown and foreign alike —
+/// [`WyrdError::CardScopeTooLarge`] when the walk exceeds its depth or member
+/// cap, and the mapped registry error when a store read fails or a referenced
+/// Card cannot be read.
 ///
 /// # Panics
 ///
-/// Panics only if the walk terminates with no resolved member, which cannot
-/// happen: the frontier is seeded with the root, and a root that fails to
-/// resolve returns an error before the split.
-pub async fn resolve_card_ref_scope(
+/// Never in practice: the walk seeds its members with the root, so the
+/// resolved list always has a first member.
+pub async fn resolve_workload_scope(
     conn: &mut TenantConn<'_>,
-    root: &CardRef,
+    root_uid: &CardUid,
+    restriction: Option<&WorkloadFamily>,
 ) -> Result<CardRefScope, WyrdError> {
-    let mut members: Vec<CardRef> = Vec::new();
-    let mut frontier = vec![(root.clone(), 0usize)];
+    let root_row = fetch_card_row(conn, root_uid)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "workload root lookup failed");
+            WyrdError::registry_unavailable("card registry unavailable")
+        })?
+        .and_then(|row| ParsedCardRow::try_from(row).ok())
+        .filter(|row| {
+            row.status == CardStatus::Active
+                && WorkloadKind::from_card_kind(&row.kind).is_some()
+                && restriction.is_none_or(|family| family.contains(&row.kind, &row.name))
+        })
+        .ok_or_else(|| refused_root(root_uid))?;
+    let root = CardRef {
+        kind: root_row.kind.clone(),
+        name: root_row.name.clone(),
+        version: root_row.version.clone(),
+        uid: Some(root_row.card_uid.clone()),
+    };
+    let mut members = vec![root.clone()];
+    let mut frontier: Vec<(CardRef, usize)> = children(&root_row, 1);
 
     while let Some((card_ref, depth)) = frontier.pop() {
         if depth > MAX_SCOPE_DEPTH {
-            return Err(too_large("depth", MAX_SCOPE_DEPTH, root));
+            return Err(too_large("depth", MAX_SCOPE_DEPTH, &root));
         }
         if members.iter().any(|m| m.same_identity(&card_ref)) {
             continue;
         }
         if members.len() == MAX_SCOPE_CARDS {
-            return Err(too_large("cards", MAX_SCOPE_CARDS, root));
+            return Err(too_large("cards", MAX_SCOPE_CARDS, &root));
         }
 
-        let space = card_ref
-            .space
-            .as_ref()
-            .ok_or_else(|| WyrdError::Validation {
-                message: "card scope member is missing a resolved space".to_owned(),
-                details: json!({ "card_ref": card_ref }),
-            })?;
         let row = get_card_by_ref(
             conn,
             card_ref.kind.clone(),
-            space,
             &card_ref.name,
             &card_ref.version,
         )
         .await
-        .map_err(|error| scope_resolution_error(error, root, &card_ref))?;
-
-        // Ingest stamps `card_uid` from the signed claim alone, so every scope
-        // member must leave the mint walk carrying its registry identity.
+        .map_err(|error| scope_resolution_error(error, &root, &card_ref))?;
+        frontier.extend(children(&row, depth + 1));
         members.push(CardRef {
             uid: Some(row.card_uid),
             ..card_ref
         });
-
-        for child in wyrd_spec::reference::scope_child_card_refs(&row.spec) {
-            if child.kind.is_observation_target() {
-                frontier.push((child, depth + 1));
-            }
-        }
     }
 
     let (resolved_root, rest) = members
@@ -106,6 +113,24 @@ pub async fn resolve_card_ref_scope(
         resolved_root,
         rest.to_vec(),
     ))
+}
+
+/// The observation-target children of `row`, one level below it.
+fn children(row: &ParsedCardRow, depth: usize) -> Vec<(CardRef, usize)> {
+    wyrd_spec::reference::scope_child_card_refs(&row.spec)
+        .into_iter()
+        .filter(|child| child.kind.is_observation_target())
+        .map(|child| (child, depth))
+        .collect()
+}
+
+/// The one refusal for every unusable selected root, so unknown and foreign
+/// roots are indistinguishable.
+fn refused_root(root_uid: &CardUid) -> WyrdError {
+    WyrdError::WorkloadUidRefused {
+        message: format!("workload root {root_uid} cannot be used by this account"),
+        details: json!({ "workload_uid": root_uid }),
+    }
 }
 
 /// Build the stable `413` error for card-ref scope count or depth overflow.
@@ -152,25 +177,31 @@ pub enum IssueErrorOrWyrd {
 
 /// Stage the successful card-ref scope mint audit event on the process audit stage.
 ///
-/// The event carries the scope digest, the full member count, and at most
+/// The event names the scope's root, its first member, and carries the scope
+/// digest, the full member count, and at most
 /// [`SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT`] members. It is staged without waiting
 /// and never refuses the grant; a digest that is not a valid audit value is
 /// logged and the event is staged without it.
 ///
 /// # Panics
 ///
-/// Panics if `scope.len()` exceeds `u32::MAX`. Callers must enforce the
-/// `MAX_SCOPE_CARDS` limit upstream; violating it is a programmer error,
-/// not a runtime condition.
+/// Panics if `scope` is empty or `scope.len()` exceeds `u32::MAX`. Callers
+/// pass a scope from [`resolve_workload_scope`], which always starts with its
+/// root and enforces the `MAX_SCOPE_CARDS` limit; violating either is a
+/// programmer error, not a runtime condition.
 pub fn stage_scope_mint_success_audit(
     audit: &dyn AuditStage,
     tenant_id: DataTenantId,
     principal_id: Uuid,
-    root: &CardRef,
+    principal_kind: PrincipalKindTag,
     scope: &CardRefScope,
     request_id: &str,
     mint_kind: CardScopeMintKind,
 ) {
+    let root = scope
+        .as_slice()
+        .first()
+        .expect("resolved scope invariant: the root is the first member");
     let scope_hash = ScopeHash::new(scope_hash(&scope_member_strings(scope)))
         .inspect_err(|error| {
             tracing::error!(error = %error, "scope digest is not a valid audit value");
@@ -180,7 +211,7 @@ pub fn stage_scope_mint_success_audit(
         request_id,
         CARD_SCOPE_MINT_OPERATION,
         Attribution::direct(PrincipalId::new(principal_id)),
-        card_principal_kind(root),
+        principal_kind,
         Some(root.clone()),
         AuditOutcome::Allowed,
         AuditDetail::CardScopeMint {
@@ -231,15 +262,6 @@ pub fn stage_scope_mint_failure_audit(
         },
     );
     audit.stage(tenant_id, event);
-}
-
-/// Principal kind of the card-bound principal that owns `root`.
-fn card_principal_kind(root: &CardRef) -> PrincipalKindTag {
-    if root.kind == CardKind::Agent {
-        PrincipalKindTag::Agent
-    } else {
-        PrincipalKindTag::Service
-    }
 }
 
 /// Attach scope-mint context to resolver errors that should be audited.
@@ -315,22 +337,20 @@ mod pg_tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::ids::CardName;
     use wyrd_spec::reference::CardRef;
 
     use super::*;
 
-    /// Return the resolved space of a test card reference.
-    fn space_of(card_ref: &CardRef) -> &SpaceName {
-        card_ref.space.as_ref().expect("test card ref has a space")
-    }
-
-    fn make_card_ref(kind: CardKind, space: &str, name: &str) -> CardRef {
+    /// Build a flat, UID-free `kind`/`name`@`1.0.0` reference fixture.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid Card name.
+    fn make_card_ref(kind: CardKind, name: &str) -> CardRef {
         CardRef {
             kind,
             name: CardName::new(name).expect("valid name"),
             version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: Some(SpaceName::new(space).expect("valid space")),
             uid: None,
         }
     }
@@ -339,7 +359,7 @@ mod pg_tests {
 
     #[test]
     fn too_large_depth_sets_scope_mint_root() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let err = too_large("depth", MAX_SCOPE_DEPTH, &root);
         let WyrdError::CardScopeTooLarge { details, .. } = err else {
             panic!("expected CardScopeTooLarge");
@@ -356,7 +376,7 @@ mod pg_tests {
 
     #[test]
     fn too_large_cards_sets_scope_mint_root() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let err = too_large("cards", MAX_SCOPE_CARDS, &root);
         let WyrdError::CardScopeTooLarge { details, .. } = err else {
             panic!("expected CardScopeTooLarge");
@@ -371,7 +391,7 @@ mod pg_tests {
 
     #[test]
     fn issue_scope_error_converts_too_large_and_sets_root() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let issue_err = IssueError::CardScopeTooLarge {
             encoded_len: 9000,
             limit: 8192,
@@ -392,14 +412,19 @@ mod pg_tests {
         );
     }
 
+    /// `issue_scope_error` maps only a too-large scope to a `WyrdError` and
+    /// returns every other issuance error unchanged.
+    ///
+    /// # Panics
+    /// Panics when `InvalidCardAccess` is not passed through as an issue error.
     #[test]
     fn issue_scope_error_passes_through_other_errors() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
-        let issue_err = IssueError::InvalidCardRef;
+        let root = make_card_ref(CardKind::Service, "svc");
+        let issue_err = IssueError::InvalidCardAccess;
         let result = issue_scope_error(issue_err, &root);
         assert!(matches!(
             result,
-            IssueErrorOrWyrd::Issue(IssueError::InvalidCardRef)
+            IssueErrorOrWyrd::Issue(IssueError::InvalidCardAccess)
         ));
     }
 
@@ -407,7 +432,7 @@ mod pg_tests {
 
     #[test]
     fn scope_failure_root_reads_scope_mint_root_field() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let err = too_large("depth", MAX_SCOPE_DEPTH, &root);
         let found = scope_failure_root(&err).expect("scope_failure_root returns Some");
         assert!(found.same_identity(&root));
@@ -415,7 +440,7 @@ mod pg_tests {
 
     #[test]
     fn scope_failure_root_falls_back_to_root_field() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc");
+        let root = make_card_ref(CardKind::Service, "svc");
         let err = WyrdError::CardScopeTooLarge {
             message: "test".to_owned(),
             details: json!({ "root": root.to_string() }),
@@ -447,20 +472,20 @@ mod pg_tests {
     #[test]
     fn scope_hash_is_order_independent() {
         let a = vec![
-            "prod/Service/svc-a@1.0.0".to_owned(),
-            "prod/Service/svc-b@1.0.0".to_owned(),
+            "Service/svc-a@1.0.0".to_owned(),
+            "Service/svc-b@1.0.0".to_owned(),
         ];
         let b = vec![
-            "prod/Service/svc-b@1.0.0".to_owned(),
-            "prod/Service/svc-a@1.0.0".to_owned(),
+            "Service/svc-b@1.0.0".to_owned(),
+            "Service/svc-a@1.0.0".to_owned(),
         ];
         assert_eq!(scope_hash(&a), scope_hash(&b));
     }
 
     #[test]
     fn scope_hash_differs_for_different_members() {
-        let a = vec!["prod/Service/svc-a@1.0.0".to_owned()];
-        let b = vec!["prod/Service/svc-b@1.0.0".to_owned()];
+        let a = vec!["Service/svc-a@1.0.0".to_owned()];
+        let b = vec!["Service/svc-b@1.0.0".to_owned()];
         assert_ne!(scope_hash(&a), scope_hash(&b));
     }
 
@@ -470,7 +495,7 @@ mod pg_tests {
     #[test]
     fn scope_member_summary_keeps_members_under_limit() {
         let members: Vec<CardRef> = (0..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT)
-            .map(|i| make_card_ref(CardKind::Service, "prod", &format!("svc-{i}")))
+            .map(|i| make_card_ref(CardKind::Service, &format!("svc-{i}")))
             .collect();
         assert_eq!(scope_member_summary(&members), members);
     }
@@ -480,7 +505,7 @@ mod pg_tests {
     #[test]
     fn scope_member_summary_truncates_past_limit() {
         let members: Vec<CardRef> = (0..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT + 5)
-            .map(|i| make_card_ref(CardKind::Service, "prod", &format!("svc-{i}")))
+            .map(|i| make_card_ref(CardKind::Service, &format!("svc-{i}")))
             .collect();
         assert_eq!(
             scope_member_summary(&members),
@@ -488,34 +513,104 @@ mod pg_tests {
         );
     }
 
-    // --- DB: resolve_card_ref_scope ---
+    // --- DB: resolve_workload_scope ---
 
+    /// The registry UID of the seeded `card_ref`.
+    ///
+    /// # Panics
+    /// Panics when the seeded Card row cannot be loaded.
+    async fn uid_of(conn: &mut TenantConn<'_>, card_ref: &CardRef) -> CardUid {
+        get_card_by_ref(
+            conn,
+            card_ref.kind.clone(),
+            &card_ref.name,
+            &card_ref.version,
+        )
+        .await
+        .expect("seeded card row loads")
+        .card_uid
+    }
+
+    /// A Service root with no components resolves to a one-member scope that
+    /// is the root itself, carrying its registry UID.
+    ///
+    /// # Panics
+    /// Panics when the fixture, seed, or resolve fails, or the scope is not
+    /// exactly the root with its UID.
     #[tokio::test]
     async fn resolve_single_service_card_produces_own_scope() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let creator = uuid::Uuid::new_v4();
-        let root = make_card_ref(CardKind::Service, "prod", "svc-resolve-test");
+        let root = make_card_ref(CardKind::Service, "svc-resolve-test");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         seed_backing_card(&mut conn, &root, creator).await;
+        let uid = uid_of(&mut conn, &root).await;
 
-        let scope = resolve_card_ref_scope(&mut conn, &root)
+        let scope = resolve_workload_scope(&mut conn, &uid, None)
             .await
             .expect("resolves without error");
 
         assert_eq!(scope.as_slice().len(), 1);
         assert!(scope.as_slice()[0].same_identity(&root));
+        assert_eq!(scope.as_slice()[0].uid.as_ref(), Some(&uid));
+    }
+
+    /// A root outside the account's family is refused exactly like an
+    /// unknown root, so a caller cannot probe another family's releases.
+    ///
+    /// # Panics
+    /// Panics when the fixture or seed fails, the own-family root is refused,
+    /// or the foreign or unknown root resolves or is refused with anything
+    /// other than `WorkloadUidRefused`.
+    #[tokio::test]
+    async fn resolve_refuses_foreign_and_unknown_roots_identically() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let root = make_card_ref(CardKind::Service, "svc-family-test");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        seed_backing_card(&mut conn, &root, uuid::Uuid::new_v4()).await;
+        let uid = uid_of(&mut conn, &root).await;
+        let own = WorkloadFamily {
+            kind: WorkloadKind::Service,
+            name: root.name.clone(),
+        };
+        let other = WorkloadFamily {
+            kind: WorkloadKind::Service,
+            name: CardName::new("svc-other").expect("static name is valid"),
+        };
+        let unknown = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 uid");
+
+        resolve_workload_scope(&mut conn, &uid, Some(&own))
+            .await
+            .expect("own family root resolves");
+        let foreign = resolve_workload_scope(&mut conn, &uid, Some(&other))
+            .await
+            .expect_err("foreign family root is refused");
+        let missing = resolve_workload_scope(&mut conn, &unknown, None)
+            .await
+            .expect_err("unknown root is refused");
+
+        for error in [&foreign, &missing] {
+            assert!(
+                matches!(error, WyrdError::WorkloadUidRefused { .. }),
+                "{error:?}"
+            );
+        }
     }
 
     /// Ingest stamps `card_uid` from trusted signed claims alone, so the mint
     /// walk must replace each authored reference — root and secondary — with the
     /// exact tenant-local registry identity and its `card_uid`.
+    ///
+    /// # Panics
+    /// Panics when the fixture, seed, or resolve fails, the scope is not the
+    /// root first plus the secondary, or either member lacks its registry UID.
     #[tokio::test]
     async fn resolve_scope_populates_every_member_uid() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let creator = uuid::Uuid::new_v4();
-        let root = make_card_ref(CardKind::Service, "prod", "svc-uid-root");
-        let secondary = make_card_ref(CardKind::Service, "prod", "svc-uid-secondary");
+        let root = make_card_ref(CardKind::Service, "svc-uid-root");
+        let secondary = make_card_ref(CardKind::Service, "svc-uid-secondary");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         seed_backing_card(&mut conn, &secondary, creator).await;
@@ -526,7 +621,6 @@ mod pg_tests {
                     "alias": "secondary",
                     "ref": {
                         "kind": "Service",
-                        "space": space_of(&secondary).as_str(),
                         "name": secondary.name.as_str(),
                         "version": secondary.version.as_str(),
                     },
@@ -536,20 +630,14 @@ mod pg_tests {
         .expect("root service spec decodes");
         seed_card_with_spec(&mut conn, &root, &root_spec, creator).await;
 
-        let expected_root_uid = get_card_by_ref(
-            &mut conn,
-            root.kind.clone(),
-            space_of(&root),
-            &root.name,
-            &root.version,
-        )
-        .await
-        .expect("root card row loads")
-        .card_uid;
+        let expected_root_uid =
+            get_card_by_ref(&mut conn, root.kind.clone(), &root.name, &root.version)
+                .await
+                .expect("root card row loads")
+                .card_uid;
         let expected_secondary_uid = get_card_by_ref(
             &mut conn,
             secondary.kind.clone(),
-            space_of(&secondary),
             &secondary.name,
             &secondary.version,
         )
@@ -557,7 +645,7 @@ mod pg_tests {
         .expect("secondary card row loads")
         .card_uid;
 
-        let scope = resolve_card_ref_scope(&mut conn, &root)
+        let scope = resolve_workload_scope(&mut conn, &expected_root_uid, None)
             .await
             .expect("resolves without error");
 
@@ -584,17 +672,6 @@ mod pg_tests {
         );
     }
 
-    #[tokio::test]
-    async fn resolve_missing_card_returns_error() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let root = make_card_ref(CardKind::Service, "prod", "nonexistent-card");
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let result = resolve_card_ref_scope(&mut conn, &root).await;
-
-        assert!(result.is_err(), "missing card should error");
-    }
-
     /// The Card-count cap refusal names the `cards` limit, its value, and the
     /// scope root; the cap itself is unreachable here without Agent Cards that
     /// have scope children, so the test checks the refusal's shape.
@@ -608,7 +685,7 @@ mod pg_tests {
         // but we can verify the pure error shape produced by too_large directly
         // and confirm resolve errors for a missing card (cap logic is unreachable
         // without Agent cards having scope children).
-        let root = make_card_ref(CardKind::Service, "prod", "svc-cap-test");
+        let root = make_card_ref(CardKind::Service, "svc-cap-test");
         let err = too_large("cards", MAX_SCOPE_CARDS, &root);
         let WyrdError::CardScopeTooLarge { message, details } = err else {
             panic!("expected CardScopeTooLarge");
@@ -626,7 +703,7 @@ mod pg_tests {
 
     #[tokio::test]
     async fn resolve_caps_at_max_scope_depth() {
-        let root = make_card_ref(CardKind::Service, "prod", "svc-depth-test");
+        let root = make_card_ref(CardKind::Service, "svc-depth-test");
         let err = too_large("depth", MAX_SCOPE_DEPTH, &root);
         let WyrdError::CardScopeTooLarge { message, details } = err else {
             panic!("expected CardScopeTooLarge");

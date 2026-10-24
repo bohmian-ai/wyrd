@@ -27,6 +27,9 @@ const CAPACITY: usize = 16_384;
 pub(crate) struct CommittedBatch {
     /// Canonical logical table the batch was fenced for.
     pub(crate) table_fqn: String,
+    /// Table version the batch was accepted under; a retry prepared under
+    /// any other version is not this batch.
+    pub(crate) table_version: wyrd_spec::vala::ids::TableVersion,
     /// Ordered logical slice-set digest the fence stores.
     pub(crate) logical_digest: [u8; 32],
     /// Closed slice-set cardinality the fence stores.
@@ -82,6 +85,20 @@ impl CommittedBatches {
         self.lock().batches.get(&(tenant, batch_id)) == Some(batch)
     }
 
+    /// Accepting table version recorded for `(tenant, batch_id)` in `table_fqn`.
+    pub(crate) fn version(
+        &self,
+        tenant: DataTenantId,
+        batch_id: Uuid,
+        table_fqn: &str,
+    ) -> Option<wyrd_spec::vala::ids::TableVersion> {
+        self.lock()
+            .batches
+            .get(&(tenant, batch_id))
+            .filter(|batch| batch.table_fqn == table_fqn)
+            .map(|batch| batch.table_version)
+    }
+
     /// Whether anything is recorded for `(tenant, batch_id)`, so a caller can
     /// skip computing the logical identity of a fresh batch.
     pub(crate) fn knows(&self, tenant: DataTenantId, batch_id: Uuid) -> bool {
@@ -106,12 +123,14 @@ mod tests {
     fn batch(table: &str, digest: u8) -> CommittedBatch {
         CommittedBatch {
             table_fqn: table.to_owned(),
+            table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
             logical_digest: [digest; 32],
             slice_count: 1,
         }
     }
 
-    /// Only an exact tenant, batch id, table, and logical identity match; the
+    /// Only an exact tenant, batch id, table, table version, and logical
+    /// identity match; the
     /// first record wins and the oldest identity is evicted at the bound.
     #[test]
     fn matches_exact_identity_and_evicts_oldest() {
@@ -125,6 +144,9 @@ mod tests {
         assert!(!index.contains(tenant, first, &batch("t.a", 2)));
         assert!(!index.contains(tenant, first, &batch("t.b", 1)));
         assert!(!index.contains(other, first, &batch("t.a", 1)));
+        let mut next_version = batch("t.a", 1);
+        next_version.table_version = next_version.table_version.next().expect("next version");
+        assert!(!index.contains(tenant, first, &next_version));
         for _ in 0..CAPACITY {
             index.record(tenant, Uuid::now_v7(), batch("t.a", 3));
         }

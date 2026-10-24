@@ -24,6 +24,7 @@ use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, PhysicalLayoutWire,
     RegisterOutcome, RegisterTableResponse,
 };
+use wyrd_spec::vala::ids::TableVersion;
 
 use crate::catalog::cut_cache::{CUT_CHANNEL, CutCache};
 use crate::catalog::error::BifrostCatalogError;
@@ -103,6 +104,8 @@ struct Registration {
     outcome: RegisterOutcome,
     /// The stored user-schema fingerprint the registration was compared on.
     fingerprint: SchemaFingerprint,
+    /// The physical table's current version, `1` for a table this call created.
+    table_version: TableVersion,
 }
 
 /// Inputs for one tenant-qualified physical table registration.
@@ -265,29 +268,98 @@ pub struct BifrostCatalog {
     metadata_cache: mini_moka::sync::Cache<String, TableMetadataRef>,
     /// Registrations this node has already read, by tenant and table name.
     ///
-    /// A registration row is immutable once written: its UID is minted once,
-    /// `(tenant, fqn)` is unique, and no production path updates or deletes
-    /// it. Only found rows are cached, so a table registered later is still
+    /// A registration's UID is minted once and `(tenant, fqn)` is unique; its
+    /// fingerprint and layout change only with a new table version, after
+    /// which [`BifrostCatalog::evict_current_definition`] drops the entry.
+    /// Only found rows are cached, so a table registered later is still
     /// seen on its first lookup. One control-row read fills the UID,
     /// fingerprint, and layout every write and query resolves. Grows with
     /// registered tables, never with writes or queries.
     registrations: Arc<RwLock<HashMap<(DataTenantId, String), CachedRegistration>>>,
-    /// Registered Iceberg schemas this node has already loaded, by tenant and
+    /// Current table definitions this node has already loaded, by tenant and
     /// table name.
     ///
-    /// The schema is the field-id authority Scribe stamps into every Parquet
-    /// object. A registered table's schema never evolves and its registration
-    /// is never dropped, so a loaded schema stays authoritative for the life
-    /// of the node. Grows with registered tables, never with writes.
-    registered_schemas: Arc<RwLock<RegisteredSchemas>>,
+    /// The definition is what new admission binds: its schema is the field-id
+    /// authority Scribe stamps into every Parquet object. An entry stays until
+    /// [`BifrostCatalog::evict_current_definition`] drops it after a new
+    /// version commits; batches already accepted are unaffected because each
+    /// carries its own version. Grows with registered tables, never with
+    /// writes.
+    current_definitions: Arc<RwLock<CurrentDefinitions>>,
     /// Node-local Oracle cut cache, served only while [`Self::watch_cuts`]
     /// is listening for invalidations.
     cut_cache: Arc<CutCache>,
+    /// Deployment Forge file target a new table's version-1 definition stores
+    /// when its registration declares none.
+    default_target_file_size_bytes: u64,
 }
 
-/// Registered Iceberg schemas a node has loaded, keyed by tenant and table
-/// name; the field-id authority behind [`BifrostCatalog`]'s schema cache.
-type RegisteredSchemas = HashMap<(DataTenantId, String), Arc<spec::Schema>>;
+/// Current table definitions a node has loaded, keyed by tenant and table
+/// name.
+type CurrentDefinitions = HashMap<(DataTenantId, String), Arc<TableDefinition>>;
+
+/// The complete definition one table version declares.
+///
+/// Rebuilt from that version's native Iceberg metadata, so every batch bound
+/// to the version is admitted, sealed, recovered, and published under the
+/// same schema, spec, sort order, and Bloom set.
+#[derive(Debug)]
+pub struct TableDefinition {
+    /// Version this definition belongs to.
+    pub table_version: TableVersion,
+    /// Default partition-spec id the version partitions under.
+    pub spec_id: i32,
+    /// Default sort-order id the version writes under.
+    pub sort_order_id: i32,
+    /// The version's Iceberg schema, the field-id authority Scribe stamps.
+    pub schema: Arc<spec::Schema>,
+    /// Layout the version declares.
+    pub layout: PhysicalLayout,
+    /// Partition scheme the version plans slices under, bound to the version.
+    pub partition_scheme: crate::catalog::PartitionScheme,
+}
+
+impl TableDefinition {
+    /// Rebuilds the definition one metadata document declares.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::MetadataMismatch`] when the document has
+    /// no canonical version, its sort-order id leaves the `i32` domain, or its
+    /// layout or partition scheme does not rebuild.
+    pub(crate) fn of_metadata(
+        fqn: &str,
+        metadata: &TableMetadata,
+    ) -> Result<Self, BifrostCatalogError> {
+        let mismatch = |error: wyrd_spec::vala::BifrostError| {
+            BifrostCatalogError::MetadataMismatch(error.to_string())
+        };
+        let table_version =
+            crate::catalog::layout::table_version(fqn, metadata).map_err(mismatch)?;
+        let spec_id = metadata.default_partition_spec_id();
+        let sort_order_id = i32::try_from(metadata.default_sort_order_id()).map_err(|_| {
+            BifrostCatalogError::MetadataMismatch(format!(
+                "{fqn} default sort-order id exceeds the i32 domain"
+            ))
+        })?;
+        let (layout, schema) =
+            PhysicalLayout::of_iceberg(fqn, metadata, spec_id).map_err(mismatch)?;
+        let partition_scheme = crate::catalog::PartitionScheme::of_wire(&layout.to_wire(), spec_id)
+            .map_err(|error| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "{fqn} partition layout is invalid: {error}"
+                ))
+            })?
+            .with_table_version(table_version);
+        Ok(Self {
+            table_version,
+            spec_id,
+            sort_order_id,
+            schema,
+            layout,
+            partition_scheme,
+        })
+    }
+}
 
 /// Estimated-weight eviction limit of the node-wide decoded manifest cache.
 ///
@@ -798,9 +870,21 @@ impl BifrostCatalog {
             manifest_cache: Arc::new(std::sync::OnceLock::new()),
             metadata_cache: mini_moka::sync::Cache::new(METADATA_CACHE_ENTRIES),
             registrations: Arc::default(),
-            registered_schemas: Arc::default(),
+            current_definitions: Arc::default(),
             cut_cache: Arc::default(),
+            default_target_file_size_bytes: crate::forge::compact::DEFAULT_TARGET_FILE_SIZE_BYTES,
         })
+    }
+
+    /// Sets the deployment Forge file target that table creation resolves an
+    /// omitted target to; the compiled 1 GiB Forge default until set.
+    ///
+    /// The resolved value is stored in the new definition, so a later change
+    /// to this deployment value never alters an existing table version.
+    #[must_use]
+    pub fn with_default_target_file_size_bytes(mut self, bytes: u64) -> Self {
+        self.default_target_file_size_bytes = bytes;
+        self
     }
 
     /// Borrows the node's one storage owner this catalog binds Iceberg to.
@@ -908,6 +992,7 @@ impl BifrostCatalog {
             outcome: registration.outcome,
             table_uid: hex::encode(registration.table_uid.as_bytes()),
             fingerprint: hex::encode(registration.fingerprint.0),
+            table_version: registration.table_version,
         })
     }
 
@@ -1063,23 +1148,29 @@ impl BifrostCatalog {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
             compaction.assert_matches(physical.metadata(), &fqn)?;
+            let table_version = crate::catalog::layout::table_version(&fqn, physical.metadata())
+                .map_err(BifrostCatalogError::Registration)?;
             conn.commit().await?;
             return Ok(Registration {
                 table_uid: TableUid::from_row(&row.table_uid, &row.fqn)?,
                 outcome: RegisterOutcome::AlreadyExists,
                 fingerprint,
+                table_version,
             });
         }
 
         self.ensure_namespace(binding.physical_namespace()).await?;
-        if physical_exists {
+        let table_version = if physical_exists {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
             compaction.assert_matches(physical.metadata(), &fqn)?;
+            crate::catalog::layout::table_version(&fqn, physical.metadata())
+                .map_err(BifrostCatalogError::Registration)?
         } else {
             self.create_physical_table(&binding, &arrow_schema, &layout, compaction)
                 .await?;
-        }
+            TableVersion::INITIAL
+        };
 
         let table_uid = TableUid::new_v7();
         vala_sql::queries::olap_catalog::upsert_table(
@@ -1096,6 +1187,7 @@ impl BifrostCatalog {
             table_uid,
             outcome: RegisterOutcome::Created,
             fingerprint,
+            table_version,
         })
     }
 
@@ -1105,14 +1197,14 @@ impl BifrostCatalog {
     /// exists yet. The table is always Iceberg format v3, so appends assign
     /// row lineage through the first-row-id mechanism and Forge rewrites carry
     /// it forward. Every physical decision — schema ids, partition spec, sort
-    /// order, location, and the Bloom and Forge data-path properties — is
-    /// derived from `layout` and `binding`, so the canonical layout stays the
-    /// single authority for the table's shape. The Forge data path is written
-    /// as `write.data.path` so the managed rewrite core roots its outputs under
-    /// the recipe segment instead of the default data root. Each option
-    /// `compaction` declares is written as the table's explicit property;
-    /// an omitted option writes nothing, so Forge resolves its default at
-    /// planning time.
+    /// order, location, and the Bloom property — is derived from `layout` and
+    /// `binding`, so the canonical layout stays the single authority for the
+    /// table's shape. No data path is stored: Forge derives each rewrite's
+    /// output location from the version it selects. The file target
+    /// `compaction` declares, or else this catalog's deployment default, is
+    /// written as `write.target-file-size-bytes`, so the definition fixes it;
+    /// a declared compaction type is written as its property and an omitted
+    /// one writes nothing.
     ///
     /// # Errors
     ///
@@ -1138,18 +1230,11 @@ impl BifrostCatalog {
             self.warehouse.trim_end_matches('/'),
             binding.object_prefix
         );
-        let forge_data_location = crate::catalog::layout::forge_data_location(&location);
-        let mut properties = std::collections::HashMap::from([
-            (
-                crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
-                layout.bloom_columns_property(),
-            ),
-            (
-                crate::catalog::layout::WRITE_DATA_PATH_PROPERTY.to_owned(),
-                forge_data_location,
-            ),
-        ]);
-        compaction.write_properties(&mut properties);
+        let mut properties = std::collections::HashMap::from([(
+            crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
+            layout.bloom_columns_property(),
+        )]);
+        compaction.write_properties(&mut properties, self.default_target_file_size_bytes);
         let creation = TableCreation::builder()
             .name(binding.table_name.clone())
             .location(location)
@@ -1214,25 +1299,37 @@ impl BifrostCatalog {
             )));
         }
         let schema = table.metadata().current_schema();
-        let partition_source_id = schema
-            .field_by_name(layout.time_column())
-            .map(|field| field.id)
+        let expected_partition_fields = layout
+            .partition_by()
+            .iter()
+            .map(|field| {
+                schema.field_by_name(field.column()).map(|source| {
+                    (
+                        source.id,
+                        field.transform().iceberg_field_name(field.column()),
+                        field.transform().to_iceberg(),
+                    )
+                })
+            })
+            .collect::<Option<Vec<_>>>()
             .ok_or_else(|| {
-                BifrostCatalogError::MetadataMismatch(format!(
-                    "physical schema lacks partition column {}",
-                    layout.time_column()
-                ))
+                BifrostCatalogError::MetadataMismatch(
+                    "physical schema lacks a partition source column".to_owned(),
+                )
             })?;
-        let expected_partition_name = layout.iceberg_partition_field_name();
         let fields = table.metadata().default_partition_spec().fields();
-        if fields.len() != 1
-            || fields[0].source_id != partition_source_id
-            || fields[0].name != expected_partition_name
-            || fields[0].transform != layout.iceberg_transform()
+        if fields.len() != expected_partition_fields.len()
+            || fields.iter().zip(&expected_partition_fields).any(
+                |(field, (source_id, name, transform))| {
+                    field.source_id != *source_id
+                        || &field.name != name
+                        || field.transform != *transform
+                },
+            )
         {
-            return Err(BifrostCatalogError::MetadataMismatch(format!(
-                "physical table partition spec mismatch: expected one {expected_partition_name} field"
-            )));
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "physical table partition spec mismatch".to_owned(),
+            ));
         }
         let expected_sort_fields = layout
             .sort_keys()
@@ -1316,46 +1413,122 @@ impl BifrostCatalog {
         Ok(self.registration(table, tenant).await?.table_uid)
     }
 
-    /// Return the registered Iceberg schema of one tenant/logical table.
+    /// Return the current definition new admission binds for one table.
     ///
     /// The registered table, not any declaration, assigns every physical field
-    /// id, nested and managed fields included; Scribe stamps exactly these ids
-    /// into the objects it writes so Forge and Oracle resolve its columns by
-    /// the table's own numbering. Answers from the node's cache when this
-    /// table was loaded before, and otherwise loads the tenant-bound Iceberg
-    /// table once and caches its current schema.
+    /// id, nested and managed fields included; Scribe stamps exactly the
+    /// definition's ids into the objects it writes so Forge and Oracle resolve
+    /// its columns by the table's own numbering. Answers from the node's cache
+    /// when this table was loaded before, and otherwise loads the tenant-bound
+    /// Iceberg table once and caches its current definition.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::InvalidBinding`] when the tenant-qualified
-    /// binding cannot be resolved, and the Iceberg error when the physical
-    /// table cannot be loaded.
+    /// binding cannot be resolved, the Iceberg error when the physical table
+    /// cannot be loaded, and [`BifrostCatalogError::MetadataMismatch`] when
+    /// the current metadata does not rebuild a valid definition.
     ///
     /// # Panics
     /// Panics only if a thread panicked while holding the cache lock.
-    pub async fn registered_schema(
+    pub async fn current_definition(
         &self,
         table: &TableRef,
         tenant: DataTenantId,
-    ) -> Result<Arc<spec::Schema>, BifrostCatalogError> {
+    ) -> Result<Arc<TableDefinition>, BifrostCatalogError> {
         let key = (tenant, table.fqn());
         let cached = self
-            .registered_schemas
+            .current_definitions
             .read()
-            .expect("the registered schema cache lock is never poisoned")
+            .expect("the current definition cache lock is never poisoned")
             .get(&key)
             .map(Arc::clone);
-        if let Some(schema) = cached {
-            return Ok(schema);
+        if let Some(definition) = cached {
+            return Ok(definition);
         }
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let loaded = self.catalog.load_table(&binding.table_ident()).await?;
-        let schema = Arc::clone(loaded.metadata().current_schema());
-        self.registered_schemas
+        let definition = Arc::new(TableDefinition::of_metadata(&key.1, loaded.metadata())?);
+        self.current_definitions
             .write()
-            .expect("the registered schema cache lock is never poisoned")
-            .insert(key, Arc::clone(&schema));
-        Ok(schema)
+            .expect("the current definition cache lock is never poisoned")
+            .insert(key, Arc::clone(&definition));
+        Ok(definition)
+    }
+
+    /// Resolves the definition one retained version of a table declares.
+    ///
+    /// Seal, staged recovery, and publication call this with the version a
+    /// batch was accepted under, so the batch is written exactly as accepted
+    /// whatever the table's current version is. The current version answers
+    /// from the cache; an older one reads its retained metadata reference and
+    /// that immutable document. ponytail: an older version re-reads its
+    /// reference per call; cache it if seals behind an edit become frequent.
+    ///
+    /// # Errors
+    /// Returns the Iceberg error when the table or reference cannot be read and
+    /// [`BifrostCatalogError::MetadataMismatch`] when the version is not
+    /// retained for this table or its document does not declare it.
+    pub async fn retained_definition(
+        &self,
+        binding: &TenantTableBinding,
+        table_version: TableVersion,
+    ) -> Result<Arc<TableDefinition>, BifrostCatalogError> {
+        let fqn = binding.table_ref.fqn();
+        let current = self
+            .current_definition(&binding.table_ref, binding.tenant)
+            .await?;
+        if current.table_version == table_version {
+            return Ok(current);
+        }
+        let identifier = binding.table_ident();
+        let loaded = self.catalog.load_table(&identifier).await?;
+        let location = self
+            .catalog
+            .load_table_version_location(
+                &identifier,
+                &loaded.metadata().uuid().to_string(),
+                table_version.get(),
+            )
+            .await?
+            .ok_or_else(|| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "{fqn} retains no table version {table_version}"
+                ))
+            })?;
+        let metadata = if let Some(metadata) = self.metadata_cache.get(&location) {
+            metadata
+        } else {
+            let metadata = Arc::new(TableMetadata::read_from(&self.file_io, &location).await?);
+            self.metadata_cache
+                .insert(location.clone(), Arc::clone(&metadata));
+            metadata
+        };
+        let definition = TableDefinition::of_metadata(&fqn, &metadata)?;
+        if definition.table_version != table_version {
+            return Err(BifrostCatalogError::MetadataMismatch(format!(
+                "{fqn} version {table_version} references a document at version {}",
+                definition.table_version
+            )));
+        }
+        Ok(Arc::new(definition))
+    }
+
+    /// Drops this node's cached registration and current definition of one
+    /// table, so the next admission reads the version committed since.
+    ///
+    /// # Panics
+    /// Panics only if a thread panicked while holding a cache lock.
+    pub fn evict_current_definition(&self, table: &TableRef, tenant: DataTenantId) {
+        let key = (tenant, table.fqn());
+        self.current_definitions
+            .write()
+            .expect("the current definition cache lock is never poisoned")
+            .remove(&key);
+        self.registrations
+            .write()
+            .expect("the registration cache lock is never poisoned")
+            .remove(&key);
     }
 
     /// Return the registered user-schema fingerprint for one tenant/logical table.
@@ -1435,9 +1608,13 @@ impl BifrostCatalog {
 
     /// Describe one tenant-qualified table and its stored physical schema.
     ///
+    /// The version and physical layout are the current metadata's, so a
+    /// definition edit is described with its own Bloom list and layout.
+    ///
     /// # Errors
     /// Returns a catalog error for a missing registration, invalid binding,
-    /// Iceberg load failure, or malformed stored schema.
+    /// Iceberg load failure, or a stored schema or definition that does not
+    /// rebuild.
     pub async fn describe_table(
         &self,
         table: &TableRef,
@@ -1455,7 +1632,7 @@ impl BifrostCatalog {
         let row = self
             .lookup_table_row(&fqn, tenant)
             .await?
-            .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn))?;
+            .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
         // A canonical built-in is described from its own declaration, not from
         // the Iceberg round trip: the stored schema drops the ledger's
         // sensitivity markers and renames nested list elements, and it is the
@@ -1473,14 +1650,18 @@ impl BifrostCatalog {
             )?)
         };
         let described = described_fields_from_stored_schema(&arrow_schema)?;
+        // The version and the layout come from one metadata document, so a
+        // definition edit is never described with another version's layout.
+        let definition = TableDefinition::of_metadata(&fqn, iceberg_table.metadata())?;
         Ok(BifrostTableDescription {
             entry: entry_from_row(&row)?,
+            table_version: definition.table_version,
             user_fields: described.user_fields,
             correlation_fields: described.correlation_fields,
             canonical_physical_fingerprint: builtin
                 .and_then(|definition| (definition.canonical_physical_fingerprint)())
                 .map(crate::tables::CanonicalPhysicalFingerprint::to_hex),
-            physical_layout: layout_wire_from_row(&row)?,
+            physical_layout: definition.layout.to_wire(),
             compaction_target_file_size_bytes: explicit_compaction_target(
                 iceberg_table.metadata(),
             )?,
@@ -1717,10 +1898,10 @@ pub const MAX_PHYSICAL_LEAF_COLUMNS: usize = 256;
 /// Iceberg property naming a table's explicit Forge compaction file target.
 const TARGET_FILE_SIZE_PROPERTY: &str = TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES;
 
-/// Reads the explicit compaction file target a physical table stores.
+/// Reads the compaction file target a physical table's definition stores.
 ///
-/// `None` means the table declares none and follows Forge's deployment
-/// default.
+/// Creation always stores one, declared or resolved from the deployment
+/// default; `None` only for metadata that stores none.
 ///
 /// # Errors
 /// Returns [`BifrostCatalogError::MetadataMismatch`] when the stored property
@@ -1767,11 +1948,12 @@ fn explicit_compaction_type(
 /// The Forge compaction options one dataset registration declares.
 ///
 /// Every option is optional and independent: a declared option becomes the
-/// new table's explicit Iceberg property in its create transaction, and on a
-/// re-registration must equal the stored explicit value. An omitted option
-/// stores nothing and never conflicts, so the table follows Forge's default
-/// (the deployment file target, the `small-files` type). [`Default`] declares
-/// nothing, which is how built-ins register.
+/// new table's Iceberg property in its create transaction, and on a
+/// re-registration must equal the stored value. An omitted file target is
+/// stored as the deployment default resolved at creation; an omitted type
+/// stores nothing and plans `small-files`. Omission never conflicts on
+/// re-registration. [`Default`] declares nothing, which is how built-ins
+/// register.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CompactionRegistration {
     /// Soft file target Forge compacts toward, stored as
@@ -1845,13 +2027,21 @@ impl CompactionRegistration {
         Ok(())
     }
 
-    /// Adds each declared option to a new table's creation properties.
+    /// Adds the options to a new table's creation properties.
     ///
-    /// Writes nothing for an omitted option.
-    fn write_properties(&self, properties: &mut HashMap<String, String>) {
-        if let Some(bytes) = self.target_file_size_bytes {
-            properties.insert(TARGET_FILE_SIZE_PROPERTY.to_owned(), bytes.to_string());
-        }
+    /// An omitted file target resolves to `default_target_file_size_bytes`;
+    /// an omitted compaction type writes nothing.
+    fn write_properties(
+        &self,
+        properties: &mut HashMap<String, String>,
+        default_target_file_size_bytes: u64,
+    ) {
+        properties.insert(
+            TARGET_FILE_SIZE_PROPERTY.to_owned(),
+            self.target_file_size_bytes
+                .unwrap_or(default_target_file_size_bytes)
+                .to_string(),
+        );
         if let Some(kind) = self.compaction_type {
             properties.insert(
                 COMPACTION_TYPE_PROPERTY.to_owned(),
@@ -2024,7 +2214,8 @@ mod tests {
     /// A declared compaction type is written under Forge's own property in
     /// the hyphenated spelling Forge parses back to the same type, every wire
     /// value round-trips through the Forge type, and an empty declaration
-    /// writes nothing so Forge keeps its `small-files` default.
+    /// writes only the resolved file target, so Forge keeps its `small-files`
+    /// default.
     ///
     /// # Panics
     /// Panics when a written property is missing, misspelled, or does not
@@ -2044,8 +2235,8 @@ mod tests {
                 target_file_size_bytes: None,
                 compaction_type: Some(kind),
             }
-            .write_properties(&mut properties);
-            assert_eq!(properties.len(), 1);
+            .write_properties(&mut properties, 1);
+            assert_eq!(properties.len(), 2);
             let settings =
                 ForgeTableSettings::from_properties(&properties).expect("settings parse");
             assert_eq!(settings.compaction_type, kind);
@@ -2055,16 +2246,20 @@ mod tests {
             target_file_size_bytes: None,
             compaction_type: Some(ForgeCompactionType::SmallFiles),
         }
-        .write_properties(&mut properties);
+        .write_properties(&mut properties, 1);
         assert_eq!(
             properties.get(COMPACTION_TYPE_PROPERTY).map(String::as_str),
             Some("small-files")
         );
-        let mut empty = HashMap::new();
-        CompactionRegistration::default().write_properties(&mut empty);
-        assert!(empty.is_empty());
+        let mut omitted = HashMap::new();
+        CompactionRegistration::default().write_properties(&mut omitted, 1);
         assert_eq!(
-            ForgeTableSettings::from_properties(&empty)
+            omitted,
+            HashMap::from([(super::TARGET_FILE_SIZE_PROPERTY.to_owned(), "1".to_owned())]),
+            "an omitted target stores the supplied default and an omitted type nothing"
+        );
+        assert_eq!(
+            ForgeTableSettings::from_properties(&omitted)
                 .expect("defaults parse")
                 .compaction_type,
             ForgeCompactionType::SmallFiles
@@ -2438,6 +2633,112 @@ mod production_pin_tests {
         });
     }
 
+    /// An omitted file target is resolved into the version-1 definition.
+    ///
+    /// Creation under deployment default A stores A, so Forge extracts A from
+    /// that definition under both A and a later default B; only a table
+    /// created under B stores B, and re-registering the first under B leaves
+    /// its stored target unchanged.
+    ///
+    /// # Panics
+    /// Panics when the fixture, a registration, or a load fails, or when a
+    /// stored or extracted target differs from the default its table was
+    /// created under.
+    #[test]
+    fn an_omitted_target_is_fixed_by_the_creating_deployment() {
+        const A: u64 = 256 * 1024 * 1024;
+        const B: u64 = 512 * 1024 * 1024;
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let mut catalogs = Vec::new();
+            for bytes in [A, B] {
+                catalogs.push(
+                    BifrostCatalog::new(
+                        fixture.catalog_dsn().expose_secret(),
+                        local_storage_owner(warehouse.path()),
+                        fixture.vala_postgres().clone(),
+                    )
+                    .await
+                    .expect("redux catalog builds over the fixture")
+                    .with_default_target_file_size_bytes(bytes),
+                );
+            }
+            let (under_a, under_b) = (&catalogs[0], &catalogs[1]);
+            let tenant = fixture.data_tenant_id();
+            let register = async |catalog: &BifrostCatalog, name: &'static str| {
+                catalog
+                    .register_dataset(
+                        tenant,
+                        wyrd_spec::auth::Attribution::unresolved(),
+                        TableRef::new(BifrostNamespace::Datasets, name),
+                        vec![arrow::datatypes::Field::new(
+                            "value",
+                            arrow::datatypes::DataType::Int64,
+                            true,
+                        )],
+                        None,
+                        CompactionRegistration::default(),
+                    )
+                    .await
+            };
+            let stored = |name: &'static str| {
+                let binding = crate::catalog::TenantTableBinding::resolve((
+                    tenant,
+                    TableRef::new(BifrostNamespace::Datasets, name),
+                ))
+                .expect("binding resolves");
+                let catalog = under_a.iceberg_catalog();
+                async move {
+                    catalog
+                        .load_table(&binding.table_ident())
+                        .await
+                        .expect("physical table loads")
+                        .metadata()
+                        .clone()
+                }
+            };
+            register(under_a, "target_a")
+                .await
+                .expect("registers under A");
+            let created_a = stored("target_a").await;
+            for deployment in [A, B] {
+                let config = crate::forge::ForgeConfig {
+                    default_target_file_size_bytes: deployment,
+                    ..crate::forge::ForgeConfig::default()
+                };
+                assert_eq!(
+                    crate::forge::managed::policy::ForgeTablePolicy::extract(&created_a, &config)
+                        .expect("the stored target is admissible")
+                        .target_file_size_bytes,
+                    A,
+                    "deployment {deployment} does not move the definition's target"
+                );
+            }
+
+            let repeated = register(under_b, "target_a")
+                .await
+                .expect("re-registers under B");
+            assert_eq!(
+                repeated.outcome,
+                wyrd_spec::vala::api::RegisterOutcome::AlreadyExists
+            );
+            register(under_b, "target_b")
+                .await
+                .expect("registers under B");
+            for (name, expected) in [("target_a", A), ("target_b", B)] {
+                assert_eq!(
+                    super::explicit_compaction_target(&stored(name).await)
+                        .expect("stored target parses"),
+                    Some(expected),
+                    "{name} stores the default it was created under"
+                );
+            }
+        });
+    }
+
     /// A built-in this node has ensured is ensured again without Postgres.
     ///
     /// Only the first ensure per tenant and table may take the advisory lock
@@ -2607,6 +2908,74 @@ mod production_pin_tests {
         tasks.len()
     }
 
+    /// Registers `vala.datasets.<name>` with one nullable `value` column and
+    /// fast-appends one fixture data file, returning the table's binding.
+    ///
+    /// # Panics
+    /// Panics when registration, loading, or the append fails.
+    async fn register_with_one_file(
+        catalog: &BifrostCatalog,
+        tenant: DataTenantId,
+        table: &TableRef,
+    ) -> crate::catalog::TenantTableBinding {
+        catalog
+            .register_dataset(
+                tenant,
+                wyrd_spec::auth::Attribution::unresolved(),
+                table.clone(),
+                vec![arrow::datatypes::Field::new(
+                    "value",
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                )],
+                None,
+                CompactionRegistration::default(),
+            )
+            .await
+            .expect("dataset registers");
+
+        let binding = crate::catalog::TenantTableBinding::resolve((tenant, table.clone()))
+            .expect("binding resolves");
+        let physical = catalog
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .expect("physical table loads");
+        let lower_micros = 1_787_493_600_000_000_i64;
+        let partition = crate::catalog::layout::TimeGranularity::Hour
+            .bucket(
+                chrono::DateTime::from_timestamp_micros(lower_micros)
+                    .expect("fixture instant is representable"),
+            )
+            .expect("fixture instant buckets");
+        let location = physical.metadata().location().to_owned();
+        let data_file = iceberg::spec::DataFileBuilder::default()
+            .content(iceberg::spec::DataContentType::Data)
+            .file_path(format!("{location}/data/pinned.parquet"))
+            .file_format(iceberg::spec::DataFileFormat::Parquet)
+            .partition(iceberg::spec::Struct::from_iter([Some(
+                partition.iceberg_partition_literal(),
+            )]))
+            .record_count(1)
+            .file_size_in_bytes(1_024)
+            .partition_spec_id(physical.metadata().default_partition_spec_id())
+            .sort_order_id(
+                i32::try_from(physical.metadata().default_sort_order_id())
+                    .expect("fixture sort order id fits i32"),
+            )
+            .build()
+            .expect("fixture data file builds");
+        let transaction = Transaction::new(&physical);
+        let action = transaction.fast_append().add_data_files([data_file]);
+        let applied = ApplyTransactionAction::apply(action, transaction).expect("append applies");
+        applied
+            .commit(catalog.iceberg_catalog().as_ref())
+            .await
+            .expect("fast append commits");
+
+        binding
+    }
+
     /// A pinned provider resolves only against the snapshot it names.
     ///
     /// A follower resolves its own catalog handle, so without pinning its leaf
@@ -2643,61 +3012,7 @@ mod production_pin_tests {
 
             let tenant = fixture.data_tenant_id();
             let table = TableRef::new(BifrostNamespace::Datasets, "pinned_provider");
-            catalog
-                .register_dataset(
-                    tenant,
-                    wyrd_spec::auth::Attribution::unresolved(),
-                    table.clone(),
-                    vec![arrow::datatypes::Field::new(
-                        "value",
-                        arrow::datatypes::DataType::Int64,
-                        true,
-                    )],
-                    None,
-                    CompactionRegistration::default(),
-                )
-                .await
-                .expect("dataset registers");
-
-            let binding = crate::catalog::TenantTableBinding::resolve((tenant, table.clone()))
-                .expect("binding resolves");
-            let physical = catalog
-                .iceberg_catalog()
-                .load_table(&binding.table_ident())
-                .await
-                .expect("physical table loads");
-            let lower_micros = 1_787_493_600_000_000_i64;
-            let partition = crate::catalog::layout::TimeGranularity::Hour
-                .bucket(
-                    chrono::DateTime::from_timestamp_micros(lower_micros)
-                        .expect("fixture instant is representable"),
-                )
-                .expect("fixture instant buckets");
-            let location = physical.metadata().location().to_owned();
-            let data_file = iceberg::spec::DataFileBuilder::default()
-                .content(iceberg::spec::DataContentType::Data)
-                .file_path(format!("{location}/data/pinned.parquet"))
-                .file_format(iceberg::spec::DataFileFormat::Parquet)
-                .partition(iceberg::spec::Struct::from_iter([Some(
-                    partition.iceberg_partition_literal(),
-                )]))
-                .record_count(1)
-                .file_size_in_bytes(1_024)
-                .partition_spec_id(physical.metadata().default_partition_spec_id())
-                .sort_order_id(
-                    i32::try_from(physical.metadata().default_sort_order_id())
-                        .expect("fixture sort order id fits i32"),
-                )
-                .build()
-                .expect("fixture data file builds");
-            let transaction = Transaction::new(&physical);
-            let action = transaction.fast_append().add_data_files([data_file]);
-            let applied =
-                ApplyTransactionAction::apply(action, transaction).expect("append applies");
-            applied
-                .commit(catalog.iceberg_catalog().as_ref())
-                .await
-                .expect("fast append commits");
+            let binding = register_with_one_file(&catalog, tenant, &table).await;
 
             let pinned = pin_current(&catalog, tenant, &table).await;
             let snapshot_id = pinned
@@ -2719,6 +3034,123 @@ mod production_pin_tests {
                     .await
                     .is_err(),
                 "an unpublished snapshot must fail to resolve rather than serve the current one"
+            );
+        });
+    }
+
+    /// A pin taken before a schema and partition-spec revision keeps reading
+    /// the snapshot it named: its schema is the one that snapshot was written
+    /// under, not the revised current schema, and its file still plans under
+    /// the retained spec.
+    ///
+    /// # Panics
+    /// Panics when the fixture, registration, commit, or pin fails, when the
+    /// pinned schema shows the revised column, or when the file stops planning.
+    #[test]
+    fn pinned_snapshot_survives_schema_and_spec_revisions() {
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let catalog = BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                local_storage_owner(warehouse.path()),
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture");
+            let tenant = fixture.data_tenant_id();
+            let table = TableRef::new(BifrostNamespace::Datasets, "pinned_revision");
+            let binding = register_with_one_file(&catalog, tenant, &table).await;
+            let snapshot_id = pin_current(&catalog, tenant, &table)
+                .await
+                .snapshot_id
+                .expect("a committed table has a snapshot");
+
+            let physical = catalog
+                .iceberg_catalog()
+                .load_table(&binding.table_ident())
+                .await
+                .expect("physical table loads");
+            let metadata = physical.metadata();
+            let current = metadata.current_schema();
+            let schema = iceberg::spec::Schema::builder()
+                .with_schema_id(current.schema_id() + 1)
+                .with_fields(
+                    current
+                        .as_struct()
+                        .fields()
+                        .iter()
+                        .cloned()
+                        .chain([Arc::new(iceberg::spec::NestedField::optional(
+                            metadata.last_column_id() + 1,
+                            "note",
+                            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                        ))]),
+                )
+                .build()
+                .expect("revised schema builds");
+            let spec = iceberg::spec::UnboundPartitionSpec::builder().build();
+            let transaction = Transaction::new(&physical);
+            let action = [
+                iceberg::TableUpdate::AddSchema { schema },
+                iceberg::TableUpdate::SetCurrentSchema { schema_id: -1 },
+                iceberg::TableUpdate::AddSpec { spec },
+                iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
+                iceberg::TableUpdate::SetProperties {
+                    updates: [(
+                        crate::catalog::TABLE_VERSION_PROPERTY.to_owned(),
+                        "2".to_owned(),
+                    )]
+                    .into(),
+                },
+            ]
+            .into_iter()
+            .fold(
+                transaction.apply_updates(),
+                iceberg::transaction::ApplyUpdatesAction::update,
+            );
+            ApplyTransactionAction::apply(action, transaction)
+                .expect("revision applies")
+                .commit(catalog.iceberg_catalog().as_ref())
+                .await
+                .expect("revision commits");
+            catalog.evict_current_definition(&table, tenant);
+
+            let current = catalog
+                .current_definition(&table, tenant)
+                .await
+                .expect("the current definition loads");
+            assert_eq!(current.table_version.get(), 2);
+            let retained = catalog
+                .retained_definition(&binding, wyrd_spec::vala::ids::TableVersion::INITIAL)
+                .await
+                .expect("the retained reference resolves the prior version");
+            assert_eq!(
+                retained.table_version,
+                wyrd_spec::vala::ids::TableVersion::INITIAL
+            );
+            assert!(
+                retained.schema.field_by_name("note").is_none()
+                    && current.schema.field_by_name("note").is_some(),
+                "each version resolves its own schema"
+            );
+
+            let pinned = catalog
+                .pinned_provider(&table, tenant, snapshot_id)
+                .await
+                .expect("the pinned snapshot still resolves after the revision");
+            let pinned_schema = datafusion::datasource::TableProvider::schema(&pinned);
+            assert!(
+                pinned_schema.field_with_name("value").is_ok()
+                    && pinned_schema.field_with_name("note").is_err(),
+                "the pin reads the schema its snapshot was written under: {pinned_schema:?}"
+            );
+            assert_eq!(
+                planned_file_count(&catalog, &binding.table_ident()).await,
+                1,
+                "the file written under the retained spec still plans"
             );
         });
     }

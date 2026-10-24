@@ -12,7 +12,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,7 +24,7 @@ from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer, cli
+from wyrd.testing import WyrdTestServer
 
 from .gateway.support import PROVIDER_KEY, Upstream
 from .support import (
@@ -73,6 +73,29 @@ FOREIGN_CITE = (
 )
 """The policy judge's Verdict for ``JUDGE-FOREIGN-CITE``: a pass citing a pointer the answer lacks."""
 
+
+def scored(text: str) -> str:
+    """The scored judge's Verdict for a prompt carrying ``text``: a pass citing the answer text.
+
+    Its custom data is a score and a category, which the judge's schema
+    refuses on ``BAD-DATA`` and which exceeds the 65,536-byte bound on
+    ``HUGE-DATA``.
+    """
+    data: dict[str, object] = {"score": 0.9, "category": "refund"}
+    if "BAD-DATA" in text:
+        data = {"score": "high", "category": "refund"}
+    elif "HUGE-DATA" in text:
+        data = {"score": 0.9, "category": "x" * 70_000}
+    return json.dumps(
+        {
+            "outcome": "passed",
+            "reason": "scored",
+            "citations": [{"slot": "answer", "locator": {"json_pointer": "/text"}}],
+            "data": data,
+        }
+    )
+
+
 READ_POLICY = {
     "role": "assistant",
     "content": None,
@@ -105,7 +128,6 @@ INVESTIGATE = {
                         "kind": "Service",
                         "name": "policy-desk",
                         "version": "1.0.0",
-                        "space": "default",
                     }
                 },
             ),
@@ -185,7 +207,8 @@ def completion(body: dict) -> tuple[int, dict]:
     judge (its prompt carries ``Rules:``) fails ``REFUSE-POLICY``, passes
     ``UNCITED`` without a citation, answers ``JUDGE-MALFORMED`` with no
     Verdict, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and otherwise
-    passes citing the answer text; every other judge agrees.
+    passes citing the answer text. The scored judge (its prompt carries
+    ``SCORE:``) answers ``scored``; every other judge agrees.
     """
     text = json.dumps(body)
     returned = any(message.get("role") == "tool" for message in body.get("messages", []))
@@ -208,6 +231,8 @@ def completion(body: dict) -> tuple[int, dict]:
     elif LIVE_REVIEW in text:
         [trace_id, *_] = re.findall("[0-9a-f]{32}", text)
         message = {"role": "assistant", "content": REVIEWED} if returned else live_query(trace_id)
+    elif "SCORE:" in text:
+        message = {"role": "assistant", "content": scored(text)}
     else:
         content = AGREES
         if "Rules:" in text:
@@ -246,7 +271,7 @@ def fresh_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @contextmanager
-def serving(delay: float = 0.0) -> Iterator[Receiver]:
+def serving(delay: float = 0.0) -> Generator[Receiver]:
     """Serve the local model provider and Operator hook endpoint until exit.
 
     With a ``delay``, each judge call is recorded on arrival and answered
@@ -354,7 +379,7 @@ def registered_assistant(
 
 @pytest.fixture(scope="session")
 def assistant_key(wyrd_server: WyrdTestServer, assistant_bundle: Path) -> str:
-    """The ``assistant`` Service's own key, issued with ``wyrd auth issue-key`` and no added Role."""
+    """A key for the ``assistant`` Service's runtime account, holding only ``workload``."""
     return service_key("assistant")
 
 
@@ -377,7 +402,7 @@ def unfitted_assistant(wyrd_server: WyrdTestServer, cards: Cards, tmp_path: Path
 @contextmanager
 def watching(
     tmp_path: Path, service: str, verifier: str, *, fitted: bool = True
-) -> Iterator[Watch]:
+) -> Generator[Watch]:
     """Deploy the scheduled-drift ``service`` on a server of its own until exit.
 
     The server's ``on-call-hooks`` connection points at a hook of its own,
@@ -404,9 +429,7 @@ def watching(
         if fitted:
             server.wait_for_baseline(str(registered[verifier].uid), BASELINE_TIMEOUT_SECONDS)
         root = registered[service]
-        key = cli.issue_key(
-            kind="Service", name=service, version="1.0.0", space="default", client=admin
-        ).key
+        key = service_key(service, admin)
         state = WyrdState.from_path(pull(cards, service, tmp_path), client_of(server, key))
         state.start_bifrost()
         [binding_id] = binding_ids(cards, root)
@@ -449,7 +472,7 @@ def observed_bundle(
 
 @pytest.fixture(scope="session")
 def observed_key(observed_bundle: Path) -> str:
-    """A key bound to the ``observed-service`` Card, issued with ``wyrd auth issue-key``."""
+    """A key for the ``observed-service`` runtime account, holding only ``workload``."""
     return service_key("observed-service")
 
 

@@ -23,7 +23,7 @@ use wyrd_spec::DataTenantId;
 
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
-use crate::catalog::layout::{TimePartition, TimePrecision};
+use crate::catalog::layout::TimePrecision;
 use crate::contracts::ScribeError;
 use crate::parquet::footer::BifrostFooterIdentity;
 use crate::parquet::variant_residual::{VariantWriter, variant_residual_share};
@@ -82,7 +82,7 @@ pub struct ParquetEncoded {
     /// Row group statistics.
     pub row_group_stats: Vec<RowGroupStats>,
     /// Partition day (from seal-key, not row min/max).
-    pub partition: TimePartition,
+    pub partition: crate::catalog::PhysicalPartition,
     /// `ScribeAppendMeta` list threaded forward for 's `file_list` INSERT.
     pub append_metas: Vec<ScribeAppendMeta>,
 }
@@ -374,7 +374,7 @@ impl<'a> ParquetBatchEncoder<'a> {
         Ok(ParquetEncoded {
             artifacts: BoundedParquetArtifactSet::encoded(artifacts)?,
             row_group_stats,
-            partition: self.frozen.seal_key.partition,
+            partition: self.frozen.seal_key.partition.clone(),
             append_metas: self.frozen.metas.clone(),
         })
     }
@@ -1106,7 +1106,7 @@ mod tests {
             Field::new("service", DataType::Utf8, false),
             Field::new(
                 "event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
                 false,
             ),
         ]));
@@ -1115,11 +1115,19 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(services)),
-                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+                Arc::new(TimestampMicrosecondArray::from(timestamps).with_timezone("+00:00")),
             ],
         )
         .unwrap();
+        frozen_from_batch(seal_partition, seal_tenant, batch)
+    }
 
+    /// Freezes one batch of the `bifrost.events` fixture table.
+    fn frozen_from_batch(
+        seal_partition: TimePartition,
+        seal_tenant: DataTenantId,
+        batch: RecordBatch,
+    ) -> FrozenMemtable {
         let seal_key = SealKey::new(
             seal_tenant,
             TableRef::new(BifrostNamespace::Bifrost, "events"),
@@ -1130,7 +1138,7 @@ mod tests {
             seal_id: 0,
             seal_key,
             shard_id: 0,
-            schema: Arc::clone(&schema),
+            schema: batch.schema(),
             batches: vec![batch],
             statistics: Vec::new(),
             metas: vec![],
@@ -1168,12 +1176,15 @@ mod tests {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
                 false,
             )])),
-            vec![Arc::new(TimestampMicrosecondArray::from_iter_values(
-                first_timestamp..first_timestamp + row_count,
-            ))],
+            vec![Arc::new(
+                TimestampMicrosecondArray::from_iter_values(
+                    first_timestamp..first_timestamp + row_count,
+                )
+                .with_timezone("+00:00"),
+            )],
         )
         .expect("whole member batch")
     }
@@ -1186,7 +1197,7 @@ mod tests {
         let day = crate::test_support::day_partition(2026, 7, 14);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         )]));
         let frozen = FrozenMemtable {
@@ -1233,12 +1244,12 @@ mod tests {
     fn incompressible_frozen(tenant: DataTenantId, rows: usize) -> FrozenMemtable {
         let mut fields = vec![Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         )];
         let row_count = i64::try_from(rows).expect("test row count fits i64");
         let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(
-            TimestampMicrosecondArray::from_iter_values(0..row_count),
+            TimestampMicrosecondArray::from_iter_values(0..row_count).with_timezone("+00:00"),
         )];
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
         for column in 0..INCOMPRESSIBLE_PAYLOAD_COLUMNS {
@@ -1756,7 +1767,7 @@ mod tests {
             Field::new("service", DataType::Utf8, false),
             Field::new(
                 "event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
                 false,
             ),
         ]));
@@ -1764,7 +1775,9 @@ mod tests {
             Arc::clone(&schema),
             vec![
                 Arc::new(StringArray::from(vec!["api"; 4])),
-                Arc::new(TimestampMicrosecondArray::from(vec![10, 20, 30, 40])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![10, 20, 30, 40]).with_timezone("+00:00"),
+                ),
             ],
         )
         .expect("stored batch");
@@ -1862,13 +1875,15 @@ mod tests {
         let day = crate::test_support::day_partition(2026, 7, 14);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         )]));
         let stored_batch = |timestamps: Vec<i64>| {
             RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![Arc::new(TimestampMicrosecondArray::from(timestamps))],
+                vec![Arc::new(
+                    TimestampMicrosecondArray::from(timestamps).with_timezone("+00:00"),
+                )],
             )
             .expect("stored batch")
         };
@@ -1935,7 +1950,7 @@ mod tests {
             TenantTableBinding::resolve((frozen.seal_key.tenant, frozen.seal_key.table.clone()))
                 .unwrap();
         let (_scratch, encoded) = encode_for_test(&frozen, &binding, frozen.seal_key.tenant);
-        assert_eq!(encoded.partition, seal_partition);
+        assert_eq!(encoded.partition, seal_partition.into());
     }
 
     #[test]
@@ -1995,7 +2010,27 @@ mod tests {
         let binding =
             TenantTableBinding::resolve((frozen.seal_key.tenant, frozen.seal_key.table.clone()))
                 .unwrap();
-        let (_scratch, encoded) = encode_for_test(&frozen, &binding, frozen.seal_key.tenant);
+        let scratch = tempfile::tempdir().expect("test scratch");
+        let layout = PhysicalLayout::resolve(
+            "vala.bifrost.test",
+            frozen.schema.as_ref(),
+            Some(&crate::tables::hourly_layout(
+                "event_time",
+                vec![crate::tables::sort_asc("event_time")],
+                &["service"],
+            )),
+        )
+        .expect("service is a Bloom-eligible column");
+        let encoded = encode_batch(
+            &frozen,
+            &binding,
+            frozen.seal_key.tenant,
+            scratch.path(),
+            "s3://bucket/table/day=2026-07-14/scribe-test-0",
+            &layout,
+            crate::resources::ScribeResources::for_test(),
+        )
+        .expect("Scribe Parquet encode");
 
         let reader = SerializedFileReader::new(
             std::fs::File::open(&encoded.artifacts[0].scratch_path).unwrap(),
@@ -2011,8 +2046,8 @@ mod tests {
             .find(|column| column.column_descr().name() == "service")
             .unwrap();
         assert!(
-            service_col.bloom_filter_offset().is_none(),
-            "an undeclared column must not be Bloomed"
+            service_col.bloom_filter_offset().is_some(),
+            "a declared Bloom column must have a bloom filter"
         );
 
         let col = rg
@@ -2021,8 +2056,8 @@ mod tests {
             .find(|column| column.column_descr().name() == "event_time")
             .unwrap();
         assert!(
-            col.bloom_filter_offset().is_some(),
-            "a declared Bloom column must have a bloom filter"
+            col.bloom_filter_offset().is_none(),
+            "an undeclared column must not be Bloomed"
         );
 
         // Page index presence is indicated by offset_index_offset being set
@@ -2030,6 +2065,196 @@ mod tests {
             col.offset_index_offset().is_some() || col.column_index_offset().is_some(),
             "page index metadata not found"
         );
+    }
+
+    /// Every resolved Bloom set — empty, partial, complete, and reordered —
+    /// encodes the same rows in the resolved scalar sort, Blooms exactly the
+    /// declared columns, and never rules out a value a file holds, so a read
+    /// that prunes by Bloom and one that falls back to scanning a file without
+    /// Blooms return the same rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a layout does not resolve, encoding fails, the file's
+    /// order differs from the declared keys, its Bloom set differs from the
+    /// declared one, or a Bloom rejects a value the file holds.
+    #[test]
+    fn resolved_sort_and_blooms_preserve_exact_reads() {
+        let tenant = DataTenantId::new_v7();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service", DataType::Utf8, false),
+            Field::new("environment", DataType::Utf8, true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "api", "web", "api", "db", "web", "api",
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("prod"),
+                    None,
+                    Some("dev"),
+                    Some("prod"),
+                    Some("dev"),
+                    None,
+                ])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![600, 500, 400, 300, 200, 100])
+                        .with_timezone("+00:00"),
+                ),
+            ],
+        )
+        .unwrap();
+        let frozen = frozen_from_batch(
+            crate::test_support::day_partition(2026, 7, 14),
+            tenant,
+            batch,
+        );
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone())).unwrap();
+        // Service descending, environment ascending with nulls first, then time.
+        let expected = [
+            ("web", None, 500),
+            ("web", Some("dev"), 200),
+            ("db", Some("prod"), 300),
+            ("api", None, 100),
+            ("api", Some("dev"), 400),
+            ("api", Some("prod"), 600),
+        ];
+
+        for blooms in [
+            &[][..],
+            &["service"][..],
+            &["service", "environment"][..],
+            &["environment", "service"][..],
+        ] {
+            let layout = PhysicalLayout::resolve(
+                "vala.bifrost.test",
+                schema.as_ref(),
+                Some(&crate::tables::hourly_layout(
+                    "event_time",
+                    vec![
+                        crate::tables::sort_desc("service"),
+                        crate::tables::sort_asc_nulls_first("environment"),
+                        crate::tables::sort_asc("event_time"),
+                    ],
+                    blooms,
+                )),
+            )
+            .expect("the layout resolves");
+            let scratch = tempfile::tempdir().expect("test scratch");
+            let encoded = encode_batch(
+                &frozen,
+                &binding,
+                tenant,
+                scratch.path(),
+                "s3://bucket/table/day=2026-07-14/scribe-test-0",
+                &layout,
+                crate::resources::ScribeResources::for_test(),
+            )
+            .expect("Scribe Parquet encode");
+            let path = &encoded.artifacts[0].scratch_path;
+
+            let rows = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap())
+                .unwrap()
+                .build()
+                .unwrap()
+                .map(|batch| batch.unwrap())
+                .flat_map(|batch| {
+                    let column = |name| {
+                        batch
+                            .column_by_name(name)
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .clone()
+                    };
+                    let (service, environment) = (column("service"), column("environment"));
+                    let time = batch
+                        .column_by_name("event_time")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap()
+                        .clone();
+                    (0..batch.num_rows())
+                        .map(|row| {
+                            (
+                                service.value(row).to_owned(),
+                                arrow::array::Array::is_valid(&environment, row)
+                                    .then(|| environment.value(row).to_owned()),
+                                time.value(row),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows,
+                expected
+                    .iter()
+                    .map(|(service, environment, time)| (
+                        (*service).to_owned(),
+                        environment.map(str::to_owned),
+                        *time
+                    ))
+                    .collect::<Vec<_>>(),
+                "blooms {blooms:?}: rows follow the resolved sort"
+            );
+
+            let reader = SerializedFileReader::new_with_options(
+                std::fs::File::open(path).unwrap(),
+                parquet::file::serialized_reader::ReadOptionsBuilder::new()
+                    .with_reader_properties(
+                        parquet::file::properties::ReaderProperties::builder()
+                            .set_read_bloom_filter(true)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .unwrap();
+            let mut bloomed = std::collections::BTreeSet::new();
+            for group in 0..reader.metadata().num_row_groups() {
+                let row_group = reader.get_row_group(group).unwrap();
+                for (index, column) in reader
+                    .metadata()
+                    .row_group(group)
+                    .columns()
+                    .iter()
+                    .enumerate()
+                {
+                    let Some(bloom) = row_group.get_column_bloom_filter(index) else {
+                        continue;
+                    };
+                    let name = column.column_descr().name().to_owned();
+                    for (service, environment, _) in &rows {
+                        let held = if name == "service" {
+                            Some(service)
+                        } else {
+                            environment.as_ref()
+                        };
+                        if let Some(value) = held {
+                            assert!(
+                                bloom.check(&value.as_str()),
+                                "blooms {blooms:?}: {name} never rules out held value {value}"
+                            );
+                        }
+                    }
+                    bloomed.insert(name);
+                }
+            }
+            assert_eq!(
+                bloomed,
+                blooms.iter().map(|name| (*name).to_owned()).collect(),
+                "blooms {blooms:?}: exactly the declared columns carry Blooms"
+            );
+        }
     }
 
     #[test]
@@ -2082,7 +2307,10 @@ mod tests {
             arrow::datatypes::Field::new("service", DataType::Utf8, false),
             arrow::datatypes::Field::new(
                 "event_time",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("+00:00".into()),
+                ),
                 false,
             ),
         ]));
@@ -2090,7 +2318,7 @@ mod tests {
             schema,
             vec![
                 Arc::new(StringArray::from(vec!["c", "b", "a"])),
-                Arc::new(TimestampMicrosecondArray::from(vec![3, 2, 1])),
+                Arc::new(TimestampMicrosecondArray::from(vec![3, 2, 1]).with_timezone("+00:00")),
             ],
         )
         .unwrap();
@@ -2243,15 +2471,18 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new(
                     "event_time",
-                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
                     false,
                 ),
                 wyrd_types::variant::variant_field("v", true),
             ])),
             vec![
-                Arc::new(TimestampMicrosecondArray::from_iter_values(
-                    first_timestamp..first_timestamp + rows,
-                )),
+                Arc::new(
+                    TimestampMicrosecondArray::from_iter_values(
+                        first_timestamp..first_timestamp + rows,
+                    )
+                    .with_timezone("+00:00"),
+                ),
                 variant,
             ],
         )

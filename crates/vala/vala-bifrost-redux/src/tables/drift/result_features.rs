@@ -56,7 +56,13 @@ impl DomainTable for ResultFeaturesTable {
         daily_layout(
             WYRD_INGESTED_AT,
             vec![sort_desc(WYRD_INGESTED_AT)],
-            &["result_id"],
+            &[
+                "run_id",
+                "card_uid",
+                "sub_principal_id",
+                "act_principal_id",
+                "result_id",
+            ],
         )
     }
 }

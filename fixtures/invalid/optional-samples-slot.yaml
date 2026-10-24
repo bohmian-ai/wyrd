@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: optional-latency
   version: 1.0.0
-  space: default
 spec:
   description: A samples slot is always required; required false is refused.
   inputs:

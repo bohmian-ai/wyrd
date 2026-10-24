@@ -4,12 +4,14 @@ use std::sync::Arc;
 
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderName};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::WORKLOAD_UID_HEADER;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 
 use super::AuthenticatedPrincipal;
@@ -21,6 +23,26 @@ pub(crate) const WYRD_ACCESS_TOKEN_HEADER: HeaderName =
 /// Header a stock OTLP exporter sends its Wyrd API key in. Only the OTLP
 /// routes, HTTP and gRPC, accept it.
 pub(crate) const WYRD_API_KEY_HEADER: HeaderName = HeaderName::from_static("x-wyrd-api-key");
+
+/// Header and gRPC metadata key that selects workload context; see
+/// [`WORKLOAD_UID_HEADER`].
+pub(crate) const WYRD_WORKLOAD_UID_HEADER: HeaderName =
+    HeaderName::from_static(WORKLOAD_UID_HEADER);
+
+/// The optional workload-context selector of an HTTP request, parsed by
+/// [`wyrd_spec::auth::workload_uid_selector`] like every other surface's.
+///
+/// # Errors
+/// Returns [`WyrdError::WorkloadUidRefused`] for a repeated or malformed
+/// selector.
+pub(crate) fn workload_uid_header(headers: &HeaderMap) -> Result<Option<CardUid>, WyrdError> {
+    wyrd_spec::auth::workload_uid_selector(
+        headers
+            .get_all(WYRD_WORKLOAD_UID_HEADER)
+            .iter()
+            .map(HeaderValue::as_bytes),
+    )
+}
 
 pub(crate) fn extract_wyrd_access_token(
     headers: &HeaderMap,
@@ -116,7 +138,7 @@ pub(crate) fn auth_not_configured() -> WyrdErrorResponse {
 ///
 /// This is the single verify pipeline shared by the `/v1` default-deny
 /// middlewares and `AuthenticatedPrincipal::from_request_parts` (the extractor fallback for
-/// off-nest routes such as `/auth/issue-key`). Every call site produces identical
+/// off-nest routes). Every call site produces identical
 /// `400`/`401`/`503` error responses because they share this function.
 ///
 /// # Errors

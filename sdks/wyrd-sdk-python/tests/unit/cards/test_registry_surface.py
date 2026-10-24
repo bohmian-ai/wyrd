@@ -18,7 +18,6 @@ def test_agent_cards_are_not_declarable(offline_cards: Cards) -> None:
     card = AgentCard(
         PromptReference.inline(Prompt.openai_chat("gpt-4o", messages="hello")),
         execution_route={"kind": "native"},
-        space="unit",
         name="agent",
         version="0.1.0",
     )
@@ -31,7 +30,6 @@ def test_exact_pin_and_explicit_bump_are_rejected_before_network(offline_cards: 
     """An exact authored pin cannot be combined with a caller bump intent."""
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="hello"),
-        space="unit",
         name="prompt",
         version="1.2.3",
     )
@@ -74,17 +72,14 @@ def test_client_with_an_empty_server_url_raises_config_invalid_details() -> None
     ("method", "kwargs", "field"),
     [
         ("get", {"uid": "not-a-uid"}, "uid"),
-        ("get", {"uid": "not-a-uid", "space": "unit", "name": "card"}, "uid"),
-        ("get", {"space": "Bad Space", "name": "card"}, "space"),
-        ("get", {"space": "unit", "name": "Bad Name"}, "name"),
-        ("get", {"space": "unit", "name": "card", "version": "not-a-version"}, "version"),
-        ("get", {}, "space"),
-        ("get", {"space": "unit"}, "name"),
-        ("list", {"space": "Bad Space"}, "space"),
+        ("get", {"uid": "not-a-uid", "name": "card"}, "uid"),
+        ("get", {"name": "Bad Name"}, "name"),
+        ("get", {"name": "card", "version": "not-a-version"}, "version"),
+        ("get", {}, "name"),
         ("list", {"name": "Bad Name"}, "name"),
-        ("resolve_latest", {"space": "unit", "name": "Bad Name"}, "name"),
+        ("resolve_latest", {"name": "Bad Name"}, "name"),
         ("delete", {"uid": "not-a-uid"}, "uid"),
-        ("delete", {"space": "unit"}, "name"),
+        ("delete", {}, "name"),
     ],
 )
 def test_registry_selector_errors_use_request_validation(
@@ -101,3 +96,30 @@ def test_registry_selector_errors_use_request_validation(
         "Check the submitted Wyrd request fields against the published schema and retry."
     )
     assert captured.value.details == {"field": field}
+
+
+@pytest.mark.parametrize("kind", ["data", "model", "prompt"])
+@pytest.mark.parametrize(
+    ("method", "kwargs"),
+    [
+        ("get", {"space": "unit", "name": "card"}),
+        ("list", {"space": "unit"}),
+        ("resolve_latest", {"space": "unit", "name": "card"}),
+        ("delete", {"space": "unit", "name": "card", "version": "1.0.0"}),
+    ],
+)
+def test_registry_selectors_refuse_a_card_space(
+    offline_cards: Cards, kind: str, method: str, kwargs: dict[str, str]
+) -> None:
+    """Card identity is flat, so a ``space`` selector is an unknown argument."""
+    registry = getattr(offline_cards, kind)
+    with pytest.raises(TypeError, match="space"):
+        getattr(registry, method)(**kwargs)
+
+
+def test_unscoped_registry_refuses_a_card_space(offline_cards: Cards) -> None:
+    """The unscoped list and resolve_latest take no ``space`` either."""
+    with pytest.raises(TypeError, match="space"):
+        offline_cards.list(space="unit")  # ty: ignore[unknown-argument]
+    with pytest.raises(TypeError, match="space"):
+        offline_cards.resolve_latest("Prompt", space="unit", name="card")  # ty: ignore[unknown-argument]

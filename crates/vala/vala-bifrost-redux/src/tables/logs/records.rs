@@ -100,7 +100,14 @@ impl DomainTable for RecordsTable {
                 sort_desc("time_unix_nano"),
                 sort_asc_nulls_first("event_name"),
             ],
-            &["severity_number", "trace_id"],
+            &[
+                "run_id",
+                "card_uid",
+                "sub_principal_id",
+                "act_principal_id",
+                "severity_number",
+                "trace_id",
+            ],
         )
     }
 }

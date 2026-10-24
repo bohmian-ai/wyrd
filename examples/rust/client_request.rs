@@ -39,7 +39,6 @@ async fn main() -> anyhow::Result<()> {
     let listed = cards
         .list(ListCardsRequest {
             kind: None,
-            space: None,
             name: None,
             version_range: None,
             status: None,

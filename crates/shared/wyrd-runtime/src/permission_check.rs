@@ -83,14 +83,13 @@ mod tests {
     use crate::principal::{Principal, PrincipalId, PrincipalKind, RoleRef};
 
     fn principal_with_permissions(permissions: impl IntoIterator<Item = Permission>) -> Principal {
-        Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::User,
-            tenant_id: wyrd_spec::DataTenantId::new_v7(),
-            roles: vec![RoleRef::new("editor").expect("static role is valid")],
-            effective_permissions: PermissionSet::from_iter(permissions),
-            credential_id: None,
-        }
+        Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            wyrd_spec::DataTenantId::new_v7(),
+            vec![RoleRef::new("editor").expect("static role is valid")],
+            PermissionSet::from_iter(permissions),
+        )
     }
 
     #[test]

@@ -16,13 +16,12 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind, PrincipalRef};
 use wyrd_runtime::{AcceptedAuthority, DelegationStep, PermissionSet};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::Attribution;
+use wyrd_spec::auth::{Attribution, WorkloadFamily, WorkloadKind};
 use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS, OperatorFailureContext};
 use wyrd_spec::card::trigger::TriggerDuration;
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, SourceText};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
-use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
@@ -31,10 +30,9 @@ use wyrd_spec::verification::{
     VerificationExecutionStatus, VerificationVerdict, VerifierReadiness,
 };
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::provision_system_principal;
+use wyrd_sql::queries::auth::{insert_service_account, provision_system_principal};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
-    upsert_service_account_from_card,
 };
 use wyrd_sql::queries::operator_dispatches::OperatorDispatchQueue;
 use wyrd_sql::queries::verification::{
@@ -170,20 +168,21 @@ fn service_card(name: &str) -> Card {
     serde_json::from_value(json!({
         "apiVersion": "wyrd/v1",
         "kind": "Service",
-        "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+        "metadata": { "name": name, "version": "1.0.0" },
         "spec": {},
         "relationships": { "outbound": [], "inbound": [] }
     }))
     .expect("service fixture must deserialize")
 }
 
-/// Register one active Service Card and its principal; return (card UID, principal id).
+/// Register one active Service Card and its family's stable runtime account;
+/// return (card UID, account id).
 ///
 /// Activation is forced with a direct update because the full lifecycle
 /// requires a verified blob that this persistence-level test does not need.
 ///
 /// # Panics
-/// Panics when the Card, principal, or activation write fails.
+/// Panics when the Card, account, or activation write fails.
 async fn declare_service(
     conn: &mut TenantConn<'_>,
     actor: &Principal,
@@ -191,14 +190,22 @@ async fn declare_service(
 ) -> (CardUid, PrincipalId) {
     let card = service_card(name);
     let card_uid = insert_card(conn, actor, &card).await;
-    let principal = upsert_service_account_from_card(
+    let principal = PrincipalId::new(Uuid::now_v7());
+    let family = WorkloadFamily {
+        kind: WorkloadKind::Service,
+        name: card.metadata.name.clone(),
+    };
+    insert_service_account(
         conn,
-        &card_uid,
-        &card,
-        wyrd_spec::auth::Attribution::direct(actor.id),
+        principal.as_uuid(),
+        "service",
+        Some(&family),
+        name,
+        None,
+        Attribution::direct(actor.id),
     )
     .await
-    .expect("principal projects");
+    .expect("account inserts");
     sqlx::query("UPDATE wyrd.cards SET status = 'active' WHERE card_uid = $1")
         .bind(card_uid.as_uuid())
         .execute(&mut **conn.transaction())
@@ -344,17 +351,17 @@ async fn stored_backoff(conn: &mut TenantConn<'_>, execution: ExecutionId) -> Du
     attempt_at - updated_at
 }
 
-/// Move `principal`'s recorded machine activity `ago` into the past, so an
+/// Move `principal`'s recorded root activity `ago` into the past, so an
 /// activity window can lapse without a process clock.
 ///
 /// # Panics
 /// Panics when the update fails.
 async fn age_activity(conn: &mut TenantConn<'_>, principal: PrincipalId, ago: Duration) {
     sqlx::query(
-        "UPDATE wyrd.auth_service_accounts
+        "UPDATE wyrd.workload_activity
             SET last_authenticated_at =
                     statement_timestamp() - ($2::bigint * INTERVAL '1 millisecond')
-          WHERE id = $1",
+          WHERE principal_id = $1",
     )
     .bind(principal.as_uuid())
     .bind(ago.num_milliseconds())
@@ -403,17 +410,14 @@ fn authority(principal: &Principal) -> AcceptedAuthority {
     AcceptedAuthority::new(principal, &[])
 }
 
-/// The accepted authority of the binding owner's Card-bound `principal`.
+/// The accepted authority of the binding owner's family account `principal`.
 ///
-/// Persistence does not interpret the authority, so a Card-free Service
-/// principal with no permissions stands in for the owner.
+/// Persistence does not interpret the authority, so a Service account with no
+/// permissions stands in for the owner.
 fn owner_authority(tenant: DataTenantId, principal: PrincipalId) -> AcceptedAuthority {
     authority(&Principal::new(
         principal,
-        PrincipalKind::Service {
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
-        },
+        PrincipalKind::Service,
         tenant,
         Vec::new(),
         PermissionSet::new(),
@@ -480,7 +484,7 @@ async fn schedule_next_due(
 ) -> Option<ScheduleTick> {
     let due = queue.claim_due(conn).await.expect("due binding claims")?;
     let authority = match due.owner() {
-        Some(owner) => Some(background(conn, owner).await),
+        Some((owner, _root)) => Some(background(conn, owner).await),
         None => None,
     };
     Some(
@@ -505,6 +509,7 @@ fn request(verifier: &CardUid, subject: &CardUid) -> VerificationRequest {
             },
         )]),
         execution_route_overrides: BTreeMap::new(),
+        deployment_environment: None,
     }
 }
 
@@ -1138,7 +1143,7 @@ async fn concurrent_schedulers_create_one_run_per_occurrence() {
     let verifier = register_verifier(&mut setup, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut setup, &owner, &verifier, Vec::new()).await;
     let armed_after = database_now(&mut setup).await;
-    record_machine_authentication(&mut setup, principal)
+    record_machine_authentication(&mut setup, principal, &owner)
         .await
         .expect("owner activates");
     assert_next_daily_boundary(cursor(&mut setup, binding).await, armed_after);
@@ -1235,7 +1240,7 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
 
     let (stale_owner, stale) = declare_service(&mut conn, &actor, "stale").await;
     let inactive = bind(&mut conn, &stale_owner, &custom, Vec::new()).await;
-    record_machine_authentication(&mut conn, stale)
+    record_machine_authentication(&mut conn, stale, &stale_owner)
         .await
         .expect("stale activation records");
     age_activity(&mut conn, stale, Duration::days(2)).await;
@@ -1244,7 +1249,7 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
     let (live_owner, live) = declare_service(&mut conn, &actor, "live").await;
     let unready = bind(&mut conn, &live_owner, &psi, Vec::new()).await;
     let missed = bind(&mut conn, &live_owner, &custom, Vec::new()).await;
-    record_machine_authentication(&mut conn, live)
+    record_machine_authentication(&mut conn, live, &live_owner)
         .await
         .expect("live activation records");
     set_cursor(&mut conn, unready, Some(due)).await;
@@ -1907,7 +1912,7 @@ async fn queue_state_is_tenant_isolated() {
     let (owner, principal) = declare_service(&mut conn, &actor, "svc").await;
     let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
     let binding = bind(&mut conn, &owner, &verifier, vec![FrozenTarget::Uid(uid())]).await;
-    record_machine_authentication(&mut conn, principal)
+    record_machine_authentication(&mut conn, principal, &owner)
         .await
         .expect("owner activates");
     let failed = scheduled(&queue, &mut conn, binding).await;
@@ -2054,7 +2059,7 @@ async fn binding_status_reports_activity_readiness_and_latest_run() {
     assert_eq!(dormant.last_execution_id, None);
 
     let activated_after = database_now(&mut conn).await;
-    record_machine_authentication(&mut conn, principal)
+    record_machine_authentication(&mut conn, principal, &owner)
         .await
         .expect("owner activates");
     let mut latest = None;
@@ -2228,7 +2233,7 @@ async fn database_clock_owns_verifier_queue_deadlines() {
         "a dispatch created by settlement is stamped by the database clock"
     );
 
-    record_machine_authentication(&mut conn, principal)
+    record_machine_authentication(&mut conn, principal, &owner)
         .await
         .expect("owner activates");
     set_cursor(
@@ -2328,8 +2333,8 @@ async fn failed_settlement_freezes_the_bounded_failure_context() {
         assert_eq!(context.dispatch_id.as_uuid(), dispatch_id);
         assert_eq!(context.execution_id, execution);
         assert_eq!(context.verdict, VerificationVerdict::Failed);
-        assert_eq!(context.verifier_ref, "default/drift@1.0.0");
-        assert_eq!(context.subject_ref, "default/svc@1.0.0");
+        assert_eq!(context.verifier_ref, "Verifier/drift@1.0.0");
+        assert_eq!(context.subject_ref, "Service/svc@1.0.0");
         assert_eq!(context.summary.chars().count(), MAX_SUMMARY_CHARS);
         assert_eq!(context.drift, Some(DRIFT_COUNTS));
     }
@@ -2685,7 +2690,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     .await
     .expect("bindings project");
     let (binding, year, day, hours) = (bindings[0], bindings[1], bindings[2], bindings[3]);
-    record_machine_authentication(&mut conn, principal)
+    record_machine_authentication(&mut conn, principal, &owner)
         .await
         .expect("owner activates");
     assert_eq!(

@@ -623,7 +623,7 @@ async fn production_valid_target_serves_token_exchange_without_preview() {
         .await
         .expect("subject key exchanges");
     let actor_jwt = server
-        .exchange_api_key(actor.api_key().expect("actor carries a key"))
+        .exchange_rooted(&actor)
         .await
         .expect("actor key exchanges");
 

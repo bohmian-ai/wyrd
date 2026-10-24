@@ -3,7 +3,6 @@ kind: Prompt
 metadata:
   name: reviewer-prompt
   version: 1.0.0
-  space: default
 spec:
   provider: openai
   model: gpt-test

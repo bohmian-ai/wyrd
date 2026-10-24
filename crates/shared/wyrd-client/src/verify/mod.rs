@@ -281,6 +281,9 @@ pub(crate) struct Target<'a> {
     pub(crate) run_id: RunId,
     /// The caller group the execution belongs to, when grouped.
     pub(crate) group_id: Option<GroupId>,
+    /// The state's configured deployment environment, sent as the
+    /// execution's correlation tag; `None` when unknown.
+    pub(crate) deployment_environment: Option<String>,
 }
 
 /// The evidence one call carries, projected from the caller's values.
@@ -461,6 +464,7 @@ impl Target<'_> {
             group_id: self.group_id.clone(),
             inputs,
             execution_route_overrides: BTreeMap::new(),
+            deployment_environment: self.deployment_environment.clone(),
         }
     }
 }

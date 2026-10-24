@@ -24,10 +24,10 @@ mod pg_tests {
     use wyrd_testing::bifrost::seed_query_fixture;
 
     /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
-    /// caller that also holds tenant principal administration, `verifier:run`,
+    /// caller that also holds tenant administration (`*`), `verifier:run`,
     /// `operators:write`, `gateway:write`, and `gateway:delete`: every read
     /// tool, then that caller's write tools.
-    const ADVERTISED_TOOLS: [&str; 36] = [
+    const ADVERTISED_TOOLS: [&str; 37] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
@@ -47,6 +47,7 @@ mod pg_tests {
         "gateway.get_provider_deployment",
         "wyrd.guide",
         "principals.revoke_credential",
+        "principals.set_workload_restriction",
         "verification.evidence",
         "verification.execute",
         "verification.enqueue",
@@ -479,8 +480,12 @@ mod pg_tests {
         );
         let layout = &described["physical_layout"];
         assert!(
-            layout["partition_granularity"].is_string(),
-            "the event-time partition granularity is described: {layout}"
+            layout["partition_by"]
+                .as_array()
+                .is_some_and(|fields| fields
+                    .iter()
+                    .any(|field| matches!(field["transform"].as_str(), Some("hour" | "day")))),
+            "the event-time partition transform is described: {layout}"
         );
         assert!(
             layout["sort_keys"].as_array().is_some_and(

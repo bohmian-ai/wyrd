@@ -81,11 +81,7 @@ pub struct BundleArtifactManifest {
 /// Wire-compatibility fixtures for Card bundle projections.
 #[cfg(test)]
 mod tests {
-    use crate::{
-        envelope::CardKind,
-        ids::{CardName, SpaceName},
-        reference::CardRef,
-    };
+    use crate::{envelope::CardKind, ids::CardName, reference::CardRef};
     use wyrd_semver::VersionBlock;
 
     use super::{BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode};
@@ -101,7 +97,6 @@ mod tests {
             kind: CardKind::Service,
             name: CardName::new("service").expect("static Card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static Card version is valid"),
-            space: Some(SpaceName::new("default").expect("static Card space is valid")),
             uid: None,
         }
     }
@@ -136,7 +131,7 @@ mod tests {
         let bytes = serde_json::to_vec(&manifest).expect("bundle manifest serializes");
         assert_eq!(
             bytes,
-            br#"{"apiVersion":"wyrd/bundle/v1","mode":"complete","root":{"kind":"Service","name":"service","version":"1.0.0","space":"default"},"cards":[{"aliases":["root"],"card_ref":{"kind":"Service","name":"service","version":"1.0.0","space":"default"},"card_path":"cards/service/card.yaml","relationships_path":"cards/service/relationships.yaml","artifact_inventory_path":"cards/service/artifacts.yaml","artifacts":[{"relative_path":"model.joblib","sha256":"YWJj","size_bytes":3,"content_type":"application/octet-stream","local_path":"cards/service/artifacts/model.joblib"}]}],"card_count":1,"artifact_count":1,"downloaded_artifact_count":1}"#
+            br#"{"apiVersion":"wyrd/bundle/v1","mode":"complete","root":{"kind":"Service","name":"service","version":"1.0.0"},"cards":[{"aliases":["root"],"card_ref":{"kind":"Service","name":"service","version":"1.0.0"},"card_path":"cards/service/card.yaml","relationships_path":"cards/service/relationships.yaml","artifact_inventory_path":"cards/service/artifacts.yaml","artifacts":[{"relative_path":"model.joblib","sha256":"YWJj","size_bytes":3,"content_type":"application/octet-stream","local_path":"cards/service/artifacts/model.joblib"}]}],"card_count":1,"artifact_count":1,"downloaded_artifact_count":1}"#
         );
         let round_trip: BundleManifest =
             serde_json::from_slice(&bytes).expect("bundle manifest deserializes");

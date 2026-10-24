@@ -136,6 +136,7 @@ impl DriftChecks {
                     report.verdict
                 ),
                 citations: Vec::new(),
+                data: None,
             },
             actual: None,
             detail: Some(RequirementDetail::Drift(wire)),
@@ -150,6 +151,7 @@ impl DriftChecks {
                 outcome: VerificationVerdict::Inconclusive,
                 reason,
                 citations: Vec::new(),
+                data: None,
             },
             actual: None,
             detail: None,

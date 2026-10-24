@@ -8,7 +8,7 @@ from wyrd.data import DataCard
 def test_sql_data_card_file_loads_its_identity(fixtures_dir: Path) -> None:
     card = DataCard.from_path(fixtures_dir / "authoring" / "data" / "churn-queries.yaml")
 
-    assert (card.space, card.name, card.version) == ("prod", "churn-queries", "1.0.0")
+    assert (card.name, card.version) == ("churn-queries", "1.0.0")
 
 
 def test_data_card_file_keeps_its_splits_and_target_columns(fixtures_dir: Path) -> None:

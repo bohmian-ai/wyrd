@@ -73,7 +73,7 @@ pub struct ServiceTable {
     pub schema: serde_json::Value,
 }
 
-/// Server-side runtime declaration; tenancy is inherited from `Card.metadata.space`.
+/// Server-side runtime declaration; tenancy is the registering tenant.
 // Status: Locked (2026-05-18)
 // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-4
 // source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-5

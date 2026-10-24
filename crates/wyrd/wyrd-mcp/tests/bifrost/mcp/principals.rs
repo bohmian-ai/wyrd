@@ -5,11 +5,13 @@
 //! credential and once with an administrative one — so what it observes about
 //! the catalog and the refusal is exactly what an agent observes.
 
-use crate::connectivity::{McpJourneyError, discover, principals, problem, structured, transport};
+use crate::connectivity::{
+    McpJourneyError, discover, principals, problem, refusal, structured, transport,
+};
 
 /// The Postgres-backed half of the credential journey.
 mod pg_tests {
-    use super::{McpJourneyError, discover, principals, problem, structured, transport};
+    use super::{McpJourneyError, discover, principals, problem, refusal, structured, transport};
 
     use jsonschema::Validator;
     use rmcp::ClientServiceExt as _;
@@ -26,13 +28,18 @@ mod pg_tests {
     /// The write tool only an administrative agent may use.
     const REVOKE_CREDENTIAL: &str = "principals.revoke_credential";
 
-    /// The property names one advertised schema declares required.
+    /// The write tool only a tenant administrator may use: binding a Service
+    /// account to one workload family.
+    const SET_WORKLOAD_RESTRICTION: &str = "principals.set_workload_restriction";
+
+    /// The property names one advertised schema declares required, sorted,
+    /// since JSON Schema gives `required` no order.
     ///
     /// Reading the catalog's own schema rather than restating it is the point:
     /// the assertion fails if the published contract stops matching the shared
     /// DTO the server parses and returns.
     fn required(schema: &JsonMap<String, JsonValue>) -> Vec<&str> {
-        schema
+        let mut required: Vec<&str> = schema
             .get("required")
             .and_then(serde_json::Value::as_array)
             .map(|values| {
@@ -41,7 +48,9 @@ mod pg_tests {
                     .filter_map(serde_json::Value::as_str)
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        required.sort_unstable();
+        required
     }
 
     /// Compile one advertised schema the way a strict agent-side validator
@@ -469,6 +478,145 @@ mod pg_tests {
             "a replayed revocation reports the credential is already gone: {rendered}"
         );
 
+        admin_client.cancel().await?;
+        Ok(())
+    }
+
+    /// One tool call with object arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `arguments` is not a JSON object.
+    fn call(
+        name: &'static str,
+        arguments: JsonValue,
+    ) -> Result<CallToolRequestParams, McpJourneyError> {
+        Ok(CallToolRequestParams::new(name).with_arguments(
+            arguments
+                .as_object()
+                .ok_or("arguments are an object")?
+                .clone(),
+        ))
+    }
+
+    /// An agent binds a stable Service account to one workload family only as a
+    /// tenant administrator; a credential administrator neither sees nor can
+    /// use the tool, and every caller keeps the read tools.
+    ///
+    /// Family association changes which workloads an account may speak for, so
+    /// it sits above `service_accounts:write`. The journey proves the catalog
+    /// and dispatch agree on that, then drives the administrator through the
+    /// contract an agent plans against: a family is set and read back, an
+    /// unchanged replay is idempotent, a second account claiming the same
+    /// family is a conflict, and unrestricted releases it.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, role seeding, MCP transport, or
+    /// tool-call failures.
+    ///
+    /// # Panics
+    /// Panics when the catalog offers the tool to the credential administrator
+    /// or withholds it or a read tool from anyone it should reach, when the
+    /// credential administrator's call is not a permission refusal, or when a
+    /// set, replay, conflict, or release contradicts the contract.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn stable_account_context_mcp_journey() -> Result<(), McpJourneyError> {
+        let server = WyrdTestServer::start_bound().await?;
+        server
+            .seed_role(
+                "credential_admin",
+                &["service_accounts:write".parse::<wyrd_runtime::Permission>()?],
+            )
+            .await?;
+        let admin = server
+            .bootstrap_service("mcp-family-admin", &["admin"])
+            .await?;
+        let credential_admin = server
+            .bootstrap_service("mcp-family-credentials", &["credential_admin"])
+            .await?;
+        let first = server.bootstrap_service("mcp-family-first", &[]).await?;
+        let second = server.bootstrap_service("mcp-family-second", &[]).await?;
+        let key = |bootstrap: &wyrd_testing::Bootstrap| {
+            bootstrap
+                .api_key()
+                .map(|key| ResolvedCredential::ApiKey(key.expose_secret().to_owned().into()))
+                .ok_or("a bootstrapped service carries a machine key")
+        };
+        let admin_client =
+            ().serve_with_lifecycle(transport(&server, key(&admin)?, None)?, discover())
+                .await?;
+        let credential_client = ()
+            .serve_with_lifecycle(
+                transport(&server, key(&credential_admin)?, None)?,
+                discover(),
+            )
+            .await?;
+
+        for (caller, client, offered) in [
+            ("tenant admin", &admin_client, true),
+            ("credential admin", &credential_client, false),
+        ] {
+            let tools = client.list_all_tools().await?;
+            let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+            for read in [LIST_CREDENTIALS, "cards.get", "wyrd.guide"] {
+                assert!(names.contains(&read), "{caller} keeps {read}: {names:?}");
+            }
+            assert_eq!(
+                names.contains(&SET_WORKLOAD_RESTRICTION),
+                offered,
+                "{caller} is offered the family tool only with tenant administration: {names:?}"
+            );
+        }
+
+        let family = serde_json::json!({ "mode": "family", "kind": "Service", "name": "checkout" });
+        let set = |principal: &wyrd_testing::Bootstrap, restriction: &JsonValue| {
+            call(
+                SET_WORKLOAD_RESTRICTION,
+                serde_json::json!({
+                    "principal_id": principal.id().to_string(),
+                    "workload_restriction": restriction,
+                }),
+            )
+        };
+
+        // Naming the hidden tool is refused at dispatch, and nothing changes.
+        let refused = refusal(credential_client.call_tool(set(&first, &family)?).await)?;
+        assert!(
+            refused.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "a credential administrator is refused for permission: {refused}"
+        );
+
+        // Set, then replay unchanged: both return the same restricted summary.
+        for attempt in ["set", "replay"] {
+            let summary = structured(admin_client.call_tool(set(&first, &family)?).await?)?;
+            assert_eq!(
+                summary["principal_id"],
+                serde_json::json!(first.id().to_string()),
+                "{attempt}: {summary}"
+            );
+            assert_eq!(
+                summary["workload_restriction"], family,
+                "{attempt}: {summary}"
+            );
+        }
+
+        // A second live account cannot claim the family the first holds.
+        let conflict = refusal(admin_client.call_tool(set(&second, &family)?).await)?;
+        assert!(
+            conflict.contains("WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT"),
+            "a second account for one family is a conflict: {conflict}"
+        );
+
+        // Releasing the first account frees the family for the second.
+        let unrestricted = serde_json::json!({ "mode": "unrestricted" });
+        let released = structured(admin_client.call_tool(set(&first, &unrestricted)?).await?)?;
+        assert_eq!(released["workload_restriction"], unrestricted, "{released}");
+        let claimed = structured(admin_client.call_tool(set(&second, &family)?).await?)?;
+        assert_eq!(claimed["workload_restriction"], family, "{claimed}");
+
+        credential_client.cancel().await?;
         admin_client.cancel().await?;
         Ok(())
     }

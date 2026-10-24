@@ -11,7 +11,6 @@ use crate::error::WyrdCliError;
 pub enum PrincipalKindCli {
     User,
     Service,
-    Agent,
 }
 
 impl From<PrincipalKindCli> for PrincipalKindTag {
@@ -19,7 +18,6 @@ impl From<PrincipalKindCli> for PrincipalKindTag {
         match value {
             PrincipalKindCli::User => Self::User,
             PrincipalKindCli::Service => Self::Service,
-            PrincipalKindCli::Agent => Self::Agent,
         }
     }
 }
@@ -104,9 +102,13 @@ mod tests {
         assert!(parsed.is_err(), "revoke must require --kind");
     }
 
+    /// `revoke` parses with each revocable `--kind`: `user` and `service`.
+    ///
+    /// # Panics
+    /// Panics when either kind fails to parse.
     #[test]
     fn revoke_parses_all_kinds() {
-        for kind in ["user", "service", "agent"] {
+        for kind in ["user", "service"] {
             let parsed = Cli::try_parse_from([
                 "wyrd",
                 "p-id-123",

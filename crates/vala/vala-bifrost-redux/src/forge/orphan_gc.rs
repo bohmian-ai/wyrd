@@ -28,7 +28,6 @@ use wyrd_spec::vala::api::{
 
 use vala_sql::row_types::forge_tasks::{ForgeCleanupCandidate, ForgeTaskStrategy};
 
-use crate::catalog::layout::{FORGE_DATA_MARKER, FORGE_WRITER_RECIPE};
 use crate::catalog::{BIFROST_CATALOG_NAME, TenantTableBinding};
 
 use super::Forge;
@@ -263,7 +262,7 @@ enum MaintenanceScope {
 impl MaintenanceScope {
     /// Reports whether this scope may consider the normalized object key.
     ///
-    /// Attempt-generation scope defers entirely to the writer's own recipe
+    /// Attempt-generation scope defers entirely to the writer's own output
     /// grammar, so cleanup can never recognize a shape the writer does not
     /// emit. Scribe pod/ULID names and catalog-owned metadata deliberately fail
     /// that parse and remain reclaimable only from committed expiry evidence.
@@ -277,17 +276,14 @@ impl MaintenanceScope {
     }
 }
 
-/// Returns this binding's current Forge recipe root as a normalized object key.
+/// Returns this binding's Forge root, above every version, as a normalized
+/// object key.
 ///
-/// The catalog's `forge_data_location` is derived from the table location; the
-/// binding's `object_prefix` is that same table's object-key form, so appending
-/// the fixed marker and recipe here yields the identical root without needing a
-/// loaded table.
+/// The catalog's `forge_data_root` is derived from the table location; the
+/// binding's `object_prefix` is that same table's object-key form, so this
+/// yields the identical root without needing a loaded table.
 pub(super) fn forge_data_prefix(binding: &TenantTableBinding) -> String {
-    format!(
-        "{}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}",
-        binding.object_prefix.trim_end_matches('/')
-    )
+    crate::catalog::layout::forge_data_root(&binding.object_prefix)
 }
 
 /// Validated identity of the one prepared GC batch allowed to finish itself.
@@ -1286,6 +1282,7 @@ impl Forge {
                 ),
             });
         }
+        let retained = self.retained_definitions(&table).await?;
         let mut live = ProtectedLiveSet::default();
         let table_location = table.metadata().location().to_owned();
         let mut add = |path: &str| self.add_path(&mut live, binding, &table_location, path);
@@ -1294,6 +1291,9 @@ impl Forge {
             .map_err(ForgeError::Catalog)?)?;
         for metadata_log in table.metadata().metadata_log() {
             add(&metadata_log.metadata_file)?;
+        }
+        for definition in retained {
+            add(&definition)?;
         }
         for snapshot in table.metadata().snapshots() {
             add(snapshot.manifest_list())?;
@@ -1383,7 +1383,7 @@ impl Forge {
             page_cap,
             "enumerating bounded orphan-GC candidates"
         );
-        // The scan is bounded to the Forge recipe root rather than the whole
+        // The scan is bounded to the Forge root rather than the whole
         // table prefix. Nothing outside that root is addressable by orphan
         // collection anyway, and a task-owned cursor must name a key strictly
         // beneath the prefix its plan fixes — which is exactly this root.
@@ -1941,6 +1941,7 @@ impl Forge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::layout::FORGE_DATA_MARKER;
     use crate::forge::protection_roots::OrphanProtectionRoots;
 
     /// Builds the listing metadata of one object last modified at `modified`.
@@ -2068,7 +2069,7 @@ mod tests {
         .expect("binding");
         let forge_path = |attempt: Uuid| {
             format!(
-                "{}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}/{attempt}-00000-{}.parquet",
+                "{}{FORGE_DATA_MARKER}1/{attempt}-00000-{}.parquet",
                 binding.object_prefix,
                 Uuid::now_v7()
             )
@@ -2290,7 +2291,7 @@ mod tests {
             .expect("binding");
             let output = |prefix: &str| {
                 format!(
-                    "{prefix}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}/{}-00000-{}.parquet",
+                    "{prefix}{FORGE_DATA_MARKER}1/{}-00000-{}.parquet",
                     Uuid::now_v7(),
                     Uuid::now_v7()
                 )
@@ -2390,7 +2391,7 @@ mod tests {
                 loss: RootLoss::SubjectBecomesEligible,
             },
             RootCase {
-                // Scribe pod names are outside the recipe grammar, so the
+                // Scribe pod names are outside the output grammar, so the
                 // observable loss here is union membership, not a verdict flip.
                 authority: "committed-but-unpromoted file_list objects",
                 remove: |roots| roots.hot_unpromoted.clear(),
@@ -2506,7 +2507,7 @@ mod tests {
         );
     }
 
-    /// Requires only the writer's own recipe grammar to be addressable at all.
+    /// Requires only the writer's own output grammar to be addressable at all.
     fn assert_only_canonical_recipe_paths_are_addressable(paths: &OrphanMatrixPaths) {
         let protection = orphan_matrix_protection(paths.roots());
         let aged = orphan_matrix_aged();
@@ -2514,7 +2515,7 @@ mod tests {
         for (lookalike, why) in [
             (
                 format!(
-                    "{prefix}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}/{}-00000.parquet",
+                    "{prefix}{FORGE_DATA_MARKER}1/{}-00000.parquet",
                     Uuid::now_v7()
                 ),
                 "an output with no per-writer identity is not a recipe output",
@@ -2525,7 +2526,7 @@ mod tests {
                     Uuid::now_v7(),
                     Uuid::now_v7()
                 ),
-                "the retired recipe root is outside this collector's reach",
+                "a non-canonical version segment is outside this collector's reach",
             ),
             (
                 format!("{prefix}/data/pod-a-01JABC.parquet"),

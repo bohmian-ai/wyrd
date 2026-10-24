@@ -91,14 +91,13 @@ fn batch_with_value(value: i64) -> RecordBatch {
 
 /// Build the tenant principal used by durable append cases.
 fn principal(tenant: DataTenantId) -> Principal {
-    Principal {
-        id: PrincipalId::new(Uuid::now_v7()),
-        kind: PrincipalKind::User,
-        tenant_id: tenant,
-        roles: Vec::new(),
-        effective_permissions: PermissionSet::new(),
-        credential_id: None,
-    }
+    Principal::new(
+        PrincipalId::new(Uuid::now_v7()),
+        PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        PermissionSet::new(),
+    )
 }
 
 /// Construct a Scribe and WAL sharing one explicit owner root.
@@ -156,6 +155,7 @@ async fn ingest_as(
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
                 rows.schema().as_ref(),
             )),
+            table_version: None,
             request_id,
             batch_id,
             measured_wire_bytes: 0,
@@ -192,6 +192,7 @@ async fn ingest_value(
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
                 rows.schema().as_ref(),
             )),
+            table_version: None,
             request_id,
             batch_id,
             measured_wire_bytes: 0,
@@ -228,6 +229,7 @@ async fn ingest_measured(
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
                 rows.schema().as_ref(),
             )),
+            table_version: None,
             request_id,
             batch_id,
             measured_wire_bytes,
@@ -653,7 +655,7 @@ fn multi_segment_replay_preserves_order_and_deduplicates() {
     }
 
     let replayed = replay_wal_directory(wal_root.path()).expect("replay");
-    let state = &replayed[&seal_key.as_path_components()];
+    let state = &replayed[&seal_key.canonical_key()];
     assert_eq!(state.data_records.len(), 10);
     assert!(
         state

@@ -4,7 +4,6 @@ kind: Prompt
 metadata:
   name: frame-prompt
   version: 1.0.0
-  space: default
 spec:
   provider: openai
   model: gpt-4o

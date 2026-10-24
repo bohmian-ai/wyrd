@@ -17,9 +17,9 @@
 //! `401` for `invalid_client`, `500` for `server_error`, or `503` for
 //! `temporarily_unavailable`. They are the one exception to the `WyrdError`
 //! problem-json surface. Only a
-//! refusal converted from a `WyrdError` is logged under its Wyrd code; the
-//! extractors' own malformed-form and client-identification refusals carry
-//! none.
+//! refusal converted from a `WyrdError` is logged under, and carries in its
+//! `code` extension member, its Wyrd code; the extractors' own malformed-form
+//! and client-identification refusals carry none.
 
 use axum::body::Bytes;
 use axum::extract::{FromRequest, Request};
@@ -63,6 +63,9 @@ pub struct OAuthError(
     /// The registered OAuth error code the response body carries; it also
     /// selects the HTTP status ([`Self::status`]).
     pub OAuthErrorCode,
+    /// The Wyrd catalog code of a refusal converted from a `WyrdError`,
+    /// carried as the body's `code` extension member.
+    pub Option<&'static str>,
 );
 
 impl OAuthError {
@@ -86,14 +89,15 @@ impl OAuthError {
     #[must_use]
     pub fn request(error: WyrdError) -> Self {
         match Self::from(error) {
-            Self(OAuthErrorCode::InvalidGrant) => Self(OAuthErrorCode::InvalidRequest),
+            Self(OAuthErrorCode::InvalidGrant, code) => Self(OAuthErrorCode::InvalidRequest, code),
             other => other,
         }
     }
 }
 
 impl From<WyrdError> for OAuthError {
-    /// Map a catalog refusal onto its OAuth error code and log its Wyrd code.
+    /// Map a catalog refusal onto its OAuth error code, keeping and logging
+    /// its Wyrd code.
     ///
     /// A device-code refusal carries its RFC 8628 §3.5 code in
     /// `details.error`; an unsupported grant is `unsupported_grant_type`; the
@@ -115,7 +119,7 @@ impl From<WyrdError> for OAuthError {
             },
         };
         tracing::info!(wyrd_code = error.code(), oauth_error = ?code, %error, "oauth request refused");
-        Self(code)
+        Self(code, Some(error.code()))
     }
 }
 
@@ -127,6 +131,7 @@ impl IntoResponse for OAuthError {
             Json(OAuthErrorResponse {
                 error: self.0,
                 error_description: None,
+                code: self.1.map(str::to_owned),
             }),
         )
     }
@@ -173,7 +178,7 @@ impl OAuthForm {
                 .insert(name.into_owned(), value.into_owned().into())
                 .is_some()
             {
-                return Err(OAuthError(OAuthErrorCode::InvalidRequest));
+                return Err(OAuthError(OAuthErrorCode::InvalidRequest, None));
             }
         }
         Ok(Self { params })
@@ -192,7 +197,7 @@ impl OAuthForm {
     /// value is invalid.
     pub fn decode<T: DeserializeOwned>(&self) -> Result<T, OAuthError> {
         serde_json::from_value(serde_json::Value::Object(self.params.clone()))
-            .map_err(|_| OAuthError(OAuthErrorCode::InvalidRequest))
+            .map_err(|_| OAuthError(OAuthErrorCode::InvalidRequest, None))
     }
 
     /// Decode the parameters as a token-endpoint [`TokenRequest`].
@@ -210,7 +215,7 @@ impl OAuthForm {
             serde_json::from_value::<TokenAudience>(audience.clone()).is_err()
         });
         if exchange && unsupported_audience {
-            return Err(OAuthError(OAuthErrorCode::InvalidTarget));
+            return Err(OAuthError(OAuthErrorCode::InvalidTarget, None));
         }
         self.decode()
     }
@@ -238,11 +243,11 @@ impl<S: Send + Sync> FromRequest<S> for OAuthForm {
                     .eq_ignore_ascii_case("application/x-www-form-urlencoded")
             });
         if !form {
-            return Err(OAuthError(OAuthErrorCode::InvalidRequest));
+            return Err(OAuthError(OAuthErrorCode::InvalidRequest, None));
         }
         let body = Bytes::from_request(request, state)
             .await
-            .map_err(|_| OAuthError(OAuthErrorCode::InvalidRequest))?;
+            .map_err(|_| OAuthError(OAuthErrorCode::InvalidRequest, None))?;
         Self::parse(&body)
     }
 }
@@ -261,7 +266,7 @@ pub fn identify_client(
     headers: &HeaderMap,
     form: &OAuthForm,
 ) -> Result<Option<OAuthClientId>, OAuthError> {
-    let invalid_client = OAuthError(OAuthErrorCode::InvalidClient);
+    let invalid_client = OAuthError(OAuthErrorCode::InvalidClient, None);
     if headers.contains_key(header::AUTHORIZATION) {
         return Err(invalid_client);
     }
@@ -276,7 +281,7 @@ pub fn identify_client(
 /// The errors of [`identify_client`], and `invalid_client` when the request
 /// identifies no client.
 pub fn require_client(headers: &HeaderMap, form: &OAuthForm) -> Result<OAuthClientId, OAuthError> {
-    identify_client(headers, form)?.ok_or(OAuthError(OAuthErrorCode::InvalidClient))
+    identify_client(headers, form)?.ok_or(OAuthError(OAuthErrorCode::InvalidClient, None))
 }
 
 #[cfg(test)]
@@ -295,7 +300,7 @@ mod tests {
     fn repeated_parameters_are_refused_and_empty_ones_omitted() {
         assert_eq!(
             OAuthForm::parse(b"grant_type=a&grant_type=b").expect_err("repeat refused"),
-            OAuthError(OAuthErrorCode::InvalidRequest)
+            OAuthError(OAuthErrorCode::InvalidRequest, None)
         );
         let form = OAuthForm::parse(b"grant_type=refresh_token&scope=").expect("form parses");
         assert_eq!(form.get("grant_type"), Some("refresh_token"));
@@ -320,7 +325,7 @@ mod tests {
         };
         assert_eq!(
             with("https%3A%2F%2Fother.example.com"),
-            Err(OAuthError(OAuthErrorCode::InvalidTarget))
+            Err(OAuthError(OAuthErrorCode::InvalidTarget, None))
         );
         for audience in [TokenAudience::Wyrd, TokenAudience::Bifrost] {
             assert!(matches!(
@@ -334,7 +339,7 @@ mod tests {
         .expect("form parses");
         assert_eq!(
             malformed.token_request(),
-            Err(OAuthError(OAuthErrorCode::InvalidRequest))
+            Err(OAuthError(OAuthErrorCode::InvalidRequest, None))
         );
         let refresh = OAuthForm::parse(b"grant_type=refresh_token&refresh_token=r&audience=x")
             .expect("form parses");
@@ -355,7 +360,7 @@ mod tests {
     fn clients_identify_by_client_id() {
         let none = HeaderMap::new();
         let form = |raw: &[u8]| OAuthForm::parse(raw).expect("form parses");
-        let invalid = OAuthError(OAuthErrorCode::InvalidClient);
+        let invalid = OAuthError(OAuthErrorCode::InvalidClient, None);
         assert_eq!(
             identify_client(&none, &form(b"client_id=wyrd-ui")),
             Err(invalid)
@@ -381,40 +386,47 @@ mod tests {
         );
     }
 
-    /// Catalog refusals map to their RFC codes; a token exchange reports an
-    /// unusable subject as `invalid_request`.
+    /// Catalog refusals map to their RFC codes and keep their Wyrd code; a
+    /// token exchange reports an unusable subject as `invalid_request`.
     ///
     /// # Panics
     /// Panics when a refusal maps differently.
     #[test]
     fn catalog_refusals_map_to_rfc_codes() {
-        let details = serde_json::json!({ "error": "slow_down" });
-        let message = String::new();
-        assert_eq!(
-            OAuthError::from(WyrdError::DeviceAuthorization {
-                message: message.clone(),
-                details,
-            }),
-            OAuthError(OAuthErrorCode::SlowDown)
-        );
+        let slow_down = WyrdError::DeviceAuthorization {
+            message: String::new(),
+            details: serde_json::json!({ "error": "slow_down" }),
+        };
         let invalid = || WyrdError::InvalidToken {
             message: String::new(),
             details: serde_json::json!({}),
         };
-        assert_eq!(
-            OAuthError::from(invalid()),
-            OAuthError(OAuthErrorCode::InvalidGrant)
-        );
-        assert_eq!(
-            OAuthError::request(invalid()),
-            OAuthError(OAuthErrorCode::InvalidRequest)
-        );
-        assert_eq!(
-            OAuthError::from(WyrdError::AuthVerifyUnavailable {
-                message,
-                details: serde_json::json!({}),
-            }),
-            OAuthError(OAuthErrorCode::TemporarilyUnavailable)
-        );
+        let unavailable = WyrdError::AuthVerifyUnavailable {
+            message: String::new(),
+            details: serde_json::json!({}),
+        };
+        for (refusal, expected) in [
+            (
+                OAuthError::from(slow_down.clone()),
+                OAuthError(OAuthErrorCode::SlowDown, Some(slow_down.code())),
+            ),
+            (
+                OAuthError::from(invalid()),
+                OAuthError(OAuthErrorCode::InvalidGrant, Some(invalid().code())),
+            ),
+            (
+                OAuthError::request(invalid()),
+                OAuthError(OAuthErrorCode::InvalidRequest, Some(invalid().code())),
+            ),
+            (
+                OAuthError::from(unavailable.clone()),
+                OAuthError(
+                    OAuthErrorCode::TemporarilyUnavailable,
+                    Some(unavailable.code()),
+                ),
+            ),
+        ] {
+            assert_eq!(refusal, expected);
+        }
     }
 }

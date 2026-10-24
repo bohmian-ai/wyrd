@@ -48,12 +48,8 @@ use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_runtime::{PermissionCheck, RbacCheck};
-use wyrd_semver::VersionBlock;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
-use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::{CardName, SpaceName};
-use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::{
     NodeId as ClusterNodeId, OracleCapabilitiesV1, QueryClass, ScribeCapabilitiesV1,
 };
@@ -181,10 +177,9 @@ pub enum ServerBootError {
         /// The slug that failed to resolve.
         slug: String,
     },
-    /// A `[[workload_bindings]]` entry's card target could not be built into a
-    /// [`CardRef`]. This is config malformation (bad kind/name/space/version or
-    /// issuer URL), caught at boot so the server fails closed rather than
-    /// starting with a mis-built binding. It is not a card-existence check.
+    /// A `[[workload_bindings]]` entry is malformed (bad issuer URL) or names
+    /// no active Service account, caught at boot so the server fails closed
+    /// rather than starting with a binding that can never authenticate.
     #[error("workload_bindings[{index}] is invalid: {message}")]
     InvalidWorkloadBinding {
         /// Index of the offending `[[workload_bindings]]` entry.
@@ -334,6 +329,7 @@ fn validate_scribe_expanded_request(
 async fn build_bifrost_external_dependencies(
     dsns: &ResolvedDsns,
     config: &crate::config::BifrostRuntimeConfig,
+    forge: &ForgeRuntimeConfig,
     target: crate::config::BifrostTarget,
 ) -> Result<BifrostExternalDependencies, ServerBootError> {
     let data_root = BifrostDataRoot::prepare(config.data_dir())?;
@@ -433,7 +429,10 @@ async fn build_bifrost_external_dependencies(
             postgres.vala().clone(),
         )
         .await
-        .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?
+        .with_default_target_file_size_bytes(
+            resolve_forge_config(forge).0.default_target_file_size_bytes,
+        ),
     );
     Ok(BifrostExternalDependencies {
         postgres,
@@ -1169,7 +1168,8 @@ impl StartInputs {
     pub async fn production(config: &WyrdServerConfig) -> Result<Self, ServerBootError> {
         let dsns = ResolvedDsns::from_env()?;
         let dependencies =
-            build_bifrost_external_dependencies(&dsns, &config.bifrost, config.role).await?;
+            build_bifrost_external_dependencies(&dsns, &config.bifrost, &config.forge, config.role)
+                .await?;
         Ok(Self {
             dependencies,
             signing_key: resolve_signing_key(config)?,
@@ -2026,6 +2026,16 @@ async fn release_failed_oracle_role(
 /// Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
 /// the implicit tenant. Issuers are seeded first because workload bindings
 /// reference them by FK.
+///
+/// Does nothing when neither list is configured.
+///
+/// # Errors
+/// Returns [`ServerBootError::TenantSlugUnresolved`] when federation entries are
+/// configured but `auth.tenant_slug` is unset or does not resolve to an active
+/// tenant; [`ServerBootError::InvalidWorkloadBinding`] when a binding's issuer is
+/// not a valid https issuer or names no active Service account; and any error
+/// [`crate::boot::issuer::seed_trusted_issuers`] returns (human issuer, issuer
+/// discovery, sealing, or [`ServerBootError::Sql`] write failures).
 async fn seed_federation(
     postgres: &ServerPostgres,
     config: &WyrdServerConfig,
@@ -2034,9 +2044,8 @@ async fn seed_federation(
     // Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
     // the implicit tenant. Both resolve the slug through the same
     // `WyrdPostgres::resolve_tenant_slug` the request handlers use, so the bound
-    // tenant matches request-time lookups by construction. Each binding's card
-    // target is built into a server-owned `CardRef` (F04, never from token
-    // claims); building the ref is not a card-existence check.
+    // tenant matches request-time lookups by construction. Each binding names
+    // its stable Service account, never one derived from token claims.
     if !config.trusted_issuers.is_empty() || !config.workload_bindings.is_empty() {
         let slug = config.auth.tenant_slug.as_ref().ok_or_else(|| {
             ServerBootError::TenantSlugUnresolved {
@@ -2112,7 +2121,7 @@ fn decode_sealing_key(encoded: &SecretString, label: &str) -> Result<SecretKey, 
 ///
 /// # Errors
 /// Returns [`ServerBootError::InvalidWorkloadBinding`] when an entry's issuer URL
-/// or card target cannot be parsed into the domain types.
+/// is not a valid https issuer.
 pub fn build_workload_bindings(
     entries: &[WorkloadBindingEntry],
     tenant_id: DataTenantId,
@@ -2125,6 +2134,13 @@ pub fn build_workload_bindings(
 }
 
 /// Build a single [`WorkloadBinding`] from a config entry under `tenant_id`.
+///
+/// `index` is the entry's position in `[[workload_bindings]]` and is reported
+/// in the error so operators can find the bad entry.
+///
+/// # Errors
+/// Returns [`ServerBootError::InvalidWorkloadBinding`] when the entry's issuer
+/// is not a valid https issuer URL.
 fn build_workload_binding(
     index: usize,
     entry: &WorkloadBindingEntry,
@@ -2141,45 +2157,8 @@ fn build_workload_binding(
         issuer,
         subject: entry.subject.clone(),
         audience: entry.audience.clone(),
-        card_ref: build_binding_card_ref(index, entry)?,
-    })
-}
-
-/// Build the server-owned [`CardRef`] for a binding from its config card target.
-///
-/// `uid` is always `None` and no DB/existence lookup is performed (N2, F04):
-/// building the ref is not validating that the card exists.
-fn build_binding_card_ref(
-    index: usize,
-    entry: &WorkloadBindingEntry,
-) -> Result<CardRef, ServerBootError> {
-    let invalid = |message: String| ServerBootError::InvalidWorkloadBinding { index, message };
-
-    let kind = CardKind::native()
-        .into_iter()
-        .find(|kind| kind.wire_name().eq_ignore_ascii_case(&entry.kind))
-        .ok_or_else(|| invalid(format!("unknown card kind {:?}", entry.kind)))?;
-    // Only Service and Agent cards back a workload principal; any other kind
-    // parses but never resolves at jwt-bearer exchange. Fail fast at boot.
-    if !matches!(kind, CardKind::Service | CardKind::Agent) {
-        return Err(invalid(format!(
-            "workload binding card kind must be \"service\" or \"agent\", got {:?}",
-            entry.kind
-        )));
-    }
-    let name = CardName::new(entry.name.clone())
-        .map_err(|error| invalid(format!("invalid card name {:?}: {error}", entry.name)))?;
-    let version = VersionBlock::parse(entry.version.clone())
-        .map_err(|error| invalid(format!("invalid card version {:?}: {error}", entry.version)))?;
-    let space = SpaceName::new(entry.space.clone())
-        .map_err(|error| invalid(format!("invalid card space {:?}: {error}", entry.space)))?;
-
-    Ok(CardRef {
-        kind,
-        name,
-        version,
-        space: Some(space),
-        uid: None,
+        principal_id: entry.principal_id,
+        workload_uid: entry.workload_uid.clone(),
     })
 }
 
@@ -2501,17 +2480,20 @@ mod tests {
             .expect("static tenant id is valid")
     }
 
+    /// Valid `[[workload_bindings]]` entry with an https issuer, subject,
+    /// audience, and principal id, for binding-construction tests.
+    ///
+    /// # Panics
+    /// Panics when the static principal id does not parse.
     fn sample_binding_entry() -> WorkloadBindingEntry {
         WorkloadBindingEntry {
             issuer: "https://idp.example.com".to_owned(),
             subject: "system:serviceaccount:default/my-sa".to_owned(),
             audience: Some("my-audience".to_owned()),
-            // Lowercase mirrors the canonical config example; the boot parse is
-            // case-insensitive against the kind wire name.
-            kind: "service".to_owned(),
-            name: "my-model".to_owned(),
-            space: "prod".to_owned(),
-            version: "1.0.0".to_owned(),
+            principal_id: "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"
+                .parse()
+                .expect("static principal id is valid"),
+            workload_uid: None,
         }
     }
 
@@ -2527,14 +2509,19 @@ mod tests {
         assert_ne!(bindings[0].tenant_id, DataTenantId::SYSTEM_OWNER);
     }
 
+    /// Boot refuses a workload binding whose issuer uses plain `http://`.
+    ///
+    /// # Panics
+    /// Panics when the non-https binding builds or fails with an error other than
+    /// [`ServerBootError::InvalidWorkloadBinding`].
     #[test]
-    fn workload_binding_rejects_non_service_or_agent_kind() {
+    fn workload_binding_rejects_a_non_https_issuer() {
         let tenant = implicit_tenant();
         let mut entry = sample_binding_entry();
-        entry.kind = "model".to_owned();
+        entry.issuer = "http://idp.example.com".to_owned();
 
         let error = build_workload_bindings(&[entry], tenant)
-            .expect_err("a model-kind binding must be rejected at boot");
+            .expect_err("a non-https issuer binding must be rejected at boot");
 
         assert!(
             matches!(error, ServerBootError::InvalidWorkloadBinding { .. }),

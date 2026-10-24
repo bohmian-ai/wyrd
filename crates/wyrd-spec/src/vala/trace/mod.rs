@@ -2308,9 +2308,9 @@ mod otel_proto_parity_tests {
             .expect("schema has oneOf variants")
             .iter()
             .map(|variant| {
-                variant["enum"][0]
+                variant["const"]
                     .as_str()
-                    .expect("variant has one enum value")
+                    .expect("variant has one const value")
                     .to_string()
             })
             .collect()
@@ -2328,9 +2328,9 @@ mod otel_proto_parity_tests {
     }
 
     fn status_code(variant: &Value) -> String {
-        variant["properties"]["code"]["enum"][0]
+        variant["properties"]["code"]["const"]
             .as_str()
-            .expect("span status variant has a code enum value")
+            .expect("span status variant has a code const value")
             .to_string()
     }
 

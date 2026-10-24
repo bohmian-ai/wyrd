@@ -1,5 +1,4 @@
 import type {
-  CardRef,
   DeclarationReceipt,
   ProviderCredentialView,
   PullSummary,
@@ -26,32 +25,18 @@ export interface CheckReport {
   readonly ok: boolean;
   readonly cards: readonly {
     readonly kind: string;
-    readonly space: string | null;
     readonly name: string;
     readonly version: string | null;
   }[];
   readonly diagnostics: readonly CheckDiagnostic[];
 }
 
-/** Card selector: a `uid` with `kind`, or `kind`, `space`, and `name`; `version` narrows either. */
+/** Card selector: a `uid` with `kind`, or `kind` and `name`; `version` narrows either. */
 export interface CliCardSelector {
   readonly kind?: string;
-  readonly space?: string;
   readonly name?: string;
   readonly version?: string;
   readonly uid?: string;
-}
-
-/** Response of `wyrd auth issue-key`; `key` is the plaintext API key, returned exactly once. */
-export interface IssueKeyResponse {
-  readonly key_id: string;
-  /** The Card's Service or Agent principal, the id its Role assignments are addressed by. */
-  readonly principal_id: string;
-  readonly key: string;
-  readonly prefix: string;
-  readonly card_ref: CardRef;
-  readonly created_at: string;
-  readonly expires_at: string;
 }
 
 /** Provider credential submission for {@link cli.putProviderCredential}. */
@@ -107,18 +92,6 @@ export declare const cli: {
     outputDir: string,
     options?: CliClientOptions & { readonly metadataOnly?: boolean },
   ): Promise<PullSummary>;
-  /** Issue an API key bound to one exact Card (`wyrd auth issue-key`). */
-  issueKey(
-    card: {
-      readonly kind: string;
-      readonly name: string;
-      readonly version: string;
-      readonly space: string;
-      readonly label?: string;
-      readonly expiresInSeconds?: number;
-    },
-    options?: CliClientOptions,
-  ): Promise<IssueKeyResponse>;
   /** Create or rotate a provider credential; a rejected body is not quoted and the view is redacted. */
   putProviderCredential(write: ProviderCredentialWrite, options?: CliClientOptions): Promise<ProviderCredentialView>;
   /** Terminally revoke a provider credential (`wyrd gateway credential revoke`). */

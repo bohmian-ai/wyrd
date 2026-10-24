@@ -13,7 +13,7 @@
 //!
 //! - **May these members combine?** Only when their complete
 //!   [`ScribeAssemblyKey`] matches. The key carries the tenant, canonical
-//!   table, schema fingerprint, physical layout, physical partition, node and
+//!   table, schema fingerprint, table version, physical partition, node and
 //!   writer epoch, so two members combine if and only if one merged file could
 //!   have been written from either of them without changing a single durable
 //!   fact. Nothing in this module can widen that comparison.
@@ -45,34 +45,35 @@ use chrono::{DateTime, Utc};
 use num_traits::ToPrimitive;
 use sha2::{Digest as _, Sha256};
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::vala::api::{NullOrderWire, SortDirectionWire};
+use wyrd_spec::vala::ids::TableVersion;
 
+use crate::catalog::PhysicalPartition;
 use crate::catalog::TableRef;
-use crate::catalog::layout::{PhysicalLayout, TimePartition};
 use crate::schema::fingerprint::SchemaFingerprint;
-use crate::scribe::stream_identity::{NodeId, WriterEpoch};
+use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 
 /// Exact compatibility scope shared by every member of one assembly claim.
 ///
 /// Every field is a reason two members could produce different bytes or
 /// different durable facts in a merged object: a different tenant or table is a
-/// different owner, a different schema fingerprint or layout is a different
-/// sort order and column set, a different partition is a different file-list
-/// row, and a different node or writer epoch is a different LSN stream. The key
-/// is compared whole; there is no shorter logical form and no field a caller
-/// may omit.
+/// different owner, a different schema fingerprint is a different column set,
+/// a different table version is a different sort order, partitioning, and
+/// Bloom set, a different partition is a different file-list row, and a
+/// different node or writer epoch is a different LSN stream. The key is
+/// compared whole; there is no shorter logical form and no field a caller may
+/// omit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScribeAssemblyKey {
     /// Tenant owning every row in the claim.
     tenant: DataTenantId,
     /// Canonical table every member belongs to.
     table: TableRef,
-    /// Fingerprint of the user schema the members were encoded against.
+    /// Fingerprint of the physical schema the members were encoded against.
     schema_fingerprint: SchemaFingerprint,
-    /// Digest of the canonical physical layout fixing sort and partitioning.
-    layout_fingerprint: [u8; 32],
-    /// Exact physical time partition represented by every member.
-    partition: TimePartition,
+    /// Table version every member was accepted under.
+    table_version: TableVersion,
+    /// Exact physical partition represented by every member.
+    partition: PhysicalPartition,
     /// Node whose local staging volume holds the members.
     node_id: NodeId,
     /// Fenced writer epoch whose LSN stream produced the members.
@@ -80,69 +81,35 @@ pub struct ScribeAssemblyKey {
 }
 
 impl ScribeAssemblyKey {
-    /// Builds the key from the canonical layout the table is registered with.
+    /// Builds the key one staged member belongs to.
     ///
-    /// The layout is reduced to a digest here rather than stored whole so the
-    /// key stays cheap to hash and compare, and so two structurally identical
-    /// layouts resolved by different code paths produce the same key.
+    /// Live staging and recovery build it from the same recorded facts, so a
+    /// member may only join a claim written under its own table version even
+    /// after the table's definition has changed.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         tenant: DataTenantId,
         table: TableRef,
         schema_fingerprint: SchemaFingerprint,
-        layout: &PhysicalLayout,
-        partition: TimePartition,
-        node_id: NodeId,
-        writer_epoch: WriterEpoch,
+        table_version: TableVersion,
+        partition: PhysicalPartition,
+        stream: StreamIdentity,
     ) -> Self {
         Self {
             tenant,
             table,
             schema_fingerprint,
-            layout_fingerprint: layout_fingerprint(layout),
+            table_version,
             partition,
-            node_id,
-            writer_epoch,
+            node_id: stream.node_id,
+            writer_epoch: stream.writer_epoch,
         }
     }
 
-    /// Rebuilds a key from fields recovered from a durable staged record.
-    ///
-    /// Recovery has the layout digest the member was staged under, not the
-    /// layout itself, and that digest is the fact that matters: a member may
-    /// only join a claim whose sort order and partitioning are the ones it was
-    /// written with, even if the table has since been re-registered.
-    #[must_use]
-    pub const fn from_parts(
-        tenant: DataTenantId,
-        table: TableRef,
-        schema_fingerprint: SchemaFingerprint,
-        layout_fingerprint: [u8; 32],
-        partition: TimePartition,
-        node_id: NodeId,
-        writer_epoch: WriterEpoch,
-    ) -> Self {
-        Self {
-            tenant,
-            table,
-            schema_fingerprint,
-            layout_fingerprint,
-            partition,
-            node_id,
-            writer_epoch,
-        }
-    }
-
-    /// Returns the user-schema fingerprint the members were encoded against.
+    /// Returns the physical-schema fingerprint the members were encoded against.
     #[must_use]
     pub const fn schema_fingerprint(&self) -> SchemaFingerprint {
         self.schema_fingerprint
-    }
-
-    /// Returns the digest of the canonical physical layout.
-    #[must_use]
-    pub const fn layout_fingerprint(&self) -> [u8; 32] {
-        self.layout_fingerprint
     }
 
     /// Returns the node whose staging volume holds the members.
@@ -164,7 +131,7 @@ impl ScribeAssemblyKey {
     #[must_use]
     pub fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(b"wyrd.scribe.assembly-key.v1");
+        hasher.update(b"wyrd.scribe.assembly-key.v2");
         self.hash_into(&mut hasher);
         hasher.finalize().into()
     }
@@ -184,10 +151,28 @@ impl ScribeAssemblyKey {
         &self.table
     }
 
+    /// Returns the seal key every member's generation was frozen under, the
+    /// key hot authority for those generations is registered by.
+    #[must_use]
+    pub fn seal_key(&self) -> crate::scribe::seal_key::SealKey {
+        crate::scribe::seal_key::SealKey::new(
+            self.tenant,
+            self.table.clone(),
+            self.partition.clone(),
+        )
+        .with_table_version(self.table_version)
+    }
+
+    /// Returns the table version every member was accepted under.
+    #[must_use]
+    pub const fn table_version(&self) -> TableVersion {
+        self.table_version
+    }
+
     /// Returns the exact physical partition represented by the members.
     #[must_use]
-    pub const fn partition(&self) -> TimePartition {
-        self.partition
+    pub const fn partition(&self) -> &PhysicalPartition {
+        &self.partition
     }
 
     /// Feeds every field of the key into a claim-identity hash.
@@ -200,44 +185,13 @@ impl ScribeAssemblyKey {
         hasher.update((fqn.len() as u64).to_be_bytes());
         hasher.update(fqn.as_bytes());
         hasher.update(self.schema_fingerprint.0);
-        hasher.update(self.layout_fingerprint);
-        hasher.update([self.partition.granularity_tag()]);
-        hasher.update(self.partition.start_unix_micros().to_be_bytes());
+        hasher.update(self.table_version.get().to_be_bytes());
+        let partition = self.partition.to_bytes();
+        hasher.update((partition.len() as u64).to_be_bytes());
+        hasher.update(partition);
         hasher.update(self.node_id.as_bytes());
         hasher.update(self.writer_epoch.as_i64().to_be_bytes());
     }
-}
-
-/// Digests one canonical physical layout into a comparable fingerprint.
-///
-/// Hashes the wire projection, which is the same canonical form the catalog
-/// stores and re-resolves, so a layout that round-trips through registration
-/// keeps its fingerprint. Direction and null order are matched explicitly
-/// rather than serialized so a rename in the public wire enum cannot silently
-/// change a durable claim identity.
-fn layout_fingerprint(layout: &PhysicalLayout) -> [u8; 32] {
-    let wire = layout.to_wire();
-    let mut hasher = Sha256::new();
-    hasher.update([layout.granularity().tag()]);
-    hasher.update((wire.sort_keys.len() as u64).to_be_bytes());
-    for key in &wire.sort_keys {
-        hasher.update((key.column.len() as u64).to_be_bytes());
-        hasher.update(key.column.as_bytes());
-        hasher.update([match key.direction {
-            SortDirectionWire::Asc => 1,
-            SortDirectionWire::Desc => 2,
-        }]);
-        hasher.update([match key.null_order {
-            NullOrderWire::First => 1,
-            NullOrderWire::Last => 2,
-        }]);
-    }
-    hasher.update((wire.bloom_columns.len() as u64).to_be_bytes());
-    for column in &wire.bloom_columns {
-        hasher.update((column.len() as u64).to_be_bytes());
-        hasher.update(column.as_bytes());
-    }
-    hasher.finalize().into()
 }
 
 /// Immutable identity of one staged member within its assembly key.
@@ -1202,47 +1156,20 @@ impl StagingAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::layout::TimeGranularity;
+    use crate::catalog::layout::{TimeGranularity, TimePartition};
     use crate::namespaces::BifrostNamespace;
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
-
-    /// Builds the physical schema every fixture layout resolves against.
-    fn fixture_schema() -> Schema {
-        Schema::new(vec![Field::new(
-            "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        )])
-    }
-
-    /// Resolves one canonical layout, optionally with a declared granularity.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture declaration does not resolve, which would be a
-    /// fixture bug rather than assembler behavior.
-    fn layout(granularity: Option<TimeGranularityWire>) -> PhysicalLayout {
-        let schema = fixture_schema();
-        let declared = granularity.map(|partition_granularity| PhysicalLayoutWire {
-            partition_granularity,
-            time_column: Some("event_time".to_owned()),
-            sort_keys: Vec::new(),
-            bloom_columns: Vec::new(),
-        });
-        PhysicalLayout::resolve("vala.bifrost.events", &schema, declared.as_ref())
-            .expect("fixture layout resolves")
-    }
 
     /// Builds one exact hourly partition from a fixed boundary offset.
     ///
     /// # Panics
     ///
     /// Panics when the offset is not an hour boundary.
-    fn partition(hours: i64) -> TimePartition {
+    fn partition(hours: i64) -> PhysicalPartition {
         let start = chrono::DateTime::from_timestamp(1_772_150_400 + hours * 3_600, 0)
             .expect("a fixed representable instant");
-        TimePartition::new(TimeGranularity::Hour, start).expect("a fixed hour boundary")
+        TimePartition::new(TimeGranularity::Hour, start)
+            .expect("a fixed hour boundary")
+            .into()
     }
 
     /// Builds one assembly key over the supplied tenant and partition.
@@ -1251,10 +1178,9 @@ mod tests {
             tenant,
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             SchemaFingerprint([7; 32]),
-            &layout(None),
+            TableVersion::INITIAL,
             partition(hours),
-            NodeId::new(uuid::Uuid::from_u128(9)),
-            WriterEpoch::new(4),
+            StreamIdentity::new(NodeId::new(uuid::Uuid::from_u128(9)), WriterEpoch::new(4)),
         )
     }
 
@@ -1486,19 +1412,17 @@ mod tests {
                 DataTenantId::new_v7(),
                 TableRef::new(BifrostNamespace::Bifrost, "events"),
                 SchemaFingerprint([7; 32]),
-                &layout(None),
+                TableVersion::INITIAL,
                 partition(0),
-                NodeId::new(uuid::Uuid::from_u128(9)),
-                WriterEpoch::new(4),
+                StreamIdentity::new(NodeId::new(uuid::Uuid::from_u128(9)), WriterEpoch::new(4)),
             ),
             ScribeAssemblyKey::new(
                 tenant,
                 TableRef::new(BifrostNamespace::Bifrost, "events"),
                 SchemaFingerprint([7; 32]),
-                &layout(None),
+                TableVersion::INITIAL,
                 partition(0),
-                NodeId::new(uuid::Uuid::from_u128(9)),
-                WriterEpoch::new(5),
+                StreamIdentity::new(NodeId::new(uuid::Uuid::from_u128(9)), WriterEpoch::new(5)),
             ),
         ] {
             assert_ne!(
@@ -2106,29 +2030,21 @@ mod tests {
         );
     }
 
-    /// Two layouts with different partition granularity are different keys.
+    /// Two table versions of one table are different keys.
     #[test]
-    fn a_changed_layout_changes_the_assembly_key() {
+    fn a_changed_table_version_changes_the_assembly_key() {
         let tenant = DataTenantId::new_v7();
-        let hourly = ScribeAssemblyKey::new(
+        let first = key_for(tenant, 0);
+        let second = ScribeAssemblyKey::new(
             tenant,
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             SchemaFingerprint([7; 32]),
-            &layout(Some(TimeGranularityWire::Hour)),
+            TableVersion::INITIAL.next().expect("version 2"),
             partition(0),
-            NodeId::new(uuid::Uuid::from_u128(9)),
-            WriterEpoch::new(4),
+            StreamIdentity::new(NodeId::new(uuid::Uuid::from_u128(9)), WriterEpoch::new(4)),
         );
-        let daily = ScribeAssemblyKey::new(
-            tenant,
-            TableRef::new(BifrostNamespace::Bifrost, "events"),
-            SchemaFingerprint([7; 32]),
-            &layout(Some(TimeGranularityWire::Day)),
-            partition(0),
-            NodeId::new(uuid::Uuid::from_u128(9)),
-            WriterEpoch::new(4),
-        );
-        assert_ne!(hourly, daily);
+        assert_ne!(first, second);
+        assert_ne!(first.digest(), second.digest());
     }
 
     /// AC22/AC7 unit owner: a restart reconstructs the same claim from the same

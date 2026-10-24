@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
+use wyrd_spec::vala::ids::TableVersion;
 
 use crate::queue::ProducerTrace;
 
@@ -99,6 +100,9 @@ impl<G> OwnedIpcBytes<G> {
 pub struct SealedBatch<G> {
     /// Destination table identifier, opaque to the queue.
     pub table: String,
+    /// The table version the writer's description named, sent unchanged on
+    /// every attempt so a retry never rebinds to a newer definition.
+    pub table_version: TableVersion,
     /// UUIDv7 idempotency identity minted before the first transport attempt.
     pub batch_id: [u8; 16],
     /// One owned Arrow IPC frame and its client-byte reservation.

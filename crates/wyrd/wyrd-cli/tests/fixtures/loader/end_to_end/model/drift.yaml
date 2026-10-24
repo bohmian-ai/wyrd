@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Verifier
 metadata:
-  space: wyrd-team
   name: churn-classifier-drift
   version: "1.0.0"
 spec:
@@ -25,7 +24,6 @@ spec:
           # Baseline Data card was registered by a data pipeline. External `ref:`.
           baseline_ref:
             kind: Data
-            space: wyrd-team
             name: churn-classifier-data
             version: "1.4.2"
           features: [tenure_months, monthly_charges, contract_type]

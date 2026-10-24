@@ -179,10 +179,6 @@ fn load_end_to_end_config_defaults() {
     assert_eq!(tree.cards.len(), 1);
     let metadata = &tree.cards[0].submission.metadata;
     assert_eq!(
-        metadata.space.as_ref().map(ToString::to_string).as_deref(),
-        Some("team-default")
-    );
-    assert_eq!(
         metadata
             .labels
             .iter()

@@ -1,8 +1,8 @@
 //! Registry resolution of the Cards an unbound writer attributes evidence to.
 //!
-//! A Card-bound principal attributes only within its signed scope, which Scribe
-//! checks without IO. A principal bound to no Card may attribute to any
-//! registered observation-target Card in its tenant, so Gate looks the
+//! A principal with a selected root attributes only within its signed scope,
+//! which Scribe checks without IO. A rootless unrestricted principal may
+//! attribute to any registered observation-target Card in its tenant, so Gate looks the
 //! distinct `card_uid` values a frame names up in the tenant registry before
 //! dispatch and hands Scribe the registered members as that frame's scope.
 
@@ -59,7 +59,7 @@ impl CardRegistry {
     /// Resolves the Cards `auth` attributes a frame to, when it is unbound.
     ///
     /// `cards` collects the frame's distinct Card UIDs and runs only for an
-    /// unbound principal. Returns `None` for a Card-bound principal, whose
+    /// unbound principal. Returns `None` for a scoped principal, whose
     /// signed scope governs, and when the frame names no Card. Otherwise it
     /// returns the UIDs that name a registered observation-target Card in the
     /// caller's tenant; an unregistered UID or a Card of a non-observation

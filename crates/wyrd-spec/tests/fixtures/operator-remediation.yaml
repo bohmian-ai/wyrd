@@ -3,7 +3,6 @@
 apiVersion: wyrd/v1
 kind: Operator
 metadata:
-  space: retention
   name: churn-retrain-on-drift
   version: 1.0.0
 

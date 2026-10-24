@@ -2,7 +2,8 @@
 //
 // A table declares `timeColumn`; the column partitions the table and bounds its
 // files, so a time-range read returns exactly the rows inside the range.
-// `describeTable` reports the declared column, a table declared without one
+// `describeTable` reports the declared column at the version the rows were
+// written under, a table declared without one
 // reports `wyrd_ingested_at`, and a declaration naming a column that cannot be
 // a time column is refused naming the field.
 import { Field, Int64, RecordBatch, Schema, Struct, TimestampMicrosecond, makeData } from "apache-arrow";
@@ -49,7 +50,7 @@ function readings(): RecordBatch {
 function table(name: string, timeColumn?: string): Promise<Bifrost> {
   return Bifrost.connect({
     table: TableConfig.fromArrow(`${NAMESPACE}.${name}`, SCHEMA, {
-      layout: { partitionGranularity: "hour", timeColumn },
+      layout: { partitionBy: [{ column: timeColumn ?? "wyrd_ingested_at", transform: "hour" }], timeColumn },
     }),
   });
 }
@@ -74,7 +75,9 @@ test("a user table's time column prunes a time range", async ({ server }) => {
   );
 
   expect(inRange).toEqual([{ value: 1 }, { value: 2 }]);
-  expect((await readingsTable.describeTable(NAMESPACE, READINGS)).physical_layout.time_column).toBe("event_time");
+  const described = await readingsTable.describeTable(NAMESPACE, READINGS);
+  expect(described.physical_layout.time_column).toBe("event_time");
+  expect(described.table_version).toBe(1n);
   expect((await defaults.describeTable(NAMESPACE, DEFAULTS)).physical_layout.time_column).toBe("wyrd_ingested_at");
 }, 60_000);
 

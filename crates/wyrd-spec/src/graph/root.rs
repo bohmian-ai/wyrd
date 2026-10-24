@@ -83,7 +83,6 @@ mod tests {
             kind,
             name: name.parse().expect("test card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-            space: Some("default".parse().expect("test space is valid")),
             uid: None,
         }
     }

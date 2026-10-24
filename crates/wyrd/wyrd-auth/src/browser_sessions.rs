@@ -242,7 +242,8 @@ impl BrowserSessions {
         let exchange = ExchangeApiKey {
             issuer: self.issuer.clone(),
         };
-        let verified = match exchange.authenticate(&mut conn, api_key).await {
+        // Rootless: browser recovery selects no workload and records no activity.
+        let verified = match exchange.authenticate(&mut conn, api_key, None).await {
             Ok(verified) => verified,
             Err(error) => {
                 return Err(map_exchange_error_to_wyrd(&mut conn, &parsed.prefix, error).await);

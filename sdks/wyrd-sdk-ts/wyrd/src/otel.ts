@@ -5,7 +5,8 @@
  *
  * Each factory builds the stock exporter for one signal, pointed at the
  * client's server, whose headers ask the client for its current access token
- * on every export and send it as `x-wyrd-access-token`. The token comes from
+ * on every export and send it as `x-wyrd-access-token`, beside the client's
+ * workload root, when it has one, as `x-wyrd-workload-uid`. The token comes from
  * the client's one shared refresh path, so a long-lived exporter keeps working
  * after any single access token expires; this module holds no token or cache
  * of its own. Needs the optional `@opentelemetry/exporter-*-otlp-proto` peers.
@@ -21,27 +22,41 @@ import { BasicTracerProvider, BatchSpanProcessor, type Span, type SpanProcessor 
 
 import type { WyrdClient } from "./index.js";
 
+/**
+ * The workload option every exporter factory takes: `workloadUid`, the exact
+ * Service Card UID exports run as; omitted, the client's own root, if
+ * any. A `workloadUid` that is not a UUIDv7 throws `WYRD_SPEC_400_VALIDATION`.
+ */
+export type ExporterOptions = { readonly workloadUid?: string };
+
 /** The signal's OTLP/HTTP URL on `client`'s server and per-export auth headers. */
-function config(client: WyrdClient, signal: "traces" | "logs" | "metrics") {
+function config(client: WyrdClient, signal: "traces" | "logs" | "metrics", options: ExporterOptions) {
+  const rooted = options.workloadUid === undefined ? client : client.forWorkload(options.workloadUid);
+  const workloadUid = rooted.workloadUid;
+  const environment = rooted.deploymentEnvironment;
   return {
-    url: `${client.serverUrl.replace(/\/+$/, "")}/v1/${signal}`,
-    headers: async () => ({ "x-wyrd-access-token": `Bearer ${await client.accessToken()}` }),
+    url: `${rooted.serverUrl.replace(/\/+$/, "")}/v1/${signal}`,
+    headers: async (): Promise<Record<string, string>> => ({
+      "x-wyrd-access-token": `Bearer ${await rooted.accessToken()}`,
+      ...(workloadUid === undefined ? {} : { "x-wyrd-workload-uid": workloadUid }),
+      ...(environment === undefined ? {} : { "x-wyrd-deployment-environment": environment }),
+    }),
   };
 }
 
 /** Build a span exporter that sends OTLP/HTTP protobuf to `client`'s server. */
-export function spanExporter(client: WyrdClient): OTLPTraceExporter {
-  return new OTLPTraceExporter(config(client, "traces"));
+export function spanExporter(client: WyrdClient, options: ExporterOptions = {}): OTLPTraceExporter {
+  return new OTLPTraceExporter(config(client, "traces", options));
 }
 
 /** Build a log exporter that sends OTLP/HTTP protobuf to `client`'s server. */
-export function logExporter(client: WyrdClient): OTLPLogExporter {
-  return new OTLPLogExporter(config(client, "logs"));
+export function logExporter(client: WyrdClient, options: ExporterOptions = {}): OTLPLogExporter {
+  return new OTLPLogExporter(config(client, "logs", options));
 }
 
 /** Build a metric exporter that sends OTLP/HTTP protobuf to `client`'s server. */
-export function metricExporter(client: WyrdClient): OTLPMetricExporter {
-  return new OTLPMetricExporter(config(client, "metrics"));
+export function metricExporter(client: WyrdClient, options: ExporterOptions = {}): OTLPMetricExporter {
+  return new OTLPMetricExporter(config(client, "metrics", options));
 }
 
 /**

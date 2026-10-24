@@ -7,14 +7,13 @@ from wyrd.prompt import Prompt, PromptReference, WyrdError
 
 
 def test_card_reference_round_trips_its_card_ref() -> None:
-    ref = PromptReference.card("support-prompt", "1.2.3", space="prod")
+    ref = PromptReference.card("support-prompt", "1.2.3")
 
     decoded = PromptReference.model_validate_json(ref.model_dump_json())
 
     assert decoded.kind == "card"
     assert decoded.card_ref is not None
-    assert (decoded.card_ref.space, decoded.card_ref.name, decoded.card_ref.version) == (
-        "prod",
+    assert (decoded.card_ref.name, decoded.card_ref.version) == (
         "support-prompt",
         "1.2.3",
     )

@@ -79,7 +79,7 @@ bundle_in() {
   docker run --rm --user "$(id -u):$(id -g)" "${mounts[@]}" \
     -v "$cargo/registry:/opt/cargo/registry" -v "$cargo/git:/opt/cargo/git" \
     -w "$root" -e HOME="$target/$env/home" -e CARGO_TARGET_DIR="$target/$env" \
-    -e MISE_TRUSTED_CONFIG_PATHS="$root" -e WYRD_PROFILE -e CARGO_PROFILE_DIST_LTO -e RUSTFLAGS="$rustflags" \
+    -e MISE_TRUSTED_CONFIG_PATHS="$root" -e WYRD_PROFILE -e RUSTFLAGS="$rustflags" \
     "$builder" scripts/build.sh bundle
 }
 

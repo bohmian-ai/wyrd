@@ -4,7 +4,6 @@ kind: Verifier
 metadata:
   name: reserved-source
   version: 1.0.0
-  space: default
 spec:
   description: A conversation Verifier whose source slot takes the reserved group_id name.
   inputs:

@@ -1,7 +1,6 @@
 apiVersion: wyrd/v1
 kind: Data
 metadata:
-  space: default
   name: empty-schema
   version: 1.0.0
 spec:

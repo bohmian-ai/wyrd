@@ -1,0 +1,163 @@
+# Custom Verdict data: Agent and code checks declare the `verdict` response
+# format, plain or with a `data` schema, on whole-Verifier and step
+# requirements. An answer containing `BAD-DATA` makes both scored checks
+# return data their schema refuses, and `HUGE-DATA` data past the
+# 65,536-byte bound. The code check also answers its own markers:
+# `EXACT-BYTES`/`OVER-BYTES` (UTF-8 and escapes) and `EXACT-WIDE`/`OVER-WIDE`
+# (a wide array) return exactly 65,536 and 65,537 compact bytes, `DEEP-16`/
+# `DEEP-17` nest that many containers, and `MISSING-DATA`, `NULL-DATA`,
+# `EXTRA-DATA`, and `EXTRA-FIELD` return no data, null data, an undeclared
+# data field, and an unknown Verdict field; refused values carry `s3cr3t`.
+# `ENVELOPE-DATA` makes the plain code check return data it never declared.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: scored-review
+  version: 1.0.0
+spec:
+  description: A support answer is judged with a score and a category.
+  inputs:
+    answer:
+      type: json
+      schema:
+        type: object
+        properties: {text: {type: string}}
+        required: [text]
+  steps:
+    - id: tally
+      action:
+        kind: code
+        entrypoint: tally
+        inputs: {answer: inputs.answer}
+        source:
+          inline: |
+            def tally(answer):
+                return {"words": len(answer["text"].split())}
+      requirements:
+        - id: tally-counted
+          statement: The answer has words
+          check:
+            kind: code
+            entrypoint: check
+            inputs: {answer: inputs.answer, tally: steps.tally.output}
+            response_format:
+              kind: verdict
+              data:
+                type: object
+                properties: {words: {type: integer, minimum: 0}}
+                required: [words]
+                additionalProperties: false
+            source:
+              inline: |
+                def check(answer, tally):
+                    return {
+                        "outcome": "passed" if tally["words"] else "failed",
+                        "reason": "counted the words",
+                        "citations": [{"slot": "answer", "locator": {"json_pointer": "/text"}}],
+                        "data": {"words": tally["words"]},
+                    }
+  requirements:
+    - id: polite
+      statement: The answer is polite
+      check:
+        kind: agent
+        agent: ./plain-judge.yaml
+        inputs: {answer: inputs.answer.text}
+    - id: on-topic
+      statement: The answer is on topic
+      check:
+        kind: agent
+        agent:
+          execution_route: {kind: wyrd_gateway, deployment: openai}
+          run_config: {max_iterations: 1}
+          prompt:
+            provider: openai
+            model: gpt-4o
+            messages:
+              - role: user
+                content: "Judge whether this answer is on topic: {{answer}}"
+            response_format: {kind: verdict}
+        inputs: {answer: inputs.answer.text}
+    - id: helpful
+      statement: The answer is helpful
+      check:
+        kind: agent
+        agent: ./scored-judge.yaml
+        inputs: {answer: inputs.answer.text}
+    - id: plainly-checked
+      statement: The answer is checked by plain code
+      check:
+        kind: code
+        entrypoint: check
+        inputs: {answer: inputs.answer}
+        source:
+          inline: |
+            def check(answer):
+                response = {
+                    "outcome": "passed",
+                    "reason": "checked the answer",
+                    "citations": [{"slot": "answer", "locator": {"json_pointer": "/text"}}],
+                }
+                if "ENVELOPE-DATA" in answer["text"]:
+                    response["data"] = {"note": "s3cr3t"}
+                return response
+    - id: well-formed
+      statement: The answer is well formed
+      check:
+        kind: code
+        entrypoint: check
+        inputs: {answer: inputs.answer}
+        response_format:
+          kind: verdict
+          data:
+            type: object
+            properties:
+              score: {type: number, minimum: 0, maximum: 1}
+              category: {type: string}
+              tree: {}
+            required: [score, category]
+            additionalProperties: false
+        source:
+          inline: |
+            def check(answer):
+                text = answer["text"]
+                data = {"score": 0.5, "category": "format"}
+                if "BAD-DATA" in text:
+                    data = {"score": "high", "category": "format"}
+                if "HUGE-DATA" in text:
+                    data = {"score": 0.5, "category": "x" * 70000}
+                # {"score":0.5,"category":""} is 27 compact bytes; 32,000
+                # two-byte characters, the escaped newline and quote (2 bytes
+                # each), and the escaped U+0001 (6 bytes) leave 1,499 bytes.
+                utf8 = "é" * 32000 + "\n\"\u0001"
+                if "EXACT-BYTES" in text:
+                    data = {"score": 0.5, "category": utf8 + "x" * 1499}
+                if "OVER-BYTES" in text:
+                    data = {"score": 0.5, "category": utf8 + "x" * 1500}
+                # {"score":0.5,"category":"format","tree":[]} is 43 bytes;
+                # 32,747 one-digit items and their commas take 65,493.
+                if "EXACT-WIDE" in text:
+                    data = {"score": 0.5, "category": "format", "tree": [0] * 32747}
+                if "OVER-WIDE" in text:
+                    data = {"score": 0.5, "category": "format", "tree": [0] * 32746 + [10]}
+                for marker, containers in (("DEEP-16", 16), ("DEEP-17", 17)):
+                    if marker in text:
+                        tree = "s3cr3t"
+                        for _ in range(containers - 1):
+                            tree = [tree]
+                        data = {"score": 0.5, "category": "format", "tree": tree}
+                if "EXTRA-DATA" in text:
+                    data = {"score": 0.5, "category": "format", "extra": "s3cr3t"}
+                response = {
+                    "outcome": "failed",
+                    "reason": "scored the format",
+                    "citations": [{"slot": "answer", "locator": {"json_pointer": "/text"}}],
+                    "data": data,
+                }
+                if "NULL-DATA" in text:
+                    response["data"] = None
+                if "MISSING-DATA" in text:
+                    response.pop("data")
+                if "EXTRA-FIELD" in text:
+                    response["confidence"] = "s3cr3t"
+                return response

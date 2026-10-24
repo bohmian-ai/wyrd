@@ -39,19 +39,20 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::vala::api::TimePartitionWire;
+use wyrd_spec::vala::api::PhysicalPartitionWire;
 
+use crate::catalog::PhysicalPartition;
 use crate::catalog::TableRef;
-use crate::catalog::layout::TimePartition;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::assembly::{
     ReadyMember, RecoveredMember, ScribeAssemblyKey, StagedMemberId, StagingClaimId,
 };
-use crate::scribe::stream_identity::{NodeId, WriterEpoch};
+use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::tables::AuditLogTable;
+use wyrd_spec::vala::ids::TableVersion;
 
 /// Only staged-record version this server reads or writes.
-const STAGED_RECORD_VERSION: u16 = 1;
+const STAGED_RECORD_VERSION: u16 = 3;
 /// Largest staged record accepted during fail-closed recovery.
 const MAX_STAGED_RECORD_BYTES: u64 = 1024 * 1024;
 /// Bytes read per hash step when validating a run against its record.
@@ -305,12 +306,13 @@ pub struct StagedHotSourceRecordV1 {
     tenant: DataTenantId,
     /// Canonical `<namespace>.<name>` the member belongs to.
     table_fqn: String,
-    /// Lowercase hex user-schema fingerprint the runs were encoded against.
+    /// Lowercase hex physical-schema fingerprint the runs were encoded against.
     schema_fingerprint: String,
-    /// Lowercase hex digest of the canonical physical layout.
-    layout_fingerprint: String,
-    /// Exact physical time partition of every row.
-    partition: TimePartitionWire,
+    /// Table version the rows were accepted under, which recovery resolves
+    /// through the catalog's retained definition, never the current one.
+    table_version: TableVersion,
+    /// Exact physical partition of every row.
+    partition: PhysicalPartitionWire,
     /// Node whose staging volume holds the runs.
     node_id: Uuid,
     /// Fenced writer epoch whose LSN stream produced the rows.
@@ -351,7 +353,7 @@ impl StagedHotSourceRecordV1 {
             tenant: key.tenant(),
             table_fqn: key.table().fqn(),
             schema_fingerprint: hex(&key.schema_fingerprint().0),
-            layout_fingerprint: hex(&key.layout_fingerprint()),
+            table_version: key.table_version(),
             partition: key.partition().to_wire(),
             node_id: key.node_id().as_uuid(),
             writer_epoch: key.writer_epoch().as_i64(),
@@ -408,9 +410,9 @@ impl StagedHotSourceRecordV1 {
     /// Rebuilds the assembly key this member belongs to.
     ///
     /// Recovery has only the record, so the key is reconstructed from its
-    /// recorded fields rather than from a live catalog lookup: a table whose
-    /// registered layout changed after the member was staged must not silently
-    /// merge into a claim with a different sort order.
+    /// recorded fields rather than from a live catalog lookup: a member staged
+    /// under one table version must not silently merge into a claim written
+    /// under another.
     ///
     /// # Errors
     ///
@@ -439,17 +441,18 @@ impl StagedHotSourceRecordV1 {
             SchemaFingerprint(unhex(&self.schema_fingerprint).ok_or_else(|| {
                 invalid("schema fingerprint is not a 32-byte hex digest".to_owned())
             })?);
-        let layout_fingerprint = unhex(&self.layout_fingerprint)
-            .ok_or_else(|| invalid("layout fingerprint is not a 32-byte hex digest".to_owned()))?;
-        let partition = TimePartition::from_wire(self.partition);
-        Ok(ScribeAssemblyKey::from_parts(
+        let partition = PhysicalPartition::from_wire(&self.partition)
+            .map_err(|error| invalid(format!("partition is invalid: {error}")))?;
+        Ok(ScribeAssemblyKey::new(
             self.tenant,
             table,
             schema_fingerprint,
-            layout_fingerprint,
+            self.table_version,
             partition,
-            NodeId::new(self.node_id),
-            WriterEpoch::new(self.writer_epoch),
+            StreamIdentity::new(
+                NodeId::new(self.node_id),
+                WriterEpoch::new(self.writer_epoch),
+            ),
         ))
     }
 
@@ -1164,10 +1167,9 @@ fn unhex(value: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::layout::{PhysicalLayout, TimeGranularity};
+    use crate::catalog::layout::{TimeGranularity, TimePartition};
     use crate::namespaces::BifrostNamespace;
     use crate::tables::DomainTable as _;
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     /// Builds one assembly key for the staged-namespace fixtures.
     ///
@@ -1176,26 +1178,19 @@ mod tests {
     /// Panics when the fixed fixture literals do not resolve, which would be a
     /// fixture bug rather than staged-namespace behavior.
     fn fixture_key() -> ScribeAssemblyKey {
-        let schema = Schema::new(vec![Field::new(
-            "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        )]);
-        let layout = PhysicalLayout::resolve("vala.bifrost.events", &schema, None)
-            .expect("fixture layout resolves");
         ScribeAssemblyKey::new(
             DataTenantId::new_v7(),
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             SchemaFingerprint([3; 32]),
-            &layout,
+            TableVersion::INITIAL.next().expect("version 2"),
             TimePartition::new(
                 TimeGranularity::Hour,
                 chrono::DateTime::from_timestamp(1_772_150_400, 0)
                     .expect("a fixed representable instant"),
             )
-            .expect("a fixed hour boundary"),
-            NodeId::new(Uuid::from_u128(11)),
-            WriterEpoch::new(6),
+            .expect("a fixed hour boundary")
+            .into(),
+            StreamIdentity::new(NodeId::new(Uuid::from_u128(11)), WriterEpoch::new(6)),
         )
     }
 
@@ -1385,7 +1380,7 @@ mod tests {
         );
         let mut encoded: serde_json::Value =
             serde_json::to_value(&record).expect("the record encodes");
-        encoded["version"] = serde_json::json!(2);
+        encoded["version"] = serde_json::json!(STAGED_RECORD_VERSION + 1);
         tokio::fs::write(
             member_directory.join("member.staged.json"),
             serde_json::to_vec(&encoded).expect("the altered record encodes"),
@@ -1401,10 +1396,10 @@ mod tests {
             matches!(
                 error,
                 HotStageError::UnknownVersion {
-                    found: 2,
-                    expected: 1,
+                    found,
+                    expected: STAGED_RECORD_VERSION,
                     ..
-                }
+                } if found == STAGED_RECORD_VERSION + 1
             ),
             "unexpected refusal: {error}"
         );

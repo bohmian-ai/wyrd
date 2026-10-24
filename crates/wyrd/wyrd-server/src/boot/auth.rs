@@ -116,7 +116,6 @@ mod tests {
     use wyrd_runtime::{Permission, PrincipalId};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_spec::reference::CardRefScope;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -149,8 +148,6 @@ mod tests {
                 .expect("static principal id is valid"),
             kind: PrincipalKindTag::User,
             tenant_id: tenant(),
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         }
     }
 
@@ -180,6 +177,8 @@ mod tests {
                     principal: user_principal(),
                     roles: Vec::new(),
                     permissions: std::iter::once(Permission::card_read()).collect(),
+                    card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
+                    workload_uid: None,
                     credential_id: None,
                     act: None,
                     audience: wyrd_spec::auth::TokenAudience::Wyrd,

@@ -17,7 +17,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag, TokenAudience};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, BifrostSecurityViolationKind};
-use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_testing::WyrdTestServer;
 
 use super::query::ServerJourneyError;
 
@@ -196,11 +196,10 @@ async fn subject_actor_decisions_preserve_trusted_identity() -> Result<(), Serve
     let b = server.bootstrap_service("audit-b", &[READER]).await?;
     let c = server.bootstrap_service("audit-c", &[]).await?;
     let a_jwt = a.jwt().ok_or("a user carries a token")?.to_owned();
-    let exchange = async |service: &Bootstrap| -> Result<String, ServerJourneyError> {
-        let key = service.api_key().ok_or("a service carries an API key")?;
-        Ok(server.exchange_api_key(key).await?)
-    };
-    let (b_jwt, c_jwt) = (exchange(&b).await?, exchange(&c).await?);
+    let (b_jwt, c_jwt) = (
+        server.exchange_rooted(&b).await?,
+        server.exchange_rooted(&c).await?,
+    );
     let card = uuid::Uuid::now_v7();
     let read = async |token: Option<&str>| -> Result<StatusCode, ServerJourneyError> {
         let request = Request::builder()
@@ -284,22 +283,21 @@ pub(super) fn find_field<'a>(
     }
 }
 
-/// A retained API-key issuance event keeps the issuing request's verified
-/// pair and delegation history, matching the key's creation pair
+/// A retained credential issuance decision keeps the issuing request's
+/// verified pair, matching the key's creation pair
 /// (REQ-002/010, FIND-TASK-001-5).
 ///
-/// Administrator User A issues one key directly and Service B issues one for
-/// A over HTTP. Each retained `auth.api_key.issue` completion event, located
-/// by its key id, carries the pair the key row was created with — A/A, then
-/// A/B — and exactly the accepted chain: none for A, `[B]` for B acting for A.
-/// No event retains either issued secret.
+/// Administrator User A issues one credential directly and Service B issues
+/// one for A over HTTP. The two retained `auth.credential.issue` decisions
+/// carry the pair each key row was created with: A/A, then A/B for B acting
+/// for A. No event retains either issued secret.
 ///
 /// # Errors
 /// Returns the server, bootstrap, exchange, request, query, or settle failure.
 ///
 /// # Panics
-/// Panics when an issuance fails or a retained event's pair, chain, or
-/// redaction differs.
+/// Panics when an issuance fails or a retained event's pair or redaction
+/// differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn issued_key_audit_keeps_delegation() -> Result<(), ServerJourneyError> {
@@ -309,96 +307,62 @@ async fn issued_key_audit_keeps_delegation() -> Result<(), ServerJourneyError> {
     let b = server.bootstrap_service("issue-b", &["admin"]).await?;
     let target = server.bootstrap_service("issue-target", &[]).await?;
     let a_jwt = a.jwt().ok_or("a user carries a token")?.to_owned();
-    let b_jwt = server
-        .exchange_api_key(b.api_key().ok_or("a service carries an API key")?)
-        .await?;
+    let b_jwt = server.exchange_rooted(&b).await?;
     let b_for_a = server.delegate(&a_jwt, &b_jwt, TokenAudience::Wyrd).await?;
-    let request = wyrd_spec::auth::IssueKeyRequest {
-        card_ref: target.card_ref().ok_or("the target has a Card")?.clone(),
-        label: None,
-        expires_in_seconds: None,
-    };
 
     let mut issued = Vec::new();
-    for (token, chain) in [(&a_jwt, Vec::new()), (&b_for_a, vec![b.id().to_string()])] {
+    for token in [&a_jwt, &b_for_a] {
         let response = server
             .oneshot_authenticated(
                 token,
                 Request::builder()
                     .method("POST")
-                    .uri("/auth/issue-key")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&request)?))?,
+                    .uri(format!("/v1/principals/{}/credentials", target.id()))
+                    .body(Body::empty())?,
             )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 65_536).await?;
-        let key: wyrd_spec::auth::IssueKeyResponse = serde_json::from_slice(&body)?;
-        issued.push((key, chain));
+        let key: wyrd_spec::auth::IssuedCredential = serde_json::from_slice(&body)?;
+        issued.push(key);
     }
 
-    let predicate = format!(
-        "operation = '{}'",
-        wyrd_auth::audit::API_KEY_ISSUE_OPERATION
-    );
     server.await_audit_retained().await?;
     let rows = server
         .retained_audit_records(
             tenant,
             "sub_principal_id, act_principal_id, detail",
-            &predicate,
+            "operation = 'auth.credential.issue'",
         )
         .await?;
-    for (key, chain) in issued {
+    assert_eq!(rows.len(), 2, "one decision per issuance: {rows:?}");
+    for key in issued {
         let mut conn = server.tenant_conn_for(tenant).await?;
         let (sub, act): (uuid::Uuid, uuid::Uuid) = sqlx::query_as(
             "SELECT sub_principal_id, act_principal_id FROM wyrd.auth_api_keys WHERE id = $1",
         )
-        .bind(key.key_id)
+        .bind(key.id)
         .fetch_one(&mut **conn.transaction())
         .await?;
         conn.commit().await?;
-        let completion: Vec<&Vec<Option<String>>> = rows
+        let (sub, act) = (sub.to_string(), act.to_string());
+        let [row] = rows
             .iter()
-            .filter(|row| {
-                row[2]
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains(&key.key_id.to_string()))
-            })
-            .collect();
-        let [row] = completion[..] else {
-            return Err(
-                format!("expected one completion event for {}: {rows:?}", key.key_id).into(),
-            );
+            .filter(|row| row[1].as_deref() == Some(act.as_str()))
+            .collect::<Vec<_>>()[..]
+        else {
+            return Err(format!("expected one decision acted by {act}: {rows:?}").into());
         };
         assert_eq!(
-            (row[0].as_deref(), row[1].as_deref()),
-            (
-                Some(sub.to_string().as_str()),
-                Some(act.to_string().as_str())
-            ),
-            "the completion event keeps the key's creation pair"
-        );
-        let detail: serde_json::Value =
-            serde_json::from_str(row[2].as_deref().ok_or("the event has a detail")?)?;
-        let retained: Vec<String> = find_field(&detail, "delegation_chain")
-            .and_then(serde_json::Value::as_array)
-            .map(|steps| {
-                steps
-                    .iter()
-                    .filter_map(|step| step["principal_id"].as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert_eq!(
-            retained, chain,
-            "the completion event keeps the accepted chain"
+            row[0].as_deref(),
+            Some(sub.as_str()),
+            "the decision keeps the key's creation pair"
         );
         assert!(
             rows.iter()
                 .flatten()
                 .flatten()
-                .all(|text| !text.contains(key.key.expose())),
+                .all(|text| !text.contains(key.credential.expose())),
             "no retained event carries the issued secret"
         );
     }

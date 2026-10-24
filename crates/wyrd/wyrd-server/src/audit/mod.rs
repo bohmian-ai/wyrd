@@ -44,7 +44,7 @@ pub fn audit_event(
         trace_id: None,
         operation: operation.to_owned(),
         resource: resource.to_owned(),
-        card_ref: caller.principal.card_ref().cloned(),
+        card_ref: None,
         sub_principal_id: caller.attribution().sub_principal_id,
         sub_principal_kind: caller.principal.kind.tag(),
         act_principal_id: caller.attribution().act_principal_id,

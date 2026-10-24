@@ -54,7 +54,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex};
 use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec, BuiltinTool, ExecutionRoute};
 use wyrd_spec::card::verifier::{
-    Action, AgentCall, Check, CodeCall, CodeRuntime, CodeSource, VerifierSpec,
+    Action, AgentCall, Check, CodeCall, CodeCheck, CodeRuntime, CodeSource, VerifierSpec,
 };
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SlotName};
@@ -103,7 +103,7 @@ impl Registered {
         let card = temp.path().join("evidence.yaml");
         std::fs::write(
             &card,
-            "apiVersion: wyrd/v1\nkind: Artifact\nmetadata:\n  name: hosted-evidence\n  version: 1.0.0\n  space: default\nartifacts:\n  - relative_path: notes.txt\n    content_type: text/plain\n  - relative_path: check.py\n    content_type: text/x-python\nspec:\n  artifact_kind: dataset\n",
+            "apiVersion: wyrd/v1\nkind: Artifact\nmetadata:\n  name: hosted-evidence\n  version: 1.0.0\nartifacts:\n  - relative_path: notes.txt\n    content_type: text/plain\n  - relative_path: check.py\n    content_type: text/x-python\nspec:\n  artifact_kind: dataset\n",
         )
         .expect("card writes");
         let input = build_declaration_input(load(&card).expect("loader tree builds"))
@@ -863,7 +863,10 @@ async fn capacity_refusal_is_busy_at_every_hosted_consumer() {
         )
     };
     busy(act().await.map(drop), "a code action");
-    let check = Check::Code(call);
+    let check = Check::Code(CodeCheck {
+        call,
+        response_format: None,
+    });
     busy(
         CheckExecutor::execute(
             &code,

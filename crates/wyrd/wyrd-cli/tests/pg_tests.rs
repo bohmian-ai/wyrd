@@ -670,7 +670,6 @@ async fn init_first_run_is_client_ready() {
     let card = cards
         .get(CardSelector::named(
             CardKind::Prompt,
-            "default".parse().expect("space"),
             "ask-prompt".parse().expect("name"),
         ))
         .await
@@ -1313,7 +1312,6 @@ async fn init_saved_settings_survive_working_directory_change() {
         .expect("handle connects")
         .get(CardSelector::named(
             CardKind::Prompt,
-            "default".parse().expect("space"),
             "ask-prompt".parse().expect("name"),
         ))
         .await

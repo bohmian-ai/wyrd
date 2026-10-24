@@ -21,7 +21,7 @@ pub use crate::range::VersionRange;
 pub use crate::spec::VersionSpec;
 
 /// Initial seed version used when registering a card with no prior version in
-/// the (kind, space, name) scope.
+/// the (kind, name) scope.
 ///
 /// # Panics
 ///

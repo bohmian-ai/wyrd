@@ -5,7 +5,7 @@ use pyo3::types::PyAny;
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::reference::CardRef;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
@@ -146,14 +146,18 @@ impl CardRefPy {
     /// `Verifier`, `Service`, `Policy`, `Mcp`, `Audit`, `Artifact`,
     /// `Trigger`, `Operator`, `Source`). External
     /// kinds are not constructable from Python in v1.
-    /// `space` is required; identity is `(kind, name, version, space)`.
+    /// Identity is `(kind, name, version)`; `uid` optionally pins one row.
+    ///
+    /// # Errors
+    /// Returns a validation error when `kind` is not a registrable Card kind,
+    /// or `name`, `version`, or a non-empty `uid` is not well formed. An empty
+    /// `uid` is treated as absent.
     #[new]
-    #[pyo3(signature = (kind, name, version, *, space, uid=None))]
+    #[pyo3(signature = (kind, name, version, *, uid=None))]
     fn __new__(
         kind: &Bound<'_, PyAny>,
         name: &str,
         version: &str,
-        space: &str,
         uid: Option<&str>,
     ) -> WyrdPyResult<Self> {
         let parsed_kind = parse_kind_input(kind)?;
@@ -161,8 +165,6 @@ impl CardRefPy {
             .map_err(|error| WyrdPyError::from(invalid_identity("name", name, error)))?;
         let parsed_version = VersionBlock::parse(version)
             .map_err(|error| WyrdPyError::from(invalid_identity("version", version, error)))?;
-        let parsed_space = SpaceName::new(space)
-            .map_err(|error| WyrdPyError::from(invalid_identity("space", space, error)))?;
         let parsed_uid = match uid {
             None | Some("") => None,
             Some(value) => Some(
@@ -174,7 +176,6 @@ impl CardRefPy {
             kind: parsed_kind,
             name: parsed_name,
             version: parsed_version,
-            space: Some(parsed_space),
             uid: parsed_uid,
         }))
     }
@@ -197,16 +198,6 @@ impl CardRefPy {
         self.0.version.to_string()
     }
 
-    /// Space pinning identity together with name and version.
-    #[getter]
-    fn space(&self) -> String {
-        self.0
-            .space
-            .as_ref()
-            .expect("Python CardRef construction requires a space")
-            .to_string()
-    }
-
     /// Optional resolved UID.
     #[getter]
     fn uid(&self) -> Option<String> {
@@ -227,7 +218,7 @@ impl CardRefPy {
         )?)
     }
 
-    /// The canonical `space/Kind/name@version` text of this reference.
+    /// The canonical `Kind/name@version[#uid]` text of this reference.
     fn __str__(&self) -> String {
         self.0.to_string()
     }
@@ -239,14 +230,10 @@ impl CardRefPy {
             .as_ref()
             .map_or_else(|| "None".to_string(), |u| format!("'{u}'"));
         format!(
-            "CardRef(kind='{}', name='{}', version='{}', space='{}', uid={})",
+            "CardRef(kind='{}', name='{}', version='{}', uid={})",
             self.0.kind.wire_name(),
             self.0.name,
             self.0.version,
-            self.0
-                .space
-                .as_ref()
-                .expect("Python CardRef construction requires a space"),
             uid,
         )
     }

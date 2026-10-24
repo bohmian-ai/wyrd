@@ -17,6 +17,7 @@ mod iceberg_sql;
 pub(crate) mod iceberg_storage;
 pub mod layout;
 mod logical_table_identity;
+pub mod physical_partition;
 mod storage;
 pub mod table_ref;
 pub mod tenant_table;
@@ -24,7 +25,7 @@ mod wire;
 
 pub use bifrost_catalog::{
     BifrostCatalog, CompactionRegistration, CreateTableRequest, MAX_PHYSICAL_LEAF_COLUMNS,
-    PinnedIcebergFile, PinnedSealedTable, TableUid,
+    PinnedIcebergFile, PinnedSealedTable, TableDefinition, TableUid,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use bifrost_catalog::{
@@ -33,10 +34,11 @@ pub use bifrost_catalog::{
 };
 pub use error::BifrostCatalogError;
 pub use layout::{
-    LayoutSortKey, NullOrder, PhysicalLayout, SortDirection, TimeAxis, TimeColumnValues,
-    TimeGranularity, TimePartition, TimePartitionError, TimePrecision,
+    LayoutSortKey, NullOrder, PhysicalLayout, SortDirection, TABLE_VERSION_PROPERTY, TimeAxis,
+    TimeColumnValues, TimeGranularity, TimePartition, TimePartitionError, TimePrecision,
 };
 pub(crate) use logical_table_identity::{LogicalTableIdentity, PhysicalTableProjection};
+pub use physical_partition::{PartitionScheme, PhysicalPartition, PhysicalPartitionError};
 pub use storage::warehouse_uri;
 pub use table_ref::TableRef;
 pub(crate) use tenant_table::PhysicalBindingFacts;

@@ -32,7 +32,8 @@ use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
     Bifrost, CallProvenance, Citation, Locator, MediaFormat, RequirementOutcome, RequirementResult,
-    StepResult, StepStatus, VerificationResult, VerificationVerdict, WyrdClient,
+    StepResult, StepStatus, VerificationOutcome, VerificationResult, VerificationVerdict,
+    WyrdClient,
 };
 use wyrd_spec::auth::TokenAudience;
 use wyrd_testing::server::WyrdTestServer;
@@ -134,7 +135,7 @@ async fn script_investigator(upstream: &MockServer) {
             "call-card",
             TOOLS[0],
             &json!({ "card_ref": {
-                "kind": "Service", "name": "policy-desk", "version": "1.0.0", "space": "default"
+                "kind": "Service", "name": "policy-desk", "version": "1.0.0"
             } }),
         ),
         tool_call(
@@ -163,6 +164,29 @@ async fn answer(upstream: &MockServer, marker: &str, content: &str, priority: u8
         .and(body_string_contains(marker))
         .respond_with(completion(
             json!({ "role": "assistant", "content": content }),
+        ))
+        .with_priority(priority)
+        .mount(upstream)
+        .await;
+}
+
+/// The `scored-judge`'s custom data for an answer naming no scripted case.
+static SCORED: std::sync::LazyLock<Value> =
+    std::sync::LazyLock::new(|| json!({"score": 0.9, "category": "refund"}));
+
+/// Mount the `scored-judge`'s reply to prompts containing both `SCORE:` and
+/// `marker`: a pass citing the answer text, carrying `data`.
+async fn score(upstream: &MockServer, marker: &str, data: &Value, priority: u8) {
+    let verdict = json!({
+        "outcome": "passed", "reason": "scored", "data": data,
+        "citations": [{"slot": "answer", "locator": {"json_pointer": "/text"}}],
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("SCORE:"))
+        .and(body_string_contains(marker))
+        .respond_with(completion(
+            json!({ "role": "assistant", "content": verdict.to_string() }),
         ))
         .with_priority(priority)
         .mount(upstream)
@@ -299,6 +323,22 @@ impl PolicyDesk {
         answer(&upstream, "JUDGE-FOREIGN-CITE", FOREIGN_CITE, 3).await;
         script_investigator(&upstream).await;
         answer(&upstream, "Claim:", FOLLOWS, 4).await;
+        answer(&upstream, "Judge whether", FOLLOWS, 4).await;
+        score(
+            &upstream,
+            "BAD-DATA",
+            &json!({"score": "high", "category": "refund"}),
+            2,
+        )
+        .await;
+        score(
+            &upstream,
+            "HUGE-DATA",
+            &json!({"score": 0.9, "category": "x".repeat(70_000)}),
+            2,
+        )
+        .await;
+        score(&upstream, "SCORE:", &SCORED, 3).await;
         let deployment = Deployment::start_with(
             WyrdTestServer::builder()
                 .with_verification_runtime_for_test()
@@ -311,7 +351,7 @@ impl PolicyDesk {
         let cards = deployment.cards().await;
         let desk = declare(&cards, "cards/verifier_building_blocks/policy-desk.yaml").await;
         let bundle = pull(&cards, &desk.root).await;
-        let client = deployment.client(&deployment.service_key(&desk.root).await);
+        let client = deployment.service_client(&desk.root).await;
         let state = WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
             .expect("bundle loads offline");
         state.start_bifrost().await.expect("Bifrost starts");
@@ -336,6 +376,38 @@ impl PolicyDesk {
             .verify("policy-review", inputs)
             .await
             .expect("the review runs")
+    }
+
+    /// Submit `text` to `scored-review` and return its queued execution.
+    ///
+    /// # Panics
+    /// Panics when the submission is refused or records instead of queuing.
+    async fn submit_scored(&self, text: &str) -> Execution {
+        match self
+            .state
+            .run()
+            .observe()
+            .submit("scored-review", json!({ "text": text }))
+            .await
+            .expect("the review is submitted")
+        {
+            Submission::Queued(execution) => execution,
+            Submission::Recorded => panic!("Run evidence queues an execution"),
+        }
+    }
+
+    /// How many `scored-judge` calls the upstream has received.
+    ///
+    /// # Panics
+    /// Panics when the upstream does not record requests.
+    async fn scored_calls(&self) -> usize {
+        self.upstream
+            .received_requests()
+            .await
+            .expect("the upstream records requests")
+            .iter()
+            .filter(|request| String::from_utf8_lossy(&request.body).contains("SCORE:"))
+            .count()
     }
 
     /// Export a span named `outer`, carrying `policy_id`, with one child
@@ -1177,11 +1249,12 @@ async fn delegated_tools_keep_the_narrower_authority() {
         .expect("the subject's token exchanges");
     let delegated = desk
         .deployment
-        .client(
+        .rooted(
             actor
                 .api_key()
                 .expect("the delegate has a key")
                 .expose_secret(),
+            &desk.root,
         )
         .on_behalf_of(SecretString::from(token), TokenAudience::Wyrd)
         .await
@@ -1213,6 +1286,445 @@ async fn delegated_tools_keep_the_narrower_authority() {
             act_principal_id: actor.id().to_string(),
         }]
     );
+    desk.deployment.shutdown().await;
+}
+
+/// The custom data of `scored-review`'s scored requirements: the Agent
+/// judge's score, the code check's score, and the step check's word count.
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(untagged)]
+enum Scored {
+    /// A score with its category.
+    Score {
+        /// How well the answer did, from 0 to 1.
+        score: f64,
+        /// What the score is about.
+        category: String,
+    },
+    /// A word count.
+    Tally {
+        /// Words in the answer.
+        words: u64,
+    },
+}
+
+/// One retained result's outcome, read back as JSON text.
+#[derive(Debug, Deserialize)]
+struct RetainedOutcome {
+    /// The stored outcome Variant as JSON text.
+    outcome: String,
+}
+
+/// Assert `result` carries `scored-review`'s readback for a four-word answer:
+/// the plain `verdict` and `{kind: verdict}` judges pass with no data, and the
+/// scored Agent, code, and step checks keep their exact custom data, failed
+/// requirements included.
+///
+/// # Panics
+/// Panics when a requirement's outcome, citations, or data differ.
+fn assert_scored(result: &VerificationResult) {
+    for id in ["polite", "on-topic"] {
+        let plain = requirement(result, id);
+        assert_eq!(plain.outcome, RequirementOutcome::Passed, "{id}: {plain:?}");
+        assert_eq!(plain.citations, answer_text(), "{id}");
+        assert_eq!(plain.data, None, "{id}");
+    }
+    let expected = [
+        ("helpful", RequirementOutcome::Passed, SCORED.clone()),
+        (
+            "well-formed",
+            RequirementOutcome::Failed,
+            json!({"score": 0.5, "category": "format"}),
+        ),
+        (
+            "tally-counted",
+            RequirementOutcome::Passed,
+            json!({"words": 4}),
+        ),
+    ];
+    for (id, outcome, data) in expected {
+        let scored = requirement(result, id);
+        assert_eq!(scored.outcome, outcome, "{id}: {scored:?}");
+        assert_eq!(scored.citations, answer_text(), "{id}");
+        assert_eq!(scored.data.clone().map(Value::Object), Some(data), "{id}");
+    }
+    assert_eq!(
+        requirement(result, "tally-counted")
+            .step
+            .as_ref()
+            .expect("a step requirement names its step")
+            .as_str(),
+        "tally"
+    );
+}
+
+/// Valid custom Verdict data survives every read: the direct result, a
+/// queued execution's wait and status, and the retained outcome published to
+/// Bifrost, including hosted-code data exactly at the byte and depth bounds;
+/// the plain formats execute without handwritten schemas and carry no data.
+///
+/// # Panics
+/// Panics when a read loses, changes, or invents data.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn custom_verdict_data_survives_readback() {
+    let desk = PolicyDesk::start().await;
+    let text = "Refunds follow our policy.";
+
+    let direct = desk
+        .state
+        .run()
+        .observe()
+        .verify("scored-review", json!({ "text": text }))
+        .await
+        .expect("the review runs");
+    assert_scored(&direct);
+    let execution = desk.submit_scored(text).await;
+    let waited = execution.wait(WAIT).await.expect("the review settles");
+    assert_scored(&waited);
+    let status = execution.status().await.expect("the status reads");
+    assert_eq!(status.result.as_ref(), Some(&waited));
+
+    assert_eq!(
+        retained(&desk, &waited).await,
+        waited.outcome,
+        "the retained outcome keeps its data"
+    );
+
+    for (marker, data) in exact_data() {
+        let text = format!("{marker} refunds");
+        let direct = desk
+            .state
+            .run()
+            .observe()
+            .verify("scored-review", json!({ "text": text }))
+            .await
+            .expect("the review runs");
+        let kept = |result: &VerificationResult| {
+            requirement(result, "well-formed")
+                .data
+                .clone()
+                .map(Value::Object)
+        };
+        assert_eq!(kept(&direct), Some(data.clone()), "{marker}: direct");
+        let execution = desk.submit_scored(&text).await;
+        let waited = execution.wait(WAIT).await.expect("the review settles");
+        assert_eq!(kept(&waited), Some(data.clone()), "{marker}: wait");
+        let status = execution.status().await.expect("the status reads");
+        assert_eq!(status.result.as_ref(), Some(&waited), "{marker}: status");
+        assert_eq!(
+            retained(&desk, &waited).await,
+            waited.outcome,
+            "{marker}: retained"
+        );
+    }
+    desk.deployment.shutdown().await;
+}
+
+/// The retained outcome of `result`'s execution, read back from Bifrost
+/// after publishing pending rows.
+///
+/// # Panics
+/// Panics when rows do not publish or the execution has not exactly one
+/// decodable retained outcome.
+async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> VerificationOutcome {
+    desk.deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    let retained: Vec<RetainedOutcome> =
+        Bifrost::connect_with(&desk.deployment.admin(), BifrostOptions::default())
+            .await
+            .expect("Bifrost connects")
+            .sql_as(
+                "SELECT to_json(outcome) AS outcome \
+                   FROM vala.verification.results WHERE execution_id = $1",
+                &[QueryParam::String(result.execution_id.to_string())],
+            )
+            .await
+            .expect("the result reads back");
+    let [retained] = retained.as_slice() else {
+        panic!("one retained result: {retained:?}");
+    };
+    serde_json::from_str(&retained.outcome).expect("the outcome decodes")
+}
+
+/// The `well-formed` code check's data at its inclusive bounds, by answer
+/// marker: exactly 65,536 compact bytes of UTF-8 and escapes, the same of a
+/// wide array, and 16 nested containers.
+///
+/// # Panics
+/// Panics when either byte-bound value is not exactly 65,536 compact bytes.
+fn exact_data() -> [(&'static str, Value); 3] {
+    let mut tree = json!("s3cr3t");
+    for _ in 1..16 {
+        tree = json!([tree]);
+    }
+    let data = [
+        (
+            "EXACT-BYTES",
+            json!({"score": 0.5, "category": format!("{}\n\"\u{1}{}", "é".repeat(32_000), "x".repeat(1_499))}),
+        ),
+        (
+            "EXACT-WIDE",
+            json!({"score": 0.5, "category": "format", "tree": vec![0; 32_747]}),
+        ),
+        (
+            "DEEP-16",
+            json!({"score": 0.5, "category": "format", "tree": tree}),
+        ),
+    ];
+    for (marker, value) in &data[..2] {
+        assert_eq!(value.to_string().len(), 65_536, "{marker} is at the bound");
+    }
+    data
+}
+
+/// Custom data the declared schema refuses or that exceeds the 65,536-byte
+/// bound makes its Agent or code requirement inconclusive, with no data and
+/// a reason naming the location or limit rather than the payload. Hosted
+/// code also proves missing, null, and undeclared data, an unknown Verdict
+/// field, one byte over the bound (UTF-8 and escapes, and a wide array), and
+/// 17 containers, and a plain code check refuses data it never declared,
+/// while valid sibling data survives.
+///
+/// # Panics
+/// Panics when invalid data is kept, judged, or echoed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn invalid_custom_verdict_data_is_inconclusive() {
+    let desk = PolicyDesk::start().await;
+
+    for marker in ["BAD-DATA", "HUGE-DATA"] {
+        let result = desk
+            .state
+            .run()
+            .observe()
+            .verify(
+                "scored-review",
+                json!({ "text": format!("{marker} refunds") }),
+            )
+            .await
+            .expect("the review runs");
+        for id in ["helpful", "well-formed"] {
+            let refused = requirement(&result, id);
+            assert_eq!(
+                refused.outcome,
+                RequirementOutcome::Inconclusive,
+                "{marker} {id}: {refused:?}"
+            );
+            assert_eq!(refused.data, None, "{marker} {id}");
+            assert!(
+                !refused.reason.contains("high") && !refused.reason.contains("xxxx"),
+                "{marker} {id}: {}",
+                refused.reason
+            );
+        }
+        assert_eq!(
+            requirement(&result, "tally-counted")
+                .data
+                .clone()
+                .map(Value::Object),
+            Some(json!({"words": 2})),
+            "{marker}: valid data elsewhere is kept"
+        );
+        assert_eq!(result.outcome.verdict, VerificationVerdict::Inconclusive);
+    }
+
+    for marker in [
+        "MISSING-DATA",
+        "NULL-DATA",
+        "EXTRA-DATA",
+        "EXTRA-FIELD",
+        "OVER-BYTES",
+        "OVER-WIDE",
+        "DEEP-17",
+    ] {
+        let result = desk
+            .state
+            .run()
+            .observe()
+            .verify(
+                "scored-review",
+                json!({ "text": format!("{marker} refunds") }),
+            )
+            .await
+            .expect("the review runs");
+        let refused = requirement(&result, "well-formed");
+        assert_eq!(
+            refused.outcome,
+            RequirementOutcome::Inconclusive,
+            "{marker}: {refused:?}"
+        );
+        assert_eq!(refused.data, None, "{marker}");
+        assert!(
+            !refused.reason.contains("s3cr3t") && !refused.reason.contains("xxxx"),
+            "{marker}: {}",
+            refused.reason
+        );
+        assert_eq!(
+            requirement(&result, "helpful")
+                .data
+                .clone()
+                .map(Value::Object),
+            Some(SCORED.clone()),
+            "{marker}: the Agent's valid data is kept"
+        );
+        assert_eq!(
+            requirement(&result, "tally-counted")
+                .data
+                .clone()
+                .map(Value::Object),
+            Some(json!({"words": 2})),
+            "{marker}: valid data elsewhere is kept"
+        );
+    }
+
+    let result = desk
+        .state
+        .run()
+        .observe()
+        .verify("scored-review", json!({ "text": "ENVELOPE-DATA refunds" }))
+        .await
+        .expect("the review runs");
+    let refused = requirement(&result, "plainly-checked");
+    assert_eq!(
+        refused.outcome,
+        RequirementOutcome::Inconclusive,
+        "{refused:?}"
+    );
+    assert_eq!(refused.data, None);
+    assert!(!refused.reason.contains("s3cr3t"), "{}", refused.reason);
+    assert_eq!(
+        requirement(&result, "well-formed")
+            .data
+            .clone()
+            .map(Value::Object),
+        Some(json!({"score": 0.5, "category": "format"})),
+        "a declared sibling keeps its data"
+    );
+    desk.deployment.shutdown().await;
+}
+
+/// Typed verify, wait, deadline wait, and status return the caller's type
+/// for every present data object, failed requirements included, and leave
+/// absent data absent.
+///
+/// # Panics
+/// Panics when a typed read fails or returns different data.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn custom_verdict_data_is_typed_on_return() {
+    let desk = PolicyDesk::start().await;
+    let text = "Refunds follow our policy.";
+    let expected = |result: &VerificationResult<Scored>| {
+        let data = |id: &str| {
+            result
+                .outcome
+                .requirements
+                .iter()
+                .find(|requirement| requirement.id.as_str() == id)
+                .and_then(|requirement| requirement.data.as_ref())
+        };
+        assert_eq!(data("polite"), None);
+        assert_eq!(
+            data("helpful"),
+            Some(&Scored::Score {
+                score: 0.9,
+                category: "refund".to_owned()
+            })
+        );
+        assert_eq!(
+            data("well-formed"),
+            Some(&Scored::Score {
+                score: 0.5,
+                category: "format".to_owned()
+            })
+        );
+        assert_eq!(data("tally-counted"), Some(&Scored::Tally { words: 4 }));
+    };
+
+    let direct = desk
+        .state
+        .run()
+        .observe()
+        .verify_typed::<Scored>("scored-review", json!({ "text": text }))
+        .await
+        .expect("the typed review runs");
+    expected(&direct);
+    let execution = desk.submit_scored(text).await;
+    expected(
+        &execution
+            .wait_typed::<Scored>(WAIT)
+            .await
+            .expect("typed wait"),
+    );
+    expected(
+        &execution
+            .wait_until_typed::<Scored>(tokio::time::Instant::now() + WAIT)
+            .await
+            .expect("typed deadline wait"),
+    );
+    let status = execution
+        .status_typed::<Scored>()
+        .await
+        .expect("typed status");
+    expected(status.result.as_ref().expect("a settled result"));
+    desk.deployment.shutdown().await;
+}
+
+/// A caller type the data does not fit fails every typed read with
+/// `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the requirement and
+/// the data root, never the payload or a returned key, while the ordinary read keeps the original
+/// result and nothing is judged again.
+///
+/// # Panics
+/// Panics when a mismatch decodes, leaks, mutates, or reruns.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn typed_verdict_data_mismatch_keeps_original_result() {
+    /// Numbers only, which the scores' text categories do not fit.
+    type ScoreOnly = std::collections::BTreeMap<String, f64>;
+    let desk = PolicyDesk::start().await;
+    let text = "Refunds follow our policy.";
+    let mismatch = |error: wyrd_ai::WyrdError| {
+        let problem = error.problem();
+        assert_eq!(problem.code, "WYRD_SDK_422_VERIFICATION_DATA_INVALID");
+        assert_eq!(problem.details["requirement"], "helpful");
+        assert_eq!(problem.details["path"], "", "the safe data root");
+        assert!(!problem.detail.contains("refund"), "{}", problem.detail);
+    };
+
+    mismatch(
+        desk.state
+            .run()
+            .observe()
+            .verify_typed::<ScoreOnly>("scored-review", json!({ "text": text }))
+            .await
+            .expect_err("the word count is not a score"),
+    );
+    let execution = desk.submit_scored(text).await;
+    let ordinary = execution.wait(WAIT).await.expect("the review settles");
+    let judged = desk.scored_calls().await;
+    mismatch(
+        execution
+            .wait_typed::<ScoreOnly>(WAIT)
+            .await
+            .expect_err("typed wait"),
+    );
+    mismatch(
+        execution
+            .status_typed::<ScoreOnly>()
+            .await
+            .expect_err("typed status"),
+    );
+    assert_eq!(
+        execution.status().await.expect("the status reads").result,
+        Some(ordinary),
+        "the stored result is unchanged"
+    );
+    assert_eq!(desk.scored_calls().await, judged, "nothing is judged again");
     desk.deployment.shutdown().await;
 }
 

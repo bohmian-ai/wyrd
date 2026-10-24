@@ -1,17 +1,26 @@
 //! A tenant administrator discovers principals and grants and revokes their
 //! Roles through `Principals`; each change reaches the principal's next token.
+//! One stable Service account runs every release of its family, each run
+//! keeping its own exact root.
+
+use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::json;
 use wyrd_ai::auth::{
-    PrincipalId, PrincipalKindTag, PrincipalQuery, Principals, RoleAssignment, RoleSource,
+    CreateServicePrincipalRequest, PrincipalId, PrincipalKindTag, PrincipalQuery, Principals,
+    RevokePrincipalRequest, RoleAssignment, RoleSource, WorkloadFamily, WorkloadKind,
+    WorkloadRestriction,
 };
-use wyrd_ai::bifrost::BifrostOptions;
-use wyrd_ai::cards::{CardRef, Cards};
-use wyrd_ai::cli;
+use wyrd_ai::bifrost::{BifrostOptions, QueryParam};
+use wyrd_ai::cards::Cards;
+use wyrd_ai::observe::Run;
+use wyrd_ai::state::WyrdState;
 use wyrd_ai::{Bifrost, WyrdError};
 use wyrd_testing::Bootstrap;
+use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::{Deployment, coordinates, declare, fixture};
+use crate::support::{Deployment, declare, fixture, pull, runtime_account};
 
 /// A tenant-wide query over a built-in table, which `workload` permits.
 const TENANT_WIDE: &str = "SELECT COUNT(*) AS n FROM vala.drift.observations";
@@ -34,32 +43,26 @@ fn assignment(role: &str, source: RoleSource) -> RoleAssignment {
     }
 }
 
-/// A deployment with the observed Service registered, and the principal and
-/// key the `issue_key` CLI function issues for it.
+/// A deployment with a new Service account holding only `workload`, its
+/// principal id, and its first key.
 ///
 /// # Panics
-/// Panics when registration or issuance fails.
+/// Panics when the account cannot be created.
 async fn service_principal() -> (Deployment, PrincipalId, String) {
     let deployment = Deployment::start().await;
-    let cards = deployment.cards().await;
-    declare(&cards, "cards/observe_a_run/observed-model.yaml").await;
-    let service: CardRef = declare(&cards, "cards/observe_a_run/observed-service.yaml")
+    let created = Principals::connect_with(&deployment.admin())
         .await
-        .root;
-    let [kind, name, version, space] = coordinates(&service);
-    let issued = cli::issue_key(
-        &kind,
-        &name,
-        &version,
-        &space,
-        None,
-        None,
-        Some(deployment.admin()),
-    )
-    .await
-    .expect("the CLI issues the Service key");
-    let key = issued.key.expose().to_owned();
-    (deployment, issued.principal_id, key)
+        .expect("handle connects")
+        .create_service_principal(&CreateServicePrincipalRequest {
+            name: "observed-service-runtime".to_owned(),
+            roles: vec!["workload".to_owned()],
+            description: None,
+            workload_restriction: None,
+        })
+        .await
+        .expect("the Service account is created");
+    let key = created.credential.expose().to_owned();
+    (deployment, created.principal_id, key)
 }
 
 /// Register [`AUTHORED`] as the principal holding `key`, through a fresh
@@ -221,5 +224,171 @@ async fn direct_and_idp_user_assignments_coexist() {
         .expect("the administrator revokes viewer");
     assert!(revoked.changed);
     assert_eq!(revoked.roles, [assignment("viewer", RoleSource::Idp)]);
+    deployment.shutdown().await;
+}
+
+/// Access-token lifetime of the stable-account story: five seconds longer
+/// than the client's 30-second refresh skew, so a cached token is renewed
+/// after [`PAST_REUSE_WINDOW`].
+const ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(35);
+
+/// Wait after which a cached token is inside the refresh skew.
+const PAST_REUSE_WINDOW: Duration = Duration::from_secs(6);
+
+/// One `vala.drift.observations` row's subject and run.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct Observed {
+    /// The observed Card.
+    card_uid: String,
+    /// The run the sample belongs to.
+    run_id: String,
+}
+
+/// Submit one `observed-drift` latency sample for `run`'s Model.
+///
+/// # Panics
+/// Panics when the submission is refused.
+async fn observe(run: &Run) {
+    run.for_card("model")
+        .expect("model view resolves")
+        .observe()
+        .submit("observed-drift", json!({ "latency": 12.5 }))
+        .await
+        .expect("the sample is submitted");
+}
+
+/// One administrator-provisioned Service account runs two releases of its
+/// family: it is restricted to the family, a second account cannot claim the
+/// family, one client of its key drives a state per release concurrently and
+/// across token renewal with each run's samples landing on the shared Model,
+/// a root of another family is refused, and revoking the account ends every
+/// exchange of its key.
+///
+/// # Panics
+/// Panics when a step fails or an outcome differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn stable_accounts_preserve_execution_identity() {
+    let deployment =
+        Deployment::start_with(WyrdTestServer::builder().with_access_ttl(ACCESS_TTL)).await;
+    let cards = deployment.cards().await;
+    declare(&cards, "cards/observe_a_run/observed-model.yaml").await;
+    let first = declare(&cards, "cards/observe_a_run/observed-service.yaml").await;
+    let second = declare(&cards, "cards/observe_a_run/observed-service-2.yaml").await;
+    let (first_bundle, second_bundle) = (
+        pull(&cards, &first.root).await,
+        pull(&cards, &second.root).await,
+    );
+    let admin = deployment.admin();
+    let principals = Principals::connect_with(&admin)
+        .await
+        .expect("handle connects");
+    let (account, key) = runtime_account(&admin, &first.root).await;
+    let family = WorkloadRestriction::Family(WorkloadFamily {
+        kind: WorkloadKind::Service,
+        name: first.root.name.clone(),
+    });
+
+    let listed = principals
+        .list(&PrincipalQuery {
+            name: Some("observed-service-runtime".to_owned()),
+            ..PrincipalQuery::default()
+        })
+        .await
+        .expect("principals list")
+        .principals;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].principal_id, account);
+    assert_eq!(listed[0].workload_restriction.as_ref(), Some(&family));
+    let spare = principals
+        .create_service_principal(&CreateServicePrincipalRequest {
+            name: "spare-runtime".to_owned(),
+            roles: vec!["workload".to_owned()],
+            description: None,
+            workload_restriction: Some(WorkloadRestriction::Unrestricted),
+        })
+        .await
+        .expect("an unrestricted account is created");
+    let conflict = principals
+        .set_workload_restriction(&spare.principal_id, &family)
+        .await
+        .expect_err("the family already has its runtime account");
+    assert_eq!(conflict.code(), "WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT");
+
+    let client = deployment.client(&key);
+    let states = [&first_bundle, &second_bundle].map(|bundle| {
+        WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
+            .expect("bundle loads offline")
+    });
+    for state in &states {
+        state.start_bifrost().await.expect("Bifrost starts");
+    }
+    let runs = [states[0].run(), states[1].run()];
+    tokio::join!(observe(&runs[0]), observe(&runs[1]));
+    tokio::time::sleep(PAST_REUSE_WINDOW).await;
+    tokio::join!(observe(&runs[0]), observe(&runs[1]));
+    for state in &states {
+        state.shutdown().await.expect("samples drain");
+    }
+    deployment
+        .server()
+        .flush_bifrost()
+        .await
+        .expect("rows publish");
+    let model = states[0]
+        .card_ref("model")
+        .expect("model resolves")
+        .uid
+        .clone()
+        .expect("hydrated Card carries its UID")
+        .to_string();
+    let bifrost = Bifrost::connect_with(&admin, BifrostOptions::default())
+        .await
+        .expect("Bifrost connects");
+    for run in &runs {
+        let run_id = run.run_id().to_string();
+        let rows: Vec<Observed> = bifrost
+            .sql_as(
+                "SELECT card_uid, run_id FROM vala.drift.observations WHERE run_id = $1",
+                &[QueryParam::String(run_id.clone())],
+            )
+            .await
+            .expect("rows read back");
+        let expected = Observed {
+            card_uid: model.clone(),
+            run_id,
+        };
+        assert_eq!(rows, [expected.clone(), expected]);
+    }
+
+    let foreign = states[0]
+        .card_ref("agent")
+        .expect("agent resolves")
+        .uid
+        .clone()
+        .expect("hydrated Card carries its UID");
+    let refused = client
+        .for_workload(foreign)
+        .access_token()
+        .await
+        .expect_err("a root outside the family is refused");
+    assert_eq!(refused.code(), "WYRD_AUTH_401_WORKLOAD_UID_REFUSED");
+
+    principals
+        .revoke_principal(
+            &account,
+            &RevokePrincipalRequest {
+                principal_kind: PrincipalKindTag::Service,
+                reason: "the Service is retired".to_owned(),
+            },
+        )
+        .await
+        .expect("the account is revoked");
+    let revoked = deployment
+        .client(&key)
+        .access_token()
+        .await
+        .expect_err("a revoked account's key no longer exchanges");
+    assert_eq!(revoked.code(), "WYRD_AUTH_401_API_KEY_INVALID");
     deployment.shutdown().await;
 }

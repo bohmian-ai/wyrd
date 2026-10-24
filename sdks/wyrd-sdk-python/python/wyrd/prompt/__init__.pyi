@@ -1559,7 +1559,7 @@ class Prompt:
         *,
         provider: str,
         system: str | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         operation: str | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
@@ -1586,6 +1586,10 @@ class Prompt:
                 ``instructions``. Omitted, no system instruction is sent.
             response_format: a ``ResponseFormat``, or a JSON Schema object or
                 Pydantic model class used as a schema named ``"response"``.
+                ``"verdict"`` asks for Wyrd's Verdict, and
+                ``{"kind": "verdict", "data": Model}`` adds a required custom
+                ``data`` object, given as a JSON Schema or Pydantic model
+                class; the Prompt keeps the name and Wyrd supplies the schema.
                 Omitted, the provider's default text output applies.
             output: a structured-output declaration that replaces
                 ``response_format`` when both are set. A Pydantic model class
@@ -1623,7 +1627,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         cache: str | Mapping[str, Any] | None = ...,
         model_settings: OpenAISettings | Mapping[str, Any] | None = ...,
@@ -1656,7 +1660,7 @@ class Prompt:
         *,
         instructions: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: OpenAIResponsesSettings | Mapping[str, Any] | None = ...,
     ) -> Prompt:
@@ -1687,7 +1691,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: AnthropicSettings | Mapping[str, Any] | None = ...,
     ) -> Prompt:
@@ -1718,7 +1722,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
     ) -> Prompt:
@@ -1749,7 +1753,7 @@ class Prompt:
         *,
         system: str | None = ...,
         messages: Any | None = ...,
-        response_format: ResponseFormat | type | JsonDict | None = ...,
+        response_format: ResponseFormat | type | str | JsonDict | None = ...,
         output: dict[str, type] | type | JsonDict | ResponseFormat | None = ...,
         model_settings: GeminiSettings | Mapping[str, Any] | None = ...,
     ) -> Prompt:
@@ -2228,16 +2232,15 @@ class PromptReference:
     prompt: Prompt | None
 
     @staticmethod
-    def card(name: str, version: str, *, space: str, uid: str | None = ...) -> PromptReference:
+    def card(name: str, version: str, *, uid: str | None = ...) -> PromptReference:
         """Reference a declared Prompt Card.
 
         Args:
             name: the card name.
             version: the card version or version requirement, such as
                 ``"1.2.3"``.
-            space: the card space; must not be empty.
             uid: the exact card UID. Omitted, the reference is resolved by
-                space, name, and version.
+                name and version.
 
         Returns:
             the Prompt Card reference.
@@ -2338,7 +2341,7 @@ class PromptCard:
     turned into a ``CardRef``, not when they are assigned.
 
     Attributes:
-        space, name, version, uid: the card identity; assignable.
+        name, version, uid: the card identity; assignable.
         labels: queryable user labels; assignable.
         annotations: free-form user annotations; assignable.
         metadata: the stored ``PromptCardMetadata``; assigning it replaces the
@@ -2353,7 +2356,6 @@ class PromptCard:
         is_fully_bound: ``True`` when the prompt declares no text variables.
     """
 
-    space: str
     name: str
     version: str
     uid: str
@@ -2375,7 +2377,6 @@ class PromptCard:
     def __init__(
         self,
         prompt: Prompt,
-        space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
         uid: str | None = ...,
@@ -2393,8 +2394,6 @@ class PromptCard:
 
         Args:
             prompt: the prompt to store.
-            space: the card space. Omitted, the repository's Wyrd config
-                default applies, else ``"default"``.
             name: the card name. Omitted, ``"prompt"``.
             version: the card version. Omitted, ``"0.1.0"``.
             uid: the card UID. Omitted, a new UUIDv7.
@@ -2461,7 +2460,7 @@ class PromptCard:
 
         Raises:
             WyrdError: when the file cannot be read or parsed, or is not a
-                ``wyrd/v1`` Prompt envelope with a space, uid, and version.
+                ``wyrd/v1`` Prompt envelope with a uid and version.
         """
         ...
 
@@ -2508,7 +2507,7 @@ class PromptCard:
 
         Raises:
             WyrdError: when the JSON is invalid or is not a ``wyrd/v1``
-                Prompt envelope with a space, uid, and version.
+                Prompt envelope with a uid and version.
         """
         ...
 

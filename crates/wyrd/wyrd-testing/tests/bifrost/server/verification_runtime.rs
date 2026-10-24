@@ -132,6 +132,7 @@ fn drift_outcome(report: Option<DriftReport>) -> Result<VerificationOutcome, Ser
             reason: "scored by the journey".to_owned(),
             actual: None,
             citations: Vec::new(),
+            data: None,
             detail: report.map(RequirementDetail::Drift),
             check: serde_json::from_value::<Check>(json!({
                 "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": true
@@ -201,7 +202,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
         .await?;
     // Activation arms the cursor at the next hour's boundary; the occurrence
     // is brought due in the database, which owns the schedule clock.
-    seed.activate(owner_principal).await?;
+    seed.activate(owner_principal, &owner).await?;
     seed.make_binding_due(binding).await?;
     let script = EngineScript::default();
     script.push(EngineOutcome::Completed(drift_outcome(Some(
@@ -332,7 +333,7 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
     let binding = seed
         .bind_schedule(&owner, &subject, &verifier, MONTHLY, Vec::new())
         .await?;
-    seed.activate(owner_principal).await?;
+    seed.activate(owner_principal, &owner).await?;
     seed.make_binding_due(binding).await?;
     // The runner node hosts no Oracle, so the peer that serves the read
     // stages its decision; the cluster barrier drains every Oracle first.
@@ -423,15 +424,23 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         .find(|server| server.bifrost_scribe().is_some())
         .ok_or("the cluster composed no Scribe")?;
     let seed = VerificationFixture::provision(oracle.state().postgres.wyrd(), tenant).await?;
+    let subject_ref = scribe
+        .bootstrap_service_in_tenant(tenant, "shared-subject", &[])
+        .await?
+        .card_ref()
+        .ok_or("a service bootstrap returned a user")?
+        .clone();
+    // The family's runtime account owns the scheduled bindings and writes the
+    // observations at the subject root.
     let Bootstrap::Machine {
         id: client,
         api_key,
-        card_ref: subject_ref,
+        ..
     } = scribe
-        .bootstrap_service_in_tenant(tenant, "shared-subject", &["admin"])
+        .credential_registered_service(&subject_ref, &["admin"])
         .await?
     else {
-        return Err("a service bootstrap returned a user".into());
+        return Err("a service credential returned a user".into());
     };
     let subject = subject_ref
         .uid
@@ -459,7 +468,8 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         scribe.base_url(),
         Some(api_key.expose_secret()),
         scribe.grpc_url().as_deref(),
-    )?;
+    )?
+    .for_workload(subject.clone());
     Bifrost::connect_with(&writer, BifrostOptions::default())
         .await?
         .write_batch(
@@ -467,7 +477,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
             &observation_batch(&record, &subject, observed_in_current_month(Utc::now())?)?,
         )
         .await?;
-    seed.activate(client).await?;
+    seed.activate(client, &subject).await?;
     for (_, binding) in &bindings {
         seed.make_binding_due(*binding).await?;
     }
@@ -823,7 +833,7 @@ impl<'a> ResultLayoutJourney<'a> {
         let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
         let (subject, _) = seed.service("layout-subject").await?;
         let uid = seed.drift_verifier("layout-drift").await?;
-        let verifier: CardRef = format!("default/Verifier/layout-drift@1.0.0#{uid}").parse()?;
+        let verifier: CardRef = format!("Verifier/layout-drift@1.0.0#{uid}").parse()?;
         for (namespace, name) in [("verification", "results"), ("drift", "result_features")] {
             server
                 .ensure_builtin_table_for_test(tenant, namespace, name)
@@ -879,6 +889,7 @@ impl<'a> ResultLayoutJourney<'a> {
                 card_uid: &self.subject,
                 owner_card_uid: Some(&self.subject),
                 group_id: None,
+                deployment_environment: None,
                 binding_id: Some(BindingId::new_v7()),
                 trigger: None,
                 window: Some(&window),
@@ -1280,16 +1291,17 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// bucket set keeps a child value is refused as a partial Struct.
 /// Precedence is pinned: an oversized value that is also
 /// malformed reports its size, a wrong marker on one field outranks invalid
-/// bytes in another, and an undeclared column or a non-Variant type change
-/// outranks each of invalid, over-deep, and oversized Variant bytes. A JSON
+/// bytes in another, and an undeclared column or a non-Variant type change,
+/// each a schema-conformance conflict with the registered schema, outranks
+/// each of invalid, over-deep, and oversized Variant bytes. A JSON
 /// row whose Variant holds an out-of-range integer beside an over-deep branch
 /// is refused for numeric range in both key orders, and also when the integer
 /// sits inside the over-deep branch, before any ACK; that JSON row encodes
 /// against `vala.verification.execution_inputs` on the client.
 /// `vala.traces.spans` covers the Variant nested in `events`, with a missing
 /// marker and with foreign extension metadata, named by its top-level column.
-/// A non-Variant type change on a signal column is refused as an unsupported
-/// type. Afterward the same server accepts the valid sentinel frames and only
+/// A non-Variant type change on a signal column is refused as a
+/// schema-conformance conflict. Afterward the same server accepts the valid sentinel frames and only
 /// they are readable, so no refused frame persisted a row; the accepted log
 /// record's scale-zero `u64::MAX` decimal reads back with every digit.
 ///
@@ -1616,17 +1628,8 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     };
     let frame =
         admission.records_frame(&refused, (inputs(), valid()?), (activation(), valid()?))?;
-    let retyped = BifrostError::UnsupportedType {
-        field: "severity_number".to_owned(),
-        data_type: DataType::Int64.to_string(),
-    };
     admission
-        .refuse(
-            "a non-Variant type change",
-            RECORDS,
-            &wide_severity(frame)?,
-            &retyped,
-        )
+        .refuse_conformance("a non-Variant type change", RECORDS, &wide_severity(frame)?)
         .await?;
     let variant_defects = [
         ("invalid", invalid()?),
@@ -1645,22 +1648,17 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             )
         };
         admission
-            .refuse(
+            .refuse_conformance(
                 &format!("an undeclared column outranks {defect} Variant bytes"),
                 RECORDS,
                 &undeclared(frame()?)?,
-                &BifrostError::UndeclaredField {
-                    field: "undeclared".to_owned(),
-                    row: 0,
-                },
             )
             .await?;
         admission
-            .refuse(
+            .refuse_conformance(
                 &format!("a non-Variant type change outranks {defect} Variant bytes"),
                 RECORDS,
                 &wide_severity(frame()?)?,
-                &retyped,
             )
             .await?;
     }
@@ -2165,6 +2163,27 @@ impl VariantAdmissionJourney {
         }
     }
 
+    /// Require that `batch` is refused as a schema-conformance conflict
+    /// against its table's registered schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description naming `what` when the frame is acked or the
+    /// refusal is any other error.
+    async fn refuse_conformance(
+        &self,
+        what: &str,
+        table: &str,
+        batch: &RecordBatch,
+    ) -> Result<(), ServerJourneyError> {
+        match self.refusal(table, batch).await? {
+            WyrdError::Vala {
+                error: BifrostError::FingerprintMismatch { .. },
+            } => Ok(()),
+            other => Err(format!("{what} was refused as {other:?}").into()),
+        }
+    }
+
     /// Require that `batch` is acknowledged.
     ///
     /// # Errors
@@ -2472,6 +2491,7 @@ impl TypedPayloadJourney {
                     card_uid: &subject,
                     owner_card_uid: Some(&subject),
                     group_id: None,
+                    deployment_environment: None,
                     binding_id: Some(BindingId::new_v7()),
                     trigger: None,
                     window: Some(&window),
@@ -2717,7 +2737,10 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
         return Err("A bootstraps a user".into());
     };
     let a_token = a_token.clone();
+    // B delegates while running as the verified subject, which its Card
+    // scope must cover.
     let delegated = super::query::client_for(&server, b.api_key().ok_or("B carries an API key")?)?
+        .for_workload(subject.clone())
         .on_behalf_of(
             secrecy::SecretString::from(a_token),
             wyrd_spec::auth::TokenAudience::Wyrd,
@@ -2901,7 +2924,10 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
         .bootstrap_service("history-b", &[QUEUED_RUNNER])
         .await?;
     let a_token = a.jwt().ok_or("A bootstraps a user")?.to_owned();
+    // B delegates while running as the verified subject, which its Card
+    // scope must cover.
     let delegated = super::query::client_for(&server, b.api_key().ok_or("B carries an API key")?)?
+        .for_workload(subject.clone())
         .on_behalf_of(
             secrecy::SecretString::from(a_token),
             wyrd_spec::auth::TokenAudience::Wyrd,
@@ -3009,7 +3035,7 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
     let binding = seed
         .bind_schedule(&owner, &subject, &verifier, MONTHLY, Vec::new())
         .await?;
-    seed.activate(owner_principal).await?;
+    seed.activate(owner_principal, &owner).await?;
     seed.make_binding_due(binding).await?;
 
     let runtime = VerificationRuntime::builder(server.state())
@@ -3166,9 +3192,11 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
     let b = server
         .bootstrap_service("widen-b", &[QUEUED_RUNNER])
         .await?;
+    // B delegates while running as the verified subject, which its Card
+    // scope must cover.
     let b_token = async || -> Result<String, ServerJourneyError> {
         Ok(server
-            .exchange_api_key(b.api_key().ok_or("B carries an API key")?)
+            .exchange_api_key_for_workload(b.api_key().ok_or("B carries an API key")?, &subject)
             .await?)
     };
     let initiating = server
@@ -4439,5 +4467,242 @@ async fn shared_shutdown_drains_producers_workers_and_acknowledgements()
     if drained.is_ok() {
         return Err("an expired drain with a held call reported a clean shutdown".into());
     }
+    Ok(())
+}
+
+/// A client of `server` authenticating with `credential`, an API key or an
+/// access token.
+///
+/// # Errors
+/// Returns an error when the client cannot be assembled.
+fn native_client(
+    server: &WyrdTestServer,
+    credential: &str,
+) -> Result<wyrd_client::WyrdClient, ServerJourneyError> {
+    Ok(wyrd_client::bifrost::client_from_options(
+        server.base_url(),
+        Some(credential),
+        server.grpc_url().as_deref(),
+    )?)
+}
+
+/// Send one row of the `(id, value)` table `fqn` over the native ingest wire
+/// as `client`, correlated to `card` when given, and return the server's
+/// answer.
+///
+/// # Errors
+/// Returns the server's stable refusal, or a harness error when the ingest
+/// channel cannot be dialled.
+///
+/// # Panics
+/// Panics when the row does not prepare against `preflight`.
+async fn native_row(
+    client: &wyrd_client::WyrdClient,
+    fqn: &str,
+    preflight: &wyrd_queue::RowPreflight,
+    card: Option<&CardUid>,
+) -> Result<(), WyrdError> {
+    let rows = preflight
+        .prepare(&[r#"{"id": 1, "value": "native"}"#], card, None)
+        .expect("the row prepares");
+    wyrd_testing::bifrost::write::RawIngest::connect(client)
+        .await?
+        .insert(
+            fqn,
+            uuid::Uuid::now_v7(),
+            rows.to_ipc().expect("the row encodes"),
+        )
+        .await
+        .map(|_request_id| ())
+}
+
+/// A normal User bearer with a loaded `WyrdState` writes native observations:
+/// the state selects its Service root on every frame, the server narrows the
+/// rootless User bearer to that validated root before Gate admission, and the
+/// row lands correlated to the bundle's Model under the User's own identity.
+///
+/// Selection only ever narrows. An unknown root and a non-Service root are
+/// refused as unusable, a bearer signed for one root that selects another is
+/// refused as mismatched, a User without a write grant is refused, and a row
+/// correlated to a Card outside the selected root's graph is refused, each
+/// before any ACK. A rooted machine and a rootless User sending no selector
+/// keep their native behavior.
+///
+/// # Errors
+/// Returns server, fixture, bundle, client, state, flush, or query failures.
+///
+/// # Panics
+/// Panics when an accepted write is refused, a refused write is accepted or
+/// refused with another code, or the observation lands under another identity
+/// or Card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn user_state_native_io_selects_validated_root() -> Result<(), ServerJourneyError> {
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let admin_key = server
+        .bootstrap_service("native-user-admin", &["admin"])
+        .await?;
+    let admin = native_client(
+        &server,
+        admin_key
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let cards = wyrd_client::cards::Cards::connect_with(&admin).await?;
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    let model = Box::pin(cards.declare_from_path(&fixtures.join("observed-model.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Model has a UID")?;
+    let service = Box::pin(cards.declare_from_path(&fixtures.join("observed-service.yaml")))
+        .await?
+        .root;
+    let service_uid = service.uid.clone().ok_or("the Service has a UID")?;
+    let other = Box::pin(cards.declare_from_path(&fixtures.join("configured-service.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the other Service has a UID")?;
+    let bundle = tempfile::tempdir()?;
+    Box::pin(
+        wyrd_client::cards::CardGraphPuller::new(cards.registry_context()).pull(
+            &wyrd_client::cards::CardSelector::exact(service.clone()),
+            &bundle.path().join("bundle"),
+            wyrd_client::cards::BundleMode::Complete,
+        ),
+    )
+    .await?;
+    let user = |name: &'static str, role: &'static str| {
+        let server = &server;
+        async move {
+            match server.bootstrap_user(name, &[role]).await? {
+                Bootstrap::User { id, jwt } => Ok::<_, ServerJourneyError>((id, jwt)),
+                Bootstrap::Machine { .. } => Err("a user bootstraps as a user".into()),
+            }
+        }
+    };
+    let (editor_id, editor_jwt) = user("native-user-editor", "editor").await?;
+    let editor = native_client(&server, &editor_jwt)?;
+
+    let state = wyrd_client::state::WyrdState::from_path_with(
+        bundle.path().join("bundle"),
+        editor.clone(),
+    )?;
+    state
+        .start_bifrost_with_config(None, wyrd_client::QueueConfig::default())
+        .await?;
+    state
+        .run()
+        .for_card("model")?
+        .observe()
+        .submit("observed-drift", json!({ "latency": 12.5 }))
+        .await?;
+    state.shutdown().await?;
+    server.flush_bifrost().await?;
+    let landed: Vec<Value> = Bifrost::query_only(&admin)
+        .sql_as(
+            "SELECT CAST(card_uid AS VARCHAR) AS card_uid, \
+             CAST(sub_principal_id AS VARCHAR) AS sub_principal_id \
+             FROM vala.drift.observations",
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        landed,
+        vec![json!({ "card_uid": model.to_string(), "sub_principal_id": editor_id.to_string() })],
+        "the User's state observation lands on its Model under the User"
+    );
+
+    let fqn = format!(
+        "vala.datasets.native_user_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    Bifrost::connect_with(
+        &admin,
+        BifrostOptions {
+            table: Some(TableConfig::from_arrow(
+                &fqn,
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ])),
+            )?),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?
+    .register()
+    .await?;
+    let (namespace, name) = fqn.rsplit_once('.').ok_or("the table is qualified")?;
+    let preflight = wyrd_queue::RowPreflight::from_description(
+        &Bifrost::query_only(&admin)
+            .describe_table(namespace, name)
+            .await?,
+    )?;
+
+    let (_, viewer_jwt) = user("native-user-viewer", "viewer").await?;
+    let runtime = server
+        .credential_registered_service(&service, &["workload"])
+        .await?;
+    let runtime_key = runtime.api_key().ok_or("the runtime has an API key")?;
+    let signed = server
+        .exchange_api_key_for_workload(runtime_key, &service_uid)
+        .await?;
+    let unknown = CardUid::from_uuid(uuid::Uuid::now_v7())?;
+    let refusals = [
+        (
+            editor.for_workload(unknown.clone()),
+            &unknown,
+            "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
+        ),
+        (
+            editor.for_workload(model.clone()),
+            &model,
+            "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
+        ),
+        (
+            native_client(&server, &signed)?.for_workload(other.clone()),
+            &other,
+            "WYRD_AUTH_400_SIGNED_WORKLOAD_MISMATCH",
+        ),
+        (
+            native_client(&server, &viewer_jwt)?.for_workload(service_uid.clone()),
+            &service_uid,
+            "WYRD_PERMISSION_403_DENIED_RBAC",
+        ),
+        (
+            editor.for_workload(service_uid.clone()),
+            &other,
+            "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+        ),
+    ];
+    for (client, card, code) in refusals {
+        let refused = native_row(&client, &fqn, &preflight, Some(card))
+            .await
+            .expect_err("the write is refused before any ACK");
+        assert_eq!(refused.code(), code, "{card}: {refused:?}");
+    }
+
+    native_row(
+        &editor.for_workload(service_uid.clone()),
+        &fqn,
+        &preflight,
+        Some(&service_uid),
+    )
+    .await?;
+    native_row(
+        &native_client(&server, runtime_key.expose_secret())?.for_workload(service_uid.clone()),
+        &fqn,
+        &preflight,
+        Some(&service_uid),
+    )
+    .await?;
+    native_row(&editor, &fqn, &preflight, None).await?;
+    server.shutdown().await?;
     Ok(())
 }

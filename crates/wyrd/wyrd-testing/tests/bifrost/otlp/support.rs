@@ -837,6 +837,32 @@ impl OtlpJourney {
             .api_key()
             .expect("the bootstrapped service carries an API key")
             .clone();
+        Self::connect(server, api_key).await
+    }
+
+    /// Restarts the harness on `builder` against the same Postgres and Bifrost
+    /// data root and reconnects as the same journey principal.
+    ///
+    /// The principal, and so every OTLP batch id it derives, survives the
+    /// restart, while every in-memory index of the old pod is gone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the harness does not restart or bind, or the journey's API
+    /// key cannot be exchanged for a bearer.
+    pub(super) async fn restart(self, builder: wyrd_testing::WyrdTestServerBuilder) -> Self {
+        let server = Box::pin(self.server.restart_bound(builder))
+            .await
+            .expect("the OTLP journey harness restarts");
+        Self::connect(server, self.api_key).await
+    }
+
+    /// Mints a bearer and builds the public SDK client for `api_key` on `server`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the API key cannot be exchanged or the client cannot build.
+    async fn connect(server: WyrdTestServer, api_key: secrecy::SecretString) -> Self {
         let token = server
             .exchange_api_key(&api_key)
             .await
@@ -921,23 +947,39 @@ impl OtlpJourney {
         name: &str,
         permissions: &[wyrd_runtime::Permission],
     ) -> String {
-        self.server
-            .seed_role(name, permissions)
-            .await
-            .expect("the fixture role is seeded");
-        let bootstrap = self
-            .server
-            .bootstrap_service(name, &[name])
-            .await
-            .expect("the fixture service is bootstrapped onto its role");
-        let api_key = bootstrap
-            .api_key()
-            .expect("the bootstrapped service carries an API key")
-            .clone();
+        let api_key = self.api_key_with_permissions(name, permissions).await;
         self.server
             .exchange_api_key(&api_key)
             .await
             .expect("the fixture exchanges its API key for a bearer")
+    }
+
+    /// Bootstraps Service `name` onto a seeded role holding exactly
+    /// `permissions` and returns its API key.
+    ///
+    /// The key form exists for journeys that exchange the same account both
+    /// rootless and under its own Card as the workload root.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the role cannot be seeded or the service cannot be
+    /// bootstrapped.
+    pub(super) async fn api_key_with_permissions(
+        &self,
+        name: &str,
+        permissions: &[wyrd_runtime::Permission],
+    ) -> secrecy::SecretString {
+        self.server
+            .seed_role(name, permissions)
+            .await
+            .expect("the fixture role is seeded");
+        self.server
+            .bootstrap_service(name, &[name])
+            .await
+            .expect("the fixture service is bootstrapped onto its role")
+            .api_key()
+            .expect("the bootstrapped service carries an API key")
+            .clone()
     }
 
     /// The running harness, for the cases that inject a durable fault.

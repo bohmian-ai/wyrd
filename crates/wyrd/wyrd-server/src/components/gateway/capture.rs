@@ -1501,7 +1501,6 @@ pub(crate) mod recording {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{Attribution, PrincipalId};
     use wyrd_spec::ids::CardUid;
-    use wyrd_spec::reference::CardRefScope;
     use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
 
     use crate::scribe_outbox::{ScribeSink, ScribeTable};
@@ -1570,7 +1569,7 @@ pub(crate) mod recording {
                 card_scope: frame
                     .attributed_cards
                     .clone()
-                    .or_else(|| frame.principal.card_ref_scope().map(CardRefScope::uids))
+                    .or_else(|| frame.principal.card_scope().map(<[_]>::to_vec))
                     .unwrap_or_default(),
                 table: frame.table.fqn(),
                 rows,

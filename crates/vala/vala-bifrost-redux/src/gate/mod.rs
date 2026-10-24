@@ -44,12 +44,12 @@ use crate::scribe::preprocess::{LogicalIdentity, correlation_data_identity};
 use crate::tables::{
     CallsTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, TableError,
 };
+use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_spec::vala::ids::{SpanId, TraceId};
+use wyrd_spec::vala::ids::{SpanId, TableVersion, TraceId};
 
 /// Maps a canonical OTLP projection failure to its ingest refusal.
 ///
@@ -293,7 +293,7 @@ impl<T: AuditStage> GateAudit for T {
             None,
             "bifrost.record.write".to_owned(),
             resource.to_owned(),
-            auth.principal.card_ref().cloned(),
+            None,
             auth.attribution(),
             auth.principal.kind.tag(),
             "bifrost:record:write".to_owned(),
@@ -470,24 +470,35 @@ impl<A: GateAudit + 'static> Gate<A> {
         self
     }
 
-    /// Resolves the Cards an unbound writer attributes one frame to.
+    /// Resolves the Cards one frame may attribute to.
     ///
-    /// `cards` collects the frame's distinct Card UIDs; it runs only when a
-    /// registry is composed and the principal is unbound. `None` leaves the
-    /// principal's signed scope in force.
+    /// `cards` collects the frame's distinct Card UIDs. An unbound writer's
+    /// UIDs resolve through the registry when one is composed; a scoped
+    /// writer's signed scope governs. The result falls back to that signed
+    /// scope, and `None` refuses every attributed row downstream.
     ///
     /// # Errors
     ///
-    /// Returns the registry's validation or unavailability error.
+    /// Returns [`IngestError::WorkloadContextRequired`] when a rootless
+    /// family-restricted account names any Card, and the registry's
+    /// validation or unavailability error.
     async fn attributed_cards(
         &self,
         auth: &AuthContext,
         cards: impl FnOnce() -> Vec<wyrd_spec::ids::CardUid>,
     ) -> Result<Option<Vec<wyrd_spec::ids::CardUid>>, IngestError> {
-        match &self.cards {
-            Some(registry) => registry.attributed_cards(auth, cards).await,
-            None => Ok(None),
+        if let CardAttribution::RootRequired(_) = auth.principal.card_attribution() {
+            return if cards().is_empty() {
+                Ok(None)
+            } else {
+                Err(IngestError::WorkloadContextRequired)
+            };
         }
+        let attributed = match &self.cards {
+            Some(registry) => registry.attributed_cards(auth, cards).await?,
+            None => None,
+        };
+        Ok(attributed.or_else(|| auth.principal.card_scope().map(<[_]>::to_vec)))
     }
 
     /// Attaches the sink every write decision is staged on.
@@ -684,18 +695,19 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.authenticate(metadata)
     }
 
-    /// Admit one server-owned OTLP adapter request whose caller the server
-    /// already verified, before tonic codec work.
+    /// Admit one request whose caller the hosting server already verified,
+    /// before tonic codec work.
     ///
-    /// The API-key form of [`Self::authenticate_otlp_metadata`]: the server
-    /// authenticated a stock exporter's API key, and Gate keeps its readiness
-    /// authority and builds the same [`AuthContext`] a bearer would yield.
+    /// The server authenticated a stock exporter's API key, or narrowed a
+    /// bearer to its selected workload root, which store-free Gate
+    /// verification cannot do. Gate keeps its readiness authority and builds
+    /// the same [`AuthContext`] a bearer would yield.
     ///
     /// # Errors
     ///
     /// Returns the ingress-closed refusal when the Gate is closed or its
     /// Scribe is not ready.
-    pub fn admit_otlp_verified(
+    pub fn admit_verified(
         &self,
         verified: VerifiedToken,
         metadata: &MetadataMap,
@@ -799,8 +811,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             .await?;
         let attributed = self
             .attributed_cards(auth, || attribution::span_card_uids(&decoded.request))
-            .await?
-            .or_else(|| auth.principal.card_ref_scope().map(CardRefScope::uids));
+            .await?;
         let (batch, outcome) = crate::tables::traces::project_resource_spans(
             &decoded.request.resource_spans,
             attributed.as_deref(),
@@ -838,8 +849,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             .await?;
         let attributed = self
             .attributed_cards(auth, || attribution::metric_card_uids(&decoded.request))
-            .await?
-            .or_else(|| auth.principal.card_ref_scope().map(CardRefScope::uids));
+            .await?;
         let (batch, outcome) = crate::tables::metrics::project_resource_metrics(
             &decoded.request.resource_metrics,
             attributed.as_deref(),
@@ -877,8 +887,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             .await?;
         let attributed = self
             .attributed_cards(auth, || attribution::log_card_uids(&decoded.request))
-            .await?
-            .or_else(|| auth.principal.card_ref_scope().map(CardRefScope::uids));
+            .await?;
         let (batch, outcome) = crate::tables::logs::project_resource_logs(
             &decoded.request.resource_logs,
             attributed.as_deref(),
@@ -961,6 +970,7 @@ impl<A: GateAudit + 'static> Gate<A> {
                 attributed_cards,
                 table,
                 expected_schema_fingerprint: None,
+                table_version: None,
                 request_id: auth.request_id.clone(),
                 batch_id,
                 measured_wire_bytes,
@@ -1021,6 +1031,12 @@ impl<A: GateAudit + 'static> Gate<A> {
                 "wyrd_batch_id must be UUIDv7".to_owned(),
             ));
         }
+        let table_version = TableVersion::new(frame.table_version).map_err(|_| {
+            IngestError::RequestValidation(
+                "table_version must be the positive version a describe or register returned"
+                    .to_owned(),
+            )
+        })?;
         let (namespace, name) = resolve_fqn(&frame.table)?;
         if namespace == BifrostNamespace::Audit {
             return Err(IngestError::ReservedBuiltinWriteDenied { table: frame.table });
@@ -1038,6 +1054,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             attributed_cards,
             table,
             expected_schema_fingerprint: None,
+            table_version: Some(table_version),
             request_id: auth.request_id.clone(),
             batch_id,
             measured_wire_bytes: frame.arrow_ipc.len(),
@@ -1122,6 +1139,10 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// Authenticate, validate, and dispatch one native batch, recording the
     /// request outcome on the current span.
     ///
+    /// A caller the hosting server already narrowed to its selected root
+    /// arrives as an [`auth::ResolvedCaller`] extension and is admitted as
+    /// verified; any other request's bearer is verified here.
+    ///
     /// # Errors
     ///
     /// Returns the canonical ingest status for an authentication, validation,
@@ -1132,10 +1153,14 @@ impl<A: GateAudit + 'static> Gate<A> {
     ) -> Result<Response<InsertBatchResponse>, Status> {
         let lifecycle = GateRequestLifecycle::begin("write");
         let result: Result<Response<InsertBatchResponse>, Status> = async {
-            let auth = self
-                .authenticate(request.metadata())
-                .inspect_err(|_| record_gate_rejection("write", "auth"))
-                .map_err(Status::from)?;
+            let auth = match request.extensions().get::<auth::ResolvedCaller>() {
+                Some(auth::ResolvedCaller(verified)) => {
+                    self.admit_verified(verified.clone(), request.metadata())
+                }
+                None => self.authenticate(request.metadata()),
+            }
+            .inspect_err(|_| record_gate_rejection("write", "auth"))
+            .map_err(Status::from)?;
             let frame = request.into_inner();
             validate_batch(&frame, &self.limits)
                 .inspect_err(record_write_rejection)
@@ -1780,6 +1805,7 @@ mod tests {
             wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
             arrow_ipc: Vec::new().into(),
             producer_trace_contexts: Vec::new(),
+            table_version: 1,
         }
     }
 
@@ -1837,23 +1863,11 @@ mod tests {
     /// that exercises `wyrd.card_uid` needs a service principal rather than the
     /// plain user `auth_context` builds.
     fn scoped_auth_context() -> AuthContext {
-        let tenant = DataTenantId::new_v7();
-        let card = wyrd_spec::reference::CardRef {
-            uid: crate::tables::signal::correlation_fixture::scope().pop(),
-            ..crate::tables::signal::correlation_fixture::REFERENCE_TEXT
-                .parse()
-                .expect("fixture card ref")
-        };
-        let principal = Principal::new(
-            PrincipalId::new(uuid::Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref_scope: wyrd_spec::reference::CardRefScope::own(&card),
-                card_ref: Some(card),
-            },
-            tenant,
-            Vec::new(),
+        let principal = crate::test_support::scoped_service(
+            crate::tables::signal::correlation_fixture::scope(),
             PermissionSet::from_iter([Permission::bifrost_record_write()]),
         );
+        let tenant = principal.tenant_id;
         AuthContext {
             principal,
             tenant,
@@ -2596,6 +2610,51 @@ mod tests {
         }
     }
 
+    /// A family-restricted Service account authenticated without a selected
+    /// root has no signed Card access, so any frame naming a Card is refused
+    /// as needing workload context rather than attributed or scope-denied,
+    /// while a frame naming no Card passes attribution unattributed.
+    ///
+    /// # Panics
+    /// Panics when the static family name is invalid, a Card-naming frame is
+    /// attributed or refused with another error than `WorkloadContextRequired`,
+    /// or a frame naming no Card fails or comes back attributed.
+    #[tokio::test]
+    async fn rootless_family_account_needs_a_root_to_attribute_cards() {
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
+            Arc::new(TestScribe),
+            test_interceptor(),
+            IngestLimits::default(),
+        );
+        let mut auth = kind_context(
+            PrincipalKind::Service,
+            PermissionSet::from_iter([Permission::bifrost_record_write()]),
+        );
+        auth.principal = auth.principal.with_card_access(
+            wyrd_spec::auth::CardAccess::RootRequired {
+                restriction: wyrd_spec::auth::FamilyRestriction::Family(
+                    wyrd_spec::auth::WorkloadFamily {
+                        kind: wyrd_spec::auth::WorkloadKind::Service,
+                        name: wyrd_spec::ids::CardName::new("checkout").expect("static name"),
+                    },
+                ),
+            },
+            None,
+        );
+
+        let error = gate
+            .attributed_cards(&auth, crate::tables::signal::correlation_fixture::scope)
+            .await
+            .expect_err("a rootless family account cannot attribute a Card");
+        assert!(matches!(error, IngestError::WorkloadContextRequired));
+        assert!(
+            gate.attributed_cards(&auth, Vec::new)
+                .await
+                .expect("a frame naming no Card needs no root")
+                .is_none()
+        );
+    }
+
     /// Every public write to the four server-owned verification tables is refused
     /// as reserved, for every principal kind — a SYSTEM principal and a
     /// wildcard administrator included — before Scribe, with exactly one
@@ -2616,23 +2675,12 @@ mod tests {
             (
                 "card-free service",
                 kind_context(
-                    PrincipalKind::Service {
-                        card_ref: None,
-                        card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
-                    },
+                    PrincipalKind::Service,
                     PermissionSet::from_iter([Permission::bifrost_record_write()]),
                 ),
             ),
             ("card-bound service", scoped_auth_context()),
-            (
-                "system",
-                kind_context(
-                    PrincipalKind::System {
-                        card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
-                    },
-                    wildcard(),
-                ),
-            ),
+            ("system", kind_context(PrincipalKind::System, wildcard())),
         ];
         for table in [
             "vala.verification.results",
@@ -2653,6 +2701,7 @@ mod tests {
                     wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
                     arrow_ipc: Vec::new().into(),
                     producer_trace_contexts: Vec::new(),
+                    table_version: 1,
                 };
 
                 let result = gate
@@ -2678,6 +2727,46 @@ mod tests {
                     "{label} on {table} records exactly one denied decision"
                 );
             }
+        }
+    }
+
+    /// A native frame whose table version is zero or negative is refused as a
+    /// request validation error before authorization or Scribe sees it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a non-positive version is admitted, refused with any other
+    /// error, audited, or reaches Scribe.
+    #[tokio::test]
+    async fn non_positive_table_version_is_refused_before_authorization() {
+        for table_version in [0, -1, i64::MIN] {
+            let scribe_calls = Arc::new(AtomicUsize::new(0));
+            let audit = RecordingAudit::new();
+            let gate = Gate::<RecordingAudit>::with_test_scribe(
+                Arc::new(AnyTableScribe(Arc::clone(&scribe_calls))),
+                test_interceptor(),
+                IngestLimits::default(),
+            )
+            .with_audit(Arc::clone(&audit));
+            let frame = wyrd_tonic::wyrd::v1::InsertBatchRequest {
+                table: "vala.datasets.events".to_owned(),
+                wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+                arrow_ipc: Vec::new().into(),
+                producer_trace_contexts: Vec::new(),
+                table_version,
+            };
+
+            let result = gate
+                .dispatch_native_frame(&IngestLimits::default(), &scoped_auth_context(), frame)
+                .await;
+
+            assert!(
+                matches!(&result, Err(IngestError::RequestValidation(message))
+                    if message.contains("table_version")),
+                "{table_version}: {result:?}"
+            );
+            assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
+            assert!(audit.decisions().is_empty());
         }
     }
 
@@ -2738,6 +2827,7 @@ mod tests {
             wyrd_batch_id: batch_id.into(),
             arrow_ipc: Vec::new().into(),
             producer_trace_contexts: Vec::new(),
+            table_version: 1,
         };
 
         let uuid_v4 = uuid::Uuid::new_v4();

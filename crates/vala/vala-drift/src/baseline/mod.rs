@@ -194,7 +194,7 @@ mod dispatch_errors {
         PsiProfile, PsiThreshold, SpcProfile,
     };
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
+    use wyrd_spec::ids::{CardName, FeatureName};
     use wyrd_spec::reference::CardRef;
 
     fn data_ref(name: &str) -> CardRef {
@@ -202,7 +202,6 @@ mod dispatch_errors {
             kind: CardKind::Data,
             name: CardName::new(name).expect("valid name"),
             version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: Some(SpaceName::new("default").expect("valid space")),
             uid: None,
         }
     }
@@ -304,7 +303,7 @@ mod end_to_end {
         PsiBinningStrategy, PsiProfile, PsiThreshold, SpcProfile,
     };
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
+    use wyrd_spec::ids::{CardName, FeatureName};
     use wyrd_spec::reference::CardRef;
 
     fn numeric_batch(name: &str, values: Vec<f64>) -> Result<RecordBatch, Box<dyn Error>> {
@@ -321,7 +320,6 @@ mod end_to_end {
             kind,
             name: CardName::new(name)?,
             version: VersionBlock::parse("1.0.0")?,
-            space: Some(SpaceName::new("default")?),
             uid: None,
         })
     }
@@ -681,7 +679,7 @@ mod cancellation {
         PsiProfile, PsiThreshold, SpcProfile,
     };
     use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
+    use wyrd_spec::ids::{CardName, FeatureName};
     use wyrd_spec::reference::CardRef;
 
     /// Rows per fixture: three cancellation chunks, so a mid-loop stop leaves work undone.
@@ -717,7 +715,6 @@ mod cancellation {
             kind: CardKind::Data,
             name: CardName::new("baseline").expect("valid name"),
             version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: Some(SpaceName::new("default").expect("valid space")),
             uid: None,
         };
         DriftSpec::new(

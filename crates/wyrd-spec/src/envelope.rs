@@ -3,13 +3,10 @@
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::{
-    InstanceType, Metadata as SchemaMetadata, Schema, SchemaObject, SubschemaValidation,
-};
+use schemars::Schema;
+use schemars::SchemaGenerator;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::json;
 
 use crate::api_version::ApiVersion;
 use crate::card::agent::AgentSpec;
@@ -26,7 +23,7 @@ use crate::card::service::ServiceSpec;
 use crate::card::source::SourceSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::verifier::{VerificationStatus, VerifierSpec};
-use crate::ids::{CardName, CardUid, SpaceName};
+use crate::ids::{CardName, CardUid};
 use crate::metadata::{Annotations, Labels};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 
@@ -160,6 +157,7 @@ pub struct Card {
 ///   [`VersionBlock`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Metadata {
     /// Card name.
     pub name: CardName,
@@ -174,9 +172,6 @@ pub struct Metadata {
     /// path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bump: Option<VersionBump>,
-    /// Optional space.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub space: Option<SpaceName>,
     /// Optional resolved UID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<CardUid>,
@@ -326,8 +321,8 @@ impl utoipa::ToSchema for Spec {
 /// variant and several variants accept the same object, so `oneOf` would
 /// refuse valid Cards.
 impl schemars::JsonSchema for Spec {
-    fn schema_name() -> String {
-        "Spec".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Spec".into()
     }
 
     /// `anyOf` the fourteen typed Card spec schemas, each registered in
@@ -352,19 +347,11 @@ impl schemars::JsonSchema for Spec {
             generator.subschema_for::<OperatorSpec>(),
             generator.subschema_for::<SourceSpec>(),
         ];
-        SchemaObject {
-            metadata: Some(Box::new(SchemaMetadata {
-                title: Some(Self::schema_name()),
-                description: Some("One typed Wyrd Card spec variant.".to_owned()),
-                ..SchemaMetadata::default()
-            })),
-            subschemas: Some(Box::new(SubschemaValidation {
-                any_of: Some(variants),
-                ..SubschemaValidation::default()
-            })),
-            ..SchemaObject::default()
-        }
-        .into()
+        schemars::json_schema!({
+            "title": Self::schema_name(),
+            "description": "One typed Wyrd Card spec variant.",
+            "anyOf": variants
+        })
     }
 }
 
@@ -676,27 +663,21 @@ fn native_from_str(value: &str) -> Option<CardKind> {
 }
 
 impl JsonSchema for CardKind {
-    fn schema_name() -> String {
-        "CardKind".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CardKind".into()
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
-        let enum_values = Self::registrable()
+        let enum_values: Vec<&str> = Self::registrable()
             .iter()
-            .map(|kind| json!(kind.wire_name()))
+            .map(CardKind::wire_name)
             .collect();
-
-        SchemaObject {
-            metadata: Some(Box::new(SchemaMetadata {
-                title: Some(Self::schema_name()),
-                description: Some("Wyrd Card kind.".to_string()),
-                ..SchemaMetadata::default()
-            })),
-            instance_type: Some(InstanceType::String.into()),
-            enum_values: Some(enum_values),
-            ..SchemaObject::default()
-        }
-        .into()
+        schemars::json_schema!({
+            "title": Self::schema_name(),
+            "description": "Wyrd Card kind.",
+            "type": "string",
+            "enum": enum_values
+        })
     }
 }
 

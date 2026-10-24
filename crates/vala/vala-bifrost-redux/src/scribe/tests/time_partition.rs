@@ -1,4 +1,4 @@
-//! One exact-partition contract spanning admission accounting, WAL v6 replay,
+//! One exact-partition contract spanning admission accounting, WAL v7 replay,
 //! and live-tail identity.
 //!
 //! These three seams share one failure mode: if two different physical
@@ -15,7 +15,7 @@ use crate::catalog::TableRef;
 use crate::catalog::layout::{TimeGranularity, TimePartition};
 use crate::namespaces::BifrostNamespace;
 use crate::scribe::replay::replay_wal_directory;
-use crate::scribe::seal_key::{MAX_TIME_PARTITIONS, SealKey, plan_time_partitions};
+use crate::scribe::seal_key::{MAX_PHYSICAL_PARTITIONS, PartitionScheme, SealKey, plan_partitions};
 use crate::scribe::stream_identity::NodeId;
 use crate::scribe::wal::{WalConfig, WalWriter};
 
@@ -31,7 +31,7 @@ fn batch_with_event_times(micros: Vec<i64>) -> arrow::record_batch::RecordBatch 
     let schema = Arc::new(Schema::new(vec![
         Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         ),
         Field::new("value", DataType::Int64, false),
@@ -39,7 +39,7 @@ fn batch_with_event_times(micros: Vec<i64>) -> arrow::record_batch::RecordBatch 
     arrow::record_batch::RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(TimestampMicrosecondArray::from(micros)),
+            Arc::new(TimestampMicrosecondArray::from(micros).with_timezone("+00:00")),
             Arc::new(Int64Array::from(
                 (0..i64::try_from(rows).expect("fixture row count fits i64")).collect::<Vec<_>>(),
             )),
@@ -48,7 +48,7 @@ fn batch_with_event_times(micros: Vec<i64>) -> arrow::record_batch::RecordBatch 
     .expect("fixture batch is well formed")
 }
 
-/// Admission accounting, WAL v6 replay, and tail identity agree on exactly one
+/// Admission accounting, WAL v7 replay, and tail identity agree on exactly one
 /// partition per row.
 ///
 /// Covers the per-source ceiling at both its accepted and rejected boundary,
@@ -62,43 +62,52 @@ fn time_partition_wal_tail_exact_once() {
 
     // Exactly the ceiling is admitted from one source.
     let admitted = batch_with_event_times(
-        (0..MAX_TIME_PARTITIONS)
+        (0..MAX_PHYSICAL_PARTITIONS)
             .map(|index| base + hour_micros * i64::try_from(index).expect("index fits i64"))
             .collect(),
     );
-    let plan = plan_time_partitions(
+    let plan = plan_partitions(
         &admitted,
-        &crate::catalog::TimeAxis::new("event_time", TimeGranularity::Hour),
+        &PartitionScheme::time_only(crate::catalog::TimeAxis::new(
+            "event_time",
+            TimeGranularity::Hour,
+        )),
     )
     .expect("the per-source ceiling is admitted");
-    assert_eq!(plan.len(), MAX_TIME_PARTITIONS);
+    assert_eq!(plan.len(), MAX_PHYSICAL_PARTITIONS);
 
     // One partition past it is refused, and refusal happens during planning,
     // before any WAL work.
     let refused = batch_with_event_times(
-        (0..=MAX_TIME_PARTITIONS)
+        (0..=MAX_PHYSICAL_PARTITIONS)
             .map(|index| base + hour_micros * i64::try_from(index).expect("index fits i64"))
             .collect(),
     );
     assert!(
-        plan_time_partitions(
+        plan_partitions(
             &refused,
-            &crate::catalog::TimeAxis::new("event_time", TimeGranularity::Hour)
+            &PartitionScheme::time_only(crate::catalog::TimeAxis::new(
+                "event_time",
+                TimeGranularity::Hour
+            ))
         )
         .is_err(),
         "one partition past the per-source ceiling must be refused"
     );
 
     // The bound is on partitions, not on days: the same instants that open
-    // `MAX_TIME_PARTITIONS` hours open a single day.
-    let daily = plan_time_partitions(
+    // `MAX_PHYSICAL_PARTITIONS` hours open a single day.
+    let daily = plan_partitions(
         &admitted,
-        &crate::catalog::TimeAxis::new("event_time", TimeGranularity::Day),
+        &PartitionScheme::time_only(crate::catalog::TimeAxis::new(
+            "event_time",
+            TimeGranularity::Day,
+        )),
     )
     .expect("the same source is one day at daily granularity");
     assert!(daily.len() < plan.len());
 
-    // Every appended partition survives a WAL v6 round trip with its exact
+    // Every appended partition survives a WAL v7 round trip with its exact
     // identity, and each is replayed exactly once.
     let temp_dir = TempDir::new().expect("temp WAL directory");
     let node_id = NodeId::new(uuid::Uuid::now_v7());
@@ -144,7 +153,7 @@ fn time_partition_wal_tail_exact_once() {
     for partition in appended {
         let seal_key = SealKey::new(tenant, table.clone(), partition);
         let state = replayed
-            .get(&seal_key.as_path_components())
+            .get(&seal_key.canonical_key())
             .unwrap_or_else(|| panic!("partition {partition:?} must replay"));
         assert_eq!(
             state.seal_key, seal_key,
@@ -163,9 +172,6 @@ fn time_partition_wal_tail_exact_once() {
     let hourly_key = SealKey::new(tenant, table.clone(), hour);
     let daily_key = SealKey::new(tenant, table.clone(), day);
     assert_ne!(hourly_key, daily_key);
-    assert_ne!(
-        hourly_key.as_path_components(),
-        daily_key.as_path_components()
-    );
+    assert_ne!(hourly_key.canonical_key(), daily_key.canonical_key());
     assert_ne!(hour.to_wire(), day.to_wire());
 }

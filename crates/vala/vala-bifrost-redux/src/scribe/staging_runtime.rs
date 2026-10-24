@@ -60,6 +60,8 @@ pub struct ClaimContext {
     pub schema: SchemaRef,
     /// Registered write recipe fixing sort order and partitioning.
     pub layout: PhysicalLayout,
+    /// Iceberg sort-order id the members' table version writes under.
+    pub sort_order_id: i32,
     /// Tenant-qualified binding the merged objects publish under.
     pub binding: TenantTableBinding,
 }
@@ -218,6 +220,9 @@ pub struct ScribeStagingRuntime {
     /// hands, so this owner is what moves the authority forward. A fixture
     /// runtime built without a pod tracks no authority and none is asked of it.
     hot_sources: Option<Arc<ScribeHotSourceRegistry>>,
+    /// Catalog holding the retained revisions recovered keys are rebuilt
+    /// under; absent only where every table stays at its initial revision.
+    catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
     /// Read-only record of which shards contributed to each published claim.
     ///
     /// Neither the `file_list` row nor its promotion record names the shard
@@ -261,6 +266,7 @@ impl ScribeStagingRuntime {
             contexts: Mutex::new(HashMap::new()),
             target_object_bytes: config.target_file_size_bytes(),
             hot_sources: None,
+            catalog: None,
             #[cfg(any(test, feature = "test-support"))]
             published_claims: Mutex::new(Vec::new()),
         }
@@ -275,6 +281,14 @@ impl ScribeStagingRuntime {
     pub fn with_hot_sources(mut self, hot_sources: Arc<ScribeHotSourceRegistry>) -> Self {
         self.publisher.set_hot_sources(Arc::clone(&hot_sources));
         self.hot_sources = Some(hot_sources);
+        self
+    }
+
+    /// Installs the catalog whose retained revisions recovered keys are
+    /// rebuilt under.
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: Option<Arc<crate::catalog::BifrostCatalog>>) -> Self {
+        self.catalog = catalog;
         self
     }
 
@@ -407,11 +421,7 @@ impl ScribeStagingRuntime {
         };
         hot_sources
             .advance(
-                &crate::scribe::seal_key::SealKey::new(
-                    key.tenant(),
-                    key.table().clone(),
-                    key.partition(),
-                ),
+                &key.seal_key(),
                 crate::scribe::hot_source::GenerationOrdinal::new(
                     member.shard(),
                     member.generation(),
@@ -701,11 +711,7 @@ impl ScribeStagingRuntime {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(());
         };
-        let seal_key = crate::scribe::seal_key::SealKey::new(
-            key.tenant(),
-            key.table().clone(),
-            key.partition(),
-        );
+        let seal_key = key.seal_key();
         for member in members {
             let id = member.record().member();
             let wal = member.record().wal_range();
@@ -779,6 +785,10 @@ impl ScribeStagingRuntime {
 
     /// Reconstructs one recovered key's encoding context, or fails closed.
     ///
+    /// The layout is re-resolved from the recipe the members' rows were
+    /// accepted under, which their record carries, against the runs' own
+    /// schema, so a later Bloom or layout alteration never strands them.
+    ///
     /// `members` are the members restore keeps. The schema is read from their
     /// runs only: a key can also hold the leftovers of a claim that already
     /// committed, and restore has removed those members' runs by the time it
@@ -818,27 +828,18 @@ impl ScribeStagingRuntime {
                     ),
                 }
             })?;
-        let layout =
-            crate::scribe::write_recipe::resolve_write_recipe(pool, &binding, schema.as_ref())
-                .await?;
-        let resolved = ScribeAssemblyKey::new(
-            key.tenant(),
-            key.table().clone(),
-            key.schema_fingerprint(),
-            layout.as_ref(),
-            key.partition(),
-            key.node_id(),
-            key.writer_epoch(),
-        );
-        if resolved != *key {
-            return Err(ScribeError::Internal {
-                detail: "the registered write recipe no longer reproduces a recovered staged key"
-                    .to_owned(),
-            });
-        }
+        let recipe = crate::scribe::write_recipe::resolve_write_recipe(
+            pool,
+            self.catalog.as_deref(),
+            &binding,
+            &key.seal_key(),
+            schema.as_ref(),
+        )
+        .await?;
         Ok(ClaimContext {
             schema,
-            layout: (*layout).clone(),
+            layout: (*recipe.layout).clone(),
+            sort_order_id: recipe.sort_order_id,
             binding,
         })
     }
@@ -924,6 +925,7 @@ impl ScribeStagingRuntime {
                 runs,
                 assembled,
                 binding: &context.binding,
+                sort_order_id: context.sort_order_id,
                 object_base: &object_base,
                 actor_stream,
             })
@@ -1050,7 +1052,7 @@ fn claim_object_base(
     let wal = runs.wal();
     Ok(ScribeClaimIdentity::new(
         &context.binding,
-        claim.key().partition(),
+        claim.key().partition().clone(),
         &claim.key().node_id().to_string(),
         claim.key().writer_epoch().as_i64(),
         &claim.id(),
@@ -1110,7 +1112,7 @@ mod tests {
     pub(super) fn runtime_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new(
             "event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         )]))
     }
@@ -1125,9 +1127,12 @@ mod tests {
         let schema = runtime_schema();
         let record = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(TimestampMicrosecondArray::from_iter_values(
-                (0..rows).map(|row| row * 2 + i64::from(shard)),
-            ))],
+            vec![Arc::new(
+                TimestampMicrosecondArray::from_iter_values(
+                    (0..rows).map(|row| row * 2 + i64::from(shard)),
+                )
+                .with_timezone("+00:00"),
+            )],
         )
         .expect("fixture member batch");
         let arrow_bytes = crate::scribe::memory::retained_arrow_bytes(&record);
@@ -1220,6 +1225,7 @@ mod tests {
                 ClaimContext {
                     schema: Arc::clone(&schema),
                     layout: layout.clone(),
+                    sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
                     binding: binding.clone(),
                 },
             )
@@ -1315,6 +1321,7 @@ mod tests {
                 ClaimContext {
                     schema: Arc::clone(&schema),
                     layout: layout.clone(),
+                    sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
                     binding: binding.clone(),
                 },
             )
@@ -1406,6 +1413,7 @@ mod tests {
                     ClaimContext {
                         schema: Arc::clone(&schema),
                         layout: layout.clone(),
+                        sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
                         binding: binding.clone(),
                     },
                 )
@@ -1504,6 +1512,7 @@ mod tests {
                 ClaimContext {
                     schema: Arc::clone(&schema),
                     layout: layout.clone(),
+                    sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
                     binding: binding.clone(),
                 },
             )
@@ -1757,6 +1766,7 @@ mod tests {
                     ClaimContext {
                         schema: Arc::clone(schema),
                         layout: layout.clone(),
+                        sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
                         binding: binding.clone(),
                     },
                 )
@@ -1845,7 +1855,7 @@ mod tests {
         key: &ScribeAssemblyKey,
         member_ids: &[StagedMemberId],
     ) {
-        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition());
+        let seal_key = key.seal_key();
         for member in member_ids {
             assert_eq!(
                 hot_sources
@@ -2270,7 +2280,7 @@ mod tests {
     ) {
         let claim_id = claim.to_string();
         let objects = vec![format!("objects/{claim_id}/hot-0.parquet")];
-        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition());
+        let seal_key = key.seal_key();
         let ordinal = |member: &StagedMemberId| {
             crate::scribe::hot_source::GenerationOrdinal::new(member.shard(), member.generation())
         };

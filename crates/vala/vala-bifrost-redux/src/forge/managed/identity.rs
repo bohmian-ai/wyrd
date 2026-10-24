@@ -1,9 +1,9 @@
 //! The object-path grammar every Forge rewrite output must satisfy.
 //!
 //! A produced object's path is load-bearing in three separate ways, and this
-//! module is where all three are checked at once. It carries the writer recipe,
-//! which a later selection pass resolves back out of the path to decide whether
-//! the object is still current. It carries the attempt identity, which is what
+//! module is where all three are checked at once. It carries the table version
+//! whose definition the output was written under, so the output states the
+//! complete definition it was selected for. It carries the attempt identity, which is what
 //! makes an abandoned attempt's objects reclaimable without consulting any
 //! durable state. And it carries a per-writer ordinal plus a per-writer UUID,
 //! which together keep concurrent writers inside one attempt from colliding.
@@ -11,7 +11,7 @@
 //! The grammar is the pinned core's, not this repository's invention:
 //!
 //! ```text
-//! {table}/data/forge/{recipe}/[{partition}/]{attempt}-{ordinal:05}-{writer}.parquet
+//! {table}/data/forge/{table_version}/[{partition}/]{attempt}-{ordinal:05}-{writer}.parquet
 //! ```
 //!
 //! The optional partition segment is inserted by Iceberg's own location
@@ -44,7 +44,9 @@ const UUID_TEXT_LEN: usize = 36;
 /// from its source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForgeOutputIdentity<'path> {
-    /// Partition segments between the recipe root and the file name, if any.
+    /// Selected output table version the version segment names.
+    pub(crate) table_version: wyrd_spec::vala::ids::TableVersion,
+    /// Partition segments between the version segment and the file name, if any.
     pub(crate) partition_path: &'path str,
     /// Attempt that opened the writer which produced this object.
     pub(crate) attempt_id: Uuid,
@@ -55,10 +57,10 @@ pub(crate) struct ForgeOutputIdentity<'path> {
 }
 
 impl<'path> ForgeOutputIdentity<'path> {
-    /// Recovers the recipe identity a produced path carries, on its own terms.
+    /// Recovers the output identity a produced path carries, on its own terms.
     ///
     /// Cleanup is the caller that has no prior identity to check against: it
-    /// finds an object under the recipe root and must decide who produced it
+    /// finds an object under the Forge root and must decide who produced it
     /// before it may decide whether that producer is finished. This is the one
     /// grammar that answers that, so no cleanup-local compatibility parser can
     /// drift away from what the writer actually emitted.
@@ -66,21 +68,28 @@ impl<'path> ForgeOutputIdentity<'path> {
     /// # Errors
     ///
     /// Returns [`ForgeError::Invariant`] when the path does not sit under
-    /// `data_location`, when a partition segment is non-canonical, when the
+    /// `forge_root`, when its version segment is not a canonical table
+    /// version, when a partition segment is non-canonical, when the
     /// file name is not `{attempt}-{ordinal}-{writer}.parquet`, when the
     /// ordinal is not a canonical decimal of at least [`ORDINAL_WIDTH`]
     /// digits, or when either UUID is unparseable.
-    pub(crate) fn parse(path: &'path str, data_location: &str) -> Result<Self, ForgeError> {
+    pub(crate) fn parse(path: &'path str, forge_root: &str) -> Result<Self, ForgeError> {
         let invariant = |detail: String| ForgeError::Invariant { detail };
-        let root = data_location.trim_end_matches('/');
-        let relative = path
+        let root = forge_root.trim_end_matches('/');
+        let (version_text, relative) = path
             .strip_prefix(root)
             .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.split_once('/'))
             .ok_or_else(|| {
                 invariant(format!(
-                    "rewrite output {path} is not under the recipe root {root}"
+                    "rewrite output {path} is not under a version of the Forge root {root}"
                 ))
             })?;
+        let table_version = version_text.parse().map_err(|_| {
+            invariant(format!(
+                "rewrite output {path} names no canonical table version"
+            ))
+        })?;
         let (partition_path, file_name) = match relative.rsplit_once('/') {
             Some((partition, name)) => (partition, name),
             None => ("", relative),
@@ -133,6 +142,7 @@ impl<'path> ForgeOutputIdentity<'path> {
             ))
         })?;
         Ok(Self {
+            table_version,
             partition_path,
             attempt_id,
             writer_ordinal,
@@ -140,27 +150,36 @@ impl<'path> ForgeOutputIdentity<'path> {
         })
     }
 
-    /// Proves one produced path belongs to this attempt under the recipe root.
+    /// Proves one produced path belongs to this attempt and selected version.
     ///
-    /// This is [`Self::parse`] plus the one check the producing side can make
-    /// and cleanup cannot: that the recovered attempt is the attempt whose
-    /// result set the object arrived in. An object attributed to another
+    /// This is [`Self::parse`] plus the checks the producing side can make and
+    /// cleanup cannot: that the recovered attempt is the attempt whose result
+    /// set the object arrived in, and that the version is the one it selected. An object attributed to another
     /// attempt there is either a leaked handle or a reused writer, and both are
     /// unrecoverable ambiguities about who may reclaim the object.
     ///
     /// # Errors
     ///
     /// Returns every [`Self::parse`] failure, plus [`ForgeError::Invariant`]
-    /// when the recovered attempt is not `attempt_id`.
+    /// when the recovered attempt is not `attempt_id` or the version is not
+    /// `table_version`.
     pub(crate) fn validate(
         path: &'path str,
-        data_location: &str,
+        forge_root: &str,
         attempt_id: Uuid,
+        table_version: wyrd_spec::vala::ids::TableVersion,
     ) -> Result<Self, ForgeError> {
-        let identity = Self::parse(path, data_location)?;
+        let identity = Self::parse(path, forge_root)?;
         if identity.attempt_id != attempt_id {
             return Err(ForgeError::Invariant {
                 detail: format!("rewrite output {path} is not attributed to attempt {attempt_id}"),
+            });
+        }
+        if identity.table_version != table_version {
+            return Err(ForgeError::Invariant {
+                detail: format!(
+                    "rewrite output {path} is not written under version {table_version}"
+                ),
             });
         }
         Ok(identity)
@@ -196,12 +215,15 @@ fn canonical_ordinal(text: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// The recipe root the fixture table would have registered.
+    /// The Forge root of the fixture table.
     fn root() -> String {
-        crate::catalog::layout::forge_data_location("file:///warehouse/tenant/table")
+        crate::catalog::layout::forge_data_root("file:///warehouse/tenant/table")
     }
 
-    /// The recipe path is accepted, and per-writer ordinals stay per-writer.
+    /// The version the fixture outputs are selected under.
+    const VERSION: wyrd_spec::vala::ids::TableVersion = wyrd_spec::vala::ids::TableVersion::INITIAL;
+
+    /// The version path is accepted, and per-writer ordinals stay per-writer.
     ///
     /// Two writers inside one attempt both start at ordinal `00000`, which is
     /// correct: the ordinal is a writer-local counter and the writer UUID is
@@ -210,35 +232,36 @@ mod tests {
     /// reset as a collision would fail every real concurrent rewrite, while
     /// dropping the writer UUID would let two writers overwrite each other.
     ///
-    /// The refusals cover the other direction: a missing or superseded recipe
-    /// root, a foreign attempt, a missing writer identity, and a non-canonical
+    /// The refusals cover the other direction: a missing root, a
+    /// non-canonical or other version, a foreign attempt, a missing writer identity, and a non-canonical
     /// ordinal are each unrecoverable ambiguities about which attempt owns an
     /// object, so each is refused rather than normalized.
     #[test]
-    fn forge_output_identity_accepts_recipe_path_and_per_writer_ordinals() {
+    fn forge_output_identity_accepts_version_path_and_per_writer_ordinals() {
         let root = root();
         let attempt = Uuid::now_v7();
         let first_writer = Uuid::now_v7();
         let second_writer = Uuid::now_v7();
         let path = |writer: Uuid, ordinal: &str, partition: &str| {
-            format!("{root}/{partition}{attempt}-{ordinal}-{writer}.parquet")
+            format!("{root}/1/{partition}{attempt}-{ordinal}-{writer}.parquet")
         };
 
         let first_path = path(first_writer, "00000", "created_at_day=2026-08-29/");
-        let first = ForgeOutputIdentity::validate(&first_path, &root, attempt)
-            .expect("a partitioned recipe path is well-formed");
+        let first = ForgeOutputIdentity::validate(&first_path, &root, attempt, VERSION)
+            .expect("a partitioned version path is well-formed");
+        assert_eq!(first.table_version, VERSION);
         assert_eq!(first.partition_path, "created_at_day=2026-08-29");
         assert_eq!(first.writer_ordinal, 0);
         assert_eq!(first.writer_uuid, first_writer);
 
         let flat = path(first_writer, "00001", "");
-        let unpartitioned = ForgeOutputIdentity::validate(&flat, &root, attempt)
-            .expect("an unpartitioned recipe path is well-formed");
+        let unpartitioned = ForgeOutputIdentity::validate(&flat, &root, attempt, VERSION)
+            .expect("an unpartitioned version path is well-formed");
         assert_eq!(unpartitioned.partition_path, "");
         assert_eq!(unpartitioned.writer_ordinal, 1);
 
         let second_path = path(second_writer, "00000", "created_at_day=2026-08-29/");
-        let second = ForgeOutputIdentity::validate(&second_path, &root, attempt)
+        let second = ForgeOutputIdentity::validate(&second_path, &root, attempt, VERSION)
             .expect("a concurrent writer restarts its own ordinal");
         assert_eq!(
             second.writer_ordinal, first.writer_ordinal,
@@ -252,7 +275,7 @@ mod tests {
 
         let wide = path(first_writer, "123456", "");
         assert_eq!(
-            ForgeOutputIdentity::validate(&wide, &root, attempt)
+            ForgeOutputIdentity::validate(&wide, &root, attempt, VERSION)
                 .expect("an ordinal past five digits is still canonical")
                 .writer_ordinal,
             123_456
@@ -263,13 +286,15 @@ mod tests {
                 format!(
                     "file:///warehouse/tenant/table/data/{attempt}-00000-{first_writer}.parquet"
                 ),
-                "an object outside the recipe root can never resolve to a recipe",
+                "an object outside the Forge root names no version",
             ),
             (
-                format!(
-                    "file:///warehouse/tenant/table/data/forge/v0/{attempt}-00000-{first_writer}.parquet"
-                ),
-                "a superseded recipe root is not this policy's root",
+                format!("{root}/v1/{attempt}-00000-{first_writer}.parquet"),
+                "a non-canonical version segment names no version",
+            ),
+            (
+                format!("{root}/2/{attempt}-00000-{first_writer}.parquet"),
+                "an output under another version was not selected for this one",
             ),
             (
                 path(first_writer, "00000", "")
@@ -277,7 +302,7 @@ mod tests {
                 "an object from another attempt is not this attempt's to reclaim",
             ),
             (
-                format!("{root}/{attempt}-00000.parquet"),
+                format!("{root}/1/{attempt}-00000.parquet"),
                 "without a writer identity two writers would collide",
             ),
             (
@@ -293,13 +318,13 @@ mod tests {
                 "a non-decimal ordinal is not an ordinal",
             ),
             (
-                format!("{root}/{attempt}-00000-{first_writer}.avro"),
+                format!("{root}/1/{attempt}-00000-{first_writer}.avro"),
                 "a rewrite output is always Parquet",
             ),
         ] {
             assert!(
                 matches!(
-                    ForgeOutputIdentity::validate(&bad, &root, attempt),
+                    ForgeOutputIdentity::validate(&bad, &root, attempt, VERSION),
                     Err(ForgeError::Invariant { .. })
                 ),
                 "{why}: {bad}"
@@ -319,12 +344,12 @@ mod tests {
     /// an object to the wrong attempt, or to no attempt at all, and then delete
     /// it while its real producer is still open.
     #[test]
-    fn forge_output_path_parser_matches_recipe_identity_grammar_exactly() {
+    fn forge_output_path_parser_matches_version_identity_grammar_exactly() {
         let root = root();
         let attempt = Uuid::now_v7();
         let writer = Uuid::now_v7();
         let path = |ordinal: &str, partition: &str| {
-            format!("{root}/{partition}{attempt}-{ordinal}-{writer}.parquet")
+            format!("{root}/1/{partition}{attempt}-{ordinal}-{writer}.parquet")
         };
 
         for (case, partition, ordinal, expected_ordinal) in [
@@ -335,6 +360,7 @@ mod tests {
             let object = path(ordinal, partition);
             let parsed = ForgeOutputIdentity::parse(&object, &root)
                 .unwrap_or_else(|error| panic!("{case} path parses: {error}"));
+            assert_eq!(parsed.table_version, VERSION, "{case} recovers its version");
             assert_eq!(parsed.attempt_id, attempt, "{case} recovers its attempt");
             assert_eq!(parsed.writer_ordinal, expected_ordinal, "{case} ordinal");
             assert_eq!(parsed.writer_uuid, writer, "{case} writer identity");
@@ -344,13 +370,13 @@ mod tests {
                 "{case} partition"
             );
             assert_eq!(
-                ForgeOutputIdentity::validate(&object, &root, attempt)
+                ForgeOutputIdentity::validate(&object, &root, attempt, VERSION)
                     .expect("validate accepts what parse accepted"),
                 parsed,
                 "{case}: validate is parse plus an attempt check, not a second grammar"
             );
             assert!(
-                ForgeOutputIdentity::validate(&object, &root, Uuid::now_v7()).is_err(),
+                ForgeOutputIdentity::validate(&object, &root, Uuid::now_v7(), VERSION).is_err(),
                 "{case}: validate still refuses a foreign attempt"
             );
         }
@@ -358,20 +384,26 @@ mod tests {
         for (bad, why) in [
             (
                 format!("file:///warehouse/tenant/table/data/{attempt}-00000-{writer}.parquet"),
-                "an object outside the recipe root has no recipe identity to recover",
+                "an object outside the Forge root has no version to recover",
             ),
             (
-                format!(
-                    "file:///warehouse/tenant/table/data/forge/v0/{attempt}-00000-{writer}.parquet"
-                ),
-                "a superseded recipe root is not this policy's root",
+                format!("{root}/0/{attempt}-00000-{writer}.parquet"),
+                "version zero is not a table version",
             ),
             (
-                format!("{root}/{attempt}-00000.parquet"),
+                format!("{root}/01/{attempt}-00000-{writer}.parquet"),
+                "a padded version is a second spelling of the same version",
+            ),
+            (
+                format!("{root}/{attempt}-00000-{writer}.parquet"),
+                "an object directly under the root names no version",
+            ),
+            (
+                format!("{root}/1/{attempt}-00000.parquet"),
                 "without a writer identity the object names no unique producer",
             ),
             (
-                format!("{root}/not-a-uuid-00000-{writer}.parquet"),
+                format!("{root}/1/not-a-uuid-00000-{writer}.parquet"),
                 "an unreadable attempt cannot be checked against open work",
             ),
             (
@@ -384,12 +416,12 @@ mod tests {
             ),
             (path("0000a", ""), "a non-decimal ordinal is not an ordinal"),
             (
-                format!("{root}/{attempt}-00000-{writer}.avro"),
+                format!("{root}/1/{attempt}-00000-{writer}.avro"),
                 "a rewrite output is always Parquet",
             ),
             (
-                format!("{root}/../{attempt}-00000-{writer}.parquet"),
-                "a traversal segment escapes the recipe root",
+                format!("{root}/1/../{attempt}-00000-{writer}.parquet"),
+                "a traversal segment escapes the version root",
             ),
         ] {
             assert!(

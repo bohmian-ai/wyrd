@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: model-drift
   version: 1.0.0
-  space: default
 spec:
   description: fixture drift
   inputs:
@@ -23,7 +22,6 @@ spec:
             kind: Data
             name: training
             version: 1.0.0
-            space: default
           features: [feature]
         condition:
           kind: Statistical

@@ -29,7 +29,7 @@ pub(super) const LIST: &str = "cards.list";
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetCardArgs {
-    /// Exact versioned Card identity, including space; use alone.
+    /// Exact versioned Card identity; use alone.
     #[serde(default)]
     pub(crate) card_ref: Option<CardRef>,
     /// Card kind namespace of `card_uid`; use with `card_uid`.
@@ -76,8 +76,8 @@ pub(crate) fn descriptors() -> Vec<Tool> {
         tool::<GetCardArgs, GetCardResponse>(
             GET,
             "Read a Card",
-            "Read one Card in this caller's tenant by an exact versioned card_ref, including \
-             space, or by kind with card_uid; pass exactly one form. card.status.verification \
+            "Read one Card in this caller's tenant by an exact versioned card_ref, \
+             or by kind with card_uid; pass exactly one form. card.status.verification \
              carries a Verifier's PSI/SPC baseline status and an owner Card's derived \
              binding_ids. card.relationships.outbound_refs and inbound_refs contain exact \
              related identities in each edge's ref field; follow them with cards.get by \

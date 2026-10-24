@@ -17,9 +17,10 @@ use wyrd_queue::{
 use wyrd_spec::ids::CardUid;
 #[cfg(feature = "internal")]
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::ids::{RunId, TableVersion};
 
 use crate::bifrost::scope::{ClientScope, SinkKind};
+use crate::bifrost::table::WriterTable;
 
 /// Pool key: the full `(ClientScope, SinkKind, table)` producer identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -27,6 +28,7 @@ struct ProducerKey {
     scope: ClientScope,
     kind: SinkKind,
     table: String,
+    table_version: TableVersion,
 }
 
 /// The client-tier producer pool behind [`crate::bifrost::Bifrost`].
@@ -187,13 +189,12 @@ impl WriterPool {
     /// saturated or the pool has closed.
     pub(crate) fn insert(
         &self,
-        table: &str,
-        schema: &SchemaRef,
+        table: &WriterTable,
         json: Vec<u8>,
         card_uid: Option<CardUid>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        self.insert_rows(table, schema, vec![json], card_uid, run_id)
+        self.insert_rows(table, vec![json], card_uid, run_id)
     }
 
     /// Enqueue every row of one logical record, or none of them, propagating
@@ -215,17 +216,16 @@ impl WriterPool {
     /// the record has more rows than the channel can ever hold.
     pub(crate) fn insert_rows(
         &self,
-        table: &str,
-        schema: &SchemaRef,
+        table: &WriterTable,
         rows: Vec<Vec<u8>>,
         card_uid: Option<CardUid>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        self.producer_for(table, schema)?.enqueue_rows(
+        self.producer_for(table, table.user_schema())?.enqueue_rows(
             rows,
             card_uid,
             run_id,
-            crate::transport::trace::producer(table),
+            crate::transport::trace::producer(table.fqn()),
         )
     }
 
@@ -245,7 +245,7 @@ impl WriterPool {
     #[cfg(feature = "internal")]
     pub(crate) fn enqueue_batch(
         &self,
-        table: &str,
+        table: &WriterTable,
         batch: RecordBatch,
         request_id: Option<RequestId>,
     ) -> Result<(), WyrdQueueError> {
@@ -287,12 +287,12 @@ impl WriterPool {
     /// Panics if the producer pool or direct-send mutex is poisoned.
     pub(crate) async fn write_batch(
         &self,
-        table: &str,
+        table: &WriterTable,
         batch: &RecordBatch,
     ) -> Result<(), WyrdQueueError> {
         let _admitted = DirectSendPermit::admit(self)?;
         SealedBatchSender::new(Arc::clone(&self.sink), self.budget.clone(), self.config)
-            .send(table, batch)
+            .send(table.fqn(), table.table_version(), batch)
             .await
             .map(|_| ())
     }
@@ -397,7 +397,11 @@ impl WriterPool {
         }
     }
 
-    /// Get-or-create the pooled producer for `(scope, Record, table)`.
+    /// Get-or-create the pooled producer for `(scope, Record, table,
+    /// table_version)`.
+    ///
+    /// A newly described version gets its own producer, so rows already
+    /// queued under an older version keep that version on every attempt.
     ///
     /// Closure is observed while holding the producer-map lock, the same lock
     /// [`Self::shutdown`] closes and snapshots under, so an admitted producer is
@@ -413,7 +417,7 @@ impl WriterPool {
     /// Panics if the producer pool mutex is poisoned.
     fn producer_for(
         &self,
-        table: &str,
+        table: &WriterTable,
         schema: &SchemaRef,
     ) -> Result<Arc<Producer>, WyrdQueueError> {
         let kind = SinkKind::Record;
@@ -422,13 +426,17 @@ impl WriterPool {
             return Err(WyrdQueueError::QueueFull);
         }
         if let Some(producer) = pool.iter().find_map(|(key, producer)| {
-            (key.scope == self.scope && key.kind == kind && key.table == table)
-                .then(|| Arc::clone(producer))
+            (key.scope == self.scope
+                && key.kind == kind
+                && key.table == table.fqn()
+                && key.table_version == table.table_version())
+            .then(|| Arc::clone(producer))
         }) {
             return Ok(producer);
         }
         let producer = Arc::new(Producer::with_budget(
-            table,
+            table.fqn(),
+            table.table_version(),
             schema.clone(),
             Arc::clone(&self.sink),
             self.config,
@@ -437,7 +445,8 @@ impl WriterPool {
         let key = ProducerKey {
             scope: self.scope.clone(),
             kind,
-            table: table.to_owned(),
+            table: table.fqn().to_owned(),
+            table_version: table.table_version(),
         };
         pool.insert(key, Arc::clone(&producer));
         Ok(producer)
@@ -573,7 +582,14 @@ mod tests {
         let writer = tokio::spawn({
             let pool = Arc::clone(&pool);
             let batch = batch.clone();
-            async move { pool.write_batch("direct", &batch).await }
+            let schema = Arc::clone(&schema);
+            async move {
+                pool.write_batch(
+                    &WriterTable::new("direct", Arc::clone(&schema), TableVersion::INITIAL),
+                    &batch,
+                )
+                .await
+            }
         });
         sink.started.notified().await;
 
@@ -607,7 +623,11 @@ mod tests {
             .expect("writer task")
             .expect("admitted send acknowledged");
         assert!(matches!(
-            pool.write_batch("late", &batch).await,
+            pool.write_batch(
+                &WriterTable::new("late", Arc::clone(&schema), TableVersion::INITIAL),
+                &batch
+            )
+            .await,
             Err(WyrdQueueError::QueueFull)
         ));
         assert_eq!(sink.acked.load(Ordering::SeqCst), 1);
@@ -645,8 +665,13 @@ mod tests {
         );
         let schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        pool.insert("admitted", &schema, br#"{"id": 1}"#.to_vec(), None, None)
-            .expect("row admitted before shutdown");
+        pool.insert(
+            &WriterTable::new("admitted", Arc::clone(&schema), TableVersion::INITIAL),
+            br#"{"id": 1}"#.to_vec(),
+            None,
+            None,
+        )
+        .expect("row admitted before shutdown");
 
         std::thread::scope(|scope| {
             let guard = pool.producers.lock().expect("producer pool lock");
@@ -668,11 +693,19 @@ mod tests {
             "admitted row durably acknowledged"
         );
         assert!(matches!(
-            pool.producer_for("late", &schema),
+            pool.producer_for(
+                &WriterTable::new("late", Arc::clone(&schema), TableVersion::INITIAL),
+                &schema
+            ),
             Err(WyrdQueueError::QueueFull)
         ));
         assert!(matches!(
-            pool.insert("late", &schema, br#"{"id": 2}"#.to_vec(), None, None),
+            pool.insert(
+                &WriterTable::new("late", Arc::clone(&schema), TableVersion::INITIAL),
+                br#"{"id": 2}"#.to_vec(),
+                None,
+                None
+            ),
             Err(WyrdQueueError::QueueFull)
         ));
         let metrics = pool.metrics();

@@ -3,7 +3,6 @@ kind: Verifier
 metadata:
   name: empty-each
   version: 1.0.0
-  space: default
 spec:
   description: Every listed item is ok, judged inline and after a code step.
   inputs:

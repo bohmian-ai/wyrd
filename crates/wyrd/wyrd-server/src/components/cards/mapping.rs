@@ -16,7 +16,6 @@ pub fn outcome_row_to_response(
             kind: row.kind.clone(),
             name: row.name.clone(),
             version: row.version.clone(),
-            space: Some(row.space.clone()),
             uid: Some(row.card_uid.clone()),
         },
         spec_hash: row.spec_hash.clone(),
@@ -38,7 +37,6 @@ pub fn existing_row_to_response(
             kind: row.kind.clone(),
             name: row.name.clone(),
             version: row.version.clone(),
-            space: Some(row.space.clone()),
             uid: Some(row.card_uid.clone()),
         },
         spec_hash: row.spec_hash.clone(),
@@ -72,7 +70,7 @@ mod tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::graph::relationships_from_spec;
-    use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+    use wyrd_spec::ids::{CardName, CardUid};
     use wyrd_spec::registry::{
         CardLifecycleStatus, DeclarationOperationId, DeclarationOutcomeKind,
     };
@@ -94,7 +92,6 @@ mod tests {
                     "kind": "Prompt",
                     "name": "prompt",
                     "version": "1.0.0",
-                    "space": "default",
                     "uid": "018f0000-0000-7000-8000-000000000001"
                 },
                 "execution_route": {"kind": "native"}
@@ -106,12 +103,12 @@ mod tests {
 
         assert_eq!(
             relationships.outbound,
-            vec!["default/Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"]
+            vec!["Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"]
         );
         assert_eq!(relationships.outbound_refs.len(), 1);
         assert_eq!(
             relationships.outbound_refs[0].card_ref.to_string(),
-            "default/Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"
+            "Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"
         );
         assert!(relationships.inbound.is_empty());
     }
@@ -122,7 +119,6 @@ mod tests {
             card_uid: CardUid::from_uuid(Uuid::now_v7())
                 .expect("test_setup: UUIDv7 is a valid card UID"),
             kind: CardKind::Prompt,
-            space: SpaceName::new("default").expect("test_setup: static space is valid"),
             name: CardName::new("projection").expect("test_setup: static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test_setup: static version is valid"),
             spec_hash: "spec-hash".to_owned(),

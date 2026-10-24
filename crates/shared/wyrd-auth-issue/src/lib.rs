@@ -20,9 +20,8 @@ use wyrd_auth_verify::{
 };
 use wyrd_runtime::{PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalKindTag;
-use wyrd_spec::envelope::CardKind;
-use wyrd_spec::reference::CardRefScope;
+use wyrd_spec::auth::{CardAccess, PrincipalKindTag};
+use wyrd_spec::ids::CardUid;
 
 pub use wyrd_auth_verify::{MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH};
 
@@ -76,9 +75,10 @@ pub enum IssueError {
     /// Principal kind cannot hold a tenant access token.
     #[error("principal kind cannot hold a tenant access token")]
     InvalidPrincipalKind,
-    /// Principal card reference was missing or mismatched.
-    #[error("principal card_ref is missing or mismatched")]
-    InvalidCardRef,
+    /// Card access, workload root, and delegation shape are inconsistent, so
+    /// the verifier would refuse the token.
+    #[error("card access and workload context are inconsistent")]
+    InvalidCardAccess,
     /// Encoded token would exceed the verifier bearer-token size limit.
     #[error("token too large: encoded length {encoded_len} exceeds limit {limit}")]
     CardScopeTooLarge {
@@ -105,6 +105,11 @@ pub struct AccessGrant {
     /// The token's authority: the subject's effective permissions, already
     /// attenuated to the actor's for a delegated token.
     pub permissions: PermissionSet,
+    /// The signed Card limit: `any_registered`, `root_required`, or the exact
+    /// resolved (or delegated-intersection) UID scope.
+    pub card_access: CardAccess,
+    /// The subject's selected root, when one was resolved.
+    pub workload_uid: Option<CardUid>,
     /// Stored credential the token was exchanged from, when one was presented.
     pub credential_id: Option<Uuid>,
     /// RFC 8693 actor chain for a delegated token, outermost layer the current
@@ -230,19 +235,19 @@ impl IssuingKey {
 
     /// Shape the claims of one tenant access token for a resolved grant.
     ///
-    /// The single tenant access-token claim builder. It validates that the
-    /// principal's kind and Card binding agree, re-derives a Card-bound
-    /// principal's scope from its root so a caller cannot widen it with extra
-    /// members, bounds a delegated grant's RFC 8693 `act` chain, and stamps
-    /// `sub` as the subject, the grant's audience, its `permissions` authority
-    /// snapshot, informational `roles`, and the credential attribution. The
-    /// encoded token must fit the verifier's bearer-size limit.
+    /// The single tenant access-token claim builder. It refuses kinds that
+    /// never hold a tenant token, bounds a delegated grant's RFC 8693 `act`
+    /// chain, stamps `sub` as the subject, the grant's audience, its
+    /// `permissions` authority snapshot, Card access, root, informational
+    /// `roles`, and the credential attribution, and then admits the claims
+    /// through the verifier's own shape check so no token is minted that the
+    /// verifier would refuse.
     ///
     /// # Errors
     /// Returns [`IssueError::InvalidPrincipalKind`] for a platform-scope kind
     /// or when the tenant SYSTEM principal is the subject or any delegation
     /// layer, because it never appears in a token,
-    /// [`IssueError::InvalidCardRef`] when kind and Card binding disagree,
+    /// [`IssueError::InvalidCardAccess`] when the claims would not verify,
     /// [`IssueError::DelegationDepthExceeded`] when the resulting chain would
     /// exceed [`MAX_DELEGATION_DEPTH`], and [`IssueError::InvalidTtl`] for a
     /// non-positive TTL.
@@ -265,24 +270,28 @@ impl IssuingKey {
         ttl: Duration,
     ) -> Result<AccessTokenClaims, IssueError> {
         let AccessGrant {
-            mut principal,
+            principal,
             roles,
             permissions,
+            card_access,
+            workload_uid,
             credential_id,
             act,
             audience,
         } = grant;
-        validate_principal_ref(&principal)?;
-        if std::iter::successors(act.as_deref(), |claim| claim.act.as_deref())
-            .any(|claim| claim.principal.kind == PrincipalKindTag::System)
+        if std::iter::once(principal.kind)
+            .chain(
+                std::iter::successors(act.as_deref(), |claim| claim.act.as_deref())
+                    .map(|claim| claim.principal.kind),
+            )
+            .any(|kind| {
+                matches!(
+                    kind,
+                    PrincipalKindTag::GlobalAdmin | PrincipalKindTag::System
+                )
+            })
         {
             return Err(IssueError::InvalidPrincipalKind);
-        }
-        if let Some(card_ref) = &principal.card_ref {
-            principal.card_ref_scope = CardRefScope::from_root_and_members(
-                card_ref,
-                principal.card_ref_scope.as_slice().iter().cloned(),
-            );
         }
         let depth = act_depth(act.as_deref());
         tracing::Span::current().record("delegation_depth", depth);
@@ -295,11 +304,13 @@ impl IssuingKey {
         let (iat, exp) = timestamps(Utc::now(), ttl)?;
         let jti = new_jti();
         tracing::Span::current().record("jti", &jti);
-        Ok(AccessTokenClaims {
+        let claims = AccessTokenClaims {
             sub,
             principal,
             roles,
             permissions,
+            workload_uid,
+            card_access,
             act,
             aud: audience.as_str().to_owned(),
             exp,
@@ -307,7 +318,11 @@ impl IssuingKey {
             iss: self.issuer.clone(),
             jti,
             cid: credential_id.map(|id| id.to_string()),
-        })
+        };
+        claims
+            .into_verified()
+            .map_err(|_| IssueError::InvalidCardAccess)?;
+        Ok(claims)
     }
 
     /// Mint a refresh token for a principal that holds a session, from an
@@ -458,38 +473,6 @@ fn act_depth(act: Option<&ActClaim>) -> usize {
     1 + act_depth(act.act.as_deref())
 }
 
-/// Reject a principal projection whose kind and Card binding disagree.
-///
-/// Card binding is a property of a machine principal: an agent must carry an
-/// Agent card, a service may carry a Service card or none at all, and an
-/// administrative or human principal must carry none. A platform-scope kind
-/// and the tenant SYSTEM principal, an attribution identity only, are rejected
-/// outright because no tenant-scope token is issued for either.
-///
-/// # Errors
-/// Returns [`IssueError::InvalidCardRef`] when the kind and Card binding
-/// disagree, or when the kind is platform-scoped.
-fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueError> {
-    match (
-        principal.kind,
-        principal.card_ref.as_ref().map(|card_ref| &card_ref.kind),
-    ) {
-        // A platform-scope principal is never issued a tenant-scope token. The
-        // platform plane has its own credential path, so a token request
-        // carrying this kind is malformed rather than merely unauthorized.
-        (PrincipalKindTag::GlobalAdmin | PrincipalKindTag::System, _) => {
-            Err(IssueError::InvalidPrincipalKind)
-        }
-        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, None)
-        | (PrincipalKindTag::Service, Some(CardKind::Service) | None)
-        | (PrincipalKindTag::Agent, Some(CardKind::Agent)) => Ok(()),
-        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, Some(_)) => {
-            Err(IssueError::InvalidCardRef)
-        }
-        (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => Err(IssueError::InvalidCardRef),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
@@ -501,12 +484,9 @@ mod tests {
         verify_eddsa,
     };
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
-    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use wyrd_spec::auth::{CardAccess, PrincipalKindTag};
+    use wyrd_spec::ids::CardUid;
 
     use super::{
         AccessGrant, IssueError, IssuingKey, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
@@ -540,7 +520,8 @@ mod tests {
             principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").to_string()
         );
         assert_eq!(claims.principal.kind, PrincipalKindTag::User);
-        assert_eq!(claims.principal.card_ref, None);
+        assert_eq!(claims.card_access, CardAccess::AnyRegistered);
+        assert_eq!(claims.workload_uid, None);
         assert_eq!(claims.roles, vec![role("editor")]);
         assert_eq!(claims.permissions, permissions());
         assert_eq!(claims.aud, "wyrd");
@@ -550,138 +531,61 @@ mod tests {
         assert_eq!(claims.jti.len(), 26);
     }
 
-    /// Build a Card-bound principal reference for the issuance tests.
+    /// A selected root signs its exact scope beside the stable account, and
+    /// a grant the verifier would refuse is never signed.
     ///
-    /// The kind and the Card kind are independent parameters so a test can
-    /// present the mismatched pair the issuer must reject.
-    fn card_principal(id: &str, kind: PrincipalKindTag, card_kind: CardKind) -> TokenPrincipalRef {
-        TokenPrincipalRef {
-            id: principal_id(id),
-            kind,
-            tenant_id: tenant_id(),
-            card_ref: Some(card_ref(card_kind)),
-            card_ref_scope: CardRefScope::default(),
-        }
-    }
-
-    /// A Service token carries its Card and the emit scope rooted at it.
-    ///
-    /// The `card_ref_scope` claim is what later authorizes an observation, so
-    /// the issuer must sign it rather than leave a consumer to re-derive it.
+    /// # Panics
+    /// Panics when the scoped grant fails, its claims differ, or an
+    /// inconsistent grant is signed.
     #[test]
-    fn issue_access_token_forces_service_card_ref() {
-        let card_ref = card_ref(CardKind::Service);
+    fn issue_access_token_signs_exact_root_scope_and_refuses_inconsistent_access() {
+        let (root, member) = (uid(1), uid(2));
+        let scoped = |cards: Vec<CardUid>| CardAccess::Scoped { cards };
         let token = issuing_key()
             .issue_access_token(
-                grant(
-                    card_principal(
-                        "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
-                        PrincipalKindTag::Service,
-                        CardKind::Service,
-                    ),
-                    vec![role("service")],
-                ),
-                Duration::minutes(5),
-            )
-            .expect("token issues");
-        let claims = verify_access_token(&token);
-
-        assert_eq!(claims.principal.kind, PrincipalKindTag::Service);
-        assert_eq!(claims.principal.card_ref, Some(card_ref.clone()));
-        assert_eq!(
-            claims.principal.card_ref_scope,
-            CardRefScope::own(&card_ref)
-        );
-        assert_eq!(claims.sub, claims.principal.id.to_string());
-    }
-
-    /// A Service principal may not be signed holding an Agent Card.
-    ///
-    /// Kind and Card kind are separate inputs, so nothing but this check stops
-    /// a caller from minting a token whose claimed kind and Card disagree.
-    #[test]
-    fn issue_access_token_rejects_agent_card_ref_for_a_service() {
-        let result = issuing_key().issue_access_token(
-            grant(
-                card_principal(
-                    "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
-                    PrincipalKindTag::Service,
-                    CardKind::Agent,
-                ),
-                vec![role("service")],
-            ),
-            Duration::minutes(5),
-        );
-
-        assert!(matches!(result, Err(IssueError::InvalidCardRef)));
-    }
-
-    /// An Agent token carries its Card and the emit scope rooted at it.
-    ///
-    /// The Agent half of the same contract: an Agent is always Card-bound, so
-    /// a successful issuance always signs a `card_ref` and its own scope.
-    #[test]
-    fn issue_access_token_forces_agent_card_ref() {
-        let card_ref = card_ref(CardKind::Agent);
-        let token = issuing_key()
-            .issue_access_token(
-                grant(
-                    card_principal(
-                        "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04",
-                        PrincipalKindTag::Agent,
-                        CardKind::Agent,
-                    ),
-                    vec![role("workload")],
-                ),
-                Duration::minutes(5),
-            )
-            .expect("token issues");
-        let claims = verify_access_token(&token);
-
-        assert_eq!(claims.principal.kind, PrincipalKindTag::Agent);
-        assert_eq!(claims.principal.card_ref, Some(card_ref.clone()));
-        assert_eq!(
-            claims.principal.card_ref_scope,
-            CardRefScope::own(&card_ref)
-        );
-        assert_eq!(claims.sub, claims.principal.id.to_string());
-    }
-
-    /// An Agent principal may not be signed holding a Service Card.
-    ///
-    /// The mirror of the Service rejection: the check is symmetric, so neither
-    /// kind can borrow the other's Card.
-    #[test]
-    fn issue_access_token_rejects_service_card_ref_for_an_agent() {
-        let result = issuing_key().issue_access_token(
-            grant(
-                card_principal(
-                    "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04",
-                    PrincipalKindTag::Agent,
-                    CardKind::Service,
-                ),
-                vec![role("workload")],
-            ),
-            Duration::minutes(5),
-        );
-
-        assert!(matches!(result, Err(IssueError::InvalidCardRef)));
-    }
-
-    #[test]
-    fn issue_access_token_rejects_user_with_card_ref() {
-        let result = issuing_key().issue_access_token(
-            grant(
-                TokenPrincipalRef {
-                    card_ref: Some(card_ref(CardKind::Service)),
-                    ..user_principal()
+                AccessGrant {
+                    card_access: scoped(vec![root.clone(), member.clone()]),
+                    workload_uid: Some(root.clone()),
+                    ..grant(service_principal(), vec![role("service")])
                 },
-                vec![role("editor")],
-            ),
-            Duration::minutes(5),
+                Duration::minutes(5),
+            )
+            .expect("token issues");
+        let claims = verify_access_token(&token);
+        assert_eq!(claims.principal, service_principal());
+        assert_eq!(claims.workload_uid, Some(root.clone()));
+        assert_eq!(
+            claims.card_access,
+            scoped(vec![root.clone(), member.clone()])
         );
+        assert_eq!(claims.sub, claims.principal.id.to_string());
 
-        assert!(matches!(result, Err(IssueError::InvalidCardRef)));
+        for (label, card_access, workload_uid) in [
+            (
+                "root outside scope",
+                scoped(vec![member.clone()]),
+                Some(root.clone()),
+            ),
+            ("scoped without root", scoped(vec![root.clone()]), None),
+            (
+                "any with root",
+                CardAccess::AnyRegistered,
+                Some(root.clone()),
+            ),
+        ] {
+            let result = issuing_key().issue_access_token(
+                AccessGrant {
+                    card_access,
+                    workload_uid,
+                    ..grant(service_principal(), vec![role("service")])
+                },
+                Duration::minutes(5),
+            );
+            assert!(
+                matches!(result, Err(IssueError::InvalidCardAccess)),
+                "{label}: {result:?}"
+            );
+        }
     }
 
     /// A platform-scope kind can never hold a tenant access token.
@@ -702,7 +606,7 @@ mod tests {
     }
 
     /// A grant whose encoded token would exceed the verifier's bearer limit is
-    /// refused at issuance rather than minted unverifiable.
+    /// refused at issuance rather than minted unverifiable or truncated.
     #[test]
     fn issue_access_token_rejects_token_over_bearer_limit() {
         let roles = (0..800)
@@ -792,17 +696,13 @@ mod tests {
     /// grant.
     #[test]
     fn issue_access_token_delegated_names_subject_and_outer_actor() {
-        let actor = agent_principal();
+        let actor = service_principal();
         let delegated_token = issuing_key()
             .issue_access_token(
                 AccessGrant {
-                    act: Some(Box::new(ActClaim {
-                        sub: actor.id.to_string(),
-                        principal: actor.clone(),
-                        act: None,
-                    })),
+                    act: Some(Box::new(actor_layer(None))),
                     audience: TokenAudience::Bifrost,
-                    ..grant(user_principal(), vec![role("viewer")])
+                    ..delegated(user_principal())
                 },
                 Duration::minutes(5),
             )
@@ -815,6 +715,7 @@ mod tests {
         assert_eq!(claims.aud, "bifrost");
         assert_eq!(act.sub, actor.id.to_string());
         assert_eq!(act.principal, actor);
+        assert_eq!(act.workload_uid, uid(9));
         assert_eq!(act.act, None);
     }
 
@@ -830,7 +731,7 @@ mod tests {
         let result = issuing_key().issue_access_token(
             AccessGrant {
                 act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH + 1))),
-                ..grant(user_principal(), vec![role("viewer")])
+                ..delegated(user_principal())
             },
             Duration::minutes(5),
         );
@@ -854,7 +755,7 @@ mod tests {
         let result = issuing_key().issue_access_token(
             AccessGrant {
                 act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH))),
-                ..grant(user_principal(), vec![role("viewer")])
+                ..delegated(user_principal())
             },
             Duration::minutes(5),
         );
@@ -874,7 +775,7 @@ mod tests {
         let system_actor = || ActClaim {
             sub: system.id.to_string(),
             principal: system.clone(),
-            act: None,
+            ..actor_layer(None)
         };
         let cases: Vec<(&str, AccessGrant)> = vec![
             (
@@ -885,14 +786,14 @@ mod tests {
                 },
             ),
             (
-                "card bound",
-                grant(
-                    TokenPrincipalRef {
-                        card_ref: Some(card_ref(CardKind::Verifier)),
-                        ..system.clone()
+                "verifier scoped",
+                AccessGrant {
+                    card_access: CardAccess::Scoped {
+                        cards: vec![uid(11)],
                     },
-                    Vec::new(),
-                ),
+                    workload_uid: Some(uid(11)),
+                    ..grant(system.clone(), Vec::new())
+                },
             ),
             ("role", grant(system.clone(), vec![role("editor")])),
             (
@@ -905,19 +806,15 @@ mod tests {
             (
                 "delegated system token",
                 AccessGrant {
-                    act: Some(Box::new(ActClaim {
-                        sub: user_principal().id.to_string(),
-                        principal: user_principal(),
-                        act: None,
-                    })),
-                    ..grant(system.clone(), Vec::new())
+                    act: Some(Box::new(actor_layer(None))),
+                    ..delegated(system.clone())
                 },
             ),
             (
                 "system as delegation actor",
                 AccessGrant {
                     act: Some(Box::new(system_actor())),
-                    ..grant(agent_principal(), Vec::new())
+                    ..delegated(service_principal())
                 },
             ),
         ];
@@ -943,25 +840,12 @@ mod tests {
         );
     }
 
-    /// A SYSTEM principal projection scoped to one UID-bearing Verifier, the
-    /// shape the server once signed for result writes.
-    ///
-    /// # Panics
-    /// Panics when a static identity component is invalid.
+    /// The SYSTEM principal projection the server once signed.
     fn system_principal() -> TokenPrincipalRef {
-        let verifier = CardRef {
-            uid: Some(
-                wyrd_spec::ids::CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11")
-                    .expect("static uid is valid"),
-            ),
-            ..card_ref(CardKind::Verifier)
-        };
         TokenPrincipalRef {
             id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04"),
             kind: PrincipalKindTag::System,
             tenant_id: tenant_id(),
-            card_ref: None,
-            card_ref_scope: CardRefScope::own(&verifier),
         }
     }
 
@@ -1139,10 +1023,41 @@ mod tests {
             principal,
             roles,
             permissions: permissions(),
+            card_access: CardAccess::AnyRegistered,
+            workload_uid: None,
             credential_id: None,
             act: None,
             audience: TokenAudience::Wyrd,
         }
+    }
+
+    /// A delegated grant shape for `subject`: an empty scoped intersection
+    /// with one Service actor.
+    fn delegated(subject: TokenPrincipalRef) -> AccessGrant {
+        AccessGrant {
+            card_access: CardAccess::Scoped { cards: Vec::new() },
+            act: Some(Box::new(actor_layer(None))),
+            ..grant(subject, vec![role("viewer")])
+        }
+    }
+
+    /// One Service actor layer running under a fixed root.
+    fn actor_layer(act: Option<Box<ActClaim>>) -> ActClaim {
+        ActClaim {
+            sub: service_principal().id.to_string(),
+            principal: service_principal(),
+            workload_uid: uid(9),
+            cid: None,
+            act,
+        }
+    }
+
+    /// A deterministic UUIDv7 Card UID distinguished by `n`.
+    ///
+    /// # Panics
+    /// Panics when the static UID is invalid.
+    fn uid(n: u64) -> CardUid {
+        CardUid::new(format!("01890f28-7c4a-7cc3-98e7-{n:012x}")).expect("static uid is valid")
     }
 
     /// The permission set every test grant carries.
@@ -1170,30 +1085,14 @@ mod tests {
             id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"),
             kind: PrincipalKindTag::User,
             tenant_id: tenant_id(),
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         }
     }
 
     fn service_principal() -> TokenPrincipalRef {
-        let card_ref = card_ref(CardKind::Service);
         TokenPrincipalRef {
             id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
             kind: PrincipalKindTag::Service,
             tenant_id: tenant_id(),
-            card_ref: Some(card_ref.clone()),
-            card_ref_scope: CardRefScope::own(&card_ref),
-        }
-    }
-
-    fn agent_principal() -> TokenPrincipalRef {
-        let card_ref = card_ref(CardKind::Agent);
-        TokenPrincipalRef {
-            id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03"),
-            kind: PrincipalKindTag::Agent,
-            tenant_id: tenant_id(),
-            card_ref: Some(card_ref.clone()),
-            card_ref_scope: CardRefScope::own(&card_ref),
         }
     }
 
@@ -1203,21 +1102,7 @@ mod tests {
         } else {
             None
         };
-        ActClaim {
-            sub: user_principal().id.to_string(),
-            principal: user_principal(),
-            act: next,
-        }
-    }
-
-    fn card_ref(kind: CardKind) -> CardRef {
-        CardRef {
-            kind,
-            name: CardName::new("billing").expect("static name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
-            uid: None,
-        }
+        actor_layer(next)
     }
 
     fn principal_id(value: &str) -> PrincipalId {

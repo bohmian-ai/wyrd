@@ -2284,6 +2284,206 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
     Ok(())
 }
 
+/// Canonical signal rows read back identically through every storage tier.
+///
+/// Two canonical trace/log/metric datasets, each written by its own
+/// bootstrapped Service and flushed separately so every partition seals
+/// several files, and correlated rows in a caller-registered dynamic table are
+/// read with
+/// every column, nested values included, while still hot on Scribe. The same
+/// rows must then read back unchanged after the Scribe pod restarts and
+/// recovers, after the delayed coordinator promotes the sealed files, and
+/// after Forge rewrites them. Alongside, a direct aggregate over the Service
+/// and subject dimensions must equal the accepted owner on every tier, so a
+/// lifecycle step that dropped, renamed, or restamped a dimension fails.
+///
+/// # Errors
+///
+/// Returns an error when setup, writing, recovery, promotion, compaction, or
+/// reading fails, or when any tier reads back different rows.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime; every
+/// expectation failure is returned as an error instead.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn canonical_signal_rows_survive_publication_recovery_and_compaction()
+-> Result<(), JourneyError> {
+    let spec = BifrostClusterSpec::for_targets(&[
+        BifrostTarget::Scribe,
+        BifrostTarget::Oracle,
+        BifrostTarget::ForgeWorker,
+        BifrostTarget::Server,
+    ]);
+    let scribe_node = spec
+        .nodes
+        .first()
+        .ok_or("the topology names Scribe")?
+        .node_id;
+    let coordinator = spec
+        .nodes
+        .last()
+        .ok_or("the topology names its delayed coordinator")?
+        .node_id;
+    let mut cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        spec,
+        ForgeConfig::default(),
+        true,
+        false,
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let custom = unique_table("oracle_lifecycle");
+    let mut scopes = Vec::new();
+    {
+        let scribe = cluster.server(0).ok_or("missing Scribe node")?;
+        register_table(scribe, tenant, &custom).await?;
+        let rows = writer(scribe, "lifecycle-writer").await?;
+        // Two flushes seal two files per partition, which gives Forge a
+        // rewrite to plan.
+        for id in [1, 2] {
+            rows.write(
+                &format!("bifrost.bifrost.{custom}"),
+                &journey_schema(),
+                [journey_row(id, "target")],
+            )
+            .await?;
+            let seeded = wyrd_testing::bifrost::canonical_signals::seed_canonical_signals(
+                scribe,
+                &format!("lifecycle-signals-{id}"),
+            )
+            .await?;
+            scopes.push(format!("'{}'", seeded.scope));
+        }
+    }
+    let scope = scopes.join(", ");
+    let reads = [
+        format!("SELECT * FROM bifrost.bifrost.{custom}"),
+        format!("SELECT * FROM bifrost.traces.spans WHERE scope_name IN ({scope})"),
+        format!("SELECT * FROM bifrost.logs.records WHERE scope_name IN ({scope})"),
+        format!("SELECT * FROM bifrost.metrics.points WHERE scope_name IN ({scope})"),
+        format!(
+            "SELECT service_name, service_version, subject_kind, subject_name, \
+             subject_version, count(*) FROM (\
+             SELECT service_name, service_version, subject_kind, subject_name, subject_version \
+             FROM bifrost.traces.spans WHERE scope_name IN ({scope}) UNION ALL \
+             SELECT service_name, service_version, subject_kind, subject_name, subject_version \
+             FROM bifrost.logs.records WHERE scope_name IN ({scope}) UNION ALL \
+             SELECT service_name, service_version, subject_kind, subject_name, subject_version \
+             FROM bifrost.metrics.points WHERE scope_name IN ({scope})) \
+             GROUP BY 1, 2, 3, 4, 5"
+        ),
+    ];
+    cluster.refresh_oracle_snapshots().await?;
+    let reader = client(
+        cluster.server(1).ok_or("missing Oracle node")?,
+        "lifecycle-reader",
+    )
+    .await?;
+    let hot = rendered_reads(&reader, &reads).await?;
+    let owners = hot.last().ok_or("the aggregate read ran")?;
+    if owners.len() != 2
+        || owners
+            .iter()
+            .zip(["lifecycle-signals-1\u{1f}", "lifecycle-signals-2\u{1f}"])
+            .any(|(owner, service)| !owner.starts_with(service))
+    {
+        return Err(format!("each dataset carries its writer's Service: {owners:?}").into());
+    }
+    if hot.iter().any(Vec::is_empty) {
+        return Err(format!("every hot read returns rows: {hot:?}").into());
+    }
+    let mut sealed = Vec::new();
+    for table in [custom.as_str(), "spans", "records", "points"] {
+        let (compacted, files) = file_tier_counts(&cluster, tenant, table).await?;
+        if compacted != 0 || files == 0 {
+            return Err(format!("{table}: rows are sealed hot first").into());
+        }
+        sealed.push((table, files));
+    }
+
+    cluster.stop_node(scribe_node).await?;
+    cluster.restart_node(scribe_node).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    if rendered_reads(&reader, &reads).await? != hot {
+        return Err("rows changed across the Scribe restart".into());
+    }
+
+    cluster.restart_node(coordinator).await?;
+    await_promotion(&cluster, coordinator, &sealed).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    if rendered_reads(&reader, &reads).await? != hot {
+        return Err("rows changed on publication".into());
+    }
+
+    let scribe = cluster
+        .server_by_node(scribe_node)
+        .ok_or("the Scribe pod is running")?;
+    await_rewrite(
+        &cluster,
+        scribe,
+        &[
+            (BifrostNamespace::Bifrost, custom.as_str()),
+            (BifrostNamespace::Traces, "spans"),
+            (BifrostNamespace::Logs, "records"),
+            (BifrostNamespace::Metrics, "points"),
+        ],
+    )
+    .await?;
+    cluster.refresh_oracle_snapshots().await?;
+    if rendered_reads(&reader, &reads).await? != hot {
+        return Err("rows changed on compaction".into());
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Every row each of `reads` returns, one cell-separated line per row,
+/// sorted so a tier's file order cannot change the comparison.
+///
+/// # Errors
+///
+/// Returns the query, stream, or formatting error.
+async fn rendered_reads(
+    client: &WyrdClient,
+    reads: &[String],
+) -> Result<Vec<Vec<String>>, JourneyError> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let mut rendered = Vec::with_capacity(reads.len());
+    for sql in reads {
+        let mut stream = wyrd_client::Bifrost::query_only(client)
+            .query(&BifrostQueryRequest {
+                params: Vec::new(),
+                sql: sql.clone(),
+                deadline_ms: None,
+            })
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await? {
+            let formatters = batch
+                .columns()
+                .iter()
+                .map(|column| ArrayFormatter::try_new(column.as_ref(), &FormatOptions::default()))
+                .collect::<Result<Vec<_>, _>>()?;
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    formatters
+                        .iter()
+                        .map(|formatter| formatter.value(row).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\u{1f}"),
+                );
+            }
+        }
+        stream.terminal().ok_or("query terminal missing")?;
+        rows.sort_unstable();
+        rendered.push(rows);
+    }
+    Ok(rendered)
+}
+
 /// Report whether any field in `fields`, at any depth, declares a field id.
 fn declared_field_ids(fields: &Fields) -> bool {
     fields.iter().any(|field| {
@@ -2577,7 +2777,8 @@ async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), Jour
         .await?;
 
     cluster.restart_node(coordinator).await?;
-    fixture.await_promotion(&cluster, coordinator).await?;
+    let promoted = fixture.tables().map(|(_, table)| (table, FILTER_FILES));
+    await_promotion(&cluster, coordinator, &promoted).await?;
     cluster.refresh_oracle_snapshots().await?;
     let scribe = cluster.server(0).ok_or("missing Scribe node")?;
     fixture
@@ -2591,6 +2792,61 @@ async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), Jour
         .await?;
     cluster.shutdown().await?;
     Ok(())
+}
+
+/// Waits, bounded, until the freshly started coordinator has promoted every
+/// table's sealed files.
+///
+/// Each entry names a table and the number of sealed files it must hold, all
+/// promoted. The coordinator's boot pass promotes owed Scribe debt; further
+/// passes are requested without touching the Forge clock, so no table's
+/// compaction interval elapses and nothing is rewritten. The exit condition is
+/// the durable `compacted` flag of every file.
+///
+/// # Errors
+///
+/// Returns an error when the coordinator is absent, its boot pass does not
+/// complete, a Postgres probe fails, or any table still holds hot files
+/// when the budget elapses.
+async fn await_promotion(
+    cluster: &WyrdTestCluster,
+    coordinator: NodeId,
+    tables: &[(&str, i64)],
+) -> Result<(), JourneyError> {
+    let server = cluster
+        .server_by_node(coordinator)
+        .ok_or("the delayed coordinator is running")?;
+    tokio::time::timeout(
+        COMPACTION_PASS_WAIT,
+        server.wait_for_forge_scheduler_passes_for_test(1),
+    )
+    .await
+    .map_err(|_| "the coordinator never completed its boot pass")?;
+    let tenant = cluster.data_tenant_id();
+    let deadline = std::time::Instant::now() + COMPACTION_BUDGET;
+    loop {
+        let mut hot_tables = Vec::new();
+        for &(table, files) in tables {
+            let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
+            if compacted != files || hot != 0 {
+                hot_tables.push(format!("{table}: compacted={compacted} hot={hot}"));
+            }
+        }
+        if hot_tables.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("promotion did not finish: {hot_tables:?}").into());
+        }
+        let before = server.completed_forge_scheduler_passes_for_test();
+        server.request_forge_scheduler_pass_for_test();
+        tokio::time::timeout(
+            COMPACTION_PASS_WAIT,
+            server.wait_for_forge_scheduler_passes_for_test(before + 1),
+        )
+        .await
+        .map_err(|_| "a requested scheduler pass did not complete")?;
+    }
 }
 
 /// Rows each Bloom-policy file seals: above the writer's 20,000-row page
@@ -3589,60 +3845,6 @@ impl FilteringFixture {
             (BifrostNamespace::Logs, "records"),
             (BifrostNamespace::Metrics, "points"),
         ]
-    }
-
-    /// Waits, bounded, until the freshly started coordinator has promoted every
-    /// table's sealed files.
-    ///
-    /// The coordinator's boot pass promotes owed Scribe debt; further passes
-    /// are requested without touching the Forge clock, so no table's
-    /// compaction interval elapses and nothing is rewritten. The exit
-    /// condition is the durable `compacted` flag of every file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the coordinator is absent, its boot pass does not
-    /// complete, a Postgres probe fails, or any table still holds hot files
-    /// when the budget elapses.
-    async fn await_promotion(
-        &self,
-        cluster: &WyrdTestCluster,
-        coordinator: NodeId,
-    ) -> Result<(), JourneyError> {
-        let server = cluster
-            .server_by_node(coordinator)
-            .ok_or("the delayed coordinator is running")?;
-        tokio::time::timeout(
-            COMPACTION_PASS_WAIT,
-            server.wait_for_forge_scheduler_passes_for_test(1),
-        )
-        .await
-        .map_err(|_| "the coordinator never completed its boot pass")?;
-        let tenant = cluster.data_tenant_id();
-        let deadline = std::time::Instant::now() + COMPACTION_BUDGET;
-        loop {
-            let mut hot_tables = Vec::new();
-            for (_, table) in self.tables() {
-                let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
-                if compacted != FILTER_FILES || hot != 0 {
-                    hot_tables.push(format!("{table}: compacted={compacted} hot={hot}"));
-                }
-            }
-            if hot_tables.is_empty() {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(format!("promotion did not finish: {hot_tables:?}").into());
-            }
-            let before = server.completed_forge_scheduler_passes_for_test();
-            server.request_forge_scheduler_pass_for_test();
-            tokio::time::timeout(
-                COMPACTION_PASS_WAIT,
-                server.wait_for_forge_scheduler_passes_for_test(before + 1),
-            )
-            .await
-            .map_err(|_| "a requested scheduler pass did not complete")?;
-        }
     }
 
     /// Proves `cut` is the one serving every table, the physical layout of its

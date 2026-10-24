@@ -140,7 +140,7 @@ impl Experiment {
     /// The hard budget, seconds.
     const fn budget_seconds(self) -> u64 {
         match self {
-            Self::Writes => 6 * 60,
+            Self::Writes => 8 * 60,
             Self::Hot => 5 * 60,
             Self::Parquet => 9 * 60,
         }
@@ -214,8 +214,9 @@ pub enum WriteOp {
 }
 
 impl WriteOp {
-    /// Every path, in L1 sweep order.
-    pub const ALL: [Self; 3] = [Self::Native, Self::Spans, Self::Logs];
+    /// Every path, in L1 sweep order: native last, so no later path's
+    /// warmup waits for its far larger backlog to publish.
+    pub const ALL: [Self; 3] = [Self::Spans, Self::Logs, Self::Native];
 
     /// The table this path writes, as `vala.<segment>.<name>`.
     #[must_use]
@@ -629,12 +630,6 @@ pub const SETTLED: [(&str, &str, &str, &str); 5] = [
     ),
     (
         "full-scan-c1",
-        "storage_ratio.native-write",
-        "ratio",
-        STORAGE_RATIO,
-    ),
-    (
-        "full-scan-c1",
         "storage_ratio.otlp-spans",
         "ratio",
         STORAGE_RATIO,
@@ -642,6 +637,12 @@ pub const SETTLED: [(&str, &str, &str, &str); 5] = [
     (
         "full-scan-c1",
         "storage_ratio.otlp-logs",
+        "ratio",
+        STORAGE_RATIO,
+    ),
+    (
+        "full-scan-c1",
+        "storage_ratio.native-write",
         "ratio",
         STORAGE_RATIO,
     ),

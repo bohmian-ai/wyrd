@@ -546,7 +546,7 @@ mod tests {
         let writes = experiment(query::Experiment::Writes, &[], BASELINE_HOST);
         let hot = experiment(query::Experiment::Hot, &[], BASELINE_HOST);
         let parquet = experiment(query::Experiment::Parquet, &[], BASELINE_HOST);
-        for (bifrost, budget) in [(&writes, 360), (&hot, 300), (&parquet, 540)] {
+        for (bifrost, budget) in [(&writes, 480), (&hot, 300), (&parquet, 540)] {
             assert!(bifrost.refusals().is_empty(), "{:?}", bifrost.refusals());
             assert_eq!(
                 bifrost.timing,
@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(steps(&writes, true), measured);
         assert_eq!(
             steps(&writes, false),
-            ["native-write-peak", "otlp-spans-peak", "otlp-logs-peak"]
+            ["otlp-spans-peak", "otlp-logs-peak", "native-write-peak"]
         );
         assert_eq!(
             steps(&hot, true),
@@ -740,7 +740,7 @@ mod tests {
             measured.len() * 4,
             "a warmup and three repetitions per step"
         );
-        assert!(record.elapsed_seconds <= 360.0);
+        assert!(record.elapsed_seconds <= 480.0);
         let peak = record
             .steps
             .iter()

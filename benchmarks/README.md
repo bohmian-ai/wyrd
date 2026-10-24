@@ -23,7 +23,7 @@ mise run bench:l1:gateway -- --profile --steps chat.c64
 `bench:smoke` proves every timing boundary, CPU reading and counter is
 collected, records nothing, and exits 0 or 2. Run it first. Verification and
 Gateway L1 take up to 15 minutes each. The Bifrost L1 experiments take up to
-6 (`writes`), 5 (`hot`), and 9 (`parquet`) minutes, and `bench:l1` up to 50
+8 (`writes`), 5 (`hot`), and 9 (`parquet`) minutes, and `bench:l1` up to 52
 in all. An L2 engine takes 20 to 30 minutes.
 
 ## Prerequisites
@@ -76,15 +76,18 @@ run is discarded.
 
 | Level | Shape | Windows | Budget |
 |---|---|---|---|
-| L1 | Isolated closed-loop work: a client sweep (1/4/16/64; Bifrost 1/64) per operation | 5 s warmup, then 3 × 10 s per step | 900 s; Bifrost 360/300/540 s |
+| L1 | Isolated closed-loop work: a client sweep (1/4/16/64; Bifrost 1/64) per operation | 5 s warmup, then 3 × 10 s per step | 900 s; Bifrost 480/300/540 s |
 | L2 | Competing open-loop work: every repetition runs capacity → overload → recovery from equivalent state | 120 s warmup, then 3 × 360 s | 1,800 s, at least 1,200 s |
 
 What each engine covers:
 
 - **Bifrost.**
   - L1 is three experiments at 1 and 64 clients, each with its own record:
-    - `writes`: 2M-row native, OTLP spans, and OTLP logs writes, complete
-      at their durable acknowledgement with no wait for publication.
+    - `writes`: 2M-row OTLP spans, OTLP logs, and native writes, complete
+      at their durable acknowledgement with no wait for publication. Each
+      path after the first starts once every earlier row has published,
+      outside every window, so no path's server CPU pays another path's
+      backlog; native runs last because its backlog is the largest.
     - `hot`: 10M events rows and 1M spans held in memtables (a staged or
       published row is INVALID); point lookups at 1/64, with p99 below 5 ms
       at 64, a small aggregate and a shredded-attribute span filter at 1.

@@ -25,7 +25,7 @@ use crate::query::run::{Bench, Outcome, Sender, WRONG_RESULT, ask};
 use crate::query::telemetry::{self, Telemetry};
 use crate::query::workload::{Case, Fixture, Rows, TABLE};
 use crate::query::{
-    Experiment, Lane, Read, Residence, SETTLED, SPAN_FIXTURE_ROWS, WriteOp, client, lanes,
+    Experiment, Lane, PAIR, Read, Residence, SETTLED, SPAN_FIXTURE_ROWS, WriteOp, client, lanes,
     parquet_bytes, read_op, smoke, start, table_files,
 };
 
@@ -88,9 +88,11 @@ impl Isolated {
     /// server timings, client diagnostics, and server and driver usage.
     ///
     /// Every request the window sent must have exactly one server timing at
-    /// its boundary; the judged percentiles are the successful ones'. A write
-    /// step's warmup first waits for every earlier row to publish, so no
-    /// step's server CPU pays for another step's backlog.
+    /// its boundary; the judged percentiles are the successful ones'. Each write
+    /// path after the first waits, before its first warmup, for every
+    /// earlier row to publish, so no path's server CPU pays for another
+    /// path's backlog; a path's 64-client step still carries its own
+    /// 1-client backlog.
     ///
     /// # Errors
     ///
@@ -113,7 +115,10 @@ impl Isolated {
             .ok_or_else(|| {
                 ExperimentError::workload(format!("step `{}` declares no clients", step.id))
             })?;
-        if phase == Phase::Warmup && WriteOp::parse(op).is_some() {
+        if phase == Phase::Warmup
+            && step.number("clients") == Some(PAIR[0])
+            && WriteOp::parse(op).is_some_and(|write| write != WriteOp::ALL[0])
+        {
             Residence::settle(server, SETTLE_TIMEOUT)
                 .await
                 .map_err(ExperimentError::workload)?;

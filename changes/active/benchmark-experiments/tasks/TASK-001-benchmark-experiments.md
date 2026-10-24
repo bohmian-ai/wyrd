@@ -3,12 +3,15 @@ id: TASK-001
 kind: implementation
 status: proposed
 spec: SPEC-benchmark-experiments
-spec_revision: 3
+spec_revision: 5
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, INV-009, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010]
 depends_on: []
 parent_task:
 remediates: []
 ---
+
+Approval: the maintainer approved spec revision 5 and this task. All prior
+implementation and evidence were rejected and confer no acceptance credit.
 
 ## Outcome and Value
 
@@ -20,7 +23,7 @@ paths. For example, a queue stress step currently printed as report-only becomes
 a judged step with explicit overload expectations; a saturated driver instead
 produces an INVALID record and exit 2.
 
-This single task delivers the whole approved specification: both levels for
+This single task delivers the whole proposed revision-5 specification: both levels for
 Bifrost, Verification, and Gateway; their command and documentation surfaces;
 historical baseline configuration; portable accounting and optional profiling;
 and retirement of the superseded workflow. Partial engine migrations do not
@@ -51,11 +54,16 @@ sequence; compare matching phases and warm the sequence rather than clearing
 the recovery backlog. Numeric judgment uses median repetition metrics unless
 declared otherwise; correctness and integrity hold in every repetition.
 
-“Per core” means successful work per server CPU-second actually consumed.
+Report both throughput per provisioned vCPU, (W/T)/P, and efficiency per
+server CPU-second used, W/C. P is the recorded logical CPUs available to the
+server processes, counting shared CPUs once across same-host replicas/workers
+and summing distinct server hosts. T is measured wall-seconds, C measured
+server user+system CPU-seconds, and W successful work. Never label C/T as P.
 Server processes, replicas and workers are declared and summed over the same
 measurement window; driver, upstream, Postgres and object store are separate.
-Background work stays in the L2 denominator. Host logical CPU count and declared
-load budgets are never efficiency denominators. Missing/reset counters, process
+Background work stays in the L2 CPU-used denominator. P supplies provisioned
+throughput; declared load budgets supply neither measured denominator.
+Baselines and noise-aware regression use W/C and C/W only; report (a) separately. Missing/reset counters, process
 loss and zero denominators cannot become favorable numbers. Sampled resident
 memory is a sampled peak with a recorded interval, not an OS high-water mark.
 
@@ -81,7 +89,7 @@ synthetic-fixture evidence and symbolic secret inputs, never credentials,
 private endpoints, payloads or sensitive host identifiers.
 
 Costs include three measurements per step, host checks, sampling, large L2
-fixtures, external services and three-platform qualification. Only compact
+fixtures, external services and Linux x86_64 qualification and portability inspection. Only compact
 JSON history belongs in Git; raw samples/logs/profiles stay under `target/`.
 Cross-host normalization remains qualified advisory evidence. Do not optimize
 engines, reproduce ClickBench, import old reports as runs, auto-promote
@@ -90,23 +98,24 @@ wire any benchmark into CI, gates or verification lanes.
 
 ## Approach
 
-1. Revalidate the reuse map and the approved declarations, metric boundaries,
+1. Revalidate the reuse map and the revision-5 declarations, metric boundaries,
    matrices, baseline mapping and persisted v1 contract against current owners.
 2. Establish the shared declaration, validity, repetition, budget and judgment
    workflow with deterministic failure-path proof.
 3. Extend portable process/host accounting and optional profiling at their
    existing owners; make missing evidence explicit and remove OS envelopes.
 4. Add collision-safe record publication, version-aware reading and one report
-   derived from the persisted record, then import only approved baseline data.
-5. Migrate all engine workloads to the shared workflow and approved L1/L2
+   derived from the persisted record, then import only specified baseline data.
+5. Migrate all engine workloads to the shared workflow and specified L1/L2
    declarations while preserving their production and integrity checks.
 6. Replace public commands and docs, retire dead and duplicate owners and
    references, then collect focused regression and real experiment evidence.
 
 ## Ordered Implementation Scenarios
 
-All test names below are planned except the existing regressions explicitly
-identified in Verification and Evidence. Confirm each actual selector after
+V1–V12 names are proposed proof selectors; the rejected candidate already
+contains tests with these names, whose assertions must be revised where
+needed. Existing names do not establish revision-5 compliance. Confirm each actual selector after
 adding the test and before RED. Verification entries V1–V12 give the exact
 commands; plain references replace document links throughout this packet.
 
@@ -145,7 +154,7 @@ equalities remain eligible, subject to all other checks.
 | Either 10-second pre/post host sample exceeds 10% logical CPUs in non-benchmark use | INVALID; preflight refusal admits no workload |
 | Driver exceeds 80% of its declared CPU budget | INVALID |
 | Any missed open-loop arrival, or send-lateness p99 >5 ms | INVALID; preserve scheduled/sent/completed/missed counts |
-| Each applicable p99 has <1,000 samples or p95 has <200 in any repetition | INVALID; heavy-scan p99 also needs 1,000 |
+| Each applicable p99 has <1,000 samples or p95 has <200 in any repetition | INVALID; L2 heavy-scan p95 needs 200 |
 | Required readings missing/reset, declared process lost, or required denominator zero | INVALID; unavailable metrics have reasons |
 | Invalid step beside a valid criterion miss | Run INVALID/exit 2; both reasons retained |
 
@@ -188,8 +197,13 @@ do not invent a replacement server launcher or fixture framework.
 
 **Behavior.** Sum actual user+system CPU across declared server processes in
 the same window. Exclude separately reported driver/upstream/service usage.
-For wall time T, CPU C, work W and bytes B, record used cores C/T, efficiency
-W/C, CPU/operation C/W and byte efficiency B/C. Scaling is Q64/(64×Q1) for
+For wall time T, CPU C, available provisioned vCPUs P, work W and bytes B,
+record used cores C/T, throughput (W/T)/P, efficiency W/C and CPU/operation C/W.
+Writes report rows/s/vCPU, rows/CPU-s, uncompressed MiB/s/vCPU and MiB/CPU-s;
+queries report queries/s/vCPU and queries/CPU-s with executed-plan scanned
+rows/bytes per query alongside each request's server query time.
+Missing/zero/changed P invalidates provisioned throughput; process replicas
+sharing available host CPUs cannot multiply P. Scaling is Q64/(64×Q1) for
 matching controls/query class, preserving both inputs. Storage ratio is
 published stored/ingested uncompressed bytes after declared settlement;
 memory intensity is sampled peak resident bytes/achieved uncompressed MB/s.
@@ -197,20 +211,58 @@ Keep MB=10^6, MiB=2^20 and GB=10^9. Retained Arrow bytes count newly inserted
 rows, encoded protobuf bytes count OTLP payload before framing, scan bytes come
 from executed plans, and retry duplicates are not successful new work.
 
-Point latency spans client request through validated complete result; visibility
-spans acknowledged write to first correct query result with declared probe
-cadence. Verification overhead excludes Verifier-block time from server arrival
-through result staging and retains components. Gateway overhead excludes the
-provider exchange at applicable handoffs, retaining upstream/client timings.
-Never subtract independently aggregated p99 values. Histogram resolution must
-establish strict bounds; unresolved tails cannot establish PASS. Inapplicability
-is explicit, and mixed work reports classes against total server CPU.
+Judged latency starts at server handler entry after request receipt, and ends
+at complete result ready, write acknowledgment or applicable response handoff.
+Point-query time includes server admission/queueing after entry through the
+complete result, not just stream opening or Oracle execution. Client round
+trip, first-token receipt, full-stream receipt, polling visibility and inter-chunk
+lag are diagnostic-only. Keep send scheduling/lateness solely for driver validity;
+remove scheduled-time latency criteria and collection supporting only them.
+Verification overhead subtracts that request's Verifier-block interval union
+from handler-entry-to-result-staging elapsed. Gateway overhead subtracts its
+own provider wait intervals through each buffered/head/final handoff, including
+retries. Retain components and compute residuals per request before percentiles.
+Use raw integer-nanosecond samples and nearest-rank percentiles for server
+latency/overhead and driver send-lateness validity. Server backlog/drain/recovery
+remain lifecycle checks using server state and phase boundaries. Never derive
+judged latency from Prometheus/OTel metrics buckets, counts or sums. Do not change
+bucket bounds. Inapplicability is explicit; mixed work reports classes against
+total server CPU.
 
-**RED.** V4 supplies multiple process windows, known bytes/work, changed host
-core metadata, unavailable/reset counters, per-request timing components and
-boundary-straddling histogram buckets. Assert arithmetic, units, scope and
-unavailability. Expected RED is quota/host normalization, wrong units/timing,
-or a falsely passing unresolved tail.
+Internal timings use standard OpenTelemetry spans and the existing operator
+OTLP export, configured for 100% recording, to a local collector. Preserve the
+server's monotonic per-request duration observations before metrics aggregation.
+Complete instrumentation at the existing server timing owners where needed;
+do not create an endpoint or timing protocol. Pair components by request/trace,
+process, repetition and phase, subtract within each request, then calculate
+percentiles. Count overlapping Verifier blocks once and provider waits through
+the same Gateway handoff, including retries. Preserve component and residual
+samples, clock/resolution, population/count and collection settings; reconcile
+requests/handoffs, flush collection, and make missing/dropped/duplicate required
+observations, invalid components or negative residuals INVALID. Do not clamp or
+substitute a client round trip or span entered/busy time. Server tracing cost
+stays in server CPU; collector cost is separate. Declare its PID as a benchmark
+helper for quiet-host checks and preserve its resource/collection-health
+readings; it cannot hide unrelated host load or dropped timing evidence.
+
+**RED.** V4 supplies multiple process windows, known bytes/work, changed provisioned
+CPU counts at fixed consumed CPU, unavailable/reset counters, missing/zero/changed
+P and shared-host replica counts, per-request timing components and
+out-of-order trace components, overlapping blocks, retry waits, mismatched
+handoffs and missing/dropped/duplicate required observations. Feed raw samples
+whose p99 is 499,999 ns, 500,000 ns and 500,001 ns; strict <500 µs gives PASS,
+FAIL and FAIL. V4 must exercise collection/decoding through the existing OTLP
+path and shared measurement consumer, not only hand-constructed residuals.
+Change diagnostic metrics bucket layouts while holding samples fixed and assert
+identical latency and verdict; a bucket-only input cannot supply judged latency.
+Vary client network delay and polling cadence with identical server samples;
+server latency verdicts stay identical. Send lateness still affects driver
+validity, and diagnostic-only timings cannot satisfy a server criterion.
+Assert both throughput normalizations, historical MB-to-MiB conversion, per-query
+scan rows/bytes, nearest-rank p50/p95/p99, timer metadata, sample counts, arithmetic,
+units, scope and invalidity. Expected RED is an aggregate-derived percentile,
+a missing observation accepted as complete, a clamped residual or a wrong
+strict comparison.
 
 **GREEN.** Extend existing capacity/resource/percentile and sysinfo owners;
 update all consumers of changed readings and plain-child launch, including
@@ -222,7 +274,7 @@ Forge Host and repeated memory-headroom logic; preserve still-used primitives.
 ### Scenario 5 — Criteria distinguish regression, noise and correctness
 
 **Behavior.** For eligible baseline b and three valid values, preserve median
-m, low lo, high hi and spread s=hi−lo. Higher-is-better fails only when
+m, low lo, high hi and spread s=hi−lo. For W/C only, higher-is-better fails only when
 hi<0.90b and b−m>s; lower-is-better fails only when lo>1.15b and m−b>s.
 Equality at either boundary does not fail. Baseline 100 with 75/80/85 fails;
 70/85/100 shows no demonstrated regression. Noise never excuses absolute SLO
@@ -231,21 +283,23 @@ Verification/Gateway overhead p99 <500 µs, with equality failing. Wrong answers
 unexpected errors and undeclared loss fail even if numeric medians pass.
 
 Select eligible comparisons before measurement and store provenance/value and
-both comparisons. Import the research mapping's approved values, units, source
+both comparisons. Import the research mapping's selected values, units, source
 identities and statuses to per-engine baselines.toml, preserving original
-operands and approximations. Primary candidates lacking clean provenance stay
+operands and approximations. Historical “per-core” means W/C, never (W/T)/P;
+convert decimal MB/CPU-s to MiB/CPU-s by ×10^6/2^20 and retain source units.
+Provisioned-vCPU throughput is reported without a baseline regression criterion. Primary candidates lacking clean provenance stay
 excluded; use eligible cfe21dc90 fallback entries where mapped. Verification
 and Gateway have no invented eligible fallback. A declared criterion without
 a usable baseline is INVALID. Cross-host/OS evidence remains advisory with both
 fingerprints; dirty override runs cannot become references. No auto-promotion.
 
 **RED.** V5 table-drives both regression directions, percentage/spread equality,
-the approved examples, strict SLO equality and correctness in only one
+the specified examples, strict SLO equality and correctness in only one
 repetition. V6 exercises selected/excluded/missing/incompatible baseline entries,
 unit conversion and advisory comparisons through runner-to-record integration.
 Expected RED is old inclusive SLOs, single-run comparison, or invented eligibility.
 
-**GREEN.** Use one criterion/judgment owner and approved baseline data; retain
+**GREEN.** Use one criterion/judgment owner and specified baseline data; retain
 valid performance failures independently of invalidity. Rerun V1–V6.
 
 **REFACTOR.** Remove old verdict labels as judgments and retire dead SloGate;
@@ -253,7 +307,7 @@ retain informative saturation observations without a fourth verdict.
 
 ### Scenario 6 — Historical summaries survive failure and remain private
 
-**Behavior.** Persist schema v1 with every field/meaning in the approved record
+**Behavior.** Persist schema v1 with every field/meaning in the proposed record
 table, explicit units, three repetitions, criterion and validity reasons,
 baseline snapshots, controls, build identity, monotonic elapsed time and RFC
 3339 instants. Publish under benchmarks/<engine>/<experiment>/ using actual
@@ -286,7 +340,10 @@ serialization rather than maintaining parallel record forms.
 including INVALID/FAIL reasons, spread and verdict. Common columns are exactly
 step, params, rate, p50/p95/p99 ms, errors, server CPU, peak mem, driver CPU,
 criterion, observed, verdict. Units accompany values; CPU shows consumed seconds
-and mean used cores. Non-applicable cells use an em dash with a reason. Extra
+and mean used cores plus provisioned vCPUs. Label both throughput metrics in
+rate/supporting detail, server time in latency columns, and scan rows/bytes per
+query alongside query time. Client diagnostics never fill judged latency cells.
+Non-applicable cells use an em dash with a reason. Extra
 engine detail also comes from JSON. Removing target artifacts cannot change
 the summary or require rerunning measurement.
 
@@ -335,7 +392,7 @@ fixed deterministic fixture configuration per engine and the shared windows.
 Fixed 64-client SLOs apply only at their declared client count. Ordinary slow
 scans use p95. Measured writes run the full 10 seconds with fresh identities,
 not until a finite fixture is exhausted. Only native peak ≥200k total rows/s
-and OTLP peak ≥30 wire MiB/s per measured server core are retained sanity floors;
+and OTLP peak ≥30 wire MiB/CPU-s are retained sanity floors;
 record peak client counts. Other throughput judgments use declared baseline
 regression without new absolute floors. A selected subset records omissions
 and cannot claim full coverage passed.
@@ -367,16 +424,20 @@ server CPU budget. Missing/incompatible host/build/projection/limits calibration
 refuses execution as INVALID, never substitutes historical total throughput.
 
 Bifrost concurrent bounds are point p99 <5 ms, small aggregate p95 <100 ms,
-1m aggregate p95 <300 ms, heavy scan p99 <2 s, write acknowledgment p99 ≤100 ms
-and visibility p99 ≤5 s. Table aggregates retain correctness and efficiency
+1m aggregate p95 <300 ms, heavy scan p95 <2 s with ≥200 samples per repetition,
+and server write acknowledgment p99 ≤100 ms. Preserve the 5% scan mix and
+six-minute windows: declare a query rate capable of ≥4,000 queries (≥200 scans)
+per repetition and check actual completions; under-sampling is INVALID.
+Visibility polling and its historical ≤5 s reference are diagnostic-only. Table aggregates retain correctness and efficiency
 regression without a new absolute floor. Do not label 32-client results as the
 64-client L1 SLO.
 
 Verification overlaps direct and background verification, Bifrost evidence
-writes and backlog progression. Gateway overlaps capture with completion,
-first-token, chunk-lag, full-stream and applicable overhead observations;
-its defaults are p99 ≤200/350/50/1,100 ms respectively, with explicit overrides
-fixed before execution. Every stateful repetition runs capacity → overload →
+writes and backlog progression. Gateway overlaps capture with server completion,
+first-token response handoff, final-frame handoff and applicable overhead.
+Measured from handler entry, defaults are p99 ≤200/350/1,100 ms respectively;
+explicit overrides are fixed before execution. Client timings and inter-chunk
+lag (historical p99 ≤50 ms reference) are diagnostic-only. Every stateful repetition runs capacity → overload →
 recovery from equivalent initial state and retains matching phase metrics and
 criteria. Backlog grows by at most one second of offered work, drain is ≤60 s
 and recovery restores SLOs within 30 s for corresponding phases in all engines.
@@ -389,7 +450,9 @@ resource quotas.
 **RED.** V11 tests incompatible calibration, harmonic capacity arithmetic,
 concurrent criterion failure despite isolated success, full-sequence repetition
 state, and backlog/drain/recovery/loss/shedding boundaries with controlled
-observations. Expected RED is separate windows, omitted stress judgment or
+observations. Also assert heavy-scan p95 sufficiency at 199/200 samples and
+p99 insufficiency below 1,000; visibility/client timing and chunk-lag cannot
+create SLO failures. Expected RED is separate windows, omitted stress judgment or
 incorrect calibration/phase accounting. V15 supplies actual overlapping
 production workload timelines and records for each engine.
 
@@ -404,7 +467,7 @@ production queues, storage, clients or the release-server launcher.
 ### Scenario 11 — Contributor commands give one consistent result
 
 **Behavior.** Replace all old bench entry points without aliases with the seven
-approved L1/L2 commands. L1 aggregate runs the engines sequentially, forwards
+specified L1/L2 commands. L1 aggregate runs the engines sequentially, forwards
 --profile, retains individual records and combines exit precedence even when
 an engine fails or discards. Engine commands use the same schema/options on all
 three platforms. No build occurs during measurement. Documentation teaches
@@ -434,8 +497,8 @@ TASK-001 owns every row. Proof labels refer to Verification and Evidence.
 | REQ-002, REQ-004, AC-004 | Independent validity failures and exact boundaries produce typed reasons, exit 2 and partial evidence; valid failures remain visible under INVALID precedence. | V2, V3, V12 |
 | REQ-003, INV-007 | Warmup is excluded, all three repetitions retain independent statistics/equivalent state, budgets stop work and no compilation or synthetic host load contaminates execution. | V3, V14, V15, V16 |
 | REQ-005, AC-007 | All stress/overload phases judge declared correctness, rejection, loss and recovery; isolated passing work cannot excuse concurrent misses. | V5, V11, V15 |
-| REQ-006, INV-004 | W/C and C/W recompute from disjoint real process/window data; missing/reset readings cannot masquerade as zero use. | V2, V4, V14 |
-| REQ-007 | All applicable engine metrics use approved units, timing boundaries and resolving histogram bounds; absent/inapplicable values explain why. | V4, V10, V11, V14, V15 |
+| REQ-006, INV-004 | (W/T)/P, W/C and C/W recompute from disjoint real process/window data; missing/reset readings cannot masquerade as zero use. | V2, V4, V14 |
+| REQ-007 | All applicable engine metrics use specified units, timing boundaries and raw samples and complete matched trace components; absent/inapplicable values explain why. | V4, V10, V11, V14, V15 |
 | REQ-008, AC-001 | All three full default L1 matrices finish within budget with fixed fixtures, repetitions, strict fixed-client SLOs, limited sanity floors and accurate subset claims. | V3, V10, V14 |
 | REQ-009 | L2 meets minimum/hard durations, real overlap, exact mixes and compatible L1 calibration; phase-equivalent repetitions preserve concurrent SLO/backlog/drain/recovery evidence. | V3, V11, V15 |
 | REQ-010, AC-009 | Seven discoverable commands replace old entries without aliases; aggregate is sequential; docs explain reproducibility; no benchmark enters CI/gates. | V12, V14, V16 |
@@ -447,23 +510,56 @@ TASK-001 owns every row. Proof labels refer to Verification and Evidence.
 | REQ-016 | Dead thresholds/SloGate/load, direct perf, scoped/cgroup accounting and duplicate measurement/report/parsing paths disappear; workload purposes and used primitives remain. | V13, V16 |
 | INV-001, INV-002, INV-003, AC-010 | Real paths retain result checks, tenant denials, acknowledged durable recovery and non-blocking permission audit; no performance shortcut bypasses them. | V13; real-workflow review in V14/V15 |
 | INV-006 | Summary serialization excludes sensitive sentinels; cancellation/cleanup affect only owned fixtures, and incomplete work is not claimed successful. | V3, V7, V13 |
-| INV-009, AC-005 | Every L1 experiment and real CPU accounting run on all three supported platforms with identical commands/schema; profile capture or explicit diagnostic note is present. Both levels lack prohibited harness paths. | V4, V9, V14, V16 |
+| INV-009, AC-005 | Every L1/L2 experiment and real CPU accounting run on Linux x86_64; all experiments remain runnable unchanged on macOS arm64 and Linux arm64 with identical commands/schema; profile capture or explicit diagnostic note is present. Both levels lack prohibited harness paths. | V4, V9, V14, V15, V16 |
 
 ## Implementation Reference
 
-Paths describe inspected owners and likely changes, not a file or type allowlist.
+Paths describe owners and likely changes, not a file or type allowlist.
 No nested AGENTS.md was found in changes, wyrd-testing or wyrd-bench. Production
-owners remain authoritative; changing their behavior is not part of this task.
+semantics remain authoritative; only measurement instrumentation may extend
+the existing server timing/telemetry owners for exact per-request collection.
+
+The inventory below describes the original owners, including files removed by
+the rejected uncommitted candidate. It is reuse guidance, not approval of that
+candidate. Current experiment.rs Reading::histogram/bucket and interval-bound
+judgment, capacity.rs bucket quantiles, Verification run.rs histogram p99s and
+Gateway run.rs/capacity.rs histogram overhead conflict with revision 5. Reuse
+lifecycle/resource primitives and workload setup where correct; retain raw
+client timing only as optional diagnostics. Revise declaration, record, report,
+throughput arithmetic and tests for P and the two labelled metrics. Replace
+bucket-dependent judged latency with raw server tracing; delete client-latency
+criteria, scheduled-time judgment-only collection and heavy-scan p99. Retain
+send-lateness validity and CPU-used regression. Do not delete the candidate
+wholesale; none of its existing evidence establishes revision-5 acceptance.
+Do not restore retired workflows merely to use an old filename.
+
+- Exact internal timing: Gateway server components/gateway/telemetry.rs
+  Profile::point already computes each monotonic elapsed/provider-wait/residual
+  tuple before metrics recording. Verification components/verification/service.rs
+  VerificationControl::execute documents arrival-to-staging minus block union; extend
+  verification/telemetry.rs ExecutionTelemetry::emit already computes block
+  union and residuals. Extend these timing owners to expose observations on
+  request spans. Bifrost Gate/Oracle/Scribe owners also need exact
+  handler-entry-to-complete-result/write-ack observations and executed-plan scan
+  rows/bytes per query; stream-open and Oracle-only timers omit required work.
+  The existing metrics export loses individual values; client
+  collectors cannot recover them. crates/shared/wyrd-telemetry/src/lib.rs
+  telemetry_sampler, OTLP exporter and export.rs tracer_provider already own
+  server tracing, sampling and operator routing. Reuse this standard stack with
+  local OTLP collection and 100% operator recording. Existing request tracing
+  is not evidence of complete boundary coverage: add only missing timing
+  observations at the existing owners and verify collection against request
+  counts. No new public product surface or dependency is proposed.
 
 - Shared workflow and resources: `crates/wyrd/wyrd-testing/src/capacity.rs`
-  owns Percentiles::raw/buckets, quantile, Histogram, Window::open/close,
+  owns Percentiles::raw and existing diagnostic bucket helpers, Window::open/close,
   ResourceWindow::open/freeze/finish, driver_cpu_seconds, release_binary and
   binary_identity. Inspected Gateway/Verification run consumers and Forge
   deployment resource windows. Existing inline tests cover primitive telemetry
   and percentiles. Current freeze/finish saturates counter subtraction, and
   missing readings may become zero; there is no declared experiment, repeated
   judgment or durable summary workflow. Extend these primitives into the
-  approved experiment owner rather than duplicate them or move behavior to
+  shared experiment owner rather than duplicate them or move behavior to
   wyrd-spec. Preserve existing binary/build identification behavior without
   inventing stronger source-to-binary validity requirements.
 - Server lifecycle/accounting: `src/release_server.rs` LocalServer::start,
@@ -480,7 +576,7 @@ owners remain authoritative; changing their behavior is not part of this task.
   query/run.rs Bench and Measured preserve public-client timings, exact results,
   retained Arrow/OTLP/scan observations. Measured::percentile_ms and its private
   Usage duplicate shared owners. Inspected query setup and report ownership;
-  extend the existing query/workload, telemetry and logs paths for approved
+  extend the existing query/workload, telemetry and logs paths for specified
   fixture sizes, L1 matrices, calibration and concurrent L2. Do not retain hot
   and Parquet as separate default L1 suites or lose the heavy workload purpose.
 - Verification: `src/bin/capacity/verification/workload.rs` Tenant::provision
@@ -491,9 +587,9 @@ owners remain authoritative; changing their behavior is not part of this task.
   and true direct/background/evidence overlap; retain correctness checks.
 - Gateway: `src/bin/capacity/gateway/capacity.rs` Driver, Bench::rate/overload,
   Measured and LATENESS_LIMIT_US own scheduled arrivals and backlog evidence;
-  current MIN_CALLS=30 and short windows do not satisfy the approved contract.
+  current MIN_CALLS=30 and short windows do not satisfy the revision-5 contract.
   envelope.rs classifies capacity/capture/recovery; report.rs Report/Row is the
-  approved common-report starting point but currently includes OUTSIDE-SLO and
+  original common-report starting point but currently includes OUTSIDE-SLO and
   CAPTURE-SATURATED judgments. Inspected report inline tests and mod.rs
   overhead/capacity callers. Extend those workload/timing/capture owners and
   migrate report tests, not another Gateway transport or scheduling layer.
@@ -548,12 +644,14 @@ rules while retaining the same observations.
 
 ### V1–V12 — Focused deterministic and runner integration proof
 
-Each command below runs one planned test. V1 also supplies the representative
+Each command below runs one proposed proof test (reusing a candidate selector
+where present). V1 also supplies the representative
 shared-workflow integration experiment. V6 integrates baseline selection with
 run recording; V7 exercises the real filesystem; V8 exercises the real persisted
-reader and renderer. Resource/clock/process/profiler failure observations are
-controlled without synthetic host load. These tests require no external service
-or credentials and never replace V14/V15 release-process qualification.
+reader and renderer. V4 uses local OTLP collection with known timing observations; other
+resource/clock/process/profiler failure observations are controlled without synthetic host load. Use local in-process OTLP capture for
+V4, not a deployed collector or credentials. These tests never replace
+V14/V15 release-process qualification and the real server timing/export path.
 
 ```text
 V1 — declaration and shared-workflow reuse
@@ -562,11 +660,11 @@ V2 — validity thresholds and precedence
 mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::invalid_observations_preserve_reasons)'
 V3 — windows, equivalent state, budgets and cancellation
 mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::repetitions_exclude_warmup_and_bound_execution)'
-V4 — CPU/byte/timing arithmetic and unavailable readings
+V4 — raw latency, complete OTLP collection, component and CPU/byte arithmetic
 mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::metrics_preserve_process_scope_and_units)'
 V5 — numeric, strict SLO and all-repetition integrity judgment
 mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::criteria_distinguish_regression_noise_and_invalidity)'
-V6 — approved baseline data, selection, provenance and record snapshot
+V6 — specified baseline data, selection, provenance and record snapshot
 mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::baseline_selection_preserves_eligibility)'
 V7 — v1 history, collisions, publication failure, privacy and malformed input
 mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::history_is_append_only_private_and_versioned)'
@@ -637,8 +735,8 @@ mise exec -- cargo nextest run --locked -p wyrd-testing --bin bifrost_forge_capa
 
 ### V14 — Actual L1 release-process and platform journeys
 
-These are the approved future commands to be implemented, not existing aliases
-or proof executed while planning:
+These are the proposed commands, already wired in the rejected candidate;
+their presence is not proof of a compliant implementation or an executed run:
 
 ```text
 mise run bench:l1:bifrost
@@ -651,8 +749,8 @@ mise run bench:l1:gateway -- --profile
 mise run bench:l1 -- --profile
 ```
 
-Exercise every L1 experiment for every engine on macOS arm64, Linux x86_64 and
-Linux arm64. Use the engine commands separately for budget/coverage evidence
+Exercise every L1 experiment for every engine on Linux x86_64. Real macOS arm64
+and Linux arm64 runs are optional; inspect unchanged runnable behavior there. Use the engine commands separately for budget/coverage evidence
 and the aggregate for sequential invocation/forwarding evidence. Commands own
 existing build, repository Postgres, storage and local upstream prerequisites;
 finish setup/build before the experiment clock. Use release servers and real
@@ -662,15 +760,20 @@ diagnostic note without changing judgment, in addition to successful captures
 where available. Do not claim a capture exists when unavailable.
 
 Preserve records with command, platform, controls, window/process scope, all
-repetitions, sample counts, metrics/units and verdict/exit agreement. Recompute
-W/C and C/W, validate full coverage and timing, and compare console with a report
+repetitions, timing method/resolution/population, sample counts, metrics/units
+and verdict/exit agreement. Independently recompute judged latencies from raw
+samples, including matched internal components and per-request residuals.
+Reconcile recorded requests/handoffs with collected timing observations; prove
+missing/dropped timings yield INVALID rather than a successful subset. Recompute
+(W/T)/P, W/C and C/W, including write rows and uncompressed MiB in both
+normalizations and query scan rows/bytes alongside server time; validate full coverage and timing, and compare console with a report
 regenerated from persisted JSON after target artifacts are unavailable. Use the
 implemented record reader/renderer at its actual invocation and record that
 command in execution evidence; the spec fixes report behavior but does not
 name a separate report command. Do not invent another public interface in this
 plan. Performance FAIL/INVALID is honest evidence, not permission to weaken
-criteria or claim a passing complete suite. Missing platform evidence remains
-unverified and blocks an implementation-complete claim.
+criteria or claim a passing complete suite. Missing required Linux x86_64 evidence blocks an implementation-complete claim;
+missing optional macOS arm64 or Linux arm64 runs do not.
 
 ### V15 — Actual concurrent L2 release-process journeys
 
@@ -689,12 +792,15 @@ concurrent SLO and phase applicability. Preserve compatible Bifrost L1 run IDs,
 per-signal capacities and mixed-load arithmetic, 32-client mix, Forge work,
 queue behavior, Verification evidence writes and Gateway capture accounting.
 Show offered/sent/completed/missed arrivals, per-phase backlog/drain/recovery,
-strict versus inclusive boundaries and integrity in every repetition. Exercise
+strict versus inclusive boundaries and integrity in every repetition. Recompute
+server-only latencies and both throughput metrics from raw observations; check
+≥200 heavy-scan samples for p95 and the declared query-rate feasibility in each
+repetition, with client visibility/chunk timing excluded from SLO judgment. Exercise
 optional profiling at both levels without making it required evidence.
-Both levels must work unchanged on all supported platforms; the explicit real
-three-platform qualification matrix is V14, supplemented here by source/command
-portability inspection and workload evidence rather than an invented requirement
-to repeat every L2 qualification on all platforms.
+Run every required L2 experiment on Linux x86_64. Both levels and every
+experiment must work unchanged on macOS arm64 and Linux arm64; inspect commands,
+dependencies and measurement paths for portability. Real runs on those two
+platforms are optional and their absence is not a blocker.
 
 ### V16 — Static migration, authority and documentation proof
 
@@ -734,11 +840,15 @@ and bounded corrections using changes/implementation-execution.md.
 
 ## Material Stop Conditions
 
-- Required behavior cannot fit the approved budgets, fixture sizes, windows,
+- Required behavior cannot fit the specified budgets, fixture sizes, windows,
   repetitions, sample sufficiency or workload mixes without weakening one.
   Demonstrate the conflict; do not shorten steps or invent a passing subset.
-- A required metric/timing/byte boundary cannot be measured honestly through
-  current owners, or would require a production/public telemetry contract,
+- Exact internal timing cannot be collected completely through standard
+  tracing at the specified server boundaries. Do not substitute bucket metrics,
+  sampled traces or client round trips; request a spec revision to a directly
+  measurable boundary. No universal standard overhead metric fills this gap.
+- A required metric/byte boundary cannot be measured honestly through current
+  owners, or would require a changed public telemetry contract,
   dependency, feature, tenancy, durability, audit or admission change.
 - An in-scope portable sysinfo/plain-child implementation cannot supply required
   accounting on a supported platform. Do not restore prohibited OS mechanisms
@@ -747,12 +857,12 @@ and bounded corrections using changes/implementation-execution.md.
 - Completing baseline selection requires an unmapped value, provenance waiver,
   changed eligibility or automatic promotion. Missing historical references
   must stay explicit; a declared unusable comparison is INVALID.
-- Completing persistence/report behavior requires changing approved v1 field
+- Completing persistence/report behavior requires changing revision-5 v1 field
   meanings, history identity/collision semantics or a new durable product owner.
 - A discovered conflict with repository authority needs a meaning-changing spec
   revision. Reversible private structure, fixtures, helpers and equivalent
   focused commands remain implementation-owned bounded decisions.
-- Required real platform evidence is unavailable: finish unaffected work and
+- Required real Linux x86_64 evidence is unavailable: finish unaffected work and
   report the precise unverified obligation rather than claiming completion or
   manufacturing results.
 
@@ -760,7 +870,7 @@ and bounded corrections using changes/implementation-execution.md.
 
 References are plain repository paths, following the packet's no-links rule.
 
-- changes/active/benchmark-experiments/spec.md — approved revision 3, all
+- changes/active/benchmark-experiments/spec.md — draft revision 5 (approval pending), all
   behavior, v1 record table, metrics, levels, constants and acceptance journeys.
 - changes/active/benchmark-experiments/research.md — eligible/excluded baseline
   mapping incorporated by the spec; other research is supporting evidence.
@@ -775,3 +885,12 @@ References are plain repository paths, following the packet's no-links rule.
 - agent_docs/index.md; agent_docs/rust.md; agent_docs/errors.md;
   agent_docs/maintainer-style.md; agent_docs/agent-surfaces.md — applicable
   Rust, error, maintainability and contributor/agent surface conventions.
+
+## Revision history
+
+- Revision 5 — 2026-10-24: Aligned the proposed task with server-only latency,
+  per-request traced wait subtraction, both throughput normalizations with
+  CPU-used regression, query scan evidence, diagnostic client timing and feasible
+  heavy-scan p95. Spec remains draft; task remains proposed and blocked on
+  maintainer approval. Existing implementation must be revised, not discarded
+  wholesale; obsolete judgment paths must be deleted.

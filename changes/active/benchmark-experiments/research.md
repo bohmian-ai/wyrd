@@ -1,20 +1,25 @@
 # Benchmark experiment research
 
-Supporting evidence for [spec revision 3](spec.md), inspected 2026-10-23.
+Supporting evidence for spec revision 5. Historical sources were inspected
+2026-10-23; measurement and platform decisions were revised 2026-10-24.
 This file records current behavior and provenance. REQ-011 incorporates only
 the baseline mapping's selected values, source identities and eligibility
 statuses as normative data; the remaining research adds no requirements.
-No benchmarks, tests, builds, or profilers were run. There is no `.codegraph/`
-directory in this checkout, so CodeGraph was not used. No nested `AGENTS.md`
+No benchmarks, tests, builds, or profilers were run. The original investigation did not use CodeGraph. This checkout now has
+.codegraph/; revision 4 used CodeGraph before inspecting current timing owners. No nested `AGENTS.md`
 was found in the two inspected benchmark owner trees.
 
-## Current owners and complete workflows
+## Original owners and complete workflows
+
+This inventory describes the pre-implementation investigation. It includes
+paths since changed or removed in the rejected candidate; it does not claim
+those files still exist. Current revision-4 timing owners are identified below.
 
 | Inspected owner / consumers | Current behavior and gap |
 |---|---|
 | `crates/wyrd/wyrd-testing/src/bin/capacity/main.rs`, `query/mod.rs`, `query/run.rs`, `query/report.rs` | Public-client fixture loading and query/write sweeps against a release server, exact-result checking, resource/telemetry windows, local samples/profiles and report. Preserve workload orchestration. Query still owns `Measured::percentile_ms` (line 175) and `Usage` (line 211), with its own report and judgment. No common experiment declaration or historical recorder. |
 | `capacity/verification/{mod,run,report,workload}.rs` | Direct verify and background submit through public client observation flows. Direct overhead subtracts Verifier blocks; background case is documented as reported only. Own report; no shared per-experiment persisted declaration. |
-| `capacity/gateway/{mod,capacity,envelope,report,run,workload}.rs` | Public Gateway requests with local upstream, captures, open-loop arrivals, capacity envelope and recovery. `Report`/`Row` already handle general rows and richer judgments, making them a useful base; today rows and samples still depend on engine-specific formatting. `Slo` has optional fields and reads required `--max-*-ms` flags. Release-run inputs are 200/350/50/1100 ms for answer/first-token/chunk-lag/stream; D-2 adopts these as declared Gateway capacity constants. |
+| `capacity/gateway/{mod,capacity,envelope,report,run,workload}.rs` | Public Gateway requests with local upstream, captures, open-loop arrivals, capacity envelope and recovery. `Report`/`Row` already handle general rows and richer judgments, making them a useful base; today rows and samples still depend on engine-specific formatting. `Slo` has optional fields and reads required `--max-*-ms` flags. Release-run inputs are 200/350/50/1100 ms for answer/first-token/chunk-lag/stream; D-2 originally adopted these constants; revision 5 re-expresses completion/token/stream at server boundaries and makes chunk lag diagnostic-only. |
 | `capacity/client_queue/{mod,step}.rs` | Provisions release server and tenant, emits observations, collects queue/drain/row integrity. `Record` carries a gating distinction; non-gating failures render as `report:`. `Readings::quantile` at `step.rs:147` duplicates bucket-delta percentile work. |
 | `bin/bifrost_forge_capacity/{host,report}.rs` | Separate Host and load sampler; `HostLoad::qualifies` requires eight free CPUs after sampling CPU and load average. Separate Forge report. Existing scoped/systemd workflow must not be copied into the portable experiment contract. |
 | `src/capacity.rs` | Shared Percentiles, Histogram, Usage, Window, Resources/ResourceWindow, release binary identity and telemetry helpers exist. ResourceWindow currently accesses scoped CPU/peak-memory operations; reuse meanings and portable owners, not cgroup mechanics. |
@@ -31,20 +36,22 @@ calls. Existing engine workload setup remains useful; declaration, validity,
 repetitions, shared accounting, criteria, record and rendering are the missing
 common workflow. No new production runtime or replacement client is justified.
 
-## OS-agnostic benchmarks (approved maintainer decision)
+## OS-agnostic benchmarks (maintainer portability decision)
 
-Source rechecked 2026-10-23. These paths exist today; the approved decision
-removes them rather than treating them as authority. No acceptance runs have
-been performed. Paths below link current source, not code changed here.
+Original source checked 2026-10-23. These are pre-implementation paths; some
+are now removed or changed in the rejected uncommitted implementation. The
+portability decision removes prohibited mechanisms rather than treating them
+as authority. No acceptance runs have
+been performed. Paths below identify the original inspected source, not approved implementation.
 
-| Verified current mechanism | Approved replacement |
+| Verified current mechanism | Required replacement |
 |---|---|
-| [`profile.rs:108–145`](../../../crates/wyrd/wyrd-testing/src/profile.rs#L108-L145) spawns `perf record` for CPU/context-switch captures; [`185–215`](../../../crates/wyrd/wyrd-testing/src/profile.rs#L185-L215) runs `perf report`; [`243–277`](../../../crates/wyrd/wyrd-testing/src/profile.rs#L243-L277) runs `perf script`. | Remove direct perf commands and their processing. Optional `--profile` uses external samply with identical invocation on every platform. Missing/unusable capture records a diagnostic note only; profiles never enter a verdict or make a run INVALID or FAIL. |
-| [`release_server.rs:426–444`](../../../crates/wyrd/wyrd-testing/src/release_server.rs#L426-L444) invokes `systemd-run --user --scope` with CPUQuota, MemoryMax and MemorySwapMax; [`564–606`](../../../crates/wyrd/wyrd-testing/src/release_server.rs#L564-L606) reads cgroup CPU/memory; [`691–738`](../../../crates/wyrd/wyrd-testing/src/release_server.rs#L691-L738) reads `/proc/<pid>/cgroup`, resolves `/sys/fs/cgroup`, and checks `cpu.max`/`memory.max`. | Remove scoped placement, cgroup discovery, limit enforcement and accounting. Plain child servers have no OS resource limits; only Wyrd configuration supplies server-side limits. Normalize by measured server CPU-seconds. |
-| [`bifrost_forge_capacity/main.rs:72–78`](../../../crates/wyrd/wyrd-testing/src/bin/bifrost_forge_capacity/main.rs#L72-L78) sets leader quota 100% and worker quota 233% (documented as 7/3 CPU, rounded to 2.33); [`120–125`](../../../crates/wyrd/wyrd-testing/src/bin/bifrost_forge_capacity/main.rs#L120-L125) defaults both memory envelopes to 4 GiB; [`179–185`](../../../crates/wyrd/wyrd-testing/src/bin/bifrost_forge_capacity/main.rs#L179-L185) builds envelopes and [`240`](../../../crates/wyrd/wyrd-testing/src/bin/bifrost_forge_capacity/main.rs#L240) selects scoped leader placement. [`deployment.rs:309–319`](../../../crates/wyrd/wyrd-testing/src/bin/bifrost_forge_capacity/deployment.rs#L309-L319) passes the worker envelope to `start_forge_worker`; [`release_server.rs:378–395`](../../../crates/wyrd/wyrd-testing/src/release_server.rs#L378-L395) selects scoped worker placement. | Remove leader/worker systemd user-scope envelopes and quota accounting. Preserve Forge workload coverage with plain child processes and metrics per used core across declared server processes. |
-| [`release_server/os.rs:55–70`](../../../crates/wyrd/wyrd-testing/src/release_server/os.rs#L55-L70) uses sysinfo accumulated CPU time; [`85–104`](../../../crates/wyrd/wyrd-testing/src/release_server/os.rs#L85-L104) samples resident memory (10 ms interval declared at line 20). [`bifrost_forge_capacity/host.rs:72–96`](../../../crates/wyrd/wyrd-testing/src/bin/bifrost_forge_capacity/host.rs#L72-L96) samples host/process CPU through sysinfo. [`Cargo.toml:233`](../../../Cargo.toml#L233) declares sysinfo 0.39.6; [`wyrd-testing/Cargo.toml:121`](../../../crates/wyrd/wyrd-testing/Cargo.toml#L121) consumes it. | Reuse sysinfo for CPU time, sampled peak memory, quiet-host and driver-saturation checks on all supported platforms. Zero-on-missing in the current helper must not admit missing accounting. A sampled RSS peak is not an exact OS high-water mark. |
+| `profile.rs:108–145` spawns `perf record` for CPU/context-switch captures; `185–215` runs `perf report`; `243–277` runs `perf script`. | Remove direct perf commands and their processing. Optional `--profile` uses external samply with identical invocation on every platform. Missing/unusable capture records a diagnostic note only; profiles never enter a verdict or make a run INVALID or FAIL. |
+| `release_server.rs:426–444` invokes `systemd-run --user --scope` with CPUQuota, MemoryMax and MemorySwapMax; `564–606` reads cgroup CPU/memory; `691–738` reads `/proc/<pid>/cgroup`, resolves `/sys/fs/cgroup`, and checks `cpu.max`/`memory.max`. | Remove scoped placement, cgroup discovery, limit enforcement and accounting. Plain child servers have no OS resource limits; only Wyrd configuration supplies server-side limits. Report provisioned-vCPU throughput alongside efficiency normalized by measured server CPU-seconds. |
+| `bifrost_forge_capacity/main.rs:72–78` sets leader quota 100% and worker quota 233% (documented as 7/3 CPU, rounded to 2.33); `120–125` defaults both memory envelopes to 4 GiB; `179–185` builds envelopes and `240` selects scoped leader placement. `deployment.rs:309–319` passes the worker envelope to `start_forge_worker`; `release_server.rs:378–395` selects scoped worker placement. | Remove leader/worker systemd user-scope envelopes and quota accounting. Preserve Forge workload coverage with plain child processes and both throughput normalizations across declared server processes. |
+| `release_server/os.rs:55–70` uses sysinfo accumulated CPU time; `85–104` samples resident memory (10 ms interval declared at line 20). `bifrost_forge_capacity/host.rs:72–96` samples host/process CPU through sysinfo. `Cargo.toml:233` declares sysinfo 0.39.6; `wyrd-testing/Cargo.toml:121` consumes it. | Reuse sysinfo for CPU time, sampled peak memory, quiet-host and driver-saturation checks on all supported platforms. Zero-on-missing in the current helper must not admit missing accounting. A sampled RSS peak is not an exact OS high-water mark. |
 
-The [samply upstream README](https://github.com/mstange/samply/blob/main/README.md),
+The samply upstream README,
 checked 2026-10-23, documents macOS/Linux support, `samply record`, and Linux
 perf-events sampling; macOS uses its native backend. On/off-CPU diagnostic
 detail can differ by OS. Linux event access and macOS attach setup may need
@@ -55,8 +62,77 @@ Both levels and every experiment must run unchanged on macOS arm64, Linux
 x86_64 and Linux arm64 using identical commands and record schema. Host records
 name OS and architecture. Cross-OS comparison follows the advisory cross-host
 rule with both fingerprints visible, never same-host regression proof. AC-005
-requires real CPU accounting and every L1 experiment on each platform. Source
-inspection here does not substitute for those future acceptance runs.
+requires real CPU accounting and every L1/L2 experiment only on Linux x86_64.
+Real macOS arm64 and Linux arm64 runs are optional. Source/command inspection
+must still confirm unchanged portability for every experiment on both platforms;
+it does not substitute for required Linux x86_64 runs.
+
+## Latency measurement revision
+
+The rejected candidate derives internal latency tails from production /metrics
+bucket deltas and treats a bucket crossing a strict SLO as unresolved. This
+cannot recover individual latency values. Changing bucket bounds is not a
+benchmark measurement remedy. Raw client request samples already exist and
+remain reusable only as diagnostics in revision 5; judged server durations must
+be collected before aggregation.
+
+Revision 4 selects raw integer-nanosecond duration samples with empirical
+nearest-rank percentiles. No histogram quantization is needed. Collection uses
+monotonic request timing and, for server-internal observations, standard
+OpenTelemetry request tracing with 100% recording and local OTLP collection.
+The OpenTelemetry Tracing API defines individual spans and time values up to
+nanosecond precision; the Tracing SDK defines always-on recording and export
+processing. Those are collection primitives, not proof of clock accuracy or
+zero overhead. Wyrd still needs completeness reconciliation and the declared
+same-process boundaries. Source references: OpenTelemetry specification,
+Tracing API (Time, Span) and Tracing SDK (Sampling, Span Processor), checked
+2026-10-24. Production metrics histograms remain diagnostic for latency.
+
+There is no standard universal Verification or Gateway overhead metric. The
+spec retains Wyrd's existing measurable boundaries: arrival-to-result-staging
+less Verifier-block interval union, and arrival-to-Gateway handoff less provider
+wait to that handoff. Compute residuals per request before percentiles. No
+cross-process timestamp subtraction or subtraction of aggregate p99s is valid.
+
+Inspected existing owners: components/gateway/telemetry.rs Profile::point
+computes monotonic elapsed and upstream durations per request before recording
+metrics. components/verification/service.rs VerificationControl::execute hands arrival
+into verification/telemetry.rs ExecutionTelemetry::emit, which computes
+block union and the residual before metrics recording.
+wyrd-telemetry/src/lib.rs and export.rs own SDK sampling, request tracing and
+operator OTLP export. These are extension points, not evidence that all required
+raw observations are already emitted. Missing instrumentation is future task
+work at those owners, preserving server behavior and public metrics contracts.
+Collection loss, incomplete matching or inconsistent components is INVALID;
+if standard tracing cannot expose the boundaries exactly, a new measurable
+boundary needs a spec revision. No custom timing endpoint/protocol is proposed.
+
+## Revision 5 measurement decisions
+
+The maintainer fixes handler entry after receipt through result ready, write
+acknowledgment or response handoff as the judged server latency boundary,
+using OpenObserve per-query `took` as the analogy. This is a maintainer boundary
+decision, not a newly verified upstream implementation claim. Client request
+samples, visibility polling and inter-chunk lag cannot supply that boundary and
+are diagnostic-only. Keep scheduled sends/send-lateness only for driver validity;
+remove scheduled-time-to-completion judgment. Server elapsed minus that request's
+own Verifier/provider wait union remains the traced overhead definition.
+
+Report both (W/T)/P (per provisioned vCPU) and W/C (per CPU-second actually
+used), recording P as logical CPUs available to the server process scope and
+counting shared-host CPUs once. Historical “per-core” evidence below is W/C;
+regression remains W/C and C/W. Historical decimal MB/CPU-s values must be
+converted to MiB/CPU-s by ×10^6/2^20, preserving the original operands and
+eligibility; they do not establish provisioned-vCPU baselines. Write reports
+require rows and uncompressed MiB in both normalizations. Queries additionally
+need executed-plan scanned rows/bytes per query alongside server query time.
+
+At a 5% scan share, 1,000 heavy scans require at least 20,000 total queries in
+each six-minute repetition. Select p95 with ≥200 samples instead: at least
+4,000 total queries, or 11.12 queries/s overall (0.556 scans/s), with actual
+completed samples checked. This preserves the original mixture/window and
+removes the infeasible p99 obligation; it does not waive insufficient samples.
+No benchmark was run to assert achieved rate or instrumentation feasibility.
 
 ## Historical baseline provenance (D-3)
 
@@ -65,15 +141,17 @@ Five requested originals exist and have been copied byte-for-byte below. Only
 `report.md` files were copied; no samples, logs, profiles or fabricated records.
 The requested Gateway `target/verification-capacity/report.md` does not exist.
 All reports identify AMD Ryzen 9 9950X, 32 logical CPUs, 91 GiB, Linux. The host
-count is metadata, never the CPU denominator. Times below are EDT (UTC−04:00).
+count does not supply the CPU-used baseline denominator C. Revision 5 separately
+requires P, available provisioned vCPUs, for reported throughput (W/T)/P; do not
+reinterpret these historical W/C values as provisioned throughput. Times below are EDT (UTC−04:00).
 
 | Preserved report | Original mtime, 2026-10-21 | SHA-256 |
 |---|---|---|
-| [bifrost-source-consistency/bifrost-query-capacity/standard/hot/report.md](baselines-source/2026-10-21/bifrost-source-consistency/bifrost-query-capacity/standard/hot/report.md) | 15:13:50 | `d09e2b8e4401ad87c08fa5dde17fd50affef80b6850cc9158590ba6f872f3027` |
-| [bifrost-source-consistency/bifrost-query-capacity/standard/parquet/report.md](baselines-source/2026-10-21/bifrost-source-consistency/bifrost-query-capacity/standard/parquet/report.md) | 15:21:08 | `f757e4a9a572b723113036256c02e95bcc7d4b1174a68f27be06e61fa50807d6` |
-| [bifrost-source-consistency/bifrost-query-capacity/writes/parquet/report.md](baselines-source/2026-10-21/bifrost-source-consistency/bifrost-query-capacity/writes/parquet/report.md) | 15:02:40 | `f3f337ceb8bc6c63fd33e2d0d2d5d4faca53ac68570f6f090f21b4b8e8480200` |
-| [bifrost-source-consistency/verification-capacity/report.md](baselines-source/2026-10-21/bifrost-source-consistency/verification-capacity/report.md) | 15:07:37 | `37ae97b069c1e94fe8e01a1447346ef8bde7f5f49cc5011a4342e597be2caf29` |
-| [gateway-capacity/gateway-overhead/report.md](baselines-source/2026-10-21/gateway-capacity/gateway-overhead/report.md) | 16:05:04 | `7e70fb359234e9cfc22a7ba952190b3295fa94cb8fe790920f7e586fb2b29882` |
+| bifrost-source-consistency/bifrost-query-capacity/standard/hot/report.md | 15:13:50 | `d09e2b8e4401ad87c08fa5dde17fd50affef80b6850cc9158590ba6f872f3027` |
+| bifrost-source-consistency/bifrost-query-capacity/standard/parquet/report.md | 15:21:08 | `f757e4a9a572b723113036256c02e95bcc7d4b1174a68f27be06e61fa50807d6` |
+| bifrost-source-consistency/bifrost-query-capacity/writes/parquet/report.md | 15:02:40 | `f3f337ceb8bc6c63fd33e2d0d2d5d4faca53ac68570f6f090f21b4b8e8480200` |
+| bifrost-source-consistency/verification-capacity/report.md | 15:07:37 | `37ae97b069c1e94fe8e01a1447346ef8bde7f5f49cc5011a4342e597be2caf29` |
+| gateway-capacity/gateway-overhead/report.md | 16:05:04 | `7e70fb359234e9cfc22a7ba952190b3295fa94cb8fe790920f7e586fb2b29882` |
 
 Read-only provenance checks: report titles and Gateway binary identity;
 `git -C <worktree> status --short`; worktree-local reflogs and git log around
@@ -142,12 +220,12 @@ and CPU µs/row = 1,000,000 × cores / rows/s. Prefer explicitly printed per-cor
 byte/row values over ratios of rounded display columns. Approximate derived
 values below retain the original printed operands; do not claim extra precision.
 Query CPU entries below use µs/query; divide by 1,000 for the required ms/query metric.
-Only these per-core/per-operation quantities are baseline criteria. Latency,
+Only these CPU-used W/C and C/W quantities are baseline criteria. Latency,
 absolute throughput, loss counts, backlog and drain are source context.
 
 ### Primary candidates, excluded pending provenance
 
-All following references are the preserved reports linked above. Values are
+All following references are the preserved reports identified above. Values are
 candidates only; status is **excluded** for the report-level reasons above.
 
 | Metric / step | Source | Per-core / per-operation value | Status/reason |
@@ -315,7 +393,7 @@ entry is invented from latency percentiles alone.
 | Telemetry read/write efficiency | Merged `5c775110f` | Not selected | Excluded: uncommitted fork patch; never silently attributed to clean commit. |
 | Standard read efficiency | Merged `5c775110f` | Not selected | Superseded by 2026-10-21 report generation; fallback is clean pre-merge, not this merged source. |
 | Historical raw latency / total rate / drain / loss | All reports | Retained in sources | Context only, not per-core/per-operation baseline criteria. |
-| Scan GB/s/core, capture bytes/core, storage/memory ratios without matching evidence | All selected sources | Unavailable | No invented bytes/window denominator or host-count normalization. |
+| Scan GB/s/core, capture bytes/core, storage/memory ratios without matching evidence | All selected sources | Unavailable | No invented bytes/window denominator; CPU-used baseline only, not provisioned-vCPU throughput. |
 
 Historical methodology uses production paths, no compilation during execution,
 no synthetic host load, matching-host comparisons for causal attribution and
@@ -353,3 +431,15 @@ the new packet explicitly excludes inheriting those provisions.
 - Revision 3 — 2026-10-23: Rechecked and cited perf commands, scoped server/
   cgroup paths, Forge envelopes and existing sysinfo owners/dependency; recorded
   approved portable replacements and upstream samply diagnostic limitations.
+
+- Revision 4 — 2026-10-24: Replaced bucket-based benchmark methodology with raw
+  per-request samples and standard OpenTelemetry tracing of internal duration
+  observations; distinguished standard collection from Wyrd overhead meanings.
+  Required real evidence is Linux x86_64 only, with unchanged macOS arm64 and
+  Linux arm64 portability. Marked original source inventories as historical
+  where the rejected uncommitted implementation has changed them.
+
+- Revision 5 — 2026-10-24: Recorded maintainer server-only latency boundaries,
+  diagnostic client timings, both CPU normalizations, historical byte-unit
+  conversion and heavy-scan p95 sample arithmetic. Historical reports and
+  eligibility are unchanged; no new upstream claim or benchmark evidence.

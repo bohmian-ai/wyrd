@@ -13,8 +13,8 @@ use wyrd_spec::request_id::RequestId;
 #[cfg(feature = "internal")]
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::api::{
-    AlterTableRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse, QueryParam,
-    RegisterOutcome, RunningQuerySummary,
+    AlterTableRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse,
+    QueryParam, RegisterOutcome, RunningQuerySummary,
 };
 
 use crate::bifrost::facade::{BifrostOptions, QueryResult};

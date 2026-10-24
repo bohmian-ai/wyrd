@@ -34,7 +34,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AlterTableRequest, BifrostQueryRequest, CompactionTypeWire, PhysicalLayoutWire, QueryParam, QueryTerminalFrame,
+    AlterTableRequest, BifrostQueryRequest, CompactionTypeWire, PhysicalLayoutWire, QueryParam,
+    QueryTerminalFrame,
 };
 use wyrd_spec::vala::ids::{RunId, TraceId};
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
@@ -989,11 +990,9 @@ impl Bifrost {
     ) -> WyrdPyResult<Py<PyAny>> {
         let request: AlterTableRequest = serde_json::from_str(request_json)
             .map_err(|error| invalid_argument("request_json", error))?;
-        let description = crate::trace::block_on(
-            py,
-            self.handle(py)?.alter_table(namespace, name, &request),
-        )
-        .map_err(client_error)?;
+        let description =
+            crate::trace::block_on(py, self.handle(py)?.alter_table(namespace, name, &request))
+                .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(description))
     }
 

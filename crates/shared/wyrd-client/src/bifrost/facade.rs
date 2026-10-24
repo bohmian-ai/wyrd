@@ -34,8 +34,9 @@ use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkE
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AlterTableRequest, BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse,
-    QueryParam, QueryTerminalFrame, RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
+    AlterTableRequest, BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry,
+    CancelRunningQueryResponse, QueryParam, QueryTerminalFrame, RegisterOutcome,
+    RegisterTableResponse, RunningQuerySummary,
 };
 use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::vala::trace::SpanRecord;

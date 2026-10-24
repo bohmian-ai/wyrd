@@ -104,9 +104,20 @@ pub(crate) fn edited_definition(
     let edited_schema = if renames.is_empty() && alteration.add_columns.is_empty() {
         None
     } else {
-        Some(edited_schema(fqn, schema, metadata, &renames, &alteration.add_columns)?)
+        Some(edited_schema(
+            fqn,
+            schema,
+            metadata,
+            &renames,
+            &alteration.add_columns,
+        )?)
     };
-    let renamed = |column: &str| renames.get(column).map_or(column, String::as_str).to_owned();
+    let renamed = |column: &str| {
+        renames
+            .get(column)
+            .map_or(column, String::as_str)
+            .to_owned()
+    };
     let mut layout = current.layout.to_wire();
     layout.time_column = layout.time_column.as_deref().map(renamed);
     for field in &mut layout.partition_by {
@@ -345,11 +356,14 @@ pub(crate) fn definition_updates(
     let order_changed = {
         let current_fields = &metadata.default_sort_order().fields;
         current_fields.len() != order.fields.len()
-            || current_fields.iter().zip(&order.fields).any(|(current, next)| {
-                current.source_id != next.source_id
-                    || current.direction != next.direction
-                    || current.null_order != next.null_order
-            })
+            || current_fields
+                .iter()
+                .zip(&order.fields)
+                .any(|(current, next)| {
+                    current.source_id != next.source_id
+                        || current.direction != next.direction
+                        || current.null_order != next.null_order
+                })
     };
     if let Some(schema) = schema {
         updates.push(TableUpdate::AddSchema { schema });

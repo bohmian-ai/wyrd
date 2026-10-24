@@ -6,9 +6,7 @@ use std::sync::{Arc, RwLock};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{FileIO, FileIOBuilder};
-use iceberg::spec::{
-    self, FormatVersion, TableMetadata, TableMetadataRef, TableProperties,
-};
+use iceberg::spec::{self, FormatVersion, TableMetadata, TableMetadataRef, TableProperties};
 use iceberg::table::Table;
 use iceberg::{Catalog as _, Error as IcebergError, TableCreation, TableIdent};
 use iceberg_catalog_sql::SqlCatalog;
@@ -1177,7 +1175,9 @@ impl BifrostCatalog {
                 let user_fields = schema
                     .fields()
                     .iter()
-                    .filter(|field| !crate::tables::managed_columns::is_managed_column(field.name()))
+                    .filter(|field| {
+                        !crate::tables::managed_columns::is_managed_column(field.name())
+                    })
                     .map(|field| crate::tables::iceberg_form(field))
                     .collect::<Result<Vec<_>, _>>()?;
                 SchemaFingerprint::from_arrow_schema(&Schema::new(user_fields)).0

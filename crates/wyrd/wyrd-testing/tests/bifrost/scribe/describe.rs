@@ -411,7 +411,10 @@ async fn registered_layouts_are_bounded_and_resolved() {
         default_layout.bloom_columns.is_empty(),
         "the default layout carries no hidden Bloom floor"
     );
-    assert_eq!(default_layout.time_column.as_deref(), Some("wyrd_ingested_at"));
+    assert_eq!(
+        default_layout.time_column.as_deref(),
+        Some("wyrd_ingested_at")
+    );
     assert_eq!(
         default_layout.sort_keys,
         vec![SortKeyWire {
@@ -441,7 +444,10 @@ async fn registered_layouts_are_bounded_and_resolved() {
         .physical_layout;
     assert_eq!(
         timed_layout.partition_by,
-        vec![PartitionFieldWire::new("event_time", PartitionTransformWire::Hour)],
+        vec![PartitionFieldWire::new(
+            "event_time",
+            PartitionTransformWire::Hour
+        )],
         "a declared time column drives the default partition"
     );
     assert_eq!(
@@ -655,7 +661,10 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
             committed.physical_layout.partition_by, before.physical_layout.partition_by,
             "{namespace}.{name}: an omitted list is kept"
         );
-        assert_eq!(committed.physical_layout.sort_keys, before.physical_layout.sort_keys);
+        assert_eq!(
+            committed.physical_layout.sort_keys,
+            before.physical_layout.sort_keys
+        );
         assert_eq!(
             describe(namespace, name.clone()).await,
             committed,
@@ -692,7 +701,10 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
         )
         .await
         .expect("a combined partition and sort edit commits");
-    assert_eq!(combined.table_version, current.table_version.next().expect("next"));
+    assert_eq!(
+        combined.table_version,
+        current.table_version.next().expect("next")
+    );
     assert_eq!(
         combined.physical_layout.partition_by,
         vec![
@@ -707,11 +719,18 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
     );
     assert_eq!(combined.physical_layout.bloom_columns, ["name"]);
     let cleared = bifrost
-        .alter_table("vala.datasets", &table, &bloom_edit(combined.table_version, &[]))
+        .alter_table(
+            "vala.datasets",
+            &table,
+            &bloom_edit(combined.table_version, &[]),
+        )
         .await
         .expect("an explicit empty Bloom list commits");
     assert!(cleared.physical_layout.bloom_columns.is_empty());
-    assert_eq!(cleared.physical_layout.partition_by, combined.physical_layout.partition_by);
+    assert_eq!(
+        cleared.physical_layout.partition_by,
+        combined.physical_layout.partition_by
+    );
 
     let (name_edit, customer_edit) = (
         bloom_edit(cleared.table_version, &["name"]),
@@ -726,7 +745,10 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
         other => panic!("exactly one edit from one version commits: {other:?}"),
     };
     assert_eq!(code(&loser), "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT");
-    assert_eq!(winner.table_version, cleared.table_version.next().expect("next"));
+    assert_eq!(
+        winner.table_version,
+        cleared.table_version.next().expect("next")
+    );
     let settled = describe("vala.datasets", table.clone()).await;
     assert_eq!(settled, winner, "the losing edit changed nothing");
 
@@ -772,7 +794,10 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
             .await
             .expect_err("the edit is refused");
         assert_eq!(code(&refused), expected_code, "{refused}");
-        assert!(refused.to_string().contains(expected), "names {expected}: {refused}");
+        assert!(
+            refused.to_string().contains(expected),
+            "names {expected}: {refused}"
+        );
         assert_eq!(
             describe("vala.datasets", table.clone()).await,
             settled,
@@ -928,7 +953,10 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
         )
         .await
         .expect("a nullable addition and a rename commit together");
-    assert_eq!(edited.table_version, before.table_version.next().expect("next"));
+    assert_eq!(
+        edited.table_version,
+        before.table_version.next().expect("next")
+    );
     let before_ids = field_ids(&before);
     let edited_ids = field_ids(&edited);
     assert_eq!(edited_ids[0], before_ids[0], "value keeps its name and id");
@@ -983,28 +1011,56 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
     let version = edited.table_version;
     let invalid = "WYRD_VALA_400_BIFROST_INVALID_TABLE_EDIT";
     let refusals = [
-        (schema_edit(version, Vec::new(), &[("absent", "x")]), invalid, "UnknownColumn"),
-        (schema_edit(version, Vec::new(), &[("client", "value")]), invalid, "NameCollision"),
         (
-            schema_edit(version, Vec::new(), &[("value", "client"), ("client", "c2")]),
+            schema_edit(version, Vec::new(), &[("absent", "x")]),
+            invalid,
+            "UnknownColumn",
+        ),
+        (
+            schema_edit(version, Vec::new(), &[("client", "value")]),
+            invalid,
+            "NameCollision",
+        ),
+        (
+            schema_edit(
+                version,
+                Vec::new(),
+                &[("value", "client"), ("client", "c2")],
+            ),
             invalid,
             "AmbiguousRename",
         ),
-        (schema_edit(version, Vec::new(), &[("value", "value")]), invalid, "NoEffectiveChange"),
+        (
+            schema_edit(version, Vec::new(), &[("value", "value")]),
+            invalid,
+            "NoEffectiveChange",
+        ),
         (
             schema_edit(version, Vec::new(), &[("wyrd_ingested_at", "t")]),
             invalid,
             "ProtectedColumn",
         ),
-        (schema_edit(version, vec![string_column("value", true)], &[]), invalid, "NameCollision"),
-        (schema_edit(version, vec![string_column("tag", false)], &[]), invalid, "RequiredColumn"),
+        (
+            schema_edit(version, vec![string_column("value", true)], &[]),
+            invalid,
+            "NameCollision",
+        ),
+        (
+            schema_edit(version, vec![string_column("tag", false)], &[]),
+            invalid,
+            "RequiredColumn",
+        ),
         (
             schema_edit(version, vec![string_column("card_uid", true)], &[]),
             "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
             "card_uid",
         ),
         (
-            schema_edit(version, vec![string_column("tag", true)], &[("absent", "x")]),
+            schema_edit(
+                version,
+                vec![string_column("tag", true)],
+                &[("absent", "x")],
+            ),
             invalid,
             "UnknownColumn",
         ),
@@ -1015,7 +1071,10 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
             .await
             .expect_err("the edit is refused");
         assert_eq!(code(&refused), expected_code, "{refused}");
-        assert!(refused.to_string().contains(expected), "names {expected}: {refused}");
+        assert!(
+            refused.to_string().contains(expected),
+            "names {expected}: {refused}"
+        );
         assert_eq!(
             bifrost
                 .describe_table("vala.datasets", &table)
@@ -1133,10 +1192,17 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
     let original = describe(&b, &name).await;
 
     let refused = Bifrost::query_only(&a)
-        .alter_table("vala.datasets", &name, &bloom_edit(original.table_version, &["absent"]))
+        .alter_table(
+            "vala.datasets",
+            &name,
+            &bloom_edit(original.table_version, &["absent"]),
+        )
         .await
         .expect_err("an invalid edit is refused");
-    assert_eq!(code(&refused), "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT");
+    assert_eq!(
+        code(&refused),
+        "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT"
+    );
     assert_eq!(describe(&a, &name).await, original);
     assert_eq!(describe(&b, &name).await, original);
 
@@ -1159,14 +1225,21 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
         )
         .await
         .expect("pod A commits the override");
-    assert_eq!(describe(&b, &name).await, committed, "pod B describes the commit");
+    assert_eq!(
+        describe(&b, &name).await,
+        committed,
+        "pod B describes the commit"
+    );
 
     // Pod B's admission cache follows the commit when its listener hears it;
     // until then a version-1 batch is still a valid version-1 batch.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut probes = Vec::new();
     loop {
-        let probe = shifted(&base, 100 * (i64::try_from(probes.len()).expect("small") + 1));
+        let probe = shifted(
+            &base,
+            100 * (i64::try_from(probes.len()).expect("small") + 1),
+        );
         match super::support::append_batch_at(
             &b,
             &table,
@@ -1201,7 +1274,11 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
         &[]
     };
     let spans = Bifrost::query_only(&a)
-        .alter_table("vala.traces", "spans", &bloom_edit(spans.table_version, blooms))
+        .alter_table(
+            "vala.traces",
+            "spans",
+            &bloom_edit(spans.table_version, blooms),
+        )
         .await
         .expect("a built-in layout override commits");
     let neighbour_original = describe(
@@ -1221,7 +1298,11 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
     }
     let [a, b] = clients(&cluster);
     for client in [&a, &b] {
-        assert_eq!(describe(client, &name).await, committed, "restart keeps the override");
+        assert_eq!(
+            describe(client, &name).await,
+            committed,
+            "restart keeps the override"
+        );
         assert_eq!(
             Bifrost::query_only(client)
                 .describe_table("vala.traces", "spans")
@@ -1266,7 +1347,10 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
             .downcast_ref::<arrow::array::Int64Array>()
             .expect("value is Int64");
         (0..batch.num_rows())
-            .filter(|&row| customer.is_none() || customers.is_valid(row) && Some(customers.value(row)) == customer)
+            .filter(|&row| {
+                customer.is_none()
+                    || customers.is_valid(row) && Some(customers.value(row)) == customer
+            })
             .map(|row| values.value(row))
             .collect::<Vec<_>>()
     };
@@ -1280,7 +1364,8 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
             .flat_map(|batch| values(batch, customer))
             .collect();
         expected.sort_unstable();
-        let mut read = super::support::read_sql(&a, &format!("SELECT value FROM {table}{filter}")).await;
+        let mut read =
+            super::support::read_sql(&a, &format!("SELECT value FROM {table}{filter}")).await;
         read.sort_unstable();
         assert_eq!(read, expected, "`{filter}` reads every file exactly once");
     }
@@ -1312,13 +1397,7 @@ async fn table_patch_http_contract_refuses_invalid_requests() {
     let server = start_scribe_server().await;
     let tenant = server.data_tenant_id();
     let name = unique_table("http_patch");
-    super::support::register_table(
-        &server,
-        tenant,
-        vala_bifrost_redux::namespaces::BifrostNamespace::Datasets,
-        &name,
-    )
-    .await;
+    super::support::register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
     server
         .seed_role(
             "patch_writer_reader",
@@ -1370,43 +1449,87 @@ async fn table_patch_http_contract_refuses_invalid_requests() {
             .await
             .expect("describe responds");
         assert_eq!(response.status(), 200);
-        response.json::<serde_json::Value>().await.expect("describe is JSON")
+        response
+            .json::<serde_json::Value>()
+            .await
+            .expect("describe is JSON")
     };
     let original = describe().await;
-    assert_eq!(original["table_version"], "1", "the version travels as a decimal string");
+    assert_eq!(
+        original["table_version"], "1",
+        "the version travels as a decimal string"
+    );
 
     let committed = send(
         &admin,
-        r#"{"expected_table_version":"1","physical_layout":{"bloom_columns":["value"]}}"#.to_owned(),
+        r#"{"expected_table_version":"1","physical_layout":{"bloom_columns":["value"]}}"#
+            .to_owned(),
     )
     .await
     .expect("the edit responds");
     assert_eq!(committed.status(), 200);
     let committed: serde_json::Value = committed.json().await.expect("the edit returns JSON");
     assert_eq!(committed["table_version"], "2");
-    assert_eq!(committed["physical_layout"]["bloom_columns"], serde_json::json!(["value"]));
-    assert_eq!(describe().await, committed, "the response is the committed description");
+    assert_eq!(
+        committed["physical_layout"]["bloom_columns"],
+        serde_json::json!(["value"])
+    );
+    assert_eq!(
+        describe().await,
+        committed,
+        "the response is the committed description"
+    );
 
     let validation = "WYRD_SPEC_400_VALIDATION";
     let cases = [
-        (&admin, r#"{"expected_table_version":"2","drop_columns":["value"]}"#, 400, validation),
-        (&admin, r#"{"expected_table_version":null}"#, 400, validation),
-        (&admin, r#"{"expected_table_version":"2","physical_layout":null}"#, 400, validation),
+        (
+            &admin,
+            r#"{"expected_table_version":"2","drop_columns":["value"]}"#,
+            400,
+            validation,
+        ),
+        (
+            &admin,
+            r#"{"expected_table_version":null}"#,
+            400,
+            validation,
+        ),
+        (
+            &admin,
+            r#"{"expected_table_version":"2","physical_layout":null}"#,
+            400,
+            validation,
+        ),
         (
             &admin,
             r#"{"expected_table_version":"2","physical_layout":{"bloom_columns":null}}"#,
             400,
             validation,
         ),
-        (&admin, r#"{"expected_table_version":2,"physical_layout":{"bloom_columns":[]}}"#, 400, validation),
-        (&admin, r#"{"expected_table_version":"0","physical_layout":{"bloom_columns":[]}}"#, 400, validation),
+        (
+            &admin,
+            r#"{"expected_table_version":2,"physical_layout":{"bloom_columns":[]}}"#,
+            400,
+            validation,
+        ),
+        (
+            &admin,
+            r#"{"expected_table_version":"0","physical_layout":{"bloom_columns":[]}}"#,
+            400,
+            validation,
+        ),
         (
             &admin,
             r#"{"expected_table_version":"9223372036854775808","physical_layout":{"bloom_columns":[]}}"#,
             400,
             validation,
         ),
-        (&admin, r#"{"expected_table_version":"02","physical_layout":{"bloom_columns":[]}}"#, 400, validation),
+        (
+            &admin,
+            r#"{"expected_table_version":"02","physical_layout":{"bloom_columns":[]}}"#,
+            400,
+            validation,
+        ),
         (&admin, r#"{"expected_table_version":"2""#, 400, validation),
         (
             &admin,
@@ -1434,7 +1557,9 @@ async fn table_patch_http_contract_refuses_invalid_requests() {
         ),
     ];
     for (caller, body, status, expected_code) in cases {
-        let response = send(caller, body.to_owned()).await.expect("the edit responds");
+        let response = send(caller, body.to_owned())
+            .await
+            .expect("the edit responds");
         assert_eq!(response.status(), status, "{body}");
         let problem: serde_json::Value = response.json().await.expect("a refusal is problem JSON");
         assert_eq!(problem["code"], expected_code, "{body}: {problem}");

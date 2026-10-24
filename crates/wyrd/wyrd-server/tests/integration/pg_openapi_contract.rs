@@ -876,6 +876,11 @@ async fn no_operation_documents_an_audit_caused_refusal() {
 /// Every public Bifrost table, query, and lifecycle operation publishes its
 /// pre-stream refusals as typed `WyrdProblem` bodies, and the table edit
 /// publishes its typed request and committed description.
+///
+/// # Panics
+///
+/// Panics when the server cannot start or shut down, or an operation omits a
+/// typed refusal, request, or response schema.
 #[tokio::test]
 async fn bifrost_operations_publish_typed_problem_refusals() {
     let server = WyrdTestServer::start_in_process()

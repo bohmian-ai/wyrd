@@ -1211,8 +1211,10 @@ impl Bifrost {
     ///
     /// # Cancellation
     ///
-    /// Abandoning the future may leave the edit committed server-side;
-    /// describe the table to observe its current version.
+    /// Abandoning the future, or losing the response, may leave the edit
+    /// committed server-side, with this client's cached destination for the
+    /// table still held; describe the table to observe which version
+    /// committed before retrying, since a retry at the old version conflicts.
     ///
     /// # Panics
     ///

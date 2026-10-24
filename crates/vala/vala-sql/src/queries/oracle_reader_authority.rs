@@ -205,7 +205,11 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
     }
 
     /// Sends one `bifrost_cut` notification naming `table`, followed by
-    /// `suffix`.
+    /// `suffix`, delivered only if this owner's transaction commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError`] when the statement fails.
     async fn announce(&mut self, table: CutTableRef<'_>, suffix: &str) -> Result<(), SqlError> {
         let payload = format!(
             "{}|{}|{}{suffix}",

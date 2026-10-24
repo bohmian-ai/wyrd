@@ -981,6 +981,12 @@ impl Bifrost {
     /// Raises `WYRD_SPEC_400_VALIDATION` when `request_json` is not one
     /// `AlterTableRequest`, and `WyrdError` carrying the server's invalid-edit,
     /// version-conflict, authorization, not-found, or transport code.
+    ///
+    /// # Cancellation
+    ///
+    /// The call runs to completion with the GIL released; a transport failure
+    /// after the server committed may leave the edit committed, so describe
+    /// the table before retrying, since a retry at the old version conflicts.
     fn alter_table(
         &self,
         py: Python<'_>,

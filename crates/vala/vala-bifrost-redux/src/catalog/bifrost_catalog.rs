@@ -1080,10 +1080,23 @@ impl BifrostCatalog {
     /// it unless the table is still at `expected_table_version`. A refused
     /// edit changes nothing and consumes no version.
     ///
-    /// After the commit the control row's fingerprint and layout projection
-    /// are refreshed and a definition-change notification is sent in the
-    /// same tenant transaction, so every listening node drops its cached
-    /// definition, and this node drops its own.
+    /// Every fallible projection value is derived before the native
+    /// publication. After it, still under the lock, the control row's
+    /// fingerprint and layout projection are refreshed, a definition-change
+    /// notification is sent, and the response is projected from the committed
+    /// metadata and that refreshed row, all in one tenant transaction; on its
+    /// commit every listening node drops its cached definition, and this node
+    /// drops its own. The response is therefore this edit's own definition,
+    /// never a later edit's.
+    ///
+    /// # Cancellation and partial progress
+    /// Dropping the future or failing before the native publication commits
+    /// changes nothing. The native publication commits before the tenant
+    /// transaction, so dropping the future or failing after it leaves the new
+    /// version committed in Iceberg, and described, while the control row
+    /// keeps its prior fingerprint and layout and no node is notified; a
+    /// retry at the old version then conflicts. Describe the table to observe
+    /// which version committed.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::TableNotFound`] when the tenant has no

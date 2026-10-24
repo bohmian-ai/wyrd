@@ -153,6 +153,11 @@ pub(super) fn unique_table(prefix: &str) -> String {
 /// Every Scribe case drives ingest and query through the same public routes a
 /// real caller uses, so each tenant in a case needs its own service principal
 /// and API key rather than a shared fixture credential.
+///
+/// # Panics
+///
+/// Panics when the service cannot be bootstrapped or the client cannot be
+/// built, as [`endpoint_client`] documents.
 pub(super) async fn tenant_client(
     server: &WyrdTestServer,
     tenant: DataTenantId,
@@ -169,6 +174,11 @@ pub(super) async fn tenant_client(
 ///
 /// One identity may serve through several pods, so a multi-pod case mints the
 /// key once and builds one client per pod endpoint.
+///
+/// # Panics
+///
+/// Panics when `server` has no bound gRPC or HTTP URL or the client
+/// configuration is refused.
 pub(super) fn endpoint_client(
     server: &WyrdTestServer,
     api_key: &secrecy::SecretString,

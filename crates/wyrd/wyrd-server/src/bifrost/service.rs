@@ -195,6 +195,12 @@ pub async fn describe_table(
 /// [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
 /// carries no catalog, and the mapped catalog error (not found, stale or
 /// exhausted version, invalid edit or layout) otherwise.
+///
+/// # Cancellation and partial progress
+///
+/// As [`vala_bifrost_redux::catalog::BifrostCatalog::alter_table`]: a request
+/// dropped after the catalog's native publication commits may leave the new
+/// version committed without its control projection or notification.
 pub async fn alter_table(
     state: &AppState,
     caller: Caller,

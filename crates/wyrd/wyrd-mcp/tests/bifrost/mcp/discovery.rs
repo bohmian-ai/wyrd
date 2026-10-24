@@ -337,7 +337,16 @@ mod pg_tests {
     /// than a formatting one: both tables exist in the same catalog, and only
     /// the caller's own is nameable — by listing, by describing, and by the
     /// error a foreign name produces, which is the same not-found the absent
-    /// name produces so nothing leaks across the boundary.
+    /// name produces so nothing leaks across the boundary. An administrator's
+    /// SDK edit is then what the next describe reads, for the administrator
+    /// and for a caller holding only table read.
+    ///
+    /// # Errors
+    /// Returns fixture, SDK, MCP, role, or shutdown failures.
+    ///
+    /// # Panics
+    /// Panics when a listing, description, refusal, or edited layout differs
+    /// from what the caller is authorized to see.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn agent_discovers_only_authorized_tables_and_layout() -> Result<(), McpJourneyError> {

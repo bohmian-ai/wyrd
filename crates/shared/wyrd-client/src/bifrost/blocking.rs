@@ -241,6 +241,16 @@ impl Bifrost {
     /// # Errors
     ///
     /// As [`crate::bifrost::Bifrost::alter_table`].
+    ///
+    /// # Cancellation
+    ///
+    /// The call blocks until the server answers; a lost response may leave
+    /// the edit committed, as [`crate::bifrost::Bifrost::alter_table`]
+    /// documents.
+    ///
+    /// # Panics
+    ///
+    /// As [`crate::bifrost::Bifrost::alter_table`].
     pub fn alter_table(
         &self,
         namespace: &str,

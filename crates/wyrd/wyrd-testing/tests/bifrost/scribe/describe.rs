@@ -808,6 +808,10 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
 }
 
 /// Each described user field's name and stable field id, in order.
+///
+/// # Panics
+///
+/// Panics when a described field carries no Parquet field id.
 fn field_ids(description: &wyrd_spec::vala::api::BifrostTableDescription) -> Vec<(String, String)> {
     description
         .user_fields
@@ -1130,11 +1134,21 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
     use wyrd_testing::bifrost::cluster::{BifrostClusterSpec, WyrdTestCluster};
     use wyrd_testing::bifrost::revisions::{composite_batch, register_composite_table, shifted};
 
+    /// The cluster's pod at `index`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cluster has no such pod.
     fn pod(cluster: &WyrdTestCluster, index: usize) -> &wyrd_testing::WyrdTestServer {
         cluster
             .server(index)
             .unwrap_or_else(|| panic!("the cluster owns pod {index}"))
     }
+    /// Publishes every batch both pods hold.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either pod cannot publish.
     async fn flush(cluster: &WyrdTestCluster) {
         for index in [0, 1] {
             pod(cluster, index)
@@ -1144,6 +1158,7 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
         }
     }
 
+    /// The stable code of a stale table version.
     const CONFLICT: &str = "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT";
     let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
         .await

@@ -1316,7 +1316,7 @@ def test_guided_manual_setup(language: str, tmp_path: Path) -> None:
         assert ran.returncode == 0, ran.stdout + ran.stderr
         verdicts = [line.split(":")[0] for line in ran.stdout.splitlines() if not line[0].isspace()]
         assert verdicts == ["passed", "failed"], ran.stdout
-        assert "  subject:  default/Service/support-reply@1.0.0#" in ran.stdout
+        assert "  subject:  Service/support-reply@1.0.0#" in ran.stdout
         runs = stored_verdicts(cli_path, reader, env, sql)
         assert {"passed", "failed"} in runs.values(), runs
 

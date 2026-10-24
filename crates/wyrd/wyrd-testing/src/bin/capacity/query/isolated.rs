@@ -21,7 +21,9 @@ use wyrd_testing::release_server::LocalServer;
 
 use crate::query::run::{Bench, Outcome, Sender, WRONG_RESULT};
 use crate::query::workload::{Case, Fixture, TABLE};
-use crate::query::{Lane, Residence, WriteOp, client, lanes, read_case, smoke, start};
+use crate::query::{
+    Lane, Residence, WriteOp, client, lanes, parquet_bytes, read_case, smoke, start,
+};
 
 /// Concurrent writers loading the read fixture.
 const LOADERS: usize = 16;
@@ -196,9 +198,6 @@ impl Isolated {
 /// Rows each write path's storage sample writes in [`Workload::prepare`].
 const STORAGE_ROWS: i64 = 200_000;
 
-/// Committed Parquet bytes the server published.
-const PUBLISHED: &str = "bifrost_scribe_publication_bytes_total";
-
 /// Bytes per MiB.
 pub const MIB: f64 = 1_048_576.0;
 
@@ -260,10 +259,11 @@ impl Workload for Isolated {
     /// fixture into the smoked server, waits until every row is published
     /// as Parquet, and computes the exact answers.
     ///
-    /// Each path writes [`STORAGE_ROWS`] fresh rows alone and settles; its
-    /// ratio is the settled `bifrost_scribe_publication_bytes_total` delta
-    /// over the `INSERTED` delta, both including server-internal rows written
-    /// meanwhile, and excluding WAL, staging, and catalog bytes.
+    /// Each path first writes [`STORAGE_ROWS`] fresh rows alone; after the
+    /// fixture's one settle, its ratio is its table's growth in published
+    /// Parquet bytes over the `INSERTED` delta of its load, which includes
+    /// server-internal rows written meanwhile. WAL, staging, and catalog
+    /// bytes are excluded.
     ///
     /// # Errors
     ///
@@ -277,28 +277,18 @@ impl Workload for Isolated {
             .as_ref()
             .ok_or_else(|| ExperimentError::workload("the workload was not smoked"))?;
         let client = client(server).map_err(ExperimentError::workload)?;
+        let root = server.storage_dir();
+        let mut samples = Vec::new();
         for (op, sender, cursor) in &self.senders {
+            let stored = parquet_bytes(&root, op.table());
             let before = server.metrics().await.map_err(ExperimentError::workload)?;
             let end = cursor.load(Ordering::Relaxed) + STORAGE_ROWS;
             let sample = sender
                 .closed_loop(cursor, end, LOADERS, &CancellationToken::new())
                 .await;
-            Residence::settle(server, SETTLE_TIMEOUT)
-                .await
-                .map_err(ExperimentError::workload)?;
             let after = server.metrics().await.map_err(ExperimentError::workload)?;
-            let delta = |family: &str| after.sum(family, &[]) - before.sum(family, &[]);
-            let ratio = if sample.error_count() > 0 {
-                Reading::missing(format!(
-                    "the storage sample failed with {:?}",
-                    sample.errors
-                ))
-            } else if delta(INSERTED) > 0.0 {
-                Reading::exact(delta(PUBLISHED) / delta(INSERTED))
-            } else {
-                Reading::missing("the storage sample inserted no retained bytes")
-            };
-            self.storage.push((*op, ratio));
+            let inserted = after.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
+            samples.push((*op, stored, inserted, sample));
         }
         let fixture = Fixture::standard();
         let loader = Sender::native(&client, TABLE, fixture)
@@ -321,6 +311,20 @@ impl Workload for Isolated {
         Residence::settle(server, SETTLE_TIMEOUT)
             .await
             .map_err(ExperimentError::workload)?;
+        for (op, stored, inserted, sample) in samples {
+            let stored = parquet_bytes(&root, op.table()).saturating_sub(stored);
+            let ratio = if sample.error_count() > 0 {
+                Reading::missing(format!(
+                    "the storage sample failed with {:?}",
+                    sample.errors
+                ))
+            } else if inserted > 0.0 && stored > 0 {
+                Reading::exact(stored.to_f64().unwrap_or(f64::MAX) / inserted)
+            } else {
+                Reading::missing("the storage sample inserted or published no bytes")
+            };
+            self.storage.push((op, ratio));
+        }
         self.bench = Some(Arc::new(Bench::new(
             &client,
             fixture,

@@ -106,6 +106,16 @@ impl WriteOp {
     /// Every path, in L1 sweep order.
     pub const ALL: [Self; 3] = [Self::Native, Self::Spans, Self::Logs];
 
+    /// The table this path writes, as `vala.<segment>.<name>`.
+    #[must_use]
+    pub const fn table(self) -> &'static str {
+        match self {
+            Self::Native => workload::INGEST_TABLE,
+            Self::Spans => "vala.traces.spans",
+            Self::Logs => "vala.logs.records",
+        }
+    }
+
     /// The step-id prefix and `op` parameter of this path.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -347,7 +357,7 @@ fn isolated_metrics() -> Vec<Metric> {
         Metric::raw(
             "storage_ratio",
             "ratio",
-            "published Parquet bytes per retained Arrow byte of one settled 200,000-row sample of the path taken before the windows; both include server-internal rows written meanwhile and exclude WAL, staging, and catalog bytes; write steps only",
+            "the path's table growth in published Parquet bytes per retained Arrow byte inserted while one 200,000-row sample of the path loaded before the windows, settled with the read fixture; the inserted bytes include server-internal rows written meanwhile, and WAL, staging, and catalog bytes are excluded; write steps only",
         ),
         Metric::raw("scaling", "ratio", "Q_N/(N × Q_1) of `rate`"),
         Metric::raw("base_rate", "requests/s", "the one-client step's `rate`"),
@@ -1254,7 +1264,24 @@ impl Residence {
 
 /// Counts the Parquet objects under the `file://` store rooted at `root`.
 fn parquet_files(root: &Path) -> u64 {
-    let mut found = 0;
+    parquet(root).len() as u64
+}
+
+/// Sums the sizes of `table`'s Parquet objects under the `file://` store
+/// rooted at `root`, whose keys hold `/<segment>/<name>/` after the tenant.
+pub fn parquet_bytes(root: &Path, table: &str) -> u64 {
+    let segment = format!("/{}/", table.trim_start_matches("vala.").replace('.', "/"));
+    parquet(root)
+        .iter()
+        .filter(|(path, _)| path.to_string_lossy().contains(&segment))
+        .map(|(_, bytes)| bytes)
+        .sum()
+}
+
+/// Every Parquet object under the `file://` store rooted at `root`, with
+/// its size.
+fn parquet(root: &Path) -> Vec<(std::path::PathBuf, u64)> {
+    let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         for path in std::fs::read_dir(&directory)
@@ -1269,7 +1296,8 @@ fn parquet_files(root: &Path) -> u64 {
                 .extension()
                 .is_some_and(|extension| extension == "parquet")
             {
-                found += 1;
+                let bytes = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+                found.push((path, bytes));
             }
         }
     }
@@ -1279,6 +1307,30 @@ fn parquet_files(root: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table's stored bytes sum only its own Parquet objects, never a
+    /// sibling table's or a non-Parquet object.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another object is counted.
+    #[test]
+    fn parquet_bytes_count_only_the_tables_own_objects() {
+        let root = tempfile::tempdir().expect("store");
+        for (key, bytes) in [
+            ("tenants/t/traces/spans/data/a.parquet", 3),
+            ("tenants/t/traces/spans/data/b.parquet", 4),
+            ("tenants/t/traces/spans/metadata/v1.json", 50),
+            ("tenants/t/traces/spans_old/data/c.parquet", 100),
+            ("tenants/t/logs/records/data/d.parquet", 200),
+        ] {
+            let path = root.path().join(key);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+            std::fs::write(path, vec![0; bytes]).expect("object");
+        }
+        assert_eq!(parquet_bytes(root.path(), WriteOp::Spans.table()), 7);
+        assert_eq!(parquet_bytes(root.path(), WriteOp::Native.table()), 0);
+    }
 
     /// The harmonic mix weights each path by its share of rows, and the
     /// initial rate is 70% of it per declared core.

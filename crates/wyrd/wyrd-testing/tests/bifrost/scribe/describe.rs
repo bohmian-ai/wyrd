@@ -5,6 +5,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::Bifrost;
 use wyrd_client::bifrost::BifrostOptions;
 use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_spec::vala::ids::TableVersion;
 
 use super::support::{start_scribe_server, unique_table};
 
@@ -223,16 +224,19 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     server.shutdown().await.expect("server shutdown");
 }
 
-/// A composite layout registers, describes canonically, and re-registers
-/// idempotently; a changed declaration and every out-of-bounds declaration are
-/// refused, and a refusal leaves no registration behind.
+/// A composite layout registers at table version 1, describes canonically,
+/// and re-registers idempotently without a version change; a changed
+/// declaration and every out-of-bounds declaration are refused, and a refusal
+/// leaves no registration behind.
 ///
 /// The accepted table partitions hourly on a zoned `event_time` plus an
 /// identity dimension over a nullable string and a bucket dimension over a
 /// nullable integer, sorts on the string, and Blooms a third column; describe
 /// returns exactly that declaration, with the complete Bloom set and no hidden
 /// floor. A table registered without a layout resolves to
-/// `hour(wyrd_ingested_at)` and no Bloom columns. Each refused declaration
+/// `hour(wyrd_ingested_at)`, that column descending, and no Bloom columns; a
+/// declared time column alone drives the same defaults over itself. Each
+/// refused declaration
 /// — including a timezone-naive or nullable time axis — returns the
 /// invalid-layout code naming its field and violation, and the
 /// same name then registers as `Created` under a valid layout.
@@ -244,7 +248,7 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
 /// already registered.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
-async fn composite_layout_creation_and_refusal() {
+async fn registered_layouts_are_bounded_and_resolved() {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use wyrd_spec::vala::api::{
         NullOrderWire, PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire,
@@ -347,17 +351,26 @@ async fn composite_layout_creation_and_refusal() {
     let described = query
         .describe_table("vala.datasets", &table)
         .await
-        .expect("describe the composite table")
-        .physical_layout;
+        .expect("describe the composite table");
     assert_eq!(
-        described, composite,
+        described.physical_layout, composite,
         "describe returns exactly the declared composite layout"
     );
+    assert_eq!(described.table_version, TableVersion::INITIAL);
     assert_eq!(
         register(table.clone(), Some(composite.clone()))
             .await
             .expect("the same declaration re-registers"),
         RegisterOutcome::AlreadyExists
+    );
+    assert_eq!(
+        query
+            .describe_table("vala.datasets", &table)
+            .await
+            .expect("describe after re-registration")
+            .table_version,
+        TableVersion::INITIAL,
+        "an equivalent re-registration never advances the version"
     );
     let mut changed = composite.clone();
     changed.partition_by[2] = part("shard", PartitionTransformWire::Truncate, None, Some(10));
@@ -397,6 +410,48 @@ async fn composite_layout_creation_and_refusal() {
     assert!(
         default_layout.bloom_columns.is_empty(),
         "the default layout carries no hidden Bloom floor"
+    );
+    assert_eq!(default_layout.time_column.as_deref(), Some("wyrd_ingested_at"));
+    assert_eq!(
+        default_layout.sort_keys,
+        vec![SortKeyWire {
+            column: "wyrd_ingested_at".to_owned(),
+            direction: SortDirectionWire::Desc,
+            null_order: NullOrderWire::Last,
+        }],
+        "the default sorts newest ingest first"
+    );
+
+    let timed = unique_table("timed_default");
+    register(
+        timed.clone(),
+        Some(PhysicalLayoutWire {
+            time_column: Some("event_time".to_owned()),
+            partition_by: Vec::new(),
+            sort_keys: Vec::new(),
+            bloom_columns: Vec::new(),
+        }),
+    )
+    .await
+    .expect("a declared time column alone registers");
+    let timed_layout = query
+        .describe_table("vala.datasets", &timed)
+        .await
+        .expect("describe the timed table")
+        .physical_layout;
+    assert_eq!(
+        timed_layout.partition_by,
+        vec![PartitionFieldWire::new("event_time", PartitionTransformWire::Hour)],
+        "a declared time column drives the default partition"
+    );
+    assert_eq!(
+        timed_layout.sort_keys,
+        vec![SortKeyWire {
+            column: "event_time".to_owned(),
+            direction: SortDirectionWire::Desc,
+            null_order: NullOrderWire::Last,
+        }],
+        "a declared time column drives the default sort"
     );
 
     let with = |edit: &dyn Fn(&mut PhysicalLayoutWire)| {
@@ -438,6 +493,28 @@ async fn composite_layout_creation_and_refusal() {
         (
             with(&|layout| layout.bloom_columns = vec!["event_time".to_owned()]),
             "BloomColumn/UnsupportedColumn",
+        ),
+        (
+            with(&|layout| layout.bloom_columns = vec!["absent".to_owned()]),
+            "BloomColumn/UnknownColumn",
+        ),
+        (
+            with(&|layout| {
+                let key = layout.sort_keys[0].clone();
+                layout.sort_keys.push(key);
+            }),
+            "SortKey/Duplicate",
+        ),
+        (
+            with(&|layout| {
+                layout.partition_by[2] =
+                    part("customer", PartitionTransformWire::Identity, None, None);
+            }),
+            "Partition/Duplicate",
+        ),
+        (
+            with(&|layout| layout.partition_by[2].buckets = Some(1)),
+            "PartitionTransform/OutOfRange",
         ),
     ];
     for (layout, expected) in refusals {

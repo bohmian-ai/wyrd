@@ -2,7 +2,7 @@
 id: TASK-003
 spec: SPEC-service-identity-and-telemetry
 spec_revision: 16
-status: proposed
+status: approved
 kind: implementation
 depends_on: [TASK-009, TASK-004, TASK-005]
 requirements: [REQ-054, REQ-055, REQ-056, REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-021, REQ-022, REQ-023, REQ-024, REQ-025, REQ-026, REQ-027, REQ-028, REQ-031, REQ-032, REQ-034, REQ-035, REQ-036, REQ-039, REQ-040, REQ-042, REQ-044, REQ-048]

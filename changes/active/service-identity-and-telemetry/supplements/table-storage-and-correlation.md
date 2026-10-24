@@ -1,15 +1,14 @@
 ---
 spec: SPEC-service-identity-and-telemetry
-spec_revision: 13
+spec_revision: 16
 status: approved
 ---
 
 # Unified tables, physical layouts, and correlation
 
-This is the storage supplement to approved [specification revision 13](../spec.md),
+This is the storage supplement to approved [specification revision 16](../spec.md),
 alongside [auth](auth-system.md) and [telemetry schemas](telemetry-schemas.md).
-It records the storage and table-unification contracts. Auth and telemetry
-content is unchanged from revision 12.
+It records the revision-16 storage and table-unification contracts together with the revised auth and telemetry supplements.
 
 ## One table contract
 
@@ -120,7 +119,7 @@ uses one envelope for all tables.
 
 | Column | Logical type | Nullability | Meaning and production |
 | --- | --- | --- | --- |
-| `workload_card_uid` | Utf8 | nullable | Validated exact Service/Agent execution or binding root; null without proof. |
+| `workload_card_uid` | Utf8 | nullable | Validated exact Service execution or binding root; null without proof. |
 | `subject_card_uid` | Utf8 | nullable | Exact Card observed or judged; validated under the applicable observation/verification authority. |
 | `run_id` | Utf8 | nullable | Existing application Run correlation; preserve its existing grammar. |
 | `sub_principal_id` | Utf8 | required | Account on whose behalf the recorded action occurred. |
@@ -177,9 +176,44 @@ observation schema uses `subject_card_uid` instead of `card_uid`. No old data or
 field-ID conversion is required for this release. Future in-baseline renames
 preserve IDs and values under the evolution contract.
 
-The new nullable resource and convenience fields in the telemetry supplement
-remain signal-specific. Dynamic tables and other system tables acquire the
-shared envelope, not all 27 shared signal/resource columns.
+### Shared Service and subject dimensions
+
+All nine system tables (spans, logs, metrics, gateway calls, drift
+observations, verification results, execution inputs, drift result features
+and audit) add these six nullable Utf8 columns to the seven-field envelope:
+
+| Column | Production |
+| --- | --- |
+| `service_name` | Validated Service UID's registered name; observed `service.name` only for unowned telemetry. |
+| `service_version` | Same Service UID's registered version; observed `service.version` only for unowned telemetry. |
+| `deployment_environment` | Accepted configured environment. Without accepted request environment, owned and unowned telemetry use typed resource environment promotion. |
+| `subject_kind` | Subject UID's canonical CardKind wire value. |
+| `subject_name` | Subject UID's registered name. |
+| `subject_version` | Subject UID's registered version. |
+
+This is one 13-column envelope on these tables: seven universal fields and six
+shared dimensions, with no duplicate fields. Telemetry's existing three Service/
+environment columns count once; its other resource/convenience fields stay
+signal-specific. Dynamic tables keep the universal seven-field envelope, with
+no mandatory new dimensions or attribution Bloom defaults. Audit retains its
+accountability Bloom defaults.
+There is no `workload_kind`: every workload UID names a Service.
+
+Resolve identity descriptors at the existing server registry/admission boundary,
+batch/reuse validated resolution rather than one SQL lookup per row, and freeze
+canonical context before ACK or accepted execution. Do not expand JWT graph
+claims or add catalog/reference SQL to normal ingest. Public clients can compute
+projections but the server validates or stamps them; clients cannot establish
+ownership from names. Internal retries/outboxes carry the accepted context.
+
+Configured application records outside a component Run use the Service as
+subject. Explicit component Runs retain the Service owner and select the exact
+component subject and binding occurrence. Generic unconfigured/rootless records
+may remain null; unknown identities are never guessed. A subject UID has all
+three matching descriptors or none when absent. Service descriptors match the
+workload UID whenever present. Original conflicting OTel labels remain in raw
+resource attributes. Required principals/request/time and audit semantics are
+unchanged.
 
 ## Exact system default layouts
 
@@ -189,35 +223,39 @@ additional configurable mechanisms:
 ```text
 E = deployment_environment ASC NULLS FIRST
 S = service_name ASC NULLS FIRST
+V = service_version ASC NULLS FIRST
 D(column) = column DESC NULLS LAST
 A(column) = column ASC NULLS LAST
 F(column) = column ASC NULLS FIRST
 
 ```
 
-Each row lists the complete default Bloom set, not additions to a hidden floor.
-There is no global mandatory Bloom-column set. All sets are tenant-configurable
-under the same validation rules; the attribution schema remains mandatory.
-The ledger records the agreed query-driven per-table defaults. Spans and logs
-exclude `span_id` by default; tenants may enable it. Verification results retain
-the agreed eight. No set is populated by a shared correlation-index rule.
+Creation defaults use one attribution Bloom set on all eight attributable
+tables: `service_name`, `subject_name`, `workload_card_uid`, `subject_card_uid`,
+`run_id`. Union it with the signal-specific lookup keys below, once per column.
+These are complete resolved declarations, not a runtime mandatory floor. Tenant
+replacement, empty sets and retained older definitions remain valid. Audit has
+its separate accountability defaults; dynamic defaults are unchanged.
+
+Every attributable table uses the same four-key E,S,V,time sort. The ledger
+replaces previous trace/event/metric/series tie-breakers, not time axes.
 
 | Table | Partition | Ordered sort keys | Complete default Bloom set |
 | --- | --- | --- | --- |
-| `bifrost.traces.spans` | `hour(start_time_unix_nano)` | E, S, D(start_time_unix_nano), A(trace_id) | `trace_id`, `workload_card_uid`, `subject_card_uid`, `run_id`, `service_name` |
-| `bifrost.logs.records` | `hour(time_unix_nano)` | E, S, D(time_unix_nano), F(event_name) | `trace_id`, `workload_card_uid`, `subject_card_uid`, `run_id`, `service_name` |
-| `bifrost.metrics.points` | `hour(time_unix_nano)` | E, S, D(time_unix_nano), A(metric_name) | `metric_name`, `service_name`, `workload_card_uid`, `subject_card_uid` |
-| `bifrost.gateway.calls` | `hour(started_at)` | D(started_at), A(call_id) | `call_id`, `workload_card_uid`, `subject_card_uid`, `run_id` |
-| `bifrost.drift.observations` | `day(created_at)` | D(created_at), F(series) | `subject_card_uid`, `series`, `workload_card_uid` |
-| `bifrost.verification.results` | `day(ended_at)` | D(ended_at) | `workload_card_uid`, `subject_card_uid`, `run_id`, `result_id`, `execution_id`, `verifier_card_uid`, `binding_id`, `group_id` |
-| `bifrost.verification.execution_inputs` | `day(recorded_at)` | D(recorded_at) | `execution_id`, `workload_card_uid`, `subject_card_uid`, `run_id`, `verifier_card_uid`, `binding_id`, `group_id` |
-| `bifrost.drift.result_features` | `day(wyrd_ingested_at)` | D(wyrd_ingested_at) | `result_id` |
+| `bifrost.traces.spans` | `hour(start_time_unix_nano)` | E, S, V, D(start_time_unix_nano) | `service_name`, `subject_name`, `workload_card_uid`, `subject_card_uid`, `run_id`, `trace_id` |
+| `bifrost.logs.records` | `hour(time_unix_nano)` | E, S, V, D(time_unix_nano) | `service_name`, `subject_name`, `workload_card_uid`, `subject_card_uid`, `run_id`, `trace_id` |
+| `bifrost.metrics.points` | `hour(time_unix_nano)` | E, S, V, D(time_unix_nano) | `service_name`, `subject_name`, `workload_card_uid`, `subject_card_uid`, `run_id`, `metric_name` |
+| `bifrost.gateway.calls` | `hour(started_at)` | E, S, V, D(started_at) | `service_name`, `subject_name`, `workload_card_uid`, `subject_card_uid`, `run_id`, `call_id` |
+| `bifrost.drift.observations` | `day(created_at)` | E, S, V, D(created_at) | `service_name`, `subject_name`, `workload_card_uid`, `subject_card_uid`, `run_id`, `series` |
+| `bifrost.verification.results` | `day(ended_at)` | E, S, V, D(ended_at) | `service_name`, `subject_name`, `workload_card_uid`, `subject_card_uid`, `run_id`, `result_id`, `execution_id`, `verifier_card_uid`, `binding_id`, `group_id` |
+| `bifrost.verification.execution_inputs` | `day(recorded_at)` | E, S, V, D(recorded_at) | `service_name`, `subject_name`, `workload_card_uid`, `subject_card_uid`, `run_id`, `execution_id`, `verifier_card_uid`, `binding_id`, `group_id` |
+| `bifrost.drift.result_features` | `day(wyrd_ingested_at)` | E, S, V, D(wyrd_ingested_at) | `service_name`, `subject_name`, `workload_card_uid`, `subject_card_uid`, `run_id`, `result_id` |
 | `bifrost.system.audit_log` | `day(created_at)` | D(created_at) | `sub_principal_id`, `act_principal_id`, `wyrd_request_id`, `resource` |
 
 The system default has no Service, environment, version, principal, binding,
 Run, or root-UID partition dimension. An authorized tenant may add validated
-dimensions. The proposed default telemetry sort clusters environment and Service
-inside each hour; lookup filters also use statistics, Bloom filters, and page
+dimensions. The proposed common sort clusters environment, Service and Service version
+inside each table's time partition; lookup filters also use statistics, Bloom filters, and page
 indexes. Physical partition count does not multiply with those identities.
 
 These are chosen defaults, not a measured performance guarantee. Verify
@@ -476,7 +514,8 @@ of bounded total table cardinality.
 
 The shared seven-field envelope is mandatory. Its Bloom coverage is not.
 System and dynamic tables use one validator/configuration mechanism while
-each table declares query-driven defaults. An empty Bloom set is valid and
+all eight attributable built-ins resolve the common attribution defaults plus
+signal lookup keys; audit/dynamic retain their declared defaults. An empty Bloom set is valid and
 must not weaken permissions, attribution validation, or exact query results.
 
 | Access pattern | Indexing recommendation |
@@ -498,11 +537,11 @@ occur in few groups. Min/max and dictionaries remain complementary tools.
 | Table | Intended primary access paths |
 | --- | --- |
 | Spans/logs | Trace retrieval, exact workload/component views, application Run, and Service filtering. |
-| Metrics | Metric name, Service, workload, and component; aggregated points need no invented Run/account/request lookup. |
+| Metrics | Metric name, Service, workload, and component; shared Run correlation remains nullable when no originating Run exists. |
 | Gateway calls | Individual call and its workload/component/Run context. |
 | Drift observations | Subject plus series/time windows, and explicit workload-scoped filtering. |
 | Verification results/inputs | Result or execution, application context, Verifier, binding history, and grouped source discovery. |
-| Drift result features | Detail retrieval through exact result ID. |
+| Drift result features | Shared attribution filters plus detail retrieval through exact result ID. |
 | Audit | Account, request, and exact-resource investigation. |
 
 `deployment_environment`, log severity, metric type, and audit operation remain
@@ -529,7 +568,7 @@ promise Bloom pushdown or an exact composite-key lookup.
 
 | Mechanism | Meaning | Cost/benefit |
 | --- | --- | --- |
-| Clustering here | Declared sort order groups environment/Service rows inside written files | Write/compaction sorting can tighten file/group/page statistics; it creates no per-Service partition. |
+| Clustering here | Declared sort order groups environment/Service/version rows inside written files | Write/compaction sorting can tighten file/group/page statistics; it creates no per-Service partition. |
 | Bloom | Independent membership filter per column chunk | Adds hashing/memory/storage; can reject impossible equality/finite-IN matches. |
 
 Bloom list order has no leading-column requirement, priority, or composite-key
@@ -565,34 +604,17 @@ with its other secondary-index Bloom mechanisms. Inspected sources are
 `src/config/src/utils/parquet.rs` writer gating. This is a concrete comparison,
 not an industry-frequency claim.
 
-### Verification results: eight default columns
+### Verification results: ten default columns
 
-```json
-{
-  "bloom_columns": [
-    "workload_card_uid",
-    "subject_card_uid",
-    "run_id",
-    "result_id",
-    "execution_id",
-    "verifier_card_uid",
-    "binding_id",
-    "group_id"
-  ]
-}
-```
-
-These cover the intended workload/release, component, Run, result, execution,
-Verifier, binding-history, and grouped-verification access paths. Current
-runtime evidence establishes result-ID lookup and grouped filters on workload,
-subject/Verifier, and group; execution, Run, and binding defaults also serve the
-intended explicit correlation/history queries. This is not a claim that every
-column has measured equal benefit.
-
-`sub_principal_id`, `act_principal_id`, and `wyrd_request_id` remain required
-stored columns but are optional Bloom additions for verification results.
-They may be default Blooms on another table whose queries use them. The eight
-verification defaults are configurable, not an immutable performance floor.
+The five common attribution columns plus `result_id`, `execution_id`,
+`verifier_card_uid`, `binding_id`, `group_id` yield ten defaults, exactly as in
+the ledger. Service/subject family queries use the name columns; exact release/
+subject and Run correlation use the UID/Run columns. Existing result/execution/
+Verifier/binding/group lookups retain their keys. Principal/request Blooms are
+optional here. No default environment, kind or version Bloom is added; use the
+sort/statistics and exact predicates, or a selected exact UID. Benchmark direct
+name/version predicates as well as UID selections; no automatic rewrite or
+pruning benefit is promised. All ten defaults remain replaceable/clearable.
 
 ### Cost and evidence
 
@@ -738,14 +760,19 @@ use of that evidence. Never guess from current schema/spec/order/Blooms.
 The supported schema edits and alteration contract above define this change;
 future type promotions or deletions require a separate explicit extension.
 
+Direct and queued verification capture one context
+{service_name, service_version, deployment_environment} at acceptance. Queued
+work stores it with the accepted execution; both paths write it unchanged to
+the result and inputs rows. Nothing else reads it.
+
 ## Correlation and queries across tables
 
 | Question | Correlation |
 | --- | --- |
 | Everything for one exact workload version | `workload_card_uid` |
-| Everything across a Service's releases | Resolve registered root UIDs, then filter `workload_card_uid` |
-| One component across workloads | `subject_card_uid` |
-| One workload's application Run | `workload_card_uid` plus `run_id` |
+| Everything across a Service's releases | `service_name` with non-null validated `workload_card_uid`; optional environment/version |
+| One component across workloads | `subject_kind`, `subject_name`, optional `subject_version`, or exact `subject_card_uid` |
+| One Service's application Run | `workload_card_uid` plus `run_id` |
 | One distributed trace | `trace_id` on trace-bearing surfaces |
 | Logs for one span | `trace_id` plus `span_id` |
 | One verification execution | `execution_id` on execution-bearing surfaces |
@@ -771,7 +798,7 @@ warehouse row-read policy.
 ## Whole-trace verification decision
 
 A trace check always takes the entire trace as its evidence, under ordinary
-accepted tenant/table authorization. A Service/Agent or component binding
+accepted tenant/table authorization. A Service or component binding
 identifies what is judged and owns the result; it does not narrow the trace
 input. Do not add a workload-only trace mode or a trace/workload scope switch.
 
@@ -1061,17 +1088,26 @@ directory format or hashing algorithm.
 
 ## Approval and decision closure
 
-The maintainer approved revision 13's single-version, exact integer/wire,
+The maintainer approved revision 15, retaining revision 13's single-version, exact integer/wire,
 atomic publication, stale-writer/retry, rooted-retention and legacy-refusal
 contracts above. No material choice remains unresolved.
-Revision 12's safe-edit subset, visible-trace behavior and partition/sort/Bloom/
-writer default values are unchanged.
+Revision 14 replaces the root model, shared context and sort/Bloom defaults.
+Time-only partitions, safe-edit rules, visible-trace behavior and the writer
+encoding/compression/FPP recipe remain unchanged.
 
 Performance validation remains representative before/after measurement with
 correctness evidence, not an invented numerical lookup SLO. Partial arrival
 is an explicit limit of the evidence available at evaluation time, not a
 missing trace-completion feature. Runtime layout evolution remains required
 within the fresh baseline; it is separate from an upgrade migration.
+
+## Stock gateway client closure
+
+The [approved SDK/gateway examples and header contract](auth-system.md#stock-provider-sdk-context-and-approved-examples)
+apply to both gateway credential modes. TASK-009 owns state-bound adapters;
+TASK-003 validates exact UIDs and projects the same shared context onto gateway
+calls, preserving it through buffering, streaming, retry and outbox delivery.
+No readable-name headers, new columns or layout changes accompany revision 15.
 
 ## Revision history
 
@@ -1087,3 +1123,13 @@ within the fresh baseline; it is separate from an upgrade migration.
 | 11 | draft | Records agreed hourly/daily defaults, safe editing/revision-conflict principles, and bounded queued retries for absent traces with terminal inconclusive exhaustion. Partial-trace/read-view/direct-call details and exact alteration matrices remain open. |
 | 12 | approved | Closes the supported layout/schema-edit matrices, existing DDL permission and atomic revisioned PATCH contract. Defines visible-trace evidence, per-attempt reuse, direct inconclusive behavior and late-arrival limits; preserves per-attempt queue timeouts. Defaults are unchanged. |
 | 13 | approved | Unifies definition identity as table_version with JSON decimal strings and TypeScript bigint, atomic Iceberg property/reference/pointer publication, original-version retries, current/older metadata roots and refusal of unmappable legacy evidence. Replaces the PATCH precondition spelling, batches existing pre-ACK fences without added normal-ingest SQL and leaves throughput unmeasured. |
+| 14 | approved | Service-only roots, six shared dimensions across eight tables, common E/S/V/time sort and attribution-plus-signal Bloom defaults; audit/dynamic retain independent defaults. |
+| 15 | approved | Links state-bound stock-client header/gateway closure; shared columns, counts and all physical defaults remain revision 14 values. |
+
+### Revision 16 — telemetry setup ownership
+
+The two telemetry setup paths in the telemetry supplement share this ledger and
+server validation. Accepted request environment takes precedence; when absent,
+OTLP resource environment uses the same typed fallback for owned and unowned
+telemetry. This changes no column, partition, sort, Bloom, table version or
+retention rule. Application resource labels never establish workload ownership.

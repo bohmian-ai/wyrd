@@ -2,12 +2,12 @@
 id: TASK-007
 kind: implementation
 spec: SPEC-service-identity-and-telemetry
-spec_revision: 12
+spec_revision: 16
 status: proposed
 depends_on: [TASK-003, TASK-004, TASK-005, TASK-006]
-requirements: [REQ-026, REQ-035, REQ-038, REQ-040, REQ-042, REQ-043, REQ-044, REQ-045]
+requirements: [REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-026, REQ-035, REQ-038, REQ-040, REQ-042, REQ-043, REQ-044, REQ-045]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008]
-acceptance: [AC-008, AC-014, AC-016, AC-017, AC-018, AC-019]
+acceptance: [AC-024, AC-008, AC-014, AC-016, AC-017, AC-018, AC-019]
 ---
 
 # Measure and improve verification evidence retrieval
@@ -44,6 +44,25 @@ Dependencies remain explicit so measurement uses final identity/telemetry,
 table/layout/catalog, runtime ownership and trace contracts. TASK-008 owns final
 docsite work. Cost is bounded representative fixture execution, without synthetic
 host load or a whole capacity qualification.
+
+## Exploration proof strategy
+
+Measure direct Service-name aggregation across versions, exact version/UID,
+environment, subject kind/name across versions, exact subject UID and combined
+Service+subject predicates on all nine system tables, reading optional tags
+unchanged. Use the declared sort and Bloom defaults; compare full,
+partial and empty filters with identical results. Include a shared Agent under
+two Services, concurrent releases/environments, repeated same-name Card kinds,
+low-volume and skewed Services, time-bounded and explicitly unbounded queries.
+Record candidate files/groups/pages, bytes, planning/scan time and writer memory/
+CPU/filter bytes, including the ten-column result set. Do not infer pruning from
+field presence or UI controls. Existing performance thresholds in the spec still
+apply; no new lookup SLO or default tuning is authorized.
+
+Measurement itself is verification-only and needs no manufactured RED. Add the
+exploration variants to the existing profile/scan regression proof below; any
+executable retrieval change follows the ordered TDD scenarios. Preserve exact
+Service/component binding ownership and whole-trace scope.
 
 ## Approach
 
@@ -137,6 +156,7 @@ custom-table query or authorization path.
 
 | Obligations | Required proof and failure signal |
 | --- | --- |
+| REQ-026,049–053; AC-008,017,024 | Exploration proof above compares public SQL aggregates/drilldowns with expected cross-signal populations, missing-filter fallback and physical scans. Lost rows, merged kinds/Services or unreported writer regressions fail. |
 | REQ-043; AC-017 | Comparable final-contract before/after evidence covers every listed path and measurement dimension. Unsupported speed/pruning claims or unexplained measurement gaps fail. |
 | REQ-026, 040; AC-008, 014; INV-001–008 | Four focused proofs preserve exact selections, outcomes, authority and refusal cases described above. Broadened credentials, merged populations/occurrences or partial-success overflow fail. |
 | REQ-035, 038, 042, 044; AC-016, 018 | Equal answers with absent/disabled Blooms, live/hot/published data and retained layouts; all nine defaults reviewed against query cost. Required Bloom floors, composite-order claims or silent default changes fail. |
@@ -229,7 +249,7 @@ measurement blocker instead of substituting intermediate shapes or numbers.
 
 ## Authority Links
 
-- [Approved revision 12 specification](../spec.md)
+- [Approved revision 16 specification](../spec.md)
 - [Storage supplement: evidence access and lookup performance](../supplements/table-storage-and-correlation.md#verification-evidence-access-and-lookup-performance)
 - [Storage supplement: whole-trace decision](../supplements/table-storage-and-correlation.md#whole-trace-verification-decision)
 - [Bifrost query owner](../../../../architecture/bifrost-design.md#query-oracle)

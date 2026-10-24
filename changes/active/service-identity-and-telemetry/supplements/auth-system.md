@@ -1,12 +1,12 @@
 ---
 spec: SPEC-service-identity-and-telemetry
-spec_revision: 12
+spec_revision: 16
 status: approved
 ---
 
 # Supplemental authentication contracts and complete flows
 
-This is a normative part of [specification revision 12](../spec.md), approved together with the [telemetry supplement](telemetry-schemas.md). It defines
+This is a normative part of [specification revision 16](../spec.md), approved together with the [telemetry supplement](telemetry-schemas.md). It defines
 the proposed system, not behavior already implemented. The main specification's
 requirements and invariants apply throughout.
 
@@ -98,7 +98,7 @@ The proposed `workload_restriction` is a closed JSON union:
 {"mode":"family","kind":"Service","name":"checkout"}
 ```
 
-Family kind is Service or Agent. The family is resolved in the account's
+Family kind is Service only; an Agent Card may be a subject but never a workload root. The family is resolved in the account's
 tenant. Unrestricted means no additional workload-family limit, not an
 operation grant or cross-tenant access. The former migration-only exact-root
 restriction is removed: the v0.3.0 baseline needs no legacy-account conversion.
@@ -371,7 +371,7 @@ root-bearing token as unrestricted.
 Reconstruct account, effective permissions, explicit Card limit, per-participant
 root UIDs, and non-secret provenance. Do not conflate absent context with
 unrestricted access. Do not preserve a runtime dependency on the removed
-Service/Agent version payloads or a version-principal registry lookup.
+Service version payloads or a version-principal registry lookup.
 
 Normal signed-token verification is synchronous and store-free. A signed
 scope authorizes by UID in memory. Registry work occurs at issuance, when an
@@ -410,7 +410,7 @@ unpin a token to make the operation work.
 1. The existing credential chain selects `WYRD_ACCESS_TOKEN` or saved human
    login. Use the User identity and existing renewal path; no machine key or
    workload variable is required.
-2. Loading WyrdState from a bundle stays local/offline. A Service/Agent root
+2. Loading WyrdState from a bundle stays local/offline. A Service root
    is execution context, not a request to switch principal.
 3. On owned IO, the immutable state supplies its pinned root with the existing
    bearer. The server validates it under the User's grants. A component Run
@@ -421,7 +421,268 @@ unpin a token to make the operation work.
 5. Refresh/login keeps human identity; it does not fabricate a Service account.
    State request context remains independently pinned across token renewal.
 
-### Service or Agent application with an account key
+### Immutable application configuration
+
+`state.configure(service_name, service_version, deployment_environment)` is a
+local synchronous operation on a loaded Service state. Name/version omission
+uses the bundle's root; explicit values must match. Environment precedence is
+explicit nonempty value, nonempty `WYRD_DEPLOYMENT_ENVIRONMENT`, then null.
+Explicit empty input is invalid. The first successful configure or implicit
+Run/client/writer/telemetry use freezes configuration, lazily applying defaults;
+every later configure is a typed
+conflict even after shutdown. It cannot mutate another state's client or a
+process-global resource. A family-scoped account still selects the bundle's
+exact Service UID; configuration never grants rights or chooses latest.
+
+All SDKs propagate configured context through native observations, OTLP signals,
+gateway calls and direct/queued/grouped verification. Root Runs use the Service
+subject; component Runs change only subject and preserve exact binding
+occurrence. Gateway work invoked by a check retains accepted Service/subject,
+not the executor/Verifier/model's identity. Server-resolved names/versions/kind
+are immutable descriptors, not new JWT graph claims or authorization fields.
+
+Direct and queued verification capture one context
+{service_name, service_version, deployment_environment} at acceptance. Queued
+work stores it with the accepted execution; both paths write it unchanged to
+the result and inputs rows. Nothing else reads it.
+
+HTTP/OTLP/gRPC use optional `x-wyrd-deployment-environment` header/metadata;
+typed/MCP invocations use optional `deployment_environment`.
+Configure mismatch/empty input uses `WYRD_CLIENT_400_CONFIG_INVALID`; later
+configure uses `WYRD_SDK_409_STATE_CONFIG_FROZEN`. These remain public typed
+errors with remediation and generated SDK/schema closure.
+
+Telemetry supports two setup paths:
+
+- **Wyrd-managed telemetry.** Configure the loaded state once, then call
+  `state.start_telemetry()` (or its language-native equivalent). Wyrd supplies
+  `service.name`, `service.version` and optional `deployment.environment.name`
+  from the frozen state context to its managed OpenTelemetry setup, and exports
+  with the state's validated workload context and existing authentication.
+- **Application-managed telemetry.** The application owns its OpenTelemetry
+  providers, resources and lifecycle. It supplies `service.name`,
+  `service.version` and optional `deployment.environment.name` on its resources,
+  and sends spans, logs and metrics through standard OTLP exporters to Wyrd's
+  supported endpoints with supported authentication. This path does not require
+  WyrdState, `state.start_telemetry()`, or an exporter accepting a state. Wyrd
+  does not copy private state configuration into an application-owned provider.
+
+Both paths use the same ingest validation and table projection. An application
+may supply the existing workload/subject/Run context where attribution is
+wanted; the server validates UIDs, permissions and graph membership. Resource
+names and versions never establish Card ownership, and owned promoted identity
+columns remain canonical for validated UIDs. When an accepted request supplies
+an environment, retain that value as before; without that context, promote the
+resource environment with the existing typed stable-key-first fallback, including
+on owned telemetry. Preserve raw resource attributes and leave absent environment
+null. Environment remains descriptive and grants no permission.
+
+Automatic startup must not silently reuse a provider bound to another state or
+replace an application-owned provider. Refuse incompatible startup with existing
+`WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`; its remediation is to keep the existing
+application-managed setup and use the second path. Wyrd never replaces or flushes
+that provider. Native state/Run contexts may coexist without multiple ambient
+defaults. No new exporter input, public state client accessor, exporter-specific
+identity setting or provider pipeline is required.
+
+### Stock provider SDK context and approved examples
+
+This is the approved public API shape to implement, not a claim that current
+SDKs already expose it. Reuse existing WyrdClient.http_auth/httpAuth adapters;
+add state.http_auth (Python) and state.httpAuth (TypeScript) bound to the state's
+configured Service and active Run. No public state.client accessor is required.
+The shared Rust state/client context owns identity; Python and TypeScript remain
+thin projections. Existing Rust callers continue through state.client() and the
+existing native transport; no new Rust third-party provider adapter is added.
+
+Obtaining the state-bound adapter freezes explicit/lazy configuration without
+exchanging a credential. Create provider clients once. At dispatch, take the
+state and innermost active Run snapshot before any token-refresh await; use that
+snapshot throughout that dispatched request, including stream settlement and
+transport retries. Two concurrent states/Runs never share mutable default
+headers. Provider SDK attempts made within the active Run use the same context;
+separate HTTP retries may remain separate gateway invocations under existing
+capture semantics. No logical-call deduplication guarantee is added.
+
+| Request header | Automatic state-bound source |
+| --- | --- |
+| `X-Wyrd-Access-Token` | Current bearer from the bound client; remove placeholder Authorization, x-api-key and x-goog-api-key first. |
+| `x-wyrd-workload-uid` | Exact configured Service UID. |
+| `x-wyrd-deployment-environment` | Configured non-null environment; omitted when unknown. |
+| `wyrd-card-uid` | Active Run subject, otherwise the configured Service UID. |
+| `wyrd-run-id` | Active application Run ID, omitted outside a Run. |
+| `traceparent`, `tracestate` | Active W3C context; preserve explicit parent/state according to the existing native transport precedence. |
+
+Identical explicit identity/context headers are accepted. A differing explicitly
+supplied workload, subject or Run conflicts with state-bound
+context and raises WYRD_CLIENT_400_CONFIG_INVALID before network dispatch;
+select the intended Run/state instead. That includes an explicit Run when no
+Run is active. Ordinary
+unrelated request headers remain untouched. This stricter automatic contract
+does not change the existing plain WyrdClient adapter's explicit subject/Run
+behavior. A plain client never discovers or adopts another state's root.
+
+The other supported mode is a Wyrd access token/API key in the provider's own
+api_key/apiKey slot, with explicit default/per-call headers. Its credential
+string does not provide automatic Run discovery or mutate after token renewal.
+It and the state adapter use the same gateway authority and projection path.
+Do not add service_name/version or subject_kind/name/version request headers:
+validated UIDs determine all five readable identity fields. Environment is the
+sixth descriptive field and is transported explicitly.
+
+#### Python application
+
+The installed gateway extra supplies the HTTPX/HTTPX2 adapter; the application
+installs its preferred provider SDKs. The bundle and model routes below must be
+registered/provisioned before runtime. Model strings are illustrative configured
+routes, not new implicit deployments. The code deliberately creates each
+provider client once, before either Run.
+
+```python
+import anthropic
+import openai
+
+from wyrd import WyrdClient
+from wyrd.state import WyrdState
+
+wyrd = WyrdClient()
+state = WyrdState.from_path("./service-a-bundle", client=wyrd)
+state.configure(
+    service_name="service-a",
+    service_version="v1",
+    deployment_environment="production",
+)
+
+openai_client = openai.OpenAI(
+    base_url=f"{wyrd.server_url}/v1",
+    api_key="wyrd",
+    http_client=openai.DefaultHttpxClient(auth=state.http_auth),
+)
+anthropic_client = anthropic.Anthropic(
+    base_url=wyrd.server_url,
+    api_key="wyrd",
+    http_client=anthropic.DefaultHttpxClient(auth=state.http_auth),
+)
+
+state.start_telemetry()
+
+with state.run() as service_run:
+    openai_client.chat.completions.create(
+        model="your-openai-model",
+        messages=[{"role": "user", "content": "Check overall readiness."}],
+    )
+
+with state.run("agent-a") as agent_run:
+    anthropic_client.messages.create(
+        model="your-anthropic-model",
+        max_tokens=256,
+        messages=[{"role": "user", "content": "Handle this customer request."}],
+    )
+```
+
+Omit Service name/version to use bundle defaults, and environment to use
+WYRD_DEPLOYMENT_ENVIRONMENT or null. Python async uses the same state.http_auth
+with OpenAI AsyncOpenAI/DefaultAsyncHttpxClient or Anthropic
+AsyncAnthropic/DefaultAsyncHttpxClient; keep the Run active around awaited work.
+This uses the existing Python Run context manager, not a new run_for_card API.
+
+#### TypeScript application
+
+```typescript
+import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
+import { WyrdClient, WyrdState } from "wyrd-ai";
+
+const wyrd = WyrdClient.connect();
+const state = WyrdState.fromPath("./service-a-bundle", { client: wyrd });
+state.configure({
+  serviceName: "service-a",
+  serviceVersion: "v1",
+  deploymentEnvironment: "production",
+});
+
+const openaiClient = new OpenAI({
+  baseURL: `${wyrd.serverUrl}/v1`,
+  apiKey: "wyrd",
+  fetch: state.httpAuth,
+});
+const anthropicClient = new Anthropic({
+  baseURL: wyrd.serverUrl,
+  apiKey: "wyrd",
+  fetch: state.httpAuth,
+});
+
+// Start telemetry through the existing state.startTelemetry() lifecycle.
+// Its asynchronous lifecycle remains the existing SDK contract.
+await state.startTelemetry();
+
+await state.run().scope(async () => {
+  await openaiClient.chat.completions.create({
+    model: "your-openai-model",
+    messages: [{ role: "user", content: "Check overall readiness." }],
+  });
+});
+
+await state.run("agent-a").scope(async () => {
+  await anthropicClient.messages.create({
+    model: "your-anthropic-model",
+    max_tokens: 256,
+    messages: [{ role: "user", content: "Handle this customer request." }],
+  });
+});
+```
+
+#### Gateway admission and canonical capture
+
+Both examples yield Service A v1 ownership. The first Run's subject is that
+Service; the second is the exact Agent referenced by alias agent-a. The gateway
+consumes authentication, workload, subject, Run and environment headers, validates
+the selected Service and subject before any provider request, resolves canonical
+names/version/kind, and freezes origin on admitted work. A verification-triggered
+call uses its already accepted binding/subject context, not the judging model,
+Verifier or worker. Caller secrets and Wyrd context headers never reach the
+provider; existing W3C propagation remains unchanged.
+
+An Agent request has these context headers, without readable-name headers:
+
+```http
+x-wyrd-workload-uid: <Service-A-v1-UID>
+x-wyrd-deployment-environment: production
+wyrd-card-uid: <Agent-A-UID>
+wyrd-run-id: <agent-run-ID>
+```
+
+Its gateway row has the same shared context as verification and telemetry:
+
+```json
+{
+  "workload_card_uid": "<Service-A-v1-UID>",
+  "service_name": "service-a",
+  "service_version": "v1",
+  "deployment_environment": "production",
+  "subject_card_uid": "<Agent-A-UID>",
+  "subject_kind": "Agent",
+  "subject_name": "agent-a",
+  "subject_version": "2.0",
+  "run_id": "<agent-run-ID>"
+}
+```
+
+Preserve existing duplicate/malformed header and membership refusals and trace
+validation rules. Gateway-side token/API-key cache identity remains credential
+plus workload, not environment/subject/Run. Request context is validated per call,
+never inherited from a cached prior call. Freeze rows before outbox delivery;
+buffered/streaming completion, retries and forwarding cannot relabel them.
+Provider Batch HTTP operations that create GatewayCallRequest also consume the
+same request context instead of subject: None. This concerns each existing HTTP
+operation, not new attribution for provider-owned asynchronous batch item results.
+
+TASK-009 owns public state adapters, their lifecycle/header tests and provider
+SDK invocation journeys. TASK-003 owns gateway admission/capture and full canonical
+row readback. TASK-008 updates the stock-client guide and publishes these examples
+only after implementation and tests. Physical layouts and schemas are unchanged.
+
+### Service application with an account key
 
 1. An administrator creates the stable account/restriction and roles once.
 2. CI registers a release with a separate authorized registration identity and
@@ -692,3 +953,5 @@ supplies the reusable owners, not authority for the new contracts:
 | 10 | draft | Aligns packet revision; any future evidence retry must retain accepted authority. Auth contracts are unchanged. |
 | 11 | draft | Requires evidence retries to preserve the same accepted execution authority; auth grants and claim shapes are unchanged. |
 | 12 | approved | Aligns the packet revision with closed table/trace contracts; accepted authority and all authentication contracts are unchanged. |
+| 14 | approved | Service-only roots/families, immutable state.configure defaults and context propagation; environment survives accepted work without new token descriptors, activity dimensions or schedule fanout. |
+| 15 | approved | Specifies state-bound stock-client adapters, header/override/lifetime contract, both credential modes and approved Python/TypeScript code; gateway resolves readable identity columns from UIDs. |

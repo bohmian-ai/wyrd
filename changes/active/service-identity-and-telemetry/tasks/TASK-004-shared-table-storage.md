@@ -3,12 +3,15 @@ id: TASK-004
 kind: implementation
 spec: SPEC-service-identity-and-telemetry
 spec_revision: 12
-status: proposed
+status: complete
 depends_on: []
 requirements: [REQ-024, REQ-025, REQ-027, REQ-031, REQ-035, REQ-036, REQ-037, REQ-038, REQ-042, REQ-044, REQ-047, REQ-048]
 invariants: [INV-001, INV-002, INV-006, INV-007, INV-008]
 acceptance: [AC-007, AC-008, AC-009, AC-012, AC-013, AC-016, AC-018, AC-021]
 ---
+
+> Historical baseline task. TASK-004 is treated as completed by the maintainer's revision-14 instruction; this does not claim new review or test evidence. Revision-14 authority is the current spec and supplements. Canonical shared context/sort/Bloom defaults are assigned to TASK-003; the completed generic engine is reused. Older composite/configuration-revision prose is historical; the retained single table_version contract governs.
+
 
 # Shared physical table storage
 

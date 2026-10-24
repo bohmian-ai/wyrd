@@ -3,15 +3,22 @@ id: TASK-008
 kind: implementation
 status: proposed
 spec: SPEC-service-identity-and-telemetry
-spec_revision: 12
-depends_on: [TASK-001, TASK-002, TASK-003, TASK-004, TASK-005, TASK-006, TASK-007]
-requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-024, REQ-025, REQ-026, REQ-027, REQ-028, REQ-029, REQ-030, REQ-031, REQ-032, REQ-033, REQ-034, REQ-035, REQ-036, REQ-037, REQ-038, REQ-039, REQ-040, REQ-041, REQ-042, REQ-043, REQ-044, REQ-045, REQ-046, REQ-047, REQ-048]
+spec_revision: 16
+depends_on: [TASK-001, TASK-002, TASK-003, TASK-004, TASK-005, TASK-006, TASK-007, TASK-009]
+requirements: [REQ-054, REQ-055, REQ-056, REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-024, REQ-025, REQ-026, REQ-027, REQ-028, REQ-029, REQ-030, REQ-031, REQ-032, REQ-033, REQ-034, REQ-035, REQ-036, REQ-037, REQ-038, REQ-039, REQ-040, REQ-041, REQ-042, REQ-043, REQ-044, REQ-045, REQ-046, REQ-047, REQ-048]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008]
-acceptance: [AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010, AC-011, AC-012, AC-013, AC-014, AC-015, AC-016, AC-017, AC-018, AC-019, AC-020, AC-021]
+acceptance: [AC-026, AC-025, AC-024, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010, AC-011, AC-012, AC-013, AC-014, AC-015, AC-016, AC-017, AC-018, AC-019, AC-020, AC-021]
 proof: static documentation and existing-example regression
 ---
 
 # Document the shipped identity, evidence, and table contracts
+
+## Revision-16 telemetry guidance
+
+Document both telemetry setup paths: Wyrd-managed state configuration/startup,
+and application-managed standard resources plus authenticated OTLP export. The
+latter requires neither WyrdState nor a new state-taking exporter. Explain that
+UID context is validated separately from descriptive resource labels.
 
 ## Outcome and Value
 
@@ -21,7 +28,7 @@ understand when an execution root is optional, and query evidence by its actual
 workload, subject, and account. References describe the shipped signal schemas
 and editable table layouts rather than preserving old catalog or space forms.
 
-This is the **last implementation task**, after all seven dependencies have
+This is the **last implementation task**, after all runtime dependencies have
 settled their runtime, contracts, SDKs, runnable examples, and owning architecture
 amendments. Finish this task and its documentation proof before integrated
 change review. It does not postpone missing runtime work or architecture
@@ -46,6 +53,29 @@ application logic, generator, migration, compatibility alias or performance
 promise belongs here. Do not execute a destructive reset or hide required
 coverage behind `draft: true`. Missing behavior, architecture amendments or
 example tests return to their owning dependency.
+
+## Revision-15 documentation closure
+
+Document only Services as workloads, immutable state.configure name/version
+bundle defaults and WYRD_DEPLOYMENT_ENVIRONMENT precedence, root versus Agent
+Run selection and exact binding occurrence, all nine shared-context tables,
+subject kind/name/version grouping, direct Service/version/environment SQL,
+raw OTel preservation and unowned records. Explain the common four-key sort,
+five attribution Blooms plus signal lookup keys (ten on results), time-only
+partitions, replaceable tenant defaults, verification context pass-through
+and readback, no automatic schedule fanout, and no workload_kind. Executable
+examples follow completed TASK-009 and TASK-003; no invented API placeholders.
+
+## Stock-provider client example closure
+
+Publish the [approved Python/TypeScript provider-client examples](../supplements/auth-system.md#stock-provider-sdk-context-and-approved-examples)
+in the existing connect/call-wyrd-from-a-stock-client.md guide after TASK-009 and
+TASK-003 prove them. Include state.http_auth/httpAuth and configure, clients
+constructed once, Service versus Agent Run use, async variants and the separate
+explicit-header credential-slot mode. Explain automatic headers versus server-
+resolved readable columns and preserve existing plain client adapter guidance.
+Use tested fixture/model routes in runnable examples; do not teach placeholders
+as implicit deployments or copy undocumented state.client accessors.
 
 ## Approach
 
@@ -86,13 +116,16 @@ the dependencies.
 
 | Obligations | Observable documentation and proof |
 | --- | --- |
+| AC-026; REQ-050–053 | Tested telemetry guidance describes both setup paths, resource environment fallback and separate validated UID attribution; no private configured-client or new exporter API is presented as required. |
 | REQ-001–017, 033; INV-001–007; AC-001–005, 011 | Account/auth guides and references agree with shipped creation, restriction, credential and grant contracts. A reader distinguishes optional execution identity from permissions, knows restricted missing/false context is refused, and sees no registration-created principal or implicit scheduled authority. Check against auth supplement and dependency journey evidence. |
 | REQ-018–020, 029, 032; AC-006, 010 | Declaration, selectors, config and embedded output use flat references on every documented surface. Search and inspect changed pages, examples and generated text for space and substitute namespaces; no obsolete identity syntax survives. |
 | REQ-021–024, 028, 034, 042; INV-008; AC-007, 012 | Signal references match complete shipped schemas, nested types and production rules. Seven managed fields are distinguished from promoted resources; forged managed/derived values are described as refused. Compare to live/schema-owner evidence without inventing a second stored schema. |
 | REQ-025–026, 035–039, 044, 047–048; AC-008, 013–014, 016, 018, 021 | All nine system defaults and dynamic-table rules are accessible. Configuration reference states exact permissions, transform/type limits, revisioned atomic edits, clearing Blooms, and evolution guarantees. Query examples separate ownership, subjects, resource filtering and account identity. Compare against resolved table descriptions and approved storage ledger. |
 | REQ-014–017, 040, 043, 045–046; AC-005, 014, 017, 019–020 | Verification pages explain full authorized visible trace evidence, attempt-local reuse, direct/queued differences, bounded availability retry and late-arrival limits. Result ownership remains distinct from source-span attribution; no retry-until-pass or unsupported latency/completeness claim appears. |
 | REQ-027–032, 039; AC-009–010, 014 | Setup/reset instructions explicitly describe the fresh baseline and loss from optional recreation. Public examples, table permissions and SQL use `bifrost.*`; no old catalog aliases, token aliases or conversion path are taught. No reset is executed. |
-| REQ-041; AC-015; all remaining cross-surface closure | This task follows TASK-001–007 and precedes integrated review. Generated references, navigation and machine text agree with pages; documentation checks and affected example proof pass. A local generated-drift limitation is recorded for resolution on the integrated candidate; it does not waive the gate. No required page is withheld merely to obtain a green build. |
+| REQ-054–056; AC-025 | Stock-client guide matches the approved code example and actual Python/TS SDK journeys/readback; manually supplied Run headers cannot stand in for automatic state-bound behavior. No provider wrapper or unreadable credential handoff is introduced. |
+| REQ-049–053; AC-024 | Configure/source defaults, Service-only roots and subject distinctions, unchanged environment tag readback and all shared schema/layout dimensions agree with shipped Task009/003 evidence; examples never relabel worker context as workload. |
+| REQ-041; AC-015; all remaining cross-surface closure | This task follows TASK-001–007 and TASK-009 and precedes integrated review. Generated references, navigation and machine text agree with pages; documentation checks and affected example proof pass. A local generated-drift limitation is recorded for resolution on the integrated candidate; it does not waive the gate. No required page is withheld merely to obtain a green build. |
 
 ## Implementation Reference
 
@@ -158,7 +191,7 @@ a broad gate repeated here.
 
 ## Authority Links
 
-- [Approved revision 12](../spec.md), including the separate final-docsite requirement.
+- [Approved revision 16](../spec.md), including the separate final-docsite requirement.
 - [Authentication contracts](../supplements/auth-system.md).
 - [Complete telemetry schemas](../supplements/telemetry-schemas.md).
 - [Storage, correlation, alteration and trace decisions](../supplements/table-storage-and-correlation.md).

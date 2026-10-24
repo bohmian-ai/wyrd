@@ -2,7 +2,7 @@
 id: TASK-005
 kind: implementation
 spec: SPEC-service-identity-and-telemetry
-spec_revision: 13
+spec_revision: 16
 status: proposed
 depends_on: [TASK-004, TASK-004-R2]
 requirements: [REQ-025, REQ-027, REQ-031, REQ-032, REQ-035, REQ-036, REQ-038, REQ-042, REQ-044, REQ-047, REQ-048]
@@ -235,7 +235,7 @@ Run code generation from its source owner when needed before drift checks; never
 
 ## Authority Links
 
-- [Approved specification revision 13](../spec.md), and the complete approved
+- [Approved specification revision 16](../spec.md), and the complete approved
   [table supplement](../supplements/table-storage-and-correlation.md).
 - [Bifrost authority](../../../../architecture/bifrost-design.md#table-and-row-identity),
   [declared types](../../../../architecture/bifrost-design.md#declared-types-and-the-registered-schema), and [public surface](../../../../architecture/bifrost-design.md#public-surface). Approved conflicting table/evolution/default contracts are amended in these owners, rather than preserved as alternate rules.

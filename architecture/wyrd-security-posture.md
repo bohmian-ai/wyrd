@@ -35,7 +35,7 @@ controls required to operate those boundaries.
 | Client or agent to gateway | TLS, verified Wyrd token, typed permission, request bounds |
 | Gateway to `wyrd-server` | Authenticated transport; original credentials preserved; gateway metadata is never tenant authority |
 | `wyrd-server` replica to replica | Mutual TLS from one dedicated cluster CA with the fixed `wyrd-peer` identity; the receiver checks every operation's context against its own state |
-| Application to Postgres | Tenant traffic always runs under RLS through `TenantConn`; the operator pool is excluded from handlers by construction. Operators supply the logins; boot refuses superuser and `BYPASSRLS` logins. Production uses a separate tenant login that does not own Wyrd's objects, so RLS confines it even if compromised. One ordinary login (local and small self-hosted) keeps RLS per pool, but a process compromise could set the operator flag and reach every tenant |
+| Application to Postgres | Tenant traffic runs under RLS through `TenantConn` or the named single-statement owners; the operator pool is excluded from handlers by construction. Operators supply the logins; boot refuses superuser and `BYPASSRLS` logins. Production uses a separate tenant login that does not own Wyrd's objects, so RLS confines it even if compromised. One ordinary login (local and small self-hosted) keeps RLS per pool, but a process compromise could set the operator flag and reach every tenant |
 | Application to object storage | Workload identity or short-lived credentials; tenant-qualified prefixes; encryption in transit and at rest |
 | Server to a Source endpoint | Credential indirection, DNS resolution and SSRF screening, address pinning, bounded IO |
 
@@ -93,7 +93,7 @@ principal, role grant, or credential. `POST /v1/principals` creates a Service
 account atomically with its roles, optional `workload_restriction`, and first
 credential, returned once; failure creates nothing. A restriction is
 `{"mode":"unrestricted"}` (the default) or
-`{"mode":"family","kind":"Service"|"Agent","name":...}`. A family restriction
+`{"mode":"family","kind":"Service","name":...}`. A family restriction
 limits Card-attributed emission and verification to that family's roots and
 makes the account the family's unique scheduled runtime account; a second live
 account for the family conflicts with `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT`.
@@ -108,8 +108,10 @@ tenant; ingest resolves those references against the tenant registry, never
 across tenants. A rootless family-restricted Service is `root_required`: its
 generic authorized operations work, and Card-sensitive work is refused with
 `workload_context_required` even under wildcard grants. A selected root is
-resolved under the account's restriction; an unknown and a foreign root are
-refused identically. Roles are assigned to principals, not Cards. A tenant
+required to be a Service and resolved under the account's restriction; an unknown and a foreign root are
+refused identically. Agent Cards remain valid graph subjects, never workload roots or account families.
+Configured Service/version/environment is retained as correlation on inputs/results;
+environment and derived identity labels grant no authority. Roles are assigned to principals, not Cards. A tenant
 administrator (`*`, not `service_accounts:write`) grants and revokes direct
 roles with `PUT` and `DELETE /v1/principals/{id}/roles/{role}`
 (`wyrd principal role grant|revoke`); each decision is staged on the Scribe
@@ -676,8 +678,9 @@ is not an SSRF control.
 
 ## Tenant and data isolation
 
-- Tenant Postgres operations use `TenantConn` and transaction-local RLS state.
-  A tenant caller cannot select or widen that state.
+- Tenant Postgres operations use `TenantConn` and transaction-local RLS state,
+  except the exact single-statement owners documented below. Both paths derive
+  tenant context from verified authority; a caller cannot select or widen it.
 - `OperatorPool` is restricted to named platform operations whose owner checks
   tenant equality, lease generation, and fence before mutation. It is not a
   generic query escape hatch.
@@ -741,6 +744,17 @@ from the typed `DataTenantId`, whose UUID rendering cannot contain a quote.
 Elsewhere tenant identity is parameter-bound. A missing binding fails
 (`wyrd.current_tenant()` is strict) rather than returning an empty or
 cross-tenant result; dropping the wrapper rolls back and clears the binding.
+
+Three existing hot-path owners avoid separate transaction round trips:
+`OracleTableCuts`, `GatewayAdmissions` and `VerificationTargets`, enumerated by
+`STATEMENT_TENANT_OWNERS` in `scripts/check_tenant_isolation.py`. Each executes
+one request-role SQL statement whose function binds the verified tenant as
+transaction-local RLS state within the statement's implicit transaction. RLS and
+caller privileges still apply; an existing transaction bound to another tenant
+must be refused, never rebound. On a matching transaction, the caller retains
+commit/rollback ownership. The exception is confined to those owner methods,
+not arbitrary raw connections, extra statements or new bypasses. Other tenant
+work continues through TenantConn.
 
 Postgres enforces only tenant isolation and table-local invariants that hold
 for every login. Wyrd's RBAC is the single permission model: migrations add no

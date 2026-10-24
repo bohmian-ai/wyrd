@@ -161,8 +161,8 @@ services.
     `Source`. `Verifier` and control-plane kinds (`Policy`,
     `Audit`, `Operator`, `Trigger`) may be referenced for governance or
     verification but never enter the emit scope. A Service root therefore
-    includes declared `Service.components`; an Agent root includes its declared
-    card refs. Every token mint — including the re-exchange a machine performs
+    includes declared `Service.components` and their reachable observation targets.
+    Workload roots are Services only; Agents remain component subjects. Every token mint — including the re-exchange a machine performs
     when its access token expires — resolves the selected root's bounded graph
     to Card UIDs and signs that set. A rootless User, tenant administrator, or
     unrestricted Service is `any_registered`: it may attribute to any declared
@@ -679,7 +679,7 @@ account identity.
 
 A Service account carries one `workload_restriction`, a closed union:
 `{"mode":"unrestricted"}` (the default) or
-`{"mode":"family","kind":"Service"|"Agent","name":<card name>}`. A family
+`{"mode":"family","kind":"Service","name":<card name>}`. A family
 restriction limits Card-attributed emission and verification to roots of that
 family, and makes the account that family's unique scheduled runtime account
 in the tenant; a second live account for the same family conflicts. Setting a
@@ -695,6 +695,98 @@ registry or table operations.
 | Rotate credentials | `POST`/`GET`/`DELETE /v1/principals/{principal_id}/credentials[/{credential_id}]` | Issue, verify, deploy, then revoke the old key; overlap is allowed and releases never require rotation. |
 | Register a release | `wyrd declare service.yaml` | Writes Card versions; no principal and no secret. |
 
+#### Configured Service context
+
+A WyrdState application loads a Service-rooted bundle. Workloads and account
+family restrictions accept Service only; Agent Cards remain independently
+registered components and verification subjects. There is no workload_kind.
+The Service account authorizes a family; the bundle supplies an exact release.
+
+Before its first Run/client/writer/telemetry use, state.configure accepts optional
+service_name, service_version and deployment_environment. Omitted name/version
+come from the loaded Service; explicit values must match it. Environment uses
+explicit nonempty input, then nonempty WYRD_DEPLOYMENT_ENVIRONMENT, then null;
+explicit empty input is invalid. First successful configure or implicit use
+freezes the context, and every later configure conflicts, even after shutdown.
+Loading/configuring remains offline and states do not mutate shared clients or
+global telemetry resources. Startup injects the same context on all three
+telemetry signals and native observations, including records outside a Run.
+
+Root Runs select the Service subject; component Runs select the exact component
+and binding occurrence without changing Service/version/environment. The server
+resolves each validated subject UID to canonical kind/name/version and the root
+UID to Service name/version. Gateway calls, direct/queued verification and
+trusted delivery retain that accepted context independently of worker, Verifier
+or model identity. Raw OTel labels are retained; owned promoted columns match
+the registered Service. Environment is descriptive context, not permission.
+
+Direct and queued verification capture one context
+{service_name, service_version, deployment_environment} at acceptance. Queued
+work stores it with the accepted execution; both paths write it unchanged to
+the result and inputs rows. Nothing else reads it.
+
+#### Telemetry setup ownership
+
+Telemetry supports two setup paths:
+
+- **Wyrd-managed telemetry.** Configure the loaded state once, then call
+  `state.start_telemetry()` (or its language-native equivalent). Wyrd supplies
+  `service.name`, `service.version` and optional `deployment.environment.name`
+  from the frozen state context to its managed OpenTelemetry setup, and exports
+  with the state's validated workload context and existing authentication.
+- **Application-managed telemetry.** The application owns its OpenTelemetry
+  providers, resources and lifecycle. It supplies `service.name`,
+  `service.version` and optional `deployment.environment.name` on its resources,
+  and sends spans, logs and metrics through standard OTLP exporters to Wyrd's
+  supported endpoints with supported authentication. This path does not require
+  WyrdState, `state.start_telemetry()`, or an exporter accepting a state. Wyrd
+  does not copy private state configuration into an application-owned provider.
+
+Both paths use the same ingest validation and table projection. An application
+may supply the existing workload/subject/Run context where attribution is
+wanted; the server validates UIDs, permissions and graph membership. Resource
+names and versions never establish Card ownership, and owned promoted identity
+columns remain canonical for validated UIDs. When an accepted request supplies
+an environment, retain that value as before; without that context, promote the
+resource environment with the existing typed stable-key-first fallback, including
+on owned telemetry. Preserve raw resource attributes and leave absent environment
+null. Environment remains descriptive and grants no permission.
+
+Automatic startup must not silently reuse a provider bound to another state or
+replace an application-owned provider. Refuse incompatible startup with existing
+`WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`; its remediation is to keep the existing
+application-managed setup and use the second path. Wyrd never replaces or flushes
+that provider. Native state/Run contexts may coexist without multiple ambient
+defaults. No new exporter input, public state client accessor, exporter-specific
+identity setting or provider pipeline is required.
+
+#### Stock provider SDK context
+
+Python state.http_auth and TypeScript state.httpAuth expose the existing HTTPX/
+HTTPX2 and fetch authentication adapters bound to a configured WyrdState. These
+are distinct from the existing plain WyrdClient adapters; no new public state
+client accessor is needed. Provider clients are constructed once and obtain the
+current state/Run snapshot before asynchronous credential refresh. Configured
+Service/environment stay fixed; subject/Run come from the active Run, defaulting
+to the Service subject outside one. Service/subject/Run context conflicts fail locally
+before sending; explicit W3C context retains existing precedence.
+
+The adapters replace placeholder vendor credentials with one current Wyrd bearer
+and send x-wyrd-workload-uid, optional x-wyrd-deployment-environment,
+wyrd-card-uid, optional wyrd-run-id and trace context. They never mutate a shared
+provider client's defaults. Raw token/API-key credential-slot mode with explicit
+headers remains supported. Both modes reach the same gateway admission:
+validate UID membership before dispatch, derive Service/subject descriptors,
+and freeze original context through attempts, streaming and outbox delivery.
+Do not trust readable-name headers or cached previous-call context. Wyrd
+credentials/context stay at the gateway; existing provider/W3C rules remain.
+Provider Batch HTTP operations preserve request origin without new per-item
+asynchronous attribution or deduplication machinery.
+
+The normative examples and header contract are in
+changes/active/service-identity-and-telemetry/supplements/auth-system.md,
+Stock provider SDK context and approved examples. Physical defaults are unchanged.
+
 #### API key → JWT flow
 
 Deploy-time secret injection (Vault Agent, External Secrets Operator, AWS
@@ -707,7 +799,7 @@ Renewal authority is a human concern: only a tenant human login returns a
 refresh token (a platform login is access-only), and only the public CLI client's refresh token rotates. `/auth/token`
 derives `tenant_id` and `principal_id` from the verified API-key record;
 no client-supplied tenant header is accepted. The exchange takes an optional
-`workload_uid` naming the exact Service or Agent root the account runs as; it
+`workload_uid` naming the exact Service root the account runs as; it
 selects context only and never changes the account, permissions, or tenant.
 The JWT carries the account as the top-level `principal` claim
 (`{id, kind, tenant_id}`, no Card), the `permissions` resolved from its current
@@ -750,7 +842,8 @@ Env vars in deployed services:
 | Env var | Required? | Source | Used for |
 |---|---|---|---|
 | `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (a credential of the stable Service account) | Exchanged at `POST /auth/token` for a short-lived JWT and re-exchanged by the SDK when that token expires or is refused; no refresh token is issued. The JWT names the account, never a Card. |
-| `WYRD_WORKLOAD_UID` | OPTIONAL | Deployment config or the loaded WyrdState bundle | Exact Service or Agent root the client runs as, sent as the exchange's `workload_uid` and the `x-wyrd-workload-uid` request header. Selects context only. |
+| `WYRD_WORKLOAD_UID` | OPTIONAL | Deployment config or the loaded WyrdState bundle | Exact Service root the client runs as, sent as the exchange's `workload_uid` and the `x-wyrd-workload-uid` request header. Selects context only. |
+| `WYRD_DEPLOYMENT_ENVIRONMENT` | OPTIONAL | Deployment configuration | Default configured workload environment; explicit configure wins, absence remains null. Never authority. |
 | `WYRD_SERVER_URL` | REQUIRED | Static config | Wyrd server HTTP base URL (default `http://localhost:8080`). Read by `ClientConfig::from_env`. |
 | `WYRD_GRPC_URL` | OPTIONAL | Static config | Wyrd server gRPC endpoint (default `http://localhost:50051`). Read by `ClientConfig::from_env`. |
 
@@ -831,7 +924,7 @@ principal. `/mcp`, `/v1` management, and Bifrost do not gain it. The JWT
 `X-Wyrd-Access-Token: Bearer <jwt>` header. The JWT must be a **delegated**
 Wyrd token: its top-level `principal` identifies the subject being acted
 for, and its `act` chain identifies the actor(s) acting for it, the
-outermost being the calling Service or Agent. Its `permissions` are the
+outermost being the calling Service. Its `permissions` are the
 exact intersection of the actor's and the subject's; `act` is attribution only.
 An exchange whose complete intersection cannot be represented by the existing
 token scopes is refused before signing, without silent attenuation or new

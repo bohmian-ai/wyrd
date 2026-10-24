@@ -23,8 +23,13 @@ use wyrd_spec::error::WyrdError;
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
-    /// Env filter directive.
+    /// Log output filter directive.
     pub filter: String,
+    /// Operator trace verbosity: the filter directive selecting which spans
+    /// and events reach the operator's trace backend. It never removes a
+    /// tenant copy.
+    #[serde(default = "default_trace_filter")]
+    pub trace_filter: String,
     /// Optional OTLP endpoint URL.
     pub endpoint: Option<String>,
     /// Logical service name reported by exporters.
@@ -41,6 +46,7 @@ impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             filter: "info".to_string(),
+            trace_filter: default_trace_filter(),
             endpoint: None,
             service_name: None,
             protocol: OtlpProtocol::Grpc,
@@ -48,6 +54,11 @@ impl Default for TelemetryConfig {
             export_timeout_ms: None,
         }
     }
+}
+
+/// Default operator trace verbosity.
+fn default_trace_filter() -> String {
+    "info".to_owned()
 }
 
 /// OTLP exporter protocol selection.
@@ -345,21 +356,25 @@ pub fn record_timing(
     }
 }
 
-/// Resolve the effective tracing filter from multiple sources in priority order.
+/// Resolve the effective log filter from multiple sources in priority order.
 ///
 /// Priority: `WYRD_LOG` env var → `RUST_LOG` env var → `config.filter` field → `"info"`.
 pub fn resolve_filter(config: &TelemetryConfig) -> EnvFilter {
-    if let Ok(val) = std::env::var("WYRD_LOG")
-        && !val.is_empty()
-    {
-        return EnvFilter::new(val);
-    }
-    if let Ok(val) = std::env::var("RUST_LOG")
-        && !val.is_empty()
-    {
-        return EnvFilter::new(val);
-    }
-    EnvFilter::new(&config.filter)
+    env_filter(&["WYRD_LOG", "RUST_LOG"], &config.filter)
+}
+
+/// Resolve the operator trace filter: the `WYRD_TRACE_FILTER` env var, else
+/// `config.trace_filter`.
+fn resolve_trace_filter(config: &TelemetryConfig) -> EnvFilter {
+    env_filter(&["WYRD_TRACE_FILTER"], &config.trace_filter)
+}
+
+/// The filter named by the first non-empty variable of `vars`, else
+/// `fallback`.
+fn env_filter(vars: &[&str], fallback: &str) -> EnvFilter {
+    vars.iter()
+        .find_map(|var| std::env::var(var).ok().filter(|value| !value.is_empty()))
+        .map_or_else(|| EnvFilter::new(fallback), EnvFilter::new)
 }
 
 /// Initialize a tracing subscriber without setting it as the global default.
@@ -376,11 +391,13 @@ pub fn init_test_only_no_global(config: TelemetryConfig) -> TelemetryGuard {
 
 /// Initialize a tracing subscriber for server processes.
 ///
-/// Installs one global subscriber: the configured filter, formatted log
-/// output, and an OpenTelemetry layer over the process tracer provider. The
-/// provider is always built, so tenant span export works with or without an
-/// operator destination. When `config.endpoint` is set, the spans the server
-/// sampler samples are also batched to that OTLP endpoint.
+/// Installs one global subscriber: formatted log output filtered by
+/// [`resolve_filter`], and an OpenTelemetry layer over the process tracer
+/// provider filtered by the operator trace filter (`WYRD_TRACE_FILTER`, else
+/// `config.trace_filter`) plus the tenant catalog. The provider is always
+/// built, so tenant span export works with or without an operator
+/// destination. When `config.endpoint` is set, the spans the server sampler
+/// samples are also batched to that OTLP endpoint.
 ///
 /// # Errors
 /// Returns an error if another Rustls provider already owns the process, a
@@ -388,7 +405,7 @@ pub fn init_test_only_no_global(config: TelemetryConfig) -> TelemetryGuard {
 /// build.
 pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
     use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     let operator = config
         .endpoint
@@ -405,15 +422,17 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
         telemetry_resource(&config),
         operator,
     );
-    tracing_subscriber::registry()
-        .with(resolve_filter(&config))
-        .with(tracing_subscriber::fmt::layer())
-        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("wyrd")))
-        .try_init()
-        .map_err(|_| WyrdError::Conflict {
-            message: "global tracing subscriber already set".to_string(),
-            details: serde_json::json!({ "component": "telemetry" }),
-        })?;
+    subscriber(
+        resolve_filter(&config),
+        resolve_trace_filter(&config),
+        provider.tracer("wyrd"),
+        false,
+    )
+    .try_init()
+    .map_err(|_| WyrdError::Conflict {
+        message: "global tracing subscriber already set".to_string(),
+        details: serde_json::json!({ "component": "telemetry" }),
+    })?;
     Ok(TelemetryGuard {
         config,
         tracer_provider: Some(provider),
@@ -423,14 +442,15 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
 /// Install a production-shaped OpenTelemetry provider with in-memory export.
 ///
 /// This initializer uses the same resource, sampler, SDK provider, tenant
-/// export, OTel layer, filter, formatter, and global subscriber path as
-/// [`init`]. The operator's exporter destination differs, allowing journeys to inspect completed spans without a
-/// second telemetry implementation, and every captured span also carries its
-/// `tracing` level as the `level` attribute.
+/// export, subscriber composition, and global subscriber path as [`init`].
+/// The operator's exporter destination differs, allowing journeys to inspect
+/// completed spans without a second telemetry implementation, and every
+/// captured span also carries its `tracing` level as the `level` attribute.
 ///
-/// Capture is unfiltered: every span and event the code emits reaches the
-/// exporter, so what a test can assert on never depends on `WYRD_LOG`. Only
-/// the formatted log output is filtered, by [`resolve_filter`].
+/// The operator trace filter is fixed at `trace`, so capture is unfiltered:
+/// every span and event the code emits reaches the exporter, and what a test
+/// can assert on never depends on `WYRD_LOG` or `WYRD_TRACE_FILTER`. Only the
+/// formatted log output is filtered, by [`resolve_filter`].
 ///
 /// # Errors
 ///
@@ -440,7 +460,7 @@ pub fn init_test_capture(
     config: TelemetryConfig,
 ) -> Result<(TelemetryGuard, TestTraceCapture), WyrdError> {
     use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::{Layer as _, layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     let capture = TestTraceCapture::default();
     let exporter = CaptureExporter {
@@ -453,19 +473,17 @@ pub fn init_test_capture(
             opentelemetry_sdk::trace::SimpleSpanProcessor::new(exporter),
         )),
     );
-    let tracer = provider.tracer("wyrd");
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(resolve_filter(&config)))
-        .with(
-            tracing_opentelemetry::layer()
-                .with_tracer(tracer)
-                .with_level(true),
-        )
-        .try_init()
-        .map_err(|_| WyrdError::Conflict {
-            message: "global tracing subscriber already set".to_owned(),
-            details: serde_json::json!({ "component": "telemetry" }),
-        })?;
+    subscriber(
+        resolve_filter(&config),
+        EnvFilter::new("trace"),
+        provider.tracer("wyrd"),
+        true,
+    )
+    .try_init()
+    .map_err(|_| WyrdError::Conflict {
+        message: "global tracing subscriber already set".to_owned(),
+        details: serde_json::json!({ "component": "telemetry" }),
+    })?;
     Ok((
         TelemetryGuard {
             config,
@@ -473,6 +491,39 @@ pub fn init_test_capture(
         },
         capture,
     ))
+}
+
+/// Compose the process subscriber shared by [`init`] and the test capture.
+///
+/// Each destination has its own filter. Formatted log output passes `logs`.
+/// The OpenTelemetry layer over `tracer` passes `traces`, the operator's
+/// diagnostic verbosity, and, whatever either filter says, every span and
+/// event the tenant copy needs: catalog spans and events at `INFO` or above,
+/// the verbosity the tenant catalog is defined at. Neither filter can
+/// therefore remove a tenant copy. With `level` set, each exported span also
+/// carries its `tracing` level.
+fn subscriber(
+    logs: EnvFilter,
+    traces: EnvFilter,
+    tracer: opentelemetry_sdk::trace::Tracer,
+    level: bool,
+) -> impl tracing::Subscriber + Send + Sync {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::filter::{FilterExt as _, filter_fn};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let tenant = filter_fn(|metadata| {
+        *metadata.level() <= tracing::Level::INFO
+            && (metadata.is_event() || export::in_catalog(metadata.name()))
+    });
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(logs))
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_level(level)
+                .with_filter(traces.or(tenant)),
+        )
 }
 
 /// Build the process resource shared by production and test exporters.
@@ -538,6 +589,120 @@ fn build_otlp_exporter(
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
+    use tracing_subscriber::EnvFilter;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::{Attribution, PrincipalId};
+    use wyrd_spec::trace::TraceContext;
+
+    use crate::{TenantSpanRoute, TenantSpanSink};
+
+    /// Span names of every tenant copy staged, in end order.
+    #[derive(Default)]
+    struct Staged(Mutex<Vec<String>>);
+
+    impl TenantSpanSink for Staged {
+        /// Record the staged copy's span names.
+        fn stage(&self, _route: TenantSpanRoute, span: ResourceSpans) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(
+                    span.scope_spans
+                        .iter()
+                        .flat_map(|scope| &scope.spans)
+                        .map(|span| span.name.clone()),
+                );
+        }
+    }
+
+    /// Serve one sampled client's request under the production subscriber
+    /// composed with log filter `logs` and operator filter `traces`, and
+    /// return the tenant copies and the operator's spans by name.
+    ///
+    /// The request runs a catalog child, a debug diagnostic span, and an
+    /// info event; the operator samples nothing, as at ratio zero.
+    fn serve(logs: &str, traces: &str, ratio: f64) -> (Vec<String>, Vec<String>) {
+        let operator = super::CaptureExporter {
+            spans: Arc::default(),
+        };
+        let exported = Arc::clone(&operator.spans);
+        let provider = super::export::tracer_provider(
+            opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(ratio),
+            opentelemetry_sdk::Resource::builder_empty().build(),
+            Some(super::export::OperatorExport(
+                opentelemetry_sdk::trace::SimpleSpanProcessor::new(operator),
+            )),
+        );
+        let staged = Arc::new(Staged::default());
+        let sink: Arc<dyn TenantSpanSink> = Arc::clone(&staged) as _;
+        let caller = TraceContext::parse_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            String::new(),
+        )
+        .expect("a valid traceparent");
+        let subscriber = super::subscriber(
+            EnvFilter::new(logs),
+            EnvFilter::new(traces),
+            provider.tracer("wyrd"),
+            false,
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let request = tracing::info_span!("request");
+            crate::serve_request(&request, Some(&caller), Some(&sink));
+            request.in_scope(|| {
+                crate::bind_tenant_route(TenantSpanRoute {
+                    tenant: DataTenantId::new_v7(),
+                    attribution: Attribution::direct(
+                        "01900000-0000-7000-8000-000000000007"
+                            .parse::<PrincipalId>()
+                            .expect("a principal id"),
+                    ),
+                });
+                tracing::info_span!("verification.run").in_scope(|| {
+                    tracing::debug_span!("verification.detail").in_scope(|| {});
+                    tracing::info!("verification step");
+                });
+            });
+        });
+        let operator = exported
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|span| span.name.to_string())
+            .collect();
+        let tenant = std::mem::take(&mut *staged.0.lock().unwrap_or_else(PoisonError::into_inner));
+        (tenant, operator)
+    }
+
+    /// Log verbosity and operator trace verbosity leave the tenant copy of
+    /// a sampled client's request unchanged; only the operator's diagnostic
+    /// spans follow the operator filter.
+    #[test]
+    fn production_filters_preserve_tenant_traces() {
+        let (tenant, operator) = serve("info", "info", 0.0);
+        assert_eq!(tenant, ["verification.run", "request"]);
+        assert!(
+            operator.is_empty(),
+            "ratio zero exports nothing: {operator:?}"
+        );
+        for (logs, traces) in [("off", "info"), ("error", "error"), ("info", "off")] {
+            assert_eq!(
+                serve(logs, traces, 0.0).0,
+                tenant,
+                "logs {logs:?}, traces {traces:?}"
+            );
+        }
+        assert_eq!(serve("off", "info", 1.0).1, ["verification.run", "request"]);
+        assert_eq!(
+            serve("off", "debug", 1.0).1,
+            ["verification.detail", "verification.run", "request"]
+        );
+    }
+
     /// The upgraded SDK pipeline exports completed spans with preserved attributes.
     #[test]
     fn capture_pipeline_preserves_span_semantics() {

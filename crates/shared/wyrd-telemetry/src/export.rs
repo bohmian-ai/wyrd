@@ -502,7 +502,7 @@ impl SpanProcessor for TenantExport {
 /// captures attempts as their own rows, so nothing below an attempt is
 /// copied either), `bifrost.gate.*`,
 /// `bifrost.oracle.query`, and the OTLP ingest spans.
-fn in_catalog(name: &str) -> bool {
+pub(crate) fn in_catalog(name: &str) -> bool {
     matches!(
         name,
         "request"

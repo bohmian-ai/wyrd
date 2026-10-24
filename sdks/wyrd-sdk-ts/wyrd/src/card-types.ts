@@ -1274,6 +1274,9 @@ export interface DataStats {
  * Arrow-free logical column type. The exhaustive set Bifrost accepts on the
  * register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the
  * server/engine, never in `wyrd-spec`.
+ *
+ * A parameterized variant refuses unknown members, so a misspelled
+ * parameter fails decoding instead of being dropped.
  */
 export type DataTypeSpec = "Bool" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Float32" | "Float64" | "Utf8" | "LargeUtf8" | "Binary" | "LargeBinary" | DataTypeSpecFixedSizeBinary | "Date32" | "Date64" | DataTypeSpecTimestamp | DataTypeSpecTime32 | DataTypeSpecTime64 | DataTypeSpecDecimal128 | DataTypeSpecList | DataTypeSpecStruct | DataTypeSpecMap | "Variant";
 
@@ -1390,8 +1393,10 @@ export interface DataTypeSpecTimestamp {
 export interface DataTypeSpecTimestampTimestamp {
   /**
    * IANA timezone string, or `None` for timezone-naive.
+   *
+   * Omitted when `None`; an explicit `null` is refused.
    */
-  readonly tz: string | null;
+  readonly tz?: string;
   /**
    * Precision.
    */
@@ -1853,6 +1858,9 @@ export interface FieldSpec {
 /**
  * Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
  * but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
+ *
+ * Unknown members are refused, so a misspelled key fails decoding instead of
+ * being dropped.
  */
 export interface FieldSpec2 {
   /**
@@ -3614,6 +3622,8 @@ export interface ParquetMeta {
  * `buckets` is required for and only accepted on a `bucket` transform (2
  * through 1024); `width` is required for and only accepted on a `truncate`
  * transform (a positive integer counting Unicode code points for strings).
+ * Each parameter is either omitted or carries a value; an explicit `null` is
+ * refused.
  */
 export interface PartitionFieldWire {
   /**
@@ -3708,6 +3718,7 @@ export interface PhysicalLayoutWire {
    *
    * Omitted on a request, the time column is `wyrd_ingested_at`. The
    * canonical form in a description and the control row always names it.
+   * An explicit `null` is refused.
    */
   readonly time_column?: string;
 }
@@ -5371,7 +5382,7 @@ export type SlotName = string;
 export type SortDirectionWire = "asc" | "desc";
 
 /**
- * One declared physical sort key.
+ * One declared physical sort key; unknown members are refused.
  */
 export interface SortKeyWire {
   /**

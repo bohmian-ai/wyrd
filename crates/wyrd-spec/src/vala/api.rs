@@ -197,8 +197,12 @@ pub enum TimeUnit {
 /// Arrow-free logical column type. The exhaustive set Bifrost accepts on the
 /// register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the
 /// server/engine, never in `wyrd-spec`.
+///
+/// A parameterized variant refuses unknown members, so a misspelled
+/// parameter fails decoding instead of being dropped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub enum DataTypeSpec {
     /// Boolean.
     Bool,
@@ -244,7 +248,14 @@ pub enum DataTypeSpec {
         /// Precision.
         unit: TimeUnit,
         /// IANA timezone string, or `None` for timezone-naive.
-        #[serde(default)]
+        ///
+        /// Omitted when `None`; an explicit `null` is refused.
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
         tz: Option<String>,
     },
     /// Time-of-day at second/millisecond precision.
@@ -317,8 +328,12 @@ pub const VARIANT_MAX_ENCODED_BYTES: u64 = 8_388_608;
 
 /// Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
 /// but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
+///
+/// Unknown members are refused, so a misspelled key fails decoding instead of
+/// being dropped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct FieldSpec {
     /// Column name.
     pub name: String,
@@ -386,9 +401,10 @@ pub enum NullOrderWire {
     Last,
 }
 
-/// One declared physical sort key.
+/// One declared physical sort key; unknown members are refused.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct SortKeyWire {
     /// Sorted column; must exist in the complete physical schema.
     pub column: String,
@@ -425,6 +441,8 @@ pub enum PartitionTransformWire {
 /// `buckets` is required for and only accepted on a `bucket` transform (2
 /// through 1024); `width` is required for and only accepted on a `truncate`
 /// transform (a positive integer counting Unicode code points for strings).
+/// Each parameter is either omitted or carries a value; an explicit `null` is
+/// refused.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -434,12 +452,20 @@ pub struct PartitionFieldWire {
     /// Transform applied to `column`.
     pub transform: PartitionTransformWire,
     /// Bucket count of a `bucket` transform.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::schema::skipped_option::<u32>")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "u32")]
     pub buckets: Option<u32>,
     /// Truncation width of a `truncate` transform.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::schema::skipped_option::<u32>")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "u32")]
     pub width: Option<u32>,
 }
 
@@ -483,8 +509,13 @@ pub struct PhysicalLayoutWire {
     ///
     /// Omitted on a request, the time column is `wyrd_ingested_at`. The
     /// canonical form in a description and the control row always names it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::schema::skipped_option::<String>")]
+    /// An explicit `null` is refused.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "String")]
     pub time_column: Option<String>,
     /// Ordered partition fields; at most three may be declared.
     #[serde(default)]
@@ -565,6 +596,13 @@ pub struct RegisterTableResponse {
 /// Deserializes a field that may be omitted but, when present, is never
 /// `null`: an explicit `null` fails as a type error instead of reading as
 /// omitted.
+///
+/// Pair it with `#[serde(default, skip_serializing_if = "Option::is_none")]`
+/// so `None` serializes as an omission this function accepts.
+///
+/// # Errors
+///
+/// Returns the deserializer's error when the value is `null` or is not a `T`.
 fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -3062,6 +3100,37 @@ mod bifrost_wire_tests {
         );
         assert_eq!(cleared.add_columns, None);
         bifrost_wire_round_trip(&cleared);
+        let added = decode(serde_json::json!({
+            "expected_table_version": "3",
+            "add_columns": [
+                {"name": "note", "data_type": "Utf8"},
+                {"name": "seen", "data_type": {"Timestamp": {"unit": "Microsecond"}},
+                 "metadata": {"PARQUET:field_id": "9", "origin": "caller"}}
+            ],
+            "physical_layout": {"partition_by": [{"column": "t", "transform": "day"}]}
+        }))
+        .expect("omitted nested members take their defaults");
+        let columns = added.add_columns.as_deref().expect("columns decode");
+        assert!(columns.iter().all(|column| column.nullable));
+        assert_eq!(
+            columns[1].data_type,
+            DataTypeSpec::Timestamp {
+                unit: TimeUnit::Microsecond,
+                tz: None
+            }
+        );
+        assert_eq!(columns[1].metadata.len(), 2);
+        let encoded = serde_json::to_value(&added).expect("the request encodes");
+        assert_eq!(
+            encoded["add_columns"][1]["data_type"],
+            serde_json::json!({"Timestamp": {"unit": "Microsecond"}}),
+            "an unset zone is omitted, never sent as null"
+        );
+        assert_eq!(
+            encoded["physical_layout"]["partition_by"][0],
+            serde_json::json!({"column": "t", "transform": "day"})
+        );
+        assert_eq!(decode(encoded).expect("the encoding decodes"), added);
         let max = decode(serde_json::json!({"expected_table_version": "9223372036854775807"}))
             .expect("the maximum version decodes");
         assert_eq!(max.expected_table_version.get(), i64::MAX);
@@ -3079,6 +3148,16 @@ mod bifrost_wire_tests {
             serde_json::json!({"expected_table_version": "1", "physical_layout": {"bloom_columns": null}}),
             serde_json::json!({"expected_table_version": "1", "physical_layout": {"time_column": "t"}}),
             serde_json::json!({"expected_table_version": "1", "rename_columns": [{"from": "a", "to": "b", "x": 1}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": "Utf8", "x": 1}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": "Utf8", "nullable": null}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": "Utf8", "metadata": null}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": {"Timestamp": {"unit": "Microsecond", "tz": null}}}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": {"Timestamp": {"unit": "Microsecond", "zone": "UTC"}}}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": {"Decimal128": {"precision": 9, "scale": 2, "x": 1}}}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": {"List": {"name": "item", "data_type": "Utf8", "x": 1}}}]}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": {"sort_keys": [{"column": "a", "direction": "asc", "null_order": "last", "x": 1}]}}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": {"partition_by": [{"column": "t", "transform": "day", "buckets": null}]}}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": {"partition_by": [{"column": "t", "transform": "day", "width": null}]}}),
         ] {
             assert!(
                 decode(refused.clone()).is_err(),
@@ -3087,6 +3166,12 @@ mod bifrost_wire_tests {
         }
     }
 
+    /// Every Bifrost wire type, the strict nested declarations included,
+    /// yields a JSON Schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when schema generation panics for any listed type.
     #[test]
     fn bifrost_wire_schema_for_wire_types_does_not_panic() {
         let _ = schema_for!(AlterTableRequest);

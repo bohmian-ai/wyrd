@@ -15,7 +15,7 @@ expectTypeOf<TableDescription["physical_layout"]["time_column"]>().toEqualTypeOf
 expectTypeOf<TableDescription["user_fields"][number]["metadata"]>().toEqualTypeOf<
   Readonly<Record<string, string>> | undefined
 >();
-// An unskipped Option inside a variant is always present.
-expectTypeOf<Extract<DataType, { Timestamp: unknown }>["Timestamp"]["tz"]>().toEqualTypeOf<string | null>();
+// A skipped Option inside a variant is optional and never null.
+expectTypeOf<Extract<DataType, { Timestamp: unknown }>["Timestamp"]["tz"]>().toEqualTypeOf<string | undefined>();
 // The version is an exact integer; only the wire spells it as a string.
 expectTypeOf<TableDescription["table_version"]>().toEqualTypeOf<bigint>();

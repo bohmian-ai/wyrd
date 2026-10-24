@@ -1378,7 +1378,8 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
 ///
 /// Raw HTTP pins the wire: a canonical decimal-string version and a supported
 /// effective edit commit and return the description with its version as a
-/// decimal string. Unknown, explicit-null, nested-null, numeric, zero,
+/// decimal string. Unknown, explicit-null, nested-null, nested unknown members
+/// and nulls inside otherwise effective edits, numeric, zero,
 /// overflowing, and noncanonical versions, a malformed body, a time-axis
 /// edit, and an unsupported operation are 400s; a superseded version is a
 /// 409; a caller holding only record and query grants is a 403; and another
@@ -1535,6 +1536,18 @@ async fn table_patch_http_contract_refuses_invalid_requests() {
         (
             &admin,
             r#"{"expected_table_version":"2","physical_layout":{"time_column":"value"}}"#,
+            400,
+            validation,
+        ),
+        (
+            &admin,
+            r#"{"expected_table_version":"2","add_columns":[{"name":"note","data_type":"Utf8","nullabel":true}]}"#,
+            400,
+            validation,
+        ),
+        (
+            &admin,
+            r#"{"expected_table_version":"2","physical_layout":{"partition_by":[{"column":"wyrd_ingested_at","transform":"day","buckets":null}]}}"#,
             400,
             validation,
         ),

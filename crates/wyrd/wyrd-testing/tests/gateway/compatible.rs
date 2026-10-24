@@ -4,7 +4,9 @@
 //! journeys; these cover what an SDK cannot observe from the outside: how a
 //! truncated provider stream terminates on the wire, that a Scribe outage
 //! which stops capture publication never changes a caller's answer, and that a
-//! managed provider secret keeps working across rotation and server restart.
+//! managed provider secret keeps working across rotation and server restart,
+//! and that every call's request context is admitted before dispatch and lands
+//! on its captured row with the registry's readable identity.
 
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
@@ -15,7 +17,10 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::gateway_capture::GatewayCapture;
 
-use crate::harness::{Journey, PROVIDER_KEY, assert_provider_credentials, openai_code, tokens};
+use crate::harness::{
+    ANTHROPIC_EVENTS, INVOKER_ROLE, Journey, PROVIDER_KEY, anthropic_code, api_key,
+    assert_provider_credentials, exchange, openai_code, refusal, tokens,
+};
 
 /// Chat Completions stream that stops before any choice finishes.
 const CHAT_TRUNCATED: &str = "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"h\"}}]}\n\n";
@@ -180,6 +185,361 @@ async fn openai_compatible_streams_terminate_and_survive_a_capture_outage() {
         journey.upstream_calls().await.len(),
         4,
         "the refusal reaches no provider"
+    );
+}
+
+/// Proves gateway request context becomes one canonical captured row per
+/// call, admitted before any provider dispatch, on both credential modes.
+///
+/// A configured Service with one Agent component calls `OpenAI` with its
+/// signed workload token in the provider credential slot and Anthropic, as a
+/// stream, with an unsigned token in `x-wyrd-access-token` and an explicit
+/// `x-wyrd-workload-uid`; Batch HTTP upload and creation carry the same
+/// headers. Every row names the Service as workload by UID, name, and version
+/// from the registry, never a forged label header; its subject by UID, kind,
+/// name, and version; its Run; and the environment its own request sent, so a
+/// later call without one records none. An unknown or out-of-graph subject, a
+/// repeated or malformed context header, and a workload other than the
+/// signed one are refused with their stable codes before any provider call,
+/// and no Wyrd credential or context reaches the provider.
+///
+/// # Panics
+///
+/// Panics when a status, refusal, captured row, or upstream expectation
+/// fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn configured_gateway_headers_are_authorized_and_captured() {
+    let journey = Journey::start().await;
+    let message = json!({"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-sonnet-5", "content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn", "stop_sequence": null, "usage": {"input_tokens": 5, "output_tokens": 3}});
+    for (route, answer) in [
+        ("/v1/chat/completions", GatewayCapture::completion()),
+        ("/v1/messages", message),
+        (
+            "/v1/files",
+            json!({"id": "file-up-1", "object": "file", "purpose": "batch", "bytes": 1}),
+        ),
+        (
+            "/v1/batches",
+            json!({"id": "b-up-1", "object": "batch", "status": "validating",
+                               "endpoint": "/v1/chat/completions", "input_file_id": "file-up-1"}),
+        ),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+            .mount(&journey.upstream)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_string_contains("\"stream\":true"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(ANTHROPIC_EVENTS, "text/event-stream"),
+        )
+        .with_priority(1)
+        .mount(&journey.upstream)
+        .await;
+    journey
+        .deploy("openai", "authorization", &["chat_completions", "batches"])
+        .await;
+    journey
+        .deploy("anthropic", "x-api-key", &["chat_completions"])
+        .await;
+    journey.capture_metadata().await;
+
+    let inspector = api_key(&journey.server, "context_inspector", &["admin"]).await;
+    let admin = wyrd_client::bifrost::client_from_options(
+        journey.server.base_url(),
+        Some(inspector.expose_secret()),
+        journey.server.grpc_url().as_deref(),
+    )
+    .expect("admin client builds");
+    let cards = wyrd_client::cards::Cards::connect_with(&admin)
+        .await
+        .expect("Cards connects");
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    let configured = Box::pin(cards.declare_from_path(fixtures.join("configured-service.yaml")))
+        .await
+        .expect("the configured Service registers");
+    let outside = Box::pin(cards.declare_from_path(fixtures.join("observed-model.yaml")))
+        .await
+        .expect("a Card outside the Service's graph registers")
+        .root
+        .uid
+        .expect("the Model has a UID")
+        .to_string();
+    let service = configured.root.uid.clone().expect("the Service has a UID");
+    let agent = configured
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.card_ref.name.as_str() == "observed-agent")
+        .and_then(|outcome| outcome.card_ref.uid.clone())
+        .expect("the Agent component registers")
+        .to_string();
+    let runtime = journey
+        .server
+        .credential_registered_service(&configured.root, &[INVOKER_ROLE])
+        .await
+        .expect("the Service's runtime account is credentialed");
+    let runtime_key = runtime.api_key().expect("the runtime has an API key");
+    let signed = journey
+        .server
+        .exchange_api_key_for_workload(runtime_key, &service)
+        .await
+        .expect("a signed workload token exchanges");
+    let unsigned = exchange(&journey.server, runtime_key).await;
+    let service = service.to_string();
+
+    let openai = |context: &[(&'static str, &str)]| {
+        let mut headers = vec![("authorization", format!("Bearer {signed}"))];
+        headers.extend(
+            context
+                .iter()
+                .map(|(name, value)| (*name, (*value).to_owned())),
+        );
+        headers
+    };
+    let anthropic = |context: &[(&'static str, &str)]| {
+        let mut headers = vec![
+            ("x-wyrd-access-token", format!("Bearer {unsigned}")),
+            ("x-wyrd-workload-uid", service.clone()),
+            ("anthropic-version", "2023-06-01".to_owned()),
+        ];
+        headers.extend(
+            context
+                .iter()
+                .map(|(name, value)| (*name, (*value).to_owned())),
+        );
+        headers
+    };
+    let messages = |stream: bool| {
+        json!({"model": "anthropic/claude-sonnet-5", "max_tokens": 16, "stream": stream,
+               "messages": [{"role": "user", "content": "hi"}]})
+    };
+
+    let answer = journey
+        .post(
+            "/v1/chat/completions",
+            &openai(&[
+                ("wyrd-card-uid", &service),
+                ("x-wyrd-deployment-environment", "prod"),
+                ("x-wyrd-service-name", "forged"),
+            ]),
+            &chat(false, "hi"),
+        )
+        .await;
+    assert_eq!(answer.status().as_u16(), 200);
+    let stream = journey
+        .post(
+            "/v1/messages",
+            &anthropic(&[
+                ("wyrd-card-uid", &agent),
+                ("wyrd-run-id", "agent-run"),
+                ("x-wyrd-deployment-environment", "staging"),
+            ]),
+            &messages(true),
+        )
+        .await;
+    assert_eq!(stream.status().as_u16(), 200);
+    assert_eq!(
+        stream.text().await.expect("stream relays"),
+        ANTHROPIC_EVENTS
+    );
+    let unlabelled = journey
+        .post(
+            "/v1/chat/completions",
+            &openai(&[("wyrd-card-uid", &agent)]),
+            &chat(false, "hi"),
+        )
+        .await;
+    assert_eq!(unlabelled.status().as_u16(), 200);
+    let batch_context = [
+        ("wyrd-card-uid", agent.as_str()),
+        ("wyrd-run-id", "batch-run"),
+        ("x-wyrd-deployment-environment", "prod"),
+    ];
+    let line = json!({"custom_id": "a", "method": "POST", "url": "/v1/chat/completions",
+                      "body": {"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hi"}]}});
+    let form = format!(
+        "--wyrd\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n\
+         --wyrd\r\nContent-Disposition: form-data; name=\"file\"; filename=\"in.jsonl\"\r\n\
+         Content-Type: application/jsonl\r\n\r\n{line}\n\r\n--wyrd--\r\n"
+    );
+    let upload = |context: &[(&'static str, &str)]| {
+        let mut request = journey
+            .http
+            .post(format!("{}/v1/files", journey.base))
+            .header("content-type", "multipart/form-data; boundary=wyrd")
+            .body(form.clone());
+        for (name, value) in openai(context) {
+            request = request.header(name, value);
+        }
+        request.send()
+    };
+    let file: Value = upload(&batch_context)
+        .await
+        .expect("upload sends")
+        .json()
+        .await
+        .expect("file json");
+    let created = journey
+        .post(
+            "/v1/batches",
+            &openai(&batch_context),
+            &json!({"input_file_id": file["id"], "endpoint": "/v1/chat/completions",
+                    "completion_window": "24h"}),
+        )
+        .await;
+    assert_eq!(created.status().as_u16(), 200, "{file}");
+
+    let dispatched = journey.upstream_calls().await;
+    assert_eq!(dispatched.len(), 5);
+    for call in &dispatched {
+        for (name, value) in &call.headers {
+            let value = value.to_str().unwrap_or_default();
+            assert!(
+                !value.contains(&signed) && !value.contains(&unsigned),
+                "caller token forwarded in {name}"
+            );
+            assert!(
+                !name.as_str().starts_with("x-wyrd") && !name.as_str().starts_with("wyrd-"),
+                "Wyrd context forwarded: {name}"
+            );
+        }
+    }
+
+    let unknown = uuid::Uuid::now_v7().to_string();
+    let invalid = "WYRD_GATEWAY_400_INVALID_REQUEST";
+    let scope = "WYRD_VALA_403_BIFROST_CARD_SCOPE";
+    for (headers, status, code) in [
+        (openai(&[("wyrd-card-uid", &unknown)]), 403, scope),
+        (openai(&[("wyrd-card-uid", &outside)]), 403, scope),
+        (
+            openai(&[("wyrd-card-uid", &agent), ("wyrd-card-uid", &service)]),
+            400,
+            invalid,
+        ),
+        (openai(&[("wyrd-card-uid", "not-a-uid")]), 400, invalid),
+        (openai(&[("wyrd-run-id", "")]), 400, invalid),
+        (
+            openai(&[
+                ("x-wyrd-deployment-environment", "prod"),
+                ("x-wyrd-deployment-environment", "dev"),
+            ]),
+            400,
+            invalid,
+        ),
+        (
+            openai(&[("x-wyrd-workload-uid", &outside)]),
+            400,
+            "WYRD_AUTH_400_SIGNED_WORKLOAD_MISMATCH",
+        ),
+    ] {
+        refusal(
+            journey
+                .post("/v1/chat/completions", &headers, &chat(false, "hi"))
+                .await,
+            status,
+            code,
+            openai_code,
+        )
+        .await;
+    }
+    refusal(
+        journey
+            .post(
+                "/v1/messages",
+                &anthropic(&[("wyrd-card-uid", &outside)]),
+                &messages(false),
+            )
+            .await,
+        403,
+        scope,
+        anthropic_code,
+    )
+    .await;
+    refusal(
+        upload(&[("wyrd-card-uid", &agent), ("wyrd-card-uid", &service)])
+            .await
+            .expect("upload sends"),
+        400,
+        invalid,
+        openai_code,
+    )
+    .await;
+    assert_eq!(
+        journey.upstream_calls().await.len(),
+        5,
+        "every refusal precedes dispatch"
+    );
+
+    journey.drain_calls().await;
+    let rows = journey
+        .captured_json(
+            &inspector,
+            "SELECT ingress_dialect, CAST(workload_card_uid AS VARCHAR) AS workload, \
+             service_name, service_version, deployment_environment, subject_kind, subject_name, \
+             subject_version, CAST(subject_card_uid AS VARCHAR) AS subject, run_id \
+             FROM bifrost.gateway.calls ORDER BY started_at",
+            5,
+        )
+        .await;
+    let row = |dialect: &str, environment: Value, subject: (&str, &str, &str), run: Value| {
+        json!({
+            "ingress_dialect": dialect, "workload": service, "service_name": "configured-service",
+            "service_version": "1.0.0", "deployment_environment": environment,
+            "subject_kind": subject.0, "subject_name": subject.1, "subject_version": "1.0.0",
+            "subject": subject.2, "run_id": run,
+        })
+    };
+    let as_service = ("Service", "configured-service", service.as_str());
+    let as_agent = ("Agent", "observed-agent", agent.as_str());
+    let canonical = |mut row: Value| {
+        row.as_object_mut()
+            .expect("row object")
+            .retain(|_, value| !value.is_null());
+        row
+    };
+    assert_eq!(
+        rows,
+        [
+            row(
+                "openai_chat_completions",
+                json!("prod"),
+                as_service,
+                Value::Null
+            ),
+            row(
+                "anthropic_messages",
+                json!("staging"),
+                as_agent,
+                json!("agent-run")
+            ),
+            row(
+                "openai_chat_completions",
+                Value::Null,
+                as_agent,
+                Value::Null
+            ),
+            row(
+                "openai_batches",
+                json!("prod"),
+                as_agent,
+                json!("batch-run")
+            ),
+            row(
+                "openai_batches",
+                json!("prod"),
+                as_agent,
+                json!("batch-run")
+            ),
+        ]
+        .map(canonical),
+        "each call keeps its own admitted context with registry-derived names"
     );
 }
 

@@ -1085,6 +1085,157 @@ mod pg_tests {
         journey.shutdown().await;
     }
 
+    /// The accepted request context, not a record's labels, fills the shared
+    /// dimensions of OTLP rows.
+    ///
+    /// An export under a validated root stores that Service's canonical name
+    /// and version over the resource's `service.name`, and an accepted request
+    /// environment over the resource's. Without a request environment the
+    /// typed resource environment survives, also under a validated root, and
+    /// a rootless export keeps its observed Service and no version. An empty
+    /// environment header refuses the whole request over HTTP and gRPC, and a
+    /// repeated one over HTTP.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture cannot be provisioned, an export is accepted or
+    /// refused other than expected, or a signal stores other dimensions.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn request_context_fills_shared_dimensions() {
+        let journey = OtlpJourney::start().await;
+        let anchor = support::anchor_nanos();
+        let server = journey.server();
+        server
+            .seed_role("otlp_context_writer", &[Permission::bifrost_record_write()])
+            .await
+            .expect("the writer role is seeded");
+        let observed = server
+            .bootstrap_service("otlp-context-observed", &["viewer"])
+            .await
+            .expect("the observed Service registers");
+        let observed = observed
+            .card_ref()
+            .expect("a bootstrapped Service is bound to its Card");
+        let root = registered_uid(server, observed.name.as_str()).await;
+        let family = server
+            .credential_registered_service(observed, &["otlp_context_writer"])
+            .await
+            .expect("the observed family's runtime account is credentialed");
+        let family_key = family
+            .api_key()
+            .expect("the family account carries an API key");
+        let rootless = bearer(
+            &server
+                .exchange_api_key(family_key)
+                .await
+                .expect("the family account exchanges without a root"),
+        );
+        let api_key = secrecy::ExposeSecret::expose_secret(family_key);
+        let (key, selector, environment) = (
+            "x-wyrd-api-key",
+            wyrd_spec::auth::WORKLOAD_UID_HEADER,
+            wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER,
+        );
+        let root = root.as_str();
+        let generic = [None; 3];
+        let refused = Err((StatusCode::BAD_REQUEST, "WYRD_SPEC_400_VALIDATION"));
+
+        export_everywhere(
+            &journey,
+            anchor,
+            generic,
+            &[(key, api_key), (selector, root), (environment, "")],
+            refused,
+        )
+        .await;
+        for signal in Signal::ALL {
+            let (status, body) = post_otlp_with_headers(
+                &journey,
+                signal.path(),
+                HttpEncoding::Protobuf,
+                signal.body(anchor, generic),
+                &[
+                    (key, api_key),
+                    (selector, root),
+                    (environment, "staging"),
+                    (environment, "prod"),
+                ],
+            )
+            .await;
+            assert_refusal(
+                status,
+                &body,
+                StatusCode::BAD_REQUEST,
+                "WYRD_SPEC_400_VALIDATION",
+            );
+        }
+        for headers in [
+            &[(key, api_key), (selector, root), (environment, "staging")][..],
+            &[(key, api_key), (selector, root)],
+            &[("x-wyrd-access-token", rootless.as_str())],
+        ] {
+            export_everywhere(&journey, anchor, generic, headers, Ok((0, ""))).await;
+        }
+
+        journey.publish().await;
+        let (name, version) = (
+            Some(observed.name.to_string()),
+            Some(observed.version.to_string()),
+        );
+        let resource = Some("journey".to_owned());
+        for signal in Signal::ALL {
+            let (table, scope, _) = signal.ledger();
+            let rows = journey
+                .query(&format!(
+                    "SELECT service_name, service_version, deployment_environment, \
+                     workload_card_uid FROM {table} WHERE scope_name = '{scope}'"
+                ))
+                .await;
+            let mut stored = BTreeSet::new();
+            for batch in &rows {
+                let text = |name: &str, index: usize| {
+                    let column = support::column::<StringArray>(batch, name);
+                    (!column.is_null(index)).then(|| column.value(index).to_owned())
+                };
+                for index in 0..batch.num_rows() {
+                    stored.insert([
+                        text("service_name", index),
+                        text("service_version", index),
+                        text("deployment_environment", index),
+                        text("workload_card_uid", index),
+                    ]);
+                }
+            }
+            assert_eq!(
+                stored,
+                BTreeSet::from([
+                    [
+                        name.clone(),
+                        version.clone(),
+                        Some("staging".to_owned()),
+                        Some(root.to_owned()),
+                    ],
+                    [
+                        name.clone(),
+                        version.clone(),
+                        resource.clone(),
+                        Some(root.to_owned()),
+                    ],
+                    [
+                        Some(support::SERVICE_NAME.to_owned()),
+                        None,
+                        resource.clone(),
+                        None,
+                    ],
+                ]),
+                "{signal:?} stores the accepted context over its labels"
+            );
+        }
+
+        journey.shutdown().await;
+    }
+
     /// Formats `token` as the bearer value an exporter sends.
     fn bearer(token: &str) -> String {
         format!("Bearer {token}")

@@ -607,6 +607,11 @@ fn decode_rows(
     };
     if let Some(definition) = context.definition {
         enforce_builtin_source_contract(rows, definition, trusted)?;
+        if matches!(context.attribution, StampedAttribution::Frame(_))
+            && (definition.canonical_fields)().is_none()
+        {
+            refuse_supplied_dimensions(rows)?;
+        }
     }
     if let Some(expected) = context.expected_schema_fingerprint
         && source_schema_fingerprint(rows.schema().as_ref()) != expected
@@ -963,6 +968,40 @@ fn enforce_builtin_source_contract(
     let user = RecordBatch::try_new(Arc::new(Schema::new(user_fields(rows))), user_columns(rows))
         .map_err(|_| ScribeError::InvalidFrame)?;
     (definition.canonical_validator)(&user).map_err(ScribeError::ContractViolation)?;
+    Ok(())
+}
+
+/// Refuses a public non-signal built-in batch that supplies a shared
+/// dimension.
+///
+/// Such a table has no source field a supplied Service, environment, or
+/// subject value could be validated against: its [`SHARED_DIMENSIONS`] come
+/// only from the accepted request context that [`stamp_dimensions`] applies.
+/// A public writer therefore sends each one null, and any value refuses the
+/// whole batch before ACK. Row-attributed frames are server-built from their
+/// producer's accepted origin and never reach this check, and the canonical
+/// signals validate their resource promotions against their source fields
+/// instead.
+///
+/// [`SHARED_DIMENSIONS`]: crate::tables::SHARED_DIMENSIONS
+///
+/// # Errors
+///
+/// Returns [`ScribeError::ContractViolation`] carrying
+/// [`BifrostError::SchemaParse`] naming the first dimension a row supplies.
+fn refuse_supplied_dimensions(rows: &RecordBatch) -> Result<(), ScribeError> {
+    for column in crate::tables::SHARED_DIMENSIONS {
+        if rows
+            .column_by_name(column)
+            .is_some_and(|values| values.null_count() != values.len())
+        {
+            return Err(ScribeError::ContractViolation(BifrostError::SchemaParse {
+                detail: format!(
+                    "{column} is stamped from the accepted request context; send it null"
+                ),
+            }));
+        }
+    }
     Ok(())
 }
 

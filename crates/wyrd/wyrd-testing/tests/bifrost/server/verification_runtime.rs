@@ -5139,19 +5139,224 @@ async fn span_dimensions(
     admin: &wyrd_client::WyrdClient,
     request: &RequestId,
 ) -> Result<Vec<Value>, ServerJourneyError> {
+    table_dimensions(admin, SPANS, request).await
+}
+
+/// The distinct shared dimensions and workload of the rows one request wrote
+/// to `table`, as `admin` reads them back; a null column is omitted.
+///
+/// # Errors
+/// Returns the query error.
+async fn table_dimensions(
+    admin: &wyrd_client::WyrdClient,
+    table: &str,
+    request: &RequestId,
+) -> Result<Vec<Value>, ServerJourneyError> {
     Ok(Bifrost::query_only(admin)
         .sql_as(
             &format!(
                 "SELECT DISTINCT service_name, service_version, deployment_environment, \
                  subject_kind, subject_name, subject_version, \
                  CAST(workload_card_uid AS VARCHAR) AS workload_card_uid \
-                 FROM bifrost.traces.spans \
+                 FROM {table} \
                  WHERE CAST(wyrd_request_id AS VARCHAR) = '{}'",
                 request.as_str()
             ),
             &[],
         )
         .await?)
+}
+
+/// The table a native drift writer records raw observations in.
+const DRIFT_OBSERVATIONS: &str = "bifrost.drift.observations";
+
+/// One valid drift observation row in `schema`, with every shared dimension
+/// sent as the null placeholder the SDK Drift producer sends.
+///
+/// # Errors
+/// Returns the Arrow error when the row does not build against `schema`.
+fn drift_observation(schema: &SchemaRef) -> Result<RecordBatch, ServerJourneyError> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| -> ArrayRef {
+            match field.name().as_str() {
+                "record_id" => Arc::new(StringArray::from(vec!["native-drift"])),
+                "series" => Arc::new(StringArray::from(vec!["latency"])),
+                "num_value" => Arc::new(arrow::array::Float64Array::from(vec![1.5])),
+                "created_at" => Arc::new(
+                    TimestampMicrosecondArray::from(vec![Utc::now().timestamp_micros()])
+                        .with_timezone("+00:00"),
+                ),
+                _ => arrow::array::new_null_array(field.data_type(), 1),
+            }
+        })
+        .collect();
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+}
+
+/// Public native drift rows take their shared dimensions only from the
+/// accepted request context.
+///
+/// A drift observation has no source field a supplied Service, environment,
+/// or subject value could be validated against, so supplying any of the six
+/// shared dimensions refuses the whole frame before ACK, rootless and under
+/// a selected Service root and environment alike, and stores nothing. The
+/// same row with null placeholders lands with the accepted Service, the
+/// accepted environment, and its subject's descriptor. A User delegating to
+/// that Service's runtime account, which runs under the Service's root, lands
+/// owned by that root rather than unowned.
+///
+/// # Errors
+/// Returns [`ServerJourneyError`] when the server, a fixture, or a query
+/// fails.
+///
+/// # Panics
+/// Panics when a frame supplying a dimension is acked or refused for another
+/// reason, or a stored row's dimensions or count differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn native_drift_dimensions_come_only_from_accepted_context() -> Result<(), ServerJourneyError>
+{
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    server
+        .ensure_builtin_table_for_test(server.data_tenant_id(), "drift", "observations")
+        .await?;
+    let admin_key = server
+        .bootstrap_service("native-drift-admin", &["admin"])
+        .await?;
+    let admin = native_client(
+        &server,
+        admin_key
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let cards = wyrd_client::cards::Cards::connect_with(&admin).await?;
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    let model = Box::pin(cards.declare_from_path(&fixtures.join("observed-model.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Model has a UID")?;
+    let service = Box::pin(cards.declare_from_path(&fixtures.join("observed-service.yaml")))
+        .await?
+        .root;
+    let service_uid = service.uid.clone().ok_or("the Service has a UID")?;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("native-drift-editor", &["editor"])
+        .await?
+    else {
+        return Err("a user bootstraps as a user".into());
+    };
+    let editor = native_client(&server, &jwt)?;
+    let owned = editor.for_service(service_uid.clone(), Some("staging".to_owned()));
+    let schema = Arc::clone(
+        TableConfig::describe_with(&admin, DRIFT_OBSERVATIONS)
+            .await?
+            .user_schema(),
+    );
+    let row = with_text(
+        &drift_observation(&schema)?,
+        SUBJECT_CARD_UID,
+        Some(model.as_str()),
+    )?;
+    let insert = async |client: &wyrd_client::WyrdClient, batch: &RecordBatch| {
+        RawIngest::connect(client)
+            .await?
+            .insert(
+                DRIFT_OBSERVATIONS,
+                uuid::Uuid::now_v7(),
+                ipc(batch).expect("the frame encodes"),
+            )
+            .await
+    };
+
+    for column in vala_bifrost_redux::tables::SHARED_DIMENSIONS {
+        let forged = with_text(&row, column, Some("forged"))?;
+        for (context, client) in [("rootless", &editor), ("rooted", &owned)] {
+            let refused = insert(client, &forged)
+                .await
+                .expect_err("a supplied shared dimension is refused before any ACK");
+            assert!(
+                matches!(
+                    refused,
+                    WyrdError::Vala {
+                        error: BifrostError::SchemaParse { .. }
+                    }
+                ),
+                "{context} {column}: {refused:?}"
+            );
+        }
+    }
+
+    let actor = server
+        .credential_registered_service(&service, &["editor"])
+        .await?;
+    let actor = server
+        .exchange_api_key_for_workload(
+            actor
+                .api_key()
+                .ok_or("the runtime account has an API key")?,
+            &service_uid,
+        )
+        .await?;
+    let delegated = native_client(
+        &server,
+        &server
+            .delegate(&jwt, &actor, wyrd_spec::auth::TokenAudience::Wyrd)
+            .await?,
+    )?;
+    let landed = [
+        insert(&owned, &row).await?,
+        insert(&editor, &row).await?,
+        insert(&delegated, &row).await?,
+    ];
+    server.flush_bifrost().await?;
+
+    let subject = json!({
+        "subject_kind": "Model",
+        "subject_name": "observed-model",
+        "subject_version": "1.0.0",
+    });
+    let with_service = |environment: Option<&str>| {
+        let mut expected = subject.clone();
+        expected["service_name"] = json!("observed-service");
+        expected["service_version"] = json!("1.0.0");
+        expected["workload_card_uid"] = json!(service_uid.to_string());
+        if let Some(environment) = environment {
+            expected["deployment_environment"] = json!(environment);
+        }
+        expected
+    };
+    let expected = [
+        with_service(Some("staging")),
+        subject.clone(),
+        with_service(None),
+    ];
+    for (request, expected) in landed.iter().zip(expected) {
+        assert_eq!(
+            table_dimensions(&admin, DRIFT_OBSERVATIONS, request).await?,
+            vec![expected],
+            "request {request}"
+        );
+    }
+    let stored: Vec<Value> = Bifrost::query_only(&admin)
+        .sql_as(
+            &format!("SELECT COUNT(*) AS n FROM {DRIFT_OBSERVATIONS}"),
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        stored,
+        vec![json!({ "n": 3 })],
+        "no refused frame stores a row"
+    );
+    server.shutdown().await?;
+    Ok(())
 }
 
 /// Native canonical span frames carry only what their source fields derive,

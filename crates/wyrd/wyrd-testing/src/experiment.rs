@@ -1358,13 +1358,31 @@ pub trait Workload: Send {
     /// start failure; the runner then admits no further work.
     async fn smoke(&mut self) -> Result<String, ExperimentError>;
 
-    /// Loads fixtures into the servers [`Self::smoke`] started.
+    /// Loads fixtures into the servers [`Self::smoke`] started. The runner
+    /// calls it once, only after a passing smoke, and never retries it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for an unsmoked workload or a fixture that
+    /// did not load; the runner then measures no step. Cancellation at the
+    /// budget or an interrupt drops the future, so fixtures may be partly
+    /// loaded; [`Self::finish`] still runs and stops the servers.
     async fn prepare(&mut self) -> Result<(), ExperimentError>;
 
     /// PIDs of the declared server processes, for optional profiling.
     fn processes(&self) -> Vec<u32>;
 
     /// Runs `phase` of `step` for `window` and returns what it measured.
+    /// The runner calls it once per warmup and repetition and never retries
+    /// a failed call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for an unprepared workload, an undeclared
+    /// step, or a failed read; the runner then measures no further phase of
+    /// the step. Cancellation at the budget or an interrupt drops the future
+    /// mid-window, discarding that repetition; work it launched may still be
+    /// in flight until [`Self::finish`].
     async fn measure(
         &mut self,
         step: &Step,
@@ -1372,7 +1390,15 @@ pub trait Workload: Send {
         window: Duration,
     ) -> Result<Repetition, ExperimentError>;
 
-    /// Stops admission, drains, and stops the servers.
+    /// Stops admission, drains, and stops the servers. The runner calls it
+    /// once after any admitted run, including a cancelled or failed one,
+    /// bounded by its finish grace, and never retries it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error when the drain or stop was not clean; the
+    /// record is then INVALID. Servers are released either way; one that
+    /// outlived its stop grace was killed.
     async fn finish(&mut self) -> Result<(), ExperimentError>;
 }
 

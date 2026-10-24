@@ -231,6 +231,13 @@ impl Workload for Isolated {
     /// Starts the collector and server, registers each write path, and
     /// smokes every write path and the query boundary
     /// ([`crate::query::smoke`]) before any fixture loads.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for a collector, server, or registration
+    /// failure, or the smoke's missing evidence. A started server is kept
+    /// even when the smoke fails, so [`Workload::finish`] stops it; nothing
+    /// is retried.
     async fn smoke(&mut self) -> Result<String, ExperimentError> {
         let collector = Collector::start(&self.logs)
             .await
@@ -248,6 +255,12 @@ impl Workload for Isolated {
 
     /// Writes the standard fixture into the smoked server, waits until
     /// every row is published as Parquet, and computes the exact answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for an unsmoked workload, a fixture that
+    /// loaded short or with errors, or rows not published within the settle
+    /// timeout. Rows already written stay in the server; nothing is retried.
     async fn prepare(&mut self) -> Result<(), ExperimentError> {
         let server = self
             .server
@@ -293,6 +306,12 @@ impl Workload for Isolated {
     }
 
     /// Runs one closed-loop window of `step`; a warmup runs the same work.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for an unprepared workload, an undeclared
+    /// step, or a scrape failure. A cancelled window aborts its client tasks
+    /// and their requests.
     async fn measure(
         &mut self,
         step: &Step,
@@ -302,7 +321,15 @@ impl Workload for Isolated {
         self.closed(step, phase, window).await
     }
 
-    /// Stops the server and keeps its log.
+    /// Drops the senders and queries, then stops the server and keeps its
+    /// log. The stop runs synchronously inside this future: `SIGTERM`, a
+    /// bounded wait for a clean exit, and the log copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error when the server exits unsuccessfully or
+    /// outlives its stop grace (it is then killed), or its log cannot be
+    /// copied. An unstarted workload finishes without error.
     async fn finish(&mut self) -> Result<(), ExperimentError> {
         self.senders.clear();
         self.bench = None;

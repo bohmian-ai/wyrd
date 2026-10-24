@@ -559,6 +559,11 @@ mod tests {
 
     /// A timing span reaches the exporter under its request span with exact
     /// nanosecond components, and omits the excluded component it lacks.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the test pipeline does not initialize or an exported
+    /// timing span or component is missing or wrong.
     #[test]
     fn timing_spans_carry_exact_nanoseconds() {
         let (guard, capture) = super::init_test_capture(super::TelemetryConfig::default())

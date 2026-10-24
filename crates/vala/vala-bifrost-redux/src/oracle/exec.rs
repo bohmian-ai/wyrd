@@ -2086,6 +2086,10 @@ pub(super) mod tests {
 
     /// Local file scans' output rows sum across partitions and scans, and
     /// are unavailable when no scan reported them or a remote scan also ran.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a summed or unavailable row count is wrong.
     #[test]
     fn scan_stats_sum_local_output_rows() {
         use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};

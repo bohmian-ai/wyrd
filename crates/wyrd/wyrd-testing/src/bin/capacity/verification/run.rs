@@ -588,6 +588,13 @@ impl Workload for Bench {
     /// the collector as one completed `verification.direct` timing with its
     /// Verifier component, beside positive server CPU and component
     /// observations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for a start or provisioning failure, a
+    /// failed read, or the smoke's missing evidence. A started server is
+    /// kept even when the smoke fails, so [`Workload::finish`] stops it;
+    /// nothing is retried.
     async fn smoke(&mut self) -> Result<String, ExperimentError> {
         self.start().await?;
         let (server, collector) = (self.server()?, self.collector()?);
@@ -640,6 +647,10 @@ impl Workload for Bench {
     }
 
     /// Nothing beyond what [`Self::smoke`] started and provisioned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error when the smoke did not start the server.
     async fn prepare(&mut self) -> Result<(), ExperimentError> {
         self.server().map(|_| ())
     }
@@ -655,6 +666,13 @@ impl Workload for Bench {
 
     /// Runs `step` for `window`: closed loop at L1, the whole open-loop
     /// sequence and its drain at L2. A warmup runs the same work.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for an unprepared workload, an undeclared
+    /// step, or a failed scrape. A cancelled window aborts its client and
+    /// arrival tasks with their requests; work the server already queued
+    /// stays queued until [`Workload::finish`] stops it.
     async fn measure(
         &mut self,
         step: &Step,
@@ -667,7 +685,16 @@ impl Workload for Bench {
         }
     }
 
-    /// Stops the server and keeps its log beside the tenant's files.
+    /// Drops the application states, then stops the server and keeps its
+    /// log beside the tenant's files. The stop runs synchronously inside
+    /// this future: `SIGTERM`, a bounded wait for a clean exit, and the log
+    /// copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error when the server exits unsuccessfully or
+    /// outlives its stop grace (it is then killed), or its log cannot be
+    /// copied. An unstarted workload finishes without error.
     async fn finish(&mut self) -> Result<(), ExperimentError> {
         self.states.clear();
         let Some(server) = self.server.take() else {

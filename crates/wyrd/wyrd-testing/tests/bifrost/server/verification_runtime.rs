@@ -5680,28 +5680,9 @@ async fn native_signal_values_and_attribution_are_validated_before_ack()
 /// Unix nanoseconds.
 type TraceSpan = (u64, &'static str, i64);
 
-/// `spans` of `trace` as one batch of the described span `schema`, each
-/// lasting one millisecond.
-///
-/// # Panics
-/// Panics when the described schema does not assemble the rows.
+/// `spans` of `trace` as one batch of the described span `schema`.
 fn trace_batch(schema: &SchemaRef, trace: TraceId, spans: &[TraceSpan]) -> RecordBatch {
-    use canonical_signals::Cell;
-    let rows: Vec<canonical_signals::Row> = spans
-        .iter()
-        .map(|&(id, name, start)| {
-            BTreeMap::from([
-                ("trace_id", Cell::Bytes(trace.as_bytes().to_vec())),
-                ("span_id", Cell::Bytes(id.to_be_bytes().to_vec())),
-                ("name", Cell::Text(name.to_owned())),
-                ("kind", Cell::Int32(1)),
-                ("start_time_unix_nano", Cell::Int64(start)),
-                ("end_time_unix_nano", Cell::Int64(start + 1_000_000)),
-                ("duration_nano", Cell::Int64(1_000_000)),
-            ])
-        })
-        .collect();
-    canonical_signals::batch(schema, &rows)
+    canonical_signals::trace_spans(schema, trace.as_bytes(), spans)
 }
 
 /// A fresh random trace ID.

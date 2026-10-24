@@ -534,6 +534,36 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
     batch(schema, &[parent, child])
 }
 
+/// Build one-millisecond spans of `trace_id` over a described span schema,
+/// each `(span_id, name, start)` naming its span ID, name, and start time in
+/// Unix nanoseconds, so a journey controls exactly which spans a trace holds.
+///
+/// # Panics
+///
+/// Panics when the described schema does not assemble the rows.
+#[must_use]
+pub fn trace_spans(
+    schema: &SchemaRef,
+    trace_id: &[u8; 16],
+    spans: &[(u64, &str, i64)],
+) -> RecordBatch {
+    let rows: Vec<Row> = spans
+        .iter()
+        .map(|&(span_id, name, start)| {
+            BTreeMap::from([
+                ("trace_id", Cell::Bytes(trace_id.to_vec())),
+                ("span_id", Cell::Bytes(span_id.to_be_bytes().to_vec())),
+                ("name", Cell::Text(name.to_owned())),
+                ("kind", Cell::Int32(1)),
+                ("start_time_unix_nano", Cell::Int64(start)),
+                ("end_time_unix_nano", Cell::Int64(start + 1_000_000)),
+                ("duration_nano", Cell::Int64(1_000_000)),
+            ])
+        })
+        .collect();
+    batch(schema, &rows)
+}
+
 /// Build the trace-correlated error log batch over a described log schema.
 ///
 /// # Panics

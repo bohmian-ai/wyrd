@@ -1477,6 +1477,151 @@ async fn system_and_dynamic_tables_share_attribution() -> Result<(), ServerJourn
     Ok(())
 }
 
+/// Trusted producers sharing one tenant outbox keep each row's own origin.
+///
+/// Two root Services of different families and versions, each acting through
+/// its own runtime account under its own deployment environment, judge the
+/// same shared Agent component with one Drift Verifier. Each stages its
+/// pinned inputs row and its result through the production payload builder
+/// on the process outbox before one flush, so their rows travel together.
+/// Every retained `execution_inputs`, `results`, and `result_features` row
+/// names its own owning Service as workload and by name and version, its own
+/// account pair and environment, and the shared Agent by UID, kind, name,
+/// and version; no row takes another producer's or the delivering worker's
+/// identity.
+///
+/// # Errors
+///
+/// Returns a seeding, payload, flush, or query error, or the first table
+/// whose origins differ.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn trusted_delivery_preserves_each_origin() -> Result<(), ServerJourneyError> {
+    let journey = TypedPayloadJourney::start().await?;
+    let server = &journey.gateway.server;
+    let tenant = journey.gateway.tenant;
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    seed.declare(
+        "Prompt",
+        "origin-prompt",
+        &json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "Answer." }],
+        }),
+    )
+    .await?;
+    let agent = seed
+        .declare(
+            "Agent",
+            "origin-agent",
+            &json!({
+                "prompt": { "kind": "Prompt", "name": "origin-prompt", "version": "1.0.0" },
+                "execution_route": { "kind": "native" },
+            }),
+        )
+        .await?;
+    let verifier = seed.drift_verifier("origin-drift").await?;
+    for (namespace, name) in [
+        ("verification", "execution_inputs"),
+        ("verification", "results"),
+        ("drift", "result_features"),
+    ] {
+        server
+            .ensure_builtin_table_for_test(tenant, namespace, name)
+            .await?;
+    }
+    let now = Utc::now();
+    let window = DriftWindow {
+        start: now - chrono::Duration::hours(1),
+        end: now,
+    };
+    let outbox = server.state().bifrost.scribe_outbox();
+    let mut expected = Vec::new();
+    for (name, version, environment) in [
+        ("origin-billing", "2.0.0", "staging"),
+        ("origin-checkout", "1.0.0", "prod"),
+    ] {
+        let (root, account) = seed.release(name, version).await?;
+        let builder = ResultPayloadBuilder::new(
+            ResultRun {
+                execution_id: ExecutionId::new_v7(),
+                run_id: None,
+                verifier_version: "1.0.0",
+                card_uid: &agent,
+                owner_card_uid: Some(&root),
+                group_id: None,
+                deployment_environment: Some(environment),
+                binding_id: Some(BindingId::new_v7()),
+                trigger: None,
+                window: Some(&window),
+            },
+            &verifier,
+            now,
+            now,
+        );
+        let attribution = Attribution::direct(account);
+        outbox.stage(
+            tenant,
+            ScribeWrite::ExecutionInputs {
+                row: builder.inputs(&BTreeMap::new(), None)?,
+                attribution,
+                queued: None,
+            },
+        );
+        outbox.stage(
+            tenant,
+            ScribeWrite::Result {
+                payload: builder.build(&drift_outcome(Some(two_feature_report()?))?)?,
+                attribution,
+            },
+        );
+        expected.push(
+            [
+                root.as_str(),
+                agent.as_str(),
+                &account.to_string(),
+                &account.to_string(),
+                name,
+                version,
+                environment,
+                "Agent",
+                "origin-agent",
+                "1.0.0",
+            ]
+            .map(|value| json!(value))
+            .to_vec(),
+        );
+    }
+    server.flush_bifrost().await?;
+
+    for table in [
+        "bifrost.verification.execution_inputs",
+        "bifrost.verification.results",
+        "bifrost.drift.result_features",
+    ] {
+        expect_eq(
+            &format!("{table} origins"),
+            &journey
+                .rows(format!(
+                    "SELECT DISTINCT {WORKLOAD_CARD_UID}, {SUBJECT_CARD_UID}, \
+                     {SUB_PRINCIPAL_ID}, {ACT_PRINCIPAL_ID}, service_name, service_version, \
+                     deployment_environment, subject_kind, subject_name, subject_version \
+                     FROM {table} WHERE verifier_card_uid = '{verifier}' ORDER BY service_name"
+                ))
+                .await?,
+            &expected,
+        )?;
+    }
+
+    journey.gateway.server.shutdown().await?;
+    Ok(())
+}
+
 /// Raw Arrow IPC that bypasses every client-side Variant check reaches Scribe
 /// admission for a top-level and a nested signal Variant, and each malformed
 /// frame is refused with its exact catalogued error before any ACK.

@@ -178,7 +178,8 @@ async fn system_owner_security_rejections_retain_once() -> Result<(), ServerJour
 /// allowed and C/C and A/C denied for that Card. A request with no
 /// credential, an unparsable token, or A's claims under B's signature is
 /// refused before any principal resolves and so is never retained, least of
-/// all as A.
+/// all as A. No retained decision carries a workload, subject, or shared
+/// dimension from the worker that delivered it.
 ///
 /// # Errors
 /// Returns the server, bootstrap, exchange, request, or settle failure.
@@ -243,18 +244,24 @@ async fn subject_actor_decisions_preserve_trusted_identity() -> Result<(), Serve
     let mut rows = server
         .retained_audit_records(
             tenant,
-            "sub_principal_id, act_principal_id, outcome",
+            "sub_principal_id, act_principal_id, outcome, workload_card_uid, \
+             subject_card_uid, service_name, service_version, deployment_environment, \
+             subject_kind, subject_name, subject_version",
             &predicate,
         )
         .await?;
     rows.sort();
     let (a, b, c) = (a.id().to_string(), b.id().to_string(), c.id().to_string());
+    // A decision names no Card, so neither it nor its delivery adopts a
+    // workload, subject, or shared dimension.
     let pair = |sub: &str, act: &str, outcome: &str| {
-        vec![
+        let mut row = vec![
             Some(sub.to_owned()),
             Some(act.to_owned()),
             Some(outcome.to_owned()),
-        ]
+        ];
+        row.resize(11, None);
+        row
     };
     let mut expected = vec![
         pair(&a, &a, "allowed"),

@@ -1745,6 +1745,7 @@ async fn scribe_append_and_seal(
             expected_schema_fingerprint: fingerprint,
             request_id: wyrd_spec::request_id::RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
+            table_version: None,
             payload: fixture_ingress_ipc(batch),
         })
         .await

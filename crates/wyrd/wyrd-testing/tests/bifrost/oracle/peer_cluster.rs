@@ -610,6 +610,7 @@ impl PeerCluster {
                 expected_schema_fingerprint: fingerprint,
                 request_id: RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
+                table_version: None,
                 payload: bytes::Bytes::from(payload),
             })
             .await?;

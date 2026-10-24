@@ -1,7 +1,7 @@
 //! Redux-owned tenant-qualified Bifrost catalog.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use iceberg::io::object_cache::ObjectCache;
@@ -24,7 +24,7 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::ids::TableVersion;
 
-use crate::catalog::cut_cache::{CUT_CHANNEL, CutCache};
+use crate::catalog::cut_cache::{CUT_CHANNEL, CutCache, ListenedCache};
 use crate::catalog::error::BifrostCatalogError;
 use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
 use crate::catalog::iceberg_sql;
@@ -264,26 +264,22 @@ pub struct BifrostCatalog {
     /// returns the new location. Concurrent misses on one location each read
     /// it once; nothing waits on another query's read.
     metadata_cache: mini_moka::sync::Cache<String, TableMetadataRef>,
-    /// Registrations this node has already read, by tenant and table name.
+    /// Registrations and current definitions this node has already read, by
+    /// tenant and table name, served and filled only while [`Self::watch_cuts`]
+    /// is listening.
     ///
     /// A registration's UID is minted once and `(tenant, fqn)` is unique; its
-    /// fingerprint and layout change only with a new table version, after
-    /// which [`BifrostCatalog::evict_current_definition`] drops the entry.
-    /// Only found rows are cached, so a table registered later is still
-    /// seen on its first lookup. One control-row read fills the UID,
-    /// fingerprint, and layout every write and query resolves. Grows with
-    /// registered tables, never with writes or queries.
-    registrations: Arc<RwLock<HashMap<(DataTenantId, String), CachedRegistration>>>,
-    /// Current table definitions this node has already loaded, by tenant and
-    /// table name.
-    ///
-    /// The definition is what new admission binds: its schema is the field-id
-    /// authority Scribe stamps into every Parquet object. An entry stays until
-    /// [`BifrostCatalog::evict_current_definition`] drops it after a new
-    /// version commits; batches already accepted are unaffected because each
-    /// carries its own version. Grows with registered tables, never with
-    /// writes.
-    current_definitions: Arc<RwLock<CurrentDefinitions>>,
+    /// fingerprint and layout change only with a new table version. The
+    /// current definition is what new admission binds: its schema is the
+    /// field-id authority Scribe stamps into every Parquet object. A
+    /// definition-change notification or
+    /// [`BifrostCatalog::evict_current_definition`] drops both entries and
+    /// fences any load already in flight, so an older read cannot refill
+    /// them; batches already accepted are unaffected because each carries its
+    /// own version. Only found rows are cached, so a table registered later is
+    /// still seen on its first lookup. Grows with registered tables, never
+    /// with writes or queries.
+    current: Arc<ListenedCache<CurrentEntries>>,
     /// Node-local Oracle cut cache, served only while [`Self::watch_cuts`]
     /// is listening for invalidations.
     cut_cache: Arc<CutCache>,
@@ -292,9 +288,15 @@ pub struct BifrostCatalog {
     default_target_file_size_bytes: u64,
 }
 
-/// Current table definitions a node has loaded, keyed by tenant and table
-/// name.
-type CurrentDefinitions = HashMap<(DataTenantId, String), Arc<TableDefinition>>;
+/// The registrations and current definitions a node has loaded, keyed by
+/// tenant and table name.
+#[derive(Default)]
+struct CurrentEntries {
+    /// Immutable registration facts per table version.
+    registrations: HashMap<(DataTenantId, String), CachedRegistration>,
+    /// Current table definitions.
+    definitions: HashMap<(DataTenantId, String), Arc<TableDefinition>>,
+}
 
 /// The complete definition one table version declares.
 ///
@@ -553,10 +555,8 @@ impl BifrostCatalog {
         }
         let generation = self.cut_cache.fill_generation();
         let cut = self.read_cut(tenant, tables).await?;
-        if let Some(generation) = generation {
-            self.cut_cache
-                .insert(generation, std::time::Instant::now(), &cut);
-        }
+        self.cut_cache
+            .insert(generation, std::time::Instant::now(), &cut);
         Ok(cut)
     }
 
@@ -565,13 +565,11 @@ impl BifrostCatalog {
     /// drops each cut they name. The cut cache serves only while the
     /// subscription is live; see [`vala_sql::NotificationListener::watch`].
     ///
-    /// A notification an edit sends also drops that table's cached current
-    /// definition, so this node's next admission binds the committed version.
-    /// Losing the subscription clears every cached definition as well, since
-    /// a missed edit could otherwise leave one current forever.
-    ///
-    /// # Panics
-    /// Panics only if a thread panicked while holding a cache lock.
+    /// A notification an edit sends also drops that table's cached
+    /// registration and current definition, so this node's next admission
+    /// binds the committed version. The definition cache, like the cut cache,
+    /// serves only while subscribed, since a missed edit could otherwise
+    /// leave a superseded definition current forever.
     pub async fn watch_cuts(&self, shutdown: tokio_util::sync::CancellationToken) {
         self.postgres
             .listener(CUT_CHANNEL)
@@ -579,14 +577,7 @@ impl BifrostCatalog {
                 shutdown,
                 |live| {
                     self.cut_cache.reset(live);
-                    self.current_definitions
-                        .write()
-                        .expect("the current definition cache lock is never poisoned")
-                        .clear();
-                    self.registrations
-                        .write()
-                        .expect("the registration cache lock is never poisoned")
-                        .clear();
+                    self.current.reset(live);
                 },
                 |payload| {
                     let Some(cut) = payload.strip_suffix(
@@ -951,8 +942,7 @@ impl BifrostCatalog {
             warehouse,
             manifest_cache: Arc::new(std::sync::OnceLock::new()),
             metadata_cache: mini_moka::sync::Cache::new(METADATA_CACHE_ENTRIES),
-            registrations: Arc::default(),
-            current_definitions: Arc::default(),
+            current: Arc::default(),
             cut_cache: Arc::default(),
             default_target_file_size_bytes: crate::forge::compact::DEFAULT_TARGET_FILE_SIZE_BYTES,
         })
@@ -1283,18 +1273,15 @@ impl BifrostCatalog {
     /// exists, as at startup reconciliation. Only the first registration
     /// records it; a repeat keeps the stored pair.
     ///
-    /// A built-in this node has already resolved answers from the immutable
-    /// registration cache; only the first ensure per tenant and table takes the
-    /// advisory lock and loads Iceberg metadata, then reads the control row
-    /// once into the cache.
+    /// While [`Self::watch_cuts`] is listening, a built-in this node has
+    /// already resolved answers from the registration cache; only the first
+    /// ensure per tenant and table takes the advisory lock and loads Iceberg
+    /// metadata, then reads the control row once into the cache.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::MetadataMismatch`] when the definition
     /// names an unknown namespace, and otherwise the registration, fingerprint,
     /// metadata, Iceberg, or SQL error from the locked create path.
-    ///
-    /// # Panics
-    /// Panics only if a thread panicked while holding the cache lock.
     pub async fn ensure_builtin(
         &self,
         tenant: DataTenantId,
@@ -1641,40 +1628,35 @@ impl BifrostCatalog {
     /// id, nested and managed fields included; Scribe stamps exactly the
     /// definition's ids into the objects it writes so Forge and Oracle resolve
     /// its columns by the table's own numbering. Answers from the node's cache
-    /// when this table was loaded before, and otherwise loads the tenant-bound
-    /// Iceberg table once and caches its current definition.
+    /// when this table was loaded before and the node is still listening for
+    /// edits, and otherwise loads the tenant-bound Iceberg table, caching its
+    /// current definition only when no edit was heard during the load.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::InvalidBinding`] when the tenant-qualified
     /// binding cannot be resolved, the Iceberg error when the physical table
     /// cannot be loaded, and [`BifrostCatalogError::MetadataMismatch`] when
     /// the current metadata does not rebuild a valid definition.
-    ///
-    /// # Panics
-    /// Panics only if a thread panicked while holding the cache lock.
     pub async fn current_definition(
         &self,
         table: &TableRef,
         tenant: DataTenantId,
     ) -> Result<Arc<TableDefinition>, BifrostCatalogError> {
         let key = (tenant, table.fqn());
-        let cached = self
-            .current_definitions
-            .read()
-            .expect("the current definition cache lock is never poisoned")
-            .get(&key)
-            .map(Arc::clone);
-        if let Some(definition) = cached {
+        if let Some(definition) = self
+            .current
+            .get(|entries| entries.definitions.get(&key).map(Arc::clone))
+        {
             return Ok(definition);
         }
+        let generation = self.current.fill_generation();
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let loaded = self.catalog.load_table(&binding.table_ident()).await?;
         let definition = Arc::new(TableDefinition::of_metadata(&key.1, loaded.metadata())?);
-        self.current_definitions
-            .write()
-            .expect("the current definition cache lock is never poisoned")
-            .insert(key, Arc::clone(&definition));
+        self.current.fill(generation, |entries| {
+            entries.definitions.insert(key, Arc::clone(&definition));
+        });
         Ok(definition)
     }
 
@@ -1737,20 +1719,14 @@ impl BifrostCatalog {
     }
 
     /// Drops this node's cached registration and current definition of one
-    /// table, so the next admission reads the version committed since.
-    ///
-    /// # Panics
-    /// Panics only if a thread panicked while holding a cache lock.
+    /// table, so the next admission reads the version committed since; a load
+    /// already in flight cannot refill either.
     pub fn evict_current_definition(&self, table: &TableRef, tenant: DataTenantId) {
         let key = (tenant, table.fqn());
-        self.current_definitions
-            .write()
-            .expect("the current definition cache lock is never poisoned")
-            .remove(&key);
-        self.registrations
-            .write()
-            .expect("the registration cache lock is never poisoned")
-            .remove(&key);
+        self.current.invalidate(|entries| {
+            entries.definitions.remove(&key);
+            entries.registrations.remove(&key);
+        });
     }
 
     /// Return the registered user-schema fingerprint for one tenant/logical table.
@@ -1952,16 +1928,13 @@ impl BifrostCatalog {
         Ok(())
     }
 
-    /// Returns one table's cached registration, reading and caching its
-    /// control row on this node's first lookup.
+    /// Returns one table's cached registration, reading its control row on a
+    /// miss and caching it only when no edit was heard during the read.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::TableNotFound`] when the tenant does not
     /// own the registration, a metadata error for a malformed UID,
     /// fingerprint, or stored layout, or the SQL error of the read.
-    ///
-    /// # Panics
-    /// Panics only if a thread panicked while holding the cache lock.
     async fn registration(
         &self,
         table: &TableRef,
@@ -1971,6 +1944,7 @@ impl BifrostCatalog {
         if let Some(cached) = self.cached_registration(tenant, &fqn) {
             return Ok(cached);
         }
+        let generation = self.current.fill_generation();
         let row = self
             .lookup_table_row(&fqn, tenant)
             .await?
@@ -1985,23 +1959,23 @@ impl BifrostCatalog {
             fingerprint: SchemaFingerprint(fingerprint),
             layout: layout_wire_from_row(&row)?,
         };
-        self.registrations
-            .write()
-            .expect("the registration cache lock is never poisoned")
-            .insert((tenant, fqn), registration.clone());
+        self.current.fill(generation, |entries| {
+            entries
+                .registrations
+                .insert((tenant, fqn), registration.clone());
+        });
         Ok(registration)
     }
 
-    /// Returns one table's registration when this node has already read it.
-    ///
-    /// # Panics
-    /// Panics only if a thread panicked while holding the cache lock.
+    /// Returns one table's registration when this node has already read it
+    /// and is still listening for edits.
     fn cached_registration(&self, tenant: DataTenantId, fqn: &str) -> Option<CachedRegistration> {
-        self.registrations
-            .read()
-            .expect("the registration cache lock is never poisoned")
-            .get(&(tenant, fqn.to_owned()))
-            .cloned()
+        self.current.get(|entries| {
+            entries
+                .registrations
+                .get(&(tenant, fqn.to_owned()))
+                .cloned()
+        })
     }
 
     async fn lookup_table_row(
@@ -2978,10 +2952,12 @@ mod production_pin_tests {
         });
     }
 
-    /// A built-in this node has ensured is ensured again without Postgres.
+    /// A built-in a listening node has ensured is ensured again without
+    /// Postgres.
     ///
     /// Only the first ensure per tenant and table may take the advisory lock
-    /// and load Iceberg metadata. Closing the pool
+    /// and load Iceberg metadata. The node is marked listening as
+    /// [`BifrostCatalog::watch_cuts`] does once subscribed; closing the pool
     /// after the first ensure makes any later round trip fail.
     ///
     /// # Panics
@@ -3003,6 +2979,7 @@ mod production_pin_tests {
             .expect("redux catalog builds over the fixture");
             let tenant = fixture.data_tenant_id();
             let spans = crate::tables::builtin_table("traces", "spans").expect("spans is built in");
+            catalog.current.reset(true);
             let first = catalog
                 .ensure_builtin(tenant, spans, wyrd_spec::auth::Attribution::unresolved())
                 .await

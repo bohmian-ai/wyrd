@@ -812,6 +812,7 @@ async fn seed_fixture_table(
                     expected_schema_fingerprint: fingerprint,
                     request_id: wyrd_spec::request_id::RequestId::now_v7(),
                     batch_id: uuid::Uuid::now_v7(),
+                    table_version: None,
                     payload: fixture_rows_ipc(start_id, chunk, groups)?,
                 })
                 .await?;

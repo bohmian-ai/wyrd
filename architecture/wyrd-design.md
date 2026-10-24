@@ -641,7 +641,7 @@ platform plane, and neither plane's credential or token is accepted by the
 other.
 
 Both planes write their authorization decisions to the one canonical audit
-path: the in-memory Scribe outbox into `vala.system.audit_log`. Permissions
+path: the in-memory Scribe outbox into `bifrost.system.audit_log`. Permissions
 are blocking; audits are non-blocking: a decision is staged on the shared
 Scribe outbox and never delays or fails the operation. A decision records the deciding principal's
 stored kind and, when its token was minted from a credential, that
@@ -667,7 +667,7 @@ with the tenant's `System` principal as actor for a queued run — which Scribe
 stamps as `sub_principal_id` and `act_principal_id`; each row names the verified Card as `card_uid` and the
 exact Verifier Card as `verifier_card_uid`; a result batch is never dropped for time and is retried under its
 own batch id until Scribe acknowledges it. Gate refuses every public write to
-`vala.gateway.calls` and the three result tables.
+`bifrost.gateway.calls` and the three result tables.
 Tenant principal kinds are `TenantAdmin`, `User`, and `Service`, plus the
 internal credentialless `System` actor. Agent is a Card kind, not a principal
 kind. A `Service` principal is a stable nonhuman account for Services, Agents,
@@ -998,7 +998,7 @@ Server spans export twice from one tracer provider:
   sampled flag and `tracestate`, changes what the operator receives.
 - A server span whose parent or one of whose links is a sampled client span
   also writes, with its catalog descendants, to the requesting tenant's
-  `vala.traces.spans` on the process Scribe outbox, with the same trace,
+  `bifrost.traces.spans` on the process Scribe outbox, with the same trace,
   span, and parent ids. A continued request's spans therefore form one tree
   with the client's, and a queued write's `bifrost.gate.write` CONSUMER span,
   which reaches the server with its producers as links and no `traceparent`,
@@ -1020,7 +1020,7 @@ Server spans export twice from one tracer provider:
   operator endpoint.
 
 `Bifrost::trace_timeline` (and its Python and TypeScript projections) reads
-one trace's spans from `vala.traces.spans`, plus traces linking directly to
+one trace's spans from `bifrost.traces.spans`, plus traces linking directly to
 it, in start-time order, scoped to the caller's tenant.
 
 #### Observation identity — `Card → Run → Observation`
@@ -1701,8 +1701,8 @@ A `VerificationResult` carries `execution_id`, optional `run_id`, the exact
 `duration_ms`, `reason`, `provenance`, `tool_calls`), and pinned `evidence`.
 Provenance records code hash and runtime, extraction version, Agent and Prompt
 versions, effective routes, drift baselines and windows, and input digests.
-`vala.verification.results` is the canonical analytical result surface and
-`vala.verification.execution_inputs` holds pinned input declarations and
+`bifrost.verification.results` is the canonical analytical result surface and
+`bifrost.verification.execution_inputs` holds pinned input declarations and
 queued activation context.
 
 Every work record names who the work was for (`sub_principal_id`) and who

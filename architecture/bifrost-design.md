@@ -107,7 +107,7 @@ transform, the descending time key (after shared context on attributable built-i
 bounds, and `COUNT(*)`. Built-in tables declare their own: OTLP spans
 `start_time_unix_nano`, OTLP logs and metrics `time_unix_nano`, gateway and
 agent traces `started_at`, Drift observations and
-`vala.system.audit_log` `created_at`, and `vala.verification.results`
+`bifrost.system.audit_log` `created_at`, and `bifrost.verification.results`
 `ended_at`. Every caller-supplied `wyrd_*` column is reserved and refused.
 
 A physical layout is that required UTC hour or day time partition plus at most
@@ -192,11 +192,13 @@ The tenant is not a row column. It is a property of the physical table, of
 each Parquet file, and of each in-memory Scribe bucket, all bound from the
 authenticated principal.
 
-Nullable `run_id` and `card_uid` provide optional Card/Run correlation.
-Required, non-null `sub_principal_id` and `act_principal_id` record who the
-row's work was for and who performed it. Public writes are stamped from the
-verified token and refuse supplied values; server-owned outbox writes carry
-each row's own verified pair, which Scribe validates. A direct publisher is both, a delegated one records the
+Nullable `workload_card_uid`, `subject_card_uid` and `run_id` provide
+optional execution-root, observed-Card and Run correlation. Required, non-null
+`sub_principal_id` and `act_principal_id` record who the row's work was for and
+who performed it. Public writes are stamped from the verified token and its
+validated workload root and refuse supplied values; server-owned outbox writes,
+audit included, carry each row's own accepted origin (root, subject, Run,
+pair and request), which Scribe validates. A direct publisher is both, a delegated one records the
 party it acts for as subject and itself as actor. None participates in row
 identity.
 
@@ -205,7 +207,8 @@ record-level `wyrd.card_uid` and `wyrd.run_id` attributes. Every source
 attribute is retained in the record's Variant attribute column; when a
 collection repeats a key, the final occurrence is the one stored, matching the
 OTel data model and the correlation rule. The values use the `CardUid` and
-`RunId` text grammars. Scribe stores a client Card UID only when the verified
+`RunId` text grammars and land in `subject_card_uid` and `run_id`; the OTLP
+attribute keeps its `wyrd.card_uid` spelling. Scribe stores a client Card UID only when the verified
 principal scope, or for a principal bound to no Card the tenant registry,
 confirms it.
 
@@ -331,7 +334,7 @@ order in the order above; the first failure names the field, row, and path.
 Built-in tables store open caller content as Variant and closed shapes as
 typed columns:
 
-- `vala.traces.spans`, `vala.logs.records`, and `vala.metrics.points` store
+- `bifrost.traces.spans`, `bifrost.logs.records`, and `bifrost.metrics.points` store
   their attribute collections (record, resource, scope, span event and link,
   and exemplar filtered attributes), the log `body`, and the metric `metadata`
   as Variant. `resource_entity_refs` is a list of Structs with `type`,
@@ -345,37 +348,37 @@ typed columns:
   `http_response_status_code`, `url_full`, and the `exception_*` columns of the
   span's last `exception` event on spans; the record's own `exception_*`
   attributes and `body_text` (the body when it is a string) on logs.
-- `vala.verification.results` carries the generic outcome of one execution:
+- `bifrost.verification.results` carries the generic outcome of one execution:
   execution, Run, Verifier, subject, and binding identity, the verdict, and the
   requirement, step, evidence, and provenance breakdown as the `outcome`
   Variant. A requirement's custom Verdict `data` stays inside that outcome,
   with no column of its own. A drift requirement's typed detail lives in that outcome; its
   per-feature method, score, threshold, and verdict are also projected one row
-  per feature into `vala.drift.result_features`, joined on `result_id` and
+  per feature into `bifrost.drift.result_features`, joined on `result_id` and
   `requirement_id`.
   Published correlation columns are `execution_id`, nullable `binding_id`,
   and nullable application `run_id`; result timing remains `started_at` and
   `ended_at`. A verification execution is never relabelled as an application
   Run.
-- `vala.verification.execution_inputs` holds each execution's pinned input
+- `bifrost.verification.execution_inputs` holds each execution's pinned input
   declarations (JSON values, file digests, Artifact and trace references) and
   its server-owned `queue_execution` marker: false for `verify`, true for
   `submit`. Only a `true` record activates queued work.
   Its published input timestamp is `recorded_at`, the server-recorded input
   time, distinct from execution timing or sample/window time. It uses the
   same execution/binding/application-Run correlation names where applicable.
-- Every nullable built-in Struct — the `vala.metrics.points` bucket sets and
-  `vala.gateway.calls` `resolved_model` — has nullable children, because a
+- Every nullable built-in Struct — the `bifrost.metrics.points` bucket sets and
+  `bifrost.gateway.calls` `resolved_model` — has nullable children, because a
   required Parquet leaf under a null parent reads back as another row's value
   through a field query. The Struct is whole or absent: a present one sets every child its
   shape requires and an absent one nulls every child, so `s['child']` reads
   SQL null for an absent Struct on hot and published data alike. Admission
   refuses a batch with a partial Struct before ACK with
   `WYRD_VALA_400_SCHEMA_PARSE` naming the row and child.
-- The `vala.verification.results` breakdown, the
-  `vala.verification.execution_inputs` declarations,
-  `vala.gateway.calls` `request_payload` and `response_payload`, and
-  `vala.system.audit_log` `detail` are Variant.
+- The `bifrost.verification.results` breakdown, the
+  `bifrost.verification.execution_inputs` declarations,
+  `bifrost.gateway.calls` `request_payload` and `response_payload`, and
+  `bifrost.system.audit_log` `detail` are Variant.
 
 ### Variant shredding
 
@@ -1149,7 +1152,7 @@ stability; pruning, vectorization, layout, and IO efficiency determine latency.
 
 Oracle read decisions use the one process Scribe outbox. After admission the
 read-decision event is staged without waiting; the outbox writer submits it to
-Scribe as a `vala.system.audit_log` row in a per-tenant batch, like every other
+Scribe as a `bifrost.system.audit_log` row in a per-tenant batch, like every other
 audit event. Rows are not held for that write; a retryable failure is logged,
 counted through `outbox_write_failures_total{outbox="scribe"}`, and retried with
 the identical batch, and a terminal rejection is logged, counted through
@@ -1185,7 +1188,7 @@ through the success terminal of the one public query operation. The public
 query deadline range is `1..=u32::MAX` milliseconds across Rust, HTTP, gRPC,
 Python, TypeScript, and MCP.
 
-`vala.system.audit_log` is the authoritative retained audit history. Every
+`bifrost.system.audit_log` is the authoritative retained audit history. Every
 audit event is staged in memory on the process Scribe outbox, whose one
 background writer groups a tenant slice by destination, encodes one Arrow
 frame per group with a batch id derived from its content, and submits it to
@@ -1207,7 +1210,7 @@ recorded as lineage in `vala.scribe_batch_commits` and `vala.forge_operations`;
 they emit no audit event. The publication path therefore evaluates no new
 permission and appends nothing, so retained audit history cannot feed itself.
 
-`vala.system.audit_log` partitions daily, deviating from the hourly granularity
+`bifrost.system.audit_log` partitions daily, deviating from the hourly granularity
 of the high-rate telemetry tables. Forge cannot bin-pack across partition
 boundaries, so hourly partitions would permanently cap every audit object at one
 hour of a tenant's audit traffic regardless of compaction settings. Audit also
@@ -1216,9 +1219,9 @@ to: one row per authorized request rather than continuous high-rate ingest,
 date-range rather than recent-window queries, and retention measured in years
 rather than days.
 
-The four verification tables — `vala.drift.observations`,
-`vala.verification.execution_inputs`, `vala.verification.results`, and
-`vala.drift.result_features` — also partition by UTC day on each table's time
+The four verification tables — `bifrost.drift.observations`,
+`bifrost.verification.execution_inputs`, `bifrost.verification.results`, and
+`bifrost.drift.result_features` — also partition by UTC day on each table's time
 column — `created_at` for observations, `ended_at` for results,
 `recorded_at` for execution inputs, and `wyrd_ingested_at` for result
 features —
@@ -1609,7 +1612,7 @@ across a restart; durable batch, file, and task rows answer that question.
   span records exactly one `outcome`. A request that continues a sampled
   client trace keeps it: the Gate and Oracle spans join the caller's trace,
   and the request's behavior-catalog spans are also copied to the tenant's
-  `vala.traces.spans` (see `wyrd-design.md`, Trace context). A queued write's
+  `bifrost.traces.spans` (see `wyrd-design.md`, Trace context). A queued write's
   batch carries up to 32 producer trace contexts, and `bifrost.gate.write`,
   the CONSUMER span, links each one from its start, so a batch linking a
   sampled producer is also copied to the producer's tenant as a linked trace.
@@ -1654,7 +1657,7 @@ The surface includes:
   columns after the edit's renames, and kept lists follow a rename by field
   ID. A stale edit is a typed HTTP 409 with no mutation; malformed/unsupported
   edits are 400 and missing `bifrost_table:write` is 403, audited as
-  `vala.bifrost.alter`. Time-column identity and canonical/managed schemas
+  `bifrost.bifrost.alter`. Time-column identity and canonical/managed schemas
   remain protected; re-registration never alters a table;
 - `AppendReceipt { batch_id, accepted_rows, durability }`, where `durability`
   is the closed `AppendDurability::Acknowledged` value; the synchronous append
@@ -1680,19 +1683,19 @@ new batch construction; an accepted retry uses its original fence version and
 strict equality checks. Native input remains subject to structural/type/
 nullability/reserved-field/value checks, including built-in contracts.
 
-Observation namespaces such as `vala.traces`, `vala.metrics`, `vala.logs`,
-`vala.drift`, `vala.verification`, `vala.gateway`, and
-`vala.system` remain tenant-qualified Bifrost tables. Canonical SQL is their
+Observation namespaces such as `bifrost.traces`, `bifrost.metrics`, `bifrost.logs`,
+`bifrost.drift`, `bifrost.verification`, `bifrost.gateway`, and
+`bifrost.system` remain tenant-qualified Bifrost tables. Canonical SQL is their
 only read contract;
 the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
-`vala.gateway.calls` and the three verification tables
-(`vala.verification.results`, `vala.verification.execution_inputs`, and
-`vala.drift.result_features`) accept no public write at all: Gate refuses every
+`bifrost.gateway.calls` and the three verification tables
+(`bifrost.verification.results`, `bifrost.verification.execution_inputs`, and
+`bifrost.drift.result_features`) accept no public write at all: Gate refuses every
 principal. Only the server-internal capture writer writes them, together with
-the capture spans in `vala.traces.spans`, and the tenant copies of server
+the capture spans in `bifrost.traces.spans`, and the tenant copies of server
 spans join them there through the same outbox; result rows carry the verified
 Card as `card_uid` and the exact Verifier Card as `verifier_card_uid`. Each
 row carries the verified pair it was produced under, which Scribe validates as
@@ -1707,16 +1710,16 @@ request outbox; staged inputs not yet acknowledged are lost on abrupt process
 death, and the execution then never becomes visible. A pod without
 Scribe submits through `ScribeCapturePeerService.IngestCapture` on the peer
 listener, which the same `wyrd-peer` mTLS admits; the request names its
-tenant and one of those five tables or `vala.system.audit_log` explicitly,
+tenant and one of those five tables or `bifrost.system.audit_log` explicitly,
 carries no token, and its rows carry their own subject and actor pairs. Audit
 rows carry their own identities as row content, so an audit batch submits the
 no-verified-caller sentinel pair. Every outbox frame names that
 no-verified-caller marker as its transport principal; it grants nothing. It is
 refused for any
 other table, and for the reserved system tenant unless the table is
-`vala.system.audit_log`. Sensitive-column metadata remains descriptive; table query
+`bifrost.system.audit_log`. Sensitive-column metadata remains descriptive; table query
 permission governs every column, including GenAI fields stored on trace spans,
-except that a projection reaching the `vala.gateway.calls` request or response
+except that a projection reaching the `bifrost.gateway.calls` request or response
 payload columns also requires the tenant-wide gateway payload-read permission.
 
 Bifrost query permissions carry an object axis. A `bifrost_query:read` grant is

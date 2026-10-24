@@ -2134,9 +2134,9 @@ async fn declared_file_target(
 /// by Forge, while an undeclared table compacts toward the deployment default.
 ///
 /// Both tables are registered through the public client. The declared table
-/// carries its target as its only explicit Iceberg property; re-registering it
-/// with the same value or with none is idempotent, and a different value is
-/// refused without changing it. Each table then receives two flushed public
+/// stores its target and the undeclared table stores the deployment default
+/// resolved at creation; re-registering with the same value or with none is
+/// idempotent, and a different value is refused without changing it. Each table then receives two flushed public
 /// appends, and the pod's own Forge promotes and rewrites them: the declared
 /// table's committed rewrite records the declared target, the undeclared
 /// table's records the approximately 1 GiB deployment default, the rewrite
@@ -2160,6 +2160,7 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     let tenant = cluster.data_tenant_id();
     let client = tenant_client(server, tenant).await;
     let target = 256 * 1024 * 1024_u64;
+    let default = vala_bifrost_redux::forge::ForgeConfig::default().default_target_file_size_bytes;
     let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
     ]));
@@ -2225,15 +2226,15 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
         }
     };
     assert_eq!(described(&declared).await, Some(target));
-    assert_eq!(described(&undeclared).await, None);
+    assert_eq!(described(&undeclared).await, Some(default));
     assert_eq!(
         declared_file_target(&cluster, &declared.binding).await,
         Some(target)
     );
     assert_eq!(
         declared_file_target(&cluster, &undeclared.binding).await,
-        None,
-        "an omitted target writes no Iceberg property"
+        Some(default),
+        "an omitted target stores the deployment default resolved at creation"
     );
     assert_eq!(
         register(&declared, Some(target))
@@ -2261,8 +2262,8 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     assert_eq!(described(&declared).await, Some(target));
     assert_eq!(
         described(&undeclared).await,
-        None,
-        "omission on an existing table leaves it undeclared"
+        Some(default),
+        "omission on an existing table leaves its stored target unchanged"
     );
 
     let mut expected = BTreeMap::new();
@@ -2294,15 +2295,9 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     )
     .await;
 
-    for ((table, recorded), promoted) in [
-        (&declared, target),
-        (
-            &undeclared,
-            vala_bifrost_redux::forge::ForgeConfig::default().default_target_file_size_bytes,
-        ),
-    ]
-    .into_iter()
-    .zip(promoted)
+    for ((table, recorded), promoted) in [(&declared, target), (&undeclared, default)]
+        .into_iter()
+        .zip(promoted)
     {
         let targets = rewrite_targets(&cluster, &table.binding).await;
         assert!(

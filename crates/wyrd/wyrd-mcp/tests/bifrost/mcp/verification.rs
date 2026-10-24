@@ -279,7 +279,9 @@ mod pg_tests {
             Ok(serde_json::from_value(structured(response)?)?)
         }
 
-        /// Select the named Service and follow opaque continuation without repeating a Card.
+        /// Select the named Service, then follow opaque continuation over every
+        /// Service, the administrator's fixture Service included, without
+        /// repeating or skipping one.
         ///
         /// # Errors
         /// Returns MCP or response decoding failures.
@@ -291,19 +293,24 @@ mod pg_tests {
             assert_eq!(Some(&named.items[0].card_uid), self.service.uid.as_ref());
             assert_eq!(named.items[0].version, self.service.version);
 
-            let first = self
-                .list(serde_json::json!({ "kind": "Service", "limit": 1 }))
-                .await?;
-            assert_eq!(first.items.len(), 1);
-            let cursor = first
-                .next_cursor
-                .ok_or("two Services require continuation")?;
-            let second = self
-                .list(serde_json::json!({ "kind": "Service", "limit": 1, "cursor": cursor }))
-                .await?;
-            assert_eq!(second.items.len(), 1);
-            assert_ne!(first.items[0].card_uid, second.items[0].card_uid);
-            assert!(second.next_cursor.is_none());
+            // The two shared graphs' Services and the administrator's own
+            // fixture Service.
+            let all = self.list(serde_json::json!({ "kind": "Service" })).await?;
+            assert_eq!(all.items.len(), 3, "{all:?}");
+            assert!(all.next_cursor.is_none());
+            let mut paged = Vec::new();
+            let mut arguments = serde_json::json!({ "kind": "Service", "limit": 1 });
+            loop {
+                let page = self.list(arguments.clone()).await?;
+                assert_eq!(page.items.len(), 1);
+                paged.push(page.items[0].card_uid.clone());
+                let Some(cursor) = page.next_cursor else {
+                    break;
+                };
+                arguments["cursor"] = serde_json::json!(cursor);
+            }
+            let listed: Vec<_> = all.items.iter().map(|item| item.card_uid.clone()).collect();
+            assert_eq!(paged, listed, "continuation repeats and skips no Service");
             Ok(())
         }
 
@@ -1390,10 +1397,18 @@ mod pg_tests {
             .bootstrap_service("mcp-traced-actor", &["editor", "mcp_judge_invoker"])
             .await?;
         // The subject is A's family runtime account at A's root; the actor is
-        // an unrestricted account at its own fixture root, which delegation
-        // requires.
+        // an unrestricted account that selects A's root too, since delegation
+        // needs a rooted actor and narrows the Card scope to both graphs.
         let subject_jwt = server.exchange_rooted(&agent).await?;
-        let actor_jwt = server.exchange_rooted(&actor).await?;
+        let actor_jwt = server
+            .exchange_api_key_for_workload(
+                actor.api_key().ok_or("the actor has an API key")?,
+                agent
+                    .card_ref()
+                    .and_then(|card| card.uid.as_ref())
+                    .ok_or("A has a registered root")?,
+            )
+            .await?;
         let delegated = server
             .delegate(&subject_jwt, &actor_jwt, TokenAudience::Wyrd)
             .await?;

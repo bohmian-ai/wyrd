@@ -1794,8 +1794,10 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         panic!("event stream expected: {:?}", response.body);
     };
     while stream.recv().await.is_some() {}
-    // The streamed call is accounted and captured after the relay reports
-    // usage, on tracked gateway work.
+    // Dropping the stream hands it off, as the response body does in
+    // production; the streamed call is then accounted and captured after the
+    // relay reports usage, on tracked gateway work.
+    drop(stream);
     drain_gateway(&state).await;
     let row = captured(&scribe, response.call_id);
     assert_eq!(row["outcome"], "succeeded", "{row}");

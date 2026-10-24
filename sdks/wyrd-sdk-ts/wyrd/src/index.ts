@@ -1158,11 +1158,6 @@ export class Bifrost {
     this.#native = native;
   }
 
-  /** @internal Wrap one native handle; {@link Bifrost.connect} is the public constructor. */
-  static fromNative(native: NativeBifrost): Bifrost {
-    return new Bifrost(native);
-  }
-
   /**
    * Connect one client, optionally already bound to a write target.
    *

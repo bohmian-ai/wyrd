@@ -67,18 +67,20 @@ def dataset(wyrd_server: WyrdTestServer) -> str:
 
 
 @pytest.fixture
-def otlp_tracer(otlp_environment: None, observed_key: str) -> Iterator[TracerProvider]:
+def otlp_tracer(
+    otlp_environment: None, observed_key: str, observed: WyrdState
+) -> Iterator[TracerProvider]:
     """A private stock OTel provider exporting to the deployment as the ``observed-service``.
 
     The provider is private, as an agent framework's often is, so Wyrd's
     correlation processor is registered through the explicit hook. Spans
     asserting a ``wyrd.card_uid`` are admitted only within the exporting key's
-    Card scope, so the exporter authenticates with the Service's own key.
+    Card scope, so the exporter authenticates with the Service's own key run
+    as the Service's root, which a family-restricted account must select.
     """
+    headers = {"x-wyrd-api-key": observed_key, "x-wyrd-workload-uid": str(observed.root_ref.uid)}
     provider = TracerProvider()
-    provider.add_span_processor(
-        BatchSpanProcessor(OTLPSpanExporter(headers={"x-wyrd-api-key": observed_key}))
-    )
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(headers=headers)))
     assert install_run_correlation(provider) is True
     yield provider
     provider.shutdown()

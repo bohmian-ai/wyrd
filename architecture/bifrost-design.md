@@ -198,7 +198,13 @@ optional execution-root, observed-Card and Run correlation. Required, non-null
 who performed it. Public writes are stamped from the verified token and its
 validated workload root and refuse supplied values; server-owned outbox writes,
 audit included, carry each row's own accepted origin (root, subject, Run,
-pair and request), which Scribe validates. A direct publisher is both, a delegated one records the
+pair, request and environment), which Scribe validates. The six shared
+dimensions are never caller input on either path: Scribe stamps the readable
+Service and subject labels from the registry entries of the row's own
+workload and subject UIDs when it admits the batch, and the environment from
+that row's accepted context, so one batch keeps each row's origin and neither
+the delivering worker nor a later registry change relabels it. A public write
+that supplies a dimension is refused before ACK. A direct publisher is both, a delegated one records the
 party it acts for as subject and itself as actor. None participates in row
 identity.
 

@@ -183,10 +183,10 @@ Every language prints one passing and one failing verdict, each naming the exact
 
 ```text
 passed: the comparison held
-  subject:  default/Service/support-reply@1.0.0#<uid>
+  subject:  Service/support-reply@1.0.0#<uid>
   verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
 failed: operator NotContains returned false
-  subject:  default/Service/support-reply@1.0.0#<uid>
+  subject:  Service/support-reply@1.0.0#<uid>
   verifier: default/Verifier/no-refund-promise@1.0.0#<uid>
 ```
 

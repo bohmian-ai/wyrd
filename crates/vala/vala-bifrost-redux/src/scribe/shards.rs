@@ -1405,8 +1405,8 @@ impl ShardOwner {
                     } else {
                         tracing::error!(error = %error, shard = self.id, "Scribe shard group failed");
                     }
+                    self.publish_snapshot();
                 }
-                self.publish_snapshot();
                 self.pending.fetch_sub(group_len, Ordering::AcqRel);
                 self.drained.notify_waiters();
                 continue;
@@ -3110,6 +3110,9 @@ impl PostCommitInsertOwner {
 impl ShardOwner {
     /// Writes, syncs, inserts, rotates, and ACKs one bounded tenant-fair group.
     ///
+    /// The owner's inspection snapshot is published before the ACK, so a
+    /// writer that observes its ACK reads memtable stats that include its rows.
+    ///
     /// Each append's write profile is charged its shard wait when the group
     /// starts; each serial stage is timed once into [`GroupStages`] and charged
     /// to every append the group acknowledges.
@@ -3191,6 +3194,8 @@ impl ShardOwner {
         let state = post_commit.into_state();
         let _ = touched_keys;
         self.record_committed(&state);
+        // Inspection readers observe the rows before any writer sees its ACK.
+        self.publish_snapshot();
         Self::acknowledge_visible(state, &stages);
         Ok(())
     }
@@ -3268,6 +3273,7 @@ impl ShardOwner {
             self.retained_commit_ambiguity = Some(state);
             return Err(error);
         }
+        self.publish_snapshot();
         Self::acknowledge_visible(state, &stages);
         Ok(())
     }

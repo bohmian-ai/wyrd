@@ -275,8 +275,8 @@ def test_cli_gateway_agents(cli_bootstrap_client: WyrdClient) -> None:
 
     Each loaded Agent keeps the registered route, Prompt provider, model, and
     identities. The application sends each rendered Prompt itself, and the call
-    is retained under its own Run and Card. A caller whose key is bound to
-    another Card is refused.
+    is retained under its own Run and Card. A caller restricted to another
+    Service family is refused.
     """
     bundle = Path(os.environ["WYRD_LOCAL_DEV_AGENT_BUNDLE"])
     state = WyrdState.from_path(bundle, cli_bootstrap_client)
@@ -311,7 +311,9 @@ def test_cli_gateway_agents(cli_bootstrap_client: WyrdClient) -> None:
     other = WyrdState.from_path(bundle, other_card)
     refused = call_agent(other_card, other, "openai", other.run("openai").run_id)
     assert refused.status_code == 403, refused.text
-    assert refused.json()["error"]["code"] == "WYRD_VALA_403_BIFROST_CARD_SCOPE", refused.text
+    assert refused.json()["error"]["code"] == "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED", (
+        refused.text
+    )
 
     bifrost = Bifrost(client=cli_bootstrap_client)
     query = (
@@ -832,6 +834,7 @@ def test_installed_cli_gateway_setup(tmp_path: Path) -> None:
                 issued = wyrd(
                     *("principal", "credential", "create-principal"),
                     *("--name", "ask-agent-runtime", "--role", "workload"),
+                    *("--workload-name", "other-agents"),
                     *("--server", f"http://{env['WYRD_SERVER_BIND']}"),
                 )
                 assert issued.returncode == 0, issued.stderr
@@ -1313,7 +1316,7 @@ def test_guided_manual_setup(language: str, tmp_path: Path) -> None:
         assert ran.returncode == 0, ran.stdout + ran.stderr
         verdicts = [line.split(":")[0] for line in ran.stdout.splitlines() if not line[0].isspace()]
         assert verdicts == ["passed", "failed"], ran.stdout
-        assert "  subject:  default/Service/support-reply@1.0.0#" in ran.stdout
+        assert "  subject:  Service/support-reply@1.0.0#" in ran.stdout
         runs = stored_verdicts(cli_path, reader, env, sql)
         assert {"passed", "failed"} in runs.values(), runs
 

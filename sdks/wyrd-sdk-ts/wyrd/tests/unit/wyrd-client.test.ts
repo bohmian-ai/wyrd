@@ -81,16 +81,19 @@ test("state httpAuth carries its own service, run, and environment", async () =>
     // Another state's Run nested inside never relabels this state's request,
     // and the request keeps the Run it started in while its token is fetched.
     const run = prod.run("agent_triage");
-    const pending = run.scope(() =>
-      staging.run().scope(() => {
-        const request = prodFetch("http://wyrd/v1/models", { headers: placeholders });
-        void stagingFetch("http://wyrd/v1/models");
-        return request;
-      }),
+    await run.scope(() =>
+      staging
+        .run()
+        .scope(() =>
+          Promise.all([
+            prodFetch("http://wyrd/v1/models", { headers: placeholders }),
+            stagingFetch("http://wyrd/v1/models"),
+          ]),
+        ),
     );
-    await pending;
-    await new Promise((resolve) => setImmediate(resolve));
-    const [own, other] = sent.splice(0).map(sentContext);
+    const contexts = sent.splice(0).map(sentContext);
+    const own = contexts.find((sentHeaders) => sentHeaders["x-wyrd-deployment-environment"] === "prod");
+    const other = contexts.find((sentHeaders) => sentHeaders["x-wyrd-deployment-environment"] === "staging");
     expect(own).toEqual({
       ...base,
       "x-wyrd-deployment-environment": "prod",

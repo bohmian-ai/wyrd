@@ -14,7 +14,7 @@
 //! exporter, stamping every span started inside a `Run::scope` with that Run
 //! and Card.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use opentelemetry::trace::TracerProvider as _;
@@ -31,7 +31,6 @@ use tokio::runtime::Handle;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use wyrd_client::WyrdClient;
-use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::observe::current_run_scope;
 use wyrd_client::state::WyrdState;
 use wyrd_spec::error::WyrdError;
@@ -39,9 +38,9 @@ use wyrd_spec::error::WyrdError;
 /// Header the Wyrd OTLP collector reads the bearer from.
 const ACCESS_TOKEN_HEADER: &str = "x-wyrd-access-token";
 
-/// The provider [`start_telemetry`] installed and the pinned middleware of the
+/// The provider [`start_telemetry`] installed and the pinned client of the
 /// state it exports as, which every later call for that state returns.
-static INSTALLED: OnceLock<(Arc<AuthMiddleware>, SdkTracerProvider)> = OnceLock::new();
+static INSTALLED: OnceLock<(WyrdClient, SdkTracerProvider)> = OnceLock::new();
 
 /// The `tracing` pipeline [`start_telemetry`] installed for this process.
 #[derive(Clone, Debug)]
@@ -94,8 +93,8 @@ impl Telemetry {
 /// built, such as outside a Tokio runtime.
 pub fn start_telemetry(state: &WyrdState) -> Result<Telemetry, WyrdError> {
     let client = state.client()?;
-    if let Some((auth, provider)) = INSTALLED.get() {
-        if !Arc::ptr_eq(auth, &client.auth()) {
+    if let Some((installed, provider)) = INSTALLED.get() {
+        if !installed.shares_auth(client) {
             return Err(WyrdError::SdkTelemetryProviderExists {
                 message: "another WyrdState's telemetry pipeline is already installed".to_owned(),
                 details: json!({ "root": state.root_ref() }),
@@ -126,7 +125,7 @@ pub fn start_telemetry(state: &WyrdState) -> Result<Telemetry, WyrdError> {
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
-    let _ = INSTALLED.set((client.auth(), provider.clone()));
+    let _ = INSTALLED.set((client.clone(), provider.clone()));
     Ok(Telemetry { provider })
 }
 
@@ -268,7 +267,7 @@ impl TokenHttpClient {
                 uid.as_str().try_into()?,
             );
         }
-        if let Some(environment) = client.auth().deployment_environment() {
+        if let Some(environment) = client.deployment_environment() {
             request.headers_mut().insert(
                 wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER,
                 environment.try_into()?,

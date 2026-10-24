@@ -1569,7 +1569,10 @@ pub struct Record {
 /// its repetitions, the workload finishes, and the host is sampled again.
 /// An overrun, interruption, or workload failure stops admission, keeps the
 /// partial evidence, and marks every remaining step unmeasured; it never
-/// fabricates a metric. `started_at` and `finished_at` are actual instants.
+/// fabricates a metric. Optional profile captures save beside the drain and
+/// the after sample, and the budget and minimum judge the run's elapsed time
+/// when that work ends, never the saving. `started_at` and `finished_at` are
+/// actual instants, the latter after saving.
 pub async fn run<W, H, F>(
     sealed: Sealed,
     workload: &mut W,
@@ -1594,6 +1597,7 @@ where
     let sample = Duration::from_secs(declaration.validity.host_sample_seconds);
     let interrupt = options.interrupt.clone();
     let mut stopped: Option<Reason> = None;
+    let mut worked = None;
 
     if validity.is_empty() {
         host_before = host(sample).await;
@@ -1622,7 +1626,7 @@ where
                 Err(reason) => stopped = Some(reason),
             }
         }
-        let mut profiler = match (&options.profiler, stopped.is_none()) {
+        let profiler = match (&options.profiler, stopped.is_none()) {
             (Some(program), true) => Profiler::start(
                 program,
                 &workload.processes(),
@@ -1677,18 +1681,7 @@ where
                 }
             }
         }
-        if options.profiler.is_some() {
-            profile = tokio::task::spawn_blocking(move || profiler.finish())
-                .await
-                .unwrap_or_else(|_| ProfileNote {
-                    requested: true,
-                    notes: vec!["the profiler thread panicked".to_owned()],
-                    ..ProfileNote::default()
-                });
-        } else {
-            profiler = Profiler::disabled();
-            drop(profiler);
-        }
+        let saving = tokio::task::spawn_blocking(move || profiler.finish());
         match tokio::time::timeout(FINISH_GRACE, workload.finish()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => validity.push(Reason::new(
@@ -1712,8 +1705,14 @@ where
             &declaration.validity,
             "after",
         ));
+        worked = Some(clock.elapsed());
+        profile = saving.await.unwrap_or_else(|_| ProfileNote {
+            requested: true,
+            notes: vec!["the profiler thread panicked".to_owned()],
+            ..ProfileNote::default()
+        });
     }
-    let elapsed = clock.elapsed();
+    let elapsed = worked.unwrap_or_else(|| clock.elapsed());
     if elapsed > Duration::from_secs(timing.budget_seconds) {
         validity.push(Reason::new(
             "budget.exceeded",
@@ -3155,6 +3154,8 @@ mod tests {
         prepared: bool,
         /// Whether finish ran.
         finished: bool,
+        /// Whether `watch` existed when finish began draining.
+        saved_at_drain: Option<bool>,
     }
 
     /// A workload replaying scripted repetitions; each call sleeps its
@@ -3173,6 +3174,8 @@ mod tests {
         settle: Option<Duration>,
         /// What the smoke finds missing, when set.
         smoke: Option<String>,
+        /// A file whose presence finish notes as the drain begins.
+        watch: Option<PathBuf>,
     }
 
     impl Scripted {
@@ -3185,6 +3188,7 @@ mod tests {
                 interrupt: None,
                 settle: None,
                 smoke: None,
+                watch: None,
             }
         }
     }
@@ -3234,7 +3238,9 @@ mod tests {
         }
 
         async fn finish(&mut self) -> Result<(), ExperimentError> {
-            self.seen.lock().expect("seen").finished = true;
+            let mut seen = self.seen.lock().expect("seen");
+            seen.finished = true;
+            seen.saved_at_drain = self.watch.as_ref().map(|watch| watch.exists());
             Ok(())
         }
     }
@@ -4841,5 +4847,74 @@ limitations = "excluded"
             Verdict::Invalid,
             "a profile never supplies the CPU denominator"
         );
+    }
+
+    /// V9: a capture slow to save neither postpones the drain nor changes
+    /// the budget judgment or verdict, and is still kept; a genuine overrun
+    /// is INVALID with and without a profile.
+    ///
+    /// # Panics
+    ///
+    /// Panics when saving delays the drain or decides the budget.
+    #[tokio::test(start_paused = true)]
+    async fn profile_saving_never_delays_drain_or_budget() {
+        let root = tempfile::tempdir().expect("root");
+        let slow = root.path().join("slow-profiler");
+        std::fs::write(
+            &slow,
+            "#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do [ \"$1\" = --output ] && out=\"$2\"; shift; done\n\
+             trap 'sleep 1; echo profile > \"$out\"; exit 0' INT\nwhile :; do sleep 0.02; done\n",
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&slow).expect("metadata").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&slow, permissions).expect("chmod");
+        let artifacts = root.path().join("target");
+        let capture = artifacts
+            .join("profiles")
+            .join(format!("profile-{}.json.gz", std::process::id()));
+        let run_with = |profiler: Option<PathBuf>, stall: Duration| {
+            let (artifacts, capture) = (artifacts.clone(), capture.clone());
+            async move {
+                let mut workload = Scripted::always(&good());
+                workload.settle = Some(Duration::from_millis(500));
+                workload.stall = stall;
+                workload.watch = Some(capture);
+                let options = Options {
+                    artifacts,
+                    profiler,
+                    interrupt: CancellationToken::new(),
+                };
+                let record = execute(
+                    declaration(),
+                    &mut workload,
+                    [Some(quiet()), Some(quiet())],
+                    &options,
+                )
+                .await;
+                let saved = workload.seen.lock().expect("seen").saved_at_drain;
+                (record, saved)
+            }
+        };
+        let (unprofiled, _) = run_with(None, Duration::ZERO).await;
+        let (profiled, saved) = run_with(Some(slow.clone()), Duration::ZERO).await;
+        assert_eq!(saved, Some(false), "the drain began before saving ended");
+        assert!(
+            profiled.artifacts.profile.complete,
+            "{:?}",
+            profiled.artifacts.profile
+        );
+        assert_eq!(profiled.verdict, unprofiled.verdict);
+        assert_eq!(profiled.elapsed_seconds, unprofiled.elapsed_seconds);
+        assert_eq!(validity(&profiled), validity(&unprofiled));
+        for profiler in [None, Some(slow)] {
+            let (overrun, _) = run_with(profiler, Duration::from_secs(250)).await;
+            assert!(
+                codes(&overrun).contains(&"budget.exceeded"),
+                "{:?}",
+                overrun.reasons
+            );
+            assert_eq!(overrun.verdict, Verdict::Invalid);
+        }
     }
 }

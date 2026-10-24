@@ -121,11 +121,13 @@ impl Profiler {
         profiler
     }
 
-    /// Interrupts every capture, waits up to [`SAVE_GRACE`] for each to save,
-    /// and says what was captured.
+    /// Interrupts every capture at once, then waits until one shared
+    /// [`SAVE_GRACE`] deadline for them to save, killing any still running,
+    /// and says what was captured. Blocks the calling thread while captures
+    /// save; the runner calls it beside the workload's drain, never before.
     #[must_use]
     pub fn finish(mut self) -> ProfileNote {
-        let mut captures = Vec::new();
+        let mut saving = Vec::new();
         for (pid, mut child, output) in std::mem::take(&mut self.captures) {
             if let Ok(Some(status)) = child.try_wait() {
                 self.notes.push(format!(
@@ -136,7 +138,11 @@ impl Profiler {
             let _ = Command::new("kill")
                 .args(["-s", "INT", &child.id().to_string()])
                 .status();
-            let deadline = Instant::now() + SAVE_GRACE;
+            saving.push((pid, child, output));
+        }
+        let deadline = Instant::now() + SAVE_GRACE;
+        let mut captures = Vec::new();
+        for (pid, mut child, output) in saving {
             let mut exited = false;
             while Instant::now() < deadline {
                 if let Ok(Some(_)) = child.try_wait() {

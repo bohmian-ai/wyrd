@@ -8,7 +8,10 @@ an append-only record in this directory. They are not part of any test lane,
 ```bash
 mise run bench:smoke                 # every path's release smoke, in seconds
 mise run bench:l1                    # Level 1, all three engines in order
-mise run bench:l1:bifrost            # Level 1, one engine
+mise run bench:l1:bifrost            # Level 1 Bifrost: writes, hot, parquet
+mise run bench:l1:bifrost:writes     # one Bifrost experiment
+mise run bench:l1:bifrost:hot
+mise run bench:l1:bifrost:parquet
 mise run bench:l1:verification
 mise run bench:l1:gateway
 mise run bench:l2:bifrost            # Level 2, one engine
@@ -18,8 +21,10 @@ mise run bench:l1:gateway -- --profile --steps chat.c64
 ```
 
 `bench:smoke` proves every timing boundary, CPU reading and counter is
-collected, records nothing, and exits 0 or 2. Run it first. An L1 engine takes
-up to 15 minutes (`bench:l1` about 45). An L2 engine takes 20 to 30 minutes.
+collected, records nothing, and exits 0 or 2. Run it first. Verification and
+Gateway L1 take up to 15 minutes each. The Bifrost L1 experiments take up to
+6 (`writes`), 5 (`hot`), and 9 (`parquet`) minutes, and `bench:l1` up to 50
+in all. An L2 engine takes 20 to 30 minutes.
 
 ## Prerequisites
 
@@ -71,16 +76,27 @@ run is discarded.
 
 | Level | Shape | Windows | Budget |
 |---|---|---|---|
-| L1 | Isolated closed-loop work: a client sweep (1/4/16/64) per operation | 5 s warmup, then 3 × 10 s per step | 900 s |
+| L1 | Isolated closed-loop work: a client sweep (1/4/16/64; Bifrost 1/64) per operation | 5 s warmup, then 3 × 10 s per step | 900 s; Bifrost 360/300/540 s |
 | L2 | Competing open-loop work: every repetition runs capacity → overload → recovery from equivalent state | 120 s warmup, then 3 × 360 s | 1,800 s, at least 1,200 s |
 
 What each engine covers:
 
 - **Bifrost.**
-  - L1 `isolated` uses the 10M-row events fixture published as Parquet:
-    - point lookups at 1/4/16/64 clients, with p99 below 5 ms at 64;
-    - small aggregates and full scans at 1/64; scans report p95;
-    - 2M-row write sweeps for native writes, OTLP spans, and OTLP logs.
+  - L1 is three experiments at 1 and 64 clients, each with its own record:
+    - `writes`: 2M-row native, OTLP spans, and OTLP logs writes, complete
+      at their durable acknowledgement with no wait for publication.
+    - `hot`: 10M events rows and 1M spans held in memtables (a staged or
+      published row is INVALID); point lookups at 1/64, with p99 below 5 ms
+      at 64, a small aggregate and a shredded-attribute span filter at 1.
+    - `parquet`: the same fixtures and a 200,000-row native and logs
+      storage sample, settled once as Parquet; point lookups at 1/64, a
+      small aggregate and a full scan at 1 (scans report p95), span
+      `trace_id` Bloom lookups at 1/64, and shredded and long-tail
+      attribute filters at 1. Each settled query must carry its own scan
+      facts. After settlement, outside every window, it checks that span
+      files shred exactly the keys over the 10% threshold and that a
+      span-time window prunes, and reads each write path's storage ratio.
+    - Scaling is reported for reads measured at both 1 and 64.
   - L1 sanity floors are the only absolute throughput limits: the native
     peak must reach at least 200k rows/s, and the OTLP peak at least 30 wire
     MiB per server CPU-second.
@@ -93,7 +109,8 @@ What each engine covers:
     samples per repetition.
   - The L2 ingest rate is 70% of the mixed capacity `1/Σ(f_i/r_i)` times
     `--server-cores` (default 8). It is calibrated from the newest valid
-    `bench:l1:bifrost` record with the same host, build, fixture, and limits.
+    `bench:l1:bifrost:writes` record with the same host, build, fixture, and
+    limits.
     Without such a record, L2 is INVALID before any work.
 - **Verification.**
   - L1 `direct-verify` runs direct verify at 1/4/16/64 clients. Server
@@ -179,7 +196,7 @@ it. The report printed at the end is regenerated from the record alone, so it
 can be reproduced after `target/` is gone:
 
 ```bash
-target/profiling/release/capacity report benchmarks/bifrost/isolated/<record>.json
+target/profiling/release/capacity report benchmarks/bifrost/parquet/<record>.json
 ```
 
 Commit records worth keeping. The history in this directory is how results

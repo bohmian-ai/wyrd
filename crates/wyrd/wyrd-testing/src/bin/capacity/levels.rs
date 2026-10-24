@@ -253,9 +253,22 @@ pub fn aggregate(arguments: &[String], mut run_engine: impl FnMut(Engine, &[Stri
 }
 
 /// Runs one engine's `l1` as a child of this binary under the repository's
-/// test Postgres wrapper, so each engine starts from a fresh database.
+/// test Postgres wrapper, so each engine starts from a fresh database;
+/// Bifrost runs each of its experiments in order as its own child and
+/// combines their exit codes by precedence, never stopping early.
 pub fn spawn_engine(root: &Path, engine: Engine, forwarded: &[String]) -> u8 {
-    spawn(root, &["l1", engine.name()], forwarded)
+    if engine != Engine::Bifrost {
+        return spawn(root, &["l1", engine.name()], forwarded);
+    }
+    let codes: Vec<u8> = crate::query::Experiment::ALL
+        .iter()
+        .map(|experiment| {
+            let code = spawn(root, &["l1", engine.name(), experiment.name()], forwarded);
+            eprintln!("l1 bifrost {}: exit {code}", experiment.name());
+            code
+        })
+        .collect();
+    Verdict::combine(&codes)
 }
 
 /// Runs this binary with `command` and `forwarded` as a child under the

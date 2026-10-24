@@ -3,10 +3,11 @@
 //! - `l1 <engine>`: isolated closed-loop work for `bifrost` ([`query`]),
 //!   `verification` ([`verification`]), or `gateway` ([`gateway`]), through
 //!   `mise run bench:l1:<engine>`; `l1` alone runs all three in order,
-//!   through `mise run bench:l1`.
+//!   through `mise run bench:l1`. `l1 bifrost <writes|hot|parquet>` runs one
+//!   Bifrost experiment; `l1 bifrost` alone runs all three in order.
 //! - `l2 <engine>`: competing open-loop work through capacity, overload, and
 //!   recovery, through `mise run bench:l2:<engine>`.
-//! - `smoke [l1|l2 <engine>]`: only the release smoke every level runs
+//! - `smoke [l1|l2 <engine> [experiment]]`: only the release smoke every level runs
 //!   first, through `mise run bench:smoke`; alone it smokes every level and
 //!   engine, each under its own fresh Postgres, and records nothing.
 //! - `report <record.json>`: regenerates a persisted record's report.
@@ -78,10 +79,26 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
             .cloned()
             .collect()
     };
+    let bare = |index: usize| {
+        arguments
+            .get(index)
+            .is_none_or(|next| next.starts_with("--"))
+    };
     match (command, engine) {
+        (Some("l1"), Some(Engine::Bifrost)) if bare(3) => {
+            let shared = rest(3);
+            if let Err(message) = flags::known(&shared, &levels::VALUED[..0], &levels::SWITCHES) {
+                eprintln!(
+                    "capacity l1 bifrost: {message}; running every experiment takes only --profile and --allow-dirty"
+                );
+                return 2;
+            }
+            let forwarded: Vec<String> = shared.into_iter().skip(1).collect();
+            levels::spawn_engine(root, Engine::Bifrost, &forwarded)
+        }
         (Some("l1"), Some(engine)) => Box::pin(level(Level::One, engine, &rest(3), root)).await,
         (Some("l2"), Some(engine)) => Box::pin(level(Level::Two, engine, &rest(3), root)).await,
-        (Some("l1"), None) if arguments.get(2).is_none_or(|next| next.starts_with("--")) => {
+        (Some("l1"), None) if bare(2) => {
             let shared = rest(2);
             if let Err(message) = flags::known(&shared, &levels::VALUED[..0], &levels::SWITCHES) {
                 eprintln!(
@@ -94,20 +111,26 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
             })
         }
         (Some("smoke"), _) if arguments.len() == 2 => {
-            let codes: Vec<u8> = [Level::One, Level::Two]
-                .into_iter()
-                .flat_map(|level| levels::ENGINES.map(|engine| (level, engine)))
-                .map(|(level, engine)| {
-                    levels::spawn(
-                        root,
-                        &["smoke", &format!("l{}", u8::from(level)), engine.name()],
-                        &[],
-                    )
+            let mut paths: Vec<Vec<&str>> = query::Experiment::ALL
+                .iter()
+                .map(|experiment| vec!["l1", "bifrost", experiment.name()])
+                .collect();
+            for engine in &levels::ENGINES[1..] {
+                paths.push(vec!["l1", engine.name()]);
+            }
+            for engine in levels::ENGINES {
+                paths.push(vec!["l2", engine.name()]);
+            }
+            let codes: Vec<u8> = paths
+                .iter()
+                .map(|path| {
+                    let command: Vec<&str> = std::iter::once("smoke").chain(path.clone()).collect();
+                    levels::spawn(root, &command, &[])
                 })
                 .collect();
             Verdict::combine(&codes)
         }
-        (Some("smoke"), _) if arguments.len() == 4 => {
+        (Some("smoke"), _) if matches!(arguments.len(), 4 | 5) => {
             let level = match arguments[2].as_str() {
                 "l1" => Some(Level::One),
                 "l2" => Some(Level::Two),
@@ -115,7 +138,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
             };
             let (Some(level), Some(engine)) = (level, engine_at(arguments, 3)) else {
                 eprintln!(
-                    "capacity smoke: expected `smoke [l1|l2 <bifrost|verification|gateway>]`"
+                    "capacity smoke: expected `smoke [l1|l2 <bifrost|verification|gateway>]`, `l1 bifrost` with its experiment"
                 );
                 return 2;
             };
@@ -146,7 +169,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
         }
         _ => {
             eprintln!(
-                "capacity: expected `l1 [bifrost|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `smoke [l1|l2 <engine>]`, or `report <record.json>`, got {:?}",
+                "capacity: expected `l1 [bifrost [writes|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `smoke [l1|l2 <engine>]`, or `report <record.json>`, got {:?}",
                 &arguments[1.min(arguments.len())..]
             );
             2
@@ -210,7 +233,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use wyrd_testing::experiment::{
         Arrivals, Declaration, Engine, ExperimentError, HostRecord, Level, Op, Options, Phase,
-        Reading, Record, Repetition, Rule, Source, Status, Step, StepKind, Verdict, Workload, run,
+        Reading, Record, Repetition, Rule, Source, Status, Step, StepKind, Timing, Verdict,
+        Workload, run,
     };
     use wyrd_testing::release_server::{HostLoad, PEAK_SAMPLE_INTERVAL_MS};
 
@@ -282,7 +306,12 @@ mod tests {
             &[],
         );
         let mut declaration = match engine {
-            Engine::Bifrost => query::declare(level, &arguments, base, root),
+            Engine::Bifrost => query::declare(
+                (level == Level::One).then(|| query::experiment(&arguments).expect("experiment")),
+                &arguments,
+                base,
+                root,
+            ),
             Engine::Verification => verification::declare(level, &arguments, base, root),
             Engine::Gateway => gateway::declare(level, &arguments, base, root),
         }
@@ -457,18 +486,16 @@ mod tests {
             .collect()
     }
 
-    /// The Bifrost L1 write script: rows per server CPU-second rise to a
-    /// peak at 16 clients, native twice spans and spans twice logs, and
-    /// every OTLP step sends 40 wire MiB per server CPU-second; the point
-    /// lookup at 64 clients reads `point_p99_ms`.
+    /// The Bifrost L1 script: rows per server CPU-second rise to a peak at
+    /// 64 clients, native twice spans and spans twice logs, and every OTLP
+    /// step sends 40 wire MiB per server CPU-second; the point lookup at 64
+    /// clients reads `point_p99_ms`.
     fn bifrost_script(point_p99_ms: f64) -> Script {
         Box::new(move |step, _, repetition| {
             let cpu = repetition.server_cpu_seconds.expect("cpu");
             let curve = match step.number("clients") {
                 Some(1) => 100_000.0,
-                Some(4) => 200_000.0,
-                Some(16) => 300_000.0,
-                _ => 250_000.0,
+                _ => 300_000.0,
             };
             let factor = match step.text("op") {
                 Some("native-write") => 2.0,
@@ -510,62 +537,123 @@ mod tests {
             (5, 10, 3, 900)
         );
 
-        let bifrost = declare(Engine::Bifrost, Level::One, &[], BASELINE_HOST, &root);
-        assert!(bifrost.refusals().is_empty(), "{:?}", bifrost.refusals());
-        assert_eq!(bifrost.timing, timing);
-        for control in ["fixture", "limits", "workload", "timing"] {
-            assert!(bifrost.controls.contains_key(control), "{control}");
+        let experiment = |experiment: query::Experiment, rest: &[&str], host: &str| {
+            let rest: Vec<&str> = std::iter::once(experiment.name())
+                .chain(rest.iter().copied())
+                .collect();
+            declare(Engine::Bifrost, Level::One, &rest, host, &root)
+        };
+        let writes = experiment(query::Experiment::Writes, &[], BASELINE_HOST);
+        let hot = experiment(query::Experiment::Hot, &[], BASELINE_HOST);
+        let parquet = experiment(query::Experiment::Parquet, &[], BASELINE_HOST);
+        for (bifrost, budget) in [(&writes, 360), (&hot, 300), (&parquet, 540)] {
+            assert!(bifrost.refusals().is_empty(), "{:?}", bifrost.refusals());
+            assert_eq!(
+                bifrost.timing,
+                Timing {
+                    budget_seconds: budget,
+                    ..timing
+                }
+            );
+            for control in ["fixture", "limits", "workload", "timing"] {
+                assert!(bifrost.controls.contains_key(control), "{control}");
+            }
+            assert!(
+                bifrost.controls["timing"]["timer_resolution_ns"]
+                    .as_u64()
+                    .is_some_and(|ns| ns > 0),
+                "the measured timer resolution is a declared control"
+            );
+            assert!(
+                !bifrost
+                    .criteria
+                    .iter()
+                    .any(|criterion| matches!(criterion.rule, Rule::Unusable { .. })),
+                "every declared baseline is in the approved data"
+            );
         }
-        assert!(
-            bifrost.controls["timing"]["timer_resolution_ns"]
-                .as_u64()
-                .is_some_and(|ns| ns > 0),
-            "the measured timer resolution is a declared control"
-        );
         for metric in [
-            "queries_per_s_per_vcpu",
-            "queries_per_cpu_s",
             "rows_per_s_per_vcpu",
             "rows_per_cpu_s",
             "mib_per_s_per_vcpu",
             "mib_per_cpu_s",
         ] {
-            assert!(bifrost.metric(metric).is_some(), "{metric}");
+            assert!(writes.metric(metric).is_some(), "{metric}");
         }
-        let mut measured = sweep("point", "-", &query::SWEEP);
-        measured.extend(sweep("small-aggregate", "-", &query::PAIR));
-        measured.extend(sweep("full-scan", "-", &query::PAIR));
+        for metric in [
+            "queries_per_s_per_vcpu",
+            "queries_per_cpu_s",
+            "span_shredding_faults",
+            "storage_ratio.otlp-spans",
+        ] {
+            assert!(parquet.metric(metric).is_some(), "{metric}");
+        }
+        let mut measured = Vec::new();
         for op in query::WriteOp::ALL {
-            measured.extend(sweep(op.name(), "-", &query::SWEEP));
+            measured.extend(sweep(op.name(), "-", &query::PAIR));
         }
-        assert_eq!(steps(&bifrost, true), measured);
+        assert_eq!(steps(&writes, true), measured);
         assert_eq!(
-            steps(&bifrost, false),
+            steps(&writes, false),
+            ["native-write-peak", "otlp-spans-peak", "otlp-logs-peak"]
+        );
+        assert_eq!(
+            steps(&hot, true),
             [
-                "point-scaling",
-                "small-aggregate-scaling",
-                "full-scan-scaling",
-                "native-write-peak",
-                "otlp-spans-peak",
-                "otlp-logs-peak"
+                "point-c1",
+                "point-c64",
+                "small-aggregate-c1",
+                "span-shredded-c1"
             ]
         );
+        assert_eq!(steps(&hot, false), ["point-scaling"]);
+        let reads = [
+            "point-c1",
+            "point-c64",
+            "small-aggregate-c1",
+            "full-scan-c1",
+            "span-trace-c1",
+            "span-trace-c64",
+            "span-shredded-c1",
+            "span-long-tail-c1",
+        ];
+        assert_eq!(steps(&parquet, true), reads);
+        assert_eq!(
+            steps(&parquet, false),
+            ["point-scaling", "span-trace-scaling"]
+        );
         assert!(
-            bifrost.controls["fixture"]["native"]
+            writes.controls["fixture"]["native"]
                 .as_str()
                 .is_some_and(|fixture| fixture.starts_with("native-2m"))
         );
-        assert_eq!(applies(&bifrost, "point-p99-slo"), ["point-c64"]);
-        let slo = bifrost
-            .criteria
-            .iter()
-            .find(|criterion| criterion.id == "point-p99-slo")
-            .expect("point SLO");
-        assert_eq!(slo.percentile, Some(99));
         assert!(
-            matches!(slo.rule, Rule::Limit { op: Op::Lt, limit, .. } if limit == query::POINT_P99_MS)
+            hot.controls["limits"]
+                .as_str()
+                .is_some_and(|limits| limits.contains("WYRD_MAX_FILE_SIZE_IN_MEMORY=16384")),
+            "hot keeps every row in a memtable"
         );
-        let floors: Vec<(&str, &str, f64)> = bifrost
+        assert!(applies(&writes, "point-p99-slo").is_empty());
+        for bifrost in [&hot, &parquet] {
+            assert_eq!(applies(bifrost, "point-p99-slo"), ["point-c64"]);
+            let slo = bifrost
+                .criteria
+                .iter()
+                .find(|criterion| criterion.id == "point-p99-slo")
+                .expect("point SLO");
+            assert_eq!(slo.percentile, Some(99));
+            assert!(
+                matches!(slo.rule, Rule::Limit { op: Op::Lt, limit, .. } if limit == query::POINT_P99_MS)
+            );
+        }
+        assert_eq!(applies(&parquet, "span-shredding"), ["span-shredded-c1"]);
+        assert_eq!(applies(&parquet, "span-pruning"), ["span-trace-c1"]);
+        assert_eq!(
+            applies(&parquet, "scan-facts.scanned_bytes_per_query"),
+            reads
+        );
+        assert!(applies(&hot, "scan-facts.scanned_bytes_per_query").is_empty());
+        let floors: Vec<(&str, &str, f64)> = writes
             .criteria
             .iter()
             .filter_map(|criterion| match criterion.rule {
@@ -595,7 +683,7 @@ mod tests {
                 .find(|criterion| criterion.id == format!("baseline.{id}"))
                 .map(|criterion| criterion.rule.clone())
         };
-        match baseline(&bifrost, "standard-parquet.selective.c64.cpu-us-per-query") {
+        match baseline(&parquet, "standard-parquet.selective.c64.cpu-us-per-query") {
             Some(Rule::Regression { baseline }) => {
                 assert!((baseline.value - 3_416.199).abs() < 1e-9);
                 assert!(
@@ -606,28 +694,30 @@ mod tests {
             }
             other => panic!("same-host same-fixture baseline judges: {other:?}"),
         }
+        assert!(baseline(&hot, "standard-hot.small-aggregate.c1.queries-per-cpu-s").is_some());
+        assert!(
+            parquet
+                .criteria
+                .iter()
+                .filter(|criterion| criterion.id.starts_with("baseline."))
+                .all(|criterion| !criterion.steps[0].starts_with("span-")),
+            "no span read has an eligible baseline"
+        );
         assert!(
             matches!(
-                baseline(&bifrost, "native-writes.write.c64.rows-per-cpu-s"),
+                baseline(&writes, "native-writes.write.c64.rows-per-cpu-s"),
                 Some(Rule::Advisory { .. })
             ),
             "the 10M native baseline cannot judge the 2M fixture"
         );
         assert!(matches!(
             baseline(
-                &bifrost,
+                &writes,
                 "otlp-spans-writes.otlp-spans.c64.otlp-wire-mib-per-cpu-s"
             ),
             Some(Rule::Regression { .. })
         ));
-        assert!(
-            !bifrost
-                .criteria
-                .iter()
-                .any(|criterion| matches!(criterion.rule, Rule::Unusable { .. })),
-            "every declared baseline is in the approved data"
-        );
-        let elsewhere = declare(Engine::Bifrost, Level::One, &[], OTHER_HOST, &root);
+        let elsewhere = experiment(query::Experiment::Parquet, &[], OTHER_HOST);
         assert!(
             matches!(
                 baseline(
@@ -639,7 +729,7 @@ mod tests {
             "a cross-host comparison is advisory"
         );
 
-        let (record, calls) = execute(bifrost.clone(), bifrost_script(4.9)).await;
+        let (record, calls) = execute(writes.clone(), bifrost_script(4.9)).await;
         assert!(
             record.validity.reasons.is_empty(),
             "{:?}",
@@ -650,15 +740,15 @@ mod tests {
             measured.len() * 4,
             "a warmup and three repetitions per step"
         );
-        assert!(record.elapsed_seconds <= 900.0);
+        assert!(record.elapsed_seconds <= 360.0);
         let peak = record
             .steps
             .iter()
             .find(|step| step.id == "native-write-peak")
             .expect("native peak");
         assert_eq!(peak.status, Status::Derived);
-        assert_eq!(peak.params.get("peak_of"), Some(&json!("native-write-c16")));
-        assert_eq!(peak.params.get("clients"), Some(&json!(16)));
+        assert_eq!(peak.params.get("peak_of"), Some(&json!("native-write-c64")));
+        assert_eq!(peak.params.get("clients"), Some(&json!(64)));
         assert_eq!(
             judged(&record, "native-write-peak", "native-peak-floor"),
             Some(Verdict::Pass)
@@ -667,6 +757,13 @@ mod tests {
             judged(&record, "otlp-logs-peak", "otlp-logs-peak-floor"),
             Some(Verdict::Pass)
         );
+        let (record, calls) = execute(parquet.clone(), bifrost_script(4.9)).await;
+        assert!(
+            record.validity.reasons.is_empty(),
+            "{:?}",
+            record.validity.reasons
+        );
+        assert_eq!(calls.len(), reads.len() * 4);
         assert_eq!(
             judged(&record, "point-c64", "point-p99-slo"),
             Some(Verdict::Pass)
@@ -676,23 +773,43 @@ mod tests {
             None,
             "64-client SLO only at 64"
         );
-        let (strict, _) = execute(bifrost.clone(), bifrost_script(query::POINT_P99_MS)).await;
+        assert_eq!(
+            judged(&record, "span-shredded-c1", "span-shredding"),
+            Some(Verdict::Pass)
+        );
+        assert_eq!(
+            judged(&record, "span-trace-c1", "span-pruning"),
+            Some(Verdict::Pass)
+        );
+        let (strict, _) = execute(parquet.clone(), bifrost_script(query::POINT_P99_MS)).await;
         assert_eq!(
             judged(&strict, "point-c64", "point-p99-slo"),
             Some(Verdict::Fail),
             "equality fails"
         );
+        let unscanned: Script = Box::new(|step, _, repetition| {
+            if step.id == "span-trace-c64" {
+                repetition.set(
+                    "scanned_bytes_per_query",
+                    Reading::missing("no scan on the query's trace"),
+                );
+            }
+        });
+        let (unscanned, _) = execute(parquet.clone(), unscanned).await;
+        assert_eq!(
+            unscanned.verdict,
+            Verdict::Invalid,
+            "a settled query without its scan facts is INVALID evidence"
+        );
 
-        let subset = declare(
-            Engine::Bifrost,
-            Level::One,
-            &["--steps", "point-c64,native-write-c1"],
+        let subset = experiment(
+            query::Experiment::Parquet,
+            &["--steps", "point-c64,span-trace-c1"],
             BASELINE_HOST,
-            &root,
         );
         assert_eq!(
             subset.selection,
-            Some(vec!["point-c64".to_owned(), "native-write-c1".to_owned()])
+            Some(vec!["point-c64".to_owned(), "span-trace-c1".to_owned()])
         );
         let (partial, calls) = execute(subset, bifrost_script(4.9)).await;
         assert_eq!(calls.len(), 8);
@@ -708,7 +825,7 @@ mod tests {
             "every unselected step, and every derived step over an incomplete sweep, is recorded omitted"
         );
         assert!(partial.render().contains("omitted by selection"));
-        let mut unknown = bifrost.clone();
+        let mut unknown = parquet.clone();
         assert!(levels::select(&mut unknown, &line(&["--steps", "point-c2"])).is_err());
 
         let verification = declare(Engine::Verification, Level::One, &[], BASELINE_HOST, &root);
@@ -833,16 +950,22 @@ mod tests {
         assert_eq!(record.verdict, Verdict::Invalid);
         assert!(calls.is_empty(), "a refused declaration admits no work");
 
-        let isolated = declare(
+        let writes = declare(
             Engine::Bifrost,
             Level::One,
-            &[],
+            &["writes"],
             BASELINE_HOST,
             &repository(),
         );
-        let (l1, _) = execute(isolated.clone(), bifrost_script(4.9)).await;
+        let (l1, _) = execute(writes.clone(), bifrost_script(4.9)).await;
         let (elsewhere, _) = execute(
-            declare(Engine::Bifrost, Level::One, &[], OTHER_HOST, &repository()),
+            declare(
+                Engine::Bifrost,
+                Level::One,
+                &["writes"],
+                OTHER_HOST,
+                &repository(),
+            ),
             bifrost_script(4.9),
         )
         .await;
@@ -933,8 +1056,19 @@ mod tests {
         )
         .await
         .0;
+        let (parquet, _) = execute(
+            declare(
+                Engine::Bifrost,
+                Level::One,
+                &["parquet"],
+                BASELINE_HOST,
+                &repository(),
+            ),
+            bifrost_script(4.9),
+        )
+        .await;
         assert_eq!(
-            judged(&l1, "point-c64", "point-p99-slo"),
+            judged(&parquet, "point-c64", "point-p99-slo"),
             Some(Verdict::Pass)
         );
         assert_eq!(
@@ -1146,7 +1280,12 @@ mod tests {
 
         let mut records = Vec::new();
         for engine in levels::ENGINES {
-            let declaration = declare(engine, Level::One, &[], OTHER_HOST, &repository());
+            let rest: &[&str] = if engine == Engine::Bifrost {
+                &["writes"]
+            } else {
+                &[]
+            };
+            let declaration = declare(engine, Level::One, rest, OTHER_HOST, &repository());
             let script: Script = if engine == Engine::Verification {
                 Box::new(|_, _, repetition| repetition.set("errors", Reading::exact(1.0)))
             } else {
@@ -1186,6 +1325,9 @@ mod tests {
             &["l1", "--clients", "4"],
             &["l2"],
             &["l2", "nosuch"],
+            &["l1", "bifrost", "nosuch"],
+            &["l1", "bifrost", "--clients", "4"],
+            &["smoke", "l1", "bifrost"],
             &[],
         ] {
             assert_eq!(dispatch(&line(usage), root.path()).await, 2, "{usage:?}");

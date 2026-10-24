@@ -9,11 +9,12 @@
 //! write resolves at its durable acknowledgement. Evidence comes from client
 //! timings, `/metrics`, and the OS's readings of the server process.
 //!
-//! - **L1, `isolated`** ([`isolated`]): the standard 10M-row events fixture
-//!   published as Parquet, then closed-loop point lookups at 1/4/16/64
-//!   clients, small aggregates and full scans at 1/64, and write sweeps at
-//!   1/4/16/64 clients for native Arrow writes, OTLP spans, and OTLP logs,
-//!   each repetition a full window of fresh identities.
+//! - **L1** ([`isolated`]), three experiments at 1 and 64 closed-loop
+//!   clients ([`Experiment`]): `writes` sweeps native Arrow, OTLP spans, and
+//!   OTLP logs writes, each repetition a full window of fresh identities;
+//!   `hot` reads 10M events and 1M spans held in memtables; `parquet` reads
+//!   them published as Parquet, with span Bloom, shredding, and pruning
+//!   checks and each write path's storage ratio.
 //! - **L2, `competing`** ([`competing`]): the heavy 100M-row fixture with
 //!   Forge compaction on, one stateful step whose every repetition runs open
 //!   loop mixed ingest at a rate calibrated from the newest compatible L1
@@ -47,11 +48,15 @@ use crate::levels::{Context, Plan};
 /// Error type of the server and client steps a workload runs.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Closed-loop client counts of the point and write sweeps.
-pub const SWEEP: [u64; 4] = [1, 4, 16, 64];
-
-/// Client counts of the small-aggregate and full-scan pairs.
+/// Closed-loop client counts of every Bifrost L1 sweep: unloaded latency
+/// and cost at 1, the SLO at 64.
 pub const PAIR: [u64; 2] = [1, 64];
+
+/// The one-client step of a read measured only unloaded.
+const ONE: [u64; 1] = [1];
+
+/// Spans the `hot` and `parquet` read fixtures load through OTLP.
+pub const SPAN_FIXTURE_ROWS: i64 = 1_000_000;
 
 /// Rows the L1 native and OTLP write fixtures spread over their day; a
 /// window's rows continue past it, so every repetition writes fresh rows.
@@ -65,9 +70,6 @@ pub const NATIVE_PEAK_FLOOR: f64 = 200_000.0;
 
 /// OTLP write peak sanity floor, encoded wire MiB per server CPU-second.
 pub const OTLP_PEAK_FLOOR: f64 = 30.0;
-
-/// The L1 experiment id.
-pub const ISOLATED: &str = "isolated";
 
 /// The L2 experiment and step id.
 pub const COMPETING: &str = "competing";
@@ -91,6 +93,115 @@ pub const SPLIT: [(WriteOp, f64); 3] = [
 /// the residue publishes.
 const PARQUET_ENV: [(&str, &str); 1] = [("WYRD_MAX_FILE_RETENTION_TIME", "30")];
 
+/// Scribe's operator settings that keep every row in a memtable: 16,384 MB
+/// memtable and on-disk rotation sizes and a 24-hour retention, so nothing
+/// stages or publishes.
+const HOT_ENV: [(&str, &str); 3] = [
+    ("WYRD_MAX_FILE_SIZE_IN_MEMORY", "16384"),
+    ("WYRD_MAX_FILE_SIZE_ON_DISK", "16384"),
+    ("WYRD_MAX_FILE_RETENTION_TIME", "86400"),
+];
+
+/// The three Bifrost L1 experiments, each its own record, verdict, and
+/// budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Experiment {
+    /// Native, OTLP spans, and OTLP logs writes; nothing waits for
+    /// publication.
+    Writes,
+    /// Reads while every row stays in a memtable.
+    Hot,
+    /// Reads after every row is published as Parquet.
+    Parquet,
+}
+
+impl Experiment {
+    /// Every experiment, in the order `l1 bifrost` runs them.
+    pub const ALL: [Self; 3] = [Self::Writes, Self::Hot, Self::Parquet];
+
+    /// The experiment id: its command word and record directory.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Writes => "writes",
+            Self::Hot => "hot",
+            Self::Parquet => "parquet",
+        }
+    }
+
+    /// The experiment `name` selects.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|experiment| experiment.name() == name)
+    }
+
+    /// The hard budget, seconds.
+    const fn budget_seconds(self) -> u64 {
+        match self {
+            Self::Writes => 6 * 60,
+            Self::Hot => 5 * 60,
+            Self::Parquet => 9 * 60,
+        }
+    }
+
+    /// The Scribe settings the server runs with.
+    const fn env(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Writes | Self::Parquet => &PARQUET_ENV,
+            Self::Hot => &HOT_ENV,
+        }
+    }
+
+    /// The read steps: each op, what it asks, and its client counts.
+    const fn reads(self) -> &'static [(&'static str, Read, &'static [u64])] {
+        match self {
+            Self::Writes => &[],
+            Self::Hot => &HOT_READS,
+            Self::Parquet => &PARQUET_READS,
+        }
+    }
+}
+
+/// What a read step asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Read {
+    /// An events-fixture case.
+    Events(workload::Case),
+    /// A span `trace_id` lookup, read through its Bloom filter.
+    Trace,
+    /// A span filter on a shredded attribute key.
+    Shredded,
+    /// A span filter on a long-tail key below the shredding threshold.
+    LongTail,
+}
+
+/// The `hot` read steps.
+const HOT_READS: [(&str, Read, &[u64]); 3] = [
+    ("point", Read::Events(workload::Case::Selective), &PAIR),
+    (
+        "small-aggregate",
+        Read::Events(workload::Case::SmallAggregate),
+        &ONE,
+    ),
+    ("span-shredded", Read::Shredded, &ONE),
+];
+
+/// The `parquet` read steps.
+const PARQUET_READS: [(&str, Read, &[u64]); 6] = [
+    ("point", Read::Events(workload::Case::Selective), &PAIR),
+    (
+        "small-aggregate",
+        Read::Events(workload::Case::SmallAggregate),
+        &ONE,
+    ),
+    ("full-scan", Read::Events(workload::Case::FullScan), &ONE),
+    ("span-trace", Read::Trace, &PAIR),
+    ("span-shredded", Read::Shredded, &ONE),
+    ("span-long-tail", Read::LongTail, &ONE),
+];
+
 /// The three ingest paths an experiment writes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOp {
@@ -111,7 +222,7 @@ impl WriteOp {
     pub const fn table(self) -> &'static str {
         match self {
             Self::Native => workload::INGEST_TABLE,
-            Self::Spans => "vala.traces.spans",
+            Self::Spans => telemetry::TABLE,
             Self::Logs => "vala.logs.records",
         }
     }
@@ -153,43 +264,73 @@ impl WriteOp {
     }
 }
 
-/// The L1 read operations and the case each runs.
-const READS: [(&str, workload::Case, &[u64]); 3] = [
-    ("point", workload::Case::Selective, &SWEEP),
-    ("small-aggregate", workload::Case::SmallAggregate, &PAIR),
-    ("full-scan", workload::Case::FullScan, &PAIR),
-];
-
-/// The read case an `op` step parameter names.
-fn read_case(name: &str) -> Option<workload::Case> {
-    READS
+/// The read an `op` step parameter names.
+fn read_op(name: &str) -> Option<Read> {
+    PARQUET_READS
         .iter()
+        .chain(&HOT_READS)
         .find(|(op, ..)| *op == name)
-        .map(|(_, case, _)| *case)
+        .map(|(_, read, _)| *read)
 }
 
-/// Plans the Bifrost experiment at the context's level: refuses unknown
-/// flags, declares it, and builds the workload, which starts the server only
-/// once the run admits it.
+/// The L1 experiment `arguments[1]` names (program name first).
 ///
 /// # Errors
 ///
-/// Returns a message for an unknown flag or an invalid `--server-cores`.
+/// Returns a message when it is absent or unknown.
+pub fn experiment(arguments: &[String]) -> std::result::Result<Experiment, String> {
+    arguments
+        .get(1)
+        .and_then(|name| Experiment::parse(name))
+        .ok_or_else(|| {
+            format!(
+                "l1 bifrost takes one experiment of {:?} before its flags",
+                Experiment::ALL.map(Experiment::name)
+            )
+        })
+}
+
+/// Plans the Bifrost experiment at the context's level, at L1 the one its
+/// first argument names: refuses unknown flags, declares it, and builds the
+/// workload, which starts the server only once the run admits it.
+///
+/// # Errors
+///
+/// Returns a message for a missing or unknown L1 experiment, an unknown
+/// flag, or an invalid `--server-cores`.
 pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Plan, String> {
+    let (experiment, flags) = match context.level {
+        Level::One => {
+            let experiment = experiment(context.arguments)?;
+            let flags: Vec<String> = context
+                .arguments
+                .iter()
+                .take(1)
+                .chain(context.arguments.iter().skip(2))
+                .cloned()
+                .collect();
+            (Some(experiment), flags)
+        }
+        Level::Two => (None, context.arguments.to_vec()),
+    };
     let valued: &[&str] = match context.level {
         Level::One => &[],
         Level::Two => &["--server-cores"],
     };
-    context.known(valued, &[])?;
-    let declaration = declare(context.level, context.arguments, base, context.root)?;
+    Context {
+        arguments: &flags,
+        ..*context
+    }
+    .known(valued, &[])?;
+    let declaration = declare(experiment, &flags, base, context.root)?;
     let logs = context
         .root
         .join("target/benchmarks")
         .join(Engine::Bifrost.name())
         .join(&declaration.experiment);
-    let workload: Box<dyn wyrd_testing::experiment::Workload> = match context.level {
-        Level::One => Box::new(isolated::Isolated::new(logs)),
-        Level::Two => Box::new(competing::Competing::new(logs)),
+    let workload: Box<dyn wyrd_testing::experiment::Workload> = match experiment {
+        Some(experiment) => Box::new(isolated::Isolated::new(logs, experiment)),
+        None => Box::new(competing::Competing::new(logs)),
     };
     Ok(Plan {
         declaration,
@@ -197,10 +338,10 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
     })
 }
 
-/// The Bifrost declaration at `level` over `base`, reading `--server-cores`
-/// from `arguments` (program name first), the baselines under `root`, and,
-/// at L2, the L1 records under `root/benchmarks/bifrost/isolated/`. Pure
-/// otherwise: it starts nothing.
+/// The Bifrost declaration over `base`: the L1 `experiment`, or L2 when
+/// `None`, reading `--server-cores` from `arguments` (program name first),
+/// the baselines under `root`, and, at L2, the L1 records under
+/// `root/benchmarks/bifrost/writes/`. Pure otherwise: it starts nothing.
 ///
 /// A missing or unusable calibration is a declaration refusal
 /// (`calibration.missing`), never a substituted rate.
@@ -209,19 +350,17 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
 ///
 /// Returns a message for a `--server-cores` that is not a positive number.
 pub fn declare(
-    level: Level,
+    experiment: Option<Experiment>,
     arguments: &[String],
     base: Declaration,
     root: &Path,
 ) -> std::result::Result<Declaration, String> {
     let baselines = Baselines::load(root, Engine::Bifrost);
-    let mut declaration = match level {
-        Level::One => isolated_declaration(base, baselines.as_ref().ok()),
-        Level::Two => {
-            let cores = server_cores(arguments)?;
-            let records = l1_records(root);
-            competing_declaration(base, cores, &records)
-        }
+    let mut declaration = if let Some(experiment) = experiment {
+        l1_declaration(experiment, base, baselines.as_ref().ok())
+    } else {
+        let cores = server_cores(arguments)?;
+        competing_declaration(base, cores, &l1_records(root))
     };
     let note = match &baselines {
         Ok(baselines) => format!("{} entries loaded", baselines.baseline.len()),
@@ -252,13 +391,13 @@ fn server_cores(arguments: &[String]) -> std::result::Result<f64, String> {
         .ok_or_else(|| "--server-cores takes a positive number of cores".to_owned())
 }
 
-/// Every readable record under `root/benchmarks/bifrost/isolated/`; an
+/// Every readable record under `root/benchmarks/bifrost/writes/`; an
 /// unreadable one is skipped, since calibration only needs a valid one.
 fn l1_records(root: &Path) -> Vec<Record> {
     let directory = root
         .join("benchmarks")
         .join(Engine::Bifrost.name())
-        .join(ISOLATED);
+        .join(Experiment::Writes.name());
     std::fs::read_dir(directory)
         .into_iter()
         .flatten()
@@ -272,22 +411,35 @@ fn l1_records(root: &Path) -> Vec<Record> {
         .collect()
 }
 
-/// The fixture control every L1 record declares, which a calibrating L2
-/// must match.
-fn l1_fixture() -> Value {
+/// The fixture control every `writes` record declares, which a
+/// calibrating L2 must match.
+fn write_fixture() -> Value {
     json!({
-        "read": "standard-10m-parquet: 10,000,000 events rows in vala.datasets.events, published as Parquet before any read step",
         "native": format!("native-2m: events rows into vala.datasets.events_ingest, {WRITE_FIXTURE_ROWS} rows per day, fresh ids every window"),
         "spans": format!("spans-2m: GenAI/HTTP spans into vala.traces.spans, {WRITE_FIXTURE_ROWS} spans per day, fresh ids every window"),
         "logs": format!("logs-2m: bulky Kubernetes logs into vala.logs.records, {WRITE_FIXTURE_ROWS} records per day, fresh ids every window"),
     })
 }
 
-/// The limits control both levels declare.
-fn limits() -> Value {
-    json!(
-        "server defaults on the whole host except WYRD_MAX_FILE_RETENTION_TIME=30; no resource quota"
-    )
+/// The fixture control of a read experiment: the events fixture and the
+/// spans loaded after the release smoke, as the `tier` holds them.
+fn read_fixture(tier: &str) -> Value {
+    json!({
+        "read": format!("standard-10m-{tier}: 10,000,000 events rows in vala.datasets.events, loaded before any read step"),
+        "spans": format!("spans-1m-{tier}: {SPAN_FIXTURE_ROWS} spans of the spans-2m generator into vala.traces.spans after the smoke's, loaded before any read step"),
+    })
+}
+
+/// The limits control of a server run with Scribe settings `settings`.
+fn limits(settings: &[(&str, &str)]) -> Value {
+    let settings: Vec<String> = settings
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    json!(format!(
+        "server defaults on the whole host except {}; no resource quota",
+        settings.join(", ")
+    ))
 }
 
 /// The metrics every L1 step reads, raw or derived.
@@ -459,96 +611,213 @@ const CLIENT_TIME: &str =
 /// What `server_failures` counts.
 const SERVER_FAILURES: &str = "server timings at the step's boundary whose outcome is not `success`, kept with their durations in timings.jsonl and never judged";
 
-/// The L1 `isolated` declaration: the read sweeps, then the write sweeps,
-/// their derived scaling and peak steps, the exactness, error, SLO, and
-/// sanity-floor criteria, and every baseline comparison.
-fn isolated_declaration(mut base: Declaration, baselines: Option<&Baselines>) -> Declaration {
-    ISOLATED.clone_into(&mut base.experiment);
-    base.question = String::from(
-        "With 10M events rows published as Parquet, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, what does each read and write path cost the server per CPU-second at 1/4/16/64 clients, and do native and OTLP write peaks clear their sanity floors?",
+/// The settled-state facts the `parquet` experiment reads once after its
+/// settlement, outside every window, and reports on the step each
+/// describes: `(step, metric, unit, description)`.
+pub const SETTLED: [(&str, &str, &str, &str); 5] = [
+    (
+        "span-shredded-c1",
+        "span_shredding_faults",
+        "count",
+        "1 when the published span files' `attributes` Variant does not shred exactly the keys on at least 10% of spans, or no file shredded; 0 otherwise; read once after settlement",
+    ),
+    (
+        "span-trace-c1",
+        "span_window_pruned",
+        "count",
+        "1 when a one-hour `start_time_unix_nano` window scanned fewer files or row groups (`oracle_query_files_scanned_total`, `oracle_query_row_groups_scanned_total`) than the whole span table; read once after settlement",
+    ),
+    (
+        "full-scan-c1",
+        "storage_ratio.native-write",
+        "ratio",
+        STORAGE_RATIO,
+    ),
+    (
+        "full-scan-c1",
+        "storage_ratio.otlp-spans",
+        "ratio",
+        STORAGE_RATIO,
+    ),
+    (
+        "full-scan-c1",
+        "storage_ratio.otlp-logs",
+        "ratio",
+        STORAGE_RATIO,
+    ),
+];
+
+/// What each `storage_ratio.<path>` reading is.
+const STORAGE_RATIO: &str = "the path's table growth in published Parquet bytes per retained Arrow byte inserted while its sample loaded alone: 200,000 rows for native and logs, the 1M-row span fixture for spans, all settled together; the inserted bytes include server-internal rows written meanwhile, and WAL, staging, and catalog bytes are excluded";
+
+/// The L1 declaration of `experiment`: its read steps and their scaling,
+/// or the write sweeps and their peaks, the exactness, error, SLO,
+/// sanity-floor, scan-fact, and settled-check criteria, and every eligible
+/// baseline comparison, within the experiment's own budget.
+fn l1_declaration(
+    experiment: Experiment,
+    mut base: Declaration,
+    baselines: Option<&Baselines>,
+) -> Declaration {
+    experiment.name().clone_into(&mut base.experiment);
+    base.timing.budget_seconds = experiment.budget_seconds();
+    base.question = String::from(match experiment {
+        Experiment::Writes => {
+            "What does each native, OTLP spans, and OTLP logs write cost the server per CPU-second at 1 and 64 closed-loop clients, with no error, and do the native and OTLP write peaks clear their sanity floors?"
+        }
+        Experiment::Hot => {
+            "With 10M events rows and 1M spans held in memtables, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, and what does each hot read cost the server per CPU-second?"
+        }
+        Experiment::Parquet => {
+            "With 10M events rows and 1M spans published as Parquet, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, what does each read cost per CPU-second and scan per query, do the span files shred exactly the keys over the threshold, does a span-time window prune, and what does each write path store per retained byte?"
+        }
+    });
+    base.variables.insert("clients".to_owned(), json!(PAIR));
+    base.controls.insert(
+        "fixture".to_owned(),
+        match experiment {
+            Experiment::Writes => write_fixture(),
+            Experiment::Hot => read_fixture("hot"),
+            Experiment::Parquet => read_fixture("parquet"),
+        },
     );
-    base.variables.insert("clients".to_owned(), json!(SWEEP));
-    base.controls.insert("fixture".to_owned(), l1_fixture());
-    base.controls.insert("limits".to_owned(), limits());
+    base.controls
+        .insert("limits".to_owned(), limits(experiment.env()));
     base.controls.insert(
         "workload".to_owned(),
-        json!("closed-loop public-client clients, each sending its next request once the last answers: Bifrost SQL point lookups, 100k-row aggregates, and full scans checked against exact answers; native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer"),
+        json!(match experiment {
+            Experiment::Writes => "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
+            Experiment::Hot | Experiment::Parquet => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
+        }),
     );
     base.metrics = isolated_metrics();
+    if experiment == Experiment::Parquet {
+        base.metrics.extend(
+            SETTLED
+                .iter()
+                .map(|(_, metric, unit, description)| Metric::raw(metric, unit, description)),
+        );
+    }
     let mut reads = Vec::new();
-    for (op, _, clients) in READS {
-        for clients in clients {
+    for (op, _, clients) in experiment.reads() {
+        for clients in *clients {
             let id = format!("{op}-c{clients}");
             base.steps
                 .push(Step::measured(&id, json!({ "op": op, "clients": clients })));
             reads.push(id);
         }
     }
-    let mut writes = Vec::new();
-    for op in WriteOp::ALL {
-        for clients in SWEEP {
-            let id = format!("{}-c{clients}", op.name());
-            base.steps.push(Step::measured(
-                &id,
-                json!({ "op": op.name(), "clients": clients }),
+    for (op, _, clients) in experiment.reads() {
+        if *clients == PAIR {
+            base.steps.push(Step::scaling(
+                &format!("{op}-scaling"),
+                &format!("{op}-c1"),
+                &format!("{op}-c64"),
+                64.0,
+                "rate",
             ));
-            writes.push(id);
         }
     }
-    for (op, ..) in READS {
-        base.steps.push(Step::scaling(
-            &format!("{op}-scaling"),
-            &format!("{op}-c1"),
-            &format!("{op}-c64"),
-            64.0,
-            "rate",
-        ));
-    }
-    for op in WriteOp::ALL {
-        let sweep: Vec<String> = SWEEP
-            .iter()
-            .map(|clients| format!("{}-c{clients}", op.name()))
-            .collect();
-        base.steps.push(Step::peak(
-            &format!("{}-peak", op.name()),
-            &sweep,
-            "rows_per_s",
-        ));
+    let mut writes = Vec::new();
+    if experiment == Experiment::Writes {
+        for op in WriteOp::ALL {
+            let sweep: Vec<String> = PAIR
+                .iter()
+                .map(|clients| format!("{}-c{clients}", op.name()))
+                .collect();
+            for (id, clients) in sweep.iter().zip(PAIR) {
+                base.steps.push(Step::measured(
+                    id,
+                    json!({ "op": op.name(), "clients": clients }),
+                ));
+            }
+            base.steps.push(Step::peak(
+                &format!("{}-peak", op.name()),
+                &sweep,
+                "rows_per_s",
+            ));
+            writes.extend(sweep);
+        }
     }
     let measured: Vec<String> = reads.iter().chain(&writes).cloned().collect();
-    base.criteria = vec![
-        Criterion::every("exact-answers", "wrong_results", &reads, Op::Le, 0.0),
-        Criterion::every("no-errors", "errors", &measured, Op::Le, 0.0),
-        Criterion::limit(
-            "point-p99-slo",
-            "p99_ms",
-            &["point-c64".to_owned()],
-            Op::Lt,
-            POINT_P99_MS,
-        )
-        .percentile(99),
-        Criterion::limit(
-            "native-peak-floor",
-            "rows_per_s",
-            &["native-write-peak".to_owned()],
-            Op::Ge,
-            NATIVE_PEAK_FLOOR,
-        ),
-        Criterion::limit(
-            "otlp-spans-peak-floor",
-            "wire_mib_per_cpu_s",
-            &["otlp-spans-peak".to_owned()],
-            Op::Ge,
-            OTLP_PEAK_FLOOR,
-        ),
-        Criterion::limit(
-            "otlp-logs-peak-floor",
-            "wire_mib_per_cpu_s",
-            &["otlp-logs-peak".to_owned()],
-            Op::Ge,
-            OTLP_PEAK_FLOOR,
-        ),
-    ];
+    base.criteria = vec![Criterion::every(
+        "no-errors",
+        "errors",
+        &measured,
+        Op::Le,
+        0.0,
+    )];
+    if experiment == Experiment::Writes {
+        for (id, metric, step, floor) in [
+            (
+                "native-peak-floor",
+                "rows_per_s",
+                "native-write-peak",
+                NATIVE_PEAK_FLOOR,
+            ),
+            (
+                "otlp-spans-peak-floor",
+                "wire_mib_per_cpu_s",
+                "otlp-spans-peak",
+                OTLP_PEAK_FLOOR,
+            ),
+            (
+                "otlp-logs-peak-floor",
+                "wire_mib_per_cpu_s",
+                "otlp-logs-peak",
+                OTLP_PEAK_FLOOR,
+            ),
+        ] {
+            base.criteria.push(Criterion::limit(
+                id,
+                metric,
+                &[step.to_owned()],
+                Op::Ge,
+                floor,
+            ));
+        }
+    } else {
+        base.criteria.extend([
+            Criterion::every("exact-answers", "wrong_results", &reads, Op::Le, 0.0),
+            Criterion::limit(
+                "point-p99-slo",
+                "p99_ms",
+                &["point-c64".to_owned()],
+                Op::Lt,
+                POINT_P99_MS,
+            )
+            .percentile(99),
+        ]);
+    }
+    if experiment == Experiment::Parquet {
+        // A settled query must report its own scan; zero is a fact, a
+        // missing reading is INVALID evidence.
+        for metric in ["scanned_rows_per_query", "scanned_bytes_per_query"] {
+            base.criteria.push(Criterion::every(
+                &format!("scan-facts.{metric}"),
+                metric,
+                &reads,
+                Op::Ge,
+                0.0,
+            ));
+        }
+        base.criteria.extend([
+            Criterion::every(
+                "span-shredding",
+                "span_shredding_faults",
+                &["span-shredded-c1".to_owned()],
+                Op::Le,
+                0.0,
+            ),
+            Criterion::every(
+                "span-pruning",
+                "span_window_pruned",
+                &["span-trace-c1".to_owned()],
+                Op::Ge,
+                1.0,
+            ),
+        ]);
+    }
     let baselines = baselines.cloned().unwrap_or_default();
     let host = base.host.fingerprint.clone();
     let mut compare = |metric: &str, step: &str, entry: String, fixture: &str| {
@@ -564,59 +833,64 @@ fn isolated_declaration(mut base: Declaration, baselines: Option<&Baselines>) ->
             base.criteria.push(criterion);
         }
     };
-    let read_baselines: [(&str, &str, &[u64]); 3] = [
-        ("point", "selective", &SWEEP),
-        ("small-aggregate", "small-aggregate", &PAIR),
-        ("full-scan", "full-scan", &[1]),
-    ];
-    for (op, case, clients) in read_baselines {
-        for clients in clients {
+    let tier = match experiment {
+        Experiment::Hot => "hot",
+        Experiment::Writes | Experiment::Parquet => "parquet",
+    };
+    for (op, read, clients) in experiment.reads() {
+        let Read::Events(case) = read else {
+            continue;
+        };
+        for clients in *clients {
             let step = format!("{op}-c{clients}");
-            let entry = format!("standard-parquet.{case}.c{clients}");
+            let entry = format!("standard-{tier}.{}.c{clients}", case.name());
+            let fixture = format!("standard-10m-{tier}");
             compare(
                 "queries_per_cpu_s",
                 &step,
                 format!("{entry}.queries-per-cpu-s"),
-                "standard-10m-parquet",
+                &fixture,
             );
             compare(
                 "cpu_ms_per_query",
                 &step,
                 format!("{entry}.cpu-us-per-query"),
-                "standard-10m-parquet",
+                &fixture,
             );
         }
     }
-    for op in WriteOp::ALL {
-        let (prefix, fixture) = op.baseline();
-        for clients in SWEEP {
-            let step = format!("{}-c{clients}", op.name());
-            let entry = format!("{prefix}.c{clients}");
-            compare(
-                "rows_per_cpu_s",
-                &step,
-                format!("{entry}.rows-per-cpu-s"),
-                fixture,
-            );
-            compare(
-                "cpu_us_per_row",
-                &step,
-                format!("{entry}.cpu-us-per-row"),
-                fixture,
-            );
-            compare(
-                "mib_per_cpu_s",
-                &step,
-                format!("{entry}.mb-per-cpu-s"),
-                fixture,
-            );
-            if op != WriteOp::Native {
+    if experiment == Experiment::Writes {
+        for op in WriteOp::ALL {
+            let (prefix, fixture) = op.baseline();
+            for clients in PAIR {
+                let step = format!("{}-c{clients}", op.name());
+                let entry = format!("{prefix}.c{clients}");
                 compare(
-                    "wire_mib_per_cpu_s",
+                    "rows_per_cpu_s",
                     &step,
-                    format!("{entry}.otlp-wire-mib-per-cpu-s"),
+                    format!("{entry}.rows-per-cpu-s"),
                     fixture,
                 );
+                compare(
+                    "cpu_us_per_row",
+                    &step,
+                    format!("{entry}.cpu-us-per-row"),
+                    fixture,
+                );
+                compare(
+                    "mib_per_cpu_s",
+                    &step,
+                    format!("{entry}.mb-per-cpu-s"),
+                    fixture,
+                );
+                if op != WriteOp::Native {
+                    compare(
+                        "wire_mib_per_cpu_s",
+                        &step,
+                        format!("{entry}.otlp-wire-mib-per-cpu-s"),
+                        fixture,
+                    );
+                }
             }
         }
     }
@@ -676,13 +950,13 @@ pub fn calibrate(
         .filter(|record| {
             record.engine == Engine::Bifrost
                 && record.level == Level::One
-                && record.experiment == ISOLATED
+                && record.experiment == Experiment::Writes.name()
                 && record.host.fingerprint == base.host.fingerprint
                 && ["profile", "rustflags", "compiler"]
                     .iter()
                     .all(|key| build(&record.build, key) == build(&base.build, key))
-                && record.controls.values.get("fixture") == Some(&l1_fixture())
-                && record.controls.values.get("limits") == Some(&limits())
+                && record.controls.values.get("fixture") == Some(&write_fixture())
+                && record.controls.values.get("limits") == Some(&limits(&PARQUET_ENV))
                 && record.validity.reasons.is_empty()
         })
         .collect();
@@ -718,7 +992,7 @@ pub fn calibrate(
         })
         .ok_or_else(|| {
             format!(
-                "no compatible valid L1 `isolated` record measures every write path: {} records read, {} compatible; run `mise run bench:l1:bifrost` on this host and build first",
+                "no compatible valid L1 `writes` record measures every write path: {} records read, {} compatible; run `mise run bench:l1:bifrost:writes` on this host and build first",
                 records.len(),
                 compatible.len()
             )
@@ -884,11 +1158,12 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
         "fixture".to_owned(),
         json!({
             "read": "heavy-100m-parquet: 100,000,000 events rows in vala.datasets.events, published as Parquet before the step",
-            "ingest": l1_fixture(),
+            "ingest": write_fixture(),
             "client_queue": "one Service tenant emitting Drift observations of 100 features (100 rows each) through `WyrdState`",
         }),
     );
-    base.controls.insert("limits".to_owned(), limits());
+    base.controls
+        .insert("limits".to_owned(), limits(&PARQUET_ENV));
     base.controls.insert(
         "workload".to_owned(),
         json!({
@@ -1012,17 +1287,18 @@ fn client(server: &LocalServer) -> Result<WyrdClient> {
     })?)
 }
 
-/// Starts the release server with every row published as Parquet and
-/// every span exported to `collector`.
+/// Starts the release server with Scribe settings `settings` and every
+/// span exported to `collector`.
 ///
 /// # Errors
 ///
 /// Returns the binary lookup or start failure.
-async fn start(collector: &Collector) -> Result<LocalServer> {
+async fn start(collector: &Collector, settings: &[(&str, &str)]) -> Result<LocalServer> {
     let binary = wyrd_testing::capacity::release_binary()?;
     let tracing = collector.server_env();
-    let variables: Vec<(&str, &str)> = PARQUET_ENV
-        .into_iter()
+    let variables: Vec<(&str, &str)> = settings
+        .iter()
+        .copied()
         .chain(tracing.iter().map(|(name, value)| (*name, value.as_str())))
         .collect();
     Ok(LocalServer::start(&binary, &["bench"], &variables).await?)
@@ -1037,13 +1313,6 @@ const SMOKE_WRITES: i64 = 2;
 /// Queries the release smoke may send before the smoked native rows answer
 /// exactly, [`SMOKE_POLL`] apart.
 const SMOKE_QUERIES: u64 = 50;
-
-/// How long the smoke waits for its rows to publish as Parquet: a write far
-/// below Scribe's size triggers waits out the declared
-/// `WYRD_MAX_FILE_RETENTION_TIME` of 30 s twice, once before its generation
-/// rotates and once before its staged members assemble, plus 30 s for the
-/// flush and publication.
-const SMOKE_SETTLE: Duration = Duration::from_secs(90);
 
 /// How long the release smoke waits between unanswered queries.
 const SMOKE_POLL: Duration = Duration::from_millis(100);
@@ -1090,14 +1359,11 @@ async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
 
 /// The Bifrost release smoke over the started `server`: [`SMOKE_WRITES`]
 /// requests through every lane, advancing its cursor so later windows write
-/// fresh identities, a wait of at most [`SMOKE_SETTLE`] for their Parquet
-/// publication, since only physical scans count scanned rows, then exact
-/// `count(*)` queries over the smoked native
-/// rows until one answers, all inside one window. Every request must reach
-/// `collector` as exactly one successful timing at its boundary, each write
-/// matched by the trace id it carried, with positive server CPU and inserted
-/// memtable bytes, and every answered query's own executed-plan scan on its
-/// trace, reporting positive rows and its bytes.
+/// fresh identities, then exact `count(*)` queries over the smoked native
+/// rows until one answers, all inside one window and without waiting for
+/// publication. Every request must reach `collector` as exactly one
+/// successful timing at its boundary, each write matched by the trace id it
+/// carried, with positive server CPU and inserted memtable bytes.
 ///
 /// # Errors
 ///
@@ -1136,11 +1402,6 @@ async fn smoke(
         }
         expected.push((op.boundary(), SMOKE_WRITES.cast_unsigned()));
     }
-    if let Err(error) = Residence::settle(server, SMOKE_SETTLE).await {
-        smoke.missing(format!(
-            "the smoked rows were not published as Parquet: {error}"
-        ));
-    }
     let queries = Bifrost::query_only(client);
     let sql = format!("SELECT count(*) FROM {}", workload::INGEST_TABLE);
     let mut asked = 0;
@@ -1174,17 +1435,6 @@ async fn smoke(
         .map(|(boundary, _)| (*boundary, isolated::SUCCESS, false))
         .collect();
     smoke.timings(&population, &boundaries);
-    // `count(*)` projects no column, so its scan reads no column bytes:
-    // rows must be positive, bytes only reported.
-    let [rows, bytes] = population.scanned_per_query(isolated::SUCCESS);
-    for reading in [&rows, &bytes] {
-        if reading.value.is_none() {
-            smoke.missing(reading.reason.clone().unwrap_or_default());
-        }
-    }
-    if let Some(rows) = rows.value {
-        smoke.positive("scanned rows per query", rows);
-    }
     smoke.finish()
 }
 
@@ -1217,6 +1467,18 @@ impl Residence {
             outstanding_claims: metrics.sum("bifrost_scribe_staging_outstanding_claims", &[]),
             published_files: parquet_files(&server.storage_dir()),
         })
+    }
+
+    /// Why a row left its memtable, or `None` while every row is held in
+    /// one: nothing staged, claimed, or published.
+    fn left_memtable(&self) -> Option<String> {
+        (self.staged_members > 0.0 || self.outstanding_claims > 0.0 || self.published_files > 0)
+            .then(|| {
+                format!(
+                    "rows left the memtable: {} staged, {} claims, {} published files",
+                    self.staged_members, self.outstanding_claims, self.published_files
+                )
+            })
     }
 
     /// Whether every row is published: nothing in a memtable, staged, or
@@ -1262,6 +1524,22 @@ impl Residence {
     }
 }
 
+/// The published Parquet files of `table` under the `file://` store rooted
+/// at `root`.
+pub fn table_files(root: &Path, table: &str) -> Vec<std::path::PathBuf> {
+    let segment = segment(table);
+    parquet(root)
+        .into_iter()
+        .map(|(path, _)| path)
+        .filter(|path| path.to_string_lossy().contains(&segment))
+        .collect()
+}
+
+/// The `/<segment>/<name>/` key part of `table`'s objects.
+fn segment(table: &str) -> String {
+    format!("/{}/", table.trim_start_matches("vala.").replace('.', "/"))
+}
+
 /// Counts the Parquet objects under the `file://` store rooted at `root`.
 fn parquet_files(root: &Path) -> u64 {
     parquet(root).len() as u64
@@ -1270,7 +1548,7 @@ fn parquet_files(root: &Path) -> u64 {
 /// Sums the sizes of `table`'s Parquet objects under the `file://` store
 /// rooted at `root`, whose keys hold `/<segment>/<name>/` after the tenant.
 pub fn parquet_bytes(root: &Path, table: &str) -> u64 {
-    let segment = format!("/{}/", table.trim_start_matches("vala.").replace('.', "/"));
+    let segment = segment(table);
     parquet(root)
         .iter()
         .filter(|(path, _)| path.to_string_lossy().contains(&segment))

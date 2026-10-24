@@ -21,7 +21,10 @@ use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
-use crate::query::workload::{DAY_HOURS, DAY_START_MS, HOUR_MS, mix};
+use crate::query::workload::{DAY_HOURS, DAY_START_MS, HOUR_MS, Rows, mix};
+
+/// The span table OTLP traces land in.
+pub const TABLE: &str = "vala.traces.spans";
 
 /// Spans in every trace; the trace tree is [`Role::ALL`].
 pub const SPANS_PER_TRACE: i64 = 8;
@@ -70,6 +73,24 @@ const PLANS: [&str; 4] = ["free", "pro", "team", "enterprise"];
 /// The `exception.type` values of failed spans.
 const EXCEPTIONS: [&str; 3] = ["TimeoutError", "ConnectionResetError", "ValueError"];
 
+/// Span attribute keys present on at least 10% of spans, which every
+/// shredded published file must shred.
+pub const SHREDDED_KEYS: [&str; 13] = [
+    "customer.id",
+    "user",
+    "http.request.method",
+    "http.route",
+    "http.response.status_code",
+    "gen_ai.operation.name",
+    "gen_ai.provider.name",
+    "gen_ai.request.model",
+    "gen_ai.conversation.id",
+    "region",
+    "feature.flag",
+    "cache.hit",
+    "url.full",
+];
+
 /// The mid key deliberately under the threshold, which no file may shred.
 pub const UNSHREDDED_KEY: &str = "retry.count";
 
@@ -78,6 +99,13 @@ pub const TAIL_PREFIX: &str = "custom.";
 
 /// `start_time_unix_nano` of the first trace: the events fixture's day start.
 const DAY_START_NANOS: i64 = DAY_START_MS * 1_000_000;
+
+/// The one-hour span-time window the pruning question reads: the seventh
+/// hour of the fixture day, as an offset from its start.
+const WINDOW_START_HOUR: i64 = 6;
+
+/// The long-tail key the long-tail filter reads, on about 0.1% of spans.
+const TAIL_KEY: u64 = 42;
 
 /// Nanoseconds between consecutive spans' starts within one trace.
 const SPAN_STAGGER_NANOS: i64 = 50_000;
@@ -125,6 +153,13 @@ const fn draw(index: i64, salt: u64) -> u64 {
 /// `percent` of spans.
 const fn present(index: i64, salt: u64, percent: u64) -> bool {
     draw(index, salt) % 100 < percent
+}
+
+/// The long-tail draws of span `index`, one per carried key; each key is
+/// its draw modulo [`TAIL_KEYS`].
+fn tail(index: i64) -> impl Iterator<Item = u64> {
+    std::iter::successors(Some(draw(index, salt::TAIL)), |tail| Some(mix(*tail)))
+        .take(TAIL_PER_SPAN.to_usize().unwrap_or(0))
 }
 
 /// What a span does in its trace, by its position in the trace.
@@ -537,8 +572,7 @@ impl Telemetry {
                 Value::IntValue(1 + ((draw(index, salt::RETRY) >> 32) % 4).cast_signed()),
             ));
         }
-        let mut tail = draw(index, salt::TAIL);
-        for _ in 0..TAIL_PER_SPAN {
+        for tail in tail(index) {
             let key = tail % TAIL_KEYS;
             let value = match key % 4 {
                 0 => Value::IntValue((tail >> 20).cast_signed() % 10_000),
@@ -547,10 +581,188 @@ impl Telemetry {
                 _ => Value::DoubleValue(((tail >> 20) % 10_000) as f64 / 100.0),
             };
             attributes.push(attribute(&format!("{TAIL_PREFIX}k{key:04}"), value));
-            tail = mix(tail);
         }
         attributes
     }
+
+    /// Counts the first `written` spans for which `keep` holds.
+    fn count(written: i64, keep: impl Fn(i64) -> bool) -> Rows {
+        let count = (0..written).filter(|index| keep(*index)).count();
+        vec![vec![count.to_i64().unwrap_or(i64::MAX)]]
+    }
+
+    /// Counts every span of the first `written`: the unbounded read the
+    /// window is compared with.
+    #[must_use]
+    pub fn all_spans(written: i64) -> (String, Rows) {
+        (format!("SELECT COUNT(*) FROM {TABLE}"), vec![vec![written]])
+    }
+
+    /// Counts the first `written` spans starting in one hour of the fixture
+    /// day, bounded on the table's time column `start_time_unix_nano`, so
+    /// Oracle prunes by the hourly partitions and file bounds.
+    #[must_use]
+    pub fn span_window(self, written: i64) -> (String, Rows) {
+        let lower = DAY_START_NANOS + WINDOW_START_HOUR * HOUR_MS * 1_000_000;
+        let upper = lower + HOUR_MS * 1_000_000;
+        (
+            format!(
+                "SELECT COUNT(*) FROM {TABLE} \
+                 WHERE start_time_unix_nano >= to_timestamp_nanos({lower}) \
+                 AND start_time_unix_nano < to_timestamp_nanos({upper})"
+            ),
+            Self::count(written, |index| {
+                (lower..upper).contains(&self.start_nanos(index))
+            }),
+        )
+    }
+
+    /// The `trace_id` lookup of `sequence`, rotated over the complete traces
+    /// of the first `written` spans: its span count and summed duration,
+    /// read through the column's Bloom filter.
+    #[must_use]
+    pub fn trace_lookup(written: i64, sequence: u64) -> (String, Rows) {
+        let traces = (written / SPANS_PER_TRACE).max(1).cast_unsigned();
+        let lookup = (sequence.wrapping_mul(7_919) % traces).cast_signed();
+        let spans = lookup * SPANS_PER_TRACE..(lookup + 1) * SPANS_PER_TRACE;
+        (
+            format!(
+                "SELECT COUNT(*), SUM(duration_nano) FROM {TABLE} WHERE trace_id = X'{}'",
+                hex::encode(trace_id(lookup))
+            ),
+            vec![vec![SPANS_PER_TRACE, spans.map(duration_nanos).sum()]],
+        )
+    }
+
+    /// Counts the first `written` spans whose shredded `region` key is
+    /// `eu-west`.
+    #[must_use]
+    pub fn shredded_filter(written: i64) -> (String, Rows) {
+        (
+            format!("SELECT COUNT(*) FROM {TABLE} WHERE attributes ->> 'region' = 'eu-west'"),
+            Self::count(written, |index| region(index) == Some("eu-west")),
+        )
+    }
+
+    /// Counts the first `written` spans carrying one long-tail key, which
+    /// sits far below the shredding threshold and is read from the Variant
+    /// residue.
+    #[must_use]
+    pub fn long_tail_filter(written: i64) -> (String, Rows) {
+        (
+            format!(
+                "SELECT COUNT(*) FROM {TABLE} WHERE attributes ->> '{TAIL_PREFIX}k{TAIL_KEY:04}' IS NOT NULL"
+            ),
+            Self::count(written, |index| {
+                tail(index).any(|tail| tail % TAIL_KEYS == TAIL_KEY)
+            }),
+        )
+    }
+}
+
+/// Judges span-time pruning from the `[files, row groups]` scanned by the
+/// unbounded count (`all`) and by the one-hour window over the same
+/// published spans: the window must scan fewer of either.
+///
+/// # Errors
+///
+/// Returns the scan counts when the window pruned nothing.
+pub fn judge_pruning(all: [f64; 2], window: [f64; 2]) -> std::result::Result<String, String> {
+    let summary = format!(
+        "window scanned {:.0} files and {:.0} row groups, unbounded {:.0} and {:.0}",
+        window[0], window[1], all[0], all[1]
+    );
+    if window[0] < all[0] || window[1] < all[1] {
+        Ok(summary)
+    } else {
+        Err(format!("{summary}; the window pruned nothing"))
+    }
+}
+
+/// Judges the Variant layout of the published span `files`: every shredded
+/// file shreds each of [`SHREDDED_KEYS`] in `attributes` and neither
+/// [`UNSHREDDED_KEY`] nor any long-tail key.
+///
+/// # Errors
+///
+/// Returns the first fault and their count, or that no file shredded at
+/// all, since the fixture exists to put keys over the threshold.
+pub fn judge_shredding(files: &[std::path::PathBuf]) -> std::result::Result<String, String> {
+    let (mut shredded, mut flat, mut faults) = (0_usize, 0_usize, Vec::new());
+    for path in files {
+        match shredded_keys(path) {
+            Ok(None) => {}
+            Ok(Some(keys)) if keys.is_empty() => flat += 1,
+            Ok(Some(keys)) => {
+                shredded += 1;
+                let fault = shredding_fault(&keys);
+                if let Some(fault) = fault {
+                    faults.push(format!("{}: {fault}", path.display()));
+                }
+            }
+            Err(error) => faults.push(format!("{}: {error}", path.display())),
+        }
+    }
+    let summary = format!("{shredded} shredded and {flat} unshredded span files");
+    if shredded == 0 {
+        Err(format!("{summary}; none shredded"))
+    } else if let Some(first) = faults.first() {
+        Err(format!("{summary}; {} wrong, first {first}", faults.len()))
+    } else {
+        Ok(format!(
+            "{summary}; each shreds the {} core and mid keys, not {UNSHREDDED_KEY} or {TAIL_PREFIX}*",
+            SHREDDED_KEYS.len()
+        ))
+    }
+}
+
+/// What is wrong with one shredded file's `keys`: a missing core or mid
+/// key, or a shredded key below the threshold; `None` when exact.
+fn shredding_fault(keys: &[String]) -> Option<String> {
+    let missing: Vec<_> = SHREDDED_KEYS
+        .iter()
+        .filter(|key| !keys.iter().any(|shredded| shredded == *key))
+        .collect();
+    let extra: Vec<_> = keys
+        .iter()
+        .filter(|key| *key == UNSHREDDED_KEY || key.starts_with(TAIL_PREFIX))
+        .collect();
+    (!missing.is_empty() || !extra.is_empty())
+        .then(|| format!("missing {missing:?}, unexpected {extra:?}"))
+}
+
+/// The keys shredded under `attributes.typed_value` in the Parquet file at
+/// `path`; `None` when it is not a span file (no `span_id`), empty when it
+/// is unshredded.
+///
+/// # Errors
+///
+/// Returns the open, footer, or schema-conversion failure.
+fn shredded_keys(path: &std::path::Path) -> std::result::Result<Option<Vec<String>>, String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|error| error.to_string())?;
+    let schema = builder.schema();
+    let (Ok(_), Ok(attributes)) = (
+        schema.field_with_name("span_id"),
+        schema.field_with_name("attributes"),
+    ) else {
+        return Ok(None);
+    };
+    let arrow::datatypes::DataType::Struct(storage) = attributes.data_type() else {
+        return Ok(Some(Vec::new()));
+    };
+    Ok(Some(
+        match storage
+            .find("typed_value")
+            .map(|(_, field)| field.data_type())
+        {
+            Some(arrow::datatypes::DataType::Struct(keys)) => {
+                keys.iter().map(|key| key.name().clone()).collect()
+            }
+            _ => Vec::new(),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -560,24 +772,6 @@ mod tests {
     /// Spans in the shape test's fixture, as many as the events fixture's
     /// rows.
     const STANDARD_SPANS: i64 = 10_000_000;
-
-    /// Span attribute keys present on at least 10% of spans, which every
-    /// shredded published file must shred.
-    const SHREDDED_KEYS: [&str; 13] = [
-        "customer.id",
-        "user",
-        "http.request.method",
-        "http.route",
-        "http.response.status_code",
-        "gen_ai.operation.name",
-        "gen_ai.provider.name",
-        "gen_ai.request.model",
-        "gen_ai.conversation.id",
-        "region",
-        "feature.flag",
-        "cache.hit",
-        "url.full",
-    ];
 
     /// Share of the first `spans` spans for which `keep` holds.
     fn share(spans: i64, keep: impl Fn(i64) -> bool) -> f64 {
@@ -645,5 +839,52 @@ mod tests {
             (0..sample).map(duration_nanos).max() > Some(100_000_000),
             "the duration tail reaches past 100 ms"
         );
+    }
+
+    /// The window prunes when it scans fewer files or fewer row groups, and
+    /// a shredded file is exact only with every core and mid key and none
+    /// below the threshold.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either judgment misjudges.
+    #[test]
+    fn settled_span_judgments_need_pruning_and_exact_shredding() {
+        assert!(judge_pruning([10.0, 40.0], [2.0, 40.0]).is_ok());
+        assert!(judge_pruning([10.0, 40.0], [10.0, 8.0]).is_ok());
+        assert!(judge_pruning([10.0, 40.0], [10.0, 40.0]).is_err());
+        assert!(judge_shredding(&[]).is_err(), "no shredded file");
+        let exact: Vec<String> = SHREDDED_KEYS.iter().map(|key| (*key).to_owned()).collect();
+        assert_eq!(shredding_fault(&exact), None);
+        assert!(shredding_fault(&exact[1..]).is_some(), "a missing key");
+        for below in [UNSHREDDED_KEY, "custom.k0042"] {
+            let mut keys = exact.clone();
+            keys.push(below.to_owned());
+            assert!(shredding_fault(&keys).is_some(), "{below} shredded");
+        }
+    }
+
+    /// Every span answer counts the generated spans: the trace lookup finds
+    /// one whole trace, and the long-tail key sits on about 0.1% of spans.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an answer drifts from the generated spans.
+    #[test]
+    fn span_answers_count_the_generated_spans() {
+        let written = 80_000;
+        let (_, rows) = Telemetry::trace_lookup(written, 3);
+        assert_eq!(rows[0][0], SPANS_PER_TRACE);
+        let (sql, rows) = Telemetry::long_tail_filter(written);
+        assert!(sql.contains("custom.k0042"), "{sql}");
+        let carried = (0..written)
+            .filter(|index| carries(*index, "custom.k0042"))
+            .count();
+        assert_eq!(rows, vec![vec![carried.to_i64().expect("count")]]);
+        assert!(carried > 0 && carried < 200, "on {carried} spans");
+        let (_, rows) = Telemetry::all_spans(written);
+        let fixture = Telemetry { spans: 160_000 };
+        let (_, window) = fixture.span_window(written);
+        assert!(window[0][0] > 0 && window[0][0] < rows[0][0]);
     }
 }

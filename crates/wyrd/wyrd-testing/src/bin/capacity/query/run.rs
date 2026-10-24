@@ -368,16 +368,38 @@ impl Bench {
         deadline: Instant,
         sequence: &Arc<AtomicU64>,
     ) -> Outcome {
+        let bench = Arc::clone(self);
+        self.drive_with(clients, deadline, sequence, move |next| {
+            bench.question(case, next)
+        })
+        .await
+    }
+
+    /// Runs `clients` closed-loop clients until `deadline`, each asking the
+    /// statement and exact answer `question` gives the next value of the
+    /// shared `sequence`.
+    pub async fn drive_with(
+        &self,
+        clients: usize,
+        deadline: Instant,
+        sequence: &Arc<AtomicU64>,
+        question: impl Fn(u64) -> (String, Rows) + Send + Sync + 'static,
+    ) -> Outcome {
+        let question = Arc::new(question);
         let mut tasks = JoinSet::new();
         for _ in 0..clients {
-            let (bench, sequence) = (Arc::clone(self), Arc::clone(sequence));
+            let (queries, sequence, question) = (
+                Arc::clone(&self.queries),
+                Arc::clone(sequence),
+                Arc::clone(&question),
+            );
             tasks.spawn(async move {
                 let mut outcome = Outcome::default();
                 while Instant::now() < deadline {
                     let next = sequence.fetch_add(1, Ordering::Relaxed);
-                    let (sql, expected) = bench.question(case, next);
+                    let (sql, expected) = question(next);
                     let sent = Instant::now();
-                    match ask(&bench.queries, sql, &expected).await {
+                    match ask(&queries, sql, &expected).await {
                         Ok(()) => outcome.latencies_us.push(micros(sent)),
                         Err(error) => *outcome.errors.entry(error).or_default() += 1,
                     }

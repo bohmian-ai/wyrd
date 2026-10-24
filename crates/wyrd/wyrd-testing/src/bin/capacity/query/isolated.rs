@@ -1,10 +1,12 @@
-//! The L1 `isolated` workload: one server, the standard fixture published as
-//! Parquet, and one closed loop per measured step.
+//! The Bifrost L1 workload of one [`Experiment`]: one server and one closed
+//! loop per measured step.
 //!
-//! Read steps run before any write step, so their windows never share the
-//! server with a publication of later writes. Every write window takes its
-//! rows from a cursor that only grows, so each repetition writes fresh
-//! identities instead of retrying earlier ones.
+//! `writes` loads no fixture: every write window takes its rows from a
+//! cursor that only grows, so each repetition writes fresh identities
+//! instead of retrying earlier ones. `hot` loads the events and span
+//! fixtures and checks that every row stays in a memtable; `parquet` also
+//! loads each write path's storage sample, settles everything once, and
+//! reads the settled-state facts before any window.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,10 +21,12 @@ use wyrd_testing::capacity::{Collector, Selection, Window};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
 use wyrd_testing::release_server::LocalServer;
 
-use crate::query::run::{Bench, Outcome, Sender, WRONG_RESULT};
-use crate::query::workload::{Case, Fixture, TABLE};
+use crate::query::run::{Bench, Outcome, Sender, WRONG_RESULT, ask};
+use crate::query::telemetry::{self, Telemetry};
+use crate::query::workload::{Case, Fixture, Rows, TABLE};
 use crate::query::{
-    Lane, Residence, WriteOp, client, lanes, parquet_bytes, read_case, smoke, start,
+    Experiment, Lane, Read, Residence, SETTLED, SPAN_FIXTURE_ROWS, WriteOp, client, lanes,
+    parquet_bytes, read_op, smoke, start, table_files,
 };
 
 /// Concurrent writers loading the read fixture.
@@ -41,6 +45,8 @@ pub const SUCCESS: &str = "success";
 pub struct Isolated {
     /// Where the server log and raw timings are kept.
     logs: PathBuf,
+    /// The experiment this workload runs.
+    experiment: Experiment,
     /// The collector the server exports its timings to, once prepared.
     collector: Option<Collector>,
     /// The running server, once prepared.
@@ -51,22 +57,30 @@ pub struct Isolated {
     senders: Vec<Lane>,
     /// The statement sequence every read window continues.
     sequence: Arc<AtomicU64>,
-    /// Each write path's published Parquet bytes per retained Arrow byte,
-    /// from its settled sample in [`Workload::prepare`].
-    storage: Vec<(WriteOp, Reading)>,
+    /// Spans the span table holds once prepared: indices `0..spans` of the
+    /// spans lane's generator, the smoke's included.
+    spans: i64,
+    /// Each span filter's statement and exact answer, once prepared.
+    filters: Vec<(Read, (String, Rows))>,
+    /// The `parquet` settled-state facts, by step and metric, read once in
+    /// [`Workload::prepare`].
+    settled: Vec<(&'static str, &'static str, Reading)>,
 }
 
 impl Isolated {
-    /// An unprepared workload keeping its server log under `logs`.
-    pub fn new(logs: PathBuf) -> Self {
+    /// An unprepared `experiment` keeping its server log under `logs`.
+    pub fn new(logs: PathBuf, experiment: Experiment) -> Self {
         Self {
             logs,
+            experiment,
             collector: None,
             server: None,
             bench: None,
             senders: Vec::new(),
             sequence: Arc::new(AtomicU64::new(0)),
-            storage: Vec::new(),
+            spans: 0,
+            filters: Vec::new(),
+            settled: Vec::new(),
         }
     }
 
@@ -79,7 +93,7 @@ impl Isolated {
     /// # Errors
     ///
     /// Returns a workload error for an unprepared workload, an undeclared
-    /// step, or a scrape failure.
+    /// step, a scrape failure, or, in `hot`, a row that left its memtable.
     async fn closed(
         &self,
         step: &Step,
@@ -102,12 +116,34 @@ impl Isolated {
         let (opened, before) = Window::open(server, collector, Selection::RESOURCES)
             .await
             .map_err(ExperimentError::workload)?;
-        let (outcome, write) = if let Some(case) = read_case(op) {
+        let read = read_op(op);
+        let (outcome, write) = if let Some(read) = read {
             let deadline = Instant::now() + window;
-            (
-                bench.drive(case, clients, deadline, &self.sequence).await,
-                None,
-            )
+            let outcome = match read {
+                Read::Events(case) => bench.drive(case, clients, deadline, &self.sequence).await,
+                Read::Trace => {
+                    let spans = self.spans;
+                    bench
+                        .drive_with(clients, deadline, &self.sequence, move |sequence| {
+                            Telemetry::trace_lookup(spans, sequence)
+                        })
+                        .await
+                }
+                Read::Shredded | Read::LongTail => {
+                    let (_, question) = self
+                        .filters
+                        .iter()
+                        .find(|(filter, _)| *filter == read)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ExperimentError::workload("the span fixture was not loaded")
+                        })?;
+                    bench
+                        .drive_with(clients, deadline, &self.sequence, move |_| question.clone())
+                        .await
+                }
+            };
+            (outcome, None)
         } else if let Some((write, sender, cursor)) = WriteOp::parse(op)
             .and_then(|op| self.senders.iter().find(|(declared, ..)| *declared == op))
         {
@@ -131,6 +167,9 @@ impl Isolated {
             .close(server)
             .await
             .map_err(ExperimentError::workload)?;
+        if self.experiment == Experiment::Hot {
+            hot(server).await?;
+        }
         let mut repetition = Repetition {
             seconds: usage.seconds,
             processes: vec!["wyrd-server".to_owned()],
@@ -158,11 +197,14 @@ impl Isolated {
             "server_failures",
             Reading::count(population.others(boundary, SUCCESS)),
         );
-        read_outcome(&mut repetition, &outcome, read_case(op));
-        if read_case(op).is_some() {
+        read_outcome(&mut repetition, &outcome, read);
+        if read.is_some() {
             let [rows, bytes] = population.scanned_per_query(SUCCESS);
             repetition.set("scanned_rows_per_query", rows);
             repetition.set("scanned_bytes_per_query", bytes);
+        }
+        for (_, metric, reading) in self.settled.iter().filter(|(id, ..)| *id == step.id) {
+            repetition.set(metric, reading.clone());
         }
         if let Some(write) = write {
             let inserted = after.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
@@ -182,12 +224,10 @@ impl Isolated {
                     "L1 measures closed-loop acknowledgement; visibility is judged at L2",
                 ),
             );
-            let ratio = self.storage.iter().find(|(op, _)| *op == write);
             repetition.set(
                 "storage_ratio",
-                ratio.map_or_else(
-                    || Reading::missing("the path's storage sample was not taken"),
-                    |(_, ratio)| ratio.clone(),
+                Reading::missing(
+                    "measured by the `parquet` experiment after its settlement; `writes` never waits for publication",
                 ),
             );
         }
@@ -201,10 +241,49 @@ const STORAGE_ROWS: i64 = 200_000;
 /// Bytes per MiB.
 pub const MIB: f64 = 1_048_576.0;
 
+/// Fails unless every row of the `hot` `server` is still in a memtable.
+///
+/// # Errors
+///
+/// Returns a workload error naming where rows went, or the scrape failure.
+async fn hot(server: &LocalServer) -> Result<(), ExperimentError> {
+    let residence = Residence::read(server)
+        .await
+        .map_err(ExperimentError::workload)?;
+    residence
+        .left_memtable()
+        .map_or(Ok(()), |left| Err(ExperimentError::workload(left)))
+}
+
+/// Server counters the span-time pruning check compares: files and row
+/// groups scanned.
+const SCANNED: [&str; 2] = [
+    "oracle_query_files_scanned_total",
+    "oracle_query_row_groups_scanned_total",
+];
+
+/// Asks `question` once against the settled `server` and returns the
+/// [`SCANNED`] counts it added.
+///
+/// # Errors
+///
+/// Returns the scrape failure or the query's error code, including a wrong
+/// answer.
+async fn scanned(
+    server: &LocalServer,
+    bench: &Bench,
+    (sql, expected): (String, Rows),
+) -> Result<[f64; 2], String> {
+    let before = server.metrics().await.map_err(|error| error.to_string())?;
+    ask(&bench.queries(), sql, &expected).await?;
+    let after = server.metrics().await.map_err(|error| error.to_string())?;
+    Ok(SCANNED.map(|family| after.sum(family, &[]) - before.sum(family, &[])))
+}
+
 /// Sets the client readings every closed-loop step shares: requests,
-/// errors, diagnostic client round-trip percentiles, and, for a read
-/// `case`, answered and wrong queries.
-fn read_outcome(repetition: &mut Repetition, outcome: &Outcome, case: Option<Case>) {
+/// errors, diagnostic client round-trip percentiles, and, for a `read`,
+/// answered and wrong queries.
+fn read_outcome(repetition: &mut Repetition, outcome: &Outcome, read: Option<Read>) {
     let wrong = outcome.errors.get(WRONG_RESULT).copied().unwrap_or(0);
     let requests = outcome.latencies_us.len().to_u64().unwrap_or(u64::MAX);
     repetition.set("requests", Reading::count(requests));
@@ -216,16 +295,87 @@ fn read_outcome(repetition: &mut Repetition, outcome: &Outcome, case: Option<Cas
     ] {
         repetition.set(id, Reading::percentile(&outcome.latencies_us, q, 1e3));
     }
-    if let Some(case) = case {
+    if let Some(read) = read {
         repetition.set("queries", Reading::count(requests));
         repetition.set("wrong_results", Reading::count(wrong));
-        if case == Case::FullScan {
+        if read == Read::Events(Case::FullScan) {
             repetition.set(
                 "p99_ms",
                 Reading::missing("p95 only: a full-scan window holds too few samples for a p99"),
             );
         }
     }
+}
+
+/// The `parquet` settled-state facts of the settled `server`, in
+/// [`SETTLED`] order: the span shredding and span-time pruning judgments
+/// over its `spans` spans, then each write path's storage ratio from its
+/// `samples` (path, table bytes before, inserted Arrow bytes, outcome).
+async fn settled(
+    server: &LocalServer,
+    bench: &Bench,
+    spans: i64,
+    samples: Vec<(WriteOp, u64, f64, Outcome)>,
+) -> Vec<(&'static str, &'static str, Reading)> {
+    let root = server.storage_dir();
+    let judged = |outcome: Result<String, String>| match outcome {
+        Ok(summary) => {
+            tracing::info!(%summary, "settled check passed");
+            (Reading::count(0), Reading::count(1))
+        }
+        Err(summary) => {
+            tracing::warn!(%summary, "settled check failed");
+            (Reading::count(1), Reading::count(0))
+        }
+    };
+    let (shredding, _) = judged(telemetry::judge_shredding(&table_files(
+        &root,
+        telemetry::TABLE,
+    )));
+    let all = scanned(server, bench, Telemetry::all_spans(spans)).await;
+    let window = scanned(
+        server,
+        bench,
+        Telemetry {
+            spans: crate::query::WRITE_FIXTURE_ROWS,
+        }
+        .span_window(spans),
+    )
+    .await;
+    let pruned = match (all, window) {
+        (Ok(all), Ok(window)) => judged(telemetry::judge_pruning(all, window)).1,
+        (Err(code), _) | (_, Err(code)) => {
+            Reading::missing(format!("a pruning query failed with `{code}`"))
+        }
+    };
+    let mut facts = vec![shredding, pruned];
+    for op in WriteOp::ALL {
+        let ratio = samples
+            .iter()
+            .find(|(sampled, ..)| *sampled == op)
+            .map_or_else(
+                || Reading::missing("the path's storage sample was not taken"),
+                |(_, stored, inserted, sample)| {
+                    let stored = parquet_bytes(&root, op.table()).saturating_sub(*stored);
+                    if sample.error_count() > 0 {
+                        Reading::missing(format!(
+                            "the storage sample failed with {:?}",
+                            sample.errors
+                        ))
+                    } else if *inserted > 0.0 && stored > 0 {
+                        Reading::exact(stored.to_f64().unwrap_or(f64::MAX) / inserted)
+                    } else {
+                        Reading::missing("the storage sample inserted or published no bytes")
+                    }
+                },
+            );
+        facts.push(ratio);
+    }
+    SETTLED
+        .iter()
+        .zip(facts)
+        .map(|((step, metric, ..), reading)| (*step, *metric, reading))
+        .collect()
 }
 
 #[async_trait]
@@ -244,7 +394,9 @@ impl Workload for Isolated {
         let collector = Collector::start(&self.logs)
             .await
             .map_err(ExperimentError::workload)?;
-        let server = start(&collector).await.map_err(ExperimentError::workload)?;
+        let server = start(&collector, self.experiment.env())
+            .await
+            .map_err(ExperimentError::workload)?;
         let client = client(&server).map_err(ExperimentError::workload)?;
         self.senders = lanes(&client, &WriteOp::ALL)
             .await
@@ -255,38 +407,59 @@ impl Workload for Isolated {
         proved.map_err(ExperimentError::Workload)
     }
 
-    /// Samples each write path's storage ratio, then writes the standard
-    /// fixture into the smoked server, waits until every row is published
-    /// as Parquet, and computes the exact answers.
+    /// Loads the experiment's fixtures into the smoked server and computes
+    /// the exact answers; `writes` loads nothing.
     ///
-    /// Each path first writes [`STORAGE_ROWS`] fresh rows alone; after the
-    /// fixture's one settle, its ratio is its table's growth in published
-    /// Parquet bytes over the `INSERTED` delta of its load, which includes
-    /// server-internal rows written meanwhile. WAL, staging, and catalog
-    /// bytes are excluded.
+    /// Each read experiment loads [`SPAN_FIXTURE_ROWS`] spans after the
+    /// smoke's, then the standard events fixture. `hot` then requires every
+    /// row still in a memtable. `parquet` first loads [`STORAGE_ROWS`] fresh
+    /// native and logs rows, each alone, settles everything once, and reads
+    /// the settled-state facts ([`SETTLED`]): each path's storage ratio, its
+    /// table's growth in published Parquet bytes over the `INSERTED` delta
+    /// of its own load (the span fixture is the spans sample), the span
+    /// shredding judgment, and the span-time pruning judgment.
     ///
     /// # Errors
     ///
     /// Returns a workload error for an unsmoked workload, a scrape failure,
-    /// a fixture that loaded short or with errors, or rows not published
-    /// within the settle timeout. Rows already written stay in the server;
-    /// nothing is retried.
+    /// a fixture that loaded short or with errors, a `hot` row that left its
+    /// memtable, or rows not published within the settle timeout. Rows
+    /// already written stay in the server; nothing is retried.
     async fn prepare(&mut self) -> Result<(), ExperimentError> {
+        if self.experiment == Experiment::Writes {
+            return Ok(());
+        }
         let server = self
             .server
             .as_ref()
             .ok_or_else(|| ExperimentError::workload("the workload was not smoked"))?;
         let client = client(server).map_err(ExperimentError::workload)?;
         let root = server.storage_dir();
+        let parquet = self.experiment == Experiment::Parquet;
         let mut samples = Vec::new();
         for (op, sender, cursor) in &self.senders {
+            let rows = match op {
+                WriteOp::Spans => SPAN_FIXTURE_ROWS,
+                WriteOp::Native | WriteOp::Logs if parquet => STORAGE_ROWS,
+                WriteOp::Native | WriteOp::Logs => continue,
+            };
             let stored = parquet_bytes(&root, op.table());
             let before = server.metrics().await.map_err(ExperimentError::workload)?;
-            let end = cursor.load(Ordering::Relaxed) + STORAGE_ROWS;
+            let end = cursor.load(Ordering::Relaxed) + rows;
             let sample = sender
                 .closed_loop(cursor, end, LOADERS, &CancellationToken::new())
                 .await;
+            cursor.store(end, Ordering::Relaxed);
             let after = server.metrics().await.map_err(ExperimentError::workload)?;
+            if *op == WriteOp::Spans {
+                if sample.error_count() > 0 || sample.rows != rows.cast_unsigned() {
+                    return Err(ExperimentError::workload(format!(
+                        "the span fixture loaded {} of {rows} spans with errors {:?}",
+                        sample.rows, sample.errors
+                    )));
+                }
+                self.spans = end;
+            }
             let inserted = after.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
             samples.push((*op, stored, inserted, sample));
         }
@@ -308,28 +481,29 @@ impl Workload for Isolated {
                 loaded.rows, fixture.rows, loaded.errors
             )));
         }
-        Residence::settle(server, SETTLE_TIMEOUT)
-            .await
-            .map_err(ExperimentError::workload)?;
-        for (op, stored, inserted, sample) in samples {
-            let stored = parquet_bytes(&root, op.table()).saturating_sub(stored);
-            let ratio = if sample.error_count() > 0 {
-                Reading::missing(format!(
-                    "the storage sample failed with {:?}",
-                    sample.errors
-                ))
-            } else if inserted > 0.0 && stored > 0 {
-                Reading::exact(stored.to_f64().unwrap_or(f64::MAX) / inserted)
-            } else {
-                Reading::missing("the storage sample inserted or published no bytes")
-            };
-            self.storage.push((op, ratio));
+        let cases: Vec<Case> = self
+            .experiment
+            .reads()
+            .iter()
+            .filter_map(|(_, read, _)| match read {
+                Read::Events(case) => Some(*case),
+                _ => None,
+            })
+            .collect();
+        let bench = Arc::new(Bench::new(&client, fixture, &cases));
+        self.filters = vec![
+            (Read::Shredded, Telemetry::shredded_filter(self.spans)),
+            (Read::LongTail, Telemetry::long_tail_filter(self.spans)),
+        ];
+        if parquet {
+            Residence::settle(server, SETTLE_TIMEOUT)
+                .await
+                .map_err(ExperimentError::workload)?;
+            self.settled = settled(server, &bench, self.spans, samples).await;
+        } else {
+            hot(server).await?;
         }
-        self.bench = Some(Arc::new(Bench::new(
-            &client,
-            fixture,
-            &[Case::Selective, Case::SmallAggregate, Case::FullScan],
-        )));
+        self.bench = Some(bench);
         Ok(())
     }
 

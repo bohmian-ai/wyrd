@@ -44,7 +44,7 @@ use crate::client_queue::{self, Emitted, LANES};
 use crate::query::isolated::{INSERTED, MIB, SUCCESS};
 use crate::query::run::{Bench, Overload, QUEUE_FULL, Sender, WRONG_RESULT, ask, micros};
 use crate::query::workload::{Case, Fixture, INGEST_TABLE, TABLE};
-use crate::query::{Lane, Residence, SPLIT, WriteOp, client, lanes, smoke, start};
+use crate::query::{Lane, PARQUET_ENV, Residence, SPLIT, WriteOp, client, lanes, smoke, start};
 
 /// Mixed queries in flight at most; a due query finding this many
 /// unanswered is missed rather than sent.
@@ -1008,7 +1008,9 @@ impl Workload for Competing {
         let collector = Collector::start(&self.logs)
             .await
             .map_err(ExperimentError::workload)?;
-        let server = start(&collector).await.map_err(ExperimentError::workload)?;
+        let server = start(&collector, &PARQUET_ENV)
+            .await
+            .map_err(ExperimentError::workload)?;
         let client = client(&server).map_err(ExperimentError::workload)?;
         self.senders = lanes(&client, &SPLIT.map(|(op, _)| op))
             .await

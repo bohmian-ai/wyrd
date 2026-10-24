@@ -192,6 +192,18 @@ pub enum Case {
 }
 
 impl Case {
+    /// The case's name in `baselines.toml` entry ids.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Selective => "selective",
+            Self::SmallAggregate => "small-aggregate",
+            Self::MillionAggregate => "million-aggregate",
+            Self::TableAggregate => "table-aggregate",
+            Self::FullScan => "full-scan",
+        }
+    }
+
     /// Distinct statements the case rotates through by `sequence % variants`.
     ///
     /// The selective case derives each ID from the sequence instead, so its

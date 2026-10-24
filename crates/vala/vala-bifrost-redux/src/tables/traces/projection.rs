@@ -10,14 +10,16 @@
 //! Column order and field meaning come exclusively from
 //! [`super::spans::SPAN_FIELDS`]; nothing in this module restates them.
 
-use arrow::array::ArrayRef;
-use arrow::datatypes::{Fields, Schema};
+use arrow::array::{ArrayRef, AsArray};
+use arrow::datatypes::{Fields, Schema, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 use wyrd_queue::variant::EncodedVariant;
+use wyrd_spec::vala::BifrostError;
 use wyrd_tonic::otlp::common::v1::any_value::Value;
 use wyrd_tonic::otlp::common::v1::{EntityRef, KeyValue};
+use wyrd_tonic::otlp::trace::v1::span::Event;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
 use super::spans::{SPAN_EVENT_ELEMENT, SPAN_FIELDS, SPAN_LINK_ELEMENT};
@@ -30,8 +32,8 @@ use crate::tables::signal::{
     entity_refs_column, fixed_binary_column, fixed_binary_opt_column, fixed_row_bytes, i32_column,
     i32_opt_column, i64_column, i64_opt_column, internal, last_attribute, list_column,
     nested_fields, otlp_instant_column, projected_signal_schema, promoted_int, promoted_string,
-    span_id_bytes, struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
-    variant_column,
+    refuse_forged, span_id_bytes, stored_attributes, struct_column, trace_id_bytes,
+    u32_as_i64_column, utf8_column, utf8_opt_column, variant_column,
 };
 use wyrd_spec::ids::CardUid;
 
@@ -474,11 +476,13 @@ impl SpanColumns {
         self.entity_ref_lengths
             .push(Some(resource.entity_refs.len()));
         self.entity_refs.extend_from_slice(&resource.entity_refs);
-        self.service_name.push(resource.service_name.clone());
-        self.service_version.push(resource.service_version.clone());
+        self.service_name
+            .push(resource.promotions.service_name.clone());
+        self.service_version
+            .push(resource.promotions.service_version.clone());
         self.deployment_environment
-            .push(resource.deployment_environment.clone());
-        self.resource_promotions.push(resource);
+            .push(resource.promotions.deployment_environment.clone());
+        self.resource_promotions.push(&resource.promotions);
 
         self.scope_present.push(scope.present);
         self.scope_name.push(scope.name.clone());
@@ -715,6 +719,159 @@ impl SpanColumns {
         RecordBatch::try_new(Arc::clone(&SPAN_SCHEMA), columns)
             .map_err(|error| TableError::Internal(format!("canonical span batch: {error}")))
     }
+}
+
+/// Refuse a native canonical span batch whose derived columns differ from
+/// what [`project_resource_spans`] derives from the same source fields.
+///
+/// `duration_nano`, the `GenAI`, HTTP, URL, and exception promotions, and
+/// `is_exception` are re-derived from each row's times, `attributes`, and
+/// `events` with the projection's own extractors, so a native writer cannot
+/// store a filter value the projection would not, and a wrongly typed `GenAI`
+/// source refuses the batch as it rejects an OTLP span.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] for a span that ends before it
+/// starts, a wrongly typed `GenAI` source, a malformed nested column, or the
+/// first derived column that differs.
+pub(crate) fn refuse_forged_span_derivations(batch: &RecordBatch) -> Result<(), BifrostError> {
+    let refused = |detail: String| BifrostError::SchemaParse { detail };
+    let column = |name: &str| {
+        batch
+            .column_by_name(name)
+            .ok_or_else(|| refused(format!("canonical batch is missing column {name}")))
+    };
+    let attributes = column("attributes")?;
+    let events = column("events")?
+        .as_list_opt::<i32>()
+        .ok_or_else(|| refused("events is not a list".to_owned()))?;
+    let event_fields = events
+        .values()
+        .as_struct_opt()
+        .ok_or_else(|| refused("events does not hold structs".to_owned()))?;
+    let event_names = event_fields
+        .column_by_name("name")
+        .and_then(|names| names.as_string_opt::<i32>())
+        .ok_or_else(|| refused("events carry no name".to_owned()))?;
+    let event_attributes = event_fields
+        .column_by_name("attributes")
+        .ok_or_else(|| refused("events carry no attributes".to_owned()))?;
+    let instant = |name: &str| {
+        column(name)?
+            .as_primitive_opt::<TimestampNanosecondType>()
+            .ok_or_else(|| refused(format!("{name} is not an OTLP instant")))
+            .cloned()
+    };
+    let (start, end) = (
+        instant("start_time_unix_nano")?,
+        instant("end_time_unix_nano")?,
+    );
+
+    let rows = batch.num_rows();
+    let mut duration = Vec::with_capacity(rows);
+    let mut gen_ai = Vec::with_capacity(rows);
+    let mut http = Vec::with_capacity(rows);
+    let mut exception = Vec::with_capacity(rows);
+    let mut is_exception = Vec::with_capacity(rows);
+    for row in 0..rows {
+        duration.push(
+            end.value(row)
+                .checked_sub(start.value(row))
+                .filter(|duration| *duration >= 0)
+                .ok_or_else(|| refused(format!("span row {row} ends before it starts")))?,
+        );
+        let offsets = events.value_offsets();
+        let span = Span {
+            attributes: stored_attributes(attributes.as_ref(), row)?,
+            events: (offsets[row]..offsets[row + 1])
+                .map(|event| {
+                    let event = usize::try_from(event).unwrap_or(usize::MAX);
+                    Ok(Event {
+                        name: event_names.value(event).to_owned(),
+                        attributes: stored_attributes(event_attributes.as_ref(), event)?,
+                        ..Event::default()
+                    })
+                })
+                .collect::<Result<_, BifrostError>>()?,
+            ..Span::default()
+        };
+        gen_ai.push(
+            GenAiPromotions::extract(&span.attributes)
+                .map_err(|reason| refused(format!("span row {row}: {reason}")))?,
+        );
+        http.push(HttpPromotions::extract(&span.attributes));
+        exception.push(SpanColumns::exception_promotions(&span));
+        is_exception.push(
+            span.events
+                .iter()
+                .any(|event| event.name == EXCEPTION_EVENT_NAME),
+        );
+    }
+
+    let text = |values: Vec<Option<String>>| utf8_opt_column(&values);
+    // Each `GenAI` column is its convention key with `.` spelled `_`.
+    let column_of = |key: &str| key.replace('.', "_");
+    let mut derived: Vec<(String, ArrayRef)> =
+        vec![("duration_nano".to_owned(), i64_column(duration))];
+    for (index, key) in GEN_AI_STRING_PROMOTIONS.into_iter().enumerate() {
+        let values = gen_ai
+            .iter()
+            .map(|row| row.strings[index].clone())
+            .collect();
+        derived.push((column_of(key), text(values)));
+    }
+    for (index, key) in GEN_AI_INT_PROMOTIONS.into_iter().enumerate() {
+        let values = gen_ai.iter().map(|row| row.ints[index]).collect();
+        derived.push((column_of(key), i64_opt_column(values)));
+    }
+    derived.extend([
+        (
+            "http_request_method".to_owned(),
+            text(http.iter().map(|row| row.request_method.clone()).collect()),
+        ),
+        (
+            "http_route".to_owned(),
+            text(http.iter().map(|row| row.route.clone()).collect()),
+        ),
+        (
+            "http_response_status_code".to_owned(),
+            i64_opt_column(http.iter().map(|row| row.response_status_code).collect()),
+        ),
+        (
+            "url_full".to_owned(),
+            text(http.iter().map(|row| row.url_full.clone()).collect()),
+        ),
+        (
+            "url_path".to_owned(),
+            text(http.iter().map(|row| row.url_path.clone()).collect()),
+        ),
+        (
+            "url_query".to_owned(),
+            text(http.iter().map(|row| row.url_query.clone()).collect()),
+        ),
+        (
+            "exception_type".to_owned(),
+            text(
+                exception
+                    .iter()
+                    .map(|row| row.exception_type.clone())
+                    .collect(),
+            ),
+        ),
+        (
+            "exception_message".to_owned(),
+            text(exception.iter().map(|row| row.message.clone()).collect()),
+        ),
+        (
+            "exception_stacktrace".to_owned(),
+            text(exception.iter().map(|row| row.stacktrace.clone()).collect()),
+        ),
+        ("is_exception".to_owned(), bool_column(is_exception)),
+    ]);
+    derived
+        .iter()
+        .try_for_each(|(name, values)| refuse_forged(batch, name, values))
 }
 
 /// Return the canonical user-column schema of `bifrost.traces.spans`.

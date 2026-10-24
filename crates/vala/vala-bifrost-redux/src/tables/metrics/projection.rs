@@ -1057,11 +1057,13 @@ impl PointColumns {
             .push(scope.dropped_attributes_count);
         self.scope_schema_url.push(scope.schema_url.clone());
 
-        self.service_name.push(resource.service_name.clone());
-        self.service_version.push(resource.service_version.clone());
+        self.service_name
+            .push(resource.promotions.service_name.clone());
+        self.service_version
+            .push(resource.promotions.service_version.clone());
         self.deployment_environment
-            .push(resource.deployment_environment.clone());
-        self.resource_promotions.push(resource);
+            .push(resource.promotions.deployment_environment.clone());
+        self.resource_promotions.push(&resource.promotions);
 
         self.rows += 1;
         payload_bytes

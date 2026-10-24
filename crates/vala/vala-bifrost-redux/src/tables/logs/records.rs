@@ -121,9 +121,12 @@ impl DomainTable for RecordsTable {
 ///
 /// Returns the catalogued refusal of the shared canonical validation when
 /// the supplied schema drifts from the declared ledger or a Variant value
-/// cannot be stored.
+/// cannot be stored, and the refusal of a derived column that differs from
+/// its source fields.
 fn validate_canonical_user_batch_for_table(
     batch: &RecordBatch,
 ) -> Result<RecordBatch, BifrostError> {
-    signal::validate_canonical_user_batch(LOG_FIELDS, batch)
+    let validated = signal::validate_canonical_user_batch(LOG_FIELDS, batch)?;
+    super::projection::refuse_forged_log_derivations(&validated)?;
+    Ok(validated)
 }

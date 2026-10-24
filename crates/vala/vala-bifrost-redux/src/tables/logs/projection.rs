@@ -27,10 +27,63 @@ use crate::tables::signal::{
     ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope,
     ResourcePromotionColumns, ScopeEnvelope, any_value_variant, attributes_variant, bool_column,
     checked_i64, entity_refs_column, fixed_binary_opt_column, fixed_row_bytes, i32_column,
-    otlp_instant_column, projected_signal_schema, span_id_bytes, trace_id_bytes, u32_as_i64_column,
-    utf8_column, utf8_opt_column, variant_column,
+    otlp_instant_column, projected_signal_schema, refuse_forged, span_id_bytes, stored_attributes,
+    stored_text, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, variant_column,
 };
 use wyrd_spec::ids::CardUid;
+use wyrd_spec::vala::BifrostError;
+
+/// Refuse a native canonical log batch whose derived columns differ from
+/// what [`project_resource_logs`] derives from the same source fields.
+///
+/// The exception promotions and `is_exception` are re-derived from each row's
+/// `attributes`, and `body_text` from a string `body`, with the projection's
+/// own rules, so a native writer cannot store a filter value the projection
+/// would not.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] for a malformed source column or the
+/// first derived column that differs.
+pub(crate) fn refuse_forged_log_derivations(batch: &RecordBatch) -> Result<(), BifrostError> {
+    let column = |name: &str| {
+        batch
+            .column_by_name(name)
+            .ok_or_else(|| BifrostError::SchemaParse {
+                detail: format!("canonical batch is missing column {name}"),
+            })
+    };
+    let (attributes, body) = (column("attributes")?, column("body")?);
+    let mut exception = Vec::with_capacity(batch.num_rows());
+    let mut body_text = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        exception.push(ExceptionPromotions::from_attributes(&stored_attributes(
+            attributes.as_ref(),
+            row,
+        )?));
+        body_text.push(stored_text(body.as_ref(), row)?);
+    }
+    let text = |pick: fn(&ExceptionPromotions) -> &Option<String>| {
+        utf8_opt_column(
+            &exception
+                .iter()
+                .map(|row| pick(row).clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    [
+        ("exception_type", text(|row| &row.exception_type)),
+        ("exception_message", text(|row| &row.message)),
+        ("exception_stacktrace", text(|row| &row.stacktrace)),
+        ("body_text", utf8_opt_column(&body_text)),
+        (
+            "is_exception",
+            bool_column(exception.iter().map(ExceptionPromotions::any).collect()),
+        ),
+    ]
+    .iter()
+    .try_for_each(|(name, derived)| refuse_forged(batch, name, derived))
+}
 
 /// Largest accepted severity text, in bytes.
 const MAX_SEVERITY_TEXT_BYTES: usize = 64;
@@ -294,11 +347,13 @@ impl LogColumns {
             .push(scope.dropped_attributes_count);
         self.scope_schema_url.push(scope.schema_url.clone());
 
-        self.service_name.push(resource.service_name.clone());
-        self.service_version.push(resource.service_version.clone());
+        self.service_name
+            .push(resource.promotions.service_name.clone());
+        self.service_version
+            .push(resource.promotions.service_version.clone());
         self.deployment_environment
-            .push(resource.deployment_environment.clone());
-        self.resource_promotions.push(resource);
+            .push(resource.promotions.deployment_environment.clone());
+        self.resource_promotions.push(&resource.promotions);
         self.is_exception.push(exception.any());
         self.exception_type.push(exception.exception_type);
         self.exception_message.push(exception.message);

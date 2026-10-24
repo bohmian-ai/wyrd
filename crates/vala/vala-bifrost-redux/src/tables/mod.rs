@@ -2099,6 +2099,30 @@ mod tests {
     /// value is lost, or when a signal's complete column count differs.
     #[test]
     fn resource_promotions_preserve_final_typed_values() {
+        let [spans, logs, metrics] = promotion_batches();
+        assert_resource_promotions(&spans, "spans");
+        assert_resource_promotions(&logs, "logs");
+        assert_resource_promotions(&metrics, "metrics");
+
+        for (fields, width) in [
+            (traces::spans::SPAN_FIELDS, 65),
+            (logs::records::LOG_FIELDS, 46),
+            (metrics::points::METRIC_FIELDS, 58),
+        ] {
+            assert_eq!(
+                managed_columns::canonical_physical_fields(fields).len(),
+                width
+            );
+        }
+    }
+
+    /// The span, log, and metric batches projected from every
+    /// [`promotion_resources`] shape, with correlation columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture does not project.
+    fn promotion_batches() -> [RecordBatch; 3] {
         let resources = promotion_resources();
         let template = span_fixture().remove(0);
         let spans: Vec<_> = resources
@@ -2127,27 +2151,151 @@ mod tests {
                 ..template.clone()
             })
             .collect();
+        [
+            traces::project_resource_spans(&spans, None, usize::MAX)
+                .expect("spans project")
+                .0,
+            logs::project_resource_logs(&logs, None, usize::MAX)
+                .expect("logs project")
+                .0,
+            metrics::project_resource_metrics(&metrics, None, usize::MAX)
+                .expect("metrics project")
+                .0,
+        ]
+    }
 
-        let (batch, _) =
-            traces::project_resource_spans(&spans, None, usize::MAX).expect("spans project");
-        assert_resource_promotions(&batch, "spans");
-        let (batch, _) =
-            logs::project_resource_logs(&logs, None, usize::MAX).expect("logs project");
-        assert_resource_promotions(&batch, "logs");
-        let (batch, _) =
-            metrics::project_resource_metrics(&metrics, None, usize::MAX).expect("metrics project");
-        assert_resource_promotions(&batch, "metrics");
+    /// Replace every row of `name` with a value no source field derives.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the column is missing or of an unforgeable type.
+    fn forged(batch: &RecordBatch, name: &str) -> RecordBatch {
+        let index = batch.schema().index_of(name).expect("the column exists");
+        let rows = batch.num_rows();
+        let column = batch.column(index);
+        let forged: ArrayRef = match column.data_type() {
+            DataType::Utf8 => Arc::new(StringArray::from(vec![Some("forged"); rows])),
+            DataType::Int64 => Arc::new(Int64Array::from(vec![424_242_i64; rows])),
+            DataType::Boolean => Arc::new(
+                arrow::compute::not(
+                    column
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .expect("bool"),
+                )
+                .expect("negation"),
+            ),
+            other => panic!("{name} has unforgeable type {other}"),
+        };
+        let mut columns = batch.columns().to_vec();
+        columns[index] = forged;
+        RecordBatch::try_new(batch.schema(), columns).expect("the forged batch assembles")
+    }
 
-        for (fields, width) in [
-            (traces::spans::SPAN_FIELDS, 65),
-            (logs::records::LOG_FIELDS, 46),
-            (metrics::points::METRIC_FIELDS, 58),
+    /// A native canonical signal batch is accepted only when every derived
+    /// column equals what the projection derives from the row's own source
+    /// fields; one forged filter value refuses the whole batch, and a
+    /// wrongly typed `GenAI` source refuses as it rejects an OTLP span.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a projected batch is refused, a forged derived column is
+    /// accepted, or a refusal is not the catalogued schema-parse error.
+    #[test]
+    fn native_canonical_signals_refuse_forged_derivations() {
+        let resource = [
+            "service_name",
+            "service_version",
+            "deployment_environment",
+            "service_namespace",
+            "service_instance_id",
+            "process_pid",
+            "telemetry_sdk_name",
+            "telemetry_sdk_language",
+            "telemetry_sdk_version",
+            "subject_kind",
+            "subject_name",
+            "subject_version",
+        ];
+        let span_only = [
+            "duration_nano",
+            "gen_ai_operation_name",
+            "gen_ai_provider_name",
+            "gen_ai_request_model",
+            "gen_ai_conversation_id",
+            "gen_ai_usage_input_tokens",
+            "gen_ai_usage_output_tokens",
+            "http_request_method",
+            "http_route",
+            "http_response_status_code",
+            "url_full",
+            "url_path",
+            "url_query",
+            "exception_type",
+            "exception_message",
+            "exception_stacktrace",
+            "is_exception",
+        ];
+        let log_only = [
+            "exception_type",
+            "exception_message",
+            "exception_stacktrace",
+            "body_text",
+            "is_exception",
+        ];
+        let [spans, logs, metrics] = promotion_batches();
+        for (signal, batch, validate, derived) in [
+            (
+                "spans",
+                spans,
+                traces::SpansTable::CANONICAL_VALIDATOR,
+                [&resource[..], &span_only[..]].concat(),
+            ),
+            (
+                "logs",
+                logs,
+                logs::records::RecordsTable::CANONICAL_VALIDATOR,
+                [&resource[..], &log_only[..]].concat(),
+            ),
+            (
+                "metrics",
+                metrics,
+                metrics::points::PointsTable::CANONICAL_VALIDATOR,
+                resource.to_vec(),
+            ),
         ] {
-            assert_eq!(
-                managed_columns::canonical_physical_fields(fields).len(),
-                width
-            );
+            let native = signal::without_correlation_columns(&batch).expect("user block");
+            validate(&native)
+                .unwrap_or_else(|error| panic!("{signal} projection is native: {error}"));
+            for name in derived {
+                let refusal = validate(&forged(&native, name))
+                    .err()
+                    .unwrap_or_else(|| panic!("{signal} refuses a forged {name}"));
+                assert!(
+                    matches!(&refusal, BifrostError::SchemaParse { detail } if detail.contains(name)),
+                    "{signal} {name} refusal names the column: {refusal:?}"
+                );
+            }
         }
+
+        let [spans, ..] = promotion_batches();
+        let native = signal::without_correlation_columns(&spans).expect("user block");
+        let index = native.schema().index_of("attributes").expect("attributes");
+        let wrong = signal::attributes_variant(
+            "attributes",
+            &[attribute("gen_ai.operation.name", Value::IntValue(5))],
+        )
+        .expect("encodes");
+        let mut columns = native.columns().to_vec();
+        columns[index] =
+            signal::variant_column(std::iter::repeat_n(Some(&wrong), native.num_rows()));
+        let wrongly_typed = RecordBatch::try_new(native.schema(), columns).expect("assembles");
+        let refusal = (traces::SpansTable::CANONICAL_VALIDATOR)(&wrongly_typed)
+            .expect_err("a wrongly typed GenAI source refuses");
+        assert!(
+            matches!(&refusal, BifrostError::SchemaParse { detail } if detail.contains("gen_ai")),
+            "{refusal:?}"
+        );
     }
 
     /// Assert two field lists have one exact Arrow layout.

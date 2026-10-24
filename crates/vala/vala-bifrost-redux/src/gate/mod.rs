@@ -49,7 +49,7 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_spec::vala::ids::{SpanId, TraceId};
+use wyrd_spec::vala::ids::{SpanId, TableVersion, TraceId};
 
 /// Maps a canonical OTLP projection failure to its ingest refusal.
 ///
@@ -961,6 +961,7 @@ impl<A: GateAudit + 'static> Gate<A> {
                 attributed_cards,
                 table,
                 expected_schema_fingerprint: None,
+                table_version: None,
                 request_id: auth.request_id.clone(),
                 batch_id,
                 measured_wire_bytes,
@@ -1021,6 +1022,12 @@ impl<A: GateAudit + 'static> Gate<A> {
                 "wyrd_batch_id must be UUIDv7".to_owned(),
             ));
         }
+        let table_version = TableVersion::new(frame.table_version).map_err(|_| {
+            IngestError::RequestValidation(
+                "table_version must be the positive version a describe or register returned"
+                    .to_owned(),
+            )
+        })?;
         let (namespace, name) = resolve_fqn(&frame.table)?;
         if namespace == BifrostNamespace::Audit {
             return Err(IngestError::ReservedBuiltinWriteDenied { table: frame.table });
@@ -1038,6 +1045,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             attributed_cards,
             table,
             expected_schema_fingerprint: None,
+            table_version: Some(table_version),
             request_id: auth.request_id.clone(),
             batch_id,
             measured_wire_bytes: frame.arrow_ipc.len(),
@@ -1780,6 +1788,7 @@ mod tests {
             wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
             arrow_ipc: Vec::new().into(),
             producer_trace_contexts: Vec::new(),
+            table_version: 1,
         }
     }
 
@@ -2653,6 +2662,7 @@ mod tests {
                     wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
                     arrow_ipc: Vec::new().into(),
                     producer_trace_contexts: Vec::new(),
+                    table_version: 1,
                 };
 
                 let result = gate
@@ -2678,6 +2688,46 @@ mod tests {
                     "{label} on {table} records exactly one denied decision"
                 );
             }
+        }
+    }
+
+    /// A native frame whose table version is zero or negative is refused as a
+    /// request validation error before authorization or Scribe sees it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a non-positive version is admitted, refused with any other
+    /// error, audited, or reaches Scribe.
+    #[tokio::test]
+    async fn non_positive_table_version_is_refused_before_authorization() {
+        for table_version in [0, -1, i64::MIN] {
+            let scribe_calls = Arc::new(AtomicUsize::new(0));
+            let audit = RecordingAudit::new();
+            let gate = Gate::<RecordingAudit>::with_test_scribe(
+                Arc::new(AnyTableScribe(Arc::clone(&scribe_calls))),
+                test_interceptor(),
+                IngestLimits::default(),
+            )
+            .with_audit(Arc::clone(&audit));
+            let frame = wyrd_tonic::wyrd::v1::InsertBatchRequest {
+                table: "vala.datasets.events".to_owned(),
+                wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+                arrow_ipc: Vec::new().into(),
+                producer_trace_contexts: Vec::new(),
+                table_version,
+            };
+
+            let result = gate
+                .dispatch_native_frame(&IngestLimits::default(), &scoped_auth_context(), frame)
+                .await;
+
+            assert!(
+                matches!(&result, Err(IngestError::RequestValidation(message))
+                    if message.contains("table_version")),
+                "{table_version}: {result:?}"
+            );
+            assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
+            assert!(audit.decisions().is_empty());
         }
     }
 
@@ -2738,6 +2788,7 @@ mod tests {
             wyrd_batch_id: batch_id.into(),
             arrow_ipc: Vec::new().into(),
             producer_trace_contexts: Vec::new(),
+            table_version: 1,
         };
 
         let uuid_v4 = uuid::Uuid::new_v4();

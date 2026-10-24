@@ -9,10 +9,7 @@ use crate::scribe::stream_identity::StreamIdentity;
 use wyrd_spec::DataTenantId;
 
 use crate::catalog::TenantTableBinding;
-use crate::catalog::layout::{BIFROST_PARTITION_SPEC_ID, BIFROST_SORT_ORDER_ID, TimePartition};
 use crate::contracts::ScribeError;
-use crate::scribe::memtable::FrozenMemtable;
-use crate::scribe::parquet_writer::ParquetEncoded;
 use crate::scribe::promotion::{PublishedHotFileIdentity, ScribePublishedHotFileV1};
 
 /// The unique replay key on `vala.file_list`.
@@ -70,8 +67,8 @@ pub struct FileListArtifactInsert {
     pub min_event_time: chrono::DateTime<chrono::Utc>,
     /// Maximum event timestamp for this artifact.
     pub max_event_time: chrono::DateTime<chrono::Utc>,
-    /// Exact time partition inherited from the generation seal key.
-    pub partition: TimePartition,
+    /// Exact physical partition inherited from the generation seal key.
+    pub partition: crate::catalog::PhysicalPartition,
     /// Producing Scribe node.
     pub node_id: Uuid,
     /// Producing writer epoch.
@@ -120,6 +117,7 @@ type ExistingArtifactRow = (
     String,
     chrono::DateTime<chrono::Utc>,
     Option<String>,
+    Vec<u8>,
 );
 
 /// Validates that rows form one contiguous generation-scoped artifact set.
@@ -170,9 +168,10 @@ fn artifact_replay_matches(
                 && actual.5 == expected.row_count
                 && actual.6 == expected.min_event_time
                 && actual.7 == expected.max_event_time
-                && actual.8 == expected.partition.granularity_str()
-                && actual.9 == expected.partition.start_utc()
+                && actual.8 == expected.partition.time().granularity_str()
+                && actual.9 == expected.partition.time().start_utc()
                 && actual.10.as_deref() == Some(expected.file_checksum.as_str())
+                && actual.11 == expected.partition.dimension_bytes()
         })
 }
 
@@ -215,43 +214,6 @@ fn artifact_set_outcome(
     })
 }
 
-/// Builds the ordered writer-v2 SQL rows for one sealed artifact set.
-///
-/// # Errors
-/// Returns a Scribe invariant error for an empty/noncontiguous set, malformed
-/// checksum, identity mismatch, or values outside `PostgreSQL` integer domains.
-pub fn build_artifact_inserts(
-    frozen: &FrozenMemtable,
-    encoded: &ParquetEncoded,
-    binding: &TenantTableBinding,
-    node_id: &str,
-    writer_epoch: i64,
-) -> Result<Vec<FileListArtifactInsert>, ScribeError> {
-    if encoded.artifacts.is_empty()
-        || binding.tenant != frozen.seal_key.tenant
-        || binding.table_ref != frozen.seal_key.table
-    {
-        return Err(ScribeError::Internal {
-            detail: "writer-v2 artifact set does not match its frozen generation".to_owned(),
-        });
-    }
-    let node_id = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
-        detail: format!("invalid writer-v2 node identity: {error}"),
-    })?;
-    let (wal_lsn_min, wal_lsn_max) = extract_lsn_range(encoded)?;
-    build_inserts(
-        encoded.artifacts.iter(),
-        &PublishedArtifactFacts {
-            binding,
-            partition: encoded.partition,
-            node_id,
-            writer_epoch,
-            wal_lsn_min,
-            wal_lsn_max,
-        },
-    )
-}
-
 /// Builds the ordered writer-v2 SQL rows for one assembled claim's objects.
 ///
 /// A claim has no frozen generation behind it: its identity comes from the
@@ -269,6 +231,7 @@ pub fn build_claim_inserts(
     key: &crate::scribe::assembly::ScribeAssemblyKey,
     artifacts: &crate::scribe::parquet_writer::BoundedParquetArtifactSet,
     binding: &TenantTableBinding,
+    sort_order_id: i32,
     wal: crate::scribe::hot_stage::StagedLsnRange,
 ) -> Result<Vec<FileListArtifactInsert>, ScribeError> {
     if artifacts.is_empty() || binding.tenant != key.tenant() || binding.table_ref != *key.table() {
@@ -291,7 +254,9 @@ pub fn build_claim_inserts(
         artifacts.iter(),
         &PublishedArtifactFacts {
             binding,
-            partition: key.partition(),
+            partition: key.partition().clone(),
+            sort_order_id,
+            table_version: key.table_version(),
             node_id: key.node_id().as_uuid(),
             writer_epoch: key.writer_epoch().as_i64(),
             wal_lsn_min,
@@ -310,7 +275,11 @@ struct PublishedArtifactFacts<'a> {
     /// Tenant-qualified physical binding the rows are published under.
     binding: &'a TenantTableBinding,
     /// Physical partition the objects belong to.
-    partition: crate::catalog::layout::TimePartition,
+    partition: crate::catalog::PhysicalPartition,
+    /// Iceberg sort order the objects were written under.
+    sort_order_id: i32,
+    /// Table version whose definition accepted the rows.
+    table_version: wyrd_spec::vala::ids::TableVersion,
     /// Node whose writer produced the rows.
     node_id: Uuid,
     /// Fenced writer epoch that produced the rows.
@@ -382,7 +351,7 @@ fn build_inserts<'a>(
                 })?,
                 min_event_time,
                 max_event_time,
-                partition: facts.partition,
+                partition: facts.partition.clone(),
                 node_id: facts.node_id,
                 writer_epoch: facts.writer_epoch,
                 wal_lsn_min: facts.wal_lsn_min,
@@ -401,10 +370,10 @@ fn build_inserts<'a>(
                         file_list_id: row_id,
                         object_key: &artifact.object_identity,
                         file_checksum: &artifact.checksum,
-                        partition: facts.partition,
+                        partition: &facts.partition,
                         schema_fingerprint: artifact.schema_fingerprint.clone(),
-                        partition_spec_id: BIFROST_PARTITION_SPEC_ID,
-                        sort_order_id: BIFROST_SORT_ORDER_ID,
+                        sort_order_id: facts.sort_order_id,
+                        table_version: facts.table_version,
                     },
                     artifact.data_file_metrics.clone(),
                 ),
@@ -428,33 +397,6 @@ fn artifact_row_id(object_identity: &str) -> Uuid {
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
-}
-
-/// Extract LSN range from append metadata.
-///
-/// LSN values are u64 but real-world Postgres LSNs fit in i64 (PG column is BIGINT).
-fn extract_lsn_range(encoded: &ParquetEncoded) -> Result<(i64, i64), ScribeError> {
-    let min = encoded
-        .append_metas
-        .iter()
-        .map(|m| m.wal_lsn_min.as_u64())
-        .min()
-        .unwrap_or(0);
-    let max = encoded
-        .append_metas
-        .iter()
-        .map(|m| m.wal_lsn_max.as_u64())
-        .max()
-        .unwrap_or(0);
-
-    let min_i = i64::try_from(min).map_err(|_| ScribeError::Internal {
-        detail: format!("wal_lsn_min {min} exceeds i64::MAX (invariant violation)"),
-    })?;
-    let max_i = i64::try_from(max).map_err(|_| ScribeError::Internal {
-        detail: format!("wal_lsn_max {max} exceeds i64::MAX (invariant violation)"),
-    })?;
-
-    Ok((min_i, max_i))
 }
 
 /// Atomically publishes a complete writer-v2 artifact set under one actor fence.
@@ -502,8 +444,8 @@ pub async fn insert_artifact_set_fenced(
     for row in rows {
         inserted += sqlx::query(
             "INSERT INTO vala.file_list \
-             (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal,file_checksum,promotion_record) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) \
+             (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal,file_checksum,promotion_record,partition_dimensions) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) \
              ON CONFLICT (data_tenant_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal) DO NOTHING",
         )
         .bind(row.id)
@@ -515,8 +457,8 @@ pub async fn insert_artifact_set_fenced(
         .bind(row.row_count)
         .bind(row.min_event_time)
         .bind(row.max_event_time)
-        .bind(row.partition.granularity_str())
-        .bind(row.partition.start_utc())
+        .bind(row.partition.time().granularity_str())
+        .bind(row.partition.time().start_utc())
         .bind(row.node_id)
         .bind(row.writer_epoch)
         .bind(row.wal_lsn_min)
@@ -528,6 +470,7 @@ pub async fn insert_artifact_set_fenced(
                 detail: format!("writer-v2 promotion record does not encode: {error}"),
             }
         })?)
+        .bind(row.partition.dimension_bytes())
         .execute(&mut *transaction)
         .await
         .map_err(SqlError::from)?
@@ -539,7 +482,7 @@ pub async fn insert_artifact_set_fenced(
         });
     }
     let existing: Vec<ExistingArtifactRow> = sqlx::query_as(
-        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,file_checksum FROM vala.file_list \
+        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,file_checksum,partition_dimensions FROM vala.file_list \
          WHERE data_tenant_id=$1 AND node_id=$2 AND writer_epoch=$3 AND wal_lsn_min=$4 AND wal_lsn_max=$5 \
          ORDER BY file_ordinal FOR UPDATE",
     )
@@ -674,7 +617,7 @@ pub async fn artifact_set_publication(
         "writer-v2 publication set is noncontiguous or crosses generations",
     )?;
     let existing: Vec<ExistingArtifactRow> = sqlx::query_as(
-        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,file_checksum FROM vala.file_list \
+        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,file_checksum,partition_dimensions FROM vala.file_list \
          WHERE data_tenant_id=$1 AND node_id=$2 AND writer_epoch=$3 AND wal_lsn_min=$4 AND wal_lsn_max=$5 \
          ORDER BY file_ordinal",
     )
@@ -843,7 +786,7 @@ mod tests {
                     row_count: 1,
                     min_event_time: now,
                     max_event_time: now,
-                    partition,
+                    partition: partition.into(),
                     node_id,
                     writer_epoch: 3,
                     wal_lsn_min: 1,
@@ -866,9 +809,10 @@ mod tests {
             row.row_count,
             row.min_event_time,
             row.max_event_time,
-            row.partition.granularity_str().to_owned(),
-            row.partition.start_utc(),
+            row.partition.time().granularity_str().to_owned(),
+            row.partition.time().start_utc(),
             Some(row.file_checksum.clone()),
+            row.partition.dimension_bytes(),
         )
     }
 

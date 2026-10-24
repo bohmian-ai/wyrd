@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
 import type {
-  BifrostTableDescription as TableDescription,
+  BifrostTableDescription as TableDescriptionWire,
   BifrostTableEntry as TableEntry,
   CancelRunningQueryResponse,
   CardRef,
@@ -42,6 +42,7 @@ import type {
   ModelRef,
   OperatorConnectionStatus,
   OperatorConnectionView,
+  PartitionFieldWire as PartitionField,
   PhysicalLayoutWire as PhysicalLayout,
   PrincipalKindTag as PrincipalKind,
   PrincipalPage,
@@ -175,6 +176,7 @@ export type {
   ModelRef,
   OperatorConnectionStatus,
   OperatorConnectionView,
+  PartitionField,
   PhysicalLayout,
   PrincipalKind,
   PrincipalPage,
@@ -194,7 +196,6 @@ export type {
   RoleAssignmentChange,
   RoleSource,
   SortKey,
-  TableDescription,
   TableEntry,
   TokenAudience,
   UpdateOperatorConnectionRequest,
@@ -406,6 +407,14 @@ function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
   );
 }
 
+/**
+ * Server projection of one registered table's stored physical schema.
+ *
+ * `table_version` is the exact version the schema and layout describe, as a
+ * `bigint`; its canonical decimal string is only the wire spelling.
+ */
+export type TableDescription = Omit<TableDescriptionWire, "table_version"> & { readonly table_version: bigint };
+
 function lifecycleValue<T>(result: NativeLifecycleResult): T {
   const error = projectedError(result);
   if (error !== undefined) {
@@ -604,14 +613,18 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
 /**
  * The physical layout a table asks the server to create.
  *
- * Sort keys reuse {@link SortKey} — the same shape the describe route returns —
- * so a layout read back from the server can be declared again unchanged.
- * `timeColumn` names the non-null timestamp column that partitions the table
- * and leads its default sort order; omitted, it is `wyrd_ingested_at`. Any
- * instant is accepted.
+ * Partition fields and sort keys reuse {@link PartitionField} and
+ * {@link SortKey} — the shapes the describe route returns — so a layout read
+ * back from the server can be declared again unchanged. `partitionBy` holds
+ * one `hour` or `day` field on the time column plus at most two `identity`,
+ * `bucket`, or `truncate` dimensions; omitted or empty, the table partitions
+ * hourly on the time column. `timeColumn` names the non-null UTC timestamp
+ * column that partitions the table and leads its default sort order; omitted,
+ * it is `wyrd_ingested_at`. Any instant is accepted. `bloomColumns` is the
+ * complete Bloom-filtered set; omitted or empty, no column is filtered.
  */
 export interface TableLayout {
-  partitionGranularity?: PhysicalLayout["partition_granularity"];
+  partitionBy?: readonly PartitionField[];
   timeColumn?: string;
   sortKeys?: readonly SortKey[];
   bloomColumns?: readonly string[];
@@ -642,7 +655,7 @@ function layoutJson(layout?: TableLayout): string | undefined {
     return undefined;
   }
   return JSON.stringify({
-    partition_granularity: layout.partitionGranularity ?? "hour",
+    partition_by: layout.partitionBy ?? [],
     time_column: layout.timeColumn,
     sort_keys: layout.sortKeys ?? [],
     bloom_columns: layout.bloomColumns ?? [],
@@ -734,7 +747,8 @@ export class TableConfig {
    *
    * `options.layout` requests the table's physical layout.
    * `options.compactionTargetFileSizeBytes` pins the table's Forge compaction
-   * file target; omitted, the table follows the server's deployment default.
+   * file target; omitted, the new table stores the server's deployment
+   * default, resolved once at creation.
    * Registration records it once, and a later registration naming a different
    * target is refused rather than silently changing it.
    *
@@ -1116,6 +1130,11 @@ export class Bifrost {
     this.#native = native;
   }
 
+  /** @internal Wrap one native handle; {@link Bifrost.connect} is the public constructor. */
+  static fromNative(native: NativeBifrost): Bifrost {
+    return new Bifrost(native);
+  }
+
   /**
    * Connect one client, optionally already bound to a write target.
    *
@@ -1449,7 +1468,9 @@ export class Bifrost {
    * for a transport failure.
    */
   async describeTable(namespace: string, name: string): Promise<TableDescription> {
-    return lifecycleValue<TableDescription>(await this.#native.describeTable(namespace, name));
+    const wire = lifecycleValue<TableDescriptionWire>(await this.#native.describeTable(namespace, name));
+    // The native client already refused any non-canonical or out-of-range spelling.
+    return { ...wire, table_version: BigInt(wire.table_version) };
   }
 }
 

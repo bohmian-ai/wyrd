@@ -124,22 +124,32 @@ fn replay_binding(
     )
 }
 
-/// Removes exact-retry batches from one replay group while preserving append order.
+/// Removes suppressed WAL attempts from one replay group while preserving
+/// append order.
+///
+/// An attempt is a batch id plus the inclusive WAL range from its first slice
+/// to its COMMIT, so suppressing one attempt keeps every other attempt at the
+/// same id, including the canonical one the fence accepted.
 fn retain_replayed_batches(
     replayed: &mut crate::scribe::replay::ReplayedSealKey,
-    suppressed: &HashSet<[u8; 16]>,
+    suppressed: &[([u8; 16], std::ops::RangeInclusive<u64>)],
 ) {
+    let is_suppressed = |batch_id: &[u8; 16], lsn: u64| {
+        suppressed
+            .iter()
+            .any(|(id, range)| id == batch_id && range.contains(&lsn))
+    };
     let metas = std::mem::take(&mut replayed.append_metas);
     let data = std::mem::take(&mut replayed.data_records);
     for (meta, payload) in metas.into_iter().zip(data) {
-        if !suppressed.contains(&meta.batch_id) {
+        if !is_suppressed(&meta.batch_id, meta.wal_lsn.as_u64()) {
             replayed.append_metas.push(meta);
             replayed.data_records.push(payload);
         }
     }
     replayed
         .commits
-        .retain(|commit| !suppressed.contains(&commit.batch_id));
+        .retain(|commit| !is_suppressed(&commit.batch_id, commit.wal_lsn_max.as_u64()));
 }
 
 /// Durable artifact-range projection used to suppress already-published replay input.
@@ -722,7 +732,7 @@ pub(crate) enum ShardCommand {
     /// Re-drive one replay generation after persistence queue progress.
     RetryReplayPersistence {
         /// Seal key whose FIFO front was unable to enter the bounded queue.
-        seal_key: crate::scribe::seal_key::SealKey,
+        seal_key: Box<crate::scribe::seal_key::SealKey>,
         /// Exact generation protected against stale retry notifications.
         generation_id: u64,
         /// Queue progress or terminal runtime-close result.
@@ -1121,8 +1131,8 @@ impl ScribeShardRuntime {
     /// already fenced and made visible, so the ingress can acknowledge it with
     /// no first commit instead of queueing it behind fresh writes.
     ///
-    /// The batch must match the recorded tenant, batch id, table, logical
-    /// slice-set digest, and slice count. Anything else returns `None` and the
+    /// The batch must match the recorded tenant, batch id, table, accepting
+    /// table version, logical slice-set digest, and slice count. Anything else returns `None` and the
     /// append takes the shard path, whose durable fence decides it; a fresh
     /// batch costs one map probe and no digest.
     pub(crate) fn committed_duplicate_rows(&self, append: &PreparedAppend) -> Option<u64> {
@@ -1132,12 +1142,25 @@ impl ScribeShardRuntime {
         let (logical_digest, slice_count, rows) = append.logical_identity()?;
         let batch = crate::scribe::committed_batches::CommittedBatch {
             table_fqn: append.table.fqn(),
+            table_version: append.table_version()?,
             logical_digest,
             slice_count,
         };
         self.committed
             .contains(append.tenant, append.batch_id, &batch)
             .then_some(rows)
+    }
+
+    /// Table version the pod-wide index recorded for `(tenant, batch_id)`
+    /// in `table_fqn`, so a request that states no version is prepared under
+    /// the one that accepted it.
+    pub(crate) fn committed_version(
+        &self,
+        tenant: DataTenantId,
+        batch_id: uuid::Uuid,
+        table_fqn: &str,
+    ) -> Option<wyrd_spec::vala::ids::TableVersion> {
+        self.committed.version(tenant, batch_id, table_fqn)
     }
 
     /// Enqueue a prepared request onto its deterministic shard.
@@ -1822,15 +1845,34 @@ impl ShardOwner {
             });
         }
         let commits = replayed.commits.clone();
-        let mut suppressed = HashSet::new();
+        let mut suppressed = Vec::new();
         for commit in &commits {
-            if self.resolve_replayed_commit(replayed, commit).await?
-                == vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress
-            {
-                suppressed.insert(commit.batch_id);
+            match self.resolve_replayed_commit(replayed, commit).await? {
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress => {
+                    suppressed.push((
+                        commit.batch_id,
+                        commit.wal_lsn_min.as_u64()..=commit.wal_lsn_max.as_u64(),
+                    ));
+                }
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
+                    if commit.contested =>
+                {
+                    return Err(ScribeError::Internal {
+                        detail: "WAL replay holds differing attempts at an unfenced batch id"
+                            .to_owned(),
+                    });
+                }
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Unfenced
+                | vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Restore => {
+                }
             }
         }
-        suppressed.extend(self.resolve_published_replay_batches(replayed).await?);
+        suppressed.extend(
+            self.resolve_published_replay_batches(replayed)
+                .await?
+                .into_iter()
+                .map(|batch_id| (batch_id, 0..=u64::MAX)),
+        );
         if suppressed.is_empty() {
             return Ok(None);
         }
@@ -1883,14 +1925,15 @@ impl ShardOwner {
                     MAX(file_ordinal)::smallint AS last_ordinal \
              FROM vala.file_list \
              WHERE data_tenant_id=wyrd.current_tenant() AND namespace=$1 AND table_name=$2 \
-               AND partition_granularity=$3 AND partition_start=$4 \
-               AND node_id=$5 AND writer_epoch=$6 \
+               AND partition_granularity=$3 AND partition_start=$4 AND partition_dimensions=$5 \
+               AND node_id=$6 AND writer_epoch=$7 \
              GROUP BY wal_lsn_min, wal_lsn_max",
         )
         .bind(replayed.seal_key.table.namespace.as_str())
         .bind(&replayed.seal_key.table.name)
-        .bind(replayed.seal_key.partition.granularity_str())
-        .bind(replayed.seal_key.partition.start_utc())
+        .bind(replayed.seal_key.partition.time().granularity_str())
+        .bind(replayed.seal_key.partition.time().start_utc())
+        .bind(replayed.seal_key.partition.dimension_bytes())
         .bind(replayed.stream.node_id.as_uuid())
         .bind(replayed.stream.writer_epoch.as_i64())
         .fetch_all(&mut **conn.transaction())
@@ -1923,6 +1966,7 @@ impl ShardOwner {
             tenant: replayed.seal_key.tenant,
             logical_table_fqn: replayed.seal_key.table.fqn(),
             batch_id: uuid::Uuid::from_bytes(commit.batch_id),
+            table_version: replayed.seal_key.table_version,
             slice_set_digest: commit.slice_set_digest,
             slice_count: i32::try_from(commit.slice_count).map_err(|_| ScribeError::Internal {
                 detail: "WAL replay slice count exceeds SQL integer range".to_owned(),
@@ -2245,7 +2289,7 @@ impl ShardOwner {
                         let progress = persistence.wait_for_submission_progress().await;
                         let _ = completion_tx
                             .send(ShardCommand::RetryReplayPersistence {
-                                seal_key,
+                                seal_key: Box::new(seal_key),
                                 generation_id,
                                 progress,
                             })
@@ -2992,7 +3036,7 @@ struct BatchCommitIdentity {
     first_index: usize,
     /// Validated cardinality of the closed slice set.
     slice_count: u32,
-    /// Digest over exact WAL payload bytes, carried by the v6 COMMIT record.
+    /// Digest over exact WAL payload bytes, carried by the v7 COMMIT record.
     ///
     /// This is a WAL integrity fact: it authorizes exactly the slices that were
     /// fsynced, so a substituted or reordered slice cannot be closed by a valid
@@ -3023,15 +3067,22 @@ struct GroupWalState {
     /// time, so insertion releases them instead of inserting them and replay
     /// suppresses them on the same logical-identity rule.
     spent_batch_ids: HashSet<[u8; 16]>,
+    /// Spent batch identities whose fence names another accepting version.
+    ///
+    /// Their waiters learn that version instead of an acknowledgement, and
+    /// the pod-wide index never records the version they were prepared at.
+    accepted_under: HashMap<[u8; 16], wyrd_spec::vala::ids::TableVersion>,
     /// Batch identities at least one of whose slices this group made visible.
     ///
     /// A batch absent here was a replay: the fence spent it or the memtable
     /// already retained every slice, so its ACK reports no first commit.
     inserted_batch_ids: HashSet<[u8; 16]>,
-    /// Logical identity and slice count of each batch whose fence this group
-    /// committed or found spent, by index into `prepared`; recorded into the
-    /// pod-wide index once the group's rows are visible.
-    fenced: Vec<(usize, [u8; 32], u32)>,
+    /// Logical identity, slice count, and accepting table version of each
+    /// batch whose fence this group committed or found spent, by index into
+    /// `prepared`; recorded into the pod-wide index once the group's rows are
+    /// visible. The version is captured at fence time because insertion
+    /// moves the slices that carry it.
+    fenced: Vec<(usize, [u8; 32], u32, wyrd_spec::vala::ids::TableVersion)>,
 }
 
 /// Owns one WAL/SQL-committed group until every retained batch is query-visible.
@@ -3150,13 +3201,20 @@ impl ShardOwner {
     /// Only the successful path records: a group that failed after its sync
     /// stays retained for serial retry and records nothing until it settles.
     fn record_committed(&self, state: &GroupWalState) {
-        for &(index, logical_digest, slice_count) in &state.fenced {
+        for &(index, logical_digest, slice_count, table_version) in &state.fenced {
             let append = &state.prepared[index];
+            if state
+                .accepted_under
+                .contains_key(append.batch_id.as_bytes())
+            {
+                continue;
+            }
             self.committed.record(
                 append.tenant,
                 append.batch_id,
                 crate::scribe::committed_batches::CommittedBatch {
                     table_fqn: append.table.fqn(),
+                    table_version,
                     logical_digest,
                     slice_count,
                 },
@@ -3179,6 +3237,7 @@ impl ShardOwner {
                 let _ = sender.send(Ok(crate::scribe::preprocess::DurableCompletion {
                     rows,
                     first_commit: state.inserted_batch_ids.contains(batch_id),
+                    accepted_under: None,
                 }));
             }
             drop(append.reservation);
@@ -3338,7 +3397,7 @@ impl ShardOwner {
             // Once WAL close begins, retrying as a normal active generation
             // could duplicate cohort ownership. Preserve every durable file
             // and frozen member, fail-stop admission, and let startup replay
-            // reconstruct the sole owner from WAL v6.
+            // reconstruct the sole owner from WAL v7.
             self.memory_ownership.poison();
         }
         result
@@ -3560,7 +3619,7 @@ impl ShardOwner {
         }))
     }
 
-    /// Appends one v6 COMMIT record per complete batch, syncs once, then fences.
+    /// Appends one v7 COMMIT record per complete batch, syncs once, then fences.
     ///
     /// The group's SLICE records are written but not yet synced when this
     /// method starts. Every complete batch's COMMIT is appended after them; one
@@ -3571,14 +3630,18 @@ impl ShardOwner {
     /// subset of the group's blocks; replay ends the shard chain at the first
     /// bad record, which the absent fences prove unacknowledged. A crash after
     /// the sync but before a fence leaves an unfenced COMMIT that replay and a
-    /// same-ID retry settle exactly once. The COMMIT appends accrue to
+    /// same-ID retry settle exactly once. A batch a fence accepted under
+    /// another table version holds its tenant's fresh fences rolled back while
+    /// its waiter proves it identical under that version; only then are the
+    /// remaining fences offered again, in group order. The COMMIT appends accrue to
     /// `stages.commit`, the sync to `stages.sync`, the fences to `stages.fence`.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when a batch is incomplete, its digest cannot be
-    /// prepared, the WAL lane cannot append or fsync the COMMIT records, or a
-    /// batch-control fence fails.
+    /// prepared, the WAL lane cannot append or fsync the COMMIT records, a
+    /// batch-control fence fails, or a batch accepted under another table
+    /// version is not proved identical.
     async fn append_and_sync_batch_commits(
         &mut self,
         state: &mut GroupWalState,
@@ -3616,7 +3679,7 @@ impl ShardOwner {
                 .touched_segments
                 .first()
                 .ok_or_else(|| ScribeError::Internal {
-                    detail: "WAL v6 batch commit did not retain its segment identity".to_owned(),
+                    detail: "WAL v7 batch commit did not retain its segment identity".to_owned(),
                 })?
                 .header()
                 .clone();
@@ -3633,14 +3696,20 @@ impl ShardOwner {
         let Some(postgres) = self.control_postgres.clone() else {
             return Ok(());
         };
-        let mut fences =
-            Vec::<(DataTenantId, Vec<(usize, ScribeBatchCommit, DateTime<Utc>)>)>::new();
+        let mut fences = Vec::<(
+            DataTenantId,
+            Vec<usize>,
+            Vec<(ScribeBatchCommit, DateTime<Utc>)>,
+        )>::new();
         for (index, identity, header, commit_lsn) in commits {
-            state
-                .fenced
-                .push((index, identity.logical_digest, identity.slice_count));
+            state.fenced.push((
+                index,
+                identity.logical_digest,
+                identity.slice_count,
+                state.durable[identity.first_index].seal_key.table_version,
+            ));
             let append = &state.prepared[index];
-            let (commit, ingested_at) = Self::batch_commit_fence(
+            let fence = Self::batch_commit_fence(
                 append,
                 &state.durable[identity.first_index],
                 &identity,
@@ -3649,30 +3718,119 @@ impl ShardOwner {
             )?;
             match fences
                 .iter_mut()
-                .find(|(tenant, _)| *tenant == append.tenant)
+                .find(|(tenant, _, _)| *tenant == append.tenant)
             {
-                Some((_, batch)) => batch.push((index, commit, ingested_at)),
-                None => fences.push((append.tenant, vec![(index, commit, ingested_at)])),
+                Some((_, indices, offered)) => {
+                    indices.push(index);
+                    offered.push(fence);
+                }
+                None => fences.push((append.tenant, vec![index], vec![fence])),
             }
         }
-        for (tenant, batch) in fences {
-            let spent = self
-                .commit_batch_control_fences(&postgres, tenant, &batch)
-                .await?;
-            for ((index, _, _), already) in batch.iter().zip(spent) {
-                if already {
-                    let append = &state.prepared[*index];
-                    tracing::debug!(
-                        tenant = %append.tenant,
-                        table = %append.table.fqn(),
-                        batch_id = %append.batch_id,
-                        "Scribe batch identity already committed; suppressing a second insertion"
-                    );
-                    state.spent_batch_ids.insert(*append.batch_id.as_bytes());
+        for (tenant, mut indices, mut offered) in fences {
+            use vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution;
+            let resolved = loop {
+                let resolved = self
+                    .commit_batch_control_fences(&postgres, tenant, &offered)
+                    .await?;
+                let unproved: Vec<(usize, wyrd_spec::vala::ids::TableVersion)> = resolved
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, resolution)| match resolution {
+                        ScribeBatchCommitResolution::AcceptedUnder(version) => {
+                            Some((position, *version))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if unproved.is_empty() {
+                    break resolved;
                 }
+                for &(position, version) in &unproved {
+                    let append = &mut state.prepared[indices[position]];
+                    Self::verify_accepted_retry(append, version).await?;
+                    let batch_id = *append.batch_id.as_bytes();
+                    state.accepted_under.insert(batch_id, version);
+                    state.spent_batch_ids.insert(batch_id);
+                }
+                for &(position, _) in unproved.iter().rev() {
+                    indices.remove(position);
+                    offered.remove(position);
+                }
+                if offered.is_empty() {
+                    break Vec::new();
+                }
+            };
+            for (index, resolution) in indices.into_iter().zip(resolved) {
+                let append = &state.prepared[index];
+                let batch_id = *append.batch_id.as_bytes();
+                match resolution {
+                    ScribeBatchCommitResolution::AlreadyCommitted => {}
+                    ScribeBatchCommitResolution::AcceptedUnder(_) => {
+                        return Err(ScribeError::Internal {
+                            detail: "a committed fence group held an unproved batch".to_owned(),
+                        });
+                    }
+                    ScribeBatchCommitResolution::Absent
+                    | ScribeBatchCommitResolution::Committed => continue,
+                }
+                tracing::debug!(
+                    tenant = %append.tenant,
+                    table = %append.table.fqn(),
+                    batch_id = %append.batch_id,
+                    "Scribe batch identity already committed; suppressing a second insertion"
+                );
+                state.spent_batch_ids.insert(batch_id);
             }
         }
         Ok(())
+    }
+
+    /// Asks one append's waiter to prove it is the batch a durable fence
+    /// accepted under `version`, while its tenant group's fresh fences stay
+    /// rolled back.
+    ///
+    /// The waiter receives an early [`DurableCompletion`] naming the version
+    /// and compares its retained input under that definition on the bounded
+    /// ingress CPU lane, outside any SQL transaction. The append's waiter is
+    /// consumed here, so the group's eventual ACK or error never reaches it a
+    /// second time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the append has no waiter, or the
+    /// waiter refuses, abandons, or cannot receive the verification; the
+    /// group then fails and commits none of the tenant's fresh fences.
+    async fn verify_accepted_retry(
+        append: &mut PreparedAppend,
+        version: wyrd_spec::vala::ids::TableVersion,
+    ) -> Result<(), ScribeError> {
+        let (verdict, proved) = tokio::sync::oneshot::channel();
+        let asked = append.durable_ack.take().is_some_and(|waiter| {
+            waiter
+                .send(Ok(crate::scribe::preprocess::DurableCompletion {
+                    rows: 0,
+                    first_commit: false,
+                    accepted_under: Some(crate::scribe::preprocess::AcceptedUnder {
+                        version,
+                        verdict,
+                    }),
+                }))
+                .is_ok()
+        });
+        if asked && proved.await == Ok(true) {
+            return Ok(());
+        }
+        tracing::warn!(
+            tenant = %append.tenant,
+            table = %append.table.fqn(),
+            batch_id = %append.batch_id,
+            accepted_under = %version,
+            "Scribe batch contradicts the fence that accepted its id under another version"
+        );
+        Err(ScribeError::Internal {
+            detail: "scribe batch commit identity mismatch".to_owned(),
+        })
     }
 
     /// Builds the durable batch-control fence for one synced batch COMMIT.
@@ -3698,10 +3856,11 @@ impl ShardOwner {
             tenant: append.tenant,
             logical_table_fqn: append.table.fqn(),
             batch_id: append.batch_id,
+            table_version: first.seal_key.table_version,
             slice_set_digest: identity.logical_digest,
             slice_count: i32::try_from(identity.slice_count).map_err(|_| {
                 ScribeError::Internal {
-                    detail: "WAL v6 slice count exceeds SQL integer range".to_owned(),
+                    detail: "WAL v7 slice count exceeds SQL integer range".to_owned(),
                 }
             })?,
             wal_node_id: uuid::Uuid::from_bytes(header.node_id),
@@ -3730,17 +3889,20 @@ impl ShardOwner {
     /// Commits or durably reconciles one tenant's WAL batch-control fences
     /// from one group commit in a single `PostgreSQL` transaction.
     ///
-    /// Every fence in `batch` belongs to `tenant`. Each is recorded in the
-    /// same tenant transaction, so the group pays one COMMIT instead of one
-    /// per batch. `ingested_at` is each batch's admission instant, the value
+    /// Every fence in `offered` belongs to `tenant`. One statement records them
+    /// all in one tenant transaction, so the group pays one INSERT and one
+    /// COMMIT instead of one of each per batch. `ingested_at` is each batch's admission instant, the value
     /// stamped on its rows as `wyrd_ingested_at`; the fence stores it
-    /// unchanged. The result holds, per fence and in order, whether the batch
-    /// was already committed by an earlier attempt and must not become
-    /// visible again.
+    /// unchanged. The result holds, per fence and in order, its durable
+    /// resolution: whether the batch was already committed by an earlier
+    /// attempt and must not become visible again. When any fence names
+    /// another accepting table version, the transaction is dropped without
+    /// COMMIT, so none of the tenant's fresh fences is durable until the
+    /// caller proves or refuses that batch and offers the rest again.
     ///
     /// A `PostgreSQL` COMMIT error is always ambiguous. The method then opens
-    /// a fresh tenant transaction and resolves every fence by comparing its
-    /// durable identity fields. When every fence resolves, the result is
+    /// a fresh tenant transaction and resolves every fence in one read by
+    /// comparing its durable identity fields. When every fence resolves, the result is
     /// returned; when any is absent, the method retries the identical inserts,
     /// which reclassify the fences that did land. An unavailable or
     /// contradictory lookup poisons the shared governor so
@@ -3757,23 +3919,24 @@ impl ShardOwner {
         &self,
         postgres: &ValaPostgres,
         tenant: DataTenantId,
-        batch: &[(usize, ScribeBatchCommit, DateTime<Utc>)],
-    ) -> Result<Vec<bool>, ScribeError> {
+        offered: &[(ScribeBatchCommit, DateTime<Utc>)],
+    ) -> Result<
+        Vec<vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution>,
+        ScribeError,
+    > {
         use vala_sql::queries::scribe_batch_commits::{
             ScribeBatchCommitResolution, record, resolve,
         };
         loop {
             let mut conn = postgres.tenant_conn(tenant).await?;
-            let mut spent = Vec::with_capacity(batch.len());
-            for (_, commit, ingested_at) in batch {
-                let recorded = record(&mut conn, commit, *ingested_at).await?;
-                spent.push(matches!(
-                    recorded,
-                    ScribeBatchCommitResolution::AlreadyCommitted
-                ));
+            let recorded = record(&mut conn, offered).await?;
+            if recorded.iter().any(|resolution| {
+                matches!(resolution, ScribeBatchCommitResolution::AcceptedUnder(_))
+            }) {
+                return Ok(recorded);
             }
             if conn.commit().await.is_ok() {
-                return Ok(spent);
+                return Ok(recorded);
             }
 
             let mut reconciliation = match postgres.tenant_conn(tenant).await {
@@ -3783,19 +3946,19 @@ impl ShardOwner {
                     return Err(error.into());
                 }
             };
-            let mut resolved = Vec::with_capacity(batch.len());
-            for (_, commit, _) in batch {
-                match resolve(&mut reconciliation, commit).await {
-                    Ok(ScribeBatchCommitResolution::Committed) => resolved.push(false),
-                    Ok(ScribeBatchCommitResolution::AlreadyCommitted) => resolved.push(true),
-                    Ok(ScribeBatchCommitResolution::Absent) => break,
-                    Err(error) => {
-                        self.memory_ownership.poison();
-                        return Err(error.into());
-                    }
+            let resolved = match resolve(
+                &mut reconciliation,
+                offered.iter().map(|(commit, _)| commit),
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    self.memory_ownership.poison();
+                    return Err(error.into());
                 }
-            }
-            if resolved.len() == batch.len() {
+            };
+            if !resolved.contains(&ScribeBatchCommitResolution::Absent) {
                 return Ok(resolved);
             }
         }
@@ -3885,6 +4048,7 @@ impl ShardOwner {
             touched,
             rows_by_append,
             spent_batch_ids: HashSet::new(),
+            accepted_under: HashMap::new(),
             inserted_batch_ids: HashSet::new(),
             fenced: Vec::new(),
         })
@@ -4177,7 +4341,7 @@ impl ShardOwner {
                     rows_accepted: row_count,
                     wal_lsn_min: slice.lsn,
                     wal_lsn_max: slice.lsn,
-                    seal_key: slice.seal_key.as_path_components(),
+                    seal_key: slice.seal_key.canonical_key(),
                 },
                 rows,
             )
@@ -4670,7 +4834,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "owner-test-second"),
-            first.partition,
+            first.partition.clone(),
         );
         let memtable = Memtable::new();
         for key in [&first, &second] {
@@ -4757,7 +4921,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "age-owner-peer"),
-            first.partition,
+            first.partition.clone(),
         );
         let memtable = Memtable::new();
         for key in [&first, &second] {
@@ -4845,7 +5009,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "pressure-owner-peer"),
-            first.partition,
+            first.partition.clone(),
         );
         let memtable = Memtable::new();
         for key in [&first, &second] {
@@ -5227,7 +5391,7 @@ mod tests {
                 crate::test_support::day_partition(2026, 8, 18),
             );
             chunk.states.insert(
-                seal_key.as_path_components(),
+                seal_key.canonical_key(),
                 crate::scribe::replay::ReplayedSealKey {
                     stream,
                     seal_key,
@@ -5619,7 +5783,7 @@ mod tests {
         let lock_key = SealKey::new(
             current_key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "replay-identity-lock"),
-            current_key.partition,
+            current_key.partition.clone(),
         );
         owner
             .memtable
@@ -5703,7 +5867,7 @@ mod tests {
         let next_key = SealKey::new(
             current_key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "replay-advance-failure"),
-            current_key.partition,
+            current_key.partition.clone(),
         );
         let memtable = Memtable::new();
         memtable
@@ -6097,20 +6261,23 @@ mod tests {
         )
     }
 
-    /// Exact retries are removed batch-wise without dropping canonical siblings.
+    /// Suppressed attempts are removed by batch id and WAL range, so a
+    /// refused attempt at a spent id never drops the canonical attempt or a
+    /// sibling batch in the same seal.
     #[test]
     fn replay_fence_filters_only_suppressed_batches_in_same_seal() {
         let key = owner_key();
         let canonical = [1_u8; 16];
         let retry = [2_u8; 16];
-        let commit = |batch_id| crate::scribe::replay::ReplayedCommitIdentity {
+        let commit = |batch_id, lsn: u64| crate::scribe::replay::ReplayedCommitIdentity {
             batch_id,
             slice_set_digest: [3; 32],
             slice_count: 1,
             segment_sequence: 1,
-            wal_lsn_min: WalLsn::new(1),
-            wal_lsn_max: WalLsn::new(2),
+            wal_lsn_min: WalLsn::new(lsn),
+            wal_lsn_max: WalLsn::new(lsn + 1),
             request_id: uuid::Uuid::now_v7(),
+            contested: false,
         };
         let meta = |batch_id, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id,
@@ -6133,13 +6300,13 @@ mod tests {
             ),
             seal_key: key.clone(),
             shard_id: 0,
-            data_records: vec![vec![1], vec![2]],
-            append_metas: vec![meta(canonical, 1), meta(retry, 3)],
+            data_records: vec![vec![1], vec![2], vec![3]],
+            append_metas: vec![meta(canonical, 1), meta(retry, 3), meta(canonical, 5)],
             wal_segments: Vec::new(),
-            commits: vec![commit(canonical), commit(retry)],
+            commits: vec![commit(canonical, 1), commit(retry, 3), commit(canonical, 5)],
         };
 
-        retain_replayed_batches(&mut replayed, &HashSet::from([retry]));
+        retain_replayed_batches(&mut replayed, &[(retry, 3..=4), (canonical, 5..=6)]);
 
         assert_eq!(replayed.append_metas.len(), 1);
         assert_eq!(replayed.append_metas[0].batch_id, canonical);
@@ -6208,6 +6375,112 @@ mod tests {
         );
     }
 
+    /// Same-hour composite partitions whose published WAL ranges interleave
+    /// are each suppressed on replay by their own range only.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, a row cannot be inserted, or the
+    /// replayed partition is not suppressed exactly.
+    #[tokio::test]
+    async fn replay_suppression_reads_only_its_own_composite_partition() {
+        use wyrd_spec::vala::api::PartitionValueWire;
+
+        let database = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("Postgres fixture");
+        let superuser = database.superuser_pool().expect("superuser pool");
+        let tenant = database.data_tenant_id();
+        let table = TableRef::new(BifrostNamespace::Bifrost, "composite-replay");
+        let hour = crate::catalog::TimeGranularity::Hour
+            .bucket(chrono::Utc::now())
+            .expect("now buckets");
+        let customer = |name: &str| {
+            crate::catalog::PhysicalPartition::new(
+                0,
+                hour,
+                0,
+                vec![Some(PartitionValueWire::Utf8(name.to_owned()))],
+            )
+            .expect("one dimension")
+        };
+        let (a, b) = (customer("a"), customer("b"));
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        for (partition, lsn_min, lsn_max) in [(&a, 4_i64, 8_i64), (&b, 6, 6)] {
+            sqlx::query(
+                "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, \
+                 file_size, row_count, min_event_time, max_event_time, partition_granularity, \
+                 partition_start, partition_dimensions, node_id, writer_epoch, wal_lsn_min, \
+                 wal_lsn_max, file_checksum, promotion_record) \
+                 VALUES ($1, $2, $3, $4, $5, 1, 1, $6, $6, 'hour', $6, $7, $8, 1, $9, $10, $11, \
+                 '{}'::jsonb)",
+            )
+            .bind(uuid::Uuid::now_v7())
+            .bind(tenant.as_uuid())
+            .bind(table.namespace.as_str())
+            .bind(&table.name)
+            .bind(format!("composite/{lsn_min}.parquet"))
+            .bind(hour.start_utc())
+            .bind(partition.dimension_bytes())
+            .bind(node.as_uuid())
+            .bind(lsn_min)
+            .bind(lsn_max)
+            .bind("0".repeat(64))
+            .execute(&superuser)
+            .await
+            .expect("insert a published range");
+        }
+        let key = SealKey::new(tenant, table, a);
+        let meta = |marker, lsn| crate::scribe::replay::ReplayedAppendMeta {
+            batch_id: [marker; 16],
+            payload_digest: [0; 32],
+            payload_len: 0,
+            slice_count: 2,
+            wal_lsn: WalLsn::new(lsn),
+            rows_accepted: 1,
+            append_slice_id: crate::scribe::preprocess::AppendSliceId {
+                batch_id: uuid::Uuid::from_bytes([marker; 16]),
+                seal_key: key.clone(),
+                slice_index: 0,
+            },
+            schema_fingerprint: [0; 32],
+        };
+        let append_metas = vec![meta(1, 4), meta(2, 8)];
+        let replayed = crate::scribe::replay::ReplayedSealKey {
+            stream,
+            seal_key: key,
+            shard_id: 0,
+            data_records: Vec::new(),
+            append_metas,
+            wal_segments: Vec::new(),
+            commits: Vec::new(),
+        };
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, _budget, _command_tx, _completion_tx, _pressure_tx) =
+            owner_for_completion_test_with_channels(Memtable::new(), &wal, wal_handle, stream);
+        owner.control_postgres = Some(Arc::new(database.vala_postgres().clone()));
+
+        assert_eq!(
+            owner
+                .resolve_published_replay_batches(&replayed)
+                .await
+                .expect("published ranges read"),
+            HashSet::from([[1; 16], [2; 16]]),
+            "a same-hour partition's interleaved range is not this partition's"
+        );
+    }
+
     fn owner_batch() -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
@@ -6258,7 +6531,7 @@ mod tests {
             rows_accepted: 1,
             wal_lsn_min: WalLsn::new(1),
             wal_lsn_max: WalLsn::new(1),
-            seal_key: key.as_path_components(),
+            seal_key: key.canonical_key(),
         }
     }
 
@@ -6573,7 +6846,9 @@ mod tests {
                 memory,
                 tenant: key.tenant,
                 table: key.table,
-                time_axis: crate::catalog::TimeAxis::new("event_time", key.partition.granularity()),
+                partition_scheme: crate::catalog::PartitionScheme::time_only(
+                    crate::catalog::TimeAxis::new("event_time", key.partition.time().granularity()),
+                ),
                 queued_at: std::time::Instant::now(),
                 durable_ack: None,
                 profile: Arc::default(),
@@ -7240,6 +7515,144 @@ mod tests {
         assert_eq!(rows(&owner), batch_ids.len());
     }
 
+    /// A batch a fence accepted under another table version holds its tenant
+    /// group's fresh fences rolled back until its waiter answers.
+    ///
+    /// The spent fence names version 2 and a different digest; its retry sits
+    /// between two fresh peers in one group. While the waiter holds the
+    /// verification, no fresh fence is durable and no peer is acknowledged. A
+    /// refusal fails the group with no fresh fence or visible row; a proof
+    /// commits both peers, in order, without the spent batch's rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixture cannot start, a fresh fence or ACK precedes the
+    /// verdict, the verification names another version, or the group's
+    /// fences, ACKs, or visible rows diverge from the verdict.
+    #[tokio::test]
+    async fn an_unproved_version_mismatch_holds_fresh_peers_until_its_verdict() {
+        let database = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("Postgres fixture");
+        let superuser = database.superuser_pool().expect("superuser pool");
+        let postgres = Arc::new(database.vala_postgres().clone());
+        let key = SealKey::new(
+            database.data_tenant_id(),
+            TableRef::new(BifrostNamespace::Bifrost, "owner-test"),
+            crate::test_support::day_partition(2026, 7, 24),
+        );
+        let accepted_version =
+            wyrd_spec::vala::ids::TableVersion::new(2).expect("positive version");
+        let fenced = |batch_ids: Vec<uuid::Uuid>| {
+            let superuser = superuser.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM vala.scribe_batch_commits WHERE batch_id = ANY($1)",
+                )
+                .bind(batch_ids)
+                .fetch_one(&superuser)
+                .await
+                .expect("fence count")
+            }
+        };
+        for proved in [false, true] {
+            let wal_root = tempfile::tempdir().expect("WAL directory");
+            let node = crate::scribe::stream_identity::NodeId::generate();
+            let stream =
+                StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+            let wal = Arc::new(
+                WalWriter::new(
+                    wal_root.path(),
+                    *node.as_bytes(),
+                    1,
+                    crate::scribe::wal::WalConfig::default(),
+                )
+                .expect("WAL writer"),
+            );
+            let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+            let (mut owner, budget) =
+                owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+            owner.control_postgres = Some(Arc::clone(&postgres));
+            let spent = uuid::Uuid::now_v7();
+            let fresh = vec![uuid::Uuid::now_v7(), uuid::Uuid::now_v7()];
+            sqlx::query(
+                "INSERT INTO vala.scribe_batch_commits (data_tenant_id, logical_table_fqn, \
+                 batch_id, table_version, slice_set_digest, slice_count, wal_node_id, \
+                 wal_writer_epoch, wal_shard_id, wal_segment_sequence, wal_lsn_min, \
+                 wal_lsn_max, request_id, ingested_at) \
+                 VALUES ($1, $2, $3, $4, $5, 1, $6, 1, 0, 0, 0, 0, $7, statement_timestamp())",
+            )
+            .bind(key.tenant.as_uuid())
+            .bind(key.table.fqn())
+            .bind(spent)
+            .bind(accepted_version.get())
+            .bind([0xEE_u8; 32].as_slice())
+            .bind(uuid::Uuid::now_v7())
+            .bind(uuid::Uuid::now_v7())
+            .execute(&superuser)
+            .await
+            .expect("fence the spent batch under version 2");
+            let (group, mut acks) =
+                acked_group_for_key(&budget, &key, &[fresh[0], spent, fresh[1]]);
+            let spent_ack = acks.remove(1);
+
+            let verification = async {
+                let completion = spent_ack
+                    .await
+                    .expect("verification delivered")
+                    .expect("verification is not an error");
+                let accepted = completion
+                    .accepted_under
+                    .expect("the fence names its accepting version");
+                assert_eq!(accepted.version, accepted_version);
+                assert_eq!(
+                    fenced(fresh.clone()).await,
+                    0,
+                    "no fresh fence is durable before the verdict"
+                );
+                for ack in &mut acks {
+                    assert!(
+                        matches!(
+                            ack.try_recv(),
+                            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                        ),
+                        "no peer is acknowledged before the verdict"
+                    );
+                }
+                accepted
+                    .verdict
+                    .send(proved)
+                    .expect("the group awaits its verdict");
+            };
+            let (result, ()) = tokio::join!(owner.process_group(group), verification);
+
+            let visible = owner.memtable.stats().expect("memtable stats");
+            let visible = visible.writable_rows + visible.immutable_rows;
+            if proved {
+                result.expect("a proved retry resumes the group");
+                let mut rows = 0;
+                for ack in acks {
+                    let completion = ack.await.expect("peer ACK").expect("peer commits");
+                    assert!(completion.first_commit);
+                    rows += completion.rows;
+                }
+                assert_eq!(fenced(fresh.clone()).await, 2);
+                assert_eq!(
+                    u64::try_from(visible).expect("row count fits u64"),
+                    rows,
+                    "only the fresh peers become visible"
+                );
+            } else {
+                result.expect_err("a refused retry fails the group");
+                for ack in acks {
+                    ack.await.expect("peer completion").expect_err("peer fails");
+                }
+                assert_eq!(fenced(fresh.clone()).await, 0, "no fresh fence survives");
+                assert_eq!(visible, 0, "no row becomes visible");
+            }
+        }
+    }
+
     /// Proves accepted mailbox material remains charged until query visibility permits ACK.
     ///
     /// The injected post-COMMIT insertion fault retains both the caller channel
@@ -7383,9 +7796,9 @@ mod tests {
             .readable_batches_for_range(
                 key.tenant,
                 &key.table,
-                key.partition,
-                key.partition,
-                &["value".to_owned()],
+                key.partition.time(),
+                key.partition.time(),
+                &crate::scribe::tail_rpc::tests::named_fields(["value"]),
             )
             .expect("visible owner rows");
         assert!(
@@ -8151,7 +8564,10 @@ mod tests {
         .expect("pending capture")
         .expect("unregistered capture");
         let read = active
-            .read(&(key.partition..=key.partition), &["value".to_owned()])
+            .read(
+                &(key.partition.time()..=key.partition.time()),
+                &crate::scribe::tail_rpc::tests::named_fields(["value"]),
+            )
             .expect("projected read");
         drop(active);
         owner
@@ -8233,7 +8649,10 @@ mod tests {
                 .expect("capture")
                 .expect("unregistered capture");
         let read = capture
-            .read(&(key.partition..=key.partition), &["value".to_owned()])
+            .read(
+                &(key.partition.time()..=key.partition.time()),
+                &crate::scribe::tail_rpc::tests::named_fields(["value"]),
+            )
             .expect("projected read");
         let frozen = memtable.freeze(&key).expect("owner freeze");
         let (seal_id, arrow_bytes) = (frozen.seal_id, frozen.arrow_bytes);

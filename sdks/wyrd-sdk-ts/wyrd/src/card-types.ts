@@ -194,11 +194,13 @@ export interface BifrostTableDescription {
    */
   readonly canonical_physical_fingerprint?: string;
   /**
-   * The table's explicit Forge compaction file target, in bytes.
+   * The Forge compaction file target the table's definition stores, in
+   * bytes.
    *
-   * Present only when the table stores its own
-   * `write.target-file-size-bytes`; omitted means Forge compacts it toward
-   * the deployment default.
+   * The registered target, or the deployment default resolved when the
+   * table was created; a later deployment change does not alter it.
+   * Omitted only for a definition that stores no
+   * `write.target-file-size-bytes`.
    */
   readonly compaction_target_file_size_bytes?: number;
   /**
@@ -228,6 +230,13 @@ export interface BifrostTableDescription {
    * The server-resolved canonical physical layout, fully populated.
    */
   readonly physical_layout: PhysicalLayoutWire;
+  /**
+   * The table version this schema and layout describe.
+   *
+   * A writer sends it with every batch built from this description; a
+   * batch naming a version other than the table's current one is refused.
+   */
+  readonly table_version: TableVersion;
   /**
    * The table's own declared columns, in stored order.
    *
@@ -3550,20 +3559,56 @@ export interface ParquetMeta {
 }
 
 /**
+ * One declared partition field.
+ *
+ * `buckets` is required for and only accepted on a `bucket` transform (2
+ * through 1024); `width` is required for and only accepted on a `truncate`
+ * transform (a positive integer counting Unicode code points for strings).
+ */
+export interface PartitionFieldWire {
+  /**
+   * Bucket count of a `bucket` transform.
+   */
+  readonly buckets?: number;
+  /**
+   * Top-level source column of the complete physical schema.
+   */
+  readonly column: string;
+  /**
+   * Transform applied to `column`.
+   */
+  readonly transform: PartitionTransformWire;
+  /**
+   * Truncation width of a `truncate` transform.
+   */
+  readonly width?: number;
+}
+
+/**
+ * Transform one declared partition field applies to its source column.
+ *
+ * `hour` and `day` partition the table's required UTC time column; the
+ * `identity`, `bucket`, and `truncate` transforms form at most two additional
+ * dimensions over `Utf8`, `Int32`, or `Int64` columns. Each follows Iceberg's
+ * transform semantics, including null preservation.
+ */
+export type PartitionTransformWire = "hour" | "day" | "identity" | "bucket" | "truncate";
+
+/**
  * The authoritative physical layout of one Bifrost table.
  *
  * The same shape is used three ways: as the optional declaration on
  * [`RegisterTableRequest`], as the canonical server-resolved layout returned by
  * [`BifrostTableDescription`], and as the exact JSON persisted in the control
- * row. In the latter two it is always fully populated: the sort order carries
- * at least one key and the Bloom list begins with the schema-present managed
- * floor.
+ * row. In the latter two it is always fully populated: `time_column` and
+ * `partition_by` are named, the sort order carries at least one key, and the
+ * Bloom list is the complete resolved set, which may be empty.
  *
- * Every table is partitioned on exactly one time column: a non-null
- * microsecond or nanosecond timestamp column of the table's own content,
- * named by `time_column`, or the managed `wyrd_ingested_at` when the
- * declaration names none. The column is the source of the table's one
- * Iceberg `hour` or `day` partition field.
+ * `partition_by` holds at most three fields: exactly one `hour` or `day`
+ * transform of `time_column`, a required UTC microsecond or nanosecond
+ * timestamp, plus at most two `identity`, `bucket`, or `truncate` dimensions.
+ * An omitted or empty list resolves to `hour(time_column)`, and an omitted
+ * `time_column` to `wyrd_ingested_at`.
  *
  * On the request path an omitted `sort_keys` and an explicit empty `sort_keys`
  * resolve identically, because the server injects nothing ahead of a declared
@@ -3571,20 +3616,20 @@ export interface ParquetMeta {
  */
 export interface PhysicalLayoutWire {
   /**
-   * Ordered Bloom-filtered columns.
+   * Bloom-filtered columns; at most sixteen may be declared.
    */
   readonly bloom_columns: readonly string[];
   /**
-   * Required partition granularity on the time column.
+   * Ordered partition fields; at most three may be declared.
    */
-  readonly partition_granularity: TimeGranularityWire;
+  readonly partition_by: readonly PartitionFieldWire[];
   /**
    * Ordered sort keys; at most four may be declared.
    */
   readonly sort_keys: readonly SortKeyWire[];
   /**
-   * The table's time column: a non-null `TIMESTAMP_LTZ` or `TIMESTAMP_NTZ`
-   * column at microsecond or nanosecond precision.
+   * The table's time column: a required `TIMESTAMP_LTZ` column at
+   * microsecond or nanosecond precision.
    *
    * Omitted on a request, the time column is `wyrd_ingested_at`. The
    * canonical form in a description and the control row always names it.
@@ -5711,6 +5756,8 @@ export type StepStatus = "succeeded" | "failed" | "skipped";
  */
 export type TableStatus = "Active" | "Deprecated" | "Quarantined";
 
+export type TableVersion = string;
+
 export type TaskId = string;
 
 /**
@@ -5754,14 +5801,6 @@ export interface TextMeta {
  * Save format for the Tensorflow model interface.
  */
 export type TfSaveFormat = "Keras" | "SavedModel";
-
-/**
- * Time-partition granularity on the wire.
- *
- * Bifrost partitions every table on its one time column and admits exactly
- * these two Iceberg-native transforms; nothing else is representable.
- */
-export type TimeGranularityWire = "hour" | "day";
 
 /**
  * Timestamp / time precision. Arrow-free mirror of `arrow::datatypes::TimeUnit`.

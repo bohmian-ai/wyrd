@@ -87,7 +87,7 @@ console.log(await bifrost.register()); // "created" or "already_exists"
 
 Registering the same schema again returns `already_exists` and changes nothing. A different schema for an existing table fails with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`; tables cannot be altered or dropped, so pick a new name. `card_uid`, `run_id`, `sub_principal_id`, `act_principal_id`, and names starting with `wyrd_` are reserved.
 
-By default the table is partitioned on `wyrd_ingested_at`, the time Bifrost received each row. If your rows carry their own event time and you will filter on it, name it as the time column. It must be a non-null timestamp:
+By default the table is partitioned on `wyrd_ingested_at`, the time Bifrost received each row. If your rows carry their own event time and you will filter on it, name it as the time column. It must be a non-null UTC timestamp:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
@@ -101,12 +101,12 @@ TableConfig(TicketOutcome, "vala.datasets.ticket_outcomes", time_column="closed_
 
 ```rust
 // The layout type is not re-exported from wyrd_ai yet; add wyrd-spec as a dependency.
-use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 
 let table = TableConfig::from_model::<TicketOutcome>("vala.datasets.ticket_outcomes")?
     .with_layout(PhysicalLayoutWire {
-        partition_granularity: TimeGranularityWire::Day,
         time_column: Some("closed_at".into()),
+        partition_by: vec![],
         sort_keys: vec![],
         bloom_columns: vec![],
     });
@@ -288,7 +288,7 @@ Only `vala.datasets` accepts writes from you.
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | The table exists with a different schema | Use a new table name |
 | `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` | A field is named `card_uid`, `run_id`, or `wyrd_*` | Rename the field |
 | `WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT` | `time_column` is missing, nullable, or not a timestamp | Point it at a required timestamp field |
-| `WYRD_VALA_412_NO_ACTIVE_TABLE` | `insert` before a table was set | Pass a `TableConfig` when connecting, or call `use_table` |
+| `WYRD_VALA_412_NO_ACTIVE_TABLE` | `insert` before a table was set | Register the table, or call `use_table_by_name` to bind a registered one |
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | Writing to a table that was never registered | Call `register` first |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | The credential lacks the permission for that step | See the prerequisites |
 | An empty result right after `flush` | The rows are stored but not yet queryable | Retry; see [Bifrost](/understand/bifrost/#written-versus-queryable) |

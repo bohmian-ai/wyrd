@@ -17,21 +17,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use iceberg::spec::{
-    DataContentType, DataFile, Literal, PartitionSpec, PrimitiveLiteral, Struct, Transform,
-};
+use iceberg::spec::{DataContentType, DataFile, PartitionSpec};
 use iceberg::table::Table;
 use iceberg::transaction::Transaction;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use uuid::Uuid;
+use wyrd_spec::vala::ids::TableVersion;
 
 use super::Forge;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::managed::RewriteHandoff;
 use super::managed::fingerprint::ForgeRewriteEvidence;
-use crate::catalog::layout::{TimeGranularity, TimePartition};
+use crate::catalog::layout::TimePartition;
 
 /// Value of `forge.workflow` every rewrite snapshot carries.
 ///
@@ -61,6 +60,7 @@ pub(super) const REWRITE_SNAPSHOT_PROPERTY_KEYS: &[&str] = &[
     "forge.rewrite.selection_fingerprint",
     "forge.rewrite.debt_fingerprint",
     "forge.rewrite.policy_fingerprint",
+    "forge.rewrite.table_version",
     "forge.rewrite.removed_data_files",
     "forge.rewrite.removed_delete_files",
     "forge.rewrite.retained_delete_files",
@@ -311,6 +311,8 @@ pub(super) struct RewriteCommitIdentity {
     pub(super) plan_hash: [u8; 32],
     /// Selection, debt, and policy fingerprints the attempt produced.
     pub(super) evidence: ForgeRewriteEvidence,
+    /// Table version the attempt selected and wrote every output under.
+    pub(super) table_version: TableVersion,
 }
 
 /// Everything the pure commit derivation reads, borrowed from its owner.
@@ -520,6 +522,10 @@ impl RewriteCommitRequest {
                 self.identity.evidence.policy_fingerprint.clone(),
             ),
             (
+                "forge.rewrite.table_version".to_owned(),
+                self.identity.table_version.to_string(),
+            ),
+            (
                 "forge.rewrite.removed_data_files".to_owned(),
                 self.removed_data_files.len().to_string(),
             ),
@@ -664,6 +670,8 @@ pub(super) struct RewriteSnapshotProperties {
     pub(super) debt_fingerprint: String,
     /// Policy fingerprint the publishing attempt produced.
     pub(super) policy_fingerprint: String,
+    /// Table version every added data file was written under.
+    pub(super) table_version: TableVersion,
     /// Number of live data files the commit removed.
     pub(super) removed_data_files: u64,
     /// Number of live delete files the commit removed.
@@ -686,7 +694,8 @@ impl RewriteSnapshotProperties {
     /// Returns [`ForgeError::Reconciliation`] when a required property is
     /// absent or empty, when the workflow or property version is not the one
     /// this owner writes, when an identity is not a UUID, when a count or
-    /// snapshot id is not a non-negative integer, when the plan hash is not 32
+    /// snapshot id is not a non-negative integer, when the table version is
+    /// not canonical, when the plan hash is not 32
     /// hex-encoded bytes, or when the commit claims to have added nothing.
     pub(super) fn validate(properties: &BTreeMap<String, String>) -> Result<Self, ForgeError> {
         let reconciliation = |detail: String| ForgeError::Reconciliation { detail };
@@ -757,6 +766,13 @@ impl RewriteSnapshotProperties {
             selection_fingerprint: read("forge.rewrite.selection_fingerprint")?.clone(),
             debt_fingerprint: read("forge.rewrite.debt_fingerprint")?.clone(),
             policy_fingerprint: read("forge.rewrite.policy_fingerprint")?.clone(),
+            table_version: read("forge.rewrite.table_version")?
+                .parse()
+                .map_err(|error| {
+                    reconciliation(format!(
+                        "rewrite snapshot table version is not canonical: {error}"
+                    ))
+                })?,
             removed_data_files: count("forge.rewrite.removed_data_files")?,
             removed_delete_files: count("forge.rewrite.removed_delete_files")?,
             retained_delete_files: count("forge.rewrite.retained_delete_files")?,
@@ -1129,44 +1145,6 @@ pub(super) enum RewriteSubmission {
     AcceptanceUnknown(ForgeError),
 }
 
-/// Derives the exact time partition one live file belongs to.
-///
-/// The partition value is read off the file itself rather than out of
-/// `vala.file_list`, and that difference is load-bearing: the outputs of a
-/// previous rewrite have no `file_list` row, so a `file_list`-derived partition
-/// would make every already-rewritten file permanently unselectable. The table
-/// spec supplies the transform and the data file supplies the transformed
-/// value, both of which travel with every file forever.
-///
-/// Returns `None` when the spec carries no day or hour transform, or when the
-/// file's partition tuple does not hold an integer at that position — a table
-/// Bifrost did not lay out, which Forge declines to rewrite rather than guess
-/// a partition for.
-pub(super) fn rewrite_time_partition(
-    spec: &PartitionSpec,
-    partition: &Struct,
-) -> Option<TimePartition> {
-    let (index, granularity) = spec
-        .fields()
-        .iter()
-        .enumerate()
-        .find_map(|(index, field)| match field.transform {
-            Transform::Day => Some((index, TimeGranularity::Day)),
-            Transform::Hour => Some((index, TimeGranularity::Hour)),
-            _ => None,
-        })?;
-    let Some(Some(Literal::Primitive(PrimitiveLiteral::Int(value)))) =
-        partition.fields().get(index)
-    else {
-        return None;
-    };
-    let seconds = i64::from(*value).checked_mul(match granularity {
-        TimeGranularity::Day => 86_400,
-        TimeGranularity::Hour => 3_600,
-    })?;
-    TimePartition::new(granularity, chrono::DateTime::from_timestamp(seconds, 0)?).ok()
-}
-
 /// Derives the single time partition one publication belongs to.
 ///
 /// The audit row for a rewrite names one partition, and so does the group fence
@@ -1187,14 +1165,15 @@ pub(super) fn rewrite_group_partition<'file>(
 ) -> Result<TimePartition, ForgeError> {
     let mut partitions = BTreeMap::new();
     for file in files {
-        let partition = rewrite_time_partition(spec, file.partition()).ok_or_else(|| {
-            ForgeError::Reconciliation {
-                detail: format!(
-                    "rewrite file {} carries no derivable Bifrost time partition",
-                    file.file_path()
-                ),
-            }
-        })?;
+        let partition =
+            TimePartition::of_iceberg_partition(spec, file.partition()).ok_or_else(|| {
+                ForgeError::Reconciliation {
+                    detail: format!(
+                        "rewrite file {} carries no derivable Bifrost time partition",
+                        file.file_path()
+                    ),
+                }
+            })?;
         partitions.insert(
             (partition.granularity_str(), partition.start_utc()),
             partition,
@@ -1550,6 +1529,7 @@ mod tests {
                 debt_fingerprint: "debt".to_owned(),
                 policy_fingerprint: "policy".to_owned(),
             },
+            table_version: TableVersion::INITIAL,
         }
     }
 

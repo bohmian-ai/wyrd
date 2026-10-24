@@ -1,6 +1,6 @@
 ---
 id: SPEC-service-identity-and-telemetry
-revision: 12
+revision: 13
 status: approved
 ---
 
@@ -43,6 +43,13 @@ authorized User may use an existing access token and `WyrdState`, emit evidence,
 and invoke verification without first acquiring a machine identity or selecting
 a workload root. Root absence alone never denies an otherwise authorized call.
 
+Table definitions also need one identity across ingestion and storage. Native
+schema, partition-spec and sort-order IDs do not identify a Bloom-only change.
+Use one `table_version` for the complete definition and retain its native
+Iceberg metadata. Clearing Blooms from version 1 creates version 2; data
+accepted under version 1 still recovers and publishes under version 1, and an
+identical accepted retry keeps that binding after a partition edit.
+
 ### Value, costs, and limits
 
 The developer configures credentials and permissions once, keeps exact-version
@@ -60,6 +67,14 @@ space. Existing development databases, tables, and credentials need no
 conversion or backfill. Future runtime layout evolution is a distinct
 capability and retains the specified durability guarantees.
 
+Versioning requires an Iceberg SQL catalog fork extension for atomic
+definition-reference publication, retained metadata roots and a coordinated
+wire/persistence change. It removes copied layout JSON and redundant identity
+work without adding PostgreSQL to normal ingest. The existing pre-ACK fence
+remains and is batched inside its existing transactions. Throughput is
+unmeasured until the benchmark rule below runs; no regression beyond 5% is
+allowed.
+
 Selecting a UID is an authorized declaration of execution identity, not
 attestation of the executing binary. Logfire supplies useful query conventions,
 not Wyrd's verification trust model or a published physical partition recipe.
@@ -69,10 +84,19 @@ not Wyrd's verification trust model or a published physical partition recipe.
 This packet consists of this specification and three normative supplements:
 [authentication contracts and flows](supplements/auth-system.md),
 [telemetry schemas and production](supplements/telemetry-schemas.md), and
-[unified tables, physical layouts, and correlation](supplements/table-storage-and-correlation.md),
-all at revision 12. Approval covers all four documents. Implementation tasks are derived under `tasks/`. The supplements fix their public/persisted contracts;
-this document states their purpose and obligations. The maintainer explicitly approved this complete revision for task planning.
-The previously open decisions are resolved by the agreed contracts.
+[unified tables, physical layouts, and correlation](supplements/table-storage-and-correlation.md).
+This specification and the storage supplement are revision 13. The auth and
+telemetry supplements are unchanged from revision 12 and are incorporated
+unchanged. The maintainer explicitly approved the complete revision-13 packet.
+Implementation tasks live under `tasks/`; TASK-004-R2 and TASK-005 remain
+proposed until task readiness review.
+For table-version scope, this revision and its R2 remediation replace older
+TASK-004 composite/configuration-revision wording and ownership assignments:
+R2 owns allocation and atomic publication; TASK-005 exposes PATCH and refresh.
+TASK-004 retains its other obligations, but its older text must be aligned
+through the existing task workflow before affected execution. It authorizes
+no second counter or publication coordinator. The supplements fix the
+public/persisted details; this document states their purpose and obligations.
 
 The requested change deliberately revises the current owners:
 
@@ -81,13 +105,15 @@ The requested change deliberately revises the current owners:
 | `architecture/wyrd-design.md`, Doctrine and Runtime identity | Registration creates version-bound Service/Agent principals; deployment keys select them. | Stable Service accounts; validated exact root context independent of account identity. |
 | `architecture/wyrd-design.md`, Card references, declaration, config | Space participates in identity and authoring defaults. | Tenant/kind/name/version identity and references without space. |
 | `architecture/wyrd-security-posture.md` | Separate Agent principal kind, persisted version binding, principal-free deployment credentials. | One nonhuman Service account kind, principal-owned credentials, explicit account restrictions and session root scope. |
-| `architecture/bifrost-design.md` | Publisher-to-root attribution depends on version principals; current signal layouts. | Shared attribution across system/dynamic tables; exact system layouts, bounded multi-field dynamic layouts, and explicit evolution under one engine. |
+| `architecture/bifrost-design.md` | Publisher-to-root attribution depends on version principals; current signal layouts and incomplete composite layout identity. | Shared attribution and table rules, with one complete table version, retained native metadata and atomic version/reference publication under the existing engine owners. |
 | Root `AGENTS.md` and SDK/schema documentation | CardRef includes space. | The same new CardRef contract on every public surface. |
 
 These are proposed authority amendments, not claims that current architecture
 already permits the new behavior. Implementation must update the owning prose,
 schemas, examples, and contributor rules together; no parallel old contract or
 compatibility alias remains in the fresh baseline.
+The Bifrost authority edits for the table version are part of the same
+approved revision.
 
 On approval, this packet supersedes only the conflicting deployment-identity,
 credential-retirement, and unchanged-attribution requirements of
@@ -107,6 +133,7 @@ this draft alone.
 | Graph scope | The root plus its reachable observation-target Cards, resolved to exact registry UIDs by the server. |
 | Observation subject | The exact Card a row concerns; it may be a component shared by several roots. |
 | Owner | The exact root whose execution or verification binding the record belongs to, not ownership of another independent Card. |
+| Table version | One positive signed 64-bit integer identifying a complete immutable definition within an immutable tenant-bound table identity; unrelated to Card versions, snapshots or publication progress. |
 
 ## Required behavior
 
@@ -310,22 +337,30 @@ this draft alone.
   sentinels, and nullable unknown correlations. Never replace original actors
   with delivery identities or reinterpret audit targets as observed subjects.
 - **REQ-035** Use the exact system ledger and shared writer recipe in the
-  storage supplement as defaults; descriptions expose the tenant's resolved
-  current layout and revision. Authorized tenant configuration may override
-  system partitions and Blooms using the same table rules as dynamic tables. Pruning is an optimization, not authority or
+  storage supplement as defaults; describe/register responses expose the
+  resolved schema/layout and matching `table_version`. Use that same version
+  in PATCH as `expected_table_version`, with no configuration counter or
+  aliases. Authorized tenant configuration may override system partitions and
+  Blooms using the same table rules as dynamic tables. Pruning is an optimization, not authority or
   a substitute for exact row filtering.
 - **REQ-036** System and dynamic tables use the same table owner/lifecycle and the
   supplemental layout shape, defaults, and limits. Support bounded multi-field
   partitions and explicit scalar sort/Bloom declarations. Refuse invalid
   layouts or excess composite fanout before durable acceptance, with no
   partially accepted batch or inferred resource partitions.
-- **REQ-037** Carry complete typed partition tuples and their layout/spec
-  revision consistently through Scribe, WAL, manifests, publication, Oracle,
-  peer reads, and Forge. Preserve time bounds, tenant ownership, accepted-batch
-  idempotency, and null semantics; a catalog-only multi-field change is insufficient.
+- **REQ-037** Carry the same `table_version` and complete typed partition
+  tuples through clients/Gate, Scribe, WAL slices/commits, seals, assembly,
+  staging, batch fences, promotion, Oracle pins/peer reads and Forge. Resolve
+  the complete definition from its retained native metadata, never current
+  Bloom properties or a parallel recipe blob. Native schema/spec/order IDs
+  remain physical descriptors. Preserve time bounds, tenant ownership,
+  accepted-batch idempotency and null semantics.
 - **REQ-038** Support explicit compatible schema/layout evolution with stable
-  field IDs, distinct partition/sort revisions, revision-bound accepted batches,
-  and reads across retained specifications. Re-registration stays idempotent.
+  field IDs and one version allocated atomically with each effective
+  definition edit. Retain native metadata under the publication/retention
+  contract below. Reject stale new writes; accepted retries use the fence's
+  original version through restart, publication and WAL retirement. Preserve
+  reads across retained specifications. Re-registration stays idempotent.
   Historical rewrite is explicit maintenance; layout metadata changes alone
   do not claim old files are repartitioned or resorted.
 
@@ -389,7 +424,7 @@ this draft alone.
 - **REQ-047** Apply the storage supplement's agreed safe-edit principles:
   supported transforms/types, compatible nullable additions and stable-ID
   renames, protected system/managed fields and layout dependencies, explicit
-  administration authority, and atomic rejection of stale revision edits through the specified PATCH
+  administration authority, and atomic rejection of stale table-version edits through the specified PATCH
   contract. Use the existing table DDL permission, nullable custom additions
   and stable-ID renames; refuse type changes and deletions.
 - **REQ-048** Retain hourly defaults for spans/logs/metrics/gateway and dynamic
@@ -397,6 +432,71 @@ this draft alone.
   system ledger. Withdraw the daily dynamic candidate. Authorized tenant
   overrides remain available under the shared rules; unrelated default changes
   still require explicit approval.
+
+### Single table version contract
+
+This contract fixes the public and persisted decisions for REQ-035/037/038.
+The storage supplement supplies the full alteration and lifecycle rules.
+
+- A newly created table starts at 1. Every effective definition edit increments
+  once, including schema/field IDs, partition, sort, Bloom and any writer/layout
+  setting. Data, snapshot and housekeeping commits never increment it. No-op
+  and invalid edits consume no committed version; there is no parallel
+  configuration revision. Existing safe-edit limits and immutable time axis
+  remain in force.
+- The domain is `1..=9223372036854775807`: Rust `i64`, PostgreSQL `BIGINT` with
+  positivity enforced, protobuf `int64` and eight-byte persisted version
+  fields. JSON represents both `table_version` and `expected_table_version`
+  exclusively as canonical unsigned base-10 **strings**, including `"1"`.
+  TypeScript SDK values are `bigint`, converted directly to/from those strings;
+  Rust/Python retain exact integers. No conversion passes through a JavaScript
+  `number`. Reject zero, negative/out-of-range values, JSON numbers, signs,
+  leading zeros, whitespace, fractions and exponent notation. Version
+  exhaustion refuses the edit without wrapping or changing the definition.
+- Store the decimal value in `wyrd.bifrost.table-version` with all definition
+  edits in one Iceberg metadata commit. Publish the retained
+  `(immutable table identity, table_version) -> native metadata location`
+  reference in the same catalog SQL transaction as the metadata-pointer CAS.
+  The Iceberg SQL catalog fork asserts expected version and base pointer at
+  that boundary; competing Bloom-only edits cannot bypass it. No later SQL
+  projection or second allocator owns this fact. Uncertain commit results
+  reconcile exact evidence before success or cache refresh.
+- Native Arrow writers obtain the version/schema binding from describe or
+  registration, retain it in the shared client and send it on each batch.
+  Canonical built-ins use a versioned server projection bound by Gate. New
+  batches with a stale version receive the typed table-version conflict
+  (HTTP 409 projection); accepted retries resolve the fence's original version
+  and still prove unchanged source schema, row order/count and payload.
+  Keep structural/type/nullability/reserved-field/value validation; a version
+  claim is no substitute for checking data. Do not add a preliminary accepted-
+  ID query on successful fresh ingest.
+- Always retain the current definition. Retain older native metadata and its
+  reference while any WAL, staged-data, fence, promotion/file-lineage or active
+  query-pin root or accepted-retry retention remains. Forge expiry/orphan cleanup honors
+  these roots even after native metadata-log rollover. There is no invented
+  TTL; absence of a proven retention horizon means retain. Snapshot/data-file
+  retention and visibility remain separate from definition identity.
+  Settled promotion/rewrite lineage still roots the definition while retained
+  files require it; settlement alone is not permission to discard the version.
+- This is in-baseline evolution: no release migration, backfill, compatibility
+  alias, automatic reset or dual on-disk authority. Legacy evidence is usable
+  only if its exact definition maps unambiguously to retained version evidence;
+  otherwise refuse it. Never guess a version from current schema or Blooms.
+- Keep the existing PostgreSQL fence before ACK. Successful normal ingest adds
+  no PostgreSQL call or transaction. Each tenant's drained group uses one
+  multi-row fence INSERT, one batched conflict read if needed, and batched
+  ambiguous-COMMIT resolution, preserving per-batch classification, rollback,
+  group order, RLS and poisoning. Transaction count remains unchanged.
+  Replacing the fence is out of scope.
+- Implementation may run the Bifrost capacity benchmarks
+  (`bench:bifrost:write-capacity` native, and `bench:bifrost:query-capacity`)
+  and the tracing benchmark (`bench:bifrost:write-capacity -- --fixture
+  telemetry`) only when no other worktree is running a build, test, server or
+  benchmark; otherwise skip and record the limit. A run compares the reviewed
+  baseline and the candidate on the same host and configuration. Any
+  throughput metric (rows/s, MB/s, MB/s per core) more than 5% below the
+  baseline, or any query latency more than 5% above it, is a regression and
+  fails the change. Without a run, throughput stays unmeasured.
 
 ## Invariants and non-goals
 
@@ -445,39 +545,43 @@ each shipped surface; pure extraction additionally needs in-process cases.
 | **AC-007 Schemas and production** | Describe and write/read each complete supplemental schema. Repeated and wrongly typed attributes follow its exact rules. OTLP and native Arrow produce equal promoted values; forged derived/managed values are refused before acknowledgement. Exact counters, nested fields, and timestamp precision survive hot reads, publication, restart, and compaction. | REQ-021–024; INV-007–008 |
 | **AC-008 Queries and layout** | Service-family queries return both releases, exact-owner filters separate them, shared-component filters remain independent, and resource filters work without decoding unrelated fields. Inspect actual partition manifests and pruning on representative same-service and cross-service queries; report file counts/sizes and planning overhead, not an invented latency target. | REQ-025–026; INV-003 |
 | **AC-009 Fresh baseline** | Start from fresh/reset development state and create accounts, Cards, system and dynamic tables using only the new catalog/schema/auth contract. No historical backfill, legacy key/token conversion, dual reads, or space/catalog aliases are required. | REQ-027–031; INV-001–008 |
-| **AC-010 Contract closure** | Owning architecture, public schemas, examples, SDK declarations, and error contracts agree with the approved packet. Existing unrelated guided-setup work remains independently valid; no test is switched to a broader credential to hide a failure. | REQ-032; INV-006 |
+| **AC-010 Contract closure** | Owning architecture, public schemas, examples, SDK declarations and error contracts agree. Every surface round-trips table versions above 2^53 through the maximum without precision loss: JSON uses decimal strings and TypeScript uses bigint. JSON numbers and malformed/range-invalid versions refuse. Existing unrelated guided-setup work remains independently valid; no broader credential hides a failure. | REQ-032, 035–038; INV-006 |
 | **AC-011 Complete auth contract** | Exercise the auth supplement's principal/grant matrix, account restriction administration, exact request/claim shapes, three Card-access states, delegation intersections, external assertion mapping, gateway/OTLP ingress, and queued/scheduled authority recovery. Malformed or inconsistent claims are refused, and accepted token sizes remain within the existing verifier limit. | REQ-001–017, 027–033; INV-001–007 |
 | **AC-012 Unified tables and layouts** | Describe all nine system tables and dynamic tables; observe the shared envelope and exact layout/Bloom/writer policy. Exercise custom multi-field/null partitions, invalid declarations, fanout refusal before ACK, original audit/outbox attribution, and dynamic-table correlation with verification and telemetry. | REQ-024–027, 034–037; INV-001–008 |
-| **AC-013 Evolution and recovery** | Within the new baseline, rename fields without changing IDs/values, alter an explicit layout, retry accepted batches across the revision boundary, and read/compact retained runtime specifications. No records disappear, accepted identities change, or old files acquire a false new sort/partition claim. | REQ-027–032, 037–038; INV-001–008 |
+| **AC-013 Evolution and recovery** | Rename fields with stable IDs/values; change partition grouping, then retry original bytes/ID under the fence's version with warm/cold caches, provisional WAL attempts, restart, publication and WAL retirement. Identical retries preserve original acceptance/time/origin; altered content refuses. Stale new batches refuse without residue. Retained mixed-spec reads/compaction keep exact rows and truthful old-file layout. Unmappable legacy evidence refuses without guessing/backfill. | REQ-027–032, 035, 037–038; INV-001–008 |
 | **AC-014 Catalog and verification** | Use only `bifrost.*` names for built-ins/datasets and permission scopes. Direct, queued, grouped, drift, and trace verification retain their accepted account/workload/subject/binding semantics across the renamed contracts. | REQ-039–040; INV-001–008 |
 | **AC-015 Final docsite task** | The implementation plan's last task is a separate docsite task covering the shipped contract and runnable examples, with the owning documentation checks before integrated review. | REQ-041 |
-| **AC-016 Correlation and configurable Blooms** | Describe verification results and observe exactly the eight default columns. Replace or clear the set on system and dynamic tables without automatic floor reinsertion; account/request columns remain stored. Reads and joins retain exact results with missing filters, and a Bloom-only change preserves the partition/sort declaration. | REQ-035–038, 042; INV-001–008 |
+| **AC-016 Correlation and configurable Blooms** | Describe verification results and observe exactly the eight default columns. Replace, clear or reorder declared Blooms at a new table version without floor reinsertion or partition/sort change. Staged old-version data recovers/publishes with its original policy; new batches use the new one. Account/request columns remain stored; exact query results agree across complete/partial/empty/reordered policies, missing historical filters and compaction. | REQ-035–038, 042; INV-001–008 |
 | **AC-017 Verification evidence lookup** | Exercise exact result, repeated-trace, subject/series-window, grouped input/result, and dynamic-table evidence reads across hot/published/live sources. Record planning/source/scan timings, bytes/files/groups examined and pruned, repeated query counts, and end-to-end latency. Demonstrate narrower projections/bounds and safe reuse where justified while obtaining the same authorized evidence; do not claim a millisecond lookup SLO from execution deadlines. | REQ-035–038, 040, 042–043; INV-001–008 |
 | **AC-018 Lean defaults and trace correlation** | Describe all nine tables and observe the agreed complete per-table Bloom sets; spans/logs omit span_id by default but accept an authorized explicit configuration. Trace, span, Service/environment, and time filters return the same authorized rows with missing/disabled filters; no hidden time window or order-dependent Bloom semantics appear. | REQ-035–038, 042–044; INV-001–008 |
 | **AC-019 Whole-trace evidence** | Verify a Service/Agent/component binding against a trace containing its own spans, other workloads' spans, and untagged spans. All authorized visible trace spans, including retained spans outside the old fixed time window, remain available to the authored selector; checks in one attempt share the fetched collection and later spans do not mutate a completed result; the result retains the binding owner/subject while every source span retains its own attribution. | REQ-014–015, 040, 043, 045; INV-001–008 |
 | **AC-020 Evidence-availability retry** | Queue a verification before its trace lands: no immediate completed inconclusive result is emitted, and the same execution resumes after bounded backoff when evidence appears. Exhaustion produces an inconclusive trace check (and an inconclusive trace-only result), preserving other requirement judgments; failed checks and invalid/auth/oversized evidence do not enter not-yet-landed retries. Accepted identity, authority, inputs, and configured per-attempt timeout remain unchanged. | REQ-014, 040, 043, 045–046; INV-001–008 |
-| **AC-021 Safe edits and agreed defaults** | Create system/dynamic tables with the agreed hourly/daily defaults. Exercise supported transforms, compatible custom-field evolution, protected-field/dependency refusal, and competing revision edits; a stale update changes nothing. | REQ-035–038, 047–048; INV-001–008 |
+| **AC-021 Safe edits and agreed defaults** | Create system/dynamic tables at table_version 1 with agreed defaults. Effective edits increment once; no-op/failed edits and data/snapshot/housekeeping commits do not. Competing edits, including Bloom-only edits, publish exactly one winning definition/reference in the catalog CAS transaction; stale/overflow edits change nothing. Preserve safe types, protected fields and dependencies. | REQ-035–038, 047–048; INV-001–008 |
+| **AC-022 Definition retention** | Retain the current version after data-only metadata-pointer movement. While WAL/stage/fence/promotion/query-pin or accepted-retry roots remain, expiry/orphan cleanup and metadata-log rollover cannot remove older definitions. After roots and retry retention are provably gone, eligible noncurrent metadata may be pruned; unavailable evidence never proves safety. | REQ-037–038 |
+| **AC-023 Grouped fence semantics** | A group of N fresh batches uses one multi-row INSERT per tenant with unchanged tenant transactions. Mixed duplicate/conflicting rows retain per-batch results and group order; contradictions roll back fresh rows. Batched uncertain-COMMIT reconciliation preserves absent/retry and poisoning behavior, RLS and no ACK before durable WAL/fence. Verify operation counts without claiming measured throughput. | REQ-037–038; INV-001–002, 006–007 |
 
-## Open material decisions
+## Approval and material decisions
 
-None remain. The maintainer agreed the exact supported table-editing subset,
-existing table DDL permission, revision-checked PATCH contract and retained
-historical-layout behavior. The agreed trace contract evaluates the entire
-authorized visible trace, reuses one fetched trace per attempt, retries absent
-queued evidence, and never claims distributed completeness. Direct missing
-trace evidence is inconclusive without hidden queue submission. Late spans
-require a new verification to obtain a new judgment. Trace reads have no
-implicit acceptance-relative time window and fail explicitly on limits.
+None remain. The maintainer approved revision 13: one complete table-version
+identity, the exact signed-64-bit/string/bigint representation, atomic Iceberg
+catalog publication, stale-writer refusal with accepted-retry preservation,
+rooted retention without a TTL, and refusal of unmappable legacy evidence with
+no migration or backfill.
 
-Preserve the existing queued per-attempt timeout (five minutes by default),
-three total attempts and 30/60-second backoff. The earlier wording suggesting
-an existing absolute accepted-execution deadline was incorrect; no such total
-expiry is introduced. Direct execution retains its existing 60-second default.
+The auth/telemetry decisions and partition/sort/Bloom defaults from revision
+12 remain unchanged. Whole-trace evidence still uses every authorized visible
+span without an implicit time window, one fetched collection per attempt,
+explicit limit failures and no completeness claim. Queued checks retain their
+existing per-attempt timeout (five minutes by default), three total attempts
+and 30/60-second backoff; direct execution keeps its 60-second default. No
+absolute accepted-execution expiry is introduced.
 
-All partition/sort/Bloom defaults and the v0.3.0 reset baseline remain as agreed.
-No historical migration, numerical lookup SLO, trace-completion protocol or
-immutable historical replay is added. Revision 12 records these decisions;
-the maintainer approved all four documents for task planning.
+Public representation, catalog atomicity, reference retention and safe
+legacy refusal need implementation proof; throughput is still unmeasured.
+No benchmarks, runtime changes, reset, migration or commit were performed by
+this specification revision; implementation benchmarks follow the rule above. Task readiness review is the remaining gate
+before R2/TASK-005 proceed; TASK-004's older text is aligned through
+`$wyrd-plan`.
 
 ## Research and inspected owners
 
@@ -529,3 +633,4 @@ changes.
 | 10 | draft | Records measured before/after evidence-read validation without inventing a lookup SLO; documents the current trace-not-landed retry gap and leaves its readiness/retry policy open. Partition/Bloom defaults are unchanged. |
 | 11 | draft | Records agreed hourly/daily defaults, safe editing and concurrency principles, and bounded queued missing-trace retries with final inconclusive exhaustion. Narrows the remaining open contracts without authorizing implementation or changing runtime configuration. |
 | 12 | approved | Records the maintainer-agreed table editing API/types, conservative schema evolution, existing DDL authority and revision preconditions. Settles visible-trace reads, per-attempt reuse, direct execution and late arrivals; corrects per-attempt timeout semantics without changing layout defaults. |
+| 13 | approved | Adopts one complete table_version with exact signed-64-bit/JSON-string/TypeScript-bigint representation; atomically publishes its Iceberg property and retained native metadata reference under expected-version/base-pointer CAS. Specifies stale-new-write refusal, original-version retries, rooted retention, unmappable-legacy refusal and multi-row tenant-group fencing without added ingest SQL. Defaults/auth/telemetry remain unchanged. Maintainer-amended: capacity and tracing benchmarks may run when no other worktree is running, and fail on a regression beyond 5%. |

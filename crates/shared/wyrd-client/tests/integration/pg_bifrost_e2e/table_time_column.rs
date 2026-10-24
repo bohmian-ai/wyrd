@@ -13,7 +13,9 @@ use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use wyrd_client::bifrost::{Bifrost, TableConfig};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire, UTC_TIME_ZONE};
+use wyrd_spec::vala::api::{
+    PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire, UTC_TIME_ZONE,
+};
 use wyrd_testing::server::WyrdTestServer;
 
 use super::pg_tests::service_client;
@@ -46,8 +48,11 @@ fn readings_schema() -> SchemaRef {
 /// An hourly layout partitioned on `time_column`.
 fn hourly_on(time_column: Option<&str>) -> PhysicalLayoutWire {
     PhysicalLayoutWire {
-        partition_granularity: TimeGranularityWire::Hour,
         time_column: time_column.map(str::to_owned),
+        partition_by: vec![PartitionFieldWire::new(
+            time_column.unwrap_or("wyrd_ingested_at"),
+            PartitionTransformWire::Hour,
+        )],
         sort_keys: Vec::new(),
         bloom_columns: Vec::new(),
     }

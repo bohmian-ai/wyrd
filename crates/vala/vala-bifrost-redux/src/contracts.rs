@@ -114,6 +114,11 @@ pub struct ScribeIngressFrame {
     /// through its own catalog authority and compares that. It exists only for
     /// the crate-private seam that runs a Scribe without a catalog owner.
     pub expected_schema_fingerprint: Option<SchemaFingerprint>,
+    /// The table version a native writer built this batch from.
+    ///
+    /// `None` when the server owns the projection, as for canonical and
+    /// server-internal writes, which take the table's current version.
+    pub table_version: Option<wyrd_spec::vala::ids::TableVersion>,
     /// The request correlation identifier.
     pub request_id: RequestId,
     /// The client idempotency identifier for this batch.

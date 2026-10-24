@@ -113,6 +113,7 @@ mod pg_tests {
                 tenant,
                 logical_table_fqn: "bifrost.fenced".to_owned(),
                 batch_id: Uuid::now_v7(),
+                table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
                 slice_set_digest: [7; 32],
                 slice_count: 1,
                 wal_node_id: node_id,
@@ -126,9 +127,12 @@ mod pg_tests {
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .expect("tenant connection");
-            vala_sql::queries::scribe_batch_commits::record(&mut conn, &commit, chrono::Utc::now())
-                .await
-                .expect("fence records");
+            vala_sql::queries::scribe_batch_commits::record(
+                &mut conn,
+                &[(commit, chrono::Utc::now())],
+            )
+            .await
+            .expect("fence records");
             conn.commit().await.expect("fence commits");
         }
 

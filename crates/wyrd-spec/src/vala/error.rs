@@ -459,6 +459,24 @@ pub enum BifrostError {
         table: String,
     },
 
+    /// A new batch names a table version other than the table's current one.
+    ///
+    /// The batch was refused before any durable work. An accepted retry is
+    /// never refused this way: it keeps the version it was accepted under.
+    #[error("table version conflict for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT",
+        status = 409,
+        title = "Stale table version",
+        remediation = "The table's definition changed. Describe the table again and build a new batch from the returned table_version."
+    )]
+    TableVersionConflict {
+        /// Fully-qualified table name the batch was written to.
+        table: String,
+        /// The table's current version, which a new batch must name.
+        table_version: crate::vala::ids::TableVersion,
+    },
+
     /// A batch with this ID was previously attempted but failed permanently.
     #[error("duplicate failed batch: {batch_id}")]
     #[wyrd_error(
@@ -584,7 +602,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_412_NO_ACTIVE_TABLE",
         status = 412,
         title = "No active Bifrost table",
-        remediation = "Bind a table with use_table or use_table_by_name before inserting rows."
+        remediation = "Bind a registered table with register or use_table_by_name before inserting rows."
     )]
     NoActiveTable,
 
@@ -806,7 +824,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT",
         status = 400,
         title = "Invalid Bifrost physical layout",
-        remediation = "Declare hour or day granularity, an optional non-null timestamp time column, at most four unique schema columns as sort keys, and supported sort/null values."
+        remediation = "Declare a non-null UTC timestamp time column partitioned by hour or day plus at most two identity, bucket (2 to 1024), or truncate dimensions over string or integer columns, at most four unique scalar sort keys, and at most sixteen string, integer, or binary Bloom columns."
     )]
     InvalidPhysicalLayout {
         /// Canonical `<namespace>.<name>` of the table being registered.
@@ -897,10 +915,12 @@ pub enum BifrostError {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PhysicalLayoutField {
-    /// The `partition` object itself, including its required presence.
+    /// An entry of `partition_by`, identified by its `column`, including the
+    /// one required `hour` or `day` time field.
     Partition,
-    /// The partition's `granularity` token.
-    Granularity,
+    /// A partition field's `transform`, or the `buckets` or `width` parameter
+    /// it requires.
+    PartitionTransform,
     /// An entry of `sort_keys`, identified by its `column`.
     SortKey,
     /// A sort key's `direction` token.
@@ -925,7 +945,7 @@ pub enum PhysicalLayoutViolation {
     Missing,
     /// The same identifier was declared more than once in one list.
     Duplicate,
-    /// More sort keys were declared than the layout contract admits.
+    /// A list declared more entries than the layout contract admits.
     TooManyKeys,
     /// The declaration referenced a name absent from the physical schema.
     UnknownColumn,
@@ -933,6 +953,8 @@ pub enum PhysicalLayoutViolation {
     UnsupportedColumn,
     /// The token is outside the closed set this slot accepts.
     UnsupportedValue,
+    /// A numeric parameter is outside its admitted range.
+    OutOfRange,
 }
 
 #[cfg(test)]
@@ -942,7 +964,7 @@ mod tests {
     /// Every declaration slot in the public layout contract, in declaration order.
     const ALL_FIELDS: [PhysicalLayoutField; 7] = [
         PhysicalLayoutField::Partition,
-        PhysicalLayoutField::Granularity,
+        PhysicalLayoutField::PartitionTransform,
         PhysicalLayoutField::TimeColumn,
         PhysicalLayoutField::SortKey,
         PhysicalLayoutField::SortDirection,
@@ -951,13 +973,14 @@ mod tests {
     ];
 
     /// Every rejection class in the public layout contract, in declaration order.
-    const ALL_VIOLATIONS: [PhysicalLayoutViolation; 6] = [
+    const ALL_VIOLATIONS: [PhysicalLayoutViolation; 7] = [
         PhysicalLayoutViolation::Missing,
         PhysicalLayoutViolation::Duplicate,
         PhysicalLayoutViolation::TooManyKeys,
         PhysicalLayoutViolation::UnknownColumn,
         PhysicalLayoutViolation::UnsupportedColumn,
         PhysicalLayoutViolation::UnsupportedValue,
+        PhysicalLayoutViolation::OutOfRange,
     ];
 
     /// Pins the generated code/status of both layout errors and proves every

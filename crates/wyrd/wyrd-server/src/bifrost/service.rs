@@ -183,7 +183,6 @@ mod pg_tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
         CompactionTypeWire, DataTypeSpec, FieldSpec, PhysicalLayoutWire, RegisterOutcome,
-        TimeGranularityWire,
     };
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
@@ -340,7 +339,8 @@ mod pg_tests {
 
     /// An explicit compaction target is stored on create, described back,
     /// accepted when repeated or omitted, and refused when it differs or is
-    /// below the row-group target — without changing the stored target.
+    /// below the row-group target — without changing the stored target. An
+    /// omitted target is described as the deployment default creation stored.
     ///
     /// # Panics
     /// Panics when the fixture cannot start or any registration or describe
@@ -423,8 +423,12 @@ mod pg_tests {
             .await
             .expect("default table describes");
             assert_eq!(
-                default.compaction_target_file_size_bytes, None,
-                "an omitted target stores no property and follows the deployment default"
+                default.compaction_target_file_size_bytes,
+                Some(
+                    vala_bifrost_redux::forge::ForgeConfig::default()
+                        .default_target_file_size_bytes
+                ),
+                "an omitted target stores the deployment default resolved at creation"
             );
         });
     }
@@ -522,7 +526,7 @@ mod pg_tests {
             let name = unique_name();
             let mut req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
             req.physical_layout = Some(PhysicalLayoutWire {
-                partition_granularity: TimeGranularityWire::Day,
+                partition_by: Vec::new(),
                 time_column: None,
                 sort_keys: Vec::new(),
                 bloom_columns: vec!["absent_column".to_owned()],

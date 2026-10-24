@@ -49,7 +49,7 @@ mod scope;
 mod sink;
 mod table;
 
-pub use facade::{Bifrost, BifrostOptions, QueryResult};
+pub use facade::{Bifrost, BifrostOptions, QueryResult, RecordAdmission};
 /// Binding plumbing: the explicit-option client door and the shared register
 /// outcome spelling the Python and TypeScript bindings project.
 #[cfg(feature = "internal")]
@@ -105,8 +105,10 @@ mod sdk {
     };
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::CardUid;
+    use wyrd_spec::vala::ids::TableVersion;
 
     use crate::bifrost::handle::WriterPool;
+    use crate::bifrost::table::WriterTable;
     use crate::bifrost::{
         Bifrost, BifrostIngestSink, ClientScope, Correlation, IngestTransport, TableConfig, observe,
     };
@@ -141,9 +143,17 @@ mod sdk {
         Bifrost::with_sink(&client, None, sink, config)
     }
 
-    /// A config declaring one `id` column on `fqn`.
+    /// A config declaring one `id` column on `fqn`, resolved at the initial
+    /// table version as register would leave it.
     fn table(fqn: &str) -> TableConfig {
-        TableConfig::from_arrow(fqn, test_schema()).expect("declared table")
+        let mut config = TableConfig::from_arrow(fqn, test_schema()).expect("declared table");
+        config.resolve(&wyrd_spec::vala::api::RegisterTableResponse {
+            outcome: wyrd_spec::vala::api::RegisterOutcome::Created,
+            table_uid: "00".repeat(16),
+            fingerprint: "00".repeat(32),
+            table_version: TableVersion::INITIAL,
+        });
+        config
     }
 
     /// One row correlated to the harness card.
@@ -272,10 +282,20 @@ mod sdk {
         let schema = test_schema();
 
         bifrost
-            .insert("ns.tbl", &schema, row(), Some(card()), None)
+            .insert(
+                &WriterTable::new("ns.tbl", schema.clone(), TableVersion::INITIAL),
+                row(),
+                Some(card()),
+                None,
+            )
             .expect("first accepted");
         bifrost
-            .insert("ns.tbl", &schema, row(), Some(card()), None)
+            .insert(
+                &WriterTable::new("ns.tbl", schema.clone(), TableVersion::INITIAL),
+                row(),
+                Some(card()),
+                None,
+            )
             .expect("second accepted");
         assert_eq!(
             bifrost.producer_count(),
@@ -284,7 +304,12 @@ mod sdk {
         );
 
         bifrost
-            .insert("ns.other", &schema, row(), Some(card()), None)
+            .insert(
+                &WriterTable::new("ns.other", schema.clone(), TableVersion::INITIAL),
+                row(),
+                Some(card()),
+                None,
+            )
             .expect("distinct table accepted");
         assert_eq!(bifrost.producer_count(), 2, "a new table is a new producer");
     }
@@ -298,7 +323,12 @@ mod sdk {
     fn omitted_card_uid_is_accepted() {
         let bifrost = pool(Arc::new(MockSink::new()), QueueConfig::default());
         bifrost
-            .insert("ns.tbl", &test_schema(), row(), None, None)
+            .insert(
+                &WriterTable::new("ns.tbl", test_schema(), TableVersion::INITIAL),
+                row(),
+                None,
+                None,
+            )
             .expect("an uncorrelated row is a valid write");
     }
 
@@ -311,8 +341,11 @@ mod sdk {
         for index in 0..1_000 {
             bifrost
                 .insert(
-                    &format!("ns.table_{index}"),
-                    &schema,
+                    &WriterTable::new(
+                        &format!("ns.table_{index}"),
+                        schema.clone(),
+                        TableVersion::INITIAL,
+                    ),
                     row(),
                     Some(card()),
                     None,
@@ -323,6 +356,31 @@ mod sdk {
         bifrost.shutdown().expect("every table drains");
         let settled = bifrost.metrics();
         assert_eq!((settled.producers, settled.owned_bytes), (0, 0));
+    }
+
+    /// A shutdown waits for a telemetry record admitted before it, so a
+    /// record still describing its destination is enqueued rather than
+    /// refused by a pool already closed beneath it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when shutdown settles while the admission is held, or fails
+    /// once it is released.
+    #[tokio::test]
+    async fn shutdown_waits_for_an_admitted_record() {
+        let bifrost = client_over(Arc::new(MockSink::new()), QueueConfig::default());
+        let admitted = bifrost.admit_record();
+        let shutdown = bifrost.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => panic!("shutdown cannot settle while a record is admitted"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(admitted);
+        shutdown
+            .await
+            .expect("shutdown settles once the record does");
     }
 
     /// A saturated queue reaches the caller of the public client as a stable
@@ -489,10 +547,20 @@ mod sdk {
         );
         let schema = test_schema();
         bifrost
-            .insert("b", &schema, row(), Some(card()), None)
+            .insert(
+                &WriterTable::new("b", schema.clone(), TableVersion::INITIAL),
+                row(),
+                Some(card()),
+                None,
+            )
             .expect("later producer accepted");
         bifrost
-            .insert("a", &schema, row(), Some(card()), None)
+            .insert(
+                &WriterTable::new("a", schema.clone(), TableVersion::INITIAL),
+                row(),
+                Some(card()),
+                None,
+            )
             .expect("earlier producer accepted");
 
         let flush_error = bifrost.flush().expect_err("a producer must fail");
@@ -506,7 +574,12 @@ mod sdk {
             .expect("terminally settled producers shut down");
         assert!(
             bifrost
-                .insert("b", &schema, row(), Some(card()), None)
+                .insert(
+                    &WriterTable::new("b", schema.clone(), TableVersion::INITIAL),
+                    row(),
+                    Some(card()),
+                    None
+                )
                 .expect_err("shutdown stops later producer")
                 .to_string()
                 .contains("queue full")
@@ -517,16 +590,16 @@ mod sdk {
     fn observe_record_swallows_and_counts_overflow() {
         let sink = Arc::new(StallSink::default());
         let bifrost = client_over(sink.clone(), saturating_config());
-        let schema = test_schema();
+        let table = WriterTable::new("ns.tbl", test_schema(), TableVersion::INITIAL);
 
         // Prime the stall, then flood the same saturated producer via the telemetry
         // path. `record` returns unit — the caller is never handed an error.
-        observe::record(&bifrost, "ns.tbl", &schema, row(), correlated());
+        observe::record(&bifrost, &table, row(), correlated());
         wait_until_started(&sink);
 
         for i in 0..40 {
             let payload = format!(r#"{{"id": {}}}"#, i + 1).into_bytes();
-            observe::record(&bifrost, "ns.tbl", &schema, payload, correlated());
+            observe::record(&bifrost, &table, payload, correlated());
         }
         assert!(
             bifrost.dropped() > 0,
@@ -654,6 +727,7 @@ mod sdk {
         let budget = ClientByteBudget::new(1024);
         let batch = || SealedBatch {
             table: "ns.tbl".to_owned(),
+            table_version: TableVersion::INITIAL,
             batch_id: [7u8; 16],
             frame: OwnedIpcBytes::new(
                 vec![1, 2, 3],
@@ -763,7 +837,8 @@ mod sdk {
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "outcome": "Created",
                     "table_uid": uid,
-                    "fingerprint": fingerprint
+                    "fingerprint": fingerprint,
+                    "table_version": "1"
                 })))
                 .mount(&server)
                 .await;
@@ -782,6 +857,10 @@ mod sdk {
         );
         let bound = bifrost.table().expect("the bound table stays bound");
         let bound_identity = bound.resolved().cloned().expect("bound table resolved");
+        assert!(
+            bifrost.cached_writer_table("vala.datasets.bound").is_some(),
+            "a registered table is cached for named writes"
+        );
 
         bifrost.use_table(table("vala.datasets.inflight"));
         let register = bifrost.register();

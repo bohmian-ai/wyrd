@@ -111,11 +111,16 @@ export declare class NativeBifrost {
    * The row names its own `table` and JSON Schema rather than this client's
    * bound table, so instrumentation never disturbs the application's
    * binding. A producer refusal, such as a full queue, is counted on
-   * [`NativeBifrost::dropped`] instead of returned.
+   * [`NativeBifrost::dropped`] instead of returned. The first row for a
+   * table this client has not described records on a background task
+   * once the describe returns its table version; a failed describe is
+   * counted the same way. That record is admitted before the task starts,
+   * so a following `flush` or `shutdown` waits for it.
    *
    * # Errors
    *
-   * Returns a napi error only when the outcome cannot be encoded; an
+   * Returns a napi error only when the outcome cannot be encoded or the
+   * background describe cannot be scheduled; an
    * unparsable or unmappable schema and an invalid Card UID are
    * returned in [`NativeLifecycleResult`].
    */

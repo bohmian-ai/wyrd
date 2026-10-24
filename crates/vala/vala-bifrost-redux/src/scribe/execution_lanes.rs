@@ -465,8 +465,10 @@ pub(crate) struct IngressDecodeInputs {
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<CardUid>>,
-    /// Catalog fingerprint required of the caller-owned source schema.
-    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the caller-owned source
+    /// schema; `None` leaves conformance to the registered schema as the only
+    /// schema authority.
+    pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: RequestId,
     /// Admission instant stamped as `wyrd_ingested_at`.
@@ -491,8 +493,10 @@ pub(crate) struct DecodeContext<'a> {
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<&'a [CardUid]>,
-    /// Catalog fingerprint required of the caller-owned source schema.
-    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the caller-owned source
+    /// schema; `None` leaves conformance to the registered schema as the only
+    /// schema authority.
+    pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: &'a RequestId,
     /// Admission instant in epoch microseconds, read once per batch and
@@ -574,9 +578,10 @@ fn decode_rows(
     let conformed;
     let rows = match context.registered_schema {
         Some(registered) => {
+            let policy = correlation_policy(context);
             conformed = match context.conform {
-                Some(plans) => plans.conform(rows, registered)?,
-                None => conform_to_registered(rows, registered)?,
+                Some(plans) => plans.conform(rows, registered, policy)?,
+                None => conform_to_registered(rows, registered, policy)?,
             };
             &conformed
         }
@@ -585,9 +590,10 @@ fn decode_rows(
     if let Some(definition) = context.definition {
         enforce_builtin_source_contract(rows, definition, trusted)?;
     }
-    let actual_source_fingerprint =
-        source_schema_fingerprint(rows.schema().as_ref(), correlation_policy(context));
-    if actual_source_fingerprint != context.expected_schema_fingerprint {
+    if let Some(expected) = context.expected_schema_fingerprint
+        && source_schema_fingerprint(rows.schema().as_ref(), correlation_policy(context))
+            != expected
+    {
         return Err(ScribeError::FingerprintMismatch {
             table: "resolved ingress table".to_owned(),
         });
@@ -622,28 +628,37 @@ fn decode_rows(
 ///   Arrow would refuse to relabel;
 /// - the same Iceberg type in another Arrow spelling (`Int8` for `int`, a
 ///   `UTC` zone for `+00:00`, a list element named `item`) is cast once with
-///   Arrow's `cast` to the registered type, keeping the sent field's name,
-///   nullability, and metadata;
+///   Arrow's `cast` to the registered type, keeping the sent field's name
+///   and metadata;
+/// - every matched column takes the registered top-level requiredness, so
+///   Arrow refuses a null in a required column even when the sender's field
+///   declared it nullable;
 /// - a column whose storage matches but whose Variant identity does not — a
 ///   Struct sent for a Variant, a Variant sent for a Struct, or a Variant
 ///   marker with parameters, at any depth — is refused as an unsupported type
 ///   before any value is read, because the storage-only fingerprint cannot
 ///   see the extension;
-/// - any other column is kept as sent, so the fingerprint check refuses it.
+/// - any other matched column, a column `policy` does not reserve that the
+///   table does not register, and a registered column `policy` does not
+///   reserve that was not sent are refused, so the registered schema of the
+///   selected table version alone decides the caller-owned columns; reserved
+///   columns are left for managed stamping.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::ContractViolation`] carrying
 /// [`BifrostError::UnsupportedType`] for a Variant identity mismatch,
-/// [`ScribeError::FingerprintMismatch`] when the registered schema has no
-/// Arrow form or Arrow cannot cast an equivalent column, and
-/// [`ScribeError::InvalidFrame`] when Arrow refuses the conformed batch, which
-/// duplicate-free input cannot cause.
+/// [`ScribeError::FingerprintMismatch`] for a column the registered schema
+/// does not accept, a missing registered column, a registered schema with no
+/// Arrow form, or an equivalent column Arrow cannot cast, and
+/// [`ScribeError::InvalidFrame`] when Arrow refuses the conformed batch, such
+/// as a null in a column the registered schema requires.
 fn conform_to_registered(
     rows: &RecordBatch,
     registered: &IcebergSchema,
+    policy: CorrelationPolicy,
 ) -> Result<RecordBatch, ScribeError> {
-    ConformPlan::build(&rows.schema(), registered)?.apply(rows)
+    ConformPlan::build(&rows.schema(), registered, policy)?.apply(rows)
 }
 
 /// How every batch of one sent Arrow schema conforms to one registered
@@ -669,14 +684,25 @@ impl ConformPlan {
     ///
     /// Returns [`ScribeError::ContractViolation`] carrying
     /// [`BifrostError::UnsupportedType`] for a Variant identity mismatch and
-    /// [`ScribeError::FingerprintMismatch`] when the registered schema has no
-    /// Arrow form.
-    fn build(sent: &Schema, registered: &IcebergSchema) -> Result<Self, ScribeError> {
-        let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| {
-            ScribeError::FingerprintMismatch {
-                table: "resolved ingress table".to_owned(),
-            }
-        })?;
+    /// [`ScribeError::FingerprintMismatch`] for a column the registered schema
+    /// does not accept, a missing registered column, or a registered schema
+    /// with no Arrow form.
+    fn build(
+        sent: &Schema,
+        registered: &IcebergSchema,
+        policy: CorrelationPolicy,
+    ) -> Result<Self, ScribeError> {
+        let mismatch = || ScribeError::FingerprintMismatch {
+            table: "resolved ingress table".to_owned(),
+        };
+        let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| mismatch())?;
+        if target
+            .fields()
+            .iter()
+            .any(|wanted| !policy.reserves(wanted.name()) && sent.index_of(wanted.name()).is_err())
+        {
+            return Err(mismatch());
+        }
         let registered_columns = target
             .fields()
             .iter()
@@ -704,13 +730,21 @@ impl ConformPlan {
                         },
                     ));
                 }
-                _ => None,
+                Some(_) => return Err(mismatch()),
+                None if !policy.reserves(field.name()) => return Err(mismatch()),
+                None => None,
             };
-            fields.push(match &cast {
-                Some(data_type) => {
-                    Arc::new(field.as_ref().clone().with_data_type(data_type.clone()))
-                }
-                None => Arc::clone(field),
+            // The selected schema owns top-level requiredness, so Arrow
+            // refuses a null the sender's own field would have allowed.
+            let nullable = wanted.map_or(field.is_nullable(), |wanted| wanted.is_nullable());
+            fields.push(if cast.is_none() && nullable == field.is_nullable() {
+                Arc::clone(field)
+            } else {
+                let conformed = field.as_ref().clone().with_nullable(nullable);
+                Arc::new(match &cast {
+                    Some(data_type) => conformed.with_data_type(data_type.clone()),
+                    None => conformed,
+                })
             });
             columns.push((index, cast));
         }
@@ -727,7 +761,7 @@ impl ConformPlan {
     ///
     /// Returns [`ScribeError::FingerprintMismatch`] when Arrow cannot cast an
     /// equivalent column and [`ScribeError::InvalidFrame`] when Arrow refuses
-    /// the conformed batch, which duplicate-free input cannot cause.
+    /// the conformed batch, such as a null in a required registered column.
     fn apply(&self, rows: &RecordBatch) -> Result<RecordBatch, ScribeError> {
         let columns = self
             .columns
@@ -792,6 +826,7 @@ impl ConformPlans {
         &self,
         rows: &RecordBatch,
         registered: &Arc<IcebergSchema>,
+        policy: CorrelationPolicy,
     ) -> Result<RecordBatch, ScribeError> {
         let sent = rows.schema();
         let key = Arc::as_ptr(registered).addr();
@@ -808,7 +843,7 @@ impl ConformPlans {
         if let Some(plan) = remembered {
             return plan.apply(rows);
         }
-        let plan = Arc::new(ConformPlan::build(&sent, registered)?);
+        let plan = Arc::new(ConformPlan::build(&sent, registered, policy)?);
         self.plans
             .write()
             .expect("the conform plan lock is never poisoned")
@@ -1364,8 +1399,8 @@ pub(crate) struct StageMemberOp {
     pub(crate) frozen: Box<FrozenMemtable>,
     /// Tenant-qualified physical table binding.
     pub(crate) binding: TenantTableBinding,
-    /// Registered physical write recipe resolved before the lane was entered.
-    pub(crate) layout: std::sync::Arc<crate::catalog::layout::PhysicalLayout>,
+    /// Physical write recipe resolved before the lane was entered.
+    pub(crate) recipe: crate::scribe::write_recipe::WriteRecipe,
     /// Shard, epoch, node, and WAL facts describing where the rows came from.
     pub(crate) origin: crate::scribe::member_stager::StagedMemberOrigin,
     /// Scribe capability charged for the batches the writer materializes.
@@ -1456,14 +1491,15 @@ fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, 
     let StageMemberOp {
         frozen,
         binding,
-        layout,
+        recipe,
         origin,
         memory,
         staging,
     } = operation;
     let context = crate::scribe::staging_runtime::ClaimContext {
         schema: std::sync::Arc::clone(&frozen.schema),
-        layout: (*layout).clone(),
+        layout: (*recipe.layout).clone(),
+        sort_order_id: recipe.sort_order_id,
         binding: binding.clone(),
     };
     staging
@@ -1471,7 +1507,7 @@ fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, 
             crate::scribe::member_stager::StageMemberRequest {
                 frozen: &frozen,
                 binding: &binding,
-                layout: &layout,
+                layout: &recipe.layout,
                 origin,
                 memory,
             },
@@ -2282,7 +2318,7 @@ mod tests {
             definition: None,
             attribution: Attribution::direct(principal.id).into(),
             card_scope,
-            expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
+            expected_schema_fingerprint: Some(SchemaFingerprint([0_u8; 32])),
             request_id,
             receipt_micros: receipt_now(),
             registered_schema: None,
@@ -2395,10 +2431,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     &Schema::new(cast_table_columns()),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -2473,21 +2509,91 @@ mod tests {
         let plans = super::ConformPlans::default();
 
         let first = plans
-            .conform(&narrow_spellings(Some("UTC")), &registered)
+            .conform(
+                &narrow_spellings(Some("UTC")),
+                &registered,
+                CorrelationPolicy::Observation,
+            )
             .expect("the first batch conforms");
         let second = plans
-            .conform(&narrow_spellings(Some("UTC")), &registered)
+            .conform(
+                &narrow_spellings(Some("UTC")),
+                &registered,
+                CorrelationPolicy::Observation,
+            )
             .expect("the second batch conforms");
 
         assert_eq!(
             first,
-            super::conform_to_registered(&narrow_spellings(Some("UTC")), &registered)
-                .expect("a fresh plan conforms")
+            super::conform_to_registered(
+                &narrow_spellings(Some("UTC")),
+                &registered,
+                CorrelationPolicy::Observation
+            )
+            .expect("a fresh plan conforms")
         );
         assert!(
             Arc::ptr_eq(&first.schema(), &second.schema()),
             "the second batch of one sent shape reuses the remembered plan"
         );
+    }
+
+    /// The selected schema's top-level requiredness decides which nulls a
+    /// scalar may carry, whatever the sender's Arrow field declares.
+    ///
+    /// A nullable sent field holding a null is refused for a required
+    /// registered column; the same field holding only values conforms as
+    /// required; an optional registered column keeps its null.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a registered schema does not convert, a required column
+    /// admits a null, valid values are refused or keep the sender's
+    /// nullability, or an optional column refuses its null.
+    #[test]
+    fn registered_requiredness_decides_scalar_nulls() {
+        let registered = |nullable| {
+            crate::tables::iceberg_schema_for(&Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                nullable,
+            )]))
+            .expect("the registered schema converts to Iceberg")
+        };
+        let sent = |values: Vec<Option<i64>>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    true,
+                )])),
+                vec![Arc::new(arrow::array::Int64Array::from(values))],
+            )
+            .expect("the sent batch satisfies its own schema")
+        };
+
+        assert!(matches!(
+            conform_to_registered(
+                &sent(vec![Some(1), None]),
+                &registered(false),
+                CorrelationPolicy::Observation
+            ),
+            Err(ScribeError::InvalidFrame)
+        ));
+        let valid = conform_to_registered(
+            &sent(vec![Some(1), Some(2)]),
+            &registered(false),
+            CorrelationPolicy::Observation,
+        )
+        .expect("non-null values conform to a required column");
+        assert!(!valid.schema().field(0).is_nullable());
+        let optional = conform_to_registered(
+            &sent(vec![Some(1), None]),
+            &registered(true),
+            CorrelationPolicy::Observation,
+        )
+        .expect("an optional column keeps its null");
+        assert_eq!(optional.column(0).null_count(), 1);
     }
 
     /// Spellings Iceberg stores as the registered column type are cast to it.
@@ -2613,7 +2719,9 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
+                expected_schema_fingerprint: Some(SchemaFingerprint((definition
+                    .schema_fingerprint)(
+                ))),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: Some(definition),
@@ -2672,7 +2780,9 @@ mod tests {
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
                 card_scope: None,
-                expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
+                expected_schema_fingerprint: Some(SchemaFingerprint((definition
+                    .schema_fingerprint)(
+                ))),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: Some(definition),
@@ -2768,8 +2878,9 @@ mod tests {
         let principal = principal();
         let request_id = RequestId::now_v7();
         let mut context = stamping_context(&principal, None, &request_id);
-        context.expected_schema_fingerprint =
-            crate::contracts::projected_source_schema_fingerprint(attributed.schema().as_ref());
+        context.expected_schema_fingerprint = Some(
+            crate::contracts::projected_source_schema_fingerprint(attributed.schema().as_ref()),
+        );
         assert!(
             matches!(
                 decode_rows(&attributed, &context, false),
@@ -3173,10 +3284,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3225,10 +3336,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     schema,
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3360,10 +3471,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3413,10 +3524,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3458,10 +3569,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3517,10 +3628,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3629,10 +3740,10 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(
+                expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                     CorrelationPolicy::Observation,
-                ),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3684,10 +3795,10 @@ mod tests {
                         .card_ref_scope()
                         .map(CardRefScope::uids)
                         .as_deref(),
-                    expected_schema_fingerprint: source_schema_fingerprint(
+                    expected_schema_fingerprint: Some(source_schema_fingerprint(
                         rows.schema().as_ref(),
                         CorrelationPolicy::Observation,
-                    ),
+                    )),
                     request_id: &RequestId::now_v7(),
                     receipt_micros: receipt_now(),
                     definition: None,
@@ -3959,14 +4070,18 @@ mod tests {
             "{\"shredded\":true}".to_owned(),
         );
 
-        conform_to_registered(&send(variant.clone()), &registered)
-            .expect("the canonical Variant conforms");
+        conform_to_registered(
+            &send(variant.clone()),
+            &registered,
+            CorrelationPolicy::Observation,
+        )
+        .expect("the canonical Variant conforms");
         for sent in [
             Field::new("payload", variant.data_type().clone(), true),
             variant.with_metadata(parameters),
         ] {
             assert!(matches!(
-                conform_to_registered(&send(sent), &registered),
+                conform_to_registered(&send(sent), &registered, CorrelationPolicy::Observation),
                 Err(ScribeError::ContractViolation(BifrostError::UnsupportedType { ref field, .. }))
                     if field == "payload"
             ));
@@ -4005,7 +4120,9 @@ mod tests {
         ])
         .expect("batch builds");
 
-        let ordered = conform_to_registered(&rows, &registered_ab()).expect("names all match");
+        let ordered =
+            conform_to_registered(&rows, &registered_ab(), CorrelationPolicy::Observation)
+                .expect("names all match");
 
         let names = ordered
             .schema()

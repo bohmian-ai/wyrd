@@ -47,6 +47,57 @@ pub(crate) fn retained_arrow_bytes(batch: &arrow::record_batch::RecordBatch) -> 
     })
 }
 
+/// Returns the distinct allocated bytes `source` keeps alive beyond the
+/// allocations `shared` already holds.
+///
+/// A retained recovery source shares every allocation a prepared slice
+/// aliases, which that slice's own charge covers; only its remaining
+/// allocations need a charge of their own, and nothing is copied to tell the
+/// two apart.
+pub(crate) fn unshared_arrow_bytes(
+    source: &[arrow::record_batch::RecordBatch],
+    shared: &[&arrow::record_batch::RecordBatch],
+) -> usize {
+    let mut charged = allocations(shared);
+    source
+        .iter()
+        .flat_map(arrow::record_batch::RecordBatch::columns)
+        .fold(0_usize, |total, column| {
+            total.saturating_add(retained_array_bytes(&column.to_data(), &mut charged))
+        })
+}
+
+/// Returns the bytes of one retained Arrow IPC frame that `shared` does not
+/// keep alive: none while a prepared slice still views the frame's
+/// allocation, otherwise the whole frame.
+pub(crate) fn unshared_ipc_bytes(
+    ipc: &[u8],
+    shared: &[&arrow::record_batch::RecordBatch],
+) -> usize {
+    let start = ipc.as_ptr() as usize;
+    let frame = start..start.saturating_add(ipc.len());
+    if allocations(shared)
+        .iter()
+        .any(|(allocation, _)| frame.contains(allocation))
+    {
+        0
+    } else {
+        ipc.len()
+    }
+}
+
+/// The distinct allocations `batches` keep alive, keyed as
+/// [`retained_arrow_bytes`] keys them.
+fn allocations(
+    batches: &[&arrow::record_batch::RecordBatch],
+) -> std::collections::HashSet<(usize, usize)> {
+    let mut charged = std::collections::HashSet::new();
+    for column in batches.iter().flat_map(|batch| batch.columns()) {
+        retained_array_bytes(&column.to_data(), &mut charged);
+    }
+    charged
+}
+
 /// Charges one array's own allocations, then its children's, once each.
 ///
 /// `charged` carries the allocations already counted for this batch. The key is
@@ -748,7 +799,7 @@ impl ScribeOwnership {
 #[cfg(test)]
 /// Focused ownership and lifecycle reconciliation proofs.
 mod tests {
-    use super::{MemoryCategory, ScribeOwnership, retained_arrow_bytes};
+    use super::{MemoryCategory, ScribeOwnership, retained_arrow_bytes, unshared_arrow_bytes};
 
     /// Builds one two-column batch of `rows` rows for the retention proofs.
     fn payload_batch(rows: usize) -> arrow::record_batch::RecordBatch {
@@ -772,6 +823,38 @@ mod tests {
             ],
         )
         .expect("payload batch")
+    }
+
+    /// A retained source owes a charge only for allocations no prepared slice
+    /// keeps alive.
+    ///
+    /// A zero-copy slice views the source's buffers, so retaining the source
+    /// costs only its own array descriptors; a slice that partitioning
+    /// materialized owns new buffers, so the source keeps its whole allocation
+    /// alive by itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a sliced view owes more than the source's descriptors or a
+    /// materialized copy hides any of the source's bytes.
+    #[test]
+    fn a_retained_source_is_charged_only_beyond_its_shared_slices() {
+        let source = payload_batch(64);
+        let sliced = source.slice(8, 16);
+        assert_eq!(
+            unshared_arrow_bytes(std::slice::from_ref(&source), &[&sliced]),
+            source.num_columns() * size_of::<arrow::array::ArrayData>()
+        );
+
+        let taken = arrow::compute::take_record_batch(
+            &source,
+            &arrow::array::UInt32Array::from_iter_values(8..24),
+        )
+        .expect("materialized slice");
+        assert_eq!(
+            unshared_arrow_bytes(std::slice::from_ref(&source), &[&taken]),
+            retained_arrow_bytes(&source)
+        );
     }
 
     /// A zero-copy decoded frame is charged its allocation once, not per column.

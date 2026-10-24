@@ -432,7 +432,7 @@ This page is generated from the error definitions in the Wyrd source.
 | Code | Status | Title | Fix |
 | --- | ---: | --- | --- |
 | `WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET` | 400 | Invalid Bifrost compaction target | Omit compaction_target_file_size_bytes to follow the deployment default, or supply at least 134217728 bytes. |
-| `WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT` | 400 | Invalid Bifrost physical layout | Declare hour or day granularity, an optional non-null timestamp time column, at most four unique schema columns as sort keys, and supported sort/null values. |
+| `WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT` | 400 | Invalid Bifrost physical layout | Declare a non-null UTC timestamp time column partitioned by hour or day plus at most two identity, bucket (2 to 1024), or truncate dimensions over string or integer columns, at most four unique scalar sort keys, and at most sixteen string, integer, or binary Bloom columns. |
 | `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` | 400 | Reserved system column name | Rename the column; run_id, card_uid, principal_id, wyrd_request_id, and wyrd_ingested_at are reserved. |
 | `WYRD_VALA_400_BIFROST_TENANT_ISOLATION_COLUMN_MISSING` | 400 | Tenant isolation column missing | Add the server-managed data_tenant_id Utf8 column to the physical table schema. |
 | `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD` | 400 | Undeclared Bifrost field | Remove the key or declare it on the table; store open data in a Variant field. |
@@ -464,10 +464,11 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_409_BIFROST_DUPLICATE_FAILED_BATCH` | 409 | Duplicate batch previously failed | This batch_id was committed but the write failed. Use a new batch_id to retry. |
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | 409 | Schema fingerprint mismatch | The Arrow schema does not match the registered table schema. Evolve the schema explicitly. |
 | `WYRD_VALA_409_BIFROST_LAYOUT_MISMATCH` | 409 | Bifrost physical layout mismatch | Retry with the table's registered physical layout or register a different table. |
+| `WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT` | 409 | Stale table version | The table's definition changed. Describe the table again and build a new batch from the returned table_version. |
 | `WYRD_VALA_409_RUNNING_QUERY_CONFLICT` | 409 | Running query ownership conflict | Do not retry cancellation automatically; investigate the contradictory Oracle owners. |
 | `WYRD_VALA_409_STREAM_MISMATCH` | 409 | Live-tail stream identity mismatch | Refresh the Scribe stream identity from the cluster catalog and retry the tail-fetch against the current writer stream. |
 | `WYRD_VALA_410_PAGE_SNAPSHOT_EXPIRED` | 410 | Page snapshot expired | restart the query from page 1 |
-| `WYRD_VALA_412_NO_ACTIVE_TABLE` | 412 | No active Bifrost table | Bind a table with use_table or use_table_by_name before inserting rows. |
+| `WYRD_VALA_412_NO_ACTIVE_TABLE` | 412 | No active Bifrost table | Bind a registered table with register or use_table_by_name before inserting rows. |
 | `WYRD_VALA_413_PAYLOAD_TOO_LARGE` | 413 | Ingest payload too large | Reduce the request below the enforced limit reported in this problem and retry. |
 | `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` | 413 | Query result too large | Add a LIMIT or narrower filters for large result sets. |
 | `WYRD_VALA_413_VARIANT_TOO_LARGE` | 413 | Variant value too large | Keep each Variant value at most 8388608 encoded bytes (metadata plus value); split large payloads across rows. |

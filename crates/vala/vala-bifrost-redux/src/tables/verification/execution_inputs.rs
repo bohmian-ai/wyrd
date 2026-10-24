@@ -69,7 +69,14 @@ impl DomainTable for ExecutionInputsTable {
         daily_layout(
             "recorded_at",
             vec![sort_desc("recorded_at")],
-            &["execution_id", "group_id"],
+            &[
+                "run_id",
+                "card_uid",
+                "sub_principal_id",
+                "act_principal_id",
+                "execution_id",
+                "group_id",
+            ],
         )
     }
 }

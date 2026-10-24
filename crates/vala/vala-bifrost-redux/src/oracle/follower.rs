@@ -662,12 +662,12 @@ where
                 capture_id: cut.capture_id,
                 start_partition,
                 end_partition,
-                // The signed closure, byte for byte. Scribe projects the
-                // memtable to exactly these names in exactly this order, so
+                // The signed closure's fields, in order. Scribe projects the
+                // memtable to exactly these fields, resolved by field id, so
                 // the wide columns are never materialized, and the declared
                 // leaf schema below is the same closure — the serialized
                 // plan's `Column` indices are closure indices.
-                required_columns: assignment.required_columns.clone(),
+                required_fields: required_schema.fields().clone(),
             })
             .await?;
         let plan = self
@@ -2008,8 +2008,8 @@ pub(crate) mod tests {
     /// `SELECT duration_ms ... WHERE status_code = 'STATUS_CODE_ERROR'`. Two
     /// distinct properties are pinned together because they are one contract:
     ///
-    /// 1. the fetch request copies `assignment.required_columns` byte-for-byte,
-    ///    so the memtable projects at the source;
+    /// 1. the fetch request carries the fields `assignment.required_columns`
+    ///    names, in order, so the memtable projects at the source;
     /// 2. the resolved leaf — and the non-owning empty branch, which produces
     ///    no rows at all — declares that same closure schema, so the serialized
     ///    plan's `Column` indices are closure indices on every branch.
@@ -2108,8 +2108,8 @@ pub(crate) mod tests {
             "the empty branch declares the same closure schema"
         );
 
-        // Property 1: the fetch request carries the signed closure byte for
-        // byte, so the memtable projects at the source instead of the plan
+        // Property 1: the fetch request carries the signed closure's fields in
+        // order, so the memtable projects at the source instead of the plan
         // above discarding wide columns later.
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recording = ScribeTailResolver::with_schema(
@@ -2137,7 +2137,12 @@ pub(crate) mod tests {
             .clone();
         assert_eq!(recorded.len(), 1, "exactly one live-tail fetch is issued");
         assert_eq!(
-            recorded[0].required_columns, closure,
+            recorded[0]
+                .required_fields
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>(),
+            closure,
             "the fetch request forwards the signed closure unchanged"
         );
     }

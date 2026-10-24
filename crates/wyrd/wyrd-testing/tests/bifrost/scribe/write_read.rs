@@ -10,6 +10,10 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_testing::bifrost::revisions::{
+    COMPOSITE_HOUR_MICROS, COMPOSITE_ROWS, composite_batch, composite_first_hour_micros,
+    register_composite_table, shifted,
+};
 use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, ScribeCacheMode, ScribeProductionEvidenceV1, ScribeProductionWorkloadV1,
@@ -392,7 +396,7 @@ fn publication_shape<'a>(
             shapes.push(PublishedFileShape {
                 namespace: file.namespace.clone(),
                 table_name: file.table_name.clone(),
-                partition_spec_id: file.partition_spec_id,
+                partition_spec_id: file.partition.spec_id,
                 sort_order_id: file.sort_order_id,
                 record_count: file.data_file.record_count,
                 row_groups: file.data_file.split_offsets.len(),
@@ -1266,4 +1270,608 @@ fn wal_segments(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
         }
     }
     segments
+}
+
+/// Requires every composite row once, and exact results for filters on each
+/// partition dimension.
+///
+/// # Panics
+///
+/// Panics when any read differs.
+async fn assert_composite_reads(client: &wyrd_client::WyrdClient, table: &str, stage: &str) {
+    let all: Vec<i64> = (0..COMPOSITE_ROWS).collect();
+    let pick = |keep: fn(i64) -> bool| {
+        all.iter()
+            .copied()
+            .filter(|row| keep(*row))
+            .collect::<Vec<_>>()
+    };
+    for (filter, expected) in [
+        ("TRUE", all.clone()),
+        ("customer IS NULL", pick(|row| row % 3 == 2)),
+        ("customer = 'a'", pick(|row| row % 3 == 0)),
+        ("shard = 3", pick(|row| row % 5 == 3)),
+        (
+            &*format!(
+                "event_time >= to_timestamp_micros({})",
+                composite_first_hour_micros() + COMPOSITE_HOUR_MICROS
+            ),
+            pick(|row| row % 2 == 1),
+        ),
+    ] {
+        assert_eq!(
+            super::support::read_sql(
+                client,
+                &format!("SELECT value FROM {table} WHERE {filter} ORDER BY value")
+            )
+            .await,
+            expected,
+            "{stage}: `{filter}` returns each matching row once"
+        );
+    }
+}
+
+/// Composite and null partitions read back exactly once while active, staged,
+/// and published, across restarts on a retained root, through a resent batch,
+/// and from a peer pod.
+///
+/// # Panics
+///
+/// Panics when any stage reads a missing, duplicated, or misfiled row.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn composite_partitions_survive_lifecycle_and_peers() {
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let builder = || {
+        wyrd_testing::WyrdTestServer::builder()
+            .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+    };
+    let server = builder().start_bound().await.expect("the pod starts");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("composite_lifecycle");
+    let table = register_composite_table(&server, tenant, &name).await;
+    let client = tenant_client(&server, tenant).await;
+    let batch_id = uuid::Uuid::now_v7();
+    super::support::append_batch(&client, &table, batch_id, &composite_batch())
+        .await
+        .expect("the composite batch is acknowledged");
+    assert_composite_reads(&client, &table, "active").await;
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("restarts");
+    let client = tenant_client(&server, tenant).await;
+    assert_composite_reads(&client, &table, "replayed").await;
+
+    let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
+    scribe.flush_writable_for_test().await.expect("freezes");
+    super::support::await_persistence_drained(&scribe).await;
+    assert_composite_reads(&client, &table, "staged").await;
+    drop(scribe);
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("restarts");
+    let client = tenant_client(&server, tenant).await;
+    assert_composite_reads(&client, &table, "restored staged").await;
+
+    server.flush_bifrost().await.expect("publishes");
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        COMPOSITE_ROWS as u64
+    );
+    assert_composite_reads(&client, &table, "published").await;
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("restarts");
+    let client = tenant_client(&server, tenant).await;
+    let resent = super::support::append_batch(&client, &table, batch_id, &composite_batch()).await;
+    server.flush_bifrost().await.expect("drains");
+    assert_composite_reads(&client, &table, &format!("resent {resent:?}")).await;
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        COMPOSITE_ROWS as u64
+    );
+    server.shutdown().await.expect("the server drains cleanly");
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
+        .await
+        .expect("the two-pod cluster starts");
+    let writer = cluster.server(0).expect("pod 0");
+    let reader = cluster.server(1).expect("pod 1");
+    let tenant = writer.data_tenant_id();
+    let table = register_composite_table(writer, tenant, &unique_table("composite_peer")).await;
+    let writer_client = tenant_client(writer, tenant).await;
+    let reader_client = tenant_client(reader, tenant).await;
+    super::support::append_batch(
+        &writer_client,
+        &table,
+        uuid::Uuid::now_v7(),
+        &composite_batch(),
+    )
+    .await
+    .expect("the peer batch is acknowledged");
+    assert_composite_reads(&reader_client, &table, "peer active").await;
+    let scribe = writer.bifrost_scribe().expect("pod 0 owns a Scribe");
+    scribe.flush_writable_for_test().await.expect("freezes");
+    super::support::await_persistence_drained(&scribe).await;
+    assert_composite_reads(&reader_client, &table, "peer staged").await;
+    writer.flush_bifrost().await.expect("publishes");
+    assert_composite_reads(&reader_client, &table, "peer published").await;
+}
+
+/// A batch accepted before a sort-order revision keeps that revision through
+/// staging, restart, and publication, while a batch admitted after it is
+/// written under the new one; a retry at its original table version across
+/// the revision, warm and after restart, is acknowledged without a duplicate
+/// row, a new batch at the superseded version is a typed version conflict,
+/// and a changed payload under the same id is refused. A further Bloom-only
+/// revision keeps the original-version retry acknowledged. The accepted id sent
+/// under the current version writes a provisional WAL attempt the fence
+/// refuses; replay after restart suppresses it and the original retry still
+/// acknowledges.
+///
+/// # Panics
+///
+/// Panics when a row is missing or duplicated, a retry is misjudged, or a
+/// published object names the wrong sort order.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn accepted_batch_revision_survives_alteration_and_restart() {
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let builder = || {
+        wyrd_testing::WyrdTestServer::builder()
+            .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+    };
+    let server = builder().start_bound().await.expect("the pod starts");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("accepted_revision");
+    let table = register_composite_table(&server, tenant, &name).await;
+    let table_ref = vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &name);
+    let client = tenant_client(&server, tenant).await;
+    let accepted = uuid::Uuid::now_v7();
+    super::support::append_batch(&client, &table, accepted, &composite_batch())
+        .await
+        .expect("the first batch is acknowledged");
+    let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
+    scribe.flush_writable_for_test().await.expect("freezes");
+    super::support::await_persistence_drained(&scribe).await;
+    drop(scribe);
+
+    let revised = server.commit_sort_revision(tenant, &table_ref).await;
+    let original = wyrd_spec::vala::ids::TableVersion::INITIAL;
+    super::support::append_batch_at(&client, &table, original, accepted, &composite_batch())
+        .await
+        .expect("a retry at its original version across the revision is acknowledged");
+    server
+        .commit_bloom_revision(tenant, &table_ref, &["customer"])
+        .await;
+    super::support::append_batch_at(&client, &table, original, accepted, &composite_batch())
+        .await
+        .expect("a retry at its original version across the Bloom revision is acknowledged");
+    let stale = super::support::append_batch_at(
+        &client,
+        &table,
+        original,
+        uuid::Uuid::now_v7(),
+        &composite_batch(),
+    )
+    .await
+    .expect_err("a new batch at the superseded version is refused");
+    assert_eq!(
+        stale.code(),
+        "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT",
+        "{stale}"
+    );
+    let later = shifted(&composite_batch(), COMPOSITE_ROWS);
+    super::support::append_batch(&client, &table, uuid::Uuid::now_v7(), &later)
+        .await
+        .expect("the post-revision batch is acknowledged");
+    let all: Vec<i64> = (0..2 * COMPOSITE_ROWS).collect();
+    let read_all = |client: wyrd_client::WyrdClient| {
+        let table = table.clone();
+        async move {
+            super::support::read_sql(
+                &client,
+                &format!("SELECT value FROM {table} ORDER BY value"),
+            )
+            .await
+        }
+    };
+    assert_eq!(
+        read_all(client).await,
+        all,
+        "active and staged rows read once"
+    );
+
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("restarts");
+    let client = tenant_client(&server, tenant).await;
+    assert_eq!(
+        read_all(client.clone()).await,
+        all,
+        "restored rows read once"
+    );
+    super::support::append_batch_at(&client, &table, original, accepted, &composite_batch())
+        .await
+        .expect("a retry at its original version after restart is acknowledged");
+    server.flush_bifrost().await.expect("publishes");
+    assert_eq!(
+        read_all(client.clone()).await,
+        all,
+        "published rows read once"
+    );
+
+    let mut rows_by_order = std::collections::BTreeMap::new();
+    for file in server
+        .published_hot_files_for_test(tenant, BifrostNamespace::Datasets.as_str(), &name)
+        .await
+        .expect("published hot files are inspectable")
+    {
+        *rows_by_order
+            .entry(file.promotion_record.sort_order_id)
+            .or_insert(0_u64) += file.row_count;
+    }
+    assert_eq!(
+        rows_by_order,
+        std::collections::BTreeMap::from([
+            (
+                vala_bifrost_redux::catalog::layout::BIFROST_SORT_ORDER_ID,
+                COMPOSITE_ROWS as u64
+            ),
+            (revised, COMPOSITE_ROWS as u64),
+        ]),
+        "each batch publishes under the sort order it was accepted under"
+    );
+    assert!(
+        super::support::append_batch_at(
+            &client,
+            &table,
+            original,
+            accepted,
+            &shifted(&composite_batch(), 1)
+        )
+        .await
+        .is_err(),
+        "a changed payload under an accepted batch id is refused"
+    );
+    assert_eq!(
+        read_all(client.clone()).await,
+        all,
+        "the refusal stores nothing"
+    );
+
+    let current = original
+        .next()
+        .and_then(wyrd_spec::vala::ids::TableVersion::next)
+        .expect("the Bloom revision is version 3");
+    assert!(
+        super::support::append_batch_at(&client, &table, current, accepted, &composite_batch())
+            .await
+            .is_err(),
+        "the accepted id under another version is refused after its provisional WAL attempt"
+    );
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("replay suppresses the provisional attempt the fence never accepted");
+    let client = tenant_client(&server, tenant).await;
+    assert_eq!(
+        read_all(client.clone()).await,
+        all,
+        "the provisional attempt restores no rows"
+    );
+    super::support::append_batch_at(&client, &table, original, accepted, &composite_batch())
+        .await
+        .expect("the original retry is still acknowledged");
+    assert_eq!(read_all(client).await, all, "and still stores nothing new");
+}
+
+/// Rows written under two partition specs and read after an ID-preserving
+/// rename and a nullable addition: every source — published, staged, active,
+/// and restored — answers exact time, equality, null, and membership filters
+/// by stable field id, reads the added column as null, and stays invisible to
+/// another tenant. After the revision the description names the new columns,
+/// a batch spelled with them is written, and a spec-1 batch retried at its
+/// original version is still acknowledged once; the replaced column name, a
+/// mistyped added column, a null in a required column the sender declared
+/// nullable, and changed content under the accepted id are refused.
+///
+/// # Panics
+///
+/// Panics when any read differs, the added column is not null, another
+/// tenant reads the table, the evolved batch or the original retry is
+/// refused, or a refusal stores a row.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn mixed_runtime_specifications_preserve_rows_and_pins() {
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let builder = || {
+        wyrd_testing::WyrdTestServer::builder()
+            .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+    };
+    let server = builder().start_bound().await.expect("the pod starts");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("mixed_specs");
+    let table = register_composite_table(&server, tenant, &name).await;
+    let table_ref = vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &name);
+    let client = tenant_client(&server, tenant).await;
+    super::support::append_batch(&client, &table, uuid::Uuid::now_v7(), &composite_batch())
+        .await
+        .expect("the spec-0 batch is acknowledged");
+    server.flush_bifrost().await.expect("publishes");
+
+    server.commit_spec_revision(tenant, &table_ref).await;
+    super::support::append_batch(
+        &client,
+        &table,
+        uuid::Uuid::now_v7(),
+        &shifted(&composite_batch(), COMPOSITE_ROWS),
+    )
+    .await
+    .expect("the staged spec-1 batch is acknowledged");
+    let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
+    scribe.flush_writable_for_test().await.expect("freezes");
+    super::support::await_persistence_drained(&scribe).await;
+    drop(scribe);
+    let active = uuid::Uuid::now_v7();
+    let active_batch = shifted(&composite_batch(), 2 * COMPOSITE_ROWS);
+    super::support::append_batch(&client, &table, active, &active_batch)
+        .await
+        .expect("the active spec-1 batch is acknowledged");
+
+    server.commit_schema_revision(tenant, &table_ref).await;
+    assert_mixed_reads(&client, &table, "published, staged, and active").await;
+    let server = Box::pin(server.restart_bound(builder()))
+        .await
+        .expect("restarts");
+    let client = tenant_client(&server, tenant).await;
+    assert_mixed_reads(&client, &table, "restored").await;
+    server.flush_bifrost().await.expect("publishes");
+    assert_mixed_reads(&client, &table, "published").await;
+
+    let described = wyrd_client::Bifrost::query_only(&client)
+        .describe_table("vala.datasets", &name)
+        .await
+        .expect("the evolved table describes");
+    let spec_revision = wyrd_spec::vala::ids::TableVersion::INITIAL
+        .next()
+        .expect("the spec revision is version 2");
+    let current = spec_revision
+        .next()
+        .expect("the schema revision is version 3");
+    assert_eq!(described.table_version, current);
+    assert_eq!(
+        described
+            .user_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["event_time", "client", "shard", "value", "note"],
+        "the description is the selected version's native schema"
+    );
+    let evolved = evolved_batch(&shifted(&composite_batch(), 3 * COMPOSITE_ROWS));
+    super::support::append_batch_at(&client, &table, current, uuid::Uuid::now_v7(), &evolved)
+        .await
+        .expect("a new batch under the renamed and added columns is acknowledged");
+    super::support::append_batch_at(&client, &table, spec_revision, active, &active_batch)
+        .await
+        .expect("the spec-1 batch retried at its original version is acknowledged");
+    for (refused, why) in [
+        (
+            &shifted(&composite_batch(), 4 * COMPOSITE_ROWS),
+            "the replaced column name",
+        ),
+        (
+            &mistyped_note(&evolved),
+            "a value of the wrong type for the added column",
+        ),
+    ] {
+        let error = super::support::append_batch_at(
+            &client,
+            &table,
+            current,
+            uuid::Uuid::now_v7(),
+            refused,
+        )
+        .await
+        .expect_err(why);
+        assert_eq!(
+            error.code(),
+            "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+            "{why}: {error}"
+        );
+    }
+    let error = super::support::append_batch_at(
+        &client,
+        &table,
+        current,
+        uuid::Uuid::now_v7(),
+        &null_value(&evolved),
+    )
+    .await
+    .expect_err("a null in the required `value` column is refused");
+    assert_eq!(
+        error.code(),
+        "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+        "a sender-nullable field cannot carry a null into a required column: {error}"
+    );
+    assert!(
+        super::support::append_batch_at(
+            &client,
+            &table,
+            spec_revision,
+            active,
+            &shifted(&active_batch, 1)
+        )
+        .await
+        .is_err(),
+        "changed content under the accepted spec-1 id is refused"
+    );
+    server.flush_bifrost().await.expect("publishes");
+    let evolved_rows: Vec<i64> = (3 * COMPOSITE_ROWS..4 * COMPOSITE_ROWS).collect();
+    for (filter, expected) in [
+        ("TRUE", (0..4 * COMPOSITE_ROWS).collect::<Vec<_>>()),
+        ("note IS NOT NULL", evolved_rows.clone()),
+        (
+            "note = 'evolved' AND client = 'a'",
+            evolved_rows
+                .iter()
+                .copied()
+                .filter(|value| value % COMPOSITE_ROWS % 3 == 0)
+                .collect(),
+        ),
+    ] {
+        assert_eq!(
+            super::support::read_sql(
+                &client,
+                &format!("SELECT value FROM {table} WHERE {filter} ORDER BY value")
+            )
+            .await,
+            expected,
+            "evolved: `{filter}` returns each matching row once"
+        );
+    }
+
+    let neighbour = server
+        .seed_tenant("mixed-specs-neighbour")
+        .await
+        .expect("the neighbour tenant is seeded");
+    let foreign = tenant_client(&server, neighbour).await;
+    let refused = match wyrd_client::Bifrost::query_only(&foreign)
+        .query(&BifrostQueryRequest {
+            params: Vec::new(),
+            sql: format!("SELECT value FROM {table}"),
+            deadline_ms: Some(120_000),
+        })
+        .await
+    {
+        Err(_) => true,
+        Ok(mut stream) => {
+            while let Ok(Some(_)) = stream.next_batch().await {}
+            stream.terminal().map(|terminal| terminal.outcome)
+                != Some(wyrd_spec::vala::api::QueryTerminalOutcome::Success)
+        }
+    };
+    assert!(refused, "another tenant never reads the table");
+}
+
+/// Re-spells a composite batch under the schema revision: `customer` sent as
+/// `client` and the added `note` set to `evolved` on every row.
+///
+/// # Panics
+///
+/// Panics when `batch` is not a composite batch.
+fn evolved_batch(batch: &RecordBatch) -> RecordBatch {
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "customer" => field.as_ref().clone().with_name("client"),
+            _ => field.as_ref().clone(),
+        })
+        .collect();
+    fields.push(Field::new("note", DataType::Utf8, true));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(arrow::array::StringArray::from(vec![
+        "evolved";
+        batch
+            .num_rows(
+            )
+    ])));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("evolved batch")
+}
+
+/// Replaces an evolved batch's `note` with an `Int64` column, a type the
+/// revision did not add.
+///
+/// # Panics
+///
+/// Panics when `batch` is not an evolved batch.
+fn mistyped_note(batch: &RecordBatch) -> RecordBatch {
+    let note = batch
+        .schema()
+        .index_of("note")
+        .expect("evolved batch has note");
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields[note] = Field::new("note", DataType::Int64, true);
+    let mut columns = batch.columns().to_vec();
+    columns[note] = Arc::new(Int64Array::from(vec![0_i64; batch.num_rows()]));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("mistyped batch")
+}
+
+/// Re-declares an evolved batch's required `value` as nullable and nulls its
+/// first row: a stream valid under its own schema, not the table's.
+///
+/// # Panics
+///
+/// Panics when `batch` is not an evolved batch.
+fn null_value(batch: &RecordBatch) -> RecordBatch {
+    let value = batch
+        .schema()
+        .index_of("value")
+        .expect("evolved batch has value");
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields[value] = Field::new("value", DataType::Int64, true);
+    let mut columns = batch.columns().to_vec();
+    columns[value] = Arc::new(Int64Array::from_iter(
+        (0_i64..)
+            .take(batch.num_rows())
+            .map(|row| (row > 0).then_some(row)),
+    ));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("null-value batch")
+}
+
+/// Requires the three mixed-spec batches once each, by their renamed column,
+/// with the added column null everywhere.
+///
+/// # Panics
+///
+/// Panics when any read differs.
+async fn assert_mixed_reads(client: &wyrd_client::WyrdClient, table: &str, stage: &str) {
+    let all: Vec<i64> = (0..3 * COMPOSITE_ROWS).collect();
+    let pick = |keep: fn(i64) -> bool| {
+        all.iter()
+            .copied()
+            .filter(|value| keep(*value % COMPOSITE_ROWS))
+            .collect::<Vec<_>>()
+    };
+    for (filter, expected) in [
+        ("TRUE", all.clone()),
+        ("note IS NULL", all.clone()),
+        ("note IS NOT NULL", Vec::new()),
+        ("client IS NULL", pick(|row| row % 3 == 2)),
+        ("client = 'a'", pick(|row| row % 3 == 0)),
+        ("client IN ('a', 'b')", pick(|row| row % 3 != 2)),
+        ("shard = 3", pick(|row| row % 5 == 3)),
+        (
+            &*format!(
+                "event_time >= to_timestamp_micros({})",
+                composite_first_hour_micros() + COMPOSITE_HOUR_MICROS
+            ),
+            pick(|row| row % 2 == 1),
+        ),
+    ] {
+        assert_eq!(
+            super::support::read_sql(
+                client,
+                &format!("SELECT value FROM {table} WHERE {filter} ORDER BY value")
+            )
+            .await,
+            expected,
+            "{stage}: `{filter}` returns each matching row once"
+        );
+    }
 }

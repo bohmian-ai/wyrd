@@ -15,7 +15,7 @@
 
 use bytes::Bytes;
 use iceberg::spec::DataFile;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use iceberg::table::Table;
 use serde_json::{Map, Value};
@@ -23,7 +23,7 @@ use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use uuid::Uuid;
-use vala_sql::queries::file_list::HotFileCatalog;
+use vala_sql::queries::file_list::{HotFileCatalog, PromotableHotFileRow};
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::row_types::forge_operations::{
     ForgeOperationFamily, ForgeOperationPhase, ForgeOperationTransition,
@@ -316,6 +316,9 @@ fn first_metric_disagreement(
 
 /// Proves one immutable object physically agrees with the evidence promoting it.
 ///
+/// `definition` is the retained definition of the version the evidence names;
+/// the object's spec, sort order, schema, and Bloom filters must be exactly
+/// that version's, because Bloom-only versions share every other id.
 /// The checks run cheapest-and-most-decisive first: table policy identity needs
 /// no IO at all, the footer decode needs one bounded parse, and the partition
 /// containment check needs the projection the decode already produced. Every
@@ -324,45 +327,48 @@ fn first_metric_disagreement(
 /// # Errors
 ///
 /// Returns [`ForgeError::Invariant`] when the record names a partition spec or
-/// sort order the table no longer carries, the footer cannot be decoded under
-/// the writer's bounds, the footer's schema fingerprint differs from the
-/// record's, any persisted metric disagrees with the footer, or the object's own
+/// sort order its version does not declare, the footer cannot be decoded under
+/// the writer's bounds or onto that version's schema, the footer's schema
+/// fingerprint differs from the record's, its Bloom filters are not exactly
+/// that version's, any persisted metric disagrees with the footer, or the object's own
 /// time-column bounds are unusable or fall outside the partition the record claims.
 fn validate_promoted_object(
     record: &ScribePublishedHotFileV1,
     bytes: &Bytes,
     file_size: u64,
     table: &Table,
+    definition: &crate::catalog::TableDefinition,
 ) -> Result<(), ForgeError> {
-    let metadata = table.metadata();
-    if record.partition_spec_id != metadata.default_partition_spec_id() {
+    let spec_id = record.partition.spec_id;
+    if spec_id != definition.spec_id {
         return Err(ForgeError::Invariant {
             detail: format!(
-                "promotion evidence names partition spec {} but the table now writes {}",
-                record.partition_spec_id,
-                metadata.default_partition_spec_id()
+                "promotion evidence names partition spec {spec_id}, which table version {} does not declare",
+                record.table_version
             ),
         });
     }
-    let table_sort_order = i32::try_from(metadata.default_sort_order().order_id).map_err(|_| {
-        ForgeError::Invariant {
-            detail: "table sort order id is not representable".to_owned(),
-        }
-    })?;
-    if record.sort_order_id != table_sort_order {
+    let spec = table
+        .metadata()
+        .partition_spec_by_id(spec_id)
+        .ok_or_else(|| ForgeError::Invariant {
+            detail: format!(
+                "promotion evidence names partition spec {spec_id}, which the table does not retain"
+            ),
+        })?;
+    if record.sort_order_id != definition.sort_order_id {
         return Err(ForgeError::Invariant {
             detail: format!(
-                "promotion evidence names sort order {} but the table now writes {table_sort_order}",
-                record.sort_order_id
+                "promotion evidence names sort order {}, which table version {} does not declare",
+                record.sort_order_id, record.table_version
             ),
         });
     }
 
-    let schema = metadata.current_schema();
     let footer = crate::parquet::PromotedObjectFooter::decode(
         bytes,
         &record.object_key,
-        std::sync::Arc::clone(schema),
+        std::slice::from_ref(&definition.schema),
         file_size,
     )
     .map_err(|detail| ForgeError::Invariant { detail })?;
@@ -371,6 +377,19 @@ fn validate_promoted_object(
             detail: format!(
                 "promoted object {} was sealed against another schema than its evidence claims",
                 record.object_key
+            ),
+        });
+    }
+    if !footer.bloom_columns().iter().eq(definition
+        .layout
+        .bloom_columns()
+        .iter()
+        .collect::<BTreeSet<_>>())
+    {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "promoted object {} carries other Bloom filters than table version {} declares",
+                record.object_key, record.table_version
             ),
         });
     }
@@ -386,15 +405,14 @@ fn validate_promoted_object(
         });
     }
 
-    let partition = crate::catalog::TimePartition::from_durable_columns(
-        &record.partition.granularity,
-        record.partition.start_utc,
-    )
-    .map_err(|error| ForgeError::Invariant {
-        detail: format!("promotion evidence names a non-canonical partition: {error}"),
-    })?;
-    let field_id = crate::catalog::TimeAxis::iceberg_field_id(metadata.default_partition_spec())
-        .ok_or_else(|| ForgeError::Invariant {
+    let partition = record
+        .partition()
+        .map_err(|error| ForgeError::Invariant {
+            detail: error.to_string(),
+        })?
+        .time();
+    let field_id =
+        crate::catalog::TimeAxis::iceberg_field_id(spec).ok_or_else(|| ForgeError::Invariant {
             detail: "table partition spec has no time partition field".to_owned(),
         })?;
     // Promotion is fail-closed: bounds that would merely retain a file at
@@ -427,6 +445,51 @@ fn validate_promoted_object(
     Ok(())
 }
 
+/// Refuses promotion evidence whose partition is not its durable row's.
+///
+/// Scribe writes the row's partition columns and the evidence's partition in
+/// one statement, so they can only disagree when one was altered. The footer
+/// and time bounds cannot see a contradicting dimension value, and appending
+/// it would let equality pruning hide the file's rows.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the row's partition columns or the
+/// evidence's partition are malformed, or when the two differ in any part of
+/// the complete tuple.
+fn validate_durable_partition(
+    row: &PromotableHotFileRow,
+    record: &ScribePublishedHotFileV1,
+) -> Result<(), ForgeError> {
+    let durable = crate::catalog::TimePartition::from_durable_columns(
+        &row.partition_granularity,
+        row.partition_start,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|time| {
+        crate::catalog::PhysicalPartition::from_dimension_bytes(time, &row.partition_dimensions)
+            .map_err(|error| error.to_string())
+    })
+    .map_err(|error| ForgeError::Invariant {
+        detail: format!(
+            "hot object {} carries a malformed durable partition: {error}",
+            row.file_path
+        ),
+    })?;
+    let claimed = record.partition().map_err(|error| ForgeError::Invariant {
+        detail: error.to_string(),
+    })?;
+    if claimed != durable {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "hot object {} carries promotion evidence for another partition than its row",
+                row.file_path
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Reads and validates the exact promotion demand one table currently owes.
 ///
 /// Every eligible `file_list` row must carry decodable
@@ -434,7 +497,8 @@ fn validate_promoted_object(
 /// identity, path, and checksum the row itself records. A row that fails any
 /// of those checks invalidates the whole group rather than shrinking it: a
 /// partial promotion would publish a file set whose digest no longer matches
-/// the demand the scheduler observed.
+/// the demand the scheduler observed. Revalidating an `only` plan also
+/// requires each row's evidence to name the row's own complete partition.
 ///
 /// # Errors
 ///
@@ -499,6 +563,12 @@ pub(super) async fn read_promotion_demand(
                     row.file_path
                 ),
             });
+        }
+        // Only the worker's revalidation compares partitions: a refusal there
+        // ends as one terminal attempt, while a planning refusal would leave
+        // the table owed on every sweep with no recorded outcome.
+        if only.is_some() {
+            validate_durable_partition(row, &record)?;
         }
         let path =
             StoragePath::new(row.file_path.as_str()).map_err(|error| ForgeError::Invariant {
@@ -896,8 +966,9 @@ impl Forge {
     /// [`ForgeError::Reconciliation`] when the durable demand no longer matches
     /// the prepared plan, [`ForgeError::ObjectStore`] when an object cannot be
     /// read, and [`ForgeError::Invariant`] when an object contradicts its own
-    /// promotion evidence, disagrees with its own footer, names identity the
-    /// table no longer carries, or its `DataFile` cannot be rebuilt.
+    /// promotion evidence, disagrees with its own footer or with the retained
+    /// definition of the version it names, names a version the table does not
+    /// retain, or its `DataFile` cannot be rebuilt.
     pub(super) async fn revalidate_promotion(
         &self,
         binding: &TenantTableBinding,
@@ -923,8 +994,17 @@ impl Forge {
                     .to_owned(),
             });
         }
+        let fqn = binding.table_ref.fqn();
+        let mut definitions = BTreeMap::new();
         let mut data_files = Vec::with_capacity(demand.records.len());
         for record in &demand.records {
+            let definition = match definitions.entry(record.table_version) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                    self.retained_definition(&fqn, table, record.table_version)
+                        .await?,
+                ),
+            };
             let bytes = self
                 .core
                 .object_store
@@ -947,7 +1027,7 @@ impl Forge {
                 .map_err(|error| ForgeError::Invariant {
                     detail: format!("hot object failed promotion revalidation: {error}"),
                 })?;
-            validate_promoted_object(record, &bytes, file_size, table)?;
+            validate_promoted_object(record, &bytes, file_size, table, definition)?;
             data_files.push(record.data_file().map_err(|error| ForgeError::Invariant {
                 detail: format!("promotion evidence does not rebuild a data file: {error}"),
             })?);

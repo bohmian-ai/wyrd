@@ -78,6 +78,10 @@ impl DomainTable for ResultsTable {
             "ended_at",
             vec![sort_desc("ended_at")],
             &[
+                "run_id",
+                "card_uid",
+                "sub_principal_id",
+                "act_principal_id",
                 "result_id",
                 "execution_id",
                 "verifier_card_uid",

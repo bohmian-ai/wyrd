@@ -14,7 +14,7 @@ use tokio::time::Instant;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
-use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::ids::{RunId, TableVersion};
 
 use crate::batch_builder::{PreparedRows, RowPreflight};
 use crate::config::QueueConfig;
@@ -398,12 +398,14 @@ impl Producer {
     /// [`QueueConfig::validate`].
     pub fn new(
         table: &str,
+        table_version: TableVersion,
         schema: SchemaRef,
         sink: Arc<dyn BatchSink<ClientByteGuard>>,
         config: QueueConfig,
     ) -> Result<Self, WyrdQueueError> {
         Self::with_budget(
             table,
+            table_version,
             schema,
             sink,
             config,
@@ -412,6 +414,9 @@ impl Producer {
     }
 
     /// Creates a producer sharing the supplied handle-wide budget.
+    ///
+    /// Every batch it seals names `table_version`, the version of the
+    /// description `schema` came from.
     ///
     /// Construction allocates no buffer: the data channel, staging, and
     /// outbox all grow only with admitted bytes, so any number of producers
@@ -423,6 +428,7 @@ impl Producer {
     /// [`QueueConfig::validate`].
     pub fn with_budget(
         table: &str,
+        table_version: TableVersion,
         schema: SchemaRef,
         sink: Arc<dyn BatchSink<ClientByteGuard>>,
         config: QueueConfig,
@@ -439,6 +445,7 @@ impl Producer {
         let task = Task {
             queue: RecordQueue::new(
                 table.to_owned(),
+                table_version,
                 Arc::clone(preflight.output_schema()),
                 sink,
                 config,
@@ -1208,7 +1215,13 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                Producer::new("vala.bifrost.invalid", schema(), sink.clone(), config),
+                Producer::new(
+                    "vala.bifrost.invalid",
+                    wyrd_spec::vala::ids::TableVersion::INITIAL,
+                    schema(),
+                    sink.clone(),
+                    config
+                ),
                 Err(WyrdQueueError::ConfigInvalid { .. })
             ));
         }
@@ -1226,6 +1239,7 @@ mod tests {
             .map(|index| {
                 Producer::with_budget(
                     &format!("vala.bifrost.table_{index}"),
+                    wyrd_spec::vala::ids::TableVersion::INITIAL,
                     schema(),
                     sink.clone(),
                     config,
@@ -1259,6 +1273,7 @@ mod tests {
         };
         let producer = Producer::with_budget(
             "vala.bifrost.drop_timeout",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             config,
@@ -1307,6 +1322,7 @@ mod tests {
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
             "vala.bifrost.queue",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             QueueConfig::default(),
@@ -1364,6 +1380,7 @@ mod tests {
         sink.fail_next(usize::MAX);
         let producer = Producer::with_budget(
             "vala.bifrost.context_bytes",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             config,
@@ -1428,6 +1445,7 @@ mod tests {
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
             "vala.bifrost.timeout",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             QueueConfig {
@@ -1472,6 +1490,7 @@ mod tests {
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
             "vala.bifrost.failed_shutdown",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             QueueConfig::default(),
@@ -1551,6 +1570,7 @@ mod tests {
         });
         let producer = Producer::new(
             "vala.bifrost.background_refusal",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink,
             QueueConfig {
@@ -1628,6 +1648,7 @@ mod tests {
         });
         let producer = Producer::with_budget(
             "vala.gateway.calls",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             QueueConfig::default(),
@@ -1688,6 +1709,7 @@ mod tests {
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
             "vala.gateway.calls",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             QueueConfig::default(),
@@ -1728,6 +1750,7 @@ mod tests {
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
             "vala.traces.spans",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             QueueConfig {
@@ -1779,6 +1802,7 @@ mod tests {
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
             "vala.bifrost.in_flight_intake",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             QueueConfig {
@@ -1845,6 +1869,7 @@ mod tests {
         ]));
         let producer = Producer::with_budget(
             "vala.bifrost.prepared",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             Arc::clone(&schema),
             sink.clone(),
             config,
@@ -1951,6 +1976,7 @@ mod tests {
         let sink = Arc::new(MockSink::new());
         let producer = Producer::with_budget(
             "vala.bifrost.atomic_admission",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             config,
@@ -1996,6 +2022,7 @@ mod tests {
         let sink = Arc::new(MockSink::new());
         let by_bytes = Producer::new(
             "vala.bifrost.byte_trigger",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             QueueConfig {
@@ -2016,6 +2043,7 @@ mod tests {
         });
         let by_linger = Producer::new(
             "vala.bifrost.linger_trigger",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             QueueConfig {
@@ -2049,6 +2077,7 @@ mod tests {
         let sink = Arc::new(MockSink::new());
         let producer = Producer::with_budget(
             "vala.bifrost.sealing_headroom",
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
             config,

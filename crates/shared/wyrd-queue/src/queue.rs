@@ -15,6 +15,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
+use wyrd_spec::vala::ids::TableVersion;
 
 use crate::config::QueueConfig;
 use crate::error::WyrdQueueError;
@@ -241,6 +242,7 @@ struct Staging {
 /// Every buffer grows only with admitted bytes; nothing is preallocated.
 pub struct RecordQueue {
     table: String,
+    table_version: TableVersion,
     schema: SchemaRef,
     staging: Mutex<Staging>,
     outbox: Mutex<VecDeque<SealedBatch<ClientByteGuard>>>,
@@ -255,9 +257,10 @@ impl RecordQueue {
     /// Constructs one queue over one shared handle budget.
     ///
     /// `schema` is the prepared-row output schema staged rows concatenate
-    /// over when sealed.
+    /// over when sealed; every sealed batch names `table_version`.
     pub(crate) fn new(
         table: String,
+        table_version: TableVersion,
         schema: SchemaRef,
         sink: Arc<dyn BatchSink<ClientByteGuard>>,
         config: QueueConfig,
@@ -266,6 +269,7 @@ impl RecordQueue {
     ) -> Self {
         Self {
             table,
+            table_version,
             schema,
             staging: Mutex::new(Staging::default()),
             outbox: Mutex::new(VecDeque::new()),
@@ -396,6 +400,7 @@ impl RecordQueue {
                 let guard = guard.fit(frame.len())?.attach_batch();
                 Ok(SealedBatch {
                     table: self.table.clone(),
+                    table_version: self.table_version,
                     batch_id: Uuid::now_v7().into_bytes(),
                     frame: OwnedIpcBytes::new(frame, guard),
                     rows,
@@ -629,6 +634,7 @@ impl RecordQueue {
             let frame_guard = frame_guard.resize(frame.len()).attach_batch();
             let batch = SealedBatch {
                 table: self.table.clone(),
+                table_version: self.table_version,
                 batch_id: Uuid::now_v7().into_bytes(),
                 frame: OwnedIpcBytes::new(frame, frame_guard),
                 rows: chunk.len() as u64,
@@ -821,6 +827,7 @@ mod tests {
         let counters = Arc::new(Counters::default());
         let queue = RecordQueue::new(
             "events".to_owned(),
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             batch.schema(),
             sink.clone(),
             QueueConfig {
@@ -897,6 +904,7 @@ mod tests {
         let counters = Arc::new(Counters::default());
         let probe = RecordQueue::new(
             "events".to_owned(),
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema.clone(),
             sink.clone(),
             QueueConfig::default(),
@@ -918,6 +926,7 @@ mod tests {
 
         let queue = RecordQueue::new(
             "events".to_owned(),
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema,
             sink.clone(),
             QueueConfig {
@@ -940,6 +949,7 @@ mod tests {
         let poison_counters = Arc::new(Counters::default());
         let poison_queue = RecordQueue::new(
             "events".to_owned(),
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             queue.schema.clone(),
             poison_sink.clone(),
             QueueConfig {
@@ -1008,6 +1018,7 @@ mod tests {
         sink.fail_next(1);
         let queue = RecordQueue::new(
             "events".to_owned(),
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             output_schema(),
             sink.clone(),
             QueueConfig::default(),
@@ -1042,6 +1053,7 @@ mod tests {
         let sink = Arc::new(MockSink::new());
         let queue = RecordQueue::new(
             "events".to_owned(),
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             output_schema(),
             sink.clone(),
             QueueConfig::default(),
@@ -1149,6 +1161,7 @@ mod tests {
         let sink = Arc::new(MockSink::new());
         let queue = RecordQueue::new(
             "events".to_owned(),
+            wyrd_spec::vala::ids::TableVersion::INITIAL,
             output_schema(),
             sink.clone(),
             QueueConfig::default(),

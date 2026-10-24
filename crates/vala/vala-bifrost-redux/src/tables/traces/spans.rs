@@ -150,7 +150,15 @@ impl DomainTable for SpansTable {
         hourly_layout(
             "start_time_unix_nano",
             vec![sort_desc("start_time_unix_nano"), sort_asc("trace_id")],
-            &["trace_id", "span_id", "service_name"],
+            &[
+                "run_id",
+                "card_uid",
+                "sub_principal_id",
+                "act_principal_id",
+                "trace_id",
+                "span_id",
+                "service_name",
+            ],
         )
     }
 }

@@ -371,8 +371,11 @@ pub struct FetchLiveTailRequest {
     pub start_partition: TimePartition,
     /// Inclusive last partition day governed by the query.
     pub end_partition: TimePartition,
-    /// Columns required by Oracle filters, ordering, and projection.
-    pub required_columns: Vec<String>,
+    /// Fields required by Oracle filters, ordering, and projection, in order.
+    ///
+    /// Each carries the table's current name, type, and field id, so Scribe
+    /// resolves rows admitted under an earlier schema revision by id.
+    pub required_fields: arrow::datatypes::Fields,
 }
 
 /// One shallow, structural hot snapshot returned by a shard owner.
@@ -957,7 +960,7 @@ impl FetchLiveTailService {
         }
         let read = retained.capture.read(
             &(request.start_partition..=request.end_partition),
-            &request.required_columns,
+            &request.required_fields,
         )?;
         Ok(LiveTailBatches {
             memtable: read
@@ -1293,6 +1296,19 @@ pub(crate) mod tests {
             .expect("the live capture is taken")
     }
 
+    /// Required fields that select captured columns by name, unchanged.
+    ///
+    /// The fields carry no field id, so their placeholder type is never
+    /// read: each resolves to the captured column of its name.
+    pub(crate) fn named_fields<'a>(
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> arrow::datatypes::Fields {
+        names
+            .into_iter()
+            .map(|name| arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Null, true))
+            .collect()
+    }
+
     /// Captures `request`'s table, retains the capture for its query, and
     /// returns the request naming that capture.
     ///
@@ -1453,7 +1469,7 @@ pub(crate) mod tests {
             capture_id: uuid::Uuid::nil(),
             start_partition: day,
             end_partition: day,
-            required_columns: vec!["value".to_owned()],
+            required_fields: named_fields(["value"]),
         };
         StagedGenerationFixture {
             service,
@@ -1576,7 +1592,7 @@ pub(crate) mod tests {
             capture_id: uuid::Uuid::nil(),
             start_partition: day,
             end_partition: day,
-            required_columns: vec!["value".to_owned()],
+            required_fields: named_fields(["value"]),
         };
 
         let rollover = Arc::new(std::sync::Mutex::new(None));

@@ -629,6 +629,16 @@ impl Catalog for CommitUncertaintyCatalog {
         self.inner.table_exists(table).await
     }
 
+    async fn list_table_version_locations(
+        &self,
+        table: &TableIdent,
+        table_uuid: &str,
+    ) -> iceberg::Result<Vec<String>> {
+        self.inner
+            .list_table_version_locations(table, table_uuid)
+            .await
+    }
+
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
         self.inner.rename_table(src, dest).await
     }
@@ -1621,7 +1631,10 @@ fn fixture_time_field() -> Field {
 /// the hourly `wyrd_ingested_at` default place rows by arrival.
 fn daily_layout_declaration() -> wyrd_spec::vala::api::PhysicalLayoutWire {
     wyrd_spec::vala::api::PhysicalLayoutWire {
-        partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
+        partition_by: vec![wyrd_spec::vala::api::PartitionFieldWire::new(
+            FIXTURE_TIME_COLUMN,
+            wyrd_spec::vala::api::PartitionTransformWire::Day,
+        )],
         time_column: Some(FIXTURE_TIME_COLUMN.to_owned()),
         sort_keys: Vec::new(),
         bloom_columns: Vec::new(),

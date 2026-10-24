@@ -1125,7 +1125,13 @@ pub(super) async fn published_files(
     if scan.snapshot_id().is_none() && scan.table().metadata().current_snapshot().is_none() {
         return Ok(Vec::new());
     }
-    let mut builder = scan.table().scan();
+    // The query is planned against the pinned table's current schema, so the
+    // pushed predicate binds there by field id even when the snapshot was
+    // committed under an older schema.
+    let mut builder = scan
+        .table()
+        .scan()
+        .with_schema_id(scan.table().metadata().current_schema_id());
     if let Some(snapshot_id) = scan.snapshot_id() {
         builder = builder.snapshot_id(snapshot_id);
     }

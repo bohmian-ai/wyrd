@@ -14,6 +14,7 @@ use std::sync::Arc;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use uuid::Uuid;
+use wyrd_spec::vala::ids::TableVersion;
 
 use crate::config::QueueConfig;
 use crate::error::WyrdQueueError;
@@ -64,7 +65,8 @@ impl SealedBatchSender {
         }
     }
 
-    /// Seals `batch` for `table` and settles it under one stable identity.
+    /// Seals `batch` for `table` at `table_version` and settles it under one
+    /// stable identity.
     ///
     /// The batch is encoded exactly once, charged against the handle budget
     /// once, and given one UUIDv7 that survives every resend, so an ambiguous
@@ -85,6 +87,7 @@ impl SealedBatchSender {
     pub async fn send(
         &self,
         table: &str,
+        table_version: TableVersion,
         batch: &RecordBatch,
     ) -> Result<DurableBatchAck, WyrdQueueError> {
         let frame = encode_ipc(batch, self.config.max_message_bytes)?;
@@ -92,6 +95,7 @@ impl SealedBatchSender {
         let rows = batch.num_rows() as u64;
         let sealed = SealedBatch {
             table: table.to_owned(),
+            table_version,
             batch_id: Uuid::now_v7().into_bytes(),
             frame: OwnedIpcBytes::new(frame, guard),
             rows,

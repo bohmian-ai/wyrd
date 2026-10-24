@@ -246,6 +246,8 @@ struct PersistenceDependencies {
     geometry: geometry::ScribeGeometry,
     /// Pod-wide registry the staging runtime moves generation authority in.
     hot_sources: Arc<hot_source::ScribeHotSourceRegistry>,
+    /// Catalog holding the retained revisions staged members are written under.
+    catalog: Option<Arc<BifrostCatalog>>,
 }
 
 /// The Scribe engine: the one owner of this node's durable ingest path.
@@ -328,6 +330,9 @@ pub struct ScribeImpl {
     /// The `PostgreSQL`-anchored clock every admitted batch is stamped from
     /// as `wyrd_ingested_at`.
     admission_clock: ingress::AdmissionClock,
+    /// Vala SQL pool holding the batch-control fence, read by ingress only to
+    /// recover an accepted retry the committed index no longer holds.
+    control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
     /// Test-tier barrier installed at the public ingest seam, if any.
     #[cfg(any(test, feature = "test-support"))]
     ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
@@ -723,6 +728,7 @@ impl ScribeImpl {
                 principal: frame.principal,
                 table: frame.table,
                 expected_schema_fingerprint: Some(frame.expected_schema_fingerprint),
+                table_version: None,
                 request_id: frame.request_id,
                 batch_id: frame.batch_id,
                 measured_wire_bytes,
@@ -1105,6 +1111,7 @@ impl ScribeImpl {
             staging_file_publisher,
             geometry,
             hot_sources,
+            catalog,
         } = dependencies;
         persistence::PersistenceRuntime::start(
             config,
@@ -1118,6 +1125,7 @@ impl ScribeImpl {
                 staging_file_publisher,
                 geometry,
                 hot_sources,
+                catalog,
                 #[cfg(any(test, feature = "test-support"))]
                 faults,
             },
@@ -1181,6 +1189,7 @@ impl ScribeImpl {
                     staging_file_publisher: staging_file_publisher.clone(),
                     geometry,
                     hot_sources: Arc::clone(&hot_sources),
+                    catalog: catalog.clone(),
                 },
                 &coordination_runtime,
             )
@@ -1227,7 +1236,8 @@ impl ScribeImpl {
             recovery_ready: AtomicBool::new(true),
             recovery_cancelled: Arc::new(AtomicBool::new(false)),
             persistence,
-            admission_clock: ingress::AdmissionClock::new(control_postgres),
+            admission_clock: ingress::AdmissionClock::new(control_postgres.clone()),
+            control_postgres,
             fence_operator,
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),

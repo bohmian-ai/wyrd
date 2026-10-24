@@ -225,7 +225,10 @@ pub(crate) fn timed_layout_with(
     bloom_columns: Vec<String>,
 ) -> PhysicalLayoutWire {
     PhysicalLayoutWire {
-        partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Hour,
+        partition_by: vec![wyrd_spec::vala::api::PartitionFieldWire::new(
+            EVENT_TIME,
+            wyrd_spec::vala::api::PartitionTransformWire::Hour,
+        )],
         time_column: Some(EVENT_TIME.to_owned()),
         sort_keys,
         bloom_columns,

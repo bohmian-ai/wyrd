@@ -148,7 +148,13 @@ impl DomainTable for CallsTable {
         hourly_layout(
             "started_at",
             vec![sort_desc("started_at"), sort_asc("call_id")],
-            &["call_id"],
+            &[
+                "run_id",
+                "card_uid",
+                "sub_principal_id",
+                "act_principal_id",
+                "call_id",
+            ],
         )
     }
 }

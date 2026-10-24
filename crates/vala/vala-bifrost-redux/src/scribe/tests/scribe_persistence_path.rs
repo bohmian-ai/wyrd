@@ -337,6 +337,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
             principal,
             table: table.clone(),
             expected_schema_fingerprint: Some(fingerprint),
+            table_version: None,
             request_id: request_id.clone(),
             batch_id: Uuid::now_v7(),
             measured_wire_bytes: 0,
@@ -384,11 +385,12 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
             end_partition: day,
-            required_columns: MANAGED_COLUMNS
-                .iter()
-                .map(|name| (*name).to_owned())
-                .chain(["metric_name".to_owned(), "quantile_values".to_owned()])
-                .collect(),
+            required_fields: crate::scribe::tail_rpc::tests::named_fields(
+                MANAGED_COLUMNS
+                    .iter()
+                    .copied()
+                    .chain(["metric_name", "quantile_values"]),
+            ),
             query_id: Uuid::new_v4(),
             capture_id: Uuid::nil(),
         },
@@ -443,6 +445,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
                 rows.schema().as_ref(),
             )),
+            table_version: None,
             request_id,
             batch_id,
             measured_wire_bytes: 0,
@@ -481,7 +484,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         target_stream: stream,
         start_partition,
         end_partition,
-        required_columns: vec!["value".to_owned()],
+        required_fields: crate::scribe::tail_rpc::tests::named_fields(["value"]),
         query_id: Uuid::new_v4(),
         capture_id: Uuid::nil(),
     };
@@ -569,6 +572,7 @@ async fn append_one(
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
                 rows.schema().as_ref(),
             )),
+            table_version: None,
             request_id: RequestId::now_v7(),
             batch_id: Uuid::now_v7(),
             measured_wire_bytes: 0,
@@ -600,7 +604,7 @@ fn value_read(
         target_stream: stream,
         start_partition,
         end_partition,
-        required_columns: vec!["value".to_owned()],
+        required_fields: crate::scribe::tail_rpc::tests::named_fields(["value"]),
         query_id: Uuid::new_v4(),
         capture_id: Uuid::nil(),
     }
@@ -742,6 +746,7 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
                 rows.schema().as_ref(),
             )),
+            table_version: None,
             request_id,
             batch_id: Uuid::now_v7(),
             measured_wire_bytes: 0,
@@ -756,4 +761,114 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .await;
+}
+
+mod pg_tests {
+    use super::*;
+    use secrecy::ExposeSecret;
+    use wyrd_spec::vala::error::BifrostError;
+    use wyrd_spec::vala::ids::TableVersion;
+
+    /// A native frame naming a table version that is not current is refused
+    /// as a typed table-version conflict naming the current version, before
+    /// any durable work.
+    ///
+    /// The same batch id then commits at the current version as a first
+    /// commit, so the refused frame left no fence behind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture or registration fails, the stale frame is
+    /// admitted or refused with any other error, or the retry at the current
+    /// version is refused or is not a first commit.
+    #[tokio::test]
+    async fn stale_table_version_is_refused_without_residue() {
+        let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("postgres fixture starts");
+        let warehouse = TempDir::new().expect("warehouse directory");
+        let catalog = Arc::new(
+            crate::catalog::BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                crate::storage::BifrostStorage::for_test(warehouse.path(), false),
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture"),
+        );
+        let tenant = fixture.data_tenant_id();
+        let table = TableRef::new(BifrostNamespace::Datasets, "stale_version");
+        let registered = catalog
+            .register_dataset(
+                tenant,
+                wyrd_spec::auth::Attribution::unresolved(),
+                table.clone(),
+                vec![Field::new("value", DataType::Int64, false)],
+                None,
+                crate::catalog::CompactionRegistration::default(),
+            )
+            .await
+            .expect("dataset registers");
+        assert_eq!(registered.table_version, TableVersion::INITIAL);
+        let temp_dir = TempDir::new().expect("WAL temp dir");
+        let wal = Arc::new(
+            WalWriter::new(
+                temp_dir.path(),
+                *Uuid::nil().as_bytes(),
+                1,
+                WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let scribe = ScribeImpl::new_for_embedded_with_deps_and_catalog(
+            Arc::new(object_store::memory::InMemory::new()),
+            wal,
+            &Uuid::nil().to_string(),
+            1,
+            catalog,
+        );
+        let batch_id = Uuid::now_v7();
+        let frame = |table_version| {
+            let principal = principal(tenant);
+            ScribeIngressFrame {
+                attributed_cards: None,
+                attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
+                authenticated_tenant: tenant,
+                principal,
+                table: table.clone(),
+                expected_schema_fingerprint: None,
+                table_version: Some(table_version),
+                request_id: RequestId::now_v7(),
+                batch_id,
+                measured_wire_bytes: 0,
+                payload: IngressPayload::ArrowIpc(bytes::Bytes::from(ipc_stream(&[batch(7)]))),
+            }
+        };
+
+        let refused = Scribe::ingest_frame(
+            &scribe,
+            frame(TableVersion::new(2).expect("positive version")),
+        )
+        .await
+        .expect_err("a non-current table version is refused");
+        assert!(
+            matches!(
+                &refused,
+                ScribeError::ContractViolation(BifrostError::TableVersionConflict {
+                    table_version,
+                    ..
+                }) if *table_version == TableVersion::INITIAL
+            ),
+            "{refused:?}"
+        );
+        let admitted = Scribe::ingest_frame(&scribe, frame(TableVersion::INITIAL))
+            .await
+            .expect("the current table version is admitted");
+        assert!(admitted.first_commit, "the refused frame left no fence");
+        assert_eq!(admitted.rows_accepted, 1);
+
+        scribe
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
+    }
 }

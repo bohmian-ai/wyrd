@@ -727,6 +727,9 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) geometry: crate::scribe::geometry::ScribeGeometry,
     /// Pod-wide registry the staging runtime moves generation authority in.
     pub(crate) hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
+    /// Catalog holding the retained revisions staged members are written
+    /// under; absent only where every table stays at its initial revision.
+    pub(crate) catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
     /// Deterministic fault points used only by test-tier persistence paths.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) faults: PersistenceFaults,
@@ -871,7 +874,8 @@ impl PersistenceRuntime {
         );
         Some(Arc::new(
             ScribeStagingRuntime::new(stage, publisher, config)
-                .with_hot_sources(Arc::clone(&context.hot_sources)),
+                .with_hot_sources(Arc::clone(&context.hot_sources))
+                .with_catalog(context.catalog.clone()),
         ))
     }
 
@@ -1417,6 +1421,8 @@ enum ClaimSlotWait {
 struct PersistenceWorker {
     /// Audited operator pool for atomically fenced publication.
     operator_pool: Option<OperatorPool>,
+    /// Catalog holding the retained revision each member is written under.
+    catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
     /// Shared durable failure ledger consumed by startup recovery.
     failures: Arc<Mutex<Vec<String>>>,
     /// Replacement actor identity used only for publication authority.
@@ -1977,6 +1983,7 @@ impl PersistenceWorker {
         );
         Self {
             operator_pool,
+            catalog: context.catalog,
             failures,
             actor_stream: context.actor_stream,
             wal: context.wal,
@@ -2219,13 +2226,15 @@ impl PersistenceWorker {
         frozen: &FrozenMemtable,
     ) -> Result<crate::scribe::assembly::StagedMemberId, ScribeError> {
         let staging = self.staging()?;
-        let layout = crate::scribe::write_recipe::resolve_write_recipe(
+        let recipe = crate::scribe::write_recipe::resolve_write_recipe(
             self.operator_pool
                 .as_ref()
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "writer-v2 staging requires the operator control capability".to_owned(),
                 })?,
+            self.catalog.as_deref(),
             binding,
+            &generation.seal_key,
             &frozen.schema,
         )
         .await?;
@@ -2243,7 +2252,7 @@ impl PersistenceWorker {
                 crate::scribe::execution_lanes::StageMemberOp {
                     frozen: Box::new(frozen.clone()),
                     binding: binding.clone(),
-                    layout,
+                    recipe,
                     origin: crate::scribe::member_stager::StagedMemberOrigin {
                         node_id: generation.stream.node_id,
                         writer_epoch: generation.stream.writer_epoch,
@@ -2492,7 +2501,7 @@ impl PersistenceWorker {
         let staging = self.staging()?;
         let mut published = 0;
         for key in staging.ready_keys()? {
-            if key.partition() != partition {
+            if key.partition().time() != partition {
                 continue;
             }
             while let Some(claim) =
@@ -2710,7 +2719,7 @@ impl PersistenceWorker {
         let Ok(binding) = TenantTableBinding::resolve((key.tenant(), key.table().clone())) else {
             return;
         };
-        let event = crate::maintenance::StagingFileCommitted::new(binding, key.partition());
+        let event = crate::maintenance::StagingFileCommitted::new(binding, key.partition().time());
         let _ = publisher.try_publish(event);
     }
 
@@ -3114,6 +3123,7 @@ mod tests {
                     staging_file_publisher: None,
                     geometry: crate::scribe::geometry::ScribeGeometry::default(),
                     hot_sources: Arc::clone(&hot_sources),
+                    catalog: None,
                     faults: PersistenceFaults::default(),
                 },
                 &Handle::current(),
@@ -3195,7 +3205,7 @@ mod tests {
                     "event_time",
                     arrow::datatypes::DataType::Timestamp(
                         arrow::datatypes::TimeUnit::Microsecond,
-                        None,
+                        Some("+00:00".into()),
                     ),
                     false,
                 ),
@@ -3262,9 +3272,12 @@ mod tests {
                 arrow::record_batch::RecordBatch::try_new(
                     Arc::clone(&schema),
                     vec![
-                        Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
-                            1_767_225_600_000_000_i64,
-                        ])),
+                        Arc::new(
+                            arrow::array::TimestampMicrosecondArray::from(vec![
+                                1_767_225_600_000_000_i64,
+                            ])
+                            .with_timezone("+00:00"),
+                        ),
                         Arc::new(arrow::array::Int64Array::from(vec![1_i64])),
                     ],
                 )
@@ -3584,7 +3597,7 @@ mod tests {
                 row_count: 1,
                 min_event_time: now,
                 max_event_time: now,
-                partition,
+                partition: partition.into(),
                 node_id: self.actor.node_id.as_uuid(),
                 writer_epoch: self.actor.writer_epoch.as_i64(),
                 wal_lsn_min: lsn.0,

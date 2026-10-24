@@ -400,6 +400,10 @@ fn flip_first_bound(record: &mut serde_json::Value, field: &str) {
 
 /// Every physical or policy contradiction is refused before any catalog effect.
 ///
+/// That includes evidence naming an unretained version or a Bloom-only
+/// version its object was not sealed under, while objects sealed before a
+/// Bloom-only edit still promote under their own version.
+///
 /// The object is a real sealed Parquet file and it is never altered by a record
 /// mutation, so a refusal can only come from Forge re-deriving the object's own
 /// footer and disagreeing with the persisted evidence. Size and checksum alone
@@ -444,21 +448,22 @@ async fn scribe_promotion_integration_rejects_physical_datafile_mismatch_before_
             );
         }),
         ("partition value", |record| {
-            let object = record.as_object_mut().expect("a record object");
-            let partition = object
+            let time = record
                 .get_mut("partition")
+                .and_then(|partition| partition.get_mut("time"))
                 .and_then(serde_json::Value::as_object_mut)
-                .expect("a partition value");
-            partition.insert(
+                .expect("a partition time");
+            time.insert(
                 "start_utc".to_owned(),
                 serde_json::Value::from("1999-01-01T00:00:00Z"),
             );
         }),
         ("partition spec identity", |record| {
             record
-                .as_object_mut()
-                .expect("a record object")
-                .insert("partition_spec_id".to_owned(), serde_json::Value::from(97));
+                .get_mut("partition")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("a partition value")
+                .insert("spec_id".to_owned(), serde_json::Value::from(97));
         }),
         ("schema identity", |record| {
             record.as_object_mut().expect("a record object").insert(
@@ -474,9 +479,183 @@ async fn scribe_promotion_integration_rejects_physical_datafile_mismatch_before_
         }),
     ];
 
+    // Partition-tuple contradictions only the durable row can see: the
+    // object's footer and time bounds are intact under every one of these.
+    // Each mutates the object of customer `alpha` or of the null customer.
+    type TupleMutation = (&'static str, bool, fn(&mut serde_json::Value));
+    const TUPLE_MUTATIONS: [TupleMutation; 4] = [
+        ("partition dimension value", false, |record| {
+            partition_values(record)[0] = serde_json::json!({ "utf8": "beta" });
+        }),
+        ("partition literal to null", false, |record| {
+            partition_values(record)[0] = serde_json::Value::Null;
+        }),
+        ("partition null to literal", true, |record| {
+            partition_values(record)[0] = serde_json::json!({ "utf8": "alpha" });
+        }),
+        ("partition time position", false, |record| {
+            record
+                .get_mut("partition")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("a partition value")
+                .insert("time_index".to_owned(), serde_json::Value::from(1));
+        }),
+    ];
     for (index, (name, mutate)) in MUTATIONS.into_iter().enumerate() {
-        assert_mutation_is_refused_before_catalog_io(index, name, mutate).await;
+        let fixture =
+            PromotionIntegrationFixture::start(&format!("promotion_physical_{index}")).await;
+        assert_mutation_is_refused_before_catalog_io(&fixture, 0, name, mutate).await;
     }
+
+    // Evidence naming a version the table does not retain is refused, and so
+    // is evidence naming a Bloom-only version that shares every schema, spec,
+    // and sort id with the accepting one: only the object's own Bloom filters
+    // tell the two apart.
+    let name_version_two = |record: &mut serde_json::Value| {
+        record["table_version"] = serde_json::Value::from("2");
+    };
+    let fixture = PromotionIntegrationFixture::start("promotion_unretained_version").await;
+    assert_mutation_is_refused_before_catalog_io(
+        &fixture,
+        0,
+        "unretained table version",
+        name_version_two,
+    )
+    .await;
+    let fixture = bloom_revised_fixture("promotion_bloom_version").await;
+    assert_mutation_is_refused_before_catalog_io(
+        &fixture,
+        0,
+        "Bloom-only table version",
+        name_version_two,
+    )
+    .await;
+    let intact = bloom_revised_fixture("promotion_bloom_intact").await;
+    let mut forge = SupervisedPromotion::start(
+        &intact,
+        intact.catalog.iceberg_catalog(),
+        CountingObjectStore::new(&intact.storage) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    forge.run_one_success().await;
+    forge.shutdown().await;
+    assert_eq!(
+        intact.live_data_paths().await.len(),
+        intact.file_rows().await.len(),
+        "objects accepted before a Bloom-only edit still promote under their own version"
+    );
+
+    for (index, (name, null_customer, mutate)) in TUPLE_MUTATIONS.into_iter().enumerate() {
+        let fixture = composite_fixture(&format!("promotion_tuple_{index}")).await;
+        let record = fixture
+            .promotion_records()
+            .await
+            .iter()
+            .position(|(_, record)| record["partition"]["values"][0].is_null() == null_customer)
+            .expect("the fixture sealed both customers");
+        assert_mutation_is_refused_before_catalog_io(&fixture, record, name, mutate).await;
+    }
+    let intact = composite_fixture("promotion_tuple_intact").await;
+    let mut forge = SupervisedPromotion::start(
+        &intact,
+        intact.catalog.iceberg_catalog(),
+        CountingObjectStore::new(&intact.storage) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    forge.run_one_success().await;
+    forge.shutdown().await;
+    assert_eq!(
+        intact.live_data_paths().await.len(),
+        2,
+        "intact composite evidence still promotes"
+    );
+}
+
+/// Seals the default fixture's objects at version 1, then commits version 2,
+/// a Bloom-only edit adding a `value` Bloom filter.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start or the edit does not commit.
+async fn bloom_revised_fixture(table_name: &str) -> PromotionIntegrationFixture {
+    let fixture = PromotionIntegrationFixture::start(table_name).await;
+    super::support::set_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[
+            (
+                vala_bifrost_redux::catalog::layout::BLOOM_COLUMNS_PROPERTY,
+                r#"["value"]"#,
+            ),
+            (
+                vala_bifrost_redux::catalog::layout::TABLE_VERSION_PROPERTY,
+                "2",
+            ),
+        ],
+    )
+    .await;
+    fixture
+}
+
+/// Borrows the dimension values of a promotion record's partition.
+///
+/// # Panics
+///
+/// Panics when the record carries no partition value list.
+fn partition_values(record: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+    record
+        .get_mut("partition")
+        .and_then(|partition| partition.get_mut("values"))
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("a partition value list")
+}
+
+/// Seals two objects into a table partitioned by day and then `customer`:
+/// one carries customer `alpha`, the other a null customer.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start or a batch cannot be built.
+async fn composite_fixture(table_name: &str) -> PromotionIntegrationFixture {
+    use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use wyrd_spec::vala::api::{PartitionFieldWire, PartitionTransformWire};
+
+    let user_fields = vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new("customer", DataType::Utf8, true),
+    ];
+    let mut fields = user_fields.clone();
+    fields.push(super::support::fixture_time_field());
+    let schema = Arc::new(Schema::new(fields));
+    let noon = super::support::fixture_day()
+        .and_hms_opt(12, 0, 0)
+        .expect("fixture timestamp")
+        .and_utc()
+        .timestamp_micros();
+    let batch = |value: i64, customer: Option<&str>| {
+        arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![value, value + 10])),
+                Arc::new(StringArray::from(vec![customer, customer])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![noon, noon + 1_000]).with_timezone("UTC"),
+                ),
+            ],
+        )
+        .expect("composite fixture batch")
+    };
+    PromotionIntegrationFixture::start_with_dimensions(
+        table_name,
+        user_fields,
+        vec![PartitionFieldWire::new(
+            "customer",
+            PartitionTransformWire::Identity,
+        )],
+        &[batch(0, Some("alpha")), batch(1, None)],
+    )
+    .await
 }
 
 /// Drives one mutated promotion record through the real scheduler and worker.
@@ -484,20 +663,21 @@ async fn scribe_promotion_integration_rejects_physical_datafile_mismatch_before_
 /// The fixture is per-mutation on purpose: a refused promotion is durably
 /// terminal and its Prepared operation evidence is append-only, so a second
 /// refusal over the same demand is not a thing production can produce.
+/// `record` is the position of the mutated record in durable order.
 ///
 /// # Panics
 ///
 /// Panics when the mutation does not change the evidence, when the refusal does
 /// not happen, or when the refusal left any catalog, object, or durable effect.
 async fn assert_mutation_is_refused_before_catalog_io(
-    index: usize,
+    fixture: &PromotionIntegrationFixture,
+    record: usize,
     name: &str,
     mutate: fn(&mut serde_json::Value),
 ) {
-    let fixture = PromotionIntegrationFixture::start(&format!("promotion_physical_{index}")).await;
     let records = fixture.promotion_records().await;
     let (row_id, original) = records
-        .first()
+        .get(record)
         .expect("the fixture sealed promotion evidence")
         .clone();
     let mut altered = original.clone();
@@ -511,7 +691,7 @@ async fn assert_mutation_is_refused_before_catalog_io(
         object_store.read_counter(),
     );
     let mut forge = SupervisedPromotion::start(
-        &fixture,
+        fixture,
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
         ForgeClock::system(),

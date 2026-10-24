@@ -230,3 +230,41 @@ After focused proof run `mise run test:bifrost:integration:redux`, `mise run fmt
   [spec-driven development](../../../spec-driven-development.md),
   [implementation execution](../../../implementation-execution.md), and
   [testing](../../../../TESTING.md).
+
+## Implementation Evidence
+
+Status: **IMPLEMENTED**. Commits `3bd495ce7`…`96fe37ee3` on `task/service-identity-and-telemetry/TASK-004`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+| --- | --- | --- | --- |
+| V1 bounded layout matrix and defaults (REQ-036, 047–048) | `catalog/layout.rs` single bounded validator (`3bd495ce7`) | `--lib catalog::layout::tests::bounded_composite_layout_validation` RED→GREEN | PASS |
+| V2 creation, describe, idempotency, refusal | catalog create/describe through the validator (`3bd495ce7`) | `--test scribe describe::composite_layout_creation_and_refusal` | PASS |
+| V3 composite partition identity, nulls, WAL round-trip/corruption | `catalog/physical_partition.rs`, `scribe/seal_key.rs`, WAL v7 (`f8d28ff1e`) | `--lib scribe::seal_key::tests::composite_partition_identity_and_wal` RED→GREEN | PASS |
+| V4 32/33 fanout boundary, no residue | `scribe/preprocess.rs` counts complete tuples before WAL append/fence (`f8d28ff1e`) | `--test scribe ingest_bounds::composite_partition_fanout_is_atomic` | PASS |
+| V5 lifecycle, restart, peers | full tuple in `file_list.partition_dimensions` and promotion records (`7e0b5039d`, `f38c2efaf`) | `--test scribe write_read::composite_partitions_survive_lifecycle_and_peers` | PASS |
+| V6 accepted revision survives alteration and restart | `LayoutRevision` through admission, WAL, staging, seals, claims, publication (`141dae9d4`, `9ebd9b9e0`, `3001a98c3`); `scribe/write_recipe.rs` resolves the retained revision | `--test scribe write_read::accepted_batch_revision_survives_alteration_and_restart` (selector corrected: the redux `integration` scribe module is archived) | PASS |
+| V7 mixed specs: field-id projection, filters, tenant refusal, pins | field-id resolution in memtable/tail RPC/follower; DataFusion fork `1eab549` (`feee0c92a`); pin across revisions (`2ca77eb9a`) | `--test scribe write_read::mixed_runtime_specifications_preserve_rows_and_pins` (selector corrected as V6); `--lib catalog::bifrost_catalog::production_pin_tests::pinned_snapshot_survives_schema_and_spec_revisions` | PASS |
+| V8 Forge promotion/compaction under retained specs and sort orders | `forge/scribe_promotion.rs` validates retained spec/order/schema; iceberg fork `486273c` writes one manifest per spec; compaction fork `efb39ce` (`eedddb480`, `c1c7961c5`) | `--test forge scribe_promotion::mixed_specifications_preserve_partition_and_sort_truth` RED→GREEN: 15 compaction plans admitted in one attempt; promoted `{(spec0, order1): 24, (spec1, revised order): 24}`; 48 rows compacted; each live object's partition tuple, hour, identity and sort prefix checked from Parquet | PASS |
+| V9 encoded sort keys and Bloom sets | existing `ParquetBatchEncoder` recipe; no production change (`25550077f`) | `--lib scribe::parquet_writer::tests::resolved_sort_and_blooms_preserve_exact_reads`: exact sorted rows, declared Bloom columns `[]`, `[service]`, `[service, environment]`, `[environment, service]`, every held value probes true | PASS |
+| Architecture owner amended | `architecture/bifrost-design.md` table identity, Scribe, Oracle, Forge (`c6006466f`) | `docs:check` | PASS |
+
+Final checks on `96fe37ee3`: `fmt`, `lints`, `check:deps`, `check:tenant-isolation`, `codegen:check` pass; `test:bifrost:integration:redux` 919/919; `wyrd-testing --test scribe` journeys 35/35; V8 1/1; `git diff --check` clean.
+
+Forks (pinned in `Cargo.toml`): iceberg-rust `wyrd-production` `9a1b0ee` (`Schema::builder().with_schema_id`) and `486273c` (fast append under any retained spec, one manifest per spec, as Java `FastAppend`); iceberg-compaction `wyrd-production` `a0500b1`, `efb39ce`; DataFusion `1eab549` (field-id column resolution).
+
+### Diagnoses
+
+- **V8 RED 1.** Symptom: promotion of spec-1 objects failed `Data file partition spec id does not match table default partition spec id`. Evidence: iceberg `transaction/snapshot.rs::validate_added_files` compared against the default spec only. Cause: the fork's fast append accepted only the current default spec. Fix site: the fork's snapshot producer (`486273c`); its only callers are append/rewrite actions, covered by `test_fast_append_accepts_retained_partition_specs` and the 174 transaction tests.
+- **V8 RED 2.** Symptom: no rewrite committed. Evidence: trace showed the mixed table's IcebergRewrite with no plans. Cause: each partition held one file per spec, so nothing qualified for compaction. Fix site: the test geometry (two batches per layout); no production change.
+- **V9 first run.** Symptom: no Bloomed columns were observed. Cause: the test reader never loaded Bloom filters. Fix site: the test reader (`ReaderProperties::set_read_bloom_filter(true)`).
+- **Datafusion revision pin.** Symptom: `plan_fingerprint_binds_the_pinned_datafusion_revision` failed after the fork bump. Cause: `ORACLE_DATAFUSION_REVISION` named the old revision. Fix site: `oracle/codec.rs` constant.
+- **Lints.** Eight-argument `ScribeAssemblyKey::{new,from_parts}` after adding `revision`; fixed by passing the existing `StreamIdentity` instead of `(node_id, writer_epoch)`. Remaining findings were mechanical.
+- **Redux integration `forge::promotion::scribe_promotion_integration_rejects_physical_datafile_mismatch_before_catalog_io`.** Symptom: worker attempt bound at `tests/integration/forge/support.rs:2489`, then an unrefused mutation. Evidence: `promotion evidence does not decode: unknown field start_utc, expected one of spec_id, time, time_index, values`; the next mutation promoted successfully. Cause: `f38c2efaf` moved the time and spec id into `partition: PhysicalPartitionWire`; the "partition value" mutation still wrote top-level `partition.start_utc`, and the "partition spec identity" mutation wrote a top-level `partition_spec_id`, which the record ignores. Fix site: the two mutations now edit `partition.time.start_utc` and `partition.spec_id`; production refuses both. An independent read-only diagnosis confirmed the cause and found no other caller with the stale shape (one doc comment in `wyrd-testing/tests/bifrost/scribe/support.rs` corrected).
+
+### Material risks and limits
+
+- A resend of an accepted batch id with a changed payload is refused and stores nothing; it fails closed by design.
+- Revisions in tests are committed through the Iceberg catalog directly; TASK-005 owns public PATCH-to-engine proof.
+- No file-size, pruning or planning-overhead thresholds were invented. V8 records the observed plan count and row geometry only.
+
+Non-goals stayed excluded: no automatic history rewrite, release migration, new retention or writer policy, public edit API, or new storage/query ownership. No applied migration was rewritten.

@@ -44,7 +44,7 @@ use super::support::{
 /// Writes fixture-authored objects beneath one fixed directory.
 ///
 /// The production location generator resolves `write.data.path`, which points
-/// at the Forge recipe directory. Delete files are not rewrite outputs, so they
+/// at the Forge table-version directory. Delete files are not rewrite outputs, so they
 /// must not land there; this generator keeps them in their own directory while
 /// preserving the partition path the spec requires.
 #[derive(Clone, Debug)]
@@ -627,7 +627,7 @@ pub(crate) enum RewriteOutputBreak {
 ///
 /// Delegation goes through a real [`FileIO`] rather than a second backend
 /// client, so paths, relativization, and byte handling stay the production
-/// ones. Only rewrite outputs — objects beneath the Forge recipe marker — are
+/// ones. Only rewrite outputs — objects beneath the Forge data marker — are
 /// counted and eligible to be broken; manifests, metadata, and fixture-authored
 /// delete files pass through untouched.
 pub(crate) struct RewriteOutputSeam {

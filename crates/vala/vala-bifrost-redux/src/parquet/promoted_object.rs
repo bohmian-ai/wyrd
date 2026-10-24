@@ -24,15 +24,17 @@ use crate::scribe::promotion::ScribeDataFileV1;
 
 /// What re-reading one promoted object's footer proved about the object.
 ///
-/// The projection is deliberately taken from the *table's* current schema
+/// The projection is deliberately taken from a schema the *table* retains
 /// rather than from a schema carried alongside the evidence: an object whose
-/// columns no longer project onto the table cannot be promoted into it, and
-/// discovering that here keeps it out of the manifest.
+/// columns project onto none of the table's schemas cannot be promoted into
+/// it, and discovering that here keeps it out of the manifest.
 pub struct PromotedObjectFooter {
     /// Iceberg projection of the object's own footer.
     data_file: DataFile,
     /// Lowercase hex Wyrd schema fingerprint the footer carries.
     schema_fingerprint: String,
+    /// Column paths any row group carries a Bloom filter for.
+    bloom_columns: std::collections::BTreeSet<String>,
 }
 
 impl PromotedObjectFooter {
@@ -40,22 +42,27 @@ impl PromotedObjectFooter {
     ///
     /// The trailer must be present and well formed and the footer must parse;
     /// the object must carry the Bifrost schema fingerprint, and every Parquet
-    /// field must carry the id the table assigns the field at the same path.
-    /// Only then is the footer projected onto the table schema. The id check
-    /// is explicit because the projection itself resolves columns by name and
-    /// would accept an object numbered differently from its table. The object body is never
+    /// field must carry the id one of `table_schemas` — the table's retained
+    /// schemas, newest first — assigns the field at the same path. The first
+    /// such schema is the one the object was written under — an object sealed before a rename carries the old name under the
+    /// same id — and only then is the footer projected onto it, so its metrics
+    /// are keyed by the table's stable field ids. The id check is explicit
+    /// because the projection itself resolves columns by name and would accept
+    /// an object numbered differently from its table. The object body is never
     /// decoded, so the cost is one footer regardless of object size.
     ///
     /// # Errors
     ///
     /// Returns a description of the refusal when the trailer magic is absent,
     /// the Parquet metadata cannot be parsed, the Bifrost schema fingerprint is
-    /// missing or malformed, a field's id is absent or differs from the
-    /// table's, or the footer has no Iceberg projection onto the table schema.
+    /// missing or malformed, `table_schemas` is empty, a field's id is absent
+    /// or differs from every schema's (naming the first schema's
+    /// disagreement), or the
+    /// footer has no Iceberg projection onto the matched schema.
     pub fn decode(
         bytes: &Bytes,
         object_key: &str,
-        table_schema: Arc<Schema>,
+        table_schemas: &[Arc<Schema>],
         file_size: u64,
     ) -> Result<Self, String> {
         let length = u64::try_from(bytes.len())
@@ -76,7 +83,19 @@ impl PromotedObjectFooter {
         let schema_fingerprint = footer_schema_fingerprint(metadata.file_metadata())
             .map_err(|refusal| format!("promoted object was not sealed by Bifrost: {refusal}"))?
             .to_owned();
-        verify_registered_field_ids(metadata.file_metadata().schema(), &table_schema)?;
+        let root = metadata.file_metadata().schema();
+        let table_schema = if let Some(schema) = table_schemas
+            .iter()
+            .find(|schema| verify_registered_field_ids(root, schema).is_ok())
+        {
+            Arc::clone(schema)
+        } else {
+            let first = table_schemas
+                .first()
+                .ok_or_else(|| "promoted object has no table schema to match".to_owned())?;
+            verify_registered_field_ids(root, first)?;
+            Arc::clone(first)
+        };
         let written = usize::try_from(file_size)
             .map_err(|_| "promoted object size exceeds address space".to_owned())?;
         let data_file = iceberg::writer::file_writer::ParquetWriter::parquet_to_data_file_builder(
@@ -91,9 +110,17 @@ impl PromotedObjectFooter {
         .map_err(|error| {
             format!("promoted object footer does not assemble a data file: {error}")
         })?;
+        let bloom_columns = metadata
+            .row_groups()
+            .iter()
+            .flat_map(parquet::file::metadata::RowGroupMetaData::columns)
+            .filter(|column| column.bloom_filter_offset().is_some())
+            .map(|column| column.column_path().string())
+            .collect();
         Ok(Self {
             data_file,
             schema_fingerprint,
+            bloom_columns,
         })
     }
 
@@ -113,6 +140,13 @@ impl PromotedObjectFooter {
     #[must_use]
     pub fn schema_fingerprint(&self) -> &str {
         &self.schema_fingerprint
+    }
+
+    /// Borrows the column paths the object carries Bloom filters for, the
+    /// physical trace of the Bloom policy it was sealed under.
+    #[must_use]
+    pub const fn bloom_columns(&self) -> &std::collections::BTreeSet<String> {
+        &self.bloom_columns
     }
 
     /// Borrows the Iceberg projection of the object's own footer.

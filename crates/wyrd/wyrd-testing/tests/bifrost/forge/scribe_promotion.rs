@@ -915,3 +915,383 @@ async fn lapse_forge_claim(fixture: &ForgeFixture) {
     .rows_affected();
     assert_eq!(lapsed, 1, "the promotion holds exactly one table claim");
 }
+
+/// Asserts every live data file of `binding`'s current snapshot tells the
+/// truth about itself and returns the rows each `(spec, sort order)` holds.
+///
+/// Each file's rows are read back from its object: every row lies in the
+/// hour and customer its recorded partition tuple names, the tuple has one
+/// value per field of the spec the file records, and rows are ordered by the
+/// identity-key prefix of the sort order the file records.
+///
+/// # Panics
+///
+/// Panics when the table, a manifest, or an object cannot be read, or when a
+/// file's rows contradict its recorded partition, spec, or sort order.
+async fn assert_live_layout_truth(
+    server: &wyrd_testing::WyrdTestServer,
+    binding: &vala_bifrost_redux::catalog::TenantTableBinding,
+    stage: &str,
+) -> BTreeMap<(i32, Option<i32>), u64> {
+    use arrow::array::{Array as _, AsArray as _};
+    use iceberg::spec::{Literal, PrimitiveLiteral, Transform};
+    use object_store::ObjectStoreExt as _;
+    let table = server
+        .bifrost_catalog()
+        .iceberg_catalog()
+        .load_table(&binding.table_ident())
+        .await
+        .expect("the journey table loads");
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .current_snapshot()
+        .expect("a promoted table has a snapshot")
+        .clone();
+    let storage = server
+        .state()
+        .bifrost_storage()
+        .expect("the server owns Bifrost storage");
+    let mut rows_by_layout = BTreeMap::new();
+    for (path, file) in crate::live_rewrite::snapshot_files(&table, &snapshot, binding)
+        .await
+        .data
+    {
+        *rows_by_layout
+            .entry((file.partition_spec_id, file.sort_order_id))
+            .or_insert(0) += file.record_count;
+        let bytes = storage
+            .objects()
+            .get(&object_store::path::Path::from(path.as_str()))
+            .await
+            .expect("live object reads")
+            .bytes()
+            .await
+            .expect("live object body");
+        let batches = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("live object is Parquet")
+            .build()
+            .expect("live object reader")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("live object rows");
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)
+            .expect("live object rows concatenate");
+        let spec = metadata
+            .partition_spec_by_id(file.partition_spec_id)
+            .expect("the recorded spec is retained");
+        let tuple = file.partition.iter().collect::<Vec<_>>();
+        assert_eq!(
+            tuple.len(),
+            spec.fields().len(),
+            "{stage}: {path} records one partition value per field of spec {}",
+            file.partition_spec_id
+        );
+        let schema = metadata.current_schema();
+        for (field, value) in spec.fields().iter().zip(tuple) {
+            let source = &schema
+                .field_by_id(field.source_id)
+                .expect("partition source is a column")
+                .name;
+            let column = batch
+                .column_by_name(source)
+                .expect("partition source column");
+            match (field.transform, value) {
+                (Transform::Hour, Some(Literal::Primitive(PrimitiveLiteral::Int(hour)))) => {
+                    let times = column.as_primitive::<arrow::datatypes::TimestampMicrosecondType>();
+                    assert!(
+                        times.values().iter().all(|micros| micros
+                            .div_euclid(wyrd_testing::bifrost::revisions::COMPOSITE_HOUR_MICROS)
+                            == i64::from(*hour)),
+                        "{stage}: every row of {path} lies in its recorded hour"
+                    );
+                }
+                (Transform::Identity, value) => {
+                    let names = column.as_string::<i32>();
+                    let expected = match value {
+                        Some(Literal::Primitive(PrimitiveLiteral::String(name))) => {
+                            Some(name.as_str())
+                        }
+                        None => None,
+                        other => panic!("{stage}: {path} records a non-string customer {other:?}"),
+                    };
+                    assert!(
+                        (0..names.len())
+                            .all(|row| names.is_valid(row).then(|| names.value(row)) == expected),
+                        "{stage}: every row of {path} carries its recorded customer {expected:?}"
+                    );
+                }
+                (Transform::Bucket(_), Some(_)) => {}
+                (transform, value) => {
+                    panic!("{stage}: {path} records {value:?} for a {transform} field")
+                }
+            }
+        }
+        let order = metadata
+            .sort_order_by_id(i64::from(
+                file.sort_order_id
+                    .expect("every Bifrost object records its sort order"),
+            ))
+            .expect("the recorded sort order is retained");
+        let (fields, columns): (Vec<_>, Vec<_>) = order
+            .fields
+            .iter()
+            .take_while(|field| field.transform == Transform::Identity)
+            .map(|field| {
+                let column = std::sync::Arc::clone(
+                    batch
+                        .column_by_name(
+                            &schema
+                                .field_by_id(field.source_id)
+                                .expect("sort source is a column")
+                                .name,
+                        )
+                        .expect("sort source column"),
+                );
+                let options = arrow::compute::SortOptions {
+                    descending: field.direction == iceberg::spec::SortDirection::Descending,
+                    nulls_first: field.null_order == iceberg::spec::NullOrder::First,
+                };
+                (
+                    arrow::row::SortField::new_with_options(column.data_type().clone(), options),
+                    column,
+                )
+            })
+            .unzip();
+        if columns.is_empty() {
+            continue;
+        }
+        let keys = arrow::row::RowConverter::new(fields)
+            .expect("sort key converter")
+            .convert_columns(&columns)
+            .expect("sort keys convert");
+        assert!(
+            (1..keys.num_rows()).all(|row| keys.row(row - 1) <= keys.row(row)),
+            "{stage}: {path} is ordered by its recorded sort order {}",
+            order.order_id
+        );
+    }
+    rows_by_layout
+}
+
+/// Rows written under two partition specs and two sort orders, two batches
+/// each, plus a Bloom-only version sharing the second's ids, promote and
+/// compact without changing a public row: every live file — promoted and
+/// rewritten — holds only rows of the partition tuple it records under the
+/// spec it records, ordered by the sort order it records, and promotion keeps
+/// each object under the spec and order it was written with. The specs bucket
+/// `shard` four and eight ways, so equal tuples, null customers included,
+/// exist under both; every rewrite still reads one spec's partition. Each
+/// object's published evidence names the version that accepted it, so the
+/// Bloom-only version stays distinguishable, and promotion revalidates every
+/// object against that version's retained definition.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start, a public call fails, published evidence
+/// names another accepting version, Forge leaves work owed or commits no rewrite, a public read differs, a live file
+/// contradicts its recorded layout, or a rewrite's inputs span two specs or
+/// partitions.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn mixed_specifications_preserve_partition_and_sort_truth() {
+    use wyrd_testing::bifrost::revisions::{
+        COMPOSITE_ROWS, composite_batch, register_composite_table, shifted,
+    };
+    let cluster = wyrd_testing::bifrost::WyrdTestCluster::start_with_embedded_forge_observer()
+        .await
+        .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("the journey pod carries a Forge completion observer");
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let tenant = cluster.data_tenant_id();
+    let client = crate::public_support::tenant_client(server, tenant).await;
+    let name = crate::public_support::unique_table("mixed_forge");
+    let qualified = register_composite_table(server, tenant, &name).await;
+    let table_ref = vala_bifrost_redux::catalog::TableRef::new(
+        vala_bifrost_redux::namespaces::BifrostNamespace::Datasets,
+        &name,
+    );
+    let table = crate::public_support::JourneyTable {
+        qualified: qualified.clone(),
+        name: name.clone(),
+        binding: vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+            tenant,
+            table_ref.clone(),
+        ))
+        .expect("the journey table resolves to its physical binding"),
+    };
+    crate::public_support::enable_compaction(server, &table.binding).await;
+
+    // Two batches per layout, each flushed to its own objects, so every
+    // physical partition holds a real rewrite candidate under both specs.
+    let mut rows = Vec::new();
+    let mut append_round = async |shifts: [i64; 2]| {
+        for shift in shifts {
+            rows.extend(
+                crate::public_support::append_batch(
+                    &client,
+                    &qualified,
+                    uuid::Uuid::now_v7(),
+                    &shifted(&composite_batch(), shift * COMPOSITE_ROWS),
+                )
+                .await,
+            );
+            server.flush_bifrost().await.expect("the batch publishes");
+        }
+    };
+    append_round([0, 1]).await;
+    let first_spec = server
+        .bifrost_catalog()
+        .iceberg_catalog()
+        .load_table(&table.binding.table_ident())
+        .await
+        .expect("the journey table loads")
+        .metadata()
+        .default_partition_spec_id();
+    server.commit_bucket_revision(tenant, &table_ref, 8).await;
+    let revised_order = server.commit_sort_revision(tenant, &table_ref).await;
+    append_round([2, 3]).await;
+    server
+        .commit_bloom_revision(tenant, &table_ref, &["customer"])
+        .await;
+    append_round([4, 5]).await;
+    let expected = crate::public_support::canonical_order(rows);
+    let rows_per_layout = 2 * u64::try_from(COMPOSITE_ROWS).expect("row count");
+    let mut accepted = BTreeMap::new();
+    for file in server
+        .published_hot_files_for_test(tenant, "vala.datasets", &name)
+        .await
+        .expect("published evidence reads")
+    {
+        *accepted
+            .entry(file.promotion_record.table_version.get())
+            .or_insert(0) += file.row_count;
+    }
+    assert_eq!(
+        accepted,
+        BTreeMap::from([
+            (1, rows_per_layout),
+            (3, rows_per_layout),
+            (4, rows_per_layout)
+        ]),
+        "published evidence names each object's accepting version, Bloom-only ones included"
+    );
+    crate::live_rewrite::assert_public_rows(&client, &table, &expected, "hot").await;
+
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the written partitions close");
+    crate::live_rewrite::drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+    crate::live_rewrite::assert_public_rows(&client, &table, &expected, "promoted").await;
+    let revised_spec = server
+        .bifrost_catalog()
+        .iceberg_catalog()
+        .load_table(&table.binding.table_ident())
+        .await
+        .expect("the journey table loads")
+        .metadata()
+        .default_partition_spec_id();
+    let promoted_files = {
+        let promoted = server
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&table.binding.table_ident())
+            .await
+            .expect("the journey table loads");
+        let snapshot = promoted
+            .metadata()
+            .current_snapshot()
+            .expect("a promoted table has a snapshot")
+            .clone();
+        crate::live_rewrite::snapshot_files(&promoted, &snapshot, &table.binding)
+            .await
+            .data
+    };
+    let promoted = assert_live_layout_truth(server, &table.binding, "promoted").await;
+    assert_eq!(
+        promoted,
+        BTreeMap::from([
+            (
+                (
+                    first_spec,
+                    Some(vala_bifrost_redux::catalog::layout::BIFROST_SORT_ORDER_ID)
+                ),
+                rows_per_layout
+            ),
+            ((revised_spec, Some(revised_order)), 2 * rows_per_layout),
+        ]),
+        "promotion keeps each object under the spec and sort order it was written with"
+    );
+
+    crate::live_rewrite::await_committed_rewrites(&cluster, &observer, &[&table.binding]).await;
+    crate::live_rewrite::assert_public_rows(&client, &table, &expected, "compacted").await;
+    let compacted = assert_live_layout_truth(server, &table.binding, "compacted").await;
+    assert_eq!(
+        compacted.values().sum::<u64>(),
+        3 * rows_per_layout,
+        "compaction keeps every row exactly once: {compacted:?}"
+    );
+
+    // Equal tuples exist under both specs, so a spec-blind grouping would
+    // read both specs' files in one rewrite.
+    let layouts = |spec: i32| {
+        promoted_files
+            .values()
+            .filter(|file| file.partition_spec_id == spec)
+            .map(|file| format!("{:?}", file.partition))
+            .collect::<BTreeSet<_>>()
+    };
+    assert!(
+        layouts(first_spec)
+            .intersection(&layouts(revised_spec))
+            .next()
+            .is_some(),
+        "the two specs share at least one partition tuple"
+    );
+    let rewrites = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT current_detail FROM vala.forge_operation_state \
+         WHERE data_tenant_id = $1 AND family = 'iceberg_rewrite' \
+           AND phase IN ('committed', 'recovered') AND resource LIKE $2 \
+         ORDER BY prepared_at, operation_id",
+    )
+    .bind(tenant.as_uuid())
+    .bind(format!("%/{name}"))
+    .fetch_all(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("Forge rewrite inspection");
+    // Each committed rewrite's promoted inputs; a rewrite of rewritten
+    // outputs reads none.
+    let groups = rewrites
+        .into_iter()
+        .map(|detail| {
+            let wyrd_spec::vala::audit_detail::AuditDetail::ForgeIcebergRewrite {
+                input_paths, ..
+            } = serde_json::from_value(detail).expect("rewrite detail decodes")
+            else {
+                panic!("an iceberg_rewrite operation records rewrite detail");
+            };
+            input_paths
+                .iter()
+                .filter_map(|path| promoted_files.get(path.as_str()))
+                .map(|file| (file.partition_spec_id, file.partition.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        groups.iter().any(|group| !group.is_empty()),
+        "a committed rewrite read promoted files"
+    );
+    for group in groups.iter().filter(|group| !group.is_empty()) {
+        let layouts = group
+            .iter()
+            .map(|(spec, partition)| (*spec, format!("{partition:?}")))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            layouts.len(),
+            1,
+            "one rewrite reads one spec's partition: {layouts:?}"
+        );
+    }
+}

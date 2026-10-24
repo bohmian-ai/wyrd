@@ -15,7 +15,6 @@ use chrono::Duration as ChronoDuration;
 use iceberg::spec::{ManifestContentType, Operation};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::forge::{
     ForgeCompactionOutcome, ForgeError, ForgeHeldTerm, ForgeTableKey, ForgeTableSettings,
     ForgeWorker, ForgeWorkerConfig,
@@ -769,7 +768,7 @@ async fn decided_expiration_commits_through_shutdown() {
 /// Panics when the staging operator rejects the write.
 pub(super) async fn seed_never_published_object(fixture: &PromotionIntegrationFixture) -> String {
     let path = format!(
-        "{}/data/forge/{FORGE_WRITER_RECIPE}/{}-00001-{}.parquet",
+        "{}/data/forge/1/{}-00001-{}.parquet",
         fixture.binding.object_prefix,
         Uuid::now_v7(),
         Uuid::now_v7()

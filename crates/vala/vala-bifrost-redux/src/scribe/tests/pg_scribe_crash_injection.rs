@@ -131,7 +131,7 @@ fn partial_frame_leaves_only_the_prior_acknowledged_prefix() {
     file.sync_all().expect("sync partial WAL frame");
 
     let replayed = replay_wal_directory(temp_dir.path()).expect("replay partial frame");
-    assert_eq!(replayed[&key.as_path_components()].data_records.len(), 1);
+    assert_eq!(replayed[&key.canonical_key()].data_records.len(), 1);
     assert_eq!(
         std::fs::metadata(path).expect("WAL metadata").len(),
         valid_len,
@@ -158,7 +158,7 @@ fn segment_roll_keeps_all_complete_records_replayable() {
             .expect("append");
     }
     let replayed = replay_wal_directory(temp_dir.path()).expect("replay rolled segments");
-    assert_eq!(replayed[&key.as_path_components()].data_records.len(), 4);
+    assert_eq!(replayed[&key.canonical_key()].data_records.len(), 4);
 }
 
 #[test]

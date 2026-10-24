@@ -252,6 +252,11 @@ message InsertBatchRequest {
   // the batch. The ingest span links each valid one; malformed or excess
   // entries are ignored and never refuse the batch.
   repeated ProducerTraceContext producer_trace_contexts = 4;
+  // The table version from the describe or register response the writer
+  // built this batch from: 1..=9223372036854775807, identical on every
+  // retry. A new batch naming any other version than the table's current
+  // one is refused with a table-version conflict.
+  int64  table_version  = 5;
 }
 
 // One W3C trace context of a client PRODUCER span.

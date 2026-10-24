@@ -874,7 +874,8 @@ async fn no_operation_documents_an_audit_caused_refusal() {
 }
 
 /// Every public Bifrost table, query, and lifecycle operation publishes its
-/// pre-stream refusals as typed `WyrdProblem` bodies.
+/// pre-stream refusals as typed `WyrdProblem` bodies, and the table edit
+/// publishes its typed request and committed description.
 #[tokio::test]
 async fn bifrost_operations_publish_typed_problem_refusals() {
     let server = WyrdTestServer::start_in_process()
@@ -882,13 +883,18 @@ async fn bifrost_operations_publish_typed_problem_refusals() {
         .expect("test server starts");
     let document = served_document(&server).await;
     let problem_ref = "#/components/schemas/WyrdProblem";
-    let operations: [(&str, &str, &[&str]); 7] = [
+    let operations: [(&str, &str, &[&str]); 8] = [
         ("/v1/bifrost/tables", "post", &["400", "409", "503"]),
         ("/v1/bifrost/tables", "get", &["503"]),
         (
             "/v1/bifrost/tables/{namespace}/{name}",
             "get",
             &["400", "404", "503"],
+        ),
+        (
+            "/v1/bifrost/tables/{namespace}/{name}",
+            "patch",
+            &["400", "404", "409", "503"],
         ),
         ("/v1/query", "post", &["400", "503"]),
         ("/v1/query/running", "get", &["409", "503"]),
@@ -916,6 +922,17 @@ async fn bifrost_operations_publish_typed_problem_refusals() {
             );
         }
     }
+    let alter = &document["paths"]["/v1/bifrost/tables/{namespace}/{name}"]["patch"];
+    assert_eq!(
+        alter["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/AlterTableRequest",
+        "the table edit publishes its typed request"
+    );
+    assert_eq!(
+        alter["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/BifrostTableDescription",
+        "the table edit publishes the committed description"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }

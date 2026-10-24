@@ -1286,3 +1286,174 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
     }
     cluster.shutdown().await.expect("cluster shutdown");
 }
+
+/// The real `PATCH` route decodes strictly, authorizes DDL, compares the
+/// version, and refuses every negative class with one stable code.
+///
+/// Raw HTTP pins the wire: a canonical decimal-string version and a supported
+/// effective edit commit and return the description with its version as a
+/// decimal string. Unknown, explicit-null, nested-null, numeric, zero,
+/// overflowing, and noncanonical versions, a malformed body, a time-axis
+/// edit, and an unsupported operation are 400s; a superseded version is a
+/// 409; a caller holding only record and query grants is a 403; and another
+/// tenant's caller gets a 404 that reveals nothing. Every refusal leaves the
+/// description unchanged, and each decoded request records one audited
+/// permission decision.
+///
+/// # Panics
+///
+/// Panics when a request answers with another status or code, a refusal
+/// changes the table, or the audit history misses a decision.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn table_patch_http_contract_refuses_invalid_requests() {
+    use wyrd_runtime::Permission;
+
+    let server = start_scribe_server().await;
+    let tenant = server.data_tenant_id();
+    let name = unique_table("http_patch");
+    super::support::register_table(
+        &server,
+        tenant,
+        vala_bifrost_redux::namespaces::BifrostNamespace::Datasets,
+        &name,
+    )
+    .await;
+    server
+        .seed_role(
+            "patch_writer_reader",
+            &[
+                Permission::bifrost_record_write(),
+                Permission::bifrost_query_read(),
+                Permission::bifrost_table_read(),
+            ],
+        )
+        .await
+        .expect("the record and query role is seeded");
+    let neighbour = server
+        .seed_tenant("http-patch-neighbour")
+        .await
+        .expect("the neighbour tenant is seeded");
+    let token = |tenant, roles: &'static [&'static str]| {
+        let server = &server;
+        async move {
+            let bootstrap = server
+                .bootstrap_service_in_tenant(tenant, &unique_table("http_patch"), roles)
+                .await
+                .expect("service bootstrap");
+            server
+                .exchange_api_key(bootstrap.api_key().expect("service API key"))
+                .await
+                .expect("the key exchanges")
+        }
+    };
+    let admin = token(tenant, &["admin"]).await;
+    let writer = token(tenant, &["patch_writer_reader"]).await;
+    let foreign = token(neighbour, &["admin"]).await;
+    let url = format!(
+        "{}/v1/bifrost/tables/vala.datasets/{name}",
+        server.base_url().expect("HTTP URL")
+    );
+    let http = reqwest::Client::new();
+    let send = |token: &str, body: String| {
+        http.patch(&url)
+            .header("x-wyrd-access-token", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+    };
+    let describe = || async {
+        let response = http
+            .get(&url)
+            .header("x-wyrd-access-token", format!("Bearer {admin}"))
+            .send()
+            .await
+            .expect("describe responds");
+        assert_eq!(response.status(), 200);
+        response.json::<serde_json::Value>().await.expect("describe is JSON")
+    };
+    let original = describe().await;
+    assert_eq!(original["table_version"], "1", "the version travels as a decimal string");
+
+    let committed = send(
+        &admin,
+        r#"{"expected_table_version":"1","physical_layout":{"bloom_columns":["value"]}}"#.to_owned(),
+    )
+    .await
+    .expect("the edit responds");
+    assert_eq!(committed.status(), 200);
+    let committed: serde_json::Value = committed.json().await.expect("the edit returns JSON");
+    assert_eq!(committed["table_version"], "2");
+    assert_eq!(committed["physical_layout"]["bloom_columns"], serde_json::json!(["value"]));
+    assert_eq!(describe().await, committed, "the response is the committed description");
+
+    let validation = "WYRD_SPEC_400_VALIDATION";
+    let cases = [
+        (&admin, r#"{"expected_table_version":"2","drop_columns":["value"]}"#, 400, validation),
+        (&admin, r#"{"expected_table_version":null}"#, 400, validation),
+        (&admin, r#"{"expected_table_version":"2","physical_layout":null}"#, 400, validation),
+        (
+            &admin,
+            r#"{"expected_table_version":"2","physical_layout":{"bloom_columns":null}}"#,
+            400,
+            validation,
+        ),
+        (&admin, r#"{"expected_table_version":2,"physical_layout":{"bloom_columns":[]}}"#, 400, validation),
+        (&admin, r#"{"expected_table_version":"0","physical_layout":{"bloom_columns":[]}}"#, 400, validation),
+        (
+            &admin,
+            r#"{"expected_table_version":"9223372036854775808","physical_layout":{"bloom_columns":[]}}"#,
+            400,
+            validation,
+        ),
+        (&admin, r#"{"expected_table_version":"02","physical_layout":{"bloom_columns":[]}}"#, 400, validation),
+        (&admin, r#"{"expected_table_version":"2""#, 400, validation),
+        (
+            &admin,
+            r#"{"expected_table_version":"2","physical_layout":{"time_column":"value"}}"#,
+            400,
+            validation,
+        ),
+        (
+            &admin,
+            r#"{"expected_table_version":"1","physical_layout":{"bloom_columns":[]}}"#,
+            409,
+            "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT",
+        ),
+        (
+            &writer,
+            r#"{"expected_table_version":"2","physical_layout":{"bloom_columns":[]}}"#,
+            403,
+            "WYRD_PERMISSION_403_DENIED_RBAC",
+        ),
+        (
+            &foreign,
+            r#"{"expected_table_version":"2","physical_layout":{"bloom_columns":[]}}"#,
+            404,
+            "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
+        ),
+    ];
+    for (caller, body, status, expected_code) in cases {
+        let response = send(caller, body.to_owned()).await.expect("the edit responds");
+        assert_eq!(response.status(), status, "{body}");
+        let problem: serde_json::Value = response.json().await.expect("a refusal is problem JSON");
+        assert_eq!(problem["code"], expected_code, "{body}: {problem}");
+        assert!(
+            !problem.to_string().contains(&tenant.to_string()),
+            "a refusal reveals no tenant: {problem}"
+        );
+        assert_eq!(describe().await, committed, "{body} changed nothing");
+    }
+    // The committed edit, the conflict, and the denial reached authorization;
+    // decode failures are refused before it.
+    server.await_audit_retained().await.expect("audit settles");
+    assert_eq!(
+        server
+            .retained_audit_operation_count(tenant, "vala.bifrost.alter")
+            .await
+            .expect("count audited decisions"),
+        3,
+        "every tenant decision on the edit route is audited"
+    );
+    server.shutdown().await.expect("server shutdown");
+}

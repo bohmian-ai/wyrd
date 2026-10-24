@@ -113,7 +113,7 @@ def work(client: WyrdClient, bundle_home: Path) -> Worked:
     state.shutdown()
 
     bifrost = Bifrost(client=client)
-    for table, alias in (("vala.drift.observations", "model"), ("vala.traces.spans", "agent")):
+    for table, alias in (("bifrost.drift.observations", "model"), ("bifrost.traces.spans", "agent")):
         rows = bifrost.sql(
             f"SELECT card_uid FROM {table} WHERE run_id = $1", [run.run_id], model=Attributed
         )
@@ -319,7 +319,7 @@ def test_cli_gateway_agents(cli_bootstrap_client: WyrdClient) -> None:
     query = (
         "SELECT run_id, requested_model['deployment'] AS deployment,"
         " requested_model['model'] AS model, resolved_deployment, card_uid, outcome"
-        " FROM vala.gateway.calls WHERE run_id IN ($1, $2, $3, $4)"
+        " FROM bifrost.gateway.calls WHERE run_id IN ($1, $2, $3, $4)"
     )
     deadline = time.monotonic() + 60
     while True:

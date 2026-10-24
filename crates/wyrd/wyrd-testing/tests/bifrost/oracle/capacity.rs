@@ -227,8 +227,8 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
                 // envelope, not one that must spill. Exceeding the grant and
                 // spilling is the peer-network baseline's claim.
                 sql: format!(
-                    "SELECT l.id, COUNT(*) AS matched FROM vala.bifrost.{left} AS l \
-                     JOIN vala.bifrost.{right} AS r ON l.id = r.id GROUP BY l.id"
+                    "SELECT l.id, COUNT(*) AS matched FROM bifrost.bifrost.{left} AS l \
+                     JOIN bifrost.bifrost.{right} AS r ON l.id = r.id GROUP BY l.id"
                 ),
                 deadline_ms: Some(ANALYTICAL_DEADLINE_MS),
             },
@@ -394,7 +394,7 @@ async fn prove_interactive_window(
             // statement's operators. An Analytical query would never reach
             // the Interactive floor this window exists to observe. Rows are
             // counted, not ordered.
-            sql: format!("SELECT id, filter_key FROM vala.bifrost.{table}"),
+            sql: format!("SELECT id, filter_key FROM bifrost.bifrost.{table}"),
             deadline_ms: Some(INTERACTIVE_DEADLINE_MS),
         })
         .await?;
@@ -987,7 +987,7 @@ async fn prove_heterogeneous_local_capacity() -> Result<(), JourneyError> {
     let rows = writer(ingest, "heterogeneous-writer").await?;
     for id in 1..=HETEROGENEOUS_ROWS {
         rows.write(
-            &format!("vala.bifrost.{table}"),
+            &format!("bifrost.bifrost.{table}"),
             &journey_schema(),
             [journey_row(id, "heterogeneous")],
         )
@@ -1271,7 +1271,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     let rows = writer(ingest, "memory-refusal-writer").await?;
     for id in 1..=REFUSAL_ROWS {
         rows.write(
-            &format!("vala.bifrost.{table}"),
+            &format!("bifrost.bifrost.{table}"),
             &journey_schema(),
             [journey_row(id, "refusal")],
         )
@@ -1281,7 +1281,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     cluster.refresh_oracle_snapshots().await?;
     for id in REFUSAL_ROWS + 1..=REFUSAL_ROWS + REFUSAL_LIVE_ROWS {
         rows.write(
-            &format!("vala.bifrost.{table}"),
+            &format!("bifrost.bifrost.{table}"),
             &journey_schema(),
             [journey_row(id, "refusal-live")],
         )
@@ -1315,7 +1315,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
         let stream = holder_query
             .query(&BifrostQueryRequest {
                 params: Vec::new(),
-                sql: format!("SELECT id FROM vala.bifrost.{table}"),
+                sql: format!("SELECT id FROM bifrost.bifrost.{table}"),
                 deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
             })
             .await
@@ -1344,7 +1344,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
         &wyrd_client::Bifrost::query_only(&refused),
         &format!(
             "SELECT REPEAT('x', {REFUSAL_SORT_KEY_BYTES}) || CAST(id AS VARCHAR) AS wide_key \
-             FROM vala.bifrost.{table} ORDER BY wide_key"
+             FROM bifrost.bifrost.{table} ORDER BY wide_key"
         ),
     )
     .await
@@ -1381,7 +1381,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(&next)
         .query(&BifrostQueryRequest {
             params: Vec::new(),
-            sql: format!("SELECT id FROM vala.bifrost.{table}"),
+            sql: format!("SELECT id FROM bifrost.bifrost.{table}"),
             deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
         })
         .await?;
@@ -1510,7 +1510,7 @@ async fn prove_memory_failure_is_query_local() -> Result<(), JourneyError> {
     let rows = writer(&server, "memory-failure-writer").await?;
     for id in 1..=FAILURE_ROWS {
         rows.write(
-            &format!("vala.bifrost.{table}"),
+            &format!("bifrost.bifrost.{table}"),
             &journey_schema(),
             [journey_row(id, "failure")],
         )
@@ -1528,7 +1528,7 @@ async fn prove_memory_failure_is_query_local() -> Result<(), JourneyError> {
     let query = wyrd_client::Bifrost::query_only(&reader);
     let request = BifrostQueryRequest {
         params: Vec::new(),
-        sql: format!("SELECT id FROM vala.bifrost.{table}"),
+        sql: format!("SELECT id FROM bifrost.bifrost.{table}"),
         deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
     };
 
@@ -1810,7 +1810,7 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
 /// Class follows table layout, not the operator: a one-object table plans as
 /// one scan task, so the statement stays on the leader as Interactive.
 fn scheduling_interactive_sql(table: &str) -> String {
-    format!("SELECT id, filter_key FROM vala.bifrost.{table}_ui")
+    format!("SELECT id, filter_key FROM bifrost.bifrost.{table}_ui")
 }
 
 /// Builds the grouped aggregate over a scheduling tenant's two-object table.
@@ -1818,7 +1818,9 @@ fn scheduling_interactive_sql(table: &str) -> String {
 /// The table publishes two objects, more than one partition, so the plan
 /// distributes as Analytical.
 fn scheduling_analytical_sql(table: &str) -> String {
-    format!("SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key")
+    format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} GROUP BY filter_key"
+    )
 }
 
 /// Admits one query through the public path and parks it holding its envelope.
@@ -2340,7 +2342,7 @@ async fn prove_concurrent_snapshots_wait() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
     let server = cluster.server(0).ok_or("missing mixed node")?;
     let table = unique_table("oracle_snapshot_burst");
-    let fqn = format!("vala.bifrost.{table}");
+    let fqn = format!("bifrost.bifrost.{table}");
     register_table(server, cluster.data_tenant_id(), &table).await?;
     let writer = writer(server, "snapshot-burst").await?;
     writer

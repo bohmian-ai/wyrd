@@ -369,7 +369,7 @@ mod pg_tests {
     use wyrd_spec::DataTenantId;
 
     /// Logical namespace every table in this module is registered under.
-    const NAMESPACE: &str = "vala.bifrost";
+    const NAMESPACE: &str = "bifrost.bifrost";
 
     /// Retention window every supersession assertion runs under.
     const RETENTION: std::time::Duration = std::time::Duration::from_hours(6);
@@ -493,7 +493,7 @@ mod pg_tests {
                  ON CONFLICT (catalog_name, table_namespace, table_name)
                  DO UPDATE SET metadata_location = EXCLUDED.metadata_location",
             )
-            .bind(format!("vala.tenants.{tenant}.bifrost"))
+            .bind(format!("bifrost.tenants.{tenant}.bifrost"))
             .bind(table)
             .bind(pointer)
             .execute(&self.catalog)
@@ -1070,7 +1070,7 @@ mod pg_tests {
                   metadata_location)
              VALUES ('wyrd-redux', $1, 'events', $2, 1, $3)",
         )
-        .bind(format!("vala.tenants.{tenant_a}.bifrost"))
+        .bind(format!("bifrost.tenants.{tenant_a}.bifrost"))
         .bind(UUID)
         .bind(V1)
         .execute(&reads.catalog)
@@ -1081,7 +1081,7 @@ mod pg_tests {
                 "SELECT metadata_location FROM iceberg_catalog.iceberg_tables
                   WHERE table_namespace = $1 AND table_name = 'events'",
             )
-            .bind(format!("vala.tenants.{tenant_a}.bifrost"))
+            .bind(format!("bifrost.tenants.{tenant_a}.bifrost"))
             .fetch_one(&reads.catalog)
             .await
             .expect("pointer reads");

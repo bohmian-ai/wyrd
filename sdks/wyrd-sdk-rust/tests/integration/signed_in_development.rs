@@ -90,7 +90,7 @@ async fn saved_login_completes_the_workflow_past_token_expiry() {
         .await
         .expect("Bifrost connects")
         .sql_as(
-            "SELECT card_uid FROM vala.traces.spans WHERE run_id = $1",
+            "SELECT card_uid FROM bifrost.traces.spans WHERE run_id = $1",
             &[QueryParam::String(run.run_id().to_string())],
         )
         .await

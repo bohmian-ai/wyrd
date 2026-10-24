@@ -39,7 +39,7 @@ class Event(BaseModel):
 def bifrost(wyrd_server: WyrdTestServer) -> Bifrost:
     """A client writing to a freshly registered ``Event`` table."""
 
-    bifrost = Bifrost(TableConfig(Event, f"vala.datasets.events_{uuid.uuid4().hex}"))
+    bifrost = Bifrost(TableConfig(Event, f"bifrost.datasets.events_{uuid.uuid4().hex}"))
     bifrost.register()
     return bifrost
 
@@ -93,7 +93,7 @@ def test_rows_come_back_as_native_values(bifrost: Bifrost, wyrd_server: WyrdTest
 def test_query_results_copy_into_another_table(
     bifrost: Bifrost, wyrd_server: WyrdTestServer
 ) -> None:
-    archive = TableConfig(Event, f"vala.datasets.archive_{uuid.uuid4().hex}")
+    archive = TableConfig(Event, f"bifrost.datasets.archive_{uuid.uuid4().hex}")
     Bifrost(archive).register()
     event = Event(id=1, payload={"source": "row"}, mixed=8, point=Point(x=1), tags=["a"])
     bifrost.insert(event)
@@ -143,7 +143,7 @@ class Loose(BaseModel):
 
 def test_model_allowing_extra_keys_is_refused() -> None:
     with pytest.raises(WyrdError) as error:
-        TableConfig(Loose, "vala.datasets.loose")
+        TableConfig(Loose, "bifrost.datasets.loose")
 
     assert error.value.code == "WYRD_VALA_400_SCHEMA_PARSE"
     assert error.value.status == 400
@@ -164,7 +164,7 @@ def test_unsupported_type_is_refused(arrow_type: pyarrow.DataType) -> None:
     schema = pyarrow.schema([pyarrow.field("moment", arrow_type)])
 
     with pytest.raises(WyrdError) as error:
-        TableConfig.from_arrow("vala.datasets.unsupported", schema)
+        TableConfig.from_arrow("bifrost.datasets.unsupported", schema)
 
     assert error.value.code == "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE"
     assert error.value.status == 400

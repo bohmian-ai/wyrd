@@ -901,7 +901,7 @@ mod tests {
         .expect("tenant-bound query context");
         let request = BifrostQueryRequest {
             params: Vec::new(),
-            sql: "SELECT value FROM vala.bifrost.events".to_owned(),
+            sql: "SELECT value FROM bifrost.bifrost.events".to_owned(),
             deadline_ms: Some(5_000),
         };
         (context, request)

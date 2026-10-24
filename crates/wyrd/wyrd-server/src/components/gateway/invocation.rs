@@ -127,7 +127,7 @@ pub enum GatewayCallAttribution {
 /// headers; a Verifier execution builds it from its subject Card and the Run
 /// it executes for, if any. Admission authorizes a requested UID against the
 /// caller before any provider sees the call, and the captured
-/// `vala.gateway.calls` row records whichever is present, an absent one as
+/// `bifrost.gateway.calls` row records whichever is present, an absent one as
 /// null.
 #[derive(Debug, Clone)]
 pub struct GatewayCallSubject {

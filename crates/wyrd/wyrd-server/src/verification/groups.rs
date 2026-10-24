@@ -412,7 +412,7 @@ impl Sources {
             "SELECT 'i' AS surface, card_uid, verifier_card_uid, execution_id, \
              CAST(NULL AS VARCHAR) AS result_id, wyrd_ingested_at AS at, \
              recorded_at AS recorded, CASE WHEN {} THEN inputs END AS payload \
-             FROM vala.verification.execution_inputs WHERE {} AND {group}",
+             FROM bifrost.verification.execution_inputs WHERE {} AND {group}",
             self.slots.iter().any(input),
             self.eligible,
         );
@@ -423,7 +423,7 @@ impl Sources {
             "{inputs} UNION ALL SELECT 'r' AS surface, card_uid, verifier_card_uid, \
              execution_id, result_id, wyrd_ingested_at AS at, \
              started_at AS recorded, CASE WHEN {} THEN outcome END AS payload \
-             FROM vala.verification.results WHERE {} AND {group}",
+             FROM bifrost.verification.results WHERE {} AND {group}",
             self.slots.iter().any(|slot| !input(slot)),
             self.eligible,
         )

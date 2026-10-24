@@ -20,8 +20,8 @@ from wyrd.bifrost import Bifrost, TableConfig
 if TYPE_CHECKING:
     from wyrd.testing import WyrdTestServer
 
-ALL_TYPES = "vala.datasets.all_types"
-NARROW_TYPES = "vala.datasets.narrow_types"
+ALL_TYPES = "bifrost.datasets.all_types"
+NARROW_TYPES = "bifrost.datasets.narrow_types"
 UNSUPPORTED_TYPE = "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE"
 
 FIXTURES = Path(__file__).parents[5] / "fixtures" / "bifrost"
@@ -96,6 +96,6 @@ def test_a_type_bifrost_cannot_store_is_refused_when_declared(
     column_type: pyarrow.DataType,
 ) -> None:
     with pytest.raises(WyrdError) as refused:
-        TableConfig.from_arrow("vala.datasets.no_wire_form", pyarrow.schema([("c", column_type)]))
+        TableConfig.from_arrow("bifrost.datasets.no_wire_form", pyarrow.schema([("c", column_type)]))
 
     assert refused.value.code == UNSUPPORTED_TYPE

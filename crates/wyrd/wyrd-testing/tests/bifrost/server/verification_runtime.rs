@@ -249,13 +249,15 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     };
     let checks = [
         (
-            format!("SELECT result_id FROM vala.verification.results WHERE result_id = '{result}'"),
+            format!(
+                "SELECT result_id FROM bifrost.verification.results WHERE result_id = '{result}'"
+            ),
             1,
             "one published summary for the run",
         ),
         (
             format!(
-                "SELECT result_id FROM vala.verification.results WHERE {}",
+                "SELECT result_id FROM bifrost.verification.results WHERE {}",
                 identity("")
             ),
             1,
@@ -263,15 +265,15 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
         ),
         (
             format!(
-                "SELECT result_id FROM vala.drift.result_features WHERE result_id = '{result}'"
+                "SELECT result_id FROM bifrost.drift.result_features WHERE result_id = '{result}'"
             ),
             2,
             "two published feature rows for the run",
         ),
         (
             format!(
-                "SELECT f.result_id FROM vala.drift.result_features f \
-                 JOIN vala.verification.results r \
+                "SELECT f.result_id FROM bifrost.drift.result_features f \
+                 JOIN bifrost.verification.results r \
                    ON f.result_id = r.result_id \
                   AND f.{ACT_PRINCIPAL_ID} = r.{ACT_PRINCIPAL_ID} AND f.{CARD_UID} = r.{CARD_UID} \
                  WHERE {}",
@@ -473,7 +475,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     Bifrost::connect_with(&writer, BifrostOptions::default())
         .await?
         .write_batch(
-            "vala.drift.observations",
+            "bifrost.drift.observations",
             &observation_batch(&record, &subject, observed_in_current_month(Utc::now())?)?,
         )
         .await?;
@@ -532,7 +534,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         oracle,
         tenant,
         format!(
-            "SELECT {SUB_PRINCIPAL_ID}, {CARD_UID}, series FROM vala.drift.observations \
+            "SELECT {SUB_PRINCIPAL_ID}, {CARD_UID}, series FROM bifrost.drift.observations \
              WHERE record_id = '{record}' ORDER BY series"
         ),
     )
@@ -554,7 +556,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         if query_texts(
             oracle,
             tenant,
-            format!("SELECT {column} FROM vala.drift.observations"),
+            format!("SELECT {column} FROM bifrost.drift.observations"),
         )
         .await
         .is_ok()
@@ -570,7 +572,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
             tenant,
             format!(
                 "SELECT verifier_card_uid, {CARD_UID}, verdict, {RUN_ID} \
-                 FROM vala.verification.results WHERE binding_id = '{binding}'"
+                 FROM bifrost.verification.results WHERE binding_id = '{binding}'"
             ),
         )
         .await?;
@@ -673,7 +675,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     for (result, expected) in [(&straddling, 2), (&previous_day, 2)] {
         let features = journey
             .texts(format!(
-                "SELECT feature FROM vala.drift.result_features WHERE result_id = '{result}'"
+                "SELECT feature FROM bifrost.drift.result_features WHERE result_id = '{result}'"
             ))
             .await?;
         if features.len() != expected {
@@ -686,7 +688,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     }
     let none = journey
         .texts(format!(
-            "SELECT feature FROM vala.drift.result_features WHERE result_id = '{unscored}'"
+            "SELECT feature FROM bifrost.drift.result_features WHERE result_id = '{unscored}'"
         ))
         .await?;
     if !none.is_empty() {
@@ -704,10 +706,10 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
         )
     };
     let summary = journey
-        .texts(times("ended_at", "vala.verification.results"))
+        .texts(times("ended_at", "bifrost.verification.results"))
         .await?;
     let details = journey
-        .texts(times(WYRD_INGESTED_AT, "vala.drift.result_features"))
+        .texts(times(WYRD_INGESTED_AT, "bifrost.drift.result_features"))
         .await?;
     let micros = |value: &Option<String>| -> Result<i64, ServerJourneyError> {
         Ok(value.as_deref().ok_or("null timestamp")?.parse()?)
@@ -736,7 +738,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
 
     let unfiltered = journey
         .scan(
-            "SELECT result_id FROM vala.verification.results".to_owned(),
+            "SELECT result_id FROM bifrost.verification.results".to_owned(),
             3,
         )
         .await?;
@@ -749,7 +751,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     let current_day = journey
         .scan(
             format!(
-                "SELECT result_id FROM vala.verification.results \
+                "SELECT result_id FROM bifrost.verification.results \
                  WHERE ended_at >= TIMESTAMP '{today}'"
             ),
             2,
@@ -765,7 +767,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     let by_result = journey
         .scan(
             format!(
-                "SELECT result_id FROM vala.verification.results WHERE result_id = '{straddling}'"
+                "SELECT result_id FROM bifrost.verification.results WHERE result_id = '{straddling}'"
             ),
             1,
         )
@@ -977,11 +979,11 @@ impl<'a> ResultLayoutJourney<'a> {
         let floor = [RUN_ID, CARD_UID, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID];
         let tables: [(&str, &str, &[&str]); 2] = [
             (
-                "vala.verification.results",
+                "bifrost.verification.results",
                 "execution_status",
                 &["result_id", "verifier_card_uid", "binding_id"],
             ),
-            ("vala.drift.result_features", "feature", &["result_id"]),
+            ("bifrost.drift.result_features", "feature", &["result_id"]),
         ];
         let mut found = [0_usize; 2];
         let mut pending = vec![self.cluster.storage_root().to_path_buf()];
@@ -1057,7 +1059,7 @@ impl Scribe for StraddleScribe {
     /// # Errors
     /// Returns the real Scribe's outcome.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
-        if self.straddle && frame.table.fqn() == "vala.verification.results" {
+        if self.straddle && frame.table.fqn() == "bifrost.verification.results" {
             self.inner.shift_receipt_clock_for_test(DAY);
         }
         self.inner.ingest_frame(frame).await
@@ -1177,7 +1179,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     let call = journey.gateway.capture_call().await?;
     let decision = journey.stage_audit_decision().await?;
     let outcomes_sql = format!(
-        "SELECT result_id, verdict, outcome FROM vala.verification.results \
+        "SELECT result_id, verdict, outcome FROM bifrost.verification.results \
          WHERE result_id IN ('{}', '{}') ORDER BY result_id",
         results.scored_drift.0, results.unscored_drift.0
     );
@@ -1201,7 +1203,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     // and the refused call's absent resolved model reads both children null.
     let models_sql = format!(
         "SELECT request_id, requested_model['deployment'], requested_model['model'], \
-         resolved_model['deployment'], resolved_model['model'] FROM vala.gateway.calls \
+         resolved_model['deployment'], resolved_model['model'] FROM bifrost.gateway.calls \
          WHERE request_id IN ('{}', '{}') ORDER BY request_id",
         call.request_id, call.unresolved_request_id
     );
@@ -1247,7 +1249,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     // Gateway capture: both selected payloads decode to the call's JSON.
     let payloads = journey
         .rows(format!(
-            "SELECT request_payload, response_payload FROM vala.gateway.calls \
+            "SELECT request_payload, response_payload FROM bifrost.gateway.calls \
              WHERE request_id = '{}'",
             call.request_id
         ))
@@ -1265,7 +1267,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     // Audit: the retained detail decodes to the decision's canonical JSON.
     let audit = journey
         .rows(format!(
-            "SELECT detail FROM vala.system.audit_log WHERE operation = '{}'",
+            "SELECT detail FROM bifrost.system.audit_log WHERE operation = '{}'",
             decision.operation
         ))
         .await?;
@@ -1279,7 +1281,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// admission for a top-level and a nested signal Variant, and each malformed
 /// frame is refused with its exact catalogued error before any ACK.
 ///
-/// `vala.logs.records` covers a missing and a foreign extension marker,
+/// `bifrost.logs.records` covers a missing and a foreign extension marker,
 /// the Variant marker with foreign extension metadata, invalid bytes, one
 /// container past the depth limit, a compact value nested 20,000 levels deep
 /// that is refused for depth without taking the server down, and one byte
@@ -1287,7 +1289,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// beside an over-deep sibling in either order are refused as invalid, and a
 /// Decimal16 outside the exact numeric domain — fractional, past `u64::MAX`,
 /// or a scale-zero value within `i64` — is refused for numeric range, also
-/// beside an over-deep sibling. A `vala.metrics.points` frame whose absent
+/// beside an over-deep sibling. A `bifrost.metrics.points` frame whose absent
 /// bucket set keeps a child value is refused as a partial Struct.
 /// Precedence is pinned: an oversized value that is also
 /// malformed reports its size, a wrong marker on one field outranks invalid
@@ -1297,8 +1299,8 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// row whose Variant holds an out-of-range integer beside an over-deep branch
 /// is refused for numeric range in both key orders, and also when the integer
 /// sits inside the over-deep branch, before any ACK; that JSON row encodes
-/// against `vala.verification.execution_inputs` on the client.
-/// `vala.traces.spans` covers the Variant nested in `events`, with a missing
+/// against `bifrost.verification.execution_inputs` on the client.
+/// `bifrost.traces.spans` covers the Variant nested in `events`, with a missing
 /// marker and with foreign extension metadata, named by its top-level column.
 /// A non-Variant type change on a signal column is refused as a
 /// schema-conformance conflict. Afterward the same server accepts the valid sentinel frames and only
@@ -1810,14 +1812,14 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
 
 /// The client-writable built-in whose top-level Variants the journey writes:
 /// a required `attributes` and a nullable `body`.
-const RECORDS: &str = "vala.logs.records";
+const RECORDS: &str = "bifrost.logs.records";
 
 /// The server-written built-in the public JSON-row facade encodes against;
 /// its Variant refusals surface on the client before anything is queued.
-const EXECUTION_INPUTS: &str = "vala.verification.execution_inputs";
+const EXECUTION_INPUTS: &str = "bifrost.verification.execution_inputs";
 
 /// The signal built-in whose nested `events` Variant the journey writes.
-const SPANS: &str = "vala.traces.spans";
+const SPANS: &str = "bifrost.traces.spans";
 
 /// Arrow field-metadata key naming a field's extension type.
 const EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
@@ -1859,7 +1861,7 @@ const VARIANT_LONG_STRING: u8 = 16;
 const VARIANT_MALFORMED: u8 = 31 << 2;
 
 /// The canonical metric points ledger the journey writes raw frames to.
-const POINTS: &str = "vala.metrics.points";
+const POINTS: &str = "bifrost.metrics.points";
 
 /// One bound server and an admin ingest door that sends raw Arrow IPC frames.
 struct VariantAdmissionJourney {
@@ -1869,11 +1871,11 @@ struct VariantAdmissionJourney {
     ingest: RawIngest,
     /// Admin client the public Bifrost facade writes JSON rows through.
     client: wyrd_client::WyrdClient,
-    /// The described `vala.logs.records` user schema.
+    /// The described `bifrost.logs.records` user schema.
     records: SchemaRef,
-    /// The described `vala.traces.spans` user schema.
+    /// The described `bifrost.traces.spans` user schema.
     spans: SchemaRef,
-    /// The described `vala.metrics.points` user schema.
+    /// The described `bifrost.metrics.points` user schema.
     points: SchemaRef,
     /// Suffix that scopes this run's sessions and span scopes.
     run: String,
@@ -2861,7 +2863,7 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
         &server,
         tenant,
         format!(
-            "SELECT result_id FROM vala.verification.results WHERE result_id = '{result}' \
+            "SELECT result_id FROM bifrost.verification.results WHERE result_id = '{result}' \
              AND {SUB_PRINCIPAL_ID} = '{a_id}' AND {ACT_PRINCIPAL_ID} = '{system}'"
         ),
     )
@@ -3103,7 +3105,7 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
         &server,
         tenant,
         format!(
-            "SELECT result_id FROM vala.verification.results WHERE result_id = '{result}' \
+            "SELECT result_id FROM bifrost.verification.results WHERE result_id = '{result}' \
              AND binding_id = '{binding}' AND {SUB_PRINCIPAL_ID} = '{owner_id}' \
              AND {ACT_PRINCIPAL_ID} = '{system}'"
         ),
@@ -4414,7 +4416,7 @@ async fn shared_shutdown_drains_producers_workers_and_acknowledgements()
     let captured = query_rows(
         &server,
         server.data_tenant_id(),
-        "SELECT call_id FROM vala.gateway.calls WHERE outcome = 'cancelled'".to_owned(),
+        "SELECT call_id FROM bifrost.gateway.calls WHERE outcome = 'cancelled'".to_owned(),
     )
     .await?;
     server.shutdown().await?;
@@ -4608,7 +4610,7 @@ async fn user_state_native_io_selects_validated_root() -> Result<(), ServerJourn
         .sql_as(
             "SELECT CAST(card_uid AS VARCHAR) AS card_uid, \
              CAST(sub_principal_id AS VARCHAR) AS sub_principal_id \
-             FROM vala.drift.observations",
+             FROM bifrost.drift.observations",
             &[],
         )
         .await?;
@@ -4619,7 +4621,7 @@ async fn user_state_native_io_selects_validated_root() -> Result<(), ServerJourn
     );
 
     let fqn = format!(
-        "vala.datasets.native_user_{}",
+        "bifrost.datasets.native_user_{}",
         uuid::Uuid::now_v7().simple()
     );
     Bifrost::connect_with(

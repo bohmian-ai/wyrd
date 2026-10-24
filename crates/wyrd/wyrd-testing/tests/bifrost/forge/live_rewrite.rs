@@ -2165,7 +2165,7 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
         arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
     ]));
     let journey_table = |name: &str| JourneyTable {
-        qualified: format!("vala.datasets.{name}"),
+        qualified: format!("bifrost.datasets.{name}"),
         name: name.to_owned(),
         binding: TenantTableBinding::resolve((
             tenant,
@@ -2346,7 +2346,7 @@ async fn property_less_public_table_is_compacted_by_default() {
     let client = tenant_client(server, tenant).await;
     let name = unique_table("default_compaction");
     let table = JourneyTable {
-        qualified: format!("vala.datasets.{name}"),
+        qualified: format!("bifrost.datasets.{name}"),
         name: name.clone(),
         binding: TenantTableBinding::resolve((
             tenant,
@@ -2726,7 +2726,7 @@ async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
         arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
     ]));
     let journey_table = |name: &str| JourneyTable {
-        qualified: format!("vala.datasets.{name}"),
+        qualified: format!("bifrost.datasets.{name}"),
         name: name.to_owned(),
         binding: TenantTableBinding::resolve((
             tenant,

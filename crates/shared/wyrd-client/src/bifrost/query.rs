@@ -1948,7 +1948,7 @@ mod tests {
     async fn describe_builds_writable_schema_without_duplicate_correlation() {
         let body = r#"{
             "entry": {
-                "namespace": "vala.traces",
+                "namespace": "bifrost.traces",
                 "name": "spans",
                 "table_uid": "0102030405060708090a0b0c0d0e0f10",
                 "status": "Active",
@@ -1972,13 +1972,13 @@ mod tests {
         }"#;
         let (base_url, seen) = recording_server(body);
         let described = client_for(&base_url)
-            .describe_table("vala.traces", "spans")
+            .describe_table("bifrost.traces", "spans")
             .await
             .expect("describe returns the stored schema projection");
 
         assert_eq!(
             seen.lock().expect("recording is readable").as_slice(),
-            ["GET /v1/bifrost/tables/vala.traces/spans HTTP/1.1"],
+            ["GET /v1/bifrost/tables/bifrost.traces/spans HTTP/1.1"],
             "describe reads the one table route and sends no body"
         );
         assert_eq!(

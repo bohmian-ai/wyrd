@@ -387,7 +387,7 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
 /// One logical table a query asks to read, as the planner canonicalized it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CutTableRef<'a> {
-    /// Canonical logical namespace, `vala.<segment>`.
+    /// Canonical logical namespace, `bifrost.<segment>`.
     pub namespace_name: &'a str,
     /// Local table name inside that namespace.
     pub table_name: &'a str,

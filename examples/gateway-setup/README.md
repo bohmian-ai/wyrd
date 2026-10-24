@@ -34,7 +34,7 @@ fixtures.
    wyrd gateway deployment put --file gateway.json
    ```
 
-3. Check the deployments and retain call metadata in `vala.gateway.calls`:
+3. Check the deployments and retain call metadata in `bifrost.gateway.calls`:
 
    ```bash
    wyrd gateway deployment list
@@ -101,7 +101,7 @@ fixtures.
        print(alias, reply.json())
    ```
 
-   Every call is retained in `vala.gateway.calls` under its `run_id` and the
+   Every call is retained in `bifrost.gateway.calls` under its `run_id` and the
    Agent's `card_uid`. The Jev deployment returns keyed `answers`.
 
 `wyrd gateway credential revoke <name>` is permanent: every deployment using

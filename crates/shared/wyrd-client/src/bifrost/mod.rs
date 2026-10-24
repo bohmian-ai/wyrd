@@ -847,7 +847,7 @@ mod sdk {
             .expect("client assembles");
         let bifrost = Bifrost::with_sink(
             &client,
-            Some(table("vala.datasets.bound")),
+            Some(table("bifrost.datasets.bound")),
             Arc::new(MockSink::new()),
             QueueConfig::default(),
         );
@@ -858,11 +858,13 @@ mod sdk {
         let bound = bifrost.table().expect("the bound table stays bound");
         let bound_identity = bound.resolved().cloned().expect("bound table resolved");
         assert!(
-            bifrost.cached_writer_table("vala.datasets.bound").is_some(),
+            bifrost
+                .cached_writer_table("bifrost.datasets.bound")
+                .is_some(),
             "a registered table is cached for named writes"
         );
 
-        bifrost.use_table(table("vala.datasets.inflight"));
+        bifrost.use_table(table("bifrost.datasets.inflight"));
         let register = bifrost.register();
         tokio::pin!(register);
         tokio::select! {
@@ -879,7 +881,7 @@ mod sdk {
         );
 
         let active = bifrost.table().expect("the rebound table stays bound");
-        assert_eq!(active.fqn(), "vala.datasets.bound");
+        assert_eq!(active.fqn(), "bifrost.datasets.bound");
         assert_eq!(
             active.resolved(),
             Some(&bound_identity),

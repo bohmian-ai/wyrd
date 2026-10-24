@@ -180,7 +180,7 @@ mod pg_tests {
                 partition_granularity, partition_start, node_id, writer_epoch,
                 wal_lsn_min, wal_lsn_max, promotion_record
             ) VALUES (
-                $1, $2, 'vala.traces', 'spans', '/fake/path1.parquet',
+                $1, $2, 'bifrost.traces', 'spans', '/fake/path1.parquet',
                 1024, 100, now(), now(),
                 'day', date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
                 $3, $4, $5, $6, '{"fixture": "pg-file-list-cluster-nodes"}'::jsonb
@@ -206,7 +206,7 @@ mod pg_tests {
                 partition_granularity, partition_start, node_id, writer_epoch,
                 wal_lsn_min, wal_lsn_max, promotion_record
             ) VALUES (
-                $1, $2, 'vala.traces', 'spans', '/fake/path2.parquet',
+                $1, $2, 'bifrost.traces', 'spans', '/fake/path2.parquet',
                 2048, 200, now(), now(),
                 'day', date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
                 $3, $4, $5, $6, '{"fixture": "pg-file-list-cluster-nodes"}'::jsonb
@@ -326,7 +326,7 @@ mod pg_tests {
                 partition_granularity, partition_start, node_id, writer_epoch,
                 wal_lsn_min, wal_lsn_max, promotion_record
             ) VALUES (
-                $1, $2, 'vala.traces', 'spans', '/fake/pathA.parquet',
+                $1, $2, 'bifrost.traces', 'spans', '/fake/pathA.parquet',
                 1024, 100, now(), now(),
                 'day', date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
                 $3, 1, 100, 200, '{"fixture": "pg-file-list-cluster-nodes"}'::jsonb
@@ -372,7 +372,7 @@ mod pg_tests {
                 partition_granularity, partition_start, node_id, writer_epoch,
                 wal_lsn_min, wal_lsn_max, promotion_record
             ) VALUES (
-                $1, $2, 'vala.traces', 'spans', '/fake/operator.parquet',
+                $1, $2, 'bifrost.traces', 'spans', '/fake/operator.parquet',
                 1024, 100, now(), now(),
                 'day', date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
                 $3, 1, 100, 200, '{"fixture": "pg-file-list-cluster-nodes"}'::jsonb

@@ -30,7 +30,7 @@ from .support import FIXTURES, Count, client_of, declare, hydrated, runtime_acco
 
 pytestmark = pytest.mark.integration
 
-TENANT_WIDE = "SELECT COUNT(*) AS n FROM vala.drift.observations"
+TENANT_WIDE = "SELECT COUNT(*) AS n FROM bifrost.drift.observations"
 """A tenant-wide query over a built-in table, which ``workload`` permits."""
 
 AUTHORED = FIXTURES / "cards/gateway_inference/ask-prompt.yaml"
@@ -174,7 +174,7 @@ def attributed(server: WyrdTestServer, run_ids: list[str]) -> list[Attributed]:
     placeholders = ", ".join(f"${index}" for index in range(1, len(run_ids) + 1))
     return Bifrost(client=client_of(server)).sql(
         "SELECT run_id, card_uid, sub_principal_id, act_principal_id "
-        f"FROM vala.drift.observations WHERE run_id IN ({placeholders}) ORDER BY run_id",
+        f"FROM bifrost.drift.observations WHERE run_id IN ({placeholders}) ORDER BY run_id",
         run_ids,
         model=Attributed,
     )

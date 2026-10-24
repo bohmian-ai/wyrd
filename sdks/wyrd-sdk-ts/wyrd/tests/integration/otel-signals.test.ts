@@ -69,7 +69,7 @@ test("stock log record reads back through bifrost", async ({ server, bifrost }) 
 
   const rows = await bifrost.sql(
     `SELECT severity_text, severity_number, trace_id, span_id
-       FROM vala.logs.records WHERE scope_name = 'wyrd.tests.otel.log'`,
+       FROM bifrost.logs.records WHERE scope_name = 'wyrd.tests.otel.log'`,
     [],
     LogRow,
   );
@@ -95,7 +95,7 @@ test("stock metric points read back through bifrost", async ({ server, bifrost }
 
   const rows = await bifrost.sql(
     `SELECT metric_name, metric_type, int_value, double_value, histogram_count, histogram_sum
-       FROM vala.metrics.points WHERE scope_name = 'wyrd.tests.otel.metric' ORDER BY metric_name`,
+       FROM bifrost.metrics.points WHERE scope_name = 'wyrd.tests.otel.metric' ORDER BY metric_name`,
     [],
     MetricRow,
   );

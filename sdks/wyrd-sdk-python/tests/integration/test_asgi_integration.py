@@ -69,7 +69,7 @@ def drift(server: WyrdTestServer, bifrost: Bifrost, run_ids: list[str]) -> dict[
     server.flush_bifrost()
     placeholders = ", ".join(f"${index}" for index in range(1, len(run_ids) + 1))
     rows = bifrost.sql(
-        "SELECT run_id, num_value, card_uid FROM vala.drift.observations "
+        "SELECT run_id, num_value, card_uid FROM bifrost.drift.observations "
         f"WHERE series = 'latency' AND run_id IN ({placeholders})",
         run_ids,
     )
@@ -499,7 +499,7 @@ def test_fastapi_example(
     assert closed(example["state"])
     wyrd_server.flush_bifrost()
     rows = bifrost.sql(
-        "SELECT run_id, verdict FROM vala.verification.results WHERE run_id IN ($1, $2)",
+        "SELECT run_id, verdict FROM bifrost.verification.results WHERE run_id IN ($1, $2)",
         list(served),
     )
     assert {row["run_id"]: row["verdict"] for row in rows.to_arrow().to_pylist()} == served

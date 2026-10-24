@@ -65,8 +65,8 @@ export async function work(client: WyrdClient): Promise<Worked> {
 
   const bifrost = await Bifrost.connect({ client });
   for (const [table, alias] of [
-    ["vala.drift.observations", "model"],
-    ["vala.traces.spans", "agent"],
+    ["bifrost.drift.observations", "model"],
+    ["bifrost.traces.spans", "agent"],
   ] as const) {
     const rows = await bifrost.sql(`SELECT card_uid FROM ${table} WHERE run_id = $1`, [run.runId], Attributed);
     expect(rows, table).toEqual([{ card_uid: state.cardRef(alias).uid }]);

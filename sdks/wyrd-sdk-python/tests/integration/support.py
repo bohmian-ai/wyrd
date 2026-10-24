@@ -229,7 +229,7 @@ def binding_status(server: WyrdTestServer, binding_id: str) -> dict[str, Any]:
 
 
 class Retained(BaseModel):
-    """One ``vala.verification.results`` row's execution identity."""
+    """One ``bifrost.verification.results`` row's execution identity."""
 
     execution_id: str
 
@@ -245,7 +245,7 @@ def scheduled_result(
     """
     admin = client_of(server)
     bifrost = Bifrost(client=admin)
-    query = "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1"
+    query = "SELECT execution_id FROM bifrost.verification.results WHERE binding_id = $1"
 
     def retained() -> set[str]:
         server.flush_bifrost()

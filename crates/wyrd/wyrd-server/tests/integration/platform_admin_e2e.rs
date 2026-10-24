@@ -4372,7 +4372,7 @@ async fn system_audit_batches(srv: &WyrdTestServer) -> i64 {
         .expect("system owner connection opens");
     let batches = sqlx::query_scalar(
         "SELECT count(*) FROM vala.scribe_batch_commits \
-          WHERE logical_table_fqn = 'vala.system.audit_log'",
+          WHERE logical_table_fqn = 'bifrost.system.audit_log'",
     )
     .fetch_one(&mut **conn.transaction())
     .await
@@ -5178,7 +5178,7 @@ async fn registered_builtins(
         .map(|entry| {
             format!(
                 "{}.{}",
-                entry.namespace.trim_start_matches("vala."),
+                entry.namespace.trim_start_matches("bifrost."),
                 entry.name
             )
         })

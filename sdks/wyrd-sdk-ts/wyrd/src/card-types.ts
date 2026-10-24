@@ -5485,7 +5485,7 @@ export interface ServiceSpec {
   /**
    * Bifrost dataset tables this Service writes.
    *
-   * Registration validates and ensures each one in `vala.datasets` before
+   * Registration validates and ensures each one in `bifrost.datasets` before
    * the Service becomes active; removing the Service never drops them.
    */
   readonly tables?: readonly ServiceTable[];
@@ -5504,7 +5504,7 @@ export interface ServiceSpec {
  */
 export interface ServiceTable {
   /**
-   * Dataset table name inside `vala.datasets`.
+   * Dataset table name inside `bifrost.datasets`.
    */
   readonly name: string;
   /**

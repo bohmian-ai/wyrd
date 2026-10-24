@@ -1,4 +1,4 @@
-//! Table-owned OTLP trace projection for `vala.traces.spans`.
+//! Table-owned OTLP trace projection for `bifrost.traces.spans`.
 //!
 //! [`project_resource_spans`] is the single deterministic, IO-free conversion
 //! from decoded OTLP resource spans into the canonical span row. It performs no
@@ -694,7 +694,7 @@ impl SpanColumns {
     }
 }
 
-/// Return the canonical user-column schema of `vala.traces.spans`.
+/// Return the canonical user-column schema of `bifrost.traces.spans`.
 ///
 /// The schema is derived from the ledger on every call rather than cached, so
 /// there is exactly one place a span column order can come from.

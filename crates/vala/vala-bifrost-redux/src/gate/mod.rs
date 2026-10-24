@@ -515,7 +515,7 @@ impl<A: GateAudit + 'static> Gate<A> {
 
     /// Evaluates the table-scoped write permission and stages the decision.
     ///
-    /// The verification result tables and `vala.gateway.calls` are written
+    /// The verification result tables and `bifrost.gateway.calls` are written
     /// only by the server's internal writer, which never passes Gate, so every
     /// public write to them is refused. Every allowed or denied decision is
     /// staged on the audit sink without waiting, then the verdict is enforced.
@@ -548,10 +548,10 @@ impl<A: GateAudit + 'static> Gate<A> {
     ///
     /// The checks run cheapest first. A principal holding `BifrostRecord`
     /// `Write` under no scope at all is refused before any catalog work. The
-    /// four server-owned verification tables and the exact `vala.gateway.calls`
+    /// four server-owned verification tables and the exact `bifrost.gateway.calls`
     /// table are written only by the server's internal capture writer, which
     /// never passes Gate, so every public principal, a wildcard holder
-    /// included, is refused next; the rest of `vala.gateway` is not reserved. Otherwise Scribe resolves the tenant's registered table UID and the principal must
+    /// included, is refused next; the rest of `bifrost.gateway` is not reserved. Otherwise Scribe resolves the tenant's registered table UID and the principal must
     /// hold `BifrostRecord` `Write` covering that exact table object scope.
     ///
     /// # Errors
@@ -1646,7 +1646,7 @@ mod tests {
         ) -> Result<crate::contracts::FrameAdmission, crate::contracts::ScribeError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(frame.authenticated_tenant, frame.principal.tenant_id);
-            assert_eq!(frame.table.fqn(), "vala.traces.spans");
+            assert_eq!(frame.table.fqn(), "bifrost.traces.spans");
             assert!(frame.expected_schema_fingerprint.is_none());
             let crate::contracts::IngressPayload::Canonical(canonical) = &frame.payload else {
                 panic!("Gate must hand Scribe validated canonical batches");
@@ -2035,7 +2035,7 @@ mod tests {
             wildcard,
         );
         let error = gate
-            .dispatch_native_frame(&limits, &context, native_frame("vala.gateway.calls"))
+            .dispatch_native_frame(&limits, &context, native_frame("bifrost.gateway.calls"))
             .await
             .expect_err("no public principal writes the reserved call table");
         assert!(matches!(
@@ -2046,14 +2046,14 @@ mod tests {
         assert_eq!(scribe.ingested.load(Ordering::Relaxed), 0);
         assert_eq!(
             audit.decisions(),
-            vec![("vala.gateway.calls".to_owned(), AuditOutcome::Denied)]
+            vec![("bifrost.gateway.calls".to_owned(), AuditOutcome::Denied)]
         );
     }
 
     /// A table-scoped record write is authorized against the resolved UID.
     ///
     /// The same grant is refused when the destination resolves to another
-    /// registration, while the rest of `vala.gateway` stays unreserved for an
+    /// registration, while the rest of `bifrost.gateway` stays unreserved for an
     /// ordinary wildcard writer.
     #[tokio::test]
     async fn gate_authorizes_record_writes_against_the_resolved_table_uid() {
@@ -2081,14 +2081,14 @@ mod tests {
 
         let (gate, scribe) = gate_resolving_to(random_uid());
         let error = gate
-            .dispatch_native_frame(&limits, &scoped, native_frame("vala.traces.spans"))
+            .dispatch_native_frame(&limits, &scoped, native_frame("bifrost.traces.spans"))
             .await
             .expect_err("a grant for another registration does not cover this one");
         assert!(matches!(error, IngestError::RbacDenied { .. }));
         assert_eq!(scribe.ingested.load(Ordering::Relaxed), 0);
 
         let (gate, scribe) = gate_resolving_to(granted);
-        gate.dispatch_native_frame(&limits, &scoped, native_frame("vala.traces.spans"))
+        gate.dispatch_native_frame(&limits, &scoped, native_frame("bifrost.traces.spans"))
             .await
             .expect("the grant covers its exact registration");
         let wildcard = context_with(
@@ -2096,7 +2096,7 @@ mod tests {
             PrincipalKind::User,
             [Permission::bifrost_record_write()],
         );
-        gate.dispatch_native_frame(&limits, &wildcard, native_frame("vala.gateway.other"))
+        gate.dispatch_native_frame(&limits, &wildcard, native_frame("bifrost.gateway.other"))
             .await
             .expect("only the exact call table is reserved");
         assert_eq!(scribe.ingested.load(Ordering::Relaxed), 2);
@@ -2486,13 +2486,13 @@ mod tests {
                 detail: "bifrost:record:write denied".to_owned(),
             },
             IngestError::ReservedBuiltinWriteDenied {
-                table: "vala.audit.events".to_owned(),
+                table: "bifrost.audit.events".to_owned(),
             },
             IngestError::RequestValidation("bad batch id".to_owned()),
             IngestError::Decode("truncated frame".to_owned()),
             IngestError::PayloadTooLarge { bytes: 2, limit: 1 },
             IngestError::TableNotFound {
-                table: "vala.traces.absent".to_owned(),
+                table: "bifrost.traces.absent".to_owned(),
             },
             IngestError::IngressClosed,
             IngestError::WalDiskFull,
@@ -2531,7 +2531,7 @@ mod tests {
     fn gate_rejection_increments_only_the_projected_reason() {
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         let error = IngestError::TableNotFound {
-            table: "vala.bifrost/absent".to_owned(),
+            table: "bifrost.bifrost/absent".to_owned(),
         };
         let reason = error
             .rejection_reason()
@@ -2683,9 +2683,9 @@ mod tests {
             ("system", kind_context(PrincipalKind::System, wildcard())),
         ];
         for table in [
-            "vala.verification.results",
-            "vala.verification.execution_inputs",
-            "vala.drift.result_features",
+            "bifrost.verification.results",
+            "bifrost.verification.execution_inputs",
+            "bifrost.drift.result_features",
         ] {
             for (label, auth) in &principals {
                 let scribe_calls = Arc::new(AtomicUsize::new(0));
@@ -2749,7 +2749,7 @@ mod tests {
             )
             .with_audit(Arc::clone(&audit));
             let frame = wyrd_tonic::wyrd::v1::InsertBatchRequest {
-                table: "vala.datasets.events".to_owned(),
+                table: "bifrost.datasets.events".to_owned(),
                 wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
                 arrow_ipc: Vec::new().into(),
                 producer_trace_contexts: Vec::new(),
@@ -2823,7 +2823,7 @@ mod tests {
     fn batch_identity_acceptance_is_unchanged() {
         let limits = IngestLimits::default();
         let frame = |batch_id: Vec<u8>| wyrd_tonic::wyrd::v1::InsertBatchRequest {
-            table: "vala.traces.spans".to_owned(),
+            table: "bifrost.traces.spans".to_owned(),
             wyrd_batch_id: batch_id.into(),
             arrow_ipc: Vec::new().into(),
             producer_trace_contexts: Vec::new(),

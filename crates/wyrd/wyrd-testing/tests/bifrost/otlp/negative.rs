@@ -1112,11 +1112,11 @@ mod pg_tests {
     /// One OTLP signal a workload-context case exports and reads back.
     #[derive(Clone, Copy, Debug)]
     enum Signal {
-        /// `vala.traces.spans`, the only signal also exported over gRPC here.
+        /// `bifrost.traces.spans`, the only signal also exported over gRPC here.
         Traces,
-        /// `vala.logs.records`.
+        /// `bifrost.logs.records`.
         Logs,
-        /// `vala.metrics.points`.
+        /// `bifrost.metrics.points`.
         Metrics,
     }
 

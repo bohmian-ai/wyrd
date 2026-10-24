@@ -31,7 +31,7 @@ const CHILD: &str = "WYRD_OTEL_EXPORT_CHILD";
 /// identities.
 const EXPORTED: &str = "WYRD_OTEL_EXPORTED ";
 
-/// One `vala.traces.spans` row the story reads, identities as hex.
+/// One `bifrost.traces.spans` row the story reads, identities as hex.
 #[derive(Debug, PartialEq, Deserialize)]
 struct SpanRow {
     /// The span name.
@@ -161,7 +161,7 @@ async fn stock_exporter_span_reads_back_through_bifrost() {
             "SELECT name, encode(trace_id, 'hex') AS trace_id, encode(span_id, 'hex') AS span_id, \
                     encode(parent_span_id, 'hex') AS parent_span_id, status_code, status_message, \
                     gen_ai_request_model, gen_ai_usage_input_tokens \
-               FROM vala.traces.spans WHERE scope_name = 'wyrd.tests.otel.trace' ORDER BY name",
+               FROM bifrost.traces.spans WHERE scope_name = 'wyrd.tests.otel.trace' ORDER BY name",
             &[],
         )
         .await

@@ -23,9 +23,9 @@ use wyrd_testing::server::WyrdTestServer;
 use super::pg_tests::service_client;
 
 /// The table every Iceberg type is registered and written to.
-const ALL_TYPES: &str = "vala.datasets.all_types";
+const ALL_TYPES: &str = "bifrost.datasets.all_types";
 /// The table the narrower Arrow spellings are registered and written to.
-const NARROW_TYPES: &str = "vala.datasets.narrow_types";
+const NARROW_TYPES: &str = "bifrost.datasets.narrow_types";
 /// The catalog code for a type Bifrost cannot store.
 const UNSUPPORTED_TYPE: &str = "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE";
 
@@ -237,7 +237,7 @@ fn a_type_bifrost_cannot_store_is_refused_when_declared() {
     ] {
         let data_type = column.data_type().clone();
 
-        let refused = one_column("vala.datasets.no_wire_form", column)
+        let refused = one_column("bifrost.datasets.no_wire_form", column)
             .expect_err("a type Bifrost cannot store is refused");
 
         assert_eq!(refused.code(), UNSUPPORTED_TYPE, "{data_type}");

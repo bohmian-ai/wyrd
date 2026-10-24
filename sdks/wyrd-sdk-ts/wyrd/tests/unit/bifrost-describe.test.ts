@@ -21,7 +21,7 @@ test.each(["1", "9007199254740993", "9223372036854775807"])(
       },
     } as unknown as NativeWyrdClient);
 
-    const described = await (await Bifrost.connect({ client })).describeTable("vala.datasets", "events");
+    const described = await (await Bifrost.connect({ client })).describeTable("bifrost.datasets", "events");
 
     expect(typeof described.table_version).toBe("bigint");
     expect(described.table_version).toBe(BigInt(version));

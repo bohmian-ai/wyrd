@@ -831,7 +831,7 @@ mod pg_tests {
             &agent_client,
             format!(
                 "SELECT execution_status, verdict, card_uid, owner_card_uid, binding_id \
-                 FROM vala.verification.results WHERE execution_id = '{execution_id}'"
+                 FROM bifrost.verification.results WHERE execution_id = '{execution_id}'"
             ),
         )
         .await?;
@@ -882,7 +882,7 @@ mod pg_tests {
         );
         let foreign_rows = rows(
             &foreign_client,
-            "SELECT result_id FROM vala.verification.results".to_owned(),
+            "SELECT result_id FROM bifrost.verification.results".to_owned(),
         )
         .await?;
         assert_eq!(
@@ -996,7 +996,7 @@ mod pg_tests {
             &agent_client,
             format!(
                 "SELECT to_json(outcome -> 'requirements' -> 0 -> 'data') \
-                 FROM vala.verification.results WHERE execution_id = '{execution_id}'"
+                 FROM bifrost.verification.results WHERE execution_id = '{execution_id}'"
             ),
         )
         .await?;
@@ -1022,7 +1022,7 @@ mod pg_tests {
                 .call_tool(call(
                     QUERY,
                     serde_json::json!({
-                        "sql": format!("SELECT outcome FROM vala.verification.results WHERE execution_id = '{execution_id}'"),
+                        "sql": format!("SELECT outcome FROM bifrost.verification.results WHERE execution_id = '{execution_id}'"),
                         "max_rows": 1
                     }),
                 )?)
@@ -1770,7 +1770,7 @@ mod pg_tests {
         let persisted = rows(
             &agent_client,
             format!(
-                "SELECT execution_id, group_id FROM vala.verification.results \
+                "SELECT execution_id, group_id FROM bifrost.verification.results \
                  WHERE execution_id IN ('{first}', '{solo}', '{group_execution_id}') ORDER BY ended_at"
             ),
         )
@@ -2197,7 +2197,7 @@ mod pg_tests {
         server.flush_bifrost().await?;
         let staged = rows(
             &agent_client,
-            "SELECT count(*) FROM vala.verification.execution_inputs".to_owned(),
+            "SELECT count(*) FROM bifrost.verification.execution_inputs".to_owned(),
         )
         .await?;
         assert_eq!(
@@ -2321,7 +2321,7 @@ mod pg_tests {
                 let stored = rows(
                     &caller_client,
                     format!(
-                        "SELECT deployment_environment FROM vala.verification.{table} \
+                        "SELECT deployment_environment FROM bifrost.verification.{table} \
                          WHERE execution_id = '{execution_id}'"
                     ),
                 )

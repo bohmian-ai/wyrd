@@ -1209,10 +1209,10 @@ fn report_write_pareto(measured: &Measured, profile: &Profile) {
 /// and Bifrost table the rows go through.
 #[derive(Debug, Clone, Copy)]
 pub enum Signal {
-    /// Telemetry spans through the trace service into `vala.traces.spans`.
+    /// Telemetry spans through the trace service into `bifrost.traces.spans`.
     Spans(Telemetry),
     /// Bulky Kubernetes logs through the logs service into
-    /// `vala.logs.records`.
+    /// `bifrost.logs.records`.
     Logs(Logs),
 }
 

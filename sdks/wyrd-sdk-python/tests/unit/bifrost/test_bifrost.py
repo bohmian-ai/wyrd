@@ -13,7 +13,7 @@ from wyrd._wyrd import bifrost as native_bifrost
 from wyrd.bifrost import Bifrost, TableConfig
 from wyrd.bifrost._client import _description
 
-TABLE = "vala.datasets.events"
+TABLE = "bifrost.datasets.events"
 TARGET_FILE_SIZE_BYTES = 256 * 1024 * 1024
 
 

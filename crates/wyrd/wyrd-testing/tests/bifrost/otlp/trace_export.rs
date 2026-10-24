@@ -349,7 +349,7 @@ mod pg_tests {
 
     /// Every canonical span column that carries caller content.
     ///
-    /// These are exactly `vala.traces.spans`'s declared sensitive payload
+    /// These are exactly `bifrost.traces.spans`'s declared sensitive payload
     /// columns. `attributes` is the one that carries the structured `GenAI`
     /// input and output messages, so gating it is what keeps a conversation
     /// payload from reaching a caller holding query access alone.

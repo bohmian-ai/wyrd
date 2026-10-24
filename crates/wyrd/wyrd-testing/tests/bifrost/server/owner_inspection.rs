@@ -87,7 +87,7 @@ async fn published_values(
     .run_with(
         wyrd_spec::vala::api::BifrostQueryRequest {
             params: Vec::new(),
-            sql: format!("SELECT value FROM vala.bifrost.{table} ORDER BY value"),
+            sql: format!("SELECT value FROM bifrost.bifrost.{table} ORDER BY value"),
             deadline_ms: Some(30_000),
         },
         |batch| {
@@ -166,7 +166,7 @@ async fn scribe_wal_fault_is_role_local() -> Result<(), super::query::ServerJour
             physical_layout: None,
         })
         .await?;
-    let fqn = format!("vala.bifrost.{table}");
+    let fqn = format!("bifrost.bifrost.{table}");
     server.seed_bifrost_rows(&fqn, &[1, 2, 3]).await?;
 
     server.trip_bifrost_wal_sync_fault_for_test()?;
@@ -307,7 +307,7 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
             physical_layout: None,
         })
         .await?;
-    let fqn = format!("vala.bifrost.{table}");
+    let fqn = format!("bifrost.bifrost.{table}");
     server.seed_bifrost_rows(&fqn, &[1, 2, 3]).await?;
     server.trip_bifrost_wal_sync_fault_for_test()?;
     assert!(
@@ -396,7 +396,7 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
         "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,\
          namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,\
          estimated_bytes,state,ready_at,next_eligible_at,updated_at) \
-         VALUES ($1,$2,'wyrd-redux','vala.bifrost','dedicated_shutdown','small_files',4242,\
+         VALUES ($1,$2,'wyrd-redux','bifrost.bifrost','dedicated_shutdown','small_files',4242,\
          '{\"version\":1,\"inputs\":[\"a.parquet\"],\"parameters\":{\"kind\":\"live_rewrite\"}}'::jsonb,\
          decode(repeat('33',32),'hex'),1,100,'ready',statement_timestamp()-interval '1 hour',\
          statement_timestamp()-interval '1 hour',statement_timestamp())",

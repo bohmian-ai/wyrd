@@ -3,7 +3,7 @@ records each ticket, and checks every answer against its refund policy with
 the ``support/policy-check`` Verifier.
 
 ``deploy`` declares the checked-in Cards under ``service/``, which ensures the
-declared ``vala.datasets.tickets`` table, turns on metadata capture, and checks
+declared ``bifrost.datasets.tickets`` table, turns on metadata capture, and checks
 the Agent's model is deployed. ``serve`` answers every question in its own
 Agent Run with ``answer``, the application's own gateway call, and submits each
 answer for a background policy check.
@@ -165,7 +165,7 @@ def serve(desk: Desk) -> list[Served]:
         with run, tracer.start_as_current_span("support-desk.request"):
             reply = answer(desk.gateway, state, run, asked)
             run.observe.record(
-                "vala.datasets.tickets",
+                "bifrost.datasets.tickets",
                 {
                     "ticket_id": f"T-{index}",
                     "question": asked,
@@ -225,10 +225,10 @@ def explain(client: WyrdClient, run_id: str) -> dict[str, Any]:
     sql = (
         "SELECT t.run_id, s.trace_id, t.ticket_id, t.answer, s.name AS span, "
         "g.call_id, g.card_uid AS call_card_uid, r.verdict "
-        "FROM vala.datasets.tickets t "
-        "JOIN vala.traces.spans s ON s.run_id = t.run_id "
-        "JOIN vala.gateway.calls g ON g.run_id = t.run_id "
-        "JOIN vala.verification.results r ON r.run_id = t.run_id "
+        "FROM bifrost.datasets.tickets t "
+        "JOIN bifrost.traces.spans s ON s.run_id = t.run_id "
+        "JOIN bifrost.gateway.calls g ON g.run_id = t.run_id "
+        "JOIN bifrost.verification.results r ON r.run_id = t.run_id "
         f"WHERE t.run_id = '{run_id}' AND s.name = 'support-desk.request' "
         "ORDER BY g.call_id LIMIT 1"
     )

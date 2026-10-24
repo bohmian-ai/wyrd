@@ -6,7 +6,7 @@ use crate::tables::{
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-/// `vala.drift.observations` — one tall row per observed feature.
+/// `bifrost.drift.observations` — one tall row per observed feature.
 ///
 /// A client emits one logical Drift observation covering a whole feature map;
 /// the SDK projects it into one row per feature so windowed analysis can scan

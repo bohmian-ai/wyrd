@@ -129,7 +129,7 @@ impl TenantTableBinding {
         }
         let namespace = table_ref.namespace.as_str();
         let segment = namespace
-            .strip_prefix("vala.")
+            .strip_prefix("bifrost.")
             .filter(|value| !value.is_empty() && !value.contains('.'))
             .ok_or_else(|| TenantTableBindingError::InvalidPhysicalNamespace {
                 detail: format!("logical namespace `{namespace}` is not one segment"),
@@ -163,13 +163,13 @@ impl TenantTableBinding {
         debug_assert!(facts.input_bytes >= 4 + 7 + 36);
         let tenant_string = facts.tenant.to_string();
         let namespace = facts.table_ref.namespace.as_str();
-        let segment = namespace.strip_prefix("vala.").ok_or_else(|| {
+        let segment = namespace.strip_prefix("bifrost.").ok_or_else(|| {
             TenantTableBindingError::InvalidPhysicalNamespace {
                 detail: format!("logical namespace `{namespace}` is not one segment"),
             }
         })?;
         let iceberg_namespace =
-            NamespaceIdent::from_strs(["vala", "tenants", tenant_string.as_str(), segment])
+            NamespaceIdent::from_strs(["bifrost", "tenants", tenant_string.as_str(), segment])
                 .map_err(|error| TenantTableBindingError::InvalidPhysicalNamespace {
                     detail: error.to_string(),
                 })?;
@@ -280,9 +280,9 @@ mod tests {
         assert_eq!(facts.output_bytes, 8 + 36 + 1 + 6 + 1 + 5);
         assert_eq!(
             facts.binding_bytes,
-            5 + 5 + "vala.traces".len() + facts.input_bytes + facts.output_bytes
+            5 + 5 + "bifrost.traces".len() + facts.input_bytes + facts.output_bytes
         );
-        assert_eq!(facts.file_prefix_bytes, "vala.traces".len() + 1 + 5);
+        assert_eq!(facts.file_prefix_bytes, "bifrost.traces".len() + 1 + 5);
         assert_eq!(
             facts.peak_bytes,
             36 + facts.binding_bytes + facts.file_prefix_bytes
@@ -313,11 +313,11 @@ mod tests {
 
         assert_ne!(binding_a.iceberg_namespace, binding_b.iceberg_namespace);
         assert_ne!(binding_a.object_prefix, binding_b.object_prefix);
-        assert_eq!(binding_a.logical_namespace, "vala.traces");
-        assert_eq!(binding_b.logical_namespace, "vala.traces");
+        assert_eq!(binding_a.logical_namespace, "bifrost.traces");
+        assert_eq!(binding_b.logical_namespace, "bifrost.traces");
         assert_eq!(
             binding_a.iceberg_namespace.to_string(),
-            format!("vala.tenants.{tenant_a}.traces")
+            format!("bifrost.tenants.{tenant_a}.traces")
         );
         assert_eq!(
             binding_a.object_prefix,
@@ -414,6 +414,6 @@ mod tests {
         let binding = TenantTableBinding::resolve((tenant, table)).expect("binding");
 
         assert_eq!(binding.table_name, format!("{tenant}_spans"));
-        assert_eq!(binding.logical_namespace, "vala.traces");
+        assert_eq!(binding.logical_namespace, "bifrost.traces");
     }
 }

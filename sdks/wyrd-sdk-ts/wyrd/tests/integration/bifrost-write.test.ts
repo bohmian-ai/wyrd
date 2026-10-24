@@ -18,7 +18,7 @@ const INFERENCES: z.infer<typeof Inference>[] = [
 ];
 
 /** The table every read story queries, holding {@link INFERENCES}. */
-const INFERENCE_TABLE = "vala.datasets.inferences";
+const INFERENCE_TABLE = "bifrost.datasets.inferences";
 
 /** A one-column table declaration for the write stories. */
 const Value = z.object({ value: z.int() });
@@ -71,25 +71,25 @@ const test = serverTest().extend<{ reader: Bifrost; a: string; b: string }>({
 });
 
 test("registering the same columns again matches", async () => {
-  expect(await registerValueTable("vala.datasets.registered")).toBe("created");
-  expect(await registerValueTable("vala.datasets.registered")).toBe("already_exists");
+  expect(await registerValueTable("bifrost.datasets.registered")).toBe("created");
+  expect(await registerValueTable("bifrost.datasets.registered")).toBe("already_exists");
 });
 
 test("swapping tables drains the rows written before the swap", async ({ server, reader }) => {
-  await registerValueTable("vala.datasets.before_swap");
-  await registerValueTable("vala.datasets.after_swap");
+  await registerValueTable("bifrost.datasets.before_swap");
+  await registerValueTable("bifrost.datasets.after_swap");
   const writer = await Bifrost.connect();
 
-  await writer.useTableByName("vala.datasets.before_swap");
+  await writer.useTableByName("bifrost.datasets.before_swap");
   writer.insert({ value: 71 });
-  await writer.useTableByName("vala.datasets.after_swap");
+  await writer.useTableByName("bifrost.datasets.after_swap");
   writer.insert({ value: 91 });
   await writer.shutdown();
   server.flushBifrost();
 
   const read = (table: string) => reader.sql(`SELECT value FROM ${table}`, [], Value.extend({ value: z.bigint() }));
-  expect(await read("vala.datasets.before_swap")).toEqual([{ value: 71n }]);
-  expect(await read("vala.datasets.after_swap")).toEqual([{ value: 91n }]);
+  expect(await read("bifrost.datasets.before_swap")).toEqual([{ value: 71n }]);
+  expect(await read("bifrost.datasets.after_swap")).toEqual([{ value: 91n }]);
 });
 
 /** One insert the client refuses before sending, and the catalog code it raises. */
@@ -100,7 +100,7 @@ test.for<Refusal>([
   [
     "malformed Card UID",
     (bifrost) => {
-      bifrost.useTable(TableConfig.fromJsonSchema("vala.datasets.refused", Value));
+      bifrost.useTable(TableConfig.fromJsonSchema("bifrost.datasets.refused", Value));
       bifrost.insert({ value: 82 }, { cardUid: "not-a-uid" });
     },
     "WYRD_SPEC_400_VALIDATION",
@@ -116,38 +116,38 @@ test.for<Refusal>([
 test("compaction target is recorded and a different one is refused", async () => {
   const target = 256 * 1024 * 1024;
 
-  expect(await registerValueTable("vala.datasets.target", { compactionTargetFileSizeBytes: target })).toBe("created");
-  expect(await registerValueTable("vala.datasets.target")).toBe("already_exists");
+  expect(await registerValueTable("bifrost.datasets.target", { compactionTargetFileSizeBytes: target })).toBe("created");
+  expect(await registerValueTable("bifrost.datasets.target")).toBe("already_exists");
   await expect(
-    registerValueTable("vala.datasets.target", { compactionTargetFileSizeBytes: target * 2 }),
+    registerValueTable("bifrost.datasets.target", { compactionTargetFileSizeBytes: target * 2 }),
   ).rejects.toMatchObject({ code: "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH" });
-  expect((await TableConfig.describe("vala.datasets.target")).compactionTargetFileSizeBytes).toBe(target);
+  expect((await TableConfig.describe("bifrost.datasets.target")).compactionTargetFileSizeBytes).toBe(target);
 });
 
 test("compaction type is recorded and a different one is refused", async () => {
-  expect(await registerValueTable("vala.datasets.kind", { compactionType: "small-files" })).toBe("created");
-  expect(await registerValueTable("vala.datasets.kind")).toBe("already_exists");
-  await expect(registerValueTable("vala.datasets.kind", { compactionType: "full" })).rejects.toMatchObject({
+  expect(await registerValueTable("bifrost.datasets.kind", { compactionType: "small-files" })).toBe("created");
+  expect(await registerValueTable("bifrost.datasets.kind")).toBe("already_exists");
+  await expect(registerValueTable("bifrost.datasets.kind", { compactionType: "full" })).rejects.toMatchObject({
     code: "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH",
   });
-  expect((await TableConfig.describe("vala.datasets.kind")).compactionType).toBe("small-files");
+  expect((await TableConfig.describe("bifrost.datasets.kind")).compactionType).toBe("small-files");
 });
 
 test("recorded telemetry row reads back", async ({ server, reader }) => {
-  const writer = await Bifrost.connect({ table: TableConfig.fromJsonSchema("vala.datasets.recorded", Value) });
+  const writer = await Bifrost.connect({ table: TableConfig.fromJsonSchema("bifrost.datasets.recorded", Value) });
   expect(await writer.register()).toBe("created");
 
-  record(writer, "vala.datasets.recorded", Value, { value: 7 });
+  record(writer, "bifrost.datasets.recorded", Value, { value: 7 });
   await writer.shutdown();
   server.flushBifrost();
 
   expect(writer.dropped).toBe(0);
-  const rows = await reader.sql("SELECT value FROM vala.datasets.recorded", [], z.object({ value: z.bigint() }));
+  const rows = await reader.sql("SELECT value FROM bifrost.datasets.recorded", [], z.object({ value: z.bigint() }));
   expect(rows).toEqual([{ value: 7n }]);
 });
 
 test("recorded telemetry with an unmappable schema is refused", async ({ reader }) => {
-  expect(() => record(reader, "vala.datasets.recorded", { type: "object" }, { value: 7 })).toThrow(
+  expect(() => record(reader, "bifrost.datasets.recorded", { type: "object" }, { value: 7 })).toThrow(
     expect.objectContaining({ code: "WYRD_VALA_400_SCHEMA_PARSE" }),
   );
 });
@@ -155,28 +155,28 @@ test("recorded telemetry with an unmappable schema is refused", async ({ reader 
 // Arrow declares a column type JSON Schema cannot: a 32-bit integer.
 test("arrow declared table keeps its column types", async ({ server, reader }) => {
   const schema = new Schema([new Field("small", new Int32(), false)]);
-  const writer = await Bifrost.connect({ table: TableConfig.fromArrow("vala.datasets.arrow_declared", schema) });
+  const writer = await Bifrost.connect({ table: TableConfig.fromArrow("bifrost.datasets.arrow_declared", schema) });
   expect(await writer.register()).toBe("created");
 
   writer.insert({ small: 32 });
   await writer.shutdown();
   server.flushBifrost();
 
-  const read = await reader.sql("SELECT small FROM vala.datasets.arrow_declared");
+  const read = await reader.sql("SELECT small FROM bifrost.datasets.arrow_declared");
   expect(read.toArrow().schema.fields.map((field) => [field.name, String(field.type)])).toEqual([["small", "Int32"]]);
   expect(read.toArrow().getChild("small")?.toArray()).toEqual(Int32Array.from([32]));
 });
 
 test("described table accepts writes without restating its schema", async ({ server, reader }) => {
-  await registerValueTable("vala.datasets.described");
-  const writer = await Bifrost.connect({ table: await TableConfig.describe("vala.datasets.described") });
+  await registerValueTable("bifrost.datasets.described");
+  const writer = await Bifrost.connect({ table: await TableConfig.describe("bifrost.datasets.described") });
 
   writer.insert({ value: 91 });
   await writer.shutdown();
   server.flushBifrost();
 
   expect(writer.dropped).toBe(0);
-  expect((await reader.sql("SELECT value FROM vala.datasets.described")).numRows).toBe(1);
+  expect((await reader.sql("SELECT value FROM bifrost.datasets.described")).numRows).toBe(1);
 });
 
 test("aggregate sql reads the written rows", async ({ reader }) => {
@@ -238,17 +238,17 @@ test("delegated client reads with the callers authority", async ({ reader: _, a,
 });
 
 test("delegated client cannot write with the services authority", async ({ a, b }) => {
-  await registerValueTable("vala.datasets.delegated");
-  const { arrowSchema } = await TableConfig.describe("vala.datasets.delegated", {
+  await registerValueTable("bifrost.datasets.delegated");
+  const { arrowSchema } = await TableConfig.describe("bifrost.datasets.delegated", {
     client: WyrdClient.connect({ credential: b }),
   });
   const asA = await onBehalfOfA(a, b);
 
-  await expect(asA.writeBatch("vala.datasets.delegated", valueBatch(arrowSchema, 41n))).rejects.toMatchObject({
+  await expect(asA.writeBatch("bifrost.datasets.delegated", valueBatch(arrowSchema, 41n))).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",
   });
   await (await Bifrost.connect({ client: WyrdClient.connect({ credential: b }) })).writeBatch(
-    "vala.datasets.delegated",
+    "bifrost.datasets.delegated",
     valueBatch(arrowSchema, 42n),
   );
 });
@@ -259,7 +259,7 @@ const AttributedRow = z.object({ id: z.bigint(), sub_principal_id: z.string(), a
 test.for(["sub_principal_id", "act_principal_id"])(
   "subject actor rows and reserved columns: %s",
   async (column, { server, reader }) => {
-    const table = `vala.datasets.attributed_${column}`;
+    const table = `bifrost.datasets.attributed_${column}`;
     const permissions = ["bifrost_query:read", "bifrost_record:write", "bifrost_table:read"];
     const a = server.scopedApiKey(`subject_${column}`, permissions);
     const b = server.scopedApiKey(`actor_${column}`, permissions);
@@ -293,7 +293,7 @@ test.for(["sub_principal_id", "act_principal_id"])(
     expect(actor.sub_principal_id).toBe(actor.act_principal_id);
     expect(actor.sub_principal_id).not.toBe(direct.sub_principal_id);
     expect(() =>
-      TableConfig.fromJsonSchema("vala.datasets.spoofed", {
+      TableConfig.fromJsonSchema("bifrost.datasets.spoofed", {
         type: "object",
         properties: { [column]: { type: "string" } },
       }),

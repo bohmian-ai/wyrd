@@ -4036,7 +4036,7 @@ mod tests {
         let tenant = crate::test_support::tenant();
         let mut payload = encode_slice_payload_parts(
             tenant.as_uuid().as_bytes(),
-            "vala.bifrost.invalid/table",
+            "bifrost.bifrost.invalid/table",
             &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
                 2026, 1, 1,
             )),
@@ -4078,7 +4078,7 @@ mod tests {
 
         let payload = encode_slice_payload_parts(
             system.as_bytes(),
-            "vala.bifrost.events",
+            "bifrost.bifrost.events",
             &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
                 2026, 1, 1,
             )),

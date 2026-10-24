@@ -5,7 +5,7 @@
 //! server-owned aggregates over the execution's subject and frozen
 //! `created_at` window, and feeds only those aggregates to the existing
 //! `vala-drift` scorers. The reports become the engine's [`DriftChecks`]. [`ObservationWindow`] renders the fixed SQL: the
-//! canonical `vala.drift.observations` table, the exact subject/series/window
+//! canonical `bifrost.drift.observations` table, the exact subject/series/window
 //! filter, and one method-specific aggregate. The subject UID, feature name,
 //! fitted edges and labels, and window bounds are escaped typed literals; a
 //! Verifier contributes no SQL text.
@@ -76,7 +76,7 @@ pub const DRIFT_INVALID: &str = "drift_invalid";
 pub const BASELINE_LEGACY: &str = "baseline_legacy";
 
 /// Canonical Bifrost table every Drift statement reads.
-const OBSERVATIONS: &str = "vala.drift.observations";
+const OBSERVATIONS: &str = "bifrost.drift.observations";
 /// Aggregate bin of a null or non-finite value: the window is not scorable.
 const INVALID_BIN: i64 = -1;
 /// Part of a combined statement carrying the completeness count; feature
@@ -941,7 +941,7 @@ mod tests {
     //! Proof of the fixed Drift SQL and aggregate folds.
     //!
     //! Every statement is executed by DataFusion over the real
-    //! `vala.drift.observations` schema, so fitted-edge equality, category
+    //! `bifrost.drift.observations` schema, so fitted-edge equality, category
     //! escaping, `[start, end)` exclusion, subject/series isolation, and SPC
     //! observation order are proved on the rendered SQL rather than on its
     //! text. The fold tests pin malformed-aggregate refusal and the
@@ -1066,7 +1066,7 @@ mod tests {
         catalog
             .register_schema("drift", drift)
             .expect("schema registers");
-        context.register_catalog("vala", catalog);
+        context.register_catalog("bifrost", catalog);
         context
             .sql(sql)
             .await
@@ -1446,7 +1446,7 @@ mod tests {
         let psi = vala_drift::fit_psi_baseline(&fitting_batch(1000), &psi_profile, &features)
             .expect("PSI fits");
         let sql = window().psi_statement(&psi).expect("PSI SQL");
-        assert_eq!(sql.matches("vala.drift.observations").count(), 3);
+        assert_eq!(sql.matches("bifrost.drift.observations").count(), 3);
         let fold = || DistributionFold::psi(&psi, &psi_profile);
         assert!(decide(&sql, &complete, fold()).await.is_some());
         assert_eq!(

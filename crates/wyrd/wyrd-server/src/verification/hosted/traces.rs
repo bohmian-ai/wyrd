@@ -1,7 +1,7 @@
 //! Trace evidence read through the execution caller's ordinary Bifrost query.
 //!
 //! [`CallerTraces`] is the engine's [`TraceSource`] for `trace` inputs. Each
-//! fetch is one public query of `vala.traces.spans` under the accepted caller,
+//! fetch is one public query of `bifrost.traces.spans` under the accepted caller,
 //! so Oracle's table authorization, tenancy, and audit decide the read exactly
 //! as for any other query that caller makes.
 
@@ -76,7 +76,7 @@ impl CallerTraces {
     fn statement(&self, trace_id: TraceId) -> String {
         let format = "%Y-%m-%d %H:%M:%S%.6f";
         format!(
-            "SELECT {SPAN_COLUMNS} FROM vala.traces.spans \
+            "SELECT {SPAN_COLUMNS} FROM bifrost.traces.spans \
              WHERE trace_id = X'{}' \
                AND start_time_unix_nano >= TIMESTAMP '{}' \
                AND start_time_unix_nano < TIMESTAMP '{}' \

@@ -2,7 +2,7 @@
 
 Every client resolves the deployment's address and key from the environment
 the session ``WyrdTestServer`` exports; each story writes its own fixed
-``vala.datasets`` table.
+``bifrost.datasets`` table.
 """
 
 import asyncio
@@ -65,27 +65,27 @@ def items(bifrost: Bifrost, table: str) -> list[Item]:
 
 @pytest.fixture(scope="module")
 def inferences(wyrd_server: WyrdTestServer) -> str:
-    """A published ``vala.datasets.inferences`` table holding ``INFERENCES``."""
+    """A published ``bifrost.datasets.inferences`` table holding ``INFERENCES``."""
     schema = Inference.model_json_schema()
-    writer = Bifrost(TableConfig.from_json_schema("vala.datasets.inferences", schema))
+    writer = Bifrost(TableConfig.from_json_schema("bifrost.datasets.inferences", schema))
     assert writer.register() == "created"
     for row in INFERENCES:
         writer.insert(row)
     writer.shutdown()
     # Publish the written rows to the Iceberg table the reads below query.
     wyrd_server.flush_bifrost()
-    return "vala.datasets.inferences"
+    return "bifrost.datasets.inferences"
 
 
 def test_omitted_transport_resolves_from_the_environment(
     wyrd_server: WyrdTestServer, bifrost: Bifrost
 ) -> None:
-    writer = Bifrost(TableConfig(Item, "vala.datasets.resolved"))
+    writer = Bifrost(TableConfig(Item, "bifrost.datasets.resolved"))
     assert writer.register() == "created"
     writer.insert(Item(id=1, value="resolved"))
     writer.shutdown()
     wyrd_server.flush_bifrost()
-    assert items(bifrost, "vala.datasets.resolved") == [Item(id=1, value="resolved")]
+    assert items(bifrost, "bifrost.datasets.resolved") == [Item(id=1, value="resolved")]
 
 
 def test_no_resolvable_credential_raises(
@@ -107,23 +107,23 @@ def test_insert_without_an_active_table_refuses(wyrd_server: WyrdTestServer) -> 
 
 
 def test_recorded_telemetry_row_reads_back(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
-    writer = Bifrost(TableConfig(Item, "vala.datasets.recorded"))
+    writer = Bifrost(TableConfig(Item, "bifrost.datasets.recorded"))
     assert writer.register() == "created"
-    record(writer, "vala.datasets.recorded", Item, Item(id=1, value="recorded"))
+    record(writer, "bifrost.datasets.recorded", Item, Item(id=1, value="recorded"))
     writer.shutdown()
     wyrd_server.flush_bifrost()
     assert writer.dropped == 0
-    assert items(bifrost, "vala.datasets.recorded") == [Item(id=1, value="recorded")]
+    assert items(bifrost, "bifrost.datasets.recorded") == [Item(id=1, value="recorded")]
 
 
 def test_recorded_telemetry_with_an_unmappable_schema_is_refused(bifrost: Bifrost) -> None:
     with pytest.raises(WyrdError) as raised:
-        record(bifrost, "vala.datasets.recorded", {"type": "object"}, {"id": 1})
+        record(bifrost, "bifrost.datasets.recorded", {"type": "object"}, {"id": 1})
     assert raised.value.code == "WYRD_VALA_400_SCHEMA_PARSE"
 
 
 def test_register_insert_flush_and_read(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
-    writer = Bifrost(TableConfig(Item, "vala.datasets.journey"))
+    writer = Bifrost(TableConfig(Item, "bifrost.datasets.journey"))
     assert writer.register() == "created"
     assert writer.register() == "already_exists"
     table = writer.table
@@ -134,23 +134,23 @@ def test_register_insert_flush_and_read(wyrd_server: WyrdTestServer, bifrost: Bi
     writer.insert(Item(id=5, value="fifth"))
     writer.shutdown()
     wyrd_server.flush_bifrost()
-    assert items(bifrost, "vala.datasets.journey") == [
+    assert items(bifrost, "bifrost.datasets.journey") == [
         Item(id=4, value="fourth"),
         Item(id=5, value="fifth"),
     ]
 
 
 def test_swapped_away_table_still_drains(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
-    for table in ("vala.datasets.swap_from", "vala.datasets.swap_to"):
+    for table in ("bifrost.datasets.swap_from", "bifrost.datasets.swap_to"):
         assert Bifrost(TableConfig(Item, table)).register() == "created"
-    writer = Bifrost(TableConfig(Item, "vala.datasets.swap_from"))
+    writer = Bifrost(TableConfig(Item, "bifrost.datasets.swap_from"))
     writer.insert(Item(id=1, value="before"))
-    writer.use_table_by_name("vala.datasets.swap_to")
+    writer.use_table_by_name("bifrost.datasets.swap_to")
     writer.insert(Item(id=2, value="after"))
     writer.shutdown()
     wyrd_server.flush_bifrost()
-    assert items(bifrost, "vala.datasets.swap_from") == [Item(id=1, value="before")]
-    assert items(bifrost, "vala.datasets.swap_to") == [Item(id=2, value="after")]
+    assert items(bifrost, "bifrost.datasets.swap_from") == [Item(id=1, value="before")]
+    assert items(bifrost, "bifrost.datasets.swap_to") == [Item(id=2, value="after")]
 
 
 def test_sql_and_stream_return_the_same_rows(bifrost: Bifrost, inferences: str) -> None:
@@ -163,14 +163,14 @@ def test_sql_and_stream_return_the_same_rows(bifrost: Bifrost, inferences: str) 
 def test_describe_binds_an_existing_table_without_restating_its_schema(
     wyrd_server: WyrdTestServer, bifrost: Bifrost
 ) -> None:
-    assert Bifrost(TableConfig(Item, "vala.datasets.described")).register() == "created"
-    described = TableConfig.describe("vala.datasets.described")
+    assert Bifrost(TableConfig(Item, "bifrost.datasets.described")).register() == "created"
+    described = TableConfig.describe("bifrost.datasets.described")
     assert described.arrow_schema.names == ["id", "value"]
     writer = Bifrost(described)
     writer.insert({"id": 6, "value": "described"})
     writer.shutdown()
     wyrd_server.flush_bifrost()
-    assert items(bifrost, "vala.datasets.described") == [Item(id=6, value="described")]
+    assert items(bifrost, "bifrost.datasets.described") == [Item(id=6, value="described")]
 
 
 @contextmanager
@@ -231,12 +231,12 @@ class Renamed(BaseModel):
 def test_a_binding_replaced_during_its_describe_stays_replaced(
     wyrd_server: WyrdTestServer, bifrost: Bifrost
 ) -> None:
-    table = "vala.datasets.rebound"
+    table = "bifrost.datasets.rebound"
     assert Bifrost(TableConfig(Item, table)).register() == "created"
     described = TableConfig.describe(table)
     arrived, release = threading.Event(), threading.Event()
     with holding_describe(
-        wyrd_server.base_url, "/v1/bifrost/tables/vala.datasets/rebound", arrived, release
+        wyrd_server.base_url, "/v1/bifrost/tables/bifrost.datasets/rebound", arrived, release
     ) as proxy:
         writer = Bifrost(
             TableConfig(Renamed, table),
@@ -262,16 +262,16 @@ def test_a_binding_replaced_during_its_describe_stays_replaced(
 
 
 def test_uncorrelated_row_is_a_valid_write(wyrd_server: WyrdTestServer, bifrost: Bifrost) -> None:
-    writer = Bifrost(TableConfig(Item, "vala.datasets.uncorrelated"))
+    writer = Bifrost(TableConfig(Item, "bifrost.datasets.uncorrelated"))
     assert writer.register() == "created"
     writer.insert(Item(id=8, value="uncorrelated"))
     writer.shutdown()
     wyrd_server.flush_bifrost()
-    assert items(bifrost, "vala.datasets.uncorrelated") == [Item(id=8, value="uncorrelated")]
+    assert items(bifrost, "bifrost.datasets.uncorrelated") == [Item(id=8, value="uncorrelated")]
 
 
 def test_negative_bad_card_uid_raises(wyrd_server: WyrdTestServer) -> None:
-    writer = Bifrost(TableConfig(Item, "vala.datasets.bad_card_uid"))
+    writer = Bifrost(TableConfig(Item, "bifrost.datasets.bad_card_uid"))
     with pytest.raises(WyrdError) as raised:
         writer.insert(Item(id=1, value="bad"), {"card_uid": "not-a-uid"})
     assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
@@ -280,9 +280,9 @@ def test_negative_bad_card_uid_raises(wyrd_server: WyrdTestServer) -> None:
 def test_negative_empty_permissions_denied_rbac_on_write(
     wyrd_server: WyrdTestServer, bifrost: Bifrost
 ) -> None:
-    assert Bifrost(TableConfig(Item, "vala.datasets.denied")).register() == "created"
+    assert Bifrost(TableConfig(Item, "bifrost.datasets.denied")).register() == "created"
     denied = Bifrost(
-        TableConfig(Item, "vala.datasets.denied"),
+        TableConfig(Item, "bifrost.datasets.denied"),
         client=WyrdClient(
             credential=wyrd_server.bootstrap_service([], name="bifrost-write-denied")
         ),
@@ -295,12 +295,12 @@ def test_negative_empty_permissions_denied_rbac_on_write(
     assert unbound.value.code == "WYRD_VALA_412_NO_ACTIVE_TABLE"
     denied.shutdown()
     wyrd_server.flush_bifrost()
-    assert items(bifrost, "vala.datasets.denied") == []
+    assert items(bifrost, "bifrost.datasets.denied") == []
 
 
 def test_registering_a_different_schema_on_one_name_conflicts(wyrd_server: WyrdTestServer) -> None:
-    assert Bifrost(TableConfig(Item, "vala.datasets.conflict")).register() == "created"
-    conflicting = Bifrost(TableConfig(Inference, "vala.datasets.conflict"))
+    assert Bifrost(TableConfig(Item, "bifrost.datasets.conflict")).register() == "created"
+    conflicting = Bifrost(TableConfig(Inference, "bifrost.datasets.conflict"))
     with pytest.raises(WyrdError) as raised:
         conflicting.register()
     assert raised.value.code == "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
@@ -310,7 +310,7 @@ def test_registering_a_different_schema_on_one_name_conflicts(wyrd_server: WyrdT
 
 
 def test_compaction_target_registers_describes_and_conflicts(wyrd_server: WyrdTestServer) -> None:
-    table, target = "vala.datasets.compaction_target", 256 * 1024 * 1024
+    table, target = "bifrost.datasets.compaction_target", 256 * 1024 * 1024
 
     def writer(target_bytes: int | None) -> Bifrost:
         return Bifrost(TableConfig(Item, table, compaction_target_file_size_bytes=target_bytes))
@@ -325,7 +325,7 @@ def test_compaction_target_registers_describes_and_conflicts(wyrd_server: WyrdTe
 
 
 def test_compaction_type_registers_describes_and_conflicts(wyrd_server: WyrdTestServer) -> None:
-    table = "vala.datasets.compaction_type"
+    table = "bifrost.datasets.compaction_type"
 
     def writer(compaction_type: str | None) -> Bifrost:
         return Bifrost(TableConfig(Item, table, compaction_type=compaction_type))
@@ -342,7 +342,7 @@ def test_compaction_type_registers_describes_and_conflicts(wyrd_server: WyrdTest
 @pytest.mark.parametrize(
     "query",
     [
-        pytest.param("DELETE FROM vala.datasets.inferences", id="non-select"),
+        pytest.param("DELETE FROM bifrost.datasets.inferences", id="non-select"),
         pytest.param(f"SELECT 1 -- {'x' * 64 * 1024}", id="oversized"),
         pytest.param("SELECT FROM", id="invalid"),
     ],
@@ -384,7 +384,7 @@ def test_sql_returns_model_instances_when_a_model_is_supplied(
 def test_delegated_client_reads_as_a_and_cannot_write_with_b_authority(
     wyrd_server: WyrdTestServer, bifrost: Bifrost
 ) -> None:
-    assert Bifrost(TableConfig(Item, "vala.datasets.delegated")).register() == "created"
+    assert Bifrost(TableConfig(Item, "bifrost.datasets.delegated")).register() == "created"
     a_key = wyrd_server.scoped_api_key("delegating_reader", ["bifrost_query:read"])
     b_key = wyrd_server.scoped_api_key(
         "delegated_writer", ["bifrost_query:read", "bifrost_record:write", "bifrost_table:read"]
@@ -401,13 +401,13 @@ def test_delegated_client_reads_as_a_and_cannot_write_with_b_authority(
         ),
     )
 
-    assert items(as_a, "vala.datasets.delegated") == []
+    assert items(as_a, "bifrost.datasets.delegated") == []
     with pytest.raises(WyrdError) as raised:
-        as_a.write_batch("vala.datasets.delegated", batch)
+        as_a.write_batch("bifrost.datasets.delegated", batch)
     assert raised.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
-    Bifrost(client=service_b).write_batch("vala.datasets.delegated", batch)
+    Bifrost(client=service_b).write_batch("bifrost.datasets.delegated", batch)
     wyrd_server.flush_bifrost()
-    assert items(bifrost, "vala.datasets.delegated") == [Item(id=1, value="as-a")]
+    assert items(bifrost, "bifrost.datasets.delegated") == [Item(id=1, value="as-a")]
 
 
 class AttributedRow(BaseModel):
@@ -422,7 +422,7 @@ class AttributedRow(BaseModel):
 def test_subject_actor_rows_and_reserved_columns(
     wyrd_server: WyrdTestServer, bifrost: Bifrost, column: str
 ) -> None:
-    table = f"vala.datasets.attributed_{column}"
+    table = f"bifrost.datasets.attributed_{column}"
     permissions: list[str | dict[str, object]] = [
         "bifrost_query:read",
         "bifrost_record:write",
@@ -454,7 +454,7 @@ def test_subject_actor_rows_and_reserved_columns(
     assert actor.sub_principal_id == actor.act_principal_id != direct.sub_principal_id
     with pytest.raises(WyrdError) as declared:
         TableConfig.from_json_schema(
-            "vala.datasets.spoofed", {"type": "object", "properties": {column: {"type": "string"}}}
+            "bifrost.datasets.spoofed", {"type": "object", "properties": {column: {"type": "string"}}}
         )
     assert declared.value.code == "WYRD_VALA_400_BIFROST_RESERVED_COLUMN"
 

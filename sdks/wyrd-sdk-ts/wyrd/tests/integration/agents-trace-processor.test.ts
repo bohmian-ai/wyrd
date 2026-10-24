@@ -206,14 +206,14 @@ async function drift(server: NativeWyrdTestServer, runId: string): Promise<numbe
   server.flushBifrost();
   const reader = await Bifrost.connect({ client: WyrdClient.connect({ credential: server.apiKey }) });
   try {
-    const rows = await reader.sql("SELECT num_value FROM vala.drift.observations WHERE run_id = $1", [runId], Drift);
+    const rows = await reader.sql("SELECT num_value FROM bifrost.drift.observations WHERE run_id = $1", [runId], Drift);
     return rows.map((row) => row.num_value);
   } finally {
     await reader.shutdown();
   }
 }
 
-/** One `vala.drift.observations` value. */
+/** One `bifrost.drift.observations` value. */
 const Drift = z.object({ num_value: z.number() });
 
 /** One turn, then one drift sample submitted through the state's native writer. */

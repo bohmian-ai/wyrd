@@ -10,8 +10,8 @@ import { observedServiceTest as test } from "../support/observed-service.js";
 
 vi.setConfig({ testTimeout: 120_000 });
 
-const ANSWERS = "vala.datasets.observed_answers";
-const SCORES = "vala.datasets.observed_scores";
+const ANSWERS = "bifrost.datasets.observed_answers";
+const SCORES = "bifrost.datasets.observed_scores";
 const VALUE_ROW = { type: "object", properties: { value: { type: "integer" } }, required: ["value"] } as const;
 
 const RecordRow = z.object({ value: z.bigint(), card_uid: z.string() });
@@ -47,12 +47,12 @@ test.for<Refusal>([
   ],
   [
     "record into a built-in table",
-    (state) => state.run("agent").observe.record("vala.drift.observations", { latency: 1 }),
+    (state) => state.run("agent").observe.record("bifrost.drift.observations", { latency: 1 }),
     "WYRD_SDK_400_INVALID_OBSERVATION",
   ],
   [
     "record into an unregistered table",
-    (state) => state.run("agent").observe.record("vala.datasets.never_registered", { value: 1 }),
+    (state) => state.run("agent").observe.record("bifrost.datasets.never_registered", { value: 1 }),
     "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
   ],
   ["view of an unknown alias", (state) => state.run().forCard("missing"), "WYRD_SDK_404_UNKNOWN_ALIAS"],
@@ -87,7 +87,7 @@ test("submitted burst lands every row exactly once", async ({ server, reader, st
   server.flushBifrost();
 
   const perRecord = await reader.sql(
-    `SELECT COUNT(*) AS samples FROM vala.drift.observations WHERE run_id = $1 GROUP BY record_id`,
+    `SELECT COUNT(*) AS samples FROM bifrost.drift.observations WHERE run_id = $1 GROUP BY record_id`,
     [model.runId],
     z.object({ samples: z.bigint() }),
   );

@@ -154,7 +154,7 @@ fn object_not_found(digest: &str) -> WyrdErrorResponse {
 /// and the storage key is derived from that tenant and the canonical digest, so
 /// a digest belonging to another tenant simply resolves to an absent object.
 /// Retrieval requires both tenant-wide `gateway_payload:read` and query access
-/// scoped to this tenant's registered `vala.gateway.calls`, and each decision
+/// scoped to this tenant's registered `bifrost.gateway.calls`, and each decision
 /// is staged on the process audit outbox before the bytes are read. The table
 /// UID is resolved by lookup alone, so a read provisions nothing. Because the
 /// bucket lifecycle owns expiration, a reference can outlive its object; that

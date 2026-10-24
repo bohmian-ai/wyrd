@@ -1542,7 +1542,7 @@ mod tests {
             resource: Resource::BifrostQuery,
             action: Action::Read,
             scope: PermissionScope::Bifrost(BifrostPermissionScope::Schema(BifrostSchemaScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "logs".to_owned(),
             })),
         }
@@ -1554,7 +1554,7 @@ mod tests {
             resource: Resource::BifrostQuery,
             action: Action::Read,
             scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: schema.to_owned(),
                 table_uid: uid,
             })),
@@ -1643,7 +1643,7 @@ mod tests {
                 json!({
                     "resource": "bifrost_query",
                     "action": "read",
-                    "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+                    "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
                 }),
             ),
             (
@@ -1652,7 +1652,7 @@ mod tests {
                     "resource": "bifrost_query",
                     "action": "read",
                     "scope": {"bifrost": {"table": {
-                        "catalog": "vala",
+                        "catalog": "bifrost",
                         "schema": "traces",
                         "table_uid": uid.to_string(),
                     }}}
@@ -1683,7 +1683,7 @@ mod tests {
             resource: Resource::BifrostRecord,
             action: Action::Write,
             scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "gateway".to_owned(),
                 table_uid: uid,
             })),
@@ -1738,7 +1738,7 @@ mod tests {
             let error = serde_json::from_value::<Permission>(json!({
                 "resource": resource,
                 "action": "read",
-                "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+                "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
             }))
             .expect_err("a Bifrost object scope needs a Bifrost object resource");
 
@@ -1761,7 +1761,7 @@ mod tests {
             let error = serde_json::from_value::<Permission>(json!({
                 "resource": "bifrost_query",
                 "action": action,
-                "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+                "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
             }))
             .expect_err("a Bifrost object scope only applies to an exact read");
 
@@ -1771,7 +1771,7 @@ mod tests {
         serde_json::from_value::<Permission>(json!({
             "resource": "bifrost_query",
             "action": "read",
-            "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+            "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
         }))
         .expect("exact query read stays valid for Bifrost scope");
     }
@@ -1784,7 +1784,7 @@ mod tests {
             serde_json::from_value::<Permission>(json!({
                 "resource": "bifrost_query",
                 "action": "read",
-                "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": ""}}}
+                "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": ""}}}
             }))
             .is_err(),
             "an empty schema segment is not an object identity"

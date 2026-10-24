@@ -1,4 +1,4 @@
-//! The `vala.logs.records` bulky-log fixture: deterministic Kubernetes
+//! The `bifrost.logs.records` bulky-log fixture: deterministic Kubernetes
 //! application logs sent through OTLP log ingest.
 //!
 //! Each record is what a cluster's log collector ships for one structured

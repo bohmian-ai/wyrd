@@ -619,7 +619,7 @@ mod tests {
     fn identities() -> (ScribeBatchCommit, ExistingScribeBatchCommit) {
         let commit = ScribeBatchCommit {
             tenant: wyrd_spec::DataTenantId::new_v7(),
-            logical_table_fqn: "vala.bifrost.events".to_owned(),
+            logical_table_fqn: "bifrost.bifrost.events".to_owned(),
             batch_id: uuid::Uuid::now_v7(),
             table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
             slice_set_digest: [7; 32],

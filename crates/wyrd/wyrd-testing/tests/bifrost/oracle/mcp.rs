@@ -256,7 +256,7 @@ mod pg_tests {
                 client
                     .call_tool(
                         CallToolRequestParams::new("bifrost.describe_table").with_arguments(
-                            serde_json::json!({"namespace": "vala.bifrost", "name": table})
+                            serde_json::json!({"namespace": "bifrost.bifrost", "name": table})
                                 .as_object()
                                 .ok_or("describe arguments are an object")?
                                 .clone(),
@@ -279,9 +279,9 @@ mod pg_tests {
         // no path selector of any kind.
         let join_sql = format!(
             "SELECT a.filter_key, COUNT(*) AS matched \
-             FROM vala.bifrost.{0} a \
-             JOIN vala.bifrost.{1} b ON a.filter_key = b.filter_key \
-             JOIN vala.bifrost.{2} c ON a.filter_key = c.filter_key \
+             FROM bifrost.bifrost.{0} a \
+             JOIN bifrost.bifrost.{1} b ON a.filter_key = b.filter_key \
+             JOIN bifrost.bifrost.{2} c ON a.filter_key = c.filter_key \
              GROUP BY a.filter_key ORDER BY a.filter_key",
             tables[0], tables[1], tables[2]
         );
@@ -390,7 +390,7 @@ mod pg_tests {
             ),
             (
                 "unsupported statement",
-                serde_json::json!({"sql": format!("DELETE FROM vala.bifrost.{}", tables[0])}),
+                serde_json::json!({"sql": format!("DELETE FROM bifrost.bifrost.{}", tables[0])}),
                 "WYRD_VALA_400_QUERY_INVALID_SQL",
             ),
             (

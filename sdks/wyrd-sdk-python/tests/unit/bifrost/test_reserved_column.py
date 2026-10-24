@@ -10,5 +10,5 @@ class Reserved(BaseModel):
 
 def test_a_server_owned_column_is_refused_before_any_request() -> None:
     with pytest.raises(WyrdError) as raised:
-        TableConfig(Reserved, "vala.datasets.reserved")
+        TableConfig(Reserved, "bifrost.datasets.reserved")
     assert raised.value.code == "WYRD_VALA_400_BIFROST_RESERVED_COLUMN"

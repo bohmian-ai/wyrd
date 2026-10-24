@@ -81,7 +81,7 @@ test("ambient connect opens every handle", async ({ server }) => {
       await expect(call(), name).resolves.toBeDefined();
     }
     const bound = await Bifrost.connect({
-      table: TableConfig.fromJsonSchema("vala.datasets.ambient_options", z.object({ id: z.int() })),
+      table: TableConfig.fromJsonSchema("bifrost.datasets.ambient_options", z.object({ id: z.int() })),
       clientByteLimitBytes: 8 * 1024 * 1024,
     });
     expect(["created", "already_exists"]).toContain(await bound.register());
@@ -137,13 +137,13 @@ test("delegated connect uses the subject principal", async ({ server }) => {
 
   const asSubject = await Bifrost.connect({ client: delegated });
   await expect(asSubject.listTables()).rejects.toMatchObject(DENIED);
-  await asSubject.sql("SELECT COUNT(*) AS n FROM vala.system.audit_log");
+  await asSubject.sql("SELECT COUNT(*) AS n FROM bifrost.system.audit_log");
   const asActor = await Bifrost.connect({ client: actor });
   await expect(asActor.listTables()).resolves.toBeDefined();
 
   server.flushBifrost();
   const decisions = await asActor.sql(
-    "SELECT act_principal_id FROM vala.system.audit_log WHERE operation = 'bifrost.query.read_decision' AND sub_principal_id = $1",
+    "SELECT act_principal_id FROM bifrost.system.audit_log WHERE operation = 'bifrost.query.read_decision' AND sub_principal_id = $1",
     [subjectId ?? ""],
     z.object({ act_principal_id: z.string() }),
   );
@@ -174,24 +174,24 @@ test("handles reuse the client cache and renew", async ({ server }) => {
 
 test("Bifrost lists tables and describes schemas on demand", async ({ server }) => {
   const own = await Bifrost.connect({
-    table: TableConfig.fromJsonSchema("vala.datasets.listed", z.object({ id: z.int(), label: z.string() })),
+    table: TableConfig.fromJsonSchema("bifrost.datasets.listed", z.object({ id: z.int(), label: z.string() })),
   });
   await own.register();
   const foreign = await Bifrost.connect({
     client: WyrdClient.connect({
       credential: server.bootstrapServiceInTenant(server.seedTenant("listing-tenant"), ["admin"], "listing-admin"),
     }),
-    table: TableConfig.fromJsonSchema("vala.datasets.foreign_listed", z.object({ id: z.int() })),
+    table: TableConfig.fromJsonSchema("bifrost.datasets.foreign_listed", z.object({ id: z.int() })),
   });
   await foreign.register();
 
   const listed = (await own.listTables()).map((entry) => `${entry.namespace}.${entry.name}`);
 
-  expect(listed).toContain("vala.datasets.listed");
-  expect(listed).toContain("vala.drift.observations");
-  expect(listed).not.toContain("vala.datasets.foreign_listed");
+  expect(listed).toContain("bifrost.datasets.listed");
+  expect(listed).toContain("bifrost.drift.observations");
+  expect(listed).not.toContain("bifrost.datasets.foreign_listed");
   const unreadable = WyrdClient.connect({ credential: server.scopedApiKey("no_table_read", ["bifrost_query:read"]) });
   await expect((await Bifrost.connect({ client: unreadable })).listTables()).rejects.toMatchObject(DENIED);
-  const described = await own.describeTable("vala.datasets", "listed");
+  const described = await own.describeTable("bifrost.datasets", "listed");
   expect(described.user_fields.map((field) => field.name)).toEqual(["id", "label"]);
 });

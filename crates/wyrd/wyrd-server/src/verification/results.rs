@@ -1,9 +1,9 @@
 //! Arrow payloads for one Verifier execution: pure mapping, no transport.
 //!
 //! [`ResultPayloadBuilder`] maps one engine [`VerificationOutcome`] onto the
-//! authored schemas of `vala.verification.results` and
-//! `vala.drift.result_features`, and the execution's pinned inputs onto
-//! `vala.verification.execution_inputs`, taken from the tables' own declarations so
+//! authored schemas of `bifrost.verification.results` and
+//! `bifrost.drift.result_features`, and the execution's pinned inputs onto
+//! `bifrost.verification.execution_inputs`, taken from the tables' own declarations so
 //! the payload can never drift from the registered contract. Every batch also
 //! carries the two correlation columns Scribe admits from a native payload:
 //! `card_uid` (the Card verified; the Verifier is the authored
@@ -103,7 +103,7 @@ static SCHEMAS: LazyLock<[(TypeId, SchemaRef); 3]> = LazyLock::new(|| {
 /// One sealed-ready batch and the table it is written to.
 #[derive(Debug, Clone)]
 pub struct ResultBatch {
-    /// Fully qualified destination table, such as `vala.verification.results`.
+    /// Fully qualified destination table, such as `bifrost.verification.results`.
     pub table: String,
     /// The rows, including the correlation columns.
     pub batch: RecordBatch,
@@ -191,7 +191,7 @@ pub struct ResultRun<'a> {
     pub window: Option<&'a DriftWindow>,
 }
 
-/// One `vala.drift.result_features` row before encoding.
+/// One `bifrost.drift.result_features` row before encoding.
 struct DriftRow<'r> {
     /// The drift requirement that scored the feature.
     requirement: &'r str,
@@ -271,7 +271,7 @@ impl<'a> ResultPayloadBuilder<'a> {
         })
     }
 
-    /// Author the named columns of the one `vala.verification.results` row
+    /// Author the named columns of the one `bifrost.verification.results` row
     /// identified by `result_id`.
     ///
     /// The outcome is serialized straight to JSON text for the one Variant
@@ -331,7 +331,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     }
 
     /// Map the execution's pinned `inputs` to its one
-    /// `vala.verification.execution_inputs` row, recorded at `started_at`.
+    /// `bifrost.verification.execution_inputs` row, recorded at `started_at`.
     ///
     /// A `submission` marks the row `queue_execution` and records its
     /// accepted request context — route overrides, idempotency key and
@@ -401,7 +401,7 @@ impl<'a> ResultPayloadBuilder<'a> {
         ])
     }
 
-    /// Author the named `vala.drift.result_features` columns: one row per
+    /// Author the named `bifrost.drift.result_features` columns: one row per
     /// scored feature of every drift requirement, each keyed by `result_id`.
     ///
     /// A row's window is its requirement's scored window, else the
@@ -527,7 +527,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             .map(|(_, schema)| Arc::clone(schema))
             .expect("every result table has a shared schema");
         Ok(ResultBatch {
-            table: format!("vala.{}.{}", T::NAMESPACE, T::NAME),
+            table: format!("bifrost.{}.{}", T::NAMESPACE, T::NAME),
             batch: self.assemble(schema, columns)?,
         })
     }
@@ -625,8 +625,8 @@ fn serialized_name<T: Serialize>(value: &T) -> Result<Option<String>, JsonError>
 }
 
 /// The stored value of a Drift feature verdict: the snake_case spelling the
-/// published `vala.drift.result_features.verdict` column carries, matching
-/// `vala.verification.results.verdict`.
+/// published `bifrost.drift.result_features.verdict` column carries, matching
+/// `bifrost.verification.results.verdict`.
 const fn drift_verdict(verdict: DriftVerdict) -> &'static str {
     match verdict {
         DriftVerdict::NoDrift => "no_drift",
@@ -821,8 +821,8 @@ mod tests {
         let [features, summary] = payload.batches() else {
             panic!("features then summary");
         };
-        assert_eq!(features.table, "vala.drift.result_features");
-        assert_eq!(summary.table, "vala.verification.results");
+        assert_eq!(features.table, "bifrost.drift.result_features");
+        assert_eq!(summary.table, "bifrost.verification.results");
         let rows = &features.batch;
         assert_eq!(rows.num_rows(), 2);
         for row in 0..2 {

@@ -172,7 +172,7 @@ async fn startup_image_write() {
         .expect("register a Card with a local artifact through nginx");
     let card_uid = receipt.root.uid.expect("registered root carries its uid");
 
-    let fqn = format!("vala.datasets.startup_{}", uuid::Uuid::now_v7().simple());
+    let fqn = format!("bifrost.datasets.startup_{}", uuid::Uuid::now_v7().simple());
     let bifrost = Bifrost::connect_with(
         &client,
         BifrostOptions {
@@ -323,7 +323,7 @@ async fn insert_ids(client: &WyrdClient, fqn: &str, ids: std::ops::RangeInclusiv
 #[ignore = "run by scripts/server/test-kind-autoscale.sh against a kind cluster"]
 async fn kind_seed() {
     let client = env_client();
-    let fqn = format!("vala.datasets.kind_{}", uuid::Uuid::now_v7().simple());
+    let fqn = format!("bifrost.datasets.kind_{}", uuid::Uuid::now_v7().simple());
     insert_ids(&client, &fqn, 1..=4).await;
     let bifrost = Bifrost::connect_with(
         &client,

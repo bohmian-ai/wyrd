@@ -245,7 +245,7 @@ mod tests {
                 tenant,
                 table_uid: [1; 16],
                 catalog_name: crate::catalog::BIFROST_CATALOG_NAME.to_owned(),
-                namespace_name: "vala.events".to_owned(),
+                namespace_name: "bifrost.events".to_owned(),
                 table_name: table.to_owned(),
             },
             metadata_location: format!("s3://w/{table}/v1.metadata.json"),
@@ -266,11 +266,11 @@ mod tests {
         let cache = CutCache::default();
         let tenant = DataTenantId::new(Uuid::now_v7()).expect("tenant");
         let events = CutTableRef {
-            namespace_name: "vala.events",
+            namespace_name: "bifrost.events",
             table_name: "events",
         };
         let other = CutTableRef {
-            namespace_name: "vala.events",
+            namespace_name: "bifrost.events",
             table_name: "other",
         };
         let start = Instant::now();
@@ -300,7 +300,7 @@ mod tests {
             "read before the bound"
         );
 
-        cache.invalidate(&format!("{}|vala.events|events", tenant.as_uuid()));
+        cache.invalidate(&format!("{}|bifrost.events|events", tenant.as_uuid()));
         assert!(
             cache.get(tenant, &[events], None).is_none(),
             "named table dropped"

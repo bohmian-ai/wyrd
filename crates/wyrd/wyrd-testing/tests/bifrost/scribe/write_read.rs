@@ -133,7 +133,7 @@ async fn assert_canonical_genai_span_is_tenant_isolated(server: &wyrd_testing::W
     /// The fixed event-time anchor every canonical fixture row is written at.
     const ANCHOR: i64 = 1_760_000_000_000_000_000;
     /// The canonical span ledger both tenants provision and read.
-    const SPANS: &str = "vala.traces.spans";
+    const SPANS: &str = "bifrost.traces.spans";
 
     let tenant = server.data_tenant_id();
     server
@@ -1632,7 +1632,7 @@ async fn mixed_runtime_specifications_preserve_rows_and_pins() {
     assert_mixed_reads(&client, &table, "published").await;
 
     let described = wyrd_client::Bifrost::query_only(&client)
-        .describe_table("vala.datasets", &name)
+        .describe_table("bifrost.datasets", &name)
         .await
         .expect("the evolved table describes");
     let spec_revision = wyrd_spec::vala::ids::TableVersion::INITIAL

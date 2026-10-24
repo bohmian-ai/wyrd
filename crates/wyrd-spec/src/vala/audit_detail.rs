@@ -1096,7 +1096,7 @@ mod tests {
         let detail = AuditDetail::Ingest {
             origin,
             batch_id: BatchId::new("batch-1").expect("valid batch id"),
-            table: BifrostTableName::new("vala.events"),
+            table: BifrostTableName::new("bifrost.events"),
             record_count: 2,
             outcome: AuditOutcome::Allowed,
         };
@@ -1315,7 +1315,7 @@ mod tests {
                     "kind": "ingest",
                     "origin": {"repo": "github.com/bohmian-ai/wyrd", "commit": "0123456", "dirty": false},
                     "batch_id": value,
-                    "table": "vala.events",
+                    "table": "bifrost.events",
                     "record_count": 1,
                     "outcome": "allowed"
                 }),
@@ -1364,8 +1364,8 @@ mod tests {
                 r#"{"backend":"s3","error_code":null,"kind":"storage","operation":"complete","status_code":200,"storage_path":"cards/a","upload_id":null}"#,
             ),
             (
-                r#"{"record_count":2,"table":"vala.events","outcome":"allowed","batch_id":"batch-1","origin":{"dirty":false,"path":"cards/agent.yaml","commit":"0123456","repo":"github.com/bohmian-ai/wyrd"},"kind":"ingest"}"#,
-                r#"{"batch_id":"batch-1","kind":"ingest","origin":{"commit":"0123456","path":"cards/agent.yaml","repo":"github.com/bohmian-ai/wyrd"},"outcome":"allowed","record_count":2,"table":"vala.events"}"#,
+                r#"{"record_count":2,"table":"bifrost.events","outcome":"allowed","batch_id":"batch-1","origin":{"dirty":false,"path":"cards/agent.yaml","commit":"0123456","repo":"github.com/bohmian-ai/wyrd"},"kind":"ingest"}"#,
+                r#"{"batch_id":"batch-1","kind":"ingest","origin":{"commit":"0123456","path":"cards/agent.yaml","repo":"github.com/bohmian-ai/wyrd"},"outcome":"allowed","record_count":2,"table":"bifrost.events"}"#,
             ),
         ];
 
@@ -1381,7 +1381,7 @@ mod tests {
             RequestId::now_v7(),
             None,
             "bifrost.ingest".to_owned(),
-            "vala.events".to_owned(),
+            "bifrost.events".to_owned(),
             None,
             crate::auth::Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
             PrincipalKindTag::User,

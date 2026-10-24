@@ -1144,13 +1144,13 @@ mod tests {
                 {
                     "resource": "bifrost_query",
                     "action": "read",
-                    "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+                    "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
                 },
                 {
                     "resource": "bifrost_query",
                     "action": "read",
                     "scope": {"bifrost": {"table": {
-                        "catalog": "vala",
+                        "catalog": "bifrost",
                         "schema": "traces",
                         "table_uid": uid.to_string(),
                     }}}
@@ -1162,14 +1162,14 @@ mod tests {
         assert_eq!(set.len(), 2);
         assert!(set.contains(&scoped_query_read(PermissionScope::Bifrost(
             BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "logs".to_owned(),
                 table_uid: Uuid::now_v7(),
             })
         ))));
         assert!(set.contains(&scoped_query_read(PermissionScope::Bifrost(
             BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "traces".to_owned(),
                 table_uid: uid,
             })
@@ -1201,7 +1201,7 @@ mod tests {
                     json!([{
                         "resource": "bifrost_query",
                         "action": action,
-                        "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+                        "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
                     }]),
                 )],
                 "corrupt_analyst",

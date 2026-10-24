@@ -1,7 +1,7 @@
 //! Verifier-shared Bifrost tables.
 //!
-//! `vala.verification.results` is the one result surface every Verifier
-//! execution writes; `vala.verification.execution_inputs` pins each
+//! `bifrost.verification.results` is the one result surface every Verifier
+//! execution writes; `bifrost.verification.execution_inputs` pins each
 //! execution's named inputs and a queued execution's accepted request context.
 
 mod execution_inputs;

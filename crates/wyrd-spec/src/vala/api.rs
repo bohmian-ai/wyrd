@@ -2788,7 +2788,7 @@ mod bifrost_wire_tests {
     #[test]
     fn bifrost_wire_register_request_omits_physical_layout() {
         let req: RegisterTableRequest =
-            serde_json::from_str(r#"{"namespace":"vala.bifrost","name":"events","fields":[]}"#)
+            serde_json::from_str(r#"{"namespace":"bifrost.bifrost","name":"events","fields":[]}"#)
                 .expect("deserialize");
         assert!(req.physical_layout.is_none());
         let json = serde_json::to_string(&req).expect("serialize");
@@ -2804,7 +2804,7 @@ mod bifrost_wire_tests {
     #[test]
     fn bifrost_wire_register_request_keeps_explicit_empty_layout_lists() {
         let req: RegisterTableRequest = serde_json::from_str(
-            r#"{"namespace":"vala.bifrost","name":"events","fields":[],
+            r#"{"namespace":"bifrost.bifrost","name":"events","fields":[],
                 "physical_layout":{"partition_by":[],
                 "sort_keys":[],"bloom_columns":[]}}"#,
         )
@@ -2828,19 +2828,19 @@ mod bifrost_wire_tests {
     #[test]
     fn bifrost_wire_register_request_carries_hyphenated_compaction_type() {
         let req: RegisterTableRequest = serde_json::from_str(
-            r#"{"namespace":"vala.datasets","name":"events","fields":[],
+            r#"{"namespace":"bifrost.datasets","name":"events","fields":[],
                 "compaction_type":"small-files"}"#,
         )
         .expect("deserialize");
         assert_eq!(req.compaction_type, Some(CompactionTypeWire::SmallFiles));
         bifrost_wire_round_trip(&req);
         let omitted: RegisterTableRequest =
-            serde_json::from_str(r#"{"namespace":"vala.datasets","name":"events","fields":[]}"#)
+            serde_json::from_str(r#"{"namespace":"bifrost.datasets","name":"events","fields":[]}"#)
                 .expect("deserialize");
         assert_eq!(omitted.compaction_type, None);
         assert!(
             serde_json::from_str::<RegisterTableRequest>(
-                r#"{"namespace":"vala.datasets","name":"events","fields":[],
+                r#"{"namespace":"bifrost.datasets","name":"events","fields":[],
                     "compaction_type":"small_files"}"#,
             )
             .is_err()
@@ -2989,7 +2989,7 @@ mod bifrost_wire_tests {
     #[test]
     fn bifrost_wire_table_entry_and_description_round_trip() {
         let entry = BifrostTableEntry {
-            namespace: "vala.bifrost".to_string(),
+            namespace: "bifrost.bifrost".to_string(),
             name: "events".to_string(),
             table_uid: "ab".repeat(16),
             status: TableStatus::Active,

@@ -1,6 +1,6 @@
 """Declare the Cards in ``service/`` and download them into ``.wyrd-bundle``.
 
-Registering the Service creates its ``vala.datasets.tickets`` table. A
+Registering the Service creates its ``bifrost.datasets.tickets`` table. A
 repeat deploy replaces the bundle only once the new pull is complete, so a
 refused pull keeps the previous one. The script also turns on gateway call
 metadata capture, so every model call is recorded with its Run.

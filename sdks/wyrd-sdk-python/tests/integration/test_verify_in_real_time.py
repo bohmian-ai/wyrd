@@ -88,8 +88,8 @@ def result_with_its_judge_calls(
             "SELECT r.sub_principal_id AS result_subject, r.act_principal_id AS result_actor, "
             "r.run_id AS result_run, c.sub_principal_id AS call_subject, "
             "c.act_principal_id AS call_actor, c.run_id AS call_run "
-            "FROM vala.verification.results r "
-            "JOIN vala.gateway.calls c ON c.card_uid = r.card_uid "
+            "FROM bifrost.verification.results r "
+            "JOIN bifrost.gateway.calls c ON c.card_uid = r.card_uid "
             f"WHERE r.execution_id = $1 AND {on} = $2",
             [execution_id, value],
         )
@@ -182,7 +182,7 @@ def test_judge_call_is_attributed_to_the_run_and_card(
     caller = principal()
     calls = (
         bifrost.sql(
-            "SELECT sub_principal_id, act_principal_id, card_uid FROM vala.gateway.calls "
+            "SELECT sub_principal_id, act_principal_id, card_uid FROM bifrost.gateway.calls "
             "WHERE run_id = $1",
             [run.run_id],
         )
@@ -214,7 +214,7 @@ def test_judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
     call_id = attempt["attributes"]["gateway_call_id"]
     [call] = (
         bifrost.sql(
-            "SELECT sub_principal_id, run_id, card_uid FROM vala.gateway.calls WHERE call_id = $1",
+            "SELECT sub_principal_id, run_id, card_uid FROM bifrost.gateway.calls WHERE call_id = $1",
             [call_id],
         )
         .to_arrow()
@@ -410,7 +410,7 @@ def test_retired_verification_contracts_are_refused(
             state.run("agent").observe.verify("answer-check", "yes")
         assert raised.value.code == "WYRD_PERMISSION_500_ROLE_CORRUPT", action
 
-    assert all(table["namespace"] != "vala.eval" for table in bifrost.list_tables())
+    assert all(table["namespace"] != "bifrost.eval" for table in bifrost.list_tables())
 
     def refusals(namespace: str, name: str) -> list[str]:
         codes = []
@@ -425,8 +425,8 @@ def test_retired_verification_contracts_are_refused(
         return codes
 
     for name in ["result_items", "observations"]:
-        assert refusals("vala.eval", name) == refusals("vala.absent", name), name
-    bifrost.sql("SELECT COUNT(*) AS n FROM vala.verification.results")
+        assert refusals("bifrost.eval", name) == refusals("bifrost.absent", name), name
+    bifrost.sql("SELECT COUNT(*) AS n FROM bifrost.verification.results")
 
 
 def test_exact_verifier_grant_verifies_only_that_verifier(
@@ -595,7 +595,7 @@ def test_grouped_refund_changes_verdict(
     history = (
         Bifrost(client=admin)
         .sql(
-            "SELECT execution_id, result_id, verdict FROM vala.verification.results "
+            "SELECT execution_id, result_id, verdict FROM bifrost.verification.results "
             "WHERE binding_id = $1 ORDER BY ended_at",
             [binding_id],
         )
@@ -893,7 +893,7 @@ def group_executions(server: WyrdTestServer, binding_id: str, groups: list[str])
     """The executions of ``binding_id``'s retained executions of ``groups``, oldest first."""
     server.flush_bifrost()
     rows = Bifrost(client=client_of(server)).sql(
-        "SELECT execution_id FROM vala.verification.results "
+        "SELECT execution_id FROM bifrost.verification.results "
         "WHERE binding_id = $1 AND group_id IN ($2, $3) ORDER BY ended_at",
         [binding_id, *groups],
         model=Retained,
@@ -977,7 +977,7 @@ def test_grouped_conversations_coexist_with_drift(
         b: (2, {"kind": "json", "value": [turn("b1"), turn("")]}, "failed"),
     }, "each conversation judges only its own pinned turns"
     ungrouped = Bifrost(client=admin).sql(
-        "SELECT execution_id FROM vala.verification.results "
+        "SELECT execution_id FROM bifrost.verification.results "
         "WHERE execution_id = $1 AND group_id IS NULL",
         [solo.execution_id],
         model=Retained,
@@ -1093,6 +1093,6 @@ def test_verification_staging_refuses_and_recovers(tmp_path: Path) -> None:
 
         server.flush_bifrost()
         rows = Bifrost(client=client_of(server)).sql(
-            "SELECT count(*) AS n FROM vala.verification.execution_inputs", model=Count
+            "SELECT count(*) AS n FROM bifrost.verification.execution_inputs", model=Count
         )
         assert [row.n for row in rows] == [4 + offered]

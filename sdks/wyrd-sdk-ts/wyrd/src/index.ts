@@ -1484,7 +1484,7 @@ export class Bifrost {
   /**
    * Describe one registered table's stored physical schema.
    *
-   * @param namespace - The table's namespace, such as `vala.datasets`.
+   * @param namespace - The table's namespace, such as `bifrost.datasets`.
    * @param name - The table's name within `namespace`.
    * @returns The server's projection of the stored schema.
    * @throws {@link WyrdError} when the table is unknown or unauthorized, or
@@ -1497,7 +1497,7 @@ export class Bifrost {
   /**
    * Edit one registered table's layout or custom columns.
    *
-   * @param namespace - The table's namespace, such as `vala.datasets`.
+   * @param namespace - The table's namespace, such as `bifrost.datasets`.
    * @param name - The table's name within `namespace`.
    * @param alteration - The edit and the table version it was built from.
    * @returns The server's projection of the committed table version.
@@ -2493,14 +2493,14 @@ export class Observe {
   }
 
   /**
-   * Emit one row into a registered `vala.datasets.<name>` table.
+   * Emit one row into a registered `bifrost.datasets.<name>` table.
    *
    * The first call for a table describes it; later calls reuse the cached
    * schema and producer, so only the first awaits a lookup.
    *
-   * @param table - The table's `vala.datasets.<name>`.
+   * @param table - The table's `bifrost.datasets.<name>`.
    * @param row - One JSON row matching the table's columns.
-   * @throws a {@link WyrdError} for a table outside `vala.datasets`, an unknown
+   * @throws a {@link WyrdError} for a table outside `bifrost.datasets`, an unknown
    * or unauthorized table, before startup, or after shutdown.
    */
   async record(table: string, row: unknown): Promise<void> {
@@ -3148,7 +3148,7 @@ export class WyrdState {
   /**
    * Connect this state's one Bifrost writer and describe the fixed table.
    *
-   * Runs as the state's client. Startup describes `vala.drift.observations`
+   * Runs as the state's client. Startup describes `bifrost.drift.observations`
    * before resolving, so submitted samples can never enqueue against a
    * missing, unauthorized, or incompatible system table.
    *

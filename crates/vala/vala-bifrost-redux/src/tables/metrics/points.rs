@@ -1,4 +1,4 @@
-//! `vala.metrics.points` — the sole canonical durable table for the `OTLP`
+//! `bifrost.metrics.points` — the sole canonical durable table for the `OTLP`
 //! metric signal.
 //!
 //! [`METRIC_FIELDS`] is the table's ledger. One row is one data point of one
@@ -98,7 +98,7 @@ pub static EXEMPLAR_ELEMENT: F = F::sensitive(
     false,
 );
 
-/// The canonical `vala.metrics.points` ledger.
+/// The canonical `bifrost.metrics.points` ledger.
 ///
 /// Every kind-specific column is nullable because a point of another kind does not
 /// own it; the projector, not nullability, is what forbids a point from

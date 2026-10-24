@@ -1,4 +1,4 @@
-//! `vala.verification.results` — one row per produced Verifier result payload.
+//! `bifrost.verification.results` — one row per produced Verifier result payload.
 //!
 //! Owns the canonical result schema, its sensitive `outcome` Variant, and the
 //! Bloom columns a result lookup by id, execution, Verifier, or binding prunes
@@ -12,7 +12,7 @@ use crate::tables::fields::{ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-/// `vala.verification.results` — one row per produced Verifier result payload.
+/// `bifrost.verification.results` — one row per produced Verifier result payload.
 ///
 /// Every Verifier writes this one surface whatever its checks, so a dashboard
 /// reads one result contract. Each payload carries its own `result_id`, and
@@ -42,9 +42,9 @@ pub struct ResultsTable;
 pub const OUTCOME: &str = "outcome";
 
 impl DomainTable for ResultsTable {
-    /// Lives in `vala.verification`, the namespace the catalog registers it under.
+    /// Lives in `bifrost.verification`, the namespace the catalog registers it under.
     const NAMESPACE: &'static str = "verification";
-    /// Table segment of the fixed `vala.verification.results` FQN.
+    /// Table segment of the fixed `bifrost.verification.results` FQN.
     const NAME: &'static str = "results";
     /// The server appends and stamps the managed application `run_id`, verified `card_uid`, and subject/actor pair.
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;

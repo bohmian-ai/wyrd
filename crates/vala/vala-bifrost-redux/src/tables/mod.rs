@@ -177,7 +177,7 @@ pub(crate) fn hourly_test_layout(
     schema: &arrow::datatypes::Schema,
 ) -> crate::catalog::PhysicalLayout {
     crate::catalog::PhysicalLayout::resolve(
-        "vala.bifrost.test",
+        "bifrost.bifrost.test",
         schema,
         Some(&hourly_layout(
             "event_time",
@@ -1215,7 +1215,7 @@ pub fn builtin_table(namespace: &str, name: &str) -> Option<&'static BuiltinTabl
 pub fn builtin_fqns() -> Vec<String> {
     BUILTIN_TABLES
         .iter()
-        .map(|definition| format!("vala.{}.{}", definition.namespace, definition.name))
+        .map(|definition| format!("bifrost.{}.{}", definition.namespace, definition.name))
         .collect()
 }
 
@@ -1277,13 +1277,13 @@ mod tests {
         ] {
             assert!(
                 builtin_table(namespace, name).is_none(),
-                "the removed vala.{namespace}.{name} table must not resolve"
+                "the removed bifrost.{namespace}.{name} table must not resolve"
             );
         }
         let fqns = builtin_fqns();
         assert_eq!(BUILTIN_TABLES.len(), fqns.len());
         assert!(
-            !fqns.iter().any(|fqn| fqn.starts_with("vala.genai.")),
+            !fqns.iter().any(|fqn| fqn.starts_with("bifrost.genai.")),
             "no GenAI namespace table remains: {fqns:?}"
         );
     }
@@ -1353,7 +1353,7 @@ mod tests {
     fn every_builtin_partitions_and_sorts_on_its_time_column() {
         let otlp_instant = DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("+00:00".into()));
         for definition in builtin_tables() {
-            let fqn = format!("vala.{}.{}", definition.namespace, definition.name);
+            let fqn = format!("bifrost.{}.{}", definition.namespace, definition.name);
             let (column, transform) = match (definition.namespace, definition.name) {
                 ("traces", "spans") => ("start_time_unix_nano", PartitionTransformWire::Hour),
                 ("metrics", "points") | ("logs", "records") => {
@@ -1576,11 +1576,11 @@ mod tests {
                 blooms,
             } = contract;
             let definition = builtin_table(namespace, name)
-                .unwrap_or_else(|| panic!("vala.{namespace}.{name} is a registered built-in"));
+                .unwrap_or_else(|| panic!("bifrost.{namespace}.{name} is a registered built-in"));
             assert_eq!(
                 (definition.arrow_fields)(),
                 columns,
-                "vala.{namespace}.{name} authored columns, order, types, and nullability"
+                "bifrost.{namespace}.{name} authored columns, order, types, and nullability"
             );
             let mut physical = columns.clone();
             physical.extend(verification_managed_envelope());
@@ -1591,22 +1591,22 @@ mod tests {
                     .map(|field| field.as_ref().clone())
                     .collect::<Vec<_>>(),
                 physical,
-                "vala.{namespace}.{name} complete physical schema"
+                "bifrost.{namespace}.{name} complete physical schema"
             );
             assert_eq!(
                 definition.correlation_policy,
                 CorrelationPolicy::Observation,
-                "vala.{namespace}.{name} appends run_id, card_uid, and the subject/actor pair"
+                "bifrost.{namespace}.{name} appends run_id, card_uid, and the subject/actor pair"
             );
 
             let layout = (definition.physical_layout)();
             assert_eq!(
                 crate::catalog::TimeAxis::of_wire(&layout).granularity(),
                 crate::catalog::layout::TimeGranularity::Day,
-                "vala.{namespace}.{name} partitions by UTC day"
+                "bifrost.{namespace}.{name} partitions by UTC day"
             );
             let canonical = crate::catalog::layout::PhysicalLayout::resolve(
-                &format!("vala.{namespace}.{name}"),
+                &format!("bifrost.{namespace}.{name}"),
                 &(definition.schema)(),
                 Some(&layout),
             )
@@ -1614,7 +1614,7 @@ mod tests {
             assert_eq!(
                 canonical.bloom_columns(),
                 blooms.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>(),
-                "vala.{namespace}.{name} resolves exactly its declared Bloom set"
+                "bifrost.{namespace}.{name} resolves exactly its declared Bloom set"
             );
         }
     }
@@ -1642,7 +1642,7 @@ mod tests {
             for column in forbidden {
                 assert!(
                     !authored.iter().any(|name| name == column),
-                    "vala.{namespace}.observations authors no {column}: {authored:?}"
+                    "bifrost.{namespace}.observations authors no {column}: {authored:?}"
                 );
             }
         }
@@ -1670,7 +1670,7 @@ mod tests {
     /// Panics when any built-in violates one of those invariants.
     fn assert_builtin_layouts_are_canonical_fixed_points() {
         for definition in builtin_tables() {
-            let fqn = format!("vala.{}.{}", definition.namespace, definition.name);
+            let fqn = format!("bifrost.{}.{}", definition.namespace, definition.name);
             let schema = (definition.schema)();
             let declared = (definition.physical_layout)();
             let canonical =
@@ -2860,10 +2860,10 @@ mod tests {
             for column in variants {
                 let field = schema
                     .field_with_name(column)
-                    .unwrap_or_else(|_| panic!("vala.{namespace}.{name}.{column} exists"));
+                    .unwrap_or_else(|_| panic!("bifrost.{namespace}.{name}.{column} exists"));
                 assert!(
                     is_variant(field),
-                    "vala.{namespace}.{name}.{column} is Variant"
+                    "bifrost.{namespace}.{name}.{column} is Variant"
                 );
             }
             if matches!(namespace, "traces" | "logs" | "metrics") {
@@ -2878,7 +2878,7 @@ mod tests {
                         false,
                     )]),
                     &Fields::from(vec![refs.clone()]),
-                    &format!("vala.{namespace}.{name}.resource_entity_refs"),
+                    &format!("bifrost.{namespace}.{name}.resource_entity_refs"),
                 );
                 let DataType::List(element) = refs.data_type() else {
                     panic!("resource_entity_refs is a list");

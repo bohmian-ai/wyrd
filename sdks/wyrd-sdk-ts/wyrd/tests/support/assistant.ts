@@ -44,7 +44,7 @@ export function toolTurn(calls: readonly unknown[]): Reply {
   };
 }
 
-/** One judge call's `vala.gateway.calls` identity and attribution. */
+/** One judge call's `bifrost.gateway.calls` identity and attribution. */
 export const JudgeCall = z.object({
   call_id: z.string(),
   sub_principal_id: z.string(),
@@ -73,7 +73,7 @@ export function assistantAs(assistant: Assistant, client: WyrdClient): WyrdState
 export async function judgeCalls(server: { flushBifrost(): void }): Promise<z.infer<typeof JudgeCall>[]> {
   server.flushBifrost();
   return (await Bifrost.connect()).sql(
-    "SELECT call_id, sub_principal_id, act_principal_id, run_id, card_uid FROM vala.gateway.calls",
+    "SELECT call_id, sub_principal_id, act_principal_id, run_id, card_uid FROM bifrost.gateway.calls",
     [],
     JudgeCall,
   );

@@ -3,7 +3,7 @@
 //! with the `support/policy-check` Verifier.
 //!
 //! [`deploy`] declares the checked-in Cards under `service/`, which ensures
-//! the declared `vala.datasets.tickets` table, turns on metadata capture, and
+//! the declared `bifrost.datasets.tickets` table, turns on metadata capture, and
 //! checks the Agent's model is deployed. [`serve`] answers every question in
 //! its own Agent Run with [`answer`], which calls the model through the Wyrd
 //! gateway, and submits each answer for a background policy check.
@@ -74,7 +74,7 @@ pub struct Served {
     pub execution_id: ExecutionId,
 }
 
-/// One `vala.datasets.tickets` row.
+/// One `bifrost.datasets.tickets` row.
 #[derive(Serialize)]
 struct TicketRow<'a> {
     /// The request's ticket.
@@ -249,7 +249,7 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
             let observe = run.observe();
             observe
                 .record(
-                    "vala.datasets.tickets",
+                    "bifrost.datasets.tickets",
                     &TicketRow {
                         ticket_id: format!("T-{index}"),
                         question: &question,
@@ -335,10 +335,10 @@ pub async fn explain(client: &WyrdClient, run_id: &str) -> Result<Explanation, E
     let sql = format!(
         "SELECT t.run_id, s.trace_id, t.ticket_id, t.answer, s.name AS span, \
          g.call_id, g.card_uid AS call_card_uid, r.verdict \
-         FROM vala.datasets.tickets t \
-         JOIN vala.traces.spans s ON s.run_id = t.run_id \
-         JOIN vala.gateway.calls g ON g.run_id = t.run_id \
-         JOIN vala.verification.results r ON r.run_id = t.run_id \
+         FROM bifrost.datasets.tickets t \
+         JOIN bifrost.traces.spans s ON s.run_id = t.run_id \
+         JOIN bifrost.gateway.calls g ON g.run_id = t.run_id \
+         JOIN bifrost.verification.results r ON r.run_id = t.run_id \
          WHERE t.run_id = '{run_id}' AND s.name = 'support-desk.request' \
          ORDER BY g.call_id LIMIT 1"
     );

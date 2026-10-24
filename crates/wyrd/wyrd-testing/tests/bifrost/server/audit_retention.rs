@@ -1,7 +1,7 @@
 //! Audit decisions reach retained history through the shared Scribe outbox.
 //!
 //! Every audited surface stages its decision on the process Scribe outbox; the
-//! outbox writes `vala.system.audit_log` through the pod's own Scribe. These
+//! outbox writes `bifrost.system.audit_log` through the pod's own Scribe. These
 //! journeys stage decisions through the production [`AuditStage`] seam of a
 //! booted server and read them back through the ordinary query path.
 
@@ -22,7 +22,7 @@ use wyrd_testing::WyrdTestServer;
 use super::query::ServerJourneyError;
 
 /// Retained history this journey reads back.
-const AUDIT_LOG: &str = "vala.system.audit_log";
+const AUDIT_LOG: &str = "bifrost.system.audit_log";
 
 /// One allowed decision for `operation` by a fresh principal.
 fn decision(operation: &str) -> AuditEvent {

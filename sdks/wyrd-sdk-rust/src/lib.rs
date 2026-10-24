@@ -276,7 +276,7 @@ mod tests {
             CompactionTypeWire::FilesWithDelete,
         ] {
             let config = TableConfig::from_json_schema(
-                "vala.datasets.events",
+                "bifrost.datasets.events",
                 &serde_json::json!({
                     "type": "object",
                     "properties": {"id": {"type": "string"}},

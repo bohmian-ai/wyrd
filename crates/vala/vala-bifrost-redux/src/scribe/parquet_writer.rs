@@ -2012,7 +2012,7 @@ mod tests {
                 .unwrap();
         let scratch = tempfile::tempdir().expect("test scratch");
         let layout = PhysicalLayout::resolve(
-            "vala.bifrost.test",
+            "bifrost.bifrost.test",
             frozen.schema.as_ref(),
             Some(&crate::tables::hourly_layout(
                 "event_time",
@@ -2134,7 +2134,7 @@ mod tests {
             &["environment", "service"][..],
         ] {
             let layout = PhysicalLayout::resolve(
-                "vala.bifrost.test",
+                "bifrost.bifrost.test",
                 schema.as_ref(),
                 Some(&crate::tables::hourly_layout(
                     "event_time",

@@ -490,7 +490,7 @@ async fn enqueued_executions_replay_conflict_and_read_back() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Count the tenant's retained `vala.verification.execution_inputs` rows,
+/// Count the tenant's retained `bifrost.verification.execution_inputs` rows,
 /// in total and for `execution`, after the Scribe outbox settles.
 ///
 /// # Panics
@@ -500,7 +500,7 @@ async fn input_rows(server: &WyrdTestServer, execution: ExecutionId) -> (usize, 
     let rows = server
         .retained_records(
             server.data_tenant_id(),
-            "SELECT execution_id FROM vala.verification.execution_inputs".to_owned(),
+            "SELECT execution_id FROM bifrost.verification.execution_inputs".to_owned(),
         )
         .await
         .expect("inputs rows read");

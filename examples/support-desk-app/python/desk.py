@@ -25,7 +25,7 @@ from wyrd.state import WyrdState
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "service"
 BUNDLE = ROOT / ".wyrd-bundle"
-TICKETS = "vala.datasets.tickets"
+TICKETS = "bifrost.datasets.tickets"
 
 tracer = trace.get_tracer("support-desk")
 

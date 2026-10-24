@@ -629,7 +629,7 @@ mod tests {
     #[test]
     fn ingest_busy_grpc_retry_metadata() {
         let busy = IngestError::IngestBusy {
-            table: "vala.traces.spans".to_owned(),
+            table: "bifrost.traces.spans".to_owned(),
         }
         .into_status();
         assert_eq!(busy.code(), Code::ResourceExhausted);
@@ -658,61 +658,61 @@ mod tests {
         let cases = [
             (
                 ScribeError::IngestBusy {
-                    table: "vala.metrics.points".to_owned(),
+                    table: "bifrost.metrics.points".to_owned(),
                 },
                 "WYRD_VALA_429_INGEST_BUSY",
-                "vala.metrics.points",
+                "bifrost.metrics.points",
             ),
             (
                 ScribeError::PayloadTooLarge { bytes: 2, limit: 1 },
                 "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::FingerprintMismatch {
-                    table: "vala.logs.records".to_owned(),
+                    table: "bifrost.logs.records".to_owned(),
                 },
                 "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
-                "vala.logs.records",
+                "bifrost.logs.records",
             ),
             (
                 ScribeError::TableNotFound {
-                    table: "vala.bifrost.missing".to_owned(),
+                    table: "bifrost.bifrost.missing".to_owned(),
                 },
                 "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
-                "vala.bifrost.missing",
+                "bifrost.bifrost.missing",
             ),
             (
                 ScribeError::InvalidFrame,
                 "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::CardScopeDenied,
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::IngressClosed,
                 "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::WalDiskFull,
                 "WYRD_VALA_507_WAL_DISK_FULL",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::UnsupportedWalVersion { version: 2 },
                 "WYRD_VALA_500_BIFROST_INTERNAL",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::Internal {
                     detail: "broken".to_owned(),
                 },
                 "WYRD_VALA_500_BIFROST_INTERNAL",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
         ];
 
@@ -723,7 +723,7 @@ mod tests {
             if expected_code == "WYRD_VALA_429_INGEST_BUSY" {
                 assert_eq!(
                     public.to_string(),
-                    "ingest writer busy: vala.metrics.points"
+                    "ingest writer busy: bifrost.metrics.points"
                 );
             }
         }
@@ -753,7 +753,7 @@ mod tests {
                 "gate taxonomy must retain both bounds: {ingest_error:?}"
             );
 
-            let public = ingest_error.to_wyrd_error("vala.traces.spans");
+            let public = ingest_error.to_wyrd_error("bifrost.traces.spans");
             assert_eq!(public.code(), "WYRD_VALA_413_PAYLOAD_TOO_LARGE");
             assert_eq!(public.status(), 413);
 

@@ -251,7 +251,7 @@ mod pg_tests {
                 "verify",
                 "submit",
                 "verification.get_execution",
-                "vala.verification.results",
+                "bifrost.verification.results",
                 "Model Card",
             ] {
                 assert!(steps.contains(taught), "start teaches {taught}: {steps}");
@@ -354,7 +354,7 @@ mod pg_tests {
         let fixture = seed_query_fixture(&server, "mcp-discovery").await?;
         let authorized = fixture
             .table
-            .strip_prefix("vala.bifrost.")
+            .strip_prefix("bifrost.bifrost.")
             .ok_or("the fixture table is Bifrost-qualified")?
             .to_owned();
 
@@ -436,9 +436,9 @@ mod pg_tests {
         assert!(
             tables.iter().any(|table| {
                 table["name"] == authorized
-                    && table["namespace"] == serde_json::json!("vala.bifrost")
+                    && table["namespace"] == serde_json::json!("bifrost.bifrost")
             }),
-            "the caller's own table is listed in vala.bifrost: {tables:?}"
+            "the caller's own table is listed in bifrost.bifrost: {tables:?}"
         );
         assert!(
             !listed_names.contains(&foreign_table.as_str()),
@@ -450,7 +450,7 @@ mod pg_tests {
                 .call_tool(
                     CallToolRequestParams::new("bifrost.describe_table").with_arguments(
                         serde_json::json!({
-                            "namespace": "vala.bifrost",
+                            "namespace": "bifrost.bifrost",
                             "name": authorized,
                         })
                         .as_object()
@@ -522,7 +522,7 @@ mod pg_tests {
         )?;
         let committed = wyrd_client::Bifrost::query_only(&sdk)
             .alter_table(
-                "vala.bifrost",
+                "bifrost.bifrost",
                 &authorized,
                 &AlterTableRequest {
                     expected_table_version: described["table_version"]
@@ -577,7 +577,7 @@ mod pg_tests {
                 viewer
                     .call_tool(
                         CallToolRequestParams::new("bifrost.describe_table").with_arguments(
-                            json!({"namespace": "vala.bifrost", "name": authorized})
+                            json!({"namespace": "bifrost.bifrost", "name": authorized})
                                 .as_object()
                                 .ok_or("describe arguments are an object")?
                                 .clone(),
@@ -606,7 +606,7 @@ mod pg_tests {
                 client
                     .call_tool(
                         CallToolRequestParams::new("bifrost.describe_table").with_arguments(
-                            serde_json::json!({"namespace": "vala.bifrost", "name": absent})
+                            serde_json::json!({"namespace": "bifrost.bifrost", "name": absent})
                                 .as_object()
                                 .ok_or("describe arguments are an object")?
                                 .clone(),
@@ -643,7 +643,7 @@ mod pg_tests {
             )
             .await?;
         let describe_arguments = serde_json::json!({
-            "namespace": "vala.bifrost",
+            "namespace": "bifrost.bifrost",
             "name": authorized,
         })
         .as_object()

@@ -331,7 +331,7 @@ test("gateway call records a lone run or card", async ({ server, ask }) => {
   const calls = (
     await (
       await Bifrost.connect()
-    ).sql("SELECT run_id, card_uid FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id", [
+    ).sql("SELECT run_id, card_uid FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id", [
       issued.principalId,
     ])
   ).toArrow();
@@ -407,7 +407,7 @@ test("state httpAuth supplies service and agent context", async ({ server, provi
   const calls = (
     await (
       await Bifrost.connect()
-    ).sql("SELECT card_uid, run_id FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at", [
+    ).sql("SELECT card_uid, run_id FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at", [
       issued.principalId,
     ])
   ).toArrow();
@@ -542,7 +542,7 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
       await (
         await Bifrost.connect()
       ).sql(
-        "SELECT requested_model.deployment AS deployment FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at",
+        "SELECT requested_model.deployment AS deployment FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at",
         [issued.principalId],
       )
     ).toArrow();

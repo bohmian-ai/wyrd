@@ -135,7 +135,7 @@ INVESTIGATE = {
                 "call-query",
                 "bifrost.query",
                 {
-                    "sql": "SELECT execution_id FROM vala.verification.results LIMIT 1",
+                    "sql": "SELECT execution_id FROM bifrost.verification.results LIMIT 1",
                     "max_rows": 1,
                 },
             ),
@@ -159,7 +159,7 @@ REVIEWED = (
 def live_query(trace_id: str) -> dict:
     """The coding judge's first turn: read ``trace_id``'s span names live as ``bifrost_query``."""
     sql = (
-        "SELECT name FROM vala.traces.spans "
+        "SELECT name FROM bifrost.traces.spans "
         f"WHERE trace_id = decode('{trace_id}', 'hex') ORDER BY name"
     )
     arguments = json.dumps({"sql": sql, "max_rows": 10})
@@ -500,8 +500,8 @@ def otlp_environment(wyrd_server: WyrdTestServer, monkeypatch: pytest.MonkeyPatc
 
 @pytest.fixture(scope="session")
 def query_table(wyrd_server: WyrdTestServer) -> str:
-    """A ``vala.datasets`` table holding rows 1-3, written and published through the SDK."""
-    fqn = "vala.datasets.query_rows"
+    """A ``bifrost.datasets`` table holding rows 1-3, written and published through the SDK."""
+    fqn = "bifrost.datasets.query_rows"
     writer = Bifrost(TableConfig(QueryRow, fqn))
     assert writer.register() == "created"
     for row_id, value in ((1, "one"), (2, "two"), (3, "three")):

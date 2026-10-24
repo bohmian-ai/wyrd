@@ -145,42 +145,42 @@ mod tests {
     fn requests_are_confined_to_tenant_capture_destinations() {
         let tenant = DataTenantId::new_v7();
         for (tenant, table) in [
-            (tenant, "vala.system.audit_log"),
-            (DataTenantId::SYSTEM_OWNER, "vala.system.audit_log"),
-            (tenant, "vala.gateway.calls"),
-            (tenant, "vala.traces.spans"),
-            (tenant, "vala.verification.results"),
-            (tenant, "vala.drift.result_features"),
-            (tenant, "vala.verification.execution_inputs"),
+            (tenant, "bifrost.system.audit_log"),
+            (DataTenantId::SYSTEM_OWNER, "bifrost.system.audit_log"),
+            (tenant, "bifrost.gateway.calls"),
+            (tenant, "bifrost.traces.spans"),
+            (tenant, "bifrost.verification.results"),
+            (tenant, "bifrost.drift.result_features"),
+            (tenant, "bifrost.verification.execution_inputs"),
         ] {
             let batch = ScribeCapturePeerGrpc::batch(request(tenant, table)).expect("accepted");
             assert_eq!((batch.tenant, batch.table.fqn()), (tenant, table));
         }
         let refusals = [
             (
-                request(DataTenantId::SYSTEM_OWNER, "vala.gateway.calls"),
+                request(DataTenantId::SYSTEM_OWNER, "bifrost.gateway.calls"),
                 Code::PermissionDenied,
             ),
             (
-                request(DataTenantId::SYSTEM_OWNER, "vala.verification.results"),
+                request(DataTenantId::SYSTEM_OWNER, "bifrost.verification.results"),
                 Code::PermissionDenied,
             ),
             (
-                request(tenant, "vala.drift.observations"),
+                request(tenant, "bifrost.drift.observations"),
                 Code::PermissionDenied,
             ),
             (request(tenant, "user.events"), Code::PermissionDenied),
             (
                 IngestCaptureRequest {
                     tenant_id: "not-a-tenant".to_owned(),
-                    ..request(tenant, "vala.gateway.calls")
+                    ..request(tenant, "bifrost.gateway.calls")
                 },
                 Code::InvalidArgument,
             ),
             (
                 IngestCaptureRequest {
                     batch_id: "not-a-uuid".to_owned(),
-                    ..request(tenant, "vala.gateway.calls")
+                    ..request(tenant, "bifrost.gateway.calls")
                 },
                 Code::InvalidArgument,
             ),
@@ -202,13 +202,13 @@ mod tests {
     async fn scribe_saturation_answers_resource_exhausted() {
         let scribe = Arc::new(RecordingScribe::default());
         scribe.refuse_next(ScribeError::IngestBusy {
-            table: "vala.gateway.calls".to_owned(),
+            table: "bifrost.gateway.calls".to_owned(),
         });
         let service = ScribeCapturePeerGrpc::new(Arc::clone(&scribe) as _);
         let status = service
             .ingest_capture(Request::new(request(
                 DataTenantId::new_v7(),
-                "vala.gateway.calls",
+                "bifrost.gateway.calls",
             )))
             .await
             .expect_err("saturated");

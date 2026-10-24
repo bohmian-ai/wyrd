@@ -1,4 +1,4 @@
-//! The `vala.traces.spans` telemetry fixture: deterministic GenAI/HTTP spans
+//! The `bifrost.traces.spans` telemetry fixture: deterministic GenAI/HTTP spans
 //! sent through OTLP ingest, and the exact answers they must read back as.
 //!
 //! Like the events fixture, every value is a plain function of one span
@@ -28,7 +28,7 @@ use crate::query::run::Usage;
 use crate::query::workload::{DAY_HOURS, DAY_START_MS, HOUR_MS, Rows, mix};
 
 /// The canonical span table OTLP trace ingest writes.
-pub const TABLE: &str = "vala.traces.spans";
+pub const TABLE: &str = "bifrost.traces.spans";
 
 /// Spans in the standard telemetry fixture, as many as the events fixture's
 /// rows.

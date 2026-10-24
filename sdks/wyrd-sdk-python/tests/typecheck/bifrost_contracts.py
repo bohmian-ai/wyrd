@@ -31,7 +31,7 @@ def described_field_types_are_recursive_without_any() -> None:
     }
     description: TableDescription = {
         "entry": {
-            "namespace": "vala.traces",
+            "namespace": "bifrost.traces",
             "name": "spans",
             "table_uid": "01J0",
             "status": "Active",

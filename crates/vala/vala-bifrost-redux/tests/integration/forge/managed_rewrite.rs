@@ -1379,7 +1379,7 @@ async fn assert_builtins_are_v3(fixture: &PromotionIntegrationFixture) {
         assert_eq!(
             table.metadata().format_version(),
             FormatVersion::V3,
-            "vala.{}.{} is v3",
+            "bifrost.{}.{} is v3",
             definition.namespace,
             definition.name
         );

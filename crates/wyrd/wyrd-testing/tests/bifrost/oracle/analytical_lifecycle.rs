@@ -134,7 +134,7 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
     for object in 0..FIXTURE_OBJECTS {
         let start = object * per_object;
         rows.write(
-            &format!("vala.bifrost.{table}"),
+            &format!("bifrost.bifrost.{table}"),
             &journey_schema(),
             (start..start + per_object)
                 .map(|id| journey_row(id, &format!("group_{}", id % FIXTURE_GROUPS)))
@@ -187,7 +187,7 @@ async fn prove_terminal_cleanup() -> Result<(), JourneyError> {
             .ok_or("query node composed no Oracle")?
             .engine(),
     );
-    let sql = format!("SELECT id, filter_key FROM vala.bifrost.{table} ORDER BY id");
+    let sql = format!("SELECT id, filter_key FROM bifrost.bifrost.{table} ORDER BY id");
 
     // Explicit cancellation: the owner signals and drains under its own bound.
     let stream = engine
@@ -265,7 +265,8 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
     // The seeded table spans two published objects, so the distributed
     // planner splits its scan across tasks and the statement has an
     // Analytical attempt to lease.
-    let sql = format!("SELECT filter_key, count(*) FROM vala.bifrost.{table} GROUP BY filter_key");
+    let sql =
+        format!("SELECT filter_key, count(*) FROM bifrost.bifrost.{table} GROUP BY filter_key");
 
     let (_session, ownership) = engine
         .lease_analytical_attempt(query_context(tenant)?, request(&sql))
@@ -367,7 +368,7 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
     let broad = execute_analytical(
         query_server,
         tenant,
-        &format!("SELECT id, filter_key, unused_payload FROM vala.bifrost.{table}"),
+        &format!("SELECT id, filter_key, unused_payload FROM bifrost.bifrost.{table}"),
     )
     .await?;
     let broad_delta = cluster
@@ -383,7 +384,7 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
     let narrow = execute_analytical(
         query_server,
         tenant,
-        &format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'"),
+        &format!("SELECT id FROM bifrost.bifrost.{table} WHERE filter_key = 'group_0'"),
     )
     .await?;
     let narrow_delta = cluster
@@ -426,7 +427,7 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
         query_server,
         tenant,
         &format!(
-            "SELECT filter_key, count(*) AS matched FROM vala.bifrost.{table} \
+            "SELECT filter_key, count(*) AS matched FROM bifrost.bifrost.{table} \
              GROUP BY filter_key"
         ),
     )
@@ -453,7 +454,8 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
 
     // Qualified spill: the attempt's own runtime, not a process default. The
     // two-object table distributes, so the statement has an attempt to lease.
-    let sql = format!("SELECT filter_key, count(*) FROM vala.bifrost.{table} GROUP BY filter_key");
+    let sql =
+        format!("SELECT filter_key, count(*) FROM bifrost.bifrost.{table} GROUP BY filter_key");
     let (session, ownership) = engine
         .lease_analytical_attempt(query_context(tenant)?, request(&sql))
         .await?;
@@ -521,7 +523,7 @@ async fn prove_production_telemetry() -> Result<(), JourneyError> {
             .engine(),
     );
     let sql = format!(
-        "SELECT filter_key, count(*) AS rows FROM vala.bifrost.{table} GROUP BY filter_key"
+        "SELECT filter_key, count(*) AS rows FROM bifrost.bifrost.{table} GROUP BY filter_key"
     );
 
     let checkpoint = cluster

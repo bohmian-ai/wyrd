@@ -663,11 +663,11 @@ pub async fn seed_canonical_signals(
     let anchor = 1_760_000_000_000_000_000_i64;
     for (fqn, build) in [
         (
-            "vala.traces.spans",
+            "bifrost.traces.spans",
             spans as fn(&SchemaRef, &str, i64) -> RecordBatch,
         ),
-        ("vala.logs.records", logs),
-        ("vala.metrics.points", points),
+        ("bifrost.logs.records", logs),
+        ("bifrost.metrics.points", points),
     ] {
         let described = wyrd_client::bifrost::TableConfig::describe_with(writer.client(), fqn)
             .await

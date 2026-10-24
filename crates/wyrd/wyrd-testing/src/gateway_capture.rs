@@ -1,7 +1,7 @@
 //! A bound server whose gateway captures calls answered by a mock upstream,
 //! and the upstream answers gateway journeys and capacity benchmarks share.
 //!
-//! `vala.gateway.calls` accepts only the reserved gateway capture principal,
+//! `bifrost.gateway.calls` accepts only the reserved gateway capture principal,
 //! so a journey that needs real call rows drives a real chat completion
 //! through the gateway against a local `wiremock` provider.
 //!

@@ -510,7 +510,7 @@ async fn every_target_mounts_exactly_its_services(
 /// configured ingest ceiling, is acknowledged by the Scribe peer plane and
 /// lands whole in retained history.
 ///
-/// One `vala.system.audit_log` row whose `resource` alone is six MiB is
+/// One `bifrost.system.audit_log` row whose `resource` alone is six MiB is
 /// projected through the production audit projection, encoded as Arrow IPC,
 /// and submitted as a cluster member to the Scribe pod's capture peer RPC.
 /// The ACK proves the listener decodes at the configured ceiling rather than
@@ -556,7 +556,7 @@ async fn a_frame_above_the_tonic_default_is_acknowledged_and_retained(
     writer.finish()?;
     let request = IngestCaptureRequest {
         tenant_id: cluster.tenant().to_string(),
-        table: "vala.system.audit_log".to_owned(),
+        table: "bifrost.system.audit_log".to_owned(),
         batch_id: uuid::Uuid::now_v7().to_string(),
         request_id: event.request_id.as_str().to_owned(),
         arrow_ipc: writer.into_inner()?.into(),
@@ -801,7 +801,7 @@ async fn coordinate_public_query(
     let mut stream = wyrd_client::Bifrost::query_only(&client)
         .query(&BifrostQueryRequest {
             params: Vec::new(),
-            sql: format!("SELECT id FROM vala.bifrost.{table} ORDER BY id"),
+            sql: format!("SELECT id FROM bifrost.bifrost.{table} ORDER BY id"),
             deadline_ms: None,
         })
         .await?;

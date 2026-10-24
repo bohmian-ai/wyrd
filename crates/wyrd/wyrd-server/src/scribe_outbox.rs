@@ -149,7 +149,7 @@ const fn frame_budget(request_bytes: usize) -> usize {
 #[derive(Debug)]
 pub enum ScribeWrite {
     /// One authorization decision bound for retained audit history,
-    /// projected into its `vala.system.audit_log` row when it is staged, so
+    /// projected into its `bifrost.system.audit_log` row when it is staged, so
     /// the staging caller, not the one writer every tenant write waits on,
     /// pays for the projection; `None` when the decision could not be
     /// projected, which the sink counts lost.
@@ -167,7 +167,7 @@ pub enum ScribeWrite {
     },
     /// One Verifier execution's pinned inputs row.
     ExecutionInputs {
-        /// The `vala.verification.execution_inputs` row.
+        /// The `bifrost.verification.execution_inputs` row.
         row: ResultBatch,
         /// The execution's subject and actor, which Scribe stamps on the row.
         attribution: Attribution,
@@ -219,7 +219,7 @@ struct Rows {
     batch: RecordBatch,
 }
 
-/// Projects `spans` into one canonical `vala.traces.spans` batch.
+/// Projects `spans` into one canonical `bifrost.traces.spans` batch.
 ///
 /// Gateway capture and server-span tenant copies both project their spans
 /// here. `None` when the projection fails or rejects any span, since every
@@ -316,17 +316,17 @@ impl ScribeWrite {
 /// inputs table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeTable {
-    /// `vala.system.audit_log`, one row per authorization decision.
+    /// `bifrost.system.audit_log`, one row per authorization decision.
     AuditLog,
-    /// `vala.gateway.calls`, one row per captured call.
+    /// `bifrost.gateway.calls`, one row per captured call.
     Calls,
-    /// `vala.traces.spans`, one span per captured attempt or server span.
+    /// `bifrost.traces.spans`, one span per captured attempt or server span.
     Spans,
-    /// `vala.verification.results`, one canonical summary row per judgment.
+    /// `bifrost.verification.results`, one canonical summary row per judgment.
     Results,
-    /// `vala.drift.result_features`, a result's drift feature rows.
+    /// `bifrost.drift.result_features`, a result's drift feature rows.
     DriftFeatures,
-    /// `vala.verification.execution_inputs`, one row per execution's inputs.
+    /// `bifrost.verification.execution_inputs`, one row per execution's inputs.
     ExecutionInputs,
 }
 
@@ -345,12 +345,12 @@ impl ScribeTable {
     #[must_use]
     pub const fn fqn(self) -> &'static str {
         match self {
-            Self::AuditLog => "vala.system.audit_log",
-            Self::Calls => "vala.gateway.calls",
-            Self::Spans => "vala.traces.spans",
-            Self::Results => "vala.verification.results",
-            Self::DriftFeatures => "vala.drift.result_features",
-            Self::ExecutionInputs => "vala.verification.execution_inputs",
+            Self::AuditLog => "bifrost.system.audit_log",
+            Self::Calls => "bifrost.gateway.calls",
+            Self::Spans => "bifrost.traces.spans",
+            Self::Results => "bifrost.verification.results",
+            Self::DriftFeatures => "bifrost.drift.result_features",
+            Self::ExecutionInputs => "bifrost.verification.execution_inputs",
         }
     }
 
@@ -1638,9 +1638,9 @@ mod tests {
         assert_eq!(
             frames,
             [
-                ("vala.gateway.calls", 2),
-                ("vala.traces.spans", 2),
-                ("vala.verification.results", 3),
+                ("bifrost.gateway.calls", 2),
+                ("bifrost.traces.spans", 2),
+                ("bifrost.verification.results", 3),
             ]
         );
         for frame in &received[..2] {
@@ -1735,7 +1735,7 @@ mod tests {
 
     /// Proves audit decisions stage through the [`AuditStage`] seam and frame
     /// like every other write: one request's decisions share a lane and one
-    /// `vala.system.audit_log` frame under the platform audit principal with
+    /// `bifrost.system.audit_log` frame under the platform audit principal with
     /// no Card scope, the reserved system owner's decisions travel in their
     /// own frame, and every frame carries a v7 content identity.
     ///
@@ -1761,7 +1761,7 @@ mod tests {
             .audit_frames()
             .into_iter()
             .map(|frame| {
-                assert_eq!(frame.table, "vala.system.audit_log");
+                assert_eq!(frame.table, "bifrost.system.audit_log");
                 assert_eq!(frame.principal, PLATFORM_AUDIT_PRINCIPAL);
                 assert!(frame.card_scope.is_empty());
                 assert_eq!(frame.batch_id.get_version_num(), 7);
@@ -1820,7 +1820,7 @@ mod tests {
     async fn a_retry_resubmits_identical_frames() {
         let scribe = Arc::new(RecordingScribe::default());
         scribe.refuse_next(ScribeError::IngestBusy {
-            table: "vala.gateway.calls".to_owned(),
+            table: "bifrost.gateway.calls".to_owned(),
         });
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let tenant = DataTenantId::new_v7();
@@ -1869,7 +1869,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(tables.len(), 3, "{tables:?}");
         tables[1..].sort_unstable();
-        assert_eq!(tables[1..], ["vala.gateway.calls", "vala.traces.spans"]);
+        assert_eq!(
+            tables[1..],
+            ["bifrost.gateway.calls", "bifrost.traces.spans"]
+        );
         assert_eq!(scribe.attempts(), 4, "the rejected frame is never retried");
     }
 
@@ -2029,7 +2032,7 @@ mod tests {
         settle(&outbox).await;
         let received = scribe.received();
         assert_eq!(received.len(), 1, "{received:?}");
-        assert_eq!(received[0].table, "vala.traces.spans");
+        assert_eq!(received[0].table, "bifrost.traces.spans");
         assert_eq!(received[0].pairs, [route.attribution]);
         every_permit_returns(&spans).await;
     }
@@ -2075,7 +2078,7 @@ mod tests {
     fn detail_features(frames: &[Received]) -> Vec<String> {
         frames
             .iter()
-            .filter(|frame| frame.table == "vala.drift.result_features")
+            .filter(|frame| frame.table == "bifrost.drift.result_features")
             .flat_map(|frame| {
                 StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
                     .expect("an item frame opens")
@@ -2110,12 +2113,15 @@ mod tests {
             .map(|frame| frame.table.as_str())
             .collect::<Vec<_>>();
         let (summary, items) = tables.split_last().expect("frames were written");
-        assert_eq!(*summary, "vala.verification.results", "the summary is last");
+        assert_eq!(
+            *summary, "bifrost.verification.results",
+            "the summary is last"
+        );
         assert!(
             items.len() > 1
                 && items
                     .iter()
-                    .all(|table| *table == "vala.drift.result_features"),
+                    .all(|table| *table == "bifrost.drift.result_features"),
             "the detail splits into several item frames before the summary: {tables:?}"
         );
         let budget = frame_budget(SMALL_REQUEST_BYTES);
@@ -2317,7 +2323,7 @@ mod tests {
         assert!(frames.iter().all(|frame| frame.ipc.len() <= budget));
         let summaries = frames
             .iter()
-            .position(|frame| frame.table == "vala.verification.results")
+            .position(|frame| frame.table == "bifrost.verification.results")
             .expect("summaries were written");
         let rows = |table: &str| {
             frames
@@ -2329,14 +2335,14 @@ mod tests {
         assert!(
             frames[summaries..]
                 .iter()
-                .all(|frame| frame.table == "vala.verification.results"),
+                .all(|frame| frame.table == "bifrost.verification.results"),
             "every summary follows every detail frame"
         );
         assert_eq!(
-            rows("vala.drift.result_features"),
+            rows("bifrost.drift.result_features"),
             JUDGMENTS * DETAIL_FEATURES
         );
-        assert_eq!(rows("vala.verification.results"), JUDGMENTS);
+        assert_eq!(rows("bifrost.verification.results"), JUDGMENTS);
     }
 
     /// Proves a single row larger than the budget is still submitted alone
@@ -2541,7 +2547,7 @@ mod tests {
         others.sort_unstable();
         assert_eq!(
             others,
-            ["vala.gateway.calls", "vala.traces.spans"],
+            ["bifrost.gateway.calls", "bifrost.traces.spans"],
             "the other tenant's capture is written"
         );
     }

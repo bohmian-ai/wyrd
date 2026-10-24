@@ -358,7 +358,7 @@ mod tests {
     /// Panics when any reconstructed problem drifts from the one sent.
     #[test]
     fn bifrost_problems_reconstruct_their_exact_variant() {
-        let table = || "vala.datasets.events".to_owned();
+        let table = || "bifrost.datasets.events".to_owned();
         for (sent, status) in [
             (BifrostError::TableNotFound { table: table() }, 404),
             (BifrostError::FingerprintMismatch { table: table() }, 409),

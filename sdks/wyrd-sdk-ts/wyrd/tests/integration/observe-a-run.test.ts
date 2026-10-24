@@ -37,7 +37,7 @@ test("run observations read back by run id", async ({ server, reader, state }) =
 
   const rows = await reader.sql(
     `SELECT series, num_value, str_value, session_id, card_uid, run_id
-       FROM vala.drift.observations WHERE run_id = $1 ORDER BY series`,
+       FROM bifrost.drift.observations WHERE run_id = $1 ORDER BY series`,
     [run.runId],
     DriftRow,
   );

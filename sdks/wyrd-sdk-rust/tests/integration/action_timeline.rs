@@ -35,7 +35,7 @@ const SERVICE_SCOPE: &str = "journey.service";
 /// Scope of the gateway's captured model-call attempt rows.
 const GATEWAY_SCOPE: &str = "wyrd.gateway";
 /// The table the Service writes one row to.
-const ACTIONS: &str = "vala.datasets.actions";
+const ACTIONS: &str = "bifrost.datasets.actions";
 /// The trace identity of a caller's W3C `traceparent`.
 const CALLER_TRACE: &str = "5bf92f3577b34da6a3ce929d0e0e4736";
 /// The caller's span identity within [`CALLER_TRACE`].

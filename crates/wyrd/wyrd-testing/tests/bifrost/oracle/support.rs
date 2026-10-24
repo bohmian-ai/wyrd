@@ -504,7 +504,7 @@ pub(crate) async fn query_rows(client: &WyrdClient, table: &str) -> Result<u64, 
         .query(&BifrostQueryRequest {
             params: Vec::new(),
             sql: format!(
-                "SELECT id, filter_key, unused_payload FROM vala.bifrost.{table} ORDER BY id"
+                "SELECT id, filter_key, unused_payload FROM bifrost.bifrost.{table} ORDER BY id"
             ),
             deadline_ms: None,
         })
@@ -621,7 +621,7 @@ pub(crate) const ANALYTICAL_KEY_DIGITS: usize = 6;
 /// the zero-padded id, so string order equals numeric order.
 pub(crate) fn analytical_baseline_sql(left: &str, right: &str) -> String {
     format!(
-        "SELECT LPAD(CAST(l.id AS VARCHAR), {ANALYTICAL_KEY_DIGITS}, '0') AS filter_key, COUNT(*) AS matched          FROM vala.bifrost.{left} AS l          JOIN vala.bifrost.{right} AS r ON l.id = r.id          GROUP BY l.id ORDER BY filter_key"
+        "SELECT LPAD(CAST(l.id AS VARCHAR), {ANALYTICAL_KEY_DIGITS}, '0') AS filter_key, COUNT(*) AS matched          FROM bifrost.bifrost.{left} AS l          JOIN bifrost.bifrost.{right} AS r ON l.id = r.id          GROUP BY l.id ORDER BY filter_key"
     )
 }
 

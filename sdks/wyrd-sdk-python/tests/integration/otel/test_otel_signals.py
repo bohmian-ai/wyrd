@@ -23,7 +23,7 @@ pytestmark = pytest.mark.integration
 
 
 class LogRow(BaseModel):
-    """The ``vala.logs.records`` columns the log story reads."""
+    """The ``bifrost.logs.records`` columns the log story reads."""
 
     severity_text: str | None
     severity_number: int | None
@@ -32,7 +32,7 @@ class LogRow(BaseModel):
 
 
 class MetricRow(BaseModel):
-    """The ``vala.metrics.points`` columns the metric story reads."""
+    """The ``bifrost.metrics.points`` columns the metric story reads."""
 
     metric_name: str
     metric_type: str
@@ -58,7 +58,7 @@ def test_stdlib_log_record_reads_back_through_bifrost(
     wyrd_server.flush_bifrost()
 
     [row] = bifrost.sql(
-        "SELECT severity_text, severity_number, trace_id, span_id FROM vala.logs.records "
+        "SELECT severity_text, severity_number, trace_id, span_id FROM bifrost.logs.records "
         "WHERE scope_name = 'wyrd.tests.otel.log'",
         model=LogRow,
     )
@@ -84,7 +84,7 @@ def test_stock_metric_points_read_back_through_bifrost(
 
     rows = bifrost.sql(
         "SELECT metric_name, metric_type, int_value, double_value, histogram_count, "
-        "histogram_sum FROM vala.metrics.points "
+        "histogram_sum FROM bifrost.metrics.points "
         "WHERE scope_name = 'wyrd.tests.otel.metric' ORDER BY metric_name",
         model=MetricRow,
     )

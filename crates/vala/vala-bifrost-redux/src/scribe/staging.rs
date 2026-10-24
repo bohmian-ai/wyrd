@@ -1134,7 +1134,7 @@ pub(crate) mod tests {
         ScribePublishedHotFileV1::from_metrics(
             &crate::scribe::promotion::PublishedHotFileIdentity {
                 data_tenant_id: tenant.as_uuid(),
-                namespace: "vala.traces",
+                namespace: "bifrost.traces",
                 table_name: "spans",
                 file_list_id,
                 object_key,
@@ -1445,7 +1445,7 @@ pub(crate) mod tests {
         let rows = vec![FileListArtifactInsert {
             id: row_id,
             data_tenant_id: tenant,
-            namespace: "vala.traces".to_owned(),
+            namespace: "bifrost.traces".to_owned(),
             table_name: "spans".to_owned(),
             file_path: object_key.to_owned(),
             file_size: i64::try_from(content.len()).expect("fixture length"),

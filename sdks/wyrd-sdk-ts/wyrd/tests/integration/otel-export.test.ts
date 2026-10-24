@@ -56,7 +56,7 @@ test("stock exporter span reads back through bifrost", async ({ server, bifrost 
   const rows = await bifrost.sql(
     `SELECT name, trace_id, span_id, parent_span_id, status_code, status_message,
             gen_ai_request_model, gen_ai_usage_input_tokens
-       FROM vala.traces.spans WHERE scope_name = 'wyrd.tests.otel.trace' ORDER BY name`,
+       FROM bifrost.traces.spans WHERE scope_name = 'wyrd.tests.otel.trace' ORDER BY name`,
     [],
     SpanRow,
   );

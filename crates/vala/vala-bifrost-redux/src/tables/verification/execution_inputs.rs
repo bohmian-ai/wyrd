@@ -1,4 +1,4 @@
-//! `vala.verification.execution_inputs` — the pinned inputs of one Verifier
+//! `bifrost.verification.execution_inputs` — the pinned inputs of one Verifier
 //! execution.
 //!
 //! Owns the table's authored schema and physical layout only; the server
@@ -12,7 +12,7 @@ use crate::tables::fields::{boolean, ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-/// `vala.verification.execution_inputs` — one row per Verifier execution's inputs.
+/// `bifrost.verification.execution_inputs` — one row per Verifier execution's inputs.
 ///
 /// `inputs` holds the execution's named, pinned input declarations as one
 /// Variant; uploaded file bytes stay in tenant object storage and are named
@@ -38,9 +38,9 @@ pub const INPUTS: &str = "inputs";
 pub const ACTIVATION: &str = "activation";
 
 impl DomainTable for ExecutionInputsTable {
-    /// Lives in `vala.verification`, the namespace the catalog registers it under.
+    /// Lives in `bifrost.verification`, the namespace the catalog registers it under.
     const NAMESPACE: &'static str = "verification";
-    /// Table segment of the fixed `vala.verification.execution_inputs` FQN.
+    /// Table segment of the fixed `bifrost.verification.execution_inputs` FQN.
     const NAME: &'static str = "execution_inputs";
     /// The server appends and stamps the managed application `run_id`, subject `card_uid`, and subject/actor pair.
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;

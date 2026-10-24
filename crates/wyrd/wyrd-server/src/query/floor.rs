@@ -335,17 +335,17 @@ mod tests {
 
     #[test]
     fn query_floor_accepts_select_with_allowlisted_functions() {
-        validate_query_sql("SELECT count(*), sum(n) FROM \"vala.bifrost.t\" GROUP BY model")
+        validate_query_sql("SELECT count(*), sum(n) FROM \"bifrost.bifrost.t\" GROUP BY model")
             .expect("select with count/sum passes the floor");
     }
 
     #[test]
     fn query_floor_rejects_non_select() {
         for sql in [
-            "DELETE FROM \"vala.bifrost.t\"",
-            "INSERT INTO \"vala.bifrost.t\" VALUES (1)",
-            "DROP TABLE \"vala.bifrost.t\"",
-            "UPDATE \"vala.bifrost.t\" SET n = 1",
+            "DELETE FROM \"bifrost.bifrost.t\"",
+            "INSERT INTO \"bifrost.bifrost.t\" VALUES (1)",
+            "DROP TABLE \"bifrost.bifrost.t\"",
+            "UPDATE \"bifrost.bifrost.t\" SET n = 1",
         ] {
             let err = validate_query_sql(sql).expect_err("non-SELECT rejected");
             assert_eq!(err.status(), 400);
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn query_floor_rejects_disallowed_function() {
-        let err = validate_query_sql("SELECT evil_udf(payload) FROM \"vala.bifrost.t\"")
+        let err = validate_query_sql("SELECT evil_udf(payload) FROM \"bifrost.bifrost.t\"")
             .expect_err("unknown function rejected");
         assert_eq!(err.status(), 400);
         assert_eq!(err.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
@@ -376,9 +376,9 @@ mod tests {
 
     #[test]
     fn query_referenced_tables_extracts_relation_names() {
-        let tables = referenced_tables("SELECT payload FROM \"vala.bifrost.events\"");
+        let tables = referenced_tables("SELECT payload FROM \"bifrost.bifrost.events\"");
         assert!(
-            tables.contains(&"vala.bifrost.events".to_owned()),
+            tables.contains(&"bifrost.bifrost.events".to_owned()),
             "extracted: {tables:?}"
         );
     }

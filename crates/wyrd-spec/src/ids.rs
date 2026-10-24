@@ -358,7 +358,7 @@ uuid7_id_type!(
     /// Durable identity of one canonical Verification Result.
     ///
     /// Minted for a completed execution's result: the row in
-    /// `vala.verification.results` and every detail row join on
+    /// `bifrost.verification.results` and every detail row join on
     /// (`data_tenant_id`, `result_id`), and the settled execution points at it.
     VerificationResultId
 );

@@ -14,7 +14,7 @@ use wyrd_spec::error::WyrdError;
 use crate::bifrost::{Bifrost, WriterTable};
 
 /// The fixed Drift observation table every state describes at startup.
-pub const DRIFT_OBSERVATIONS_TABLE: &str = "vala.drift.observations";
+pub const DRIFT_OBSERVATIONS_TABLE: &str = "bifrost.drift.observations";
 
 /// The connected writer plus the fixed Drift destination resolved with it.
 ///
@@ -24,7 +24,7 @@ pub const DRIFT_OBSERVATIONS_TABLE: &str = "vala.drift.observations";
 pub struct StartedBifrost {
     /// The one state-owned facade: transport, pooled producers, and queries.
     pub bifrost: Bifrost,
-    /// `vala.drift.observations`, described once at startup.
+    /// `bifrost.drift.observations`, described once at startup.
     pub drift: WriterTable,
 }
 

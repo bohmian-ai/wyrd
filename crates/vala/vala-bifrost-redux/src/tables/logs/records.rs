@@ -1,4 +1,4 @@
-//! `vala.logs.records` — the sole canonical durable table for the `OTLP` log
+//! `bifrost.logs.records` — the sole canonical durable table for the `OTLP` log
 //! signal, including `OTel` events delivered through the Logs signal.
 //!
 //! [`LOG_FIELDS`] is the table's ledger. As with the other canonical signal
@@ -19,7 +19,7 @@ use crate::tables::{
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-/// The canonical `vala.logs.records` ledger.
+/// The canonical `bifrost.logs.records` ledger.
 ///
 /// A log record stays a log record: nothing here translates it into a span
 /// event, and its trace/span correlation columns are nullable because the

@@ -64,7 +64,7 @@ def test_each_wyrd_timestamp_type_holds_its_zone_rule() -> None:
 
 
 def test_every_time_type_declares_its_wyrd_timestamp_column() -> None:
-    schema = TableConfig(Order, "vala.datasets.orders").arrow_schema
+    schema = TableConfig(Order, "bifrost.datasets.orders").arrow_schema
 
     assert {field.name: field.type for field in schema} == {
         "store_opens": NTZ,

@@ -679,7 +679,7 @@ where
 
 /// Parses one exact domain table binding into the catalog's closed namespace type.
 ///
-/// A wire binding may carry its namespace with or without the `vala.` root, so
+/// A wire binding may carry its namespace with or without the `bifrost.` root, so
 /// the name is normalized through the shared canonicalizer rather than parsed
 /// as-is — one spelling of it names nothing the closed namespace set contains.
 ///
@@ -1195,12 +1195,12 @@ pub(crate) mod tests {
         tail: &FetchLiveTailService,
         mut assignment: FollowerScanAssignment,
     ) -> FollowerScanAssignment {
-        // Listing takes the discovery wire spelling, without the `vala.` root.
+        // Listing takes the discovery wire spelling, without the `bifrost.` root.
         let listed = TenantTableBinding {
             namespace: assignment
                 .binding
                 .namespace
-                .trim_start_matches("vala.")
+                .trim_start_matches("bifrost.")
                 .to_owned(),
             ..assignment.binding.clone()
         };
@@ -1304,7 +1304,7 @@ pub(crate) mod tests {
         let tenant_id = DataTenantId::new_v7();
         let binding = TenantTableBinding {
             tenant_id,
-            namespace: "vala.logs".to_owned(),
+            namespace: "bifrost.logs".to_owned(),
             table: "records".to_owned(),
         };
         // The closure a leader would sign for `SELECT value FROM ...`.
@@ -1399,7 +1399,7 @@ pub(crate) mod tests {
         let resolver = ScribeTailResolver::with_schema(tail, schema);
         let binding = TenantTableBinding {
             tenant_id,
-            namespace: "vala.logs".to_owned(),
+            namespace: "bifrost.logs".to_owned(),
             table: "records".to_owned(),
         };
         let assignment = |scan_id| FollowerScanAssignment {
@@ -1430,7 +1430,7 @@ pub(crate) mod tests {
             1
         );
         let sibling = super::super::scribe_follower_scan_id(
-            "vala.logs.records",
+            "bifrost.logs.records",
             wyrd_spec::vala::api::NodeId::new(uuid::Uuid::from_u128(12)),
             3,
         );
@@ -1484,7 +1484,7 @@ pub(crate) mod tests {
         );
         let binding = TenantTableBinding {
             tenant_id: DataTenantId::new_v7(),
-            namespace: "vala.logs".to_owned(),
+            namespace: "bifrost.logs".to_owned(),
             table: "records".to_owned(),
         };
         let assignment = FollowerScanAssignment {
@@ -1588,7 +1588,7 @@ pub(crate) mod tests {
             scan_id: "shape-contract-scan".to_owned(),
             binding: TenantTableBinding {
                 tenant_id: DataTenantId::new_v7(),
-                namespace: "vala.bifrost".to_owned(),
+                namespace: "bifrost.bifrost".to_owned(),
                 table: "events".to_owned(),
             },
             scribe_provider_cut: cut.then(self::cut),
@@ -1695,7 +1695,7 @@ pub(crate) mod tests {
         case.reservation_id = ReservationId::new(uuid::Uuid::now_v7());
         malformed.push(case);
         let mut case = request.clone();
-        case.assignments[0].binding.namespace = "vala.traces".to_owned();
+        case.assignments[0].binding.namespace = "bifrost.traces".to_owned();
         malformed.push(case);
         let mut case = request.clone();
         case.assignments[0].binding.table = "other".to_owned();
@@ -1754,7 +1754,7 @@ pub(crate) mod tests {
             )
             .expect("valid cohort batch")
         };
-        let table = TableRef::parse_fqn("vala.logs.records").expect("canonical table");
+        let table = TableRef::parse_fqn("bifrost.logs.records").expect("canonical table");
         let key = SealKey::new(tenant_id, table, day);
         let memtable = Arc::new(Memtable::new());
         let meta = |lsn| ScribeAppendMeta {
@@ -1816,7 +1816,7 @@ pub(crate) mod tests {
         .state();
         let binding = TenantTableBinding {
             tenant_id,
-            namespace: "vala.logs".to_owned(),
+            namespace: "bifrost.logs".to_owned(),
             table: "records".to_owned(),
         };
         let provider = resolver
@@ -1893,7 +1893,7 @@ pub(crate) mod tests {
     ) -> (SealKey, Arc<Memtable>) {
         use arrow::array::Int64Array;
 
-        let table = TableRef::parse_fqn("vala.traces.spans").expect("canonical table");
+        let table = TableRef::parse_fqn("bifrost.traces.spans").expect("canonical table");
         let key = SealKey::new(tenant_id, table, day);
         let memtable = Arc::new(Memtable::new());
         let batch = arrow::record_batch::RecordBatch::try_new(
@@ -1950,7 +1950,7 @@ pub(crate) mod tests {
     fn closure_fixture_binding(tenant_id: DataTenantId) -> TenantTableBinding {
         TenantTableBinding {
             tenant_id,
-            namespace: "vala.traces".to_owned(),
+            namespace: "bifrost.traces".to_owned(),
             table: "spans".to_owned(),
         }
     }
@@ -2092,7 +2092,7 @@ pub(crate) mod tests {
                 ClusterRole::Scribe,
                 test_query_id(),
                 &closure_assignment(
-                    "vala.traces.spans:scribe:someone-else".to_owned(),
+                    "bifrost.traces.spans:scribe:someone-else".to_owned(),
                     binding.clone(),
                     schema.as_ref(),
                     closure.clone(),
@@ -2232,7 +2232,7 @@ pub(crate) mod tests {
         let stream = service.stream();
         let binding = TenantTableBinding {
             tenant_id: fixture.key.tenant,
-            namespace: "vala.bifrost".to_owned(),
+            namespace: "bifrost.bifrost".to_owned(),
             table: "events".to_owned(),
         };
         let request = crate::scribe::tail_rpc::tests::captured(

@@ -701,7 +701,7 @@ async fn assert_tenant_calls(
         .captured_json(
             &own.inspector,
             "SELECT call_id, request_id, sub_principal_id, act_principal_id \
-             FROM vala.gateway.calls",
+             FROM bifrost.gateway.calls",
             retained,
         )
         .await;
@@ -741,7 +741,7 @@ async fn assert_tenant_calls(
     let spans = journey
         .captured_json(
             &own.inspector,
-            "SELECT trace_id, sub_principal_id, act_principal_id FROM vala.traces.spans",
+            "SELECT trace_id, sub_principal_id, act_principal_id FROM bifrost.traces.spans",
             retained,
         )
         .await;
@@ -762,7 +762,7 @@ async fn assert_tenant_calls(
     calls.into_keys().collect()
 }
 
-/// The live data file paths of `tenant`'s physical `vala.gateway.calls`
+/// The live data file paths of `tenant`'s physical `bifrost.gateway.calls`
 /// table, relative to the warehouse, with that table's location and
 /// canonical object prefix.
 ///

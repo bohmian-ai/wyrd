@@ -27,7 +27,7 @@ use crate::observe::{ProjectedColumn, invalid_observation, require_projection, r
 /// the caller never emitted.
 const MAX_EXACT_INT: i64 = 1 << 53;
 
-/// The user columns `drift(...)` projects, in `vala.drift.observations` order.
+/// The user columns `drift(...)` projects, in `bifrost.drift.observations` order.
 fn projection_columns() -> [ProjectedColumn; 6] {
     [
         ("record_id", DataType::Utf8, false),

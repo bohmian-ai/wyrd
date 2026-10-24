@@ -28,7 +28,7 @@ SERVICE_SCOPE = "journey.service"
 GATEWAY_SCOPE = "wyrd.gateway"
 """Scope of the gateway's captured model-call attempt rows."""
 
-ACTIONS = "vala.datasets.actions"
+ACTIONS = "bifrost.datasets.actions"
 """The table the Service writes one row to."""
 
 
@@ -148,7 +148,7 @@ def test_service_action_timeline_is_one_connected_tree(
         row["span_id"]: (row["sub_principal_id"], row["act_principal_id"])
         for row in bifrost.sql(
             "SELECT encode(span_id, 'hex') AS span_id, sub_principal_id, act_principal_id "
-            f"FROM vala.traces.spans WHERE trace_id = X'{trace_id}'"
+            f"FROM bifrost.traces.spans WHERE trace_id = X'{trace_id}'"
         )
         .to_arrow()
         .to_pylist()

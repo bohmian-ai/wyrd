@@ -4,7 +4,7 @@
  * with the `support/policy-check` Verifier.
  *
  * {@link deploy} declares the checked-in Cards under `service/`, which
- * ensures the declared `vala.datasets.tickets` table, turns on metadata
+ * ensures the declared `bifrost.datasets.tickets` table, turns on metadata
  * capture, and checks the Agent's model is deployed. {@link serve} answers
  * every question in its own Agent Run with {@link answer}, which calls the
  * model through the Wyrd gateway, and submits each answer for a background
@@ -184,7 +184,7 @@ export async function serve(desk: Desk): Promise<Served[]> {
         try {
           const reply = await answer(client, state, run, asked);
           const { observe } = run;
-          await observe.record("vala.datasets.tickets", {
+          await observe.record("bifrost.datasets.tickets", {
             ticket_id: `T-${index}`,
             question: asked,
             answer: reply,
@@ -249,10 +249,10 @@ export async function explain(client: WyrdClient, runId: string): Promise<Record
   const sql =
     "SELECT t.run_id, s.trace_id, t.ticket_id, t.answer, s.name AS span, " +
     "g.call_id, g.card_uid AS call_card_uid, r.verdict " +
-    "FROM vala.datasets.tickets t " +
-    "JOIN vala.traces.spans s ON s.run_id = t.run_id " +
-    "JOIN vala.gateway.calls g ON g.run_id = t.run_id " +
-    "JOIN vala.verification.results r ON r.run_id = t.run_id " +
+    "FROM bifrost.datasets.tickets t " +
+    "JOIN bifrost.traces.spans s ON s.run_id = t.run_id " +
+    "JOIN bifrost.gateway.calls g ON g.run_id = t.run_id " +
+    "JOIN bifrost.verification.results r ON r.run_id = t.run_id " +
     `WHERE t.run_id = '${runId}' AND s.name = 'support-desk.request' ` +
     "ORDER BY g.call_id LIMIT 1";
   const response = await fetch(`${client.serverUrl}/mcp`, {

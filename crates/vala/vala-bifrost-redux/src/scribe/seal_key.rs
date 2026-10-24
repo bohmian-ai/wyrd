@@ -467,7 +467,7 @@ mod tests {
         );
 
         let key = seal_key.canonical_key();
-        assert!(key.contains("vala.bifrost"));
+        assert!(key.contains("bifrost.bifrost"));
         assert!(key.contains("events"));
         assert!(key.contains("hour:2026-07-14T09:00:00+00:00"));
         assert!(!key.contains("day"));

@@ -90,7 +90,7 @@ const INVESTIGATION = [
   toolCall("call-card", TOOLS[0], {
     card_ref: { kind: "Service", name: "policy-desk", version: "1.0.0" },
   }),
-  toolCall("call-query", TOOLS[1], { sql: "SELECT execution_id FROM vala.verification.results LIMIT 1", max_rows: 1 }),
+  toolCall("call-query", TOOLS[1], { sql: "SELECT execution_id FROM bifrost.verification.results LIMIT 1", max_rows: 1 }),
   toolCall("call-code", TOOLS[2], { source: "6 * 7" }),
 ];
 
@@ -620,7 +620,7 @@ test("delegated tools keep the narrower authority", async ({ server, provider, d
   assertTools(provider, result, "delegated", [TOOLS[0]]);
   server.flushBifrost();
   const attributed = await (await Bifrost.connect()).sql(
-    "SELECT sub_principal_id, act_principal_id FROM vala.verification.results WHERE execution_id = $1",
+    "SELECT sub_principal_id, act_principal_id FROM bifrost.verification.results WHERE execution_id = $1",
     [result.execution_id],
     z.object({ sub_principal_id: z.string(), act_principal_id: z.string() }),
   );
@@ -680,7 +680,7 @@ test("custom_verdict_data_survives_readback", async ({ server, desk }) => {
   const retained = async (executionId: string): Promise<unknown> => {
     server.flushBifrost();
     const rows = await (await Bifrost.connect()).sql(
-      "SELECT to_json(outcome) AS outcome FROM vala.verification.results WHERE execution_id = $1",
+      "SELECT to_json(outcome) AS outcome FROM bifrost.verification.results WHERE execution_id = $1",
       [executionId],
       z.object({ outcome: z.string() }),
     );

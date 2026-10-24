@@ -534,7 +534,7 @@ impl ScribeImpl {
             table
                 .namespace
                 .as_str()
-                .strip_prefix("vala.")
+                .strip_prefix("bifrost.")
                 .unwrap_or_default(),
             &table.name,
         )

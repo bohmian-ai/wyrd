@@ -1595,7 +1595,7 @@ impl PromotionIntegrationFixture {
     ) -> TenantTableBinding {
         let segment = namespace
             .as_str()
-            .strip_prefix("vala.")
+            .strip_prefix("bifrost.")
             .expect("built-in namespaces are vala-qualified");
         let definition = vala_bifrost_redux::tables::builtin_table(segment, name)
             .expect("the built-in definition resolves");

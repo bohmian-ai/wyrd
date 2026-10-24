@@ -1,8 +1,8 @@
-//! `vala.drift.result_features` — the per-feature detail of one Drift result.
+//! `bifrost.drift.result_features` — the per-feature detail of one Drift result.
 //!
 //! Owns the table's authored schema and physical layout only; the server's
 //! result writer writes it, and the shared verdict lives in
-//! `vala.verification.results`.
+//! `bifrost.verification.results`.
 
 use arrow::datatypes::Field;
 
@@ -11,10 +11,10 @@ use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, 
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT;
 
-/// `vala.drift.result_features` — one row per scored feature of one drift check.
+/// `bifrost.drift.result_features` — one row per scored feature of one drift check.
 ///
 /// These are the per-feature details of a drift requirement in a row of
-/// `vala.verification.results`, joined on `result_id` and `requirement_id`
+/// `bifrost.verification.results`, joined on `result_id` and `requirement_id`
 /// inside the tenant's own namespace. The binding, owner, Verifier, window, and
 /// method are repeated on every row so a cross-execution query over one feature
 /// or one method never has to join back to the parent result. The managed
@@ -24,9 +24,9 @@ use wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT;
 pub struct ResultFeaturesTable;
 
 impl DomainTable for ResultFeaturesTable {
-    /// Lives in `vala.drift`, the namespace the catalog registers it under.
+    /// Lives in `bifrost.drift`, the namespace the catalog registers it under.
     const NAMESPACE: &'static str = "drift";
-    /// Table segment of the fixed `vala.drift.result_features` FQN.
+    /// Table segment of the fixed `bifrost.drift.result_features` FQN.
     const NAME: &'static str = "result_features";
     /// The server appends and stamps the managed application `run_id`, verified `card_uid`, and subject/actor pair.
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;

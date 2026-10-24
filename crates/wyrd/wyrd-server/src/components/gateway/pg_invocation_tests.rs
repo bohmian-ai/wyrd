@@ -423,7 +423,7 @@ async fn capture_metadata(state: &AppState, tenant: DataTenantId) {
         .expect("metadata policy stores");
 }
 
-/// The captured `vala.gateway.calls` row of `call_id` as a JSON object of
+/// The captured `bifrost.gateway.calls` row of `call_id` as a JSON object of
 /// its scalar columns, null columns absent; the row is where a call's
 /// usage, cost, and pricing are recorded.
 ///
@@ -3364,7 +3364,7 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
         .collect::<Vec<_>>();
     assert_eq!(
         tables,
-        ["vala.gateway.calls", "vala.traces.spans"],
+        ["bifrost.gateway.calls", "bifrost.traces.spans"],
         "the call row delivers before its spans"
     );
     assert!(received.iter().all(|frame| frame.tenant == tenant));
@@ -3461,7 +3461,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     let received = scribe.received();
     let calls = received
         .iter()
-        .find(|frame| frame.table == "vala.gateway.calls")
+        .find(|frame| frame.table == "bifrost.gateway.calls")
         .expect("the call row delivers");
     assert_eq!(
         calls.card_scope,
@@ -3518,7 +3518,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
         scribe
             .received()
             .iter()
-            .filter(|frame| frame.table == "vala.gateway.calls")
+            .filter(|frame| frame.table == "bifrost.gateway.calls")
             .count(),
         1,
         "no refused attribution captured"
@@ -3530,7 +3530,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
 ///
 /// The shared unit-test catalog lives over its own embedded fixture, so this
 /// fixture's tenant does not exist there and cannot register a table. Capture
-/// retrieval authorization resolves the tenant's registered `vala.gateway.calls`,
+/// retrieval authorization resolves the tenant's registered `bifrost.gateway.calls`,
 /// so it needs a catalog that shares the tenant registry the rest of the state
 /// uses.
 async fn replica_with_fixture_catalog(

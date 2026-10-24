@@ -31,7 +31,7 @@ pytestmark = pytest.mark.integration
 
 
 class DriftRow(BaseModel):
-    """One ``vala.drift.observations`` row: one per submitted feature."""
+    """One ``bifrost.drift.observations`` row: one per submitted feature."""
 
     series: str
     num_value: float | None
@@ -52,7 +52,7 @@ def test_run_observations_read_back_by_run_id(
 
     rows = bifrost.sql(
         "SELECT series, num_value, str_value, card_uid "
-        "FROM vala.drift.observations WHERE run_id = $1 ORDER BY series",
+        "FROM bifrost.drift.observations WHERE run_id = $1 ORDER BY series",
         [run.run_id],
         model=DriftRow,
     )

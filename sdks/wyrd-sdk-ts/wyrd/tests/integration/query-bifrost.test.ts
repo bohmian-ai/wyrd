@@ -9,8 +9,8 @@ import { serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
-/** The `vala.datasets` table the query stories read, holding rows 1 to 3. */
-const QUERY_ROWS = "vala.datasets.query_rows";
+/** The `bifrost.datasets` table the query stories read, holding rows 1 to 3. */
+const QUERY_ROWS = "bifrost.datasets.query_rows";
 
 /** The user columns of {@link QUERY_ROWS}, as a table declaration. */
 const QueryRowColumns = z.object({ id: z.int(), value: z.string() });
@@ -19,7 +19,7 @@ const QueryRowColumns = z.object({ id: z.int(), value: z.string() });
 const QueryRow = z.object({ id: z.bigint(), value: z.string() });
 
 /** A table holding the same rows that Scribe acknowledged and nothing published. */
-const LIVE_ROWS = "vala.datasets.live_query_rows";
+const LIVE_ROWS = "bifrost.datasets.live_query_rows";
 
 /**
  * Writes rows 1 to 3 of `table` through the SDK and waits for Scribe's
@@ -83,7 +83,7 @@ test("bound sql text is treated as data", async ({ bifrost }) => {
 
 test("unwritten builtin table reads as empty", async ({ bifrost }) => {
   const rows = await bifrost.sql(
-    "SELECT COUNT(*) AS n FROM vala.drift.result_features",
+    "SELECT COUNT(*) AS n FROM bifrost.drift.result_features",
     [],
     z.object({ n: z.bigint() }),
   );
@@ -156,7 +156,7 @@ test.for([
   { shape: "single", sql: `SELECT r.valeu FROM ${LIVE_ROWS} r` },
   {
     shape: "join",
-    sql: `SELECT r.valeu, r.valeu AS again FROM ${LIVE_ROWS} r JOIN ${LIVE_ROWS} s ON r.id = s.id JOIN vala.verification.results v ON v.result_id = s.value`,
+    sql: `SELECT r.valeu, r.valeu AS again FROM ${LIVE_ROWS} r JOIN ${LIVE_ROWS} s ON r.id = s.id JOIN bifrost.verification.results v ON v.result_id = s.value`,
   },
   { shape: "subquery", sql: `SELECT id FROM ${LIVE_ROWS} WHERE id IN (SELECT r.valeu FROM ${LIVE_ROWS} r)` },
 ])("unknown column in a $shape query carries the planners suggestion", async ({ sql }, { bifrost, live }) => {
@@ -190,7 +190,7 @@ test("unauthorized table refusal reveals no columns", async ({ server, live }) =
   const datasetsOnly = {
     resource: "bifrost_query",
     action: "read",
-    scope: { bifrost: { schema: { catalog: "vala", schema: "datasets" } } },
+    scope: { bifrost: { schema: { catalog: "bifrost", schema: "datasets" } } },
   };
   const reader = await Bifrost.connect({
     client: WyrdClient.connect({ credential: server.scopedApiKey("datasets_reader", [datasetsOnly]) }),
@@ -198,7 +198,7 @@ test("unauthorized table refusal reveals no columns", async ({ server, live }) =
 
   expect(await ids(reader, `SELECT id FROM ${live} ORDER BY id`)).toEqual([1n, 2n, 3n]);
   const refused = await reader
-    .sql(`SELECT q.id, v.verdcit FROM ${live} q JOIN vala.verification.results v ON v.result_id = q.value`)
+    .sql(`SELECT q.id, v.verdcit FROM ${live} q JOIN bifrost.verification.results v ON v.result_id = q.value`)
     .then(
       () => undefined,
       (error: unknown) => error as { code: string; detail: string },

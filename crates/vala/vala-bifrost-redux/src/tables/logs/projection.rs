@@ -1,4 +1,4 @@
-//! Table-owned `OTLP` log projection for `vala.logs.records`.
+//! Table-owned `OTLP` log projection for `bifrost.logs.records`.
 //!
 //! [`project_resource_logs`] is the single deterministic, IO-free conversion
 //! from decoded `OTLP` resource logs into the canonical log row. A record
@@ -123,7 +123,7 @@ pub fn log_row_output_bytes() -> usize {
     *LOG_ROW_BYTES
 }
 
-/// Return the canonical user-column schema of `vala.logs.records`.
+/// Return the canonical user-column schema of `bifrost.logs.records`.
 #[must_use]
 pub fn canonical_log_schema() -> Arc<Schema> {
     Arc::new(Schema::new(canonical_arrow_fields(LOG_FIELDS)))

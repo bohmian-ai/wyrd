@@ -712,7 +712,7 @@ mod tests {
             columns: vec!["id".to_owned()],
             filters: vec![
                 datafusion::logical_expr::Expr::Column(datafusion::common::Column::new(
-                    Some("vala.bifrost.events"),
+                    Some("bifrost.bifrost.events"),
                     "id",
                 ))
                 .gt(lit(150_i64)),

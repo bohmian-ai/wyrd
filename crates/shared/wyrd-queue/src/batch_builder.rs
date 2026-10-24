@@ -634,7 +634,7 @@ fn collect<T>(
 ///
 /// `FixedSizeBinary` columns take canonical lowercase hex text and decode it
 /// to exactly the declared width, so trace and span ids land as the same
-/// bytes `vala.traces.spans` stores.
+/// bytes `bifrost.traces.spans` stores.
 ///
 /// # Errors
 ///
@@ -714,7 +714,7 @@ fn build_scalar(data_type: &DataType, path: &str, cells: &[Cell<'_>]) -> Result<
 ///
 /// Trace and span identities travel as the lowercase hex text every OpenTelemetry
 /// surface prints, and land in Arrow as the same fixed-width bytes
-/// `vala.traces.spans` stores. Uppercase hex, a `0x` prefix, non-hex characters,
+/// `bifrost.traces.spans` stores. Uppercase hex, a `0x` prefix, non-hex characters,
 /// and any text whose length is not `2 * width` return `None`, which the caller
 /// reports as a column type mismatch rather than silently truncating or padding.
 fn decode_lower_hex(text: &str, width: i32) -> Option<Vec<u8>> {
@@ -1112,7 +1112,7 @@ mod batch_builder_tests {
         assert!(reader.next().is_none(), "single batch stream");
     }
 
-    /// Trace/span identity columns as `vala.traces.spans` describes them:
+    /// Trace/span identity columns as `bifrost.traces.spans` describes them:
     /// nullable fixed-width binary keyed by canonical lowercase hex text.
     fn trace_schema() -> Schema {
         Schema::new(vec![

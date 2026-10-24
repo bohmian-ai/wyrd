@@ -15,7 +15,7 @@ use wyrd_testing::server::WyrdTestServer;
 
 use crate::support::{Deployment, declare, pull};
 
-/// One `vala.drift.observations` row, as read back.
+/// One `bifrost.drift.observations` row, as read back.
 #[derive(Debug, PartialEq, Deserialize)]
 struct DriftRow {
     /// The feature name.
@@ -108,7 +108,7 @@ async fn run_observations_read_back_by_run_id() {
         .expect("Bifrost connects")
         .sql_as(
             "SELECT series, num_value, str_value, session_id, card_uid, run_id \
-             FROM vala.drift.observations WHERE run_id = $1 ORDER BY series",
+             FROM bifrost.drift.observations WHERE run_id = $1 ORDER BY series",
             &[QueryParam::String(run_id.clone())],
         )
         .await

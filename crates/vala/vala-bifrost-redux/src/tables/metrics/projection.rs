@@ -1,4 +1,4 @@
-//! Table-owned `OTLP` metric projection for `vala.metrics.points`.
+//! Table-owned `OTLP` metric projection for `bifrost.metrics.points`.
 //!
 //! [`project_resource_metrics`] is the single deterministic, IO-free conversion
 //! from decoded `OTLP` resource metrics into canonical point rows. One accepted
@@ -277,7 +277,7 @@ impl Default for MetricOutputWidths {
     }
 }
 
-/// Return the canonical user-column schema of `vala.metrics.points`.
+/// Return the canonical user-column schema of `bifrost.metrics.points`.
 #[must_use]
 pub fn canonical_metric_schema() -> Arc<Schema> {
     Arc::new(Schema::new(canonical_arrow_fields(METRIC_FIELDS)))

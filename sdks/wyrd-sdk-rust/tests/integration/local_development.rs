@@ -164,8 +164,8 @@ pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
         .expect("hydrated Card carries its UID")
         .to_string();
     for (table, uid) in [
-        ("vala.drift.observations", &model_uid),
-        ("vala.traces.spans", &agent_uid),
+        ("bifrost.drift.observations", &model_uid),
+        ("bifrost.traces.spans", &agent_uid),
     ] {
         let rows: Vec<Attributed> = bifrost
             .sql_as(

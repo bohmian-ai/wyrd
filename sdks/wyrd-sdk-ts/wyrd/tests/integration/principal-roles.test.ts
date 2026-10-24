@@ -17,7 +17,7 @@ import { declared, fixture, runtimeAccount } from "../support/server.js";
 vi.setConfig({ testTimeout: 120_000 });
 
 /** A tenant-wide query over a built-in table, which `workload` permits. */
-const TENANT_WIDE = "SELECT COUNT(*) AS n FROM vala.drift.observations";
+const TENANT_WIDE = "SELECT COUNT(*) AS n FROM bifrost.drift.observations";
 
 /** A Card only an author can register. */
 const AUTHORED = fixture("cards/gateway_inference/ask-prompt.yaml");
@@ -133,7 +133,7 @@ test("stable accounts preserve execution identity", async ({ bundle, server, rea
   server.flushBifrost();
 
   const rows = await reader.sql(
-    "SELECT run_id, card_uid, num_value FROM vala.drift.observations WHERE run_id = $1 OR run_id = $2 ORDER BY num_value",
+    "SELECT run_id, card_uid, num_value FROM bifrost.drift.observations WHERE run_id = $1 OR run_id = $2 ORDER BY num_value",
     runs,
     z.object({ run_id: z.string(), card_uid: z.string(), num_value: z.number() }),
   );

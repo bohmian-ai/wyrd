@@ -6,7 +6,7 @@
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::error::WyrdError;
 
-/// Resolve a wire namespace string (e.g. `"vala.bifrost"`) to its engine enum.
+/// Resolve a wire namespace string (e.g. `"bifrost.bifrost"`) to its engine enum.
 ///
 /// Unknown namespaces are a client error rather than a silent default.
 pub fn namespace_from_wire(namespace: &str) -> Result<BifrostNamespace, WyrdError> {
@@ -29,7 +29,7 @@ mod tests {
     #[test]
     fn bifrost_tables_namespace_parse_rejects_unknown() {
         assert_eq!(
-            namespace_from_wire("vala.bifrost").expect("known"),
+            namespace_from_wire("bifrost.bifrost").expect("known"),
             BifrostNamespace::Bifrost
         );
         let err = namespace_from_wire("public").expect_err("unknown namespace rejected");

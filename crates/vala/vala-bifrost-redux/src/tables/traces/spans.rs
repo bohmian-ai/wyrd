@@ -1,4 +1,4 @@
-//! `vala.traces.spans` — the sole canonical durable table for the OTLP trace
+//! `bifrost.traces.spans` — the sole canonical durable table for the OTLP trace
 //! signal.
 //!
 //! [`SPAN_FIELDS`] is the table's ledger: one immutable declaration per logical
@@ -56,7 +56,7 @@ pub static SPAN_LINK_ELEMENT: F = F::sensitive(
     false,
 );
 
-/// The canonical `vala.traces.spans` ledger.
+/// The canonical `bifrost.traces.spans` ledger.
 ///
 /// `?` in the specification ledger is `nullable = true` here; every other field is
 /// non-null. Presence booleans (`status_present`, `resource_present`,

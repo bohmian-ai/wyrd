@@ -2168,7 +2168,7 @@ impl WyrdTestCluster {
         table: &str,
         time_partition: &wyrd_spec::vala::api::TimePartitionWire,
     ) -> Result<(), ClusterError> {
-        let canonical = table.strip_prefix("vala.").unwrap_or(table);
+        let canonical = table.strip_prefix("bifrost.").unwrap_or(table);
         let (namespace, table_name) = canonical.split_once('.').ok_or_else(|| {
             ClusterError::Resource("tail observation table must be namespace-qualified".to_owned())
         })?;

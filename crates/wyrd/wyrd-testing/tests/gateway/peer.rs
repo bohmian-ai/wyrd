@@ -100,7 +100,7 @@ async fn strings(
     Ok(values)
 }
 
-/// Submits one `vala.gateway.calls` row whose present `resolved_model` lacks
+/// Submits one `bifrost.gateway.calls` row whose present `resolved_model` lacks
 /// its `model` child to `scribe`'s capture peer RPC, as a cluster member.
 ///
 /// The row is otherwise a valid capture, so the refusal can come only from
@@ -159,7 +159,7 @@ async fn submit_partial_resolved_model(
     let refused = ScribeCapturePeerServiceClient::new(channel)
         .ingest_capture(IngestCaptureRequest {
             tenant_id: tenant.to_string(),
-            table: "vala.gateway.calls".to_owned(),
+            table: "bifrost.gateway.calls".to_owned(),
             batch_id: uuid::Uuid::now_v7().to_string(),
             request_id: RequestId::now_v7().as_str().to_owned(),
             arrow_ipc: writer.into_inner()?.into(),
@@ -175,12 +175,12 @@ async fn submit_partial_resolved_model(
 ///
 /// The tenant administrator configures a provider and a `Metadata` capture
 /// policy on the oracle pod, and an ordinary caller invokes one chat
-/// completion there. The call row reaches `vala.gateway.calls` and its attempt
-/// span `vala.traces.spans` on the scribe pod through the capture-only peer
+/// completion there. The call row reaches `bifrost.gateway.calls` and its attempt
+/// span `bifrost.traces.spans` on the scribe pod through the capture-only peer
 /// RPC, both attributed to the caller as subject and actor and stamped with
 /// the admitting request, and read back through the oracle pod's public query path. The
 /// oracle pod's authorization decision for the call travels the same peer
-/// route into `vala.system.audit_log`.
+/// route into `bifrost.system.audit_log`.
 ///
 /// Before that call, a calls row whose present `resolved_model` lacks a child
 /// is sent straight to the scribe pod's capture peer RPC; it is refused before
@@ -317,7 +317,7 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
     // the call id, since the caller sent no trace context.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut call_id = None;
-    for table in ["vala.gateway.calls", "vala.traces.spans"] {
+    for table in ["bifrost.gateway.calls", "bifrost.traces.spans"] {
         let sql = match &call_id {
             None => format!(
                 "SELECT call_id, sub_principal_id, act_principal_id FROM {table} \
@@ -401,7 +401,7 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
         strings(
             gateway,
             &admin_key,
-            &format!("SELECT call_id FROM vala.gateway.calls WHERE call_id = '{partial_call}'"),
+            &format!("SELECT call_id FROM bifrost.gateway.calls WHERE call_id = '{partial_call}'"),
             "call_id",
         )
         .await

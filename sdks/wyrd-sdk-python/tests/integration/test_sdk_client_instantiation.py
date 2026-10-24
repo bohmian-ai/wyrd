@@ -109,7 +109,7 @@ def test_ambient_connect_opens_every_handle(
             call(handle.connect())
         asyncio.run(eager_async_operation())
         bound = Bifrost.connect(
-            table=TableConfig(Event, "vala.datasets.ambient_options"),
+            table=TableConfig(Event, "bifrost.datasets.ambient_options"),
             client_byte_limit_bytes=8 * 1024 * 1024,
         )
         assert bound.register() in ("created", "already_exists")
@@ -134,14 +134,14 @@ def test_lazy_constructors_open_every_handle_on_first_operation(
 def test_local_state_survives_the_first_connection(
     server: WyrdTestServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    bifrost = Bifrost(table=TableConfig(Event, "vala.datasets.lazy_first"))
-    bifrost.use_table(TableConfig(Event, "vala.datasets.lazy_bound"))
+    bifrost = Bifrost(table=TableConfig(Event, "bifrost.datasets.lazy_first"))
+    bifrost.use_table(TableConfig(Event, "bifrost.datasets.lazy_bound"))
     cards = Cards()
     prompts = cards.prompt
 
     assert bifrost.register() in ("created", "already_exists")
-    assert bifrost.table is not None and bifrost.table.fqn == "vala.datasets.lazy_bound"
-    assert "vala.datasets.lazy_bound" in [
+    assert bifrost.table is not None and bifrost.table.fqn == "bifrost.datasets.lazy_bound"
+    assert "bifrost.datasets.lazy_bound" in [
         f"{entry['namespace']}.{entry['name']}" for entry in bifrost.list_tables()
     ]
     prompts.list()
@@ -198,12 +198,12 @@ def test_delegated_connect_uses_the_subject_principal(server: WyrdTestServer) ->
         with pytest.raises(WyrdError) as refused:
             bifrost.list_tables()
         assert refused.value.code == DENIED
-        bifrost.sql("SELECT COUNT(*) AS n FROM vala.system.audit_log")
+        bifrost.sql("SELECT COUNT(*) AS n FROM bifrost.system.audit_log")
     Bifrost.connect(client=actor).list_tables()
 
     server.flush_bifrost()
     decisions = Bifrost.connect(client=actor).sql(
-        "SELECT act_principal_id FROM vala.system.audit_log "
+        "SELECT act_principal_id FROM bifrost.system.audit_log "
         "WHERE operation = 'bifrost.query.read_decision' AND sub_principal_id = $1",
         [subject_id],
         model=Decision,
@@ -235,27 +235,27 @@ def test_handles_reuse_the_client_cache_and_renew(
 
 
 def test_bifrost_lists_tables_and_describes_on_demand(server: WyrdTestServer) -> None:
-    own = Bifrost.connect(table=TableConfig(Event, "vala.datasets.listed"))
+    own = Bifrost.connect(table=TableConfig(Event, "bifrost.datasets.listed"))
     own.register()
     foreign_key = server.bootstrap_service_in_tenant(
         server.seed_tenant("listing-tenant"), ["admin"], "listing-admin"
     )
     foreign = Bifrost.connect(
-        table=TableConfig(Event, "vala.datasets.foreign_listed"),
+        table=TableConfig(Event, "bifrost.datasets.foreign_listed"),
         client=WyrdClient(credential=foreign_key),
     )
     foreign.register()
 
     listed = [f"{entry['namespace']}.{entry['name']}" for entry in own.list_tables()]
 
-    assert "vala.datasets.listed" in listed
-    assert "vala.drift.observations" in listed
-    assert "vala.datasets.foreign_listed" not in listed
+    assert "bifrost.datasets.listed" in listed
+    assert "bifrost.drift.observations" in listed
+    assert "bifrost.datasets.foreign_listed" not in listed
     unreadable = WyrdClient(
         credential=server.scoped_api_key("no_table_read", ["bifrost_query:read"])
     )
     with pytest.raises(WyrdError) as refused:
         Bifrost.connect(client=unreadable).list_tables()
     assert refused.value.code == DENIED
-    described = own.describe_table("vala.datasets", "listed")
+    described = own.describe_table("bifrost.datasets", "listed")
     assert [field["name"] for field in described["user_fields"]] == ["id", "label"]

@@ -49,7 +49,7 @@ impl TableRef {
         }
     }
 
-    /// Fully-qualified name: `"vala.<ns>.<name>"`.
+    /// Fully-qualified name: `"bifrost.<ns>.<name>"`.
     #[must_use]
     pub fn fqn(&self) -> String {
         format!("{}.{}", self.namespace.as_str(), self.name)
@@ -57,8 +57,8 @@ impl TableRef {
 
     /// The Bifrost table object scope naming this table's registered identity.
     ///
-    /// The namespace splits into the scope's catalog and schema (`vala` and
-    /// `traces` for `vala.traces`), and the UID pins the exact registration, so
+    /// The namespace splits into the scope's catalog and schema (`bifrost` and
+    /// `traces` for `bifrost.traces`), and the UID pins the exact registration, so
     /// one scope is shared by Oracle query reads and Gate record writes.
     #[must_use]
     pub fn permission_scope(
@@ -69,7 +69,7 @@ impl TableRef {
             .namespace
             .as_str()
             .split_once('.')
-            .unwrap_or(("vala", self.namespace.as_str()));
+            .unwrap_or(("bifrost", self.namespace.as_str()));
         wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Table(
             wyrd_runtime::BifrostTableScope {
                 catalog: catalog.to_owned(),
@@ -106,13 +106,13 @@ mod tests {
     #[test]
     fn new_and_fqn_round_trip() {
         let t = TableRef::new(BifrostNamespace::Bifrost, "events");
-        assert_eq!(t.fqn(), "vala.bifrost.events");
+        assert_eq!(t.fqn(), "bifrost.bifrost.events");
         assert_eq!(t.name, "events");
     }
 
     #[test]
     fn parse_fqn_accepts_known_namespace() {
-        let t = TableRef::parse_fqn("vala.bifrost.events").expect("known ns");
+        let t = TableRef::parse_fqn("bifrost.bifrost.events").expect("known ns");
         assert_eq!(t.namespace, BifrostNamespace::Bifrost);
         assert_eq!(t.name, "events");
     }
@@ -123,10 +123,38 @@ mod tests {
         assert!(TableRef::parse_fqn("no_dot").is_none());
     }
 
+    /// Every namespace renders, parses, and scopes under the one `bifrost`
+    /// catalog, and the retired `vala` spelling resolves nothing.
+    #[test]
+    fn canonical_catalog_has_no_alias() {
+        let uid = crate::catalog::TableUid::from_bytes([7; 16]);
+        for namespace in BifrostNamespace::ALL {
+            let table = TableRef::new(namespace, "events");
+            let fqn = table.fqn();
+            assert!(fqn.starts_with("bifrost."), "{fqn}");
+            assert_eq!(TableRef::parse_fqn(&fqn), Some(table.clone()));
+            let schema = namespace
+                .as_str()
+                .strip_prefix("bifrost.")
+                .expect("bifrost root");
+            assert!(TableRef::parse_fqn(&format!("vala.{schema}.events")).is_none());
+            let wyrd_runtime::PermissionScope::Bifrost(
+                wyrd_runtime::BifrostPermissionScope::Table(scope),
+            ) = table.permission_scope(&uid)
+            else {
+                panic!("a table scope");
+            };
+            assert_eq!(
+                (scope.catalog.as_str(), scope.schema.as_str()),
+                ("bifrost", schema)
+            );
+        }
+    }
+
     #[test]
     fn parse_fqn_rejects_path_traversal() {
-        assert!(TableRef::parse_fqn("vala.bifrost.../etc/passwd").is_none());
-        assert!(TableRef::parse_fqn("vala.bifrost./absolute").is_none());
+        assert!(TableRef::parse_fqn("bifrost.bifrost.../etc/passwd").is_none());
+        assert!(TableRef::parse_fqn("bifrost.bifrost./absolute").is_none());
     }
 
     #[test]

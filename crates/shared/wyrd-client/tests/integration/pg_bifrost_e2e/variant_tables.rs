@@ -109,7 +109,7 @@ mod pg_tests {
                 ..ClientConfig::default()
             })
             .expect("client connects");
-            let table = format!("vala.datasets.events_{}", uuid::Uuid::now_v7().simple());
+            let table = format!("bifrost.datasets.events_{}", uuid::Uuid::now_v7().simple());
             let bifrost = Bifrost::connect_with(
                 &client,
                 BifrostOptions {
@@ -233,7 +233,7 @@ mod pg_tests {
     #[tokio::test]
     async fn query_results_copy_into_another_table() {
         let events = Events::start().await;
-        let archive = format!("vala.datasets.archive_{}", uuid::Uuid::now_v7().simple());
+        let archive = format!("bifrost.datasets.archive_{}", uuid::Uuid::now_v7().simple());
         Bifrost::connect_with(
             &events.client,
             BifrostOptions {
@@ -346,7 +346,10 @@ mod pg_tests {
     #[tokio::test]
     async fn unsupported_type_is_refused_by_sdk_and_server() {
         let events = Events::start().await;
-        let table = format!("vala.datasets.unsigned_{}", uuid::Uuid::now_v7().simple());
+        let table = format!(
+            "bifrost.datasets.unsigned_{}",
+            uuid::Uuid::now_v7().simple()
+        );
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
             DataType::UInt64,
@@ -401,7 +404,7 @@ mod pg_tests {
     /// declare a Variant field instead.
     #[tokio::test]
     async fn model_allowing_extra_keys_is_refused() {
-        let refused = TableConfig::from_model::<Loose>("vala.datasets.loose")
+        let refused = TableConfig::from_model::<Loose>("bifrost.datasets.loose")
             .expect_err("extra keys could be lost");
 
         assert_eq!(code(&refused), "WYRD_VALA_400_SCHEMA_PARSE");
@@ -430,8 +433,8 @@ mod pg_tests {
                 true,
             )]));
 
-            let refused =
-                TableConfig::from_arrow("vala.datasets.unsupported", schema).expect_err("refused");
+            let refused = TableConfig::from_arrow("bifrost.datasets.unsupported", schema)
+                .expect_err("refused");
 
             assert_eq!(code(&refused), "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE");
             let message = refused.to_string();

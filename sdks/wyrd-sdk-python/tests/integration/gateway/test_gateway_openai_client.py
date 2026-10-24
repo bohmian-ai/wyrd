@@ -3,7 +3,7 @@
 The client holds a normal Wyrd access token, or a static Wyrd API key the
 gateway exchanges for one, the server's in-process gateway
 reaches the shared recording upstream, and each call is recorded in
-``vala.gateway.calls``.
+``bifrost.gateway.calls``.
 """
 
 from __future__ import annotations

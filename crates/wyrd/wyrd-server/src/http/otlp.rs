@@ -73,7 +73,7 @@ use wyrd_spec::error::WyrdProblem;
 ///
 /// Used to derive the physical Bifrost table name for per-signal error messages
 /// so that `IngestBusy` / `IngressClosed` responses name the correct table
-/// (`vala.traces.spans`, `vala.metrics.points`, `vala.logs.records`) rather
+/// (`bifrost.traces.spans`, `bifrost.metrics.points`, `bifrost.logs.records`) rather
 /// than always reporting the traces table.
 #[derive(Clone, Copy, Debug)]
 enum OtlpSignal {
@@ -86,9 +86,9 @@ impl OtlpSignal {
     /// The fully-qualified Bifrost table name for this signal.
     fn table(self) -> &'static str {
         match self {
-            Self::Traces => "vala.traces.spans",
-            Self::Metrics => "vala.metrics.points",
-            Self::Logs => "vala.logs.records",
+            Self::Traces => "bifrost.traces.spans",
+            Self::Metrics => "bifrost.metrics.points",
+            Self::Logs => "bifrost.logs.records",
         }
     }
 }
@@ -610,7 +610,7 @@ mod tests {
     fn writer_busy_maps_to_429() {
         let response = ingest_error_to_response(
             IngestError::IngestBusy {
-                table: "vala.traces.spans".to_owned(),
+                table: "bifrost.traces.spans".to_owned(),
             },
             OtlpSignal::Traces,
         );
@@ -622,9 +622,9 @@ mod tests {
     #[test]
     fn writer_closed_table_name_is_per_signal() {
         for (signal, expected_table) in [
-            (OtlpSignal::Traces, "vala.traces.spans"),
-            (OtlpSignal::Metrics, "vala.metrics.points"),
-            (OtlpSignal::Logs, "vala.logs.records"),
+            (OtlpSignal::Traces, "bifrost.traces.spans"),
+            (OtlpSignal::Metrics, "bifrost.metrics.points"),
+            (OtlpSignal::Logs, "bifrost.logs.records"),
         ] {
             let wyrd_err = IngestError::IngressClosed.to_wyrd_error(signal.table());
             match wyrd_err {
@@ -744,7 +744,7 @@ mod tests {
     fn table_not_found_maps_to_404() {
         let response = ingest_error_to_response(
             IngestError::TableNotFound {
-                table: "vala.traces.spans".to_owned(),
+                table: "bifrost.traces.spans".to_owned(),
             },
             OtlpSignal::Traces,
         );
@@ -769,7 +769,7 @@ mod tests {
             match &wyrd_err {
                 wyrd_spec::error::WyrdError::Vala {
                     error: BifrostError::OtlpRequestMalformed { table, .. },
-                } => assert_eq!(table, "vala.traces.spans", "{label} table context"),
+                } => assert_eq!(table, "bifrost.traces.spans", "{label} table context"),
                 other => panic!("{label}: expected OtlpRequestMalformed, got {other:?}"),
             }
             assert_eq!(wyrd_err.status(), 400);
@@ -785,7 +785,7 @@ mod tests {
         match wyrd_err {
             wyrd_spec::error::WyrdError::Vala {
                 error: BifrostError::OtlpRequestMalformed { table, .. },
-            } => assert_eq!(table, "vala.metrics.points"),
+            } => assert_eq!(table, "bifrost.metrics.points"),
             other => panic!("expected OtlpRequestMalformed, got {other:?}"),
         }
     }
@@ -798,7 +798,7 @@ mod tests {
         match wyrd_err {
             wyrd_spec::error::WyrdError::Vala {
                 error: BifrostError::OtlpRequestMalformed { table, .. },
-            } => assert_eq!(table, "vala.logs.records"),
+            } => assert_eq!(table, "bifrost.logs.records"),
             other => panic!("expected OtlpRequestMalformed, got {other:?}"),
         }
     }

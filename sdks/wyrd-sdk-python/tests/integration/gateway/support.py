@@ -5,7 +5,7 @@ test server's adapters reach: OpenAI under ``/v1``, Anthropic Messages, Gemini
 and Vertex ``GenerateContent``, Jev ``systemone``, and OpenAI embeddings and
 images. Journeys
 point a real ``WyrdTestServer`` at it, drive unmodified clients through the
-server, and read the published ``vala.gateway.calls`` rows once.
+server, and read the published ``bifrost.gateway.calls`` rows once.
 """
 
 from __future__ import annotations
@@ -290,9 +290,9 @@ def access_token(server: WyrdTestServer, api_key: str) -> str:
 
 
 def calls(server: WyrdTestServer, where: str, columns: str) -> list[dict[str, Any]]:
-    """Publish the gateway's captured calls, then read the ``vala.gateway.calls`` rows matching ``where``."""
+    """Publish the gateway's captured calls, then read the ``bifrost.gateway.calls`` rows matching ``where``."""
     server.flush_bifrost()
-    query = f"SELECT {columns} FROM vala.gateway.calls WHERE {where} ORDER BY started_at"
+    query = f"SELECT {columns} FROM bifrost.gateway.calls WHERE {where} ORDER BY started_at"
     return Bifrost(client=client_of(server)).sql(query).to_arrow().to_pylist()
 
 

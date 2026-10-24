@@ -173,9 +173,9 @@ async fn prove_remote_scalar_subquery_ships_as_a_literal() -> Result<(), PeerJou
     let ids: Vec<Id> = query(
         &tables,
         &format!(
-            "SELECT id FROM vala.bifrost.{events} \
+            "SELECT id FROM bifrost.bifrost.{events} \
              WHERE event_time >= '{h1}' \
-             AND event_time = (SELECT max(event_time) FROM vala.bifrost.{pick})",
+             AND event_time = (SELECT max(event_time) FROM bifrost.bifrost.{pick})",
             events = tables.events,
             pick = tables.pick,
             h1 = rfc3339(tables.at(1, 0)),
@@ -260,36 +260,36 @@ async fn prove_remote_two_row_scalar_subquery_is_refused() -> Result<(), PeerJou
         .await?;
     let client = public_client(tables.cluster.server(COORDINATOR)?, &api_key)?;
     let bifrost = wyrd_client::Bifrost::query_only(&client);
-    let scalar = format!("(SELECT event_time FROM vala.bifrost.{pair})");
+    let scalar = format!("(SELECT event_time FROM bifrost.bifrost.{pair})");
     let keyed = "(SELECT x FROM (SELECT x, COUNT(*) n FROM (VALUES (1), (2), (2)) t(x) \
                  GROUP BY x) g WHERE x = abs(n))";
     for sql in [
         format!(
-            "SELECT id FROM vala.bifrost.{events} WHERE event_time = {scalar}",
+            "SELECT id FROM bifrost.bifrost.{events} WHERE event_time = {scalar}",
             events = tables.events
         ),
         format!(
-            "SELECT id, {scalar} AS picked FROM vala.bifrost.{events}",
+            "SELECT id, {scalar} AS picked FROM bifrost.bifrost.{events}",
             events = tables.events
         ),
         format!(
             "SELECT id, (SELECT COALESCE(l.x, r.x) FROM (VALUES (1)) l(x) \
              FULL JOIN (VALUES (2)) r(x) ON l.x = r.x) AS picked \
-             FROM vala.bifrost.{events}",
+             FROM bifrost.bifrost.{events}",
             events = tables.events
         ),
         format!(
             "SELECT id, (SELECT COUNT(*) FROM (VALUES (1)) t(x) \
              GROUP BY GROUPING SETS ((x), ())) AS picked \
-             FROM vala.bifrost.{events}",
+             FROM bifrost.bifrost.{events}",
             events = tables.events
         ),
         format!(
-            "SELECT id, {keyed} AS picked FROM vala.bifrost.{events}",
+            "SELECT id, {keyed} AS picked FROM bifrost.bifrost.{events}",
             events = tables.events
         ),
         format!(
-            "SELECT id FROM vala.bifrost.{events} WHERE id > {keyed}",
+            "SELECT id FROM bifrost.bifrost.{events} WHERE id > {keyed}",
             events = tables.events
         ),
     ] {
@@ -343,8 +343,8 @@ async fn prove_remote_live_join_returns_its_rows() -> Result<(), PeerJourneyErro
     let rows: Vec<Joined> = bifrost
         .sql_as(
             &format!(
-                "SELECT e.id, p.id AS pick FROM vala.bifrost.{events} e \
-                 JOIN vala.bifrost.{pick} p ON e.event_time = p.event_time",
+                "SELECT e.id, p.id AS pick FROM bifrost.bifrost.{events} e \
+                 JOIN bifrost.bifrost.{pick} p ON e.event_time = p.event_time",
                 events = tables.events,
                 pick = tables.pick,
             ),
@@ -366,9 +366,9 @@ async fn prove_remote_live_join_returns_its_rows() -> Result<(), PeerJourneyErro
         .sql_as(
             &format!(
                 "SELECT o.id, (SELECT g.id FROM (SELECT i.id, COUNT(*) n \
-             FROM vala.bifrost.{events} i GROUP BY i.id) g \
+             FROM bifrost.bifrost.{events} i GROUP BY i.id) g \
              WHERE g.id = CASE WHEN o.id > 0 THEN o.id + 1 ELSE -o.id END) AS picked \
-             FROM vala.bifrost.{events} o WHERE o.id IN ({picked}, {last}) ORDER BY o.id",
+             FROM bifrost.bifrost.{events} o WHERE o.id IN ({picked}, {last}) ORDER BY o.id",
                 events = tables.events,
             ),
             &[],

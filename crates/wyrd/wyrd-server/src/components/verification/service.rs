@@ -197,7 +197,7 @@ impl<'a> VerificationControl<'a> {
     ///
     /// Authorizes and audits `cards:read` standalone, reads the status and
     /// both exact Cards in one tenant transaction, then — for a completed
-    /// execution — reads its result from `vala.verification.results` as the
+    /// execution — reads its result from `bifrost.verification.results` as the
     /// caller through the ordinary Bifrost query entry. A result Scribe has
     /// not yet published leaves `result` absent, so the caller polls again.
     ///
@@ -278,7 +278,7 @@ impl<'a> VerificationControl<'a> {
         let request = BifrostQueryRequest {
             params: Vec::new(),
             sql: format!(
-                "SELECT outcome, run_id FROM vala.verification.results \
+                "SELECT outcome, run_id FROM bifrost.verification.results \
                  WHERE result_id = '{result_id}' LIMIT 1"
             ),
             deadline_ms: None,

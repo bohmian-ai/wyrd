@@ -72,7 +72,7 @@ test("support desk answers, verifies, and explains every request", async ({ serv
 
   const desk = await deploy(admin, bundle);
 
-  const tickets = await (await Bifrost.connect({ client: admin })).describeTable("vala.datasets", "tickets");
+  const tickets = await (await Bifrost.connect({ client: admin })).describeTable("bifrost.datasets", "tickets");
   expect(tickets.user_fields.map((field) => field.name)).toEqual(["ticket_id", "question", "answer", "refund"]);
   await expect(
     (await Cards.connect({ client: admin })).declareFromPath(fixture("cards/support_desk/conflicting-desk.yaml")),

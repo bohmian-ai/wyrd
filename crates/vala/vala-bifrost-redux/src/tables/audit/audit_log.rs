@@ -8,7 +8,7 @@ use crate::tables::fields::{ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-/// `vala.system.audit_log` — 13 authorization-decision content columns plus the
+/// `bifrost.system.audit_log` — 13 authorization-decision content columns plus the
 /// managed physical envelope.
 ///
 /// Audit carries its own subject/actor pair and Card identity, so the table

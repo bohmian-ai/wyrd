@@ -1064,7 +1064,7 @@ mod tests {
             context,
             request: BifrostQueryRequest {
                 params: Vec::new(),
-                sql: "SELECT value FROM vala.bifrost.events".to_owned(),
+                sql: "SELECT value FROM bifrost.bifrost.events".to_owned(),
                 deadline_ms: Some(5_000),
             },
             absolute_deadline_ms: (now + chrono::Duration::seconds(30)).timestamp_millis(),

@@ -96,7 +96,7 @@ impl Inference {
         }
     }
 
-    /// Every retained `vala.gateway.calls` row's attribution, sorted, after
+    /// Every retained `bifrost.gateway.calls` row's attribution, sorted, after
     /// publishing captured rows.
     ///
     /// # Panics
@@ -113,7 +113,7 @@ impl Inference {
                 .expect("Bifrost connects")
                 .sql_as(
                     "SELECT sub_principal_id, act_principal_id, run_id, card_uid \
-                     FROM vala.gateway.calls",
+                     FROM bifrost.gateway.calls",
                     &[],
                 )
                 .await
@@ -452,7 +452,7 @@ async fn malformed_traceparent_is_ignored_by_the_gateway() {
         wyrd_ai::Bifrost::connect_with(&inference.deployment.admin(), BifrostOptions::default())
             .await
             .expect("Bifrost connects")
-            .sql_as::<CallId>("SELECT call_id FROM vala.gateway.calls", &[])
+            .sql_as::<CallId>("SELECT call_id FROM bifrost.gateway.calls", &[])
             .await
             .expect("calls read back");
     let [call] = &calls[..] else {
@@ -472,7 +472,7 @@ async fn malformed_traceparent_is_ignored_by_the_gateway() {
     inference.deployment.shutdown().await;
 }
 
-/// One `vala.gateway.calls` row's identity.
+/// One `bifrost.gateway.calls` row's identity.
 #[derive(Debug, serde::Deserialize)]
 struct CallId {
     /// The call's UUID, whose bytes are its trace id when no caller's trace
@@ -480,7 +480,7 @@ struct CallId {
     call_id: String,
 }
 
-/// One `vala.gateway.calls` row's subject/actor pair and attribution.
+/// One `bifrost.gateway.calls` row's subject/actor pair and attribution.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
 struct CallAttribution {
     /// The principal the call was for.

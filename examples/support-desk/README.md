@@ -3,7 +3,7 @@
 One Agent-backed Service, the same story in Rust, Python, and TypeScript.
 
 `service/` holds the Cards. `support-desk` declares the
-`vala.datasets.tickets` table and binds one Verifier, `policy-check`, to its
+`bifrost.datasets.tickets` table and binds one Verifier, `policy-check`, to its
 `support-agent`. `policy-check` takes the `answer` and the `policy` PDF
 (`refund-policy.pdf`):
 

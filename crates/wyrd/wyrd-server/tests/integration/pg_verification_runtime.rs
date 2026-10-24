@@ -9,7 +9,7 @@
 //! on a Scribe outbox writing to the server's own Scribe, wrapped in a
 //! [`PublicationFault`] that records every submitted batch; execution state is
 //! read back from `wyrd.verifier_executions` and audit from the tenant's retained
-//! `vala.system.audit_log` history.
+//! `bifrost.system.audit_log` history.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -60,10 +60,10 @@ use wyrd_testing::verification::{ExecutionRow, VerificationFixture};
 const WAIT: Duration = Duration::from_mins(1);
 
 /// Summary table every completed result ends with.
-const RESULTS: &str = "vala.verification.results";
+const RESULTS: &str = "bifrost.verification.results";
 
 /// Drift detail table.
-const FEATURES: &str = "vala.drift.result_features";
+const FEATURES: &str = "bifrost.drift.result_features";
 
 /// One bound server, one seeded tenant, and the controls a runtime is built with.
 struct Harness {
@@ -3329,7 +3329,7 @@ async fn linked_attempts(
         .collect()
 }
 
-/// One span a tenant reads back from its own `vala.traces.spans`.
+/// One span a tenant reads back from its own `bifrost.traces.spans`.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TenantSpan {
     /// Hex span id, equal to the operator's id for the same span.
@@ -4735,7 +4735,7 @@ async fn configured_service_context_survives_acceptance_and_restart() {
                 .retained_records(
                     server.data_tenant_id(),
                     format!(
-                        "SELECT deployment_environment FROM vala.verification.{table} \
+                        "SELECT deployment_environment FROM bifrost.verification.{table} \
                          WHERE execution_id = '{run}'"
                     ),
                 )

@@ -288,8 +288,8 @@ mod tests {
             .expect("register canonical and quoted aliases");
 
         for sql in [
-            "SELECT * FROM vala.traces.spans",
-            "SELECT * FROM \"vala.traces.spans\"",
+            "SELECT * FROM bifrost.traces.spans",
+            "SELECT * FROM \"bifrost.traces.spans\"",
         ] {
             session
                 .sql(sql)

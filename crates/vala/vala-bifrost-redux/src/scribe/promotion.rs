@@ -447,7 +447,7 @@ mod tests {
         ScribePublishedHotFileV1::from_metrics(
             &PublishedHotFileIdentity {
                 data_tenant_id: Uuid::now_v7(),
-                namespace: "vala.traces",
+                namespace: "bifrost.traces",
                 table_name: "spans",
                 file_list_id: Uuid::now_v7(),
                 object_key: "tenant/table/day=1970-01-01/scribe-0-00000.parquet",

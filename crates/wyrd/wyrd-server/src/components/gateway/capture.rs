@@ -2,7 +2,7 @@
 //!
 //! After a call's accounting settles, [`CallCapture`] projects its terminal
 //! facts under the policy admitted with the call into one
-//! `vala.gateway.calls` row and one linked GenAI span per attempt, applying
+//! `bifrost.gateway.calls` row and one linked GenAI span per attempt, applying
 //! mandatory secret redaction and binary-content references to any selected
 //! payload. Once every referenced object is persisted, the capture is staged
 //! on the process [`crate::scribe_outbox::ScribeOutbox`], which owns its
@@ -174,7 +174,7 @@ pub struct CallCapture {
     tenant: DataTenantId,
     /// Operation, which names the GenAI spans.
     operation: GatewayOperation,
-    /// The `vala.gateway.calls` row.
+    /// The `bifrost.gateway.calls` row.
     payload: GatewayCallPayloadV1,
     /// Bytes of every object the row references, persisted before delivery.
     objects: PayloadObjects,
@@ -313,7 +313,7 @@ impl CallCapture {
             + self.objects.bytes()
     }
 
-    /// Builds one `vala.gateway.calls` batch holding one row per capture, in
+    /// Builds one `bifrost.gateway.calls` batch holding one row per capture, in
     /// order, over the table's user fields followed by its `card_uid` and
     /// `run_id` correlation inputs.
     ///
@@ -411,7 +411,7 @@ impl CallCapture {
             .collect()
     }
 
-    /// Builds one canonical `vala.traces.spans` batch of every capture's
+    /// Builds one canonical `bifrost.traces.spans` batch of every capture's
     /// attempt spans, capture by capture in ordinal order, in one projection.
     ///
     /// Every span of a call shares one trace, so they link to each other and
@@ -713,7 +713,7 @@ impl PayloadObjects {
     }
 }
 
-/// The `vala.gateway.calls` row schema with its correlation inputs, and the
+/// The `bifrost.gateway.calls` row schema with its correlation inputs, and the
 /// same schema without the two payload columns, which the JSON row decoder
 /// builds. Built once, so every row shares both `Arc`s: rows of one frame
 /// compare by pointer and no row rebuilds or frees the schema tree.
@@ -732,7 +732,7 @@ static CALLS_SCHEMAS: LazyLock<(Arc<Schema>, Arc<Schema>)> = LazyLock::new(|| {
 });
 
 /// Whether `name` is one of the two Variant payload columns of
-/// `vala.gateway.calls`, which the JSON row decoder cannot build.
+/// `bifrost.gateway.calls`, which the JSON row decoder cannot build.
 fn is_payload_column(name: &str) -> bool {
     name == REQUEST_PAYLOAD || name == RESPONSE_PAYLOAD
 }
@@ -1507,7 +1507,7 @@ pub(crate) mod recording {
     use crate::state::AppState;
 
     /// One authorization decision the recording Scribe acknowledged on
-    /// `vala.system.audit_log`, decoded from its frame for content checks.
+    /// `bifrost.system.audit_log`, decoded from its frame for content checks.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct AuditDecision {
         /// Tenant whose audit history the decision was written to.
@@ -1668,7 +1668,7 @@ pub(crate) mod recording {
             AppState::from_owners_for_test(owners)
         }
 
-        /// Every acknowledged `vala.system.audit_log` row, in arrival order.
+        /// Every acknowledged `bifrost.system.audit_log` row, in arrival order.
         ///
         /// Settles nothing itself: settle the outbox first, after which every
         /// staged decision is here.
@@ -1680,7 +1680,7 @@ pub(crate) mod recording {
             self.audit.lock().expect("audit").clone()
         }
 
-        /// Every acknowledged `vala.system.audit_log` frame, in arrival order.
+        /// Every acknowledged `bifrost.system.audit_log` frame, in arrival order.
         ///
         /// Settles nothing itself: settle the outbox first.
         ///
@@ -1732,7 +1732,7 @@ pub(crate) mod recording {
             self.received().iter().map(|frame| frame.rows).sum()
         }
 
-        /// Every acknowledged `vala.gateway.calls` row as a JSON object of
+        /// Every acknowledged `bifrost.gateway.calls` row as a JSON object of
         /// its scalar columns, in arrival order; the Variant payload columns
         /// are omitted.
         ///
@@ -1784,7 +1784,7 @@ pub(crate) mod recording {
         }
     }
 
-    /// Decodes every row of one `vala.system.audit_log` batch for `tenant`.
+    /// Decodes every row of one `bifrost.system.audit_log` batch for `tenant`.
     ///
     /// # Panics
     ///

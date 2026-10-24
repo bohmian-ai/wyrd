@@ -29,7 +29,7 @@
 //!
 //! `--fixture telemetry` writes the telemetry fixture instead: 10 million
 //! GenAI/HTTP spans exported through the OTLP gRPC collector into
-//! `vala.traces.spans`, settled into the tier, checked against exact answers,
+//! `bifrost.traces.spans`, settled into the tier, checked against exact answers,
 //! and, in the Parquet tier, judged on which span attribute keys the
 //! published files shred (`telemetry/<tier>/`).
 //!

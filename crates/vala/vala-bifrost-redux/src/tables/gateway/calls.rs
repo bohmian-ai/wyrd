@@ -1,4 +1,4 @@
-//! `vala.gateway.calls` — one terminal analytical row per captured gateway call.
+//! `bifrost.gateway.calls` — one terminal analytical row per captured gateway call.
 //!
 //! The user fields are the `GatewayCallPayloadV1` record in declaration order,
 //! except that its two canonical payload JSON texts are stored as the Variant
@@ -28,7 +28,7 @@ pub const RESPONSE_PAYLOAD: &str = "response_payload";
 /// Optional resolved `ModelRef` Struct column; present exactly when routing resolved a model.
 pub const RESOLVED_MODEL: &str = "resolved_model";
 
-/// Built-in definition of `vala.gateway.calls`.
+/// Built-in definition of `bifrost.gateway.calls`.
 pub struct CallsTable;
 
 impl CallsTable {
@@ -178,7 +178,7 @@ mod tests {
     /// order, nullability, or envelope placement.
     #[test]
     fn calls_table_is_the_payload_contract_plus_the_managed_envelope() {
-        let definition = builtin_table("gateway", "calls").expect("vala.gateway.calls resolves");
+        let definition = builtin_table("gateway", "calls").expect("bifrost.gateway.calls resolves");
         let schema = (definition.schema)();
         let columns = schema
             .fields()

@@ -51,8 +51,12 @@ mod tests {
             table: table.to_owned(),
         };
         assert!(
-            task_table_binding(tenant, tenant, &identity("other", "vala.bifrost", "events"))
-                .is_err()
+            task_table_binding(
+                tenant,
+                tenant,
+                &identity("other", "bifrost.bifrost", "events")
+            )
+            .is_err()
         );
         assert!(
             task_table_binding(tenant, tenant, &identity("wyrd-redux", "unknown", "events"))
@@ -62,7 +66,7 @@ mod tests {
             task_table_binding(
                 tenant,
                 tenant,
-                &identity("wyrd-redux", "vala.bifrost", "../events")
+                &identity("wyrd-redux", "bifrost.bifrost", "../events")
             )
             .is_err()
         );
@@ -70,7 +74,7 @@ mod tests {
             task_table_binding(
                 DataTenantId::new_v7(),
                 tenant,
-                &identity("wyrd-redux", "vala.bifrost", "events")
+                &identity("wyrd-redux", "bifrost.bifrost", "events")
             )
             .is_err()
         );

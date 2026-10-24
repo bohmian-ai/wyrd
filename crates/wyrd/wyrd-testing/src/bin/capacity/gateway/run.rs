@@ -461,7 +461,7 @@ pub async fn smoke(
     smoke.positive("staged captures", integrity.staged);
     smoke.positive("Scribe outbox writes", integrity.written);
     let expected: Vec<(&str, u64)> = expected.into_iter().collect();
-    let population = collector.smoke("smoke", from, &expected).await;
+    let population = collector.smoke("smoke", from, &expected, &[]).await;
     let judged: Vec<(&str, &str, bool)> = expected
         .iter()
         .map(|(boundary, _)| (*boundary, SUCCEEDED, true))

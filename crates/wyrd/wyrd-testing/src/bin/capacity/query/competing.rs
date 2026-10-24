@@ -11,7 +11,7 @@
 //! is the one declared refusal, and only from overload's start until that
 //! grace ends.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -114,6 +114,8 @@ struct Acked {
     rows: u64,
     /// Its diagnostic client latency in microseconds, or its error code.
     result: Result<u64, String>,
+    /// The trace id its request carried, which its server timing shares.
+    trace: String,
 }
 
 /// What one ingest path's open loop scheduled, sent, and observed.
@@ -322,10 +324,11 @@ impl Competing {
 }
 
 /// Collects the window's server timings from `from`: every answered query's
-/// own `bifrost.query` observation by trace id, which is kept on it, and at
-/// least one observation per acknowledged ingest request at its path's
-/// boundary. The client-queue lanes and probes reach the same boundaries, so
-/// counts are lower bounds and the traced queries are matched exactly.
+/// own `bifrost.query` observation and every answered ingest request's own
+/// observation at its path's boundary, each matched by the trace id its
+/// request carried; the answered queries' timings are kept on them. The
+/// client-queue lanes and probes reach the same boundaries with their own
+/// traces, so counts are lower bounds and only matched identities judge.
 async fn timings(
     collector: &Collector,
     step: &str,
@@ -333,15 +336,22 @@ async fn timings(
     offered: &[Offered],
     asked: &mut [Asked],
 ) -> Population {
-    let traces: Vec<&str> = asked
+    let mut traces: Vec<&str> = asked
         .iter()
         .filter(|asked| asked.result.is_ok())
         .map(|asked| asked.trace.as_str())
         .collect();
     let mut least = vec![("bifrost.query", traces.len() as u64)];
     for ((op, _), offered) in SPLIT.iter().zip(offered) {
-        let acked = offered.acked.iter().filter(|acked| acked.result.is_ok());
-        least.push((op.boundary(), acked.count() as u64));
+        let before = traces.len();
+        traces.extend(
+            offered
+                .acked
+                .iter()
+                .filter(|acked| acked.result.is_ok())
+                .map(|acked| acked.trace.as_str()),
+        );
+        least.push((op.boundary(), (traces.len() - before) as u64));
     }
     let population = collector.traced(step, from, &least, &traces).await;
     let queries: HashMap<&str, u64> = population
@@ -394,8 +404,9 @@ async fn offer(
         outstanding.fetch_add(chunk, Ordering::Relaxed);
         pending.spawn(async move {
             let sent = std::time::Instant::now();
+            let context = request_trace();
             let result = sender
-                .send(first, first + chunk)
+                .send(first, first + chunk, &context)
                 .await
                 .map(|_| micros(sent));
             outstanding.fetch_sub(chunk, Ordering::Relaxed);
@@ -407,6 +418,7 @@ async fn offer(
                 at,
                 rows: chunk.cast_unsigned(),
                 result,
+                trace: context.trace_id,
             }
         });
     }
@@ -561,7 +573,8 @@ fn read_queries(repetition: &mut Repetition, asked: &[Asked], phases: &Phases) {
 }
 
 /// Sets every ingest reading: per-phase server acknowledgement p99 over
-/// every successful write observation that ended in the phase, the
+/// the successful observation of every offered write, matched by trace id,
+/// that ended in the phase, the
 /// diagnostic visibility, and rows; totals; the drain; arrivals; and adds
 /// ingest failures and undeclared query refusals to `errors`.
 fn read_ingest(
@@ -573,6 +586,26 @@ fn read_ingest(
 ) {
     let writes = SPLIT.map(|(op, _)| op.boundary());
     let acked: Vec<&Acked> = offered.iter().flat_map(|offered| &offered.acked).collect();
+    let offered_traces: HashSet<&str> = acked.iter().map(|acked| acked.trace.as_str()).collect();
+    let answered: HashSet<&str> = acked
+        .iter()
+        .filter(|acked| acked.result.is_ok())
+        .map(|acked| acked.trace.as_str())
+        .collect();
+    let contradicted = population
+        .timings
+        .iter()
+        .filter(|timing| {
+            writes.contains(&timing.boundary.as_str())
+                && answered.contains(timing.trace_id.as_str())
+                && timing.outcome != SUCCESS
+        })
+        .count();
+    if contradicted > 0 {
+        repetition.invalid.push(format!(
+            "{contradicted} acknowledged ingest requests have a server timing whose outcome is not `{SUCCESS}`"
+        ));
+    }
     let phase_readings: [(&str, &dyn Fn(Instant) -> bool); 2] = [
         ("capacity", &|at| phases.capacity(at)),
         ("recovery", &|at| phases.recovered(at)),
@@ -584,6 +617,7 @@ fn read_ingest(
             .iter()
             .filter(|timing| {
                 writes.contains(&timing.boundary.as_str())
+                    && offered_traces.contains(timing.trace_id.as_str())
                     && timing.outcome == SUCCESS
                     && phases.instant(timing.end_unix_ns).is_some_and(within)
             })

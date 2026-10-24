@@ -629,7 +629,7 @@ impl Workload for Bench {
                 .sum(),
         );
         let population = collector
-            .smoke("smoke", from, &[(DIRECT_TIMING, measured.answered())])
+            .smoke("smoke", from, &[(DIRECT_TIMING, measured.answered())], &[])
             .await;
         smoke.timings(&population, &[(DIRECT_TIMING, COMPLETED, true)]);
         smoke.finish().map_err(ExperimentError::Workload)

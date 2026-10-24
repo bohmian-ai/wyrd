@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Value, json};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
-use wyrd_testing::capacity::{Collector, Selection, Smoke, Window};
+use wyrd_testing::capacity::{Collector, Selection, Smoke, Window, request_trace};
 use wyrd_testing::experiment::{
     Baselines, Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reason,
     Record, Status, Step, Verdict,
@@ -1070,8 +1070,9 @@ async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
 /// publication, since only physical scans count scanned rows, then exact
 /// `count(*)` queries over the smoked native
 /// rows until one answers, all inside one window. Every request must reach
-/// `collector` as exactly one successful timing at its boundary, with
-/// positive server CPU, inserted memtable bytes, and scanned rows.
+/// `collector` as exactly one successful timing at its boundary, each write
+/// matched by the trace id it carried, with positive server CPU, inserted
+/// memtable bytes, and scanned rows.
 ///
 /// # Errors
 ///
@@ -1089,12 +1090,16 @@ async fn smoke(
         .await
         .map_err(|error| error.to_string())?;
     let mut expected = Vec::new();
+    let mut traces = Vec::new();
     let mut native_rows = 0;
     for (op, sender, cursor) in lanes {
         let chunk = sender.request_rows();
         for _ in 0..SMOKE_WRITES {
             let first = cursor.fetch_add(chunk, Ordering::Relaxed);
-            match sender.send(first, first + chunk).await {
+            let trace = request_trace();
+            let sent = sender.send(first, first + chunk, &trace).await;
+            traces.push(trace.trace_id);
+            match sent {
                 Ok(wire) if *op != WriteOp::Native => {
                     smoke.positive(&format!("{} wire bytes", op.name()), wire as f64);
                 }
@@ -1138,7 +1143,8 @@ async fn smoke(
     let delta = |family: &str| after.sum(family, &[]) - before.sum(family, &[]);
     smoke.positive(isolated::INSERTED, delta(isolated::INSERTED));
     smoke.positive(isolated::ROWS_SCANNED, delta(isolated::ROWS_SCANNED));
-    let population = collector.smoke("smoke", from, &expected).await;
+    let traces: Vec<&str> = traces.iter().map(String::as_str).collect();
+    let population = collector.smoke("smoke", from, &expected, &traces).await;
     let boundaries: Vec<(&str, &str, bool)> = expected
         .iter()
         .map(|(boundary, _)| (*boundary, isolated::SUCCESS, false))

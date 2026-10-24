@@ -1044,15 +1044,17 @@ impl Collector {
             .await
     }
 
-    /// [`Self::window`] for a smoke's handful of requests, waiting at most
-    /// [`SMOKE_WAIT`] for a short count.
+    /// [`Self::window`] for a smoke's requests, waiting at most
+    /// [`SMOKE_WAIT`] for a short count, and requiring each of `traces` to
+    /// have exactly one observation.
     pub async fn smoke(
         &self,
         label: &str,
         opened: SystemTime,
         expected: &[(&str, u64)],
+        traces: &[&str],
     ) -> Population {
-        self.collect(label, opened, expected, true, &[], SMOKE_WAIT)
+        self.collect(label, opened, expected, true, traces, SMOKE_WAIT)
             .await
     }
 
@@ -1061,8 +1063,8 @@ impl Collector {
     /// observations of each boundary ended at or after `opened` and every
     /// trace id of `traces` has one, then takes every observation of those
     /// boundaries that did. The population is invalid when a count is short
-    /// or a trace has no observation after [`COLLECTION_WAIT`], a span id
-    /// repeats, or a timing span was malformed.
+    /// or a trace has no observation after [`COLLECTION_WAIT`], a trace has
+    /// more than one, a span id repeats, or a timing span was malformed.
     pub async fn traced(
         &self,
         label: &str,
@@ -1174,6 +1176,22 @@ impl Collector {
             .partition(|timing| matching(timing));
         let (exports, spans) = (received.exports, received.spans);
         drop(received);
+        if !traces.is_empty() {
+            let wanted: std::collections::HashSet<&str> = traces.iter().copied().collect();
+            let mut seen: BTreeMap<&str, u64> = BTreeMap::new();
+            for timing in &timings {
+                if wanted.contains(timing.trace_id.as_str()) {
+                    *seen.entry(timing.trace_id.as_str()).or_default() += 1;
+                }
+            }
+            let repeated = seen.values().filter(|count| **count > 1).count();
+            if repeated > 0 {
+                invalid.push(format!(
+                    "{repeated} of {} traced requests have more than one server timing observation",
+                    traces.len()
+                ));
+            }
+        }
         let mut ids: Vec<&str> = timings
             .iter()
             .map(|timing| timing.span_id.as_str())
@@ -1686,15 +1704,18 @@ mod tests {
     /// A real OTLP export past a small retention bound keeps only the bound,
     /// and the overflow invalidates the window reading its boundary even
     /// after a window over another boundary passed and dropped the kept
-    /// stragglers; an in-limit window stays exact, and malformed reasons and a stopped
-    /// collector stay bounded, specific invalidity.
+    /// stragglers; an in-limit window stays exact; offered traces match
+    /// their own observations in any order, while a missing offered trace
+    /// beside an unrelated same-boundary span or a repeated trace is
+    /// invalid; and malformed reasons and a stopped collector stay bounded,
+    /// specific invalidity.
     ///
     /// # Panics
     ///
     /// Panics when the collector cannot start or a window's evidence is
     /// wrong.
     #[tokio::test(flavor = "multi_thread")]
-    async fn collector_bounds_overflow_and_loss() {
+    async fn collector_bounds_identity_and_loss() {
         use wyrd_tonic::otlp::common::v1::{AnyValue, any_value::Value as Any};
         use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
         use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
@@ -1706,9 +1727,10 @@ mod tests {
             .await
             .expect("connect");
         let mut id = 0_u64;
-        let mut export = async |boundary: &str, count: usize, elapsed: Option<i64>| {
-            let spans = (0..count)
-                .map(|_| {
+        let mut export = async |boundary: &str, traces: &[u64], elapsed: Option<i64>| {
+            let spans = traces
+                .iter()
+                .map(|trace| {
                     id += 1;
                     let attribute = |key: &str, value| KeyValue {
                         key: key.to_owned(),
@@ -1721,7 +1743,7 @@ mod tests {
                     attributes.extend(elapsed.map(|ns| attribute("elapsed_ns", Any::IntValue(ns))));
                     Span {
                         name: TIMING_SPAN.to_owned(),
-                        trace_id: [id.to_be_bytes(), id.to_be_bytes()].concat(),
+                        trace_id: [trace.to_be_bytes(), trace.to_be_bytes()].concat(),
                         span_id: id.to_be_bytes().to_vec(),
                         end_time_unix_nano: super::unix_nanos(std::time::SystemTime::now()),
                         attributes,
@@ -1744,10 +1766,10 @@ mod tests {
         };
 
         let opened = std::time::SystemTime::now();
-        export("a", 5, Some(10)).await;
-        let other = collector.smoke("other", opened, &[("b", 0)]).await;
+        export("a", &[0; 5], Some(10)).await;
+        let other = collector.smoke("other", opened, &[("b", 0)], &[]).await;
         assert!(other.invalid.is_empty(), "{:?}", other.invalid);
-        let over = collector.smoke("over", opened, &[("a", 5)]).await;
+        let over = collector.smoke("over", opened, &[("a", 5)], &[]).await;
         assert_eq!(
             over.invalid,
             [
@@ -1758,14 +1780,42 @@ mod tests {
         );
 
         let opened = std::time::SystemTime::now();
-        export("a", 2, Some(10)).await;
+        export("a", &[0; 2], Some(10)).await;
         let within = collector.window("within", opened, &[("a", 2)]).await;
         assert!(within.invalid.is_empty(), "{:?}", within.invalid);
         assert_eq!(within.elapsed("a", "success"), [10, 10]);
 
+        let trace = |id: u64| format!("{id:016x}{id:016x}");
+        let (x, y, z) = (trace(7), trace(8), trace(9));
         let opened = std::time::SystemTime::now();
-        export("a", KEPT_MALFORMED + 2, None).await;
-        let malformed = collector.smoke("malformed", opened, &[("a", 0)]).await;
+        export("a", &[9, 7], Some(10)).await;
+        let ordered = collector
+            .smoke("ordered", opened, &[("a", 2)], &[&x, &z])
+            .await;
+        assert!(ordered.invalid.is_empty(), "{:?}", ordered.invalid);
+        let opened = std::time::SystemTime::now();
+        export("a", &[7, 8], Some(10)).await;
+        let unrelated = collector
+            .smoke("unrelated", opened, &[("a", 2)], &[&x, &z])
+            .await;
+        assert_eq!(
+            unrelated.invalid,
+            ["1 of 2 traced requests have no server timing observation"],
+            "an unrelated span never stands in for an offered trace"
+        );
+        let opened = std::time::SystemTime::now();
+        export("a", &[8, 8], Some(10)).await;
+        let repeated = collector
+            .smoke("repeated", opened, &[("a", 2)], &[&y])
+            .await;
+        assert_eq!(
+            repeated.invalid,
+            ["1 of 1 traced requests have more than one server timing observation"]
+        );
+
+        let opened = std::time::SystemTime::now();
+        export("a", &[0; KEPT_MALFORMED + 2], None).await;
+        let malformed = collector.smoke("malformed", opened, &[("a", 0)], &[]).await;
         assert_eq!(malformed.invalid.len(), KEPT_MALFORMED + 1);
         assert_eq!(
             malformed.invalid.last().map(String::as_str),
@@ -1774,7 +1824,7 @@ mod tests {
 
         drop(collector.stop.take());
         let opened = std::time::SystemTime::now();
-        let lost = collector.smoke("lost", opened, &[("a", 0)]).await;
+        let lost = collector.smoke("lost", opened, &[("a", 0)], &[]).await;
         assert_eq!(
             lost.invalid,
             ["the timing collector stopped reporting: its output closed"]

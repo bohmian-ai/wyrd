@@ -17,8 +17,11 @@ use num_traits::ToPrimitive;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use wyrd_client::bifrost::{BifrostClientError, BifrostOptions, TableConfig};
+use wyrd_client::transport::trace::with_caller_trace;
 use wyrd_client::{Bifrost, WyrdClient};
+use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
+use wyrd_testing::capacity::request_trace;
 use wyrd_testing::release_server::LocalServer;
 use wyrd_tonic::otlp::logs_service::logs_service_client::LogsServiceClient;
 use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
@@ -180,7 +183,8 @@ impl Sender {
         }
     }
 
-    /// Sends rows `first..last` and resolves at their durable
+    /// Sends rows `first..last` as a request continuing `trace`, so its
+    /// server timing carries `trace`'s id, and resolves at their durable
     /// acknowledgement with the encoded OTLP bytes sent (zero for native).
     ///
     /// # Errors
@@ -188,7 +192,12 @@ impl Sender {
     /// Returns the stable code the failure is counted by: the client error
     /// code, the gRPC status code, or `partial-success` when an export
     /// dropped rows.
-    pub async fn send(&self, first: i64, last: i64) -> std::result::Result<u64, String> {
+    pub async fn send(
+        &self,
+        first: i64,
+        last: i64,
+        trace: &TraceContext,
+    ) -> std::result::Result<u64, String> {
         match self {
             Self::Native {
                 writer,
@@ -198,8 +207,7 @@ impl Sender {
                 let batch = fixture
                     .batch(first, last)
                     .map_err(|_| "fixture".to_owned())?;
-                writer
-                    .write_batch(table, &batch)
+                with_caller_trace(Some(trace.clone()), writer.write_batch(table, &batch))
                     .await
                     .map_err(|error| code(&error))?;
                 Ok(0)
@@ -209,7 +217,7 @@ impl Sender {
                 let encoded = body.encoded_len();
                 let token = otlp.token().await?;
                 let response = TraceServiceClient::new(otlp.channel.clone())
-                    .export(authorized(body, &token)?)
+                    .export(authorized(body, &token, trace)?)
                     .await
                     .map_err(|status| format!("{:?}", status.code()))?;
                 let rejected = response
@@ -223,7 +231,7 @@ impl Sender {
                 let encoded = body.encoded_len();
                 let token = otlp.token().await?;
                 let response = LogsServiceClient::new(otlp.channel.clone())
-                    .export(authorized(body, &token)?)
+                    .export(authorized(body, &token, trace)?)
                     .await
                     .map_err(|status| format!("{:?}", status.code()))?;
                 let rejected = response
@@ -261,7 +269,7 @@ impl Sender {
                     }
                     let last = (first + chunk).min(end);
                     let sent = Instant::now();
-                    match sender.send(first, last).await {
+                    match sender.send(first, last, &request_trace()).await {
                         Ok(wire) => {
                             outcome.latencies_us.push(micros(sent));
                             outcome.rows += (last - first).cast_unsigned();
@@ -565,16 +573,30 @@ pub fn micros(sent: Instant) -> u64 {
     u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-/// Wraps `body` in a gRPC request carrying the `x-wyrd-access-token` bearer.
+/// Wraps `body` in a gRPC request carrying the `x-wyrd-access-token` bearer
+/// and `trace` as its W3C `traceparent`.
 ///
 /// # Errors
 ///
-/// Returns `bearer` when `token` is not a valid metadata value.
-fn authorized<T>(body: T, token: &str) -> std::result::Result<Request<T>, String> {
+/// Returns `bearer` or `traceparent` when either is not a valid metadata
+/// value.
+fn authorized<T>(
+    body: T,
+    token: &str,
+    trace: &TraceContext,
+) -> std::result::Result<Request<T>, String> {
     let mut request = Request::new(body);
-    request.metadata_mut().insert(
+    let metadata = request.metadata_mut();
+    metadata.insert(
         "x-wyrd-access-token",
         token.parse().map_err(|_| "bearer".to_owned())?,
+    );
+    metadata.insert(
+        "traceparent",
+        trace
+            .to_traceparent()
+            .parse()
+            .map_err(|_| "traceparent".to_owned())?,
     );
     Ok(request)
 }

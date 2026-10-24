@@ -432,18 +432,19 @@ pub fn inject_metadata_not_found_for_test(count: usize) {
 }
 
 /// The pause armed by [`pause_next_alter_after_publication_for_test`]: the
-/// alteration signals the first notify once its native publication commits,
-/// then waits on the second.
+/// alteration signals the first notify once its native publication is staged
+/// in its tenant transaction, then waits on the second.
 #[cfg(any(test, feature = "test-support"))]
 static TEST_ALTER_PAUSE: std::sync::Mutex<
     Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 > = std::sync::Mutex::new(None);
 
 /// Pauses the next [`BifrostCatalog::alter_table`] right after its native
-/// publication commits, before its response is projected.
+/// publication is staged in its tenant transaction, before the control row,
+/// notification, response, and commit.
 ///
 /// The alteration notifies `published` and then waits for `release`, so a
-/// test can place a competing edit at exactly that point.
+/// test can place a competing edit, or drop the edit, at exactly that point.
 ///
 /// # Panics
 /// Panics only if a thread panicked while holding the pause lock.
@@ -1075,28 +1076,32 @@ impl BifrostCatalog {
     /// canonical, while its partition, sort, and Bloom lists may change. Under
     /// the table's registration lock the edit is planned from the current
     /// Iceberg definition, the whole edited schema and layout are validated
-    /// through the one layout validator, and every native update commits
-    /// with the next table version in one catalog publication, which refuses
-    /// it unless the table is still at `expected_table_version`. A refused
-    /// edit changes nothing and consumes no version.
-    ///
-    /// Every fallible projection value is derived before the native
-    /// publication. After it, still under the lock, the control row's
-    /// fingerprint and layout projection are refreshed, a definition-change
-    /// notification is sent, and the response is projected from the committed
-    /// metadata and that refreshed row, all in one tenant transaction; on its
-    /// commit every listening node drops its cached definition, and this node
-    /// drops its own. The response is therefore this edit's own definition,
-    /// never a later edit's.
+    /// through the one layout validator, and the edited metadata, stamped with
+    /// the next table version, is written beside the current one. One tenant
+    /// transaction then swaps the table's Iceberg pointer to it and records the
+    /// version's retained reference through
+    /// [`vala_sql::queries::olap_catalog::publish_definition`], refreshes the
+    /// control row's fingerprint and layout projection, sends the
+    /// definition-change notification, and projects the response. The swap
+    /// refuses unless the table is still at `expected_table_version` and its
+    /// pointer has not moved since the edit was planned. On commit every
+    /// listening node drops its cached definition, and this node drops its
+    /// own. The response is therefore this edit's own definition, never a
+    /// later edit's.
     ///
     /// # Cancellation and partial progress
-    /// Dropping the future or failing before the native publication commits
-    /// changes nothing. The native publication commits before the tenant
-    /// transaction, so dropping the future or failing after it leaves the new
-    /// version committed in Iceberg, and described, while the control row
-    /// keeps its prior fingerprint and layout and no node is notified; a
-    /// retry at the old version then conflicts. Describe the table to observe
-    /// which version committed.
+    /// The edit commits or rolls back as one: dropping the future or failing
+    /// before the tenant transaction commits leaves the pointer, version, control
+    /// row, and every node's cache unchanged and consumes no version; the
+    /// written metadata file stays unreferenced. An uncertain COMMIT is resolved
+    /// from the pointer, so a returned edit committed. A dropped response can
+    /// still hide a committed edit, after which a retry at the old version
+    /// conflicts; describe the table to observe which version committed.
+    ///
+    /// # Retries
+    /// A concurrent ingest commit that moves the pointer while the edit runs
+    /// refuses it as a version conflict at the unchanged version; repeating
+    /// the same request then succeeds.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::TableNotFound`] when the tenant has no
@@ -1111,7 +1116,8 @@ impl BifrostCatalog {
         table: &TableRef,
         alteration: TableAlteration,
     ) -> Result<BifrostTableDescription, BifrostCatalogError> {
-        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use std::str::FromStr;
+
         use wyrd_spec::vala::BifrostError;
 
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
@@ -1193,8 +1199,6 @@ impl BifrostCatalog {
             )]
             .into(),
         });
-        // Every fallible projection value is derived before the native
-        // publication, so nothing between it and the tenant commit can refuse.
         let fingerprint = match (builtin, &edited_arrow) {
             (None, Some(schema)) => {
                 let user_fields = schema
@@ -1219,28 +1223,38 @@ impl BifrostCatalog {
             ))
         })?;
         let table_uid = TableUid::from_row(&row.table_uid, &fqn)?;
-        let transaction = Transaction::new(&physical);
-        let action = updates.into_iter().fold(
-            transaction
-                .apply_updates()
-                .requirement(iceberg::TableRequirement::UuidMatch {
-                    uuid: physical.metadata().uuid(),
-                }),
-            iceberg::transaction::ApplyUpdatesAction::update,
-        );
-        let committed = match ApplyTransactionAction::apply(action, transaction)?
-            .commit(self.catalog.as_ref())
-            .await
+        // The new metadata is written beside the current one; it becomes the
+        // table's definition only when the tenant transaction below commits.
+        let base_location = physical.metadata_location_result()?;
+        let mut builder = physical
+            .metadata()
+            .clone()
+            .into_builder(Some(base_location.to_owned()));
+        for update in updates {
+            builder = update.apply(builder)?;
+        }
+        let metadata = builder.build()?.metadata;
+        let location = iceberg::MetadataLocation::from_str(base_location)?
+            .with_next_version()
+            .try_with_new_metadata(&metadata)?;
+        metadata.write_to(physical.file_io(), &location).await?;
+        let location = location.to_string();
+        if !vala_sql::queries::olap_catalog::publish_definition(
+            &mut conn,
+            &binding.logical_namespace,
+            &binding.table_name,
+            &metadata.uuid().to_string(),
+            next.get(),
+            base_location,
+            &location,
+        )
+        .await?
         {
-            Ok(committed) => committed,
-            Err(error) if error.kind() == iceberg::ErrorKind::CatalogCommitConflicts => {
-                let reloaded = self.catalog.load_table(&identifier).await?;
-                let version = crate::catalog::layout::table_version(&fqn, reloaded.metadata())
-                    .map_err(BifrostCatalogError::Registration)?;
-                return Err(conflict(version));
-            }
-            Err(error) => return Err(error.into()),
-        };
+            let reloaded = self.catalog.load_table(&identifier).await?;
+            let version = crate::catalog::layout::table_version(&fqn, reloaded.metadata())
+                .map_err(BifrostCatalogError::Registration)?;
+            return Err(conflict(version));
+        }
         #[cfg(any(test, feature = "test-support"))]
         pause_after_alter_publication_for_test().await;
 
@@ -1267,8 +1281,20 @@ impl BifrostCatalog {
         let projected = vala_sql::queries::olap_catalog::get_by_fqn(&mut conn, &fqn)
             .await?
             .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
-        let description = describe_metadata(&fqn, builtin, &projected, committed.metadata())?;
-        conn.commit().await?;
+        let description = describe_metadata(&fqn, builtin, &projected, &metadata)?;
+        // An uncertain COMMIT committed exactly when the pointer names this
+        // edit's metadata, which the same transaction published.
+        if let Err(error) = conn.commit().await
+            && self
+                .catalog
+                .load_metadata_location(&identifier)
+                .await
+                .ok()
+                .flatten()
+                != Some(location)
+        {
+            return Err(error.into());
+        }
         self.evict_current_definition(table, tenant);
         Ok(description)
     }
@@ -2856,6 +2882,97 @@ mod production_pin_tests {
                     registered.table_uid
                 );
             }
+        });
+    }
+
+    /// An edit dropped after its native publication is staged, before its
+    /// tenant transaction commits, publishes nothing.
+    ///
+    /// The pointer, table version, and control row all keep version 1, and
+    /// the same edit then commits exactly version 2, which a leaked pointer
+    /// or version reference would refuse.
+    ///
+    /// # Panics
+    /// Panics when the fixture, registration, or describe fails, the dropped
+    /// edit finishes, anything of it is described, or the repeated edit does
+    /// not commit version 2 with its Bloom list.
+    #[test]
+    fn a_dropped_edit_publishes_nothing() {
+        use wyrd_spec::vala::ids::TableVersion;
+
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let catalog = BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                local_storage_owner(warehouse.path()),
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture");
+            let tenant = fixture.data_tenant_id();
+            let table = TableRef::new(BifrostNamespace::Datasets, "dropped_edit");
+            catalog
+                .register_dataset(
+                    tenant,
+                    wyrd_spec::auth::Attribution::unresolved(),
+                    table.clone(),
+                    vec![arrow::datatypes::Field::new(
+                        "value",
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    )],
+                    None,
+                    CompactionRegistration::default(),
+                )
+                .await
+                .expect("dataset registers");
+            let edit = || crate::catalog::TableAlteration {
+                expected_table_version: TableVersion::INITIAL,
+                physical_layout: wyrd_spec::vala::api::PhysicalLayoutEdit {
+                    bloom_columns: Some(vec!["value".to_owned()]),
+                    ..Default::default()
+                },
+                add_columns: Vec::new(),
+                rename_columns: Vec::new(),
+            };
+
+            let published = Arc::new(tokio::sync::Notify::new());
+            super::pause_next_alter_after_publication_for_test(
+                Arc::clone(&published),
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            tokio::select! {
+                () = published.notified() => {}
+                finished = catalog.alter_table(tenant, &table, edit()) => {
+                    panic!("the paused edit finished: {finished:?}")
+                }
+            }
+
+            let unchanged = catalog
+                .describe_table(&table, tenant)
+                .await
+                .expect("describe the table");
+            assert_eq!(unchanged.table_version, TableVersion::INITIAL);
+            assert!(unchanged.physical_layout.bloom_columns.is_empty());
+            let committed = catalog
+                .alter_table(tenant, &table, edit())
+                .await
+                .expect("the same edit commits");
+            assert_eq!(
+                committed.table_version,
+                TableVersion::INITIAL.next().expect("v2")
+            );
+            assert_eq!(committed.physical_layout.bloom_columns, ["value"]);
+            assert_eq!(
+                catalog
+                    .describe_table(&table, tenant)
+                    .await
+                    .expect("describe the table"),
+                committed
+            );
         });
     }
 

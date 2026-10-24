@@ -1,6 +1,6 @@
 //! The L2 `competing` workload: the heavy fixture with Forge compaction on,
 //! and one stateful step whose every repetition (and warmup) runs open-loop
-//! mixed ingest, closed-loop mixed queries, and the client-queue lanes
+//! mixed ingest, open-loop mixed queries, and the client-queue lanes
 //! together through capacity → overload → recovery.
 //!
 //! Capacity runs the first 5/12 of the window. Overload then fills Oracle's
@@ -45,8 +45,14 @@ use crate::query::run::{Bench, Overload, QUEUE_FULL, Sender, WRONG_RESULT, ask, 
 use crate::query::workload::{Case, Fixture, INGEST_TABLE, TABLE};
 use crate::query::{Lane, Residence, SPLIT, WriteOp, client, lanes, smoke, start};
 
-/// Closed-loop mixed query clients.
+/// Mixed queries in flight at most; a due query finding this many
+/// unanswered is missed rather than sent.
 pub const QUERY_CLIENTS: usize = 32;
+
+/// Offered mixed queries per second, independent of answers: 4,320 per
+/// 360 s repetition, 216 of them full scans at the 5% mix, above the
+/// 4,000-query and 200-scan floors.
+pub const QUERY_RATE: f64 = 12.0;
 
 /// How long after overload the SLOs must hold again; recovery is read only
 /// after it.
@@ -118,21 +124,76 @@ struct Acked {
     trace: String,
 }
 
-/// What one ingest path's open loop scheduled, sent, and observed.
-#[derive(Default)]
-struct Offered {
+/// What one open loop, an ingest path's or the mixed queries', scheduled,
+/// sent, and observed.
+struct Offered<T> {
     /// Arrivals the schedule planned.
     scheduled: u64,
     /// Arrivals sent.
     sent: u64,
-    /// Planned arrivals never sent because [`MAX_PENDING`] were pending.
+    /// Planned arrivals never sent because the loop's bound was pending.
     missed: u64,
     /// Each sent arrival's lateness behind its schedule, microseconds.
     lateness_us: Vec<u64>,
     /// Every answered arrival.
-    acked: Vec<Acked>,
+    acked: Vec<T>,
     /// When the last pending arrival answered.
     drained: Option<Instant>,
+}
+
+impl<T> Default for Offered<T> {
+    fn default() -> Self {
+        Self {
+            scheduled: 0,
+            sent: 0,
+            missed: 0,
+            lateness_us: Vec::new(),
+            acked: Vec::new(),
+            drained: None,
+        }
+    }
+}
+
+/// Sends one arrival through `launch` every `interval` from `start` until
+/// `end`, never waiting on an answer before the next is due; a due arrival
+/// finding `bound` pending is missed. Waits for every sent arrival and
+/// keeps its answer.
+async fn open_loop<T, Fut>(
+    start: Instant,
+    end: Instant,
+    interval: Duration,
+    bound: usize,
+    mut launch: impl FnMut() -> Fut,
+) -> Offered<T>
+where
+    T: Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+{
+    let mut offered = Offered::default();
+    let mut pending = JoinSet::new();
+    for arrival in 0_u32.. {
+        let due = start + interval.mul_f64(f64::from(arrival));
+        if due >= end {
+            break;
+        }
+        tokio::time::sleep_until(due).await;
+        while let Some(joined) = pending.try_join_next() {
+            offered.acked.extend(joined.ok());
+        }
+        offered.scheduled += 1;
+        if pending.len() >= bound {
+            offered.missed += 1;
+            continue;
+        }
+        offered.sent += 1;
+        offered.lateness_us.push(micros(due.into_std()));
+        pending.spawn(launch());
+    }
+    while let Some(joined) = pending.join_next().await {
+        offered.acked.extend(joined.ok());
+    }
+    offered.drained = Some(Instant::now());
+    offered
 }
 
 /// The repetition's phase boundaries.
@@ -261,7 +322,7 @@ impl Competing {
         ));
         drop(visible);
         let prober = probe(bench.queries(), probes);
-        let queries = mixed(bench, end, &self.sequence);
+        let queries = mixed(bench, start, end, &self.sequence);
         let lanes = futures_util::future::join_all(LANES.iter().map(|lane| {
             let tenant = Arc::clone(tenant);
             async move { lane.run(&tenant, end).await }
@@ -282,12 +343,13 @@ impl Competing {
             let backlog = outstanding.load(Ordering::Relaxed);
             (opened.close(server).await, backlog)
         };
-        let (offered, visibility, mut asked, lanes, overload, (closed, backlog_end)) =
+        let (offered, visibility, mut queries, lanes, overload, (closed, backlog_end)) =
             tokio::join!(ingest, prober, queries, lanes, overload, closer);
+        let asked = &mut queries.acked;
         let (backlog_capacity, overload, overloaded, backlog_overloaded) = overload;
         let overload = overload.map_err(ExperimentError::workload)?;
         let (usage, _) = closed.map_err(ExperimentError::workload)?;
-        let population = timings(collector, &step.id, from, &offered, &mut asked).await;
+        let population = timings(collector, &step.id, from, &offered, asked).await;
         let phases = Phases {
             start,
             start_unix,
@@ -312,9 +374,10 @@ impl Competing {
             backlog(backlog_end - backlog_overloaded),
         );
         population.validate(&mut repetition);
-        read_queries(&mut repetition, &asked, &phases);
+        read_queries(&mut repetition, asked, &phases);
         read_ingest(&mut repetition, &offered, &visibility, &population, &phases);
-        read_overload(&mut repetition, &overload, &asked, &phases);
+        read_arrivals(&mut repetition, &offered, &queries);
+        read_overload(&mut repetition, &overload, &queries.acked, &phases);
         for (lane, emitted) in LANES.iter().zip(lanes) {
             let emitted = emitted.map_err(ExperimentError::workload)?;
             read_lane(&mut repetition, lane.name, &emitted, &phases);
@@ -333,7 +396,7 @@ async fn timings(
     collector: &Collector,
     step: &str,
     from: SystemTime,
-    offered: &[Offered],
+    offered: &[Offered<Acked>],
     asked: &mut [Asked],
 ) -> Population {
     let mut traces: Vec<&str> = asked
@@ -378,31 +441,14 @@ async fn offer(
     end: Instant,
     outstanding: &Arc<AtomicI64>,
     probe: Option<mpsc::UnboundedSender<(Instant, i64)>>,
-) -> Offered {
+) -> Offered<Acked> {
     let chunk = sender.request_rows();
-    let interval = chunk.to_f64().unwrap_or(f64::MAX) / rows_per_s;
-    let mut offered = Offered::default();
-    let mut pending = JoinSet::new();
-    for arrival in 0_u32.. {
-        let due = start + Duration::from_secs_f64(f64::from(arrival) * interval);
-        if due >= end {
-            break;
-        }
-        tokio::time::sleep_until(due).await;
-        while let Some(joined) = pending.try_join_next() {
-            offered.acked.extend(joined.ok());
-        }
-        offered.scheduled += 1;
-        if pending.len() >= MAX_PENDING {
-            offered.missed += 1;
-            continue;
-        }
-        offered.sent += 1;
-        offered.lateness_us.push(micros(due.into_std()));
+    let interval = Duration::from_secs_f64(chunk.to_f64().unwrap_or(f64::MAX) / rows_per_s);
+    open_loop(start, end, interval, MAX_PENDING, || {
         let first = cursor.fetch_add(chunk, Ordering::Relaxed);
         let (sender, outstanding, probe) = (sender.clone(), Arc::clone(outstanding), probe.clone());
         outstanding.fetch_add(chunk, Ordering::Relaxed);
-        pending.spawn(async move {
+        async move {
             let sent = std::time::Instant::now();
             let context = request_trace();
             let result = sender
@@ -420,13 +466,9 @@ async fn offer(
                 result,
                 trace: context.trace_id,
             }
-        });
-    }
-    while let Some(joined) = pending.join_next().await {
-        offered.acked.extend(joined.ok());
-    }
-    offered.drained = Some(Instant::now());
-    offered
+        }
+    })
+    .await
 }
 
 /// Asks, for every acknowledged native write on `acks`, until its last row
@@ -457,40 +499,38 @@ async fn probe(
     seen
 }
 
-/// Runs [`QUERY_CLIENTS`] closed-loop mixed clients until `end`.
-async fn mixed(bench: &Arc<Bench>, end: Instant, sequence: &Arc<AtomicU64>) -> Vec<Asked> {
-    let mut clients = JoinSet::new();
-    for _ in 0..QUERY_CLIENTS {
-        let (bench, sequence) = (Arc::clone(bench), Arc::clone(sequence));
-        clients.spawn(async move {
-            let mut asked = Vec::new();
-            let queries = bench.queries();
-            while Instant::now() < end {
-                let next = sequence.fetch_add(1, Ordering::Relaxed);
-                let case = mixed_case(next);
-                let (sql, expected) = bench.question(case, next);
-                let trace = request_trace();
-                let id = trace.trace_id.clone();
-                let sent = std::time::Instant::now();
-                let result = with_caller_trace(Some(trace), ask(&queries, sql, &expected))
-                    .await
-                    .map(|()| micros(sent));
-                asked.push(Asked {
-                    at: Instant::now(),
-                    case,
-                    trace: id,
-                    result,
-                    server: None,
-                });
+/// Sends mixed queries open loop at [`QUERY_RATE`] from `start` until
+/// `end`, independent of answers, with at most [`QUERY_CLIENTS`] in flight.
+async fn mixed(
+    bench: &Arc<Bench>,
+    start: Instant,
+    end: Instant,
+    sequence: &Arc<AtomicU64>,
+) -> Offered<Asked> {
+    let queries = bench.queries();
+    let interval = Duration::from_secs_f64(1.0 / QUERY_RATE);
+    open_loop(start, end, interval, QUERY_CLIENTS, || {
+        let next = sequence.fetch_add(1, Ordering::Relaxed);
+        let case = mixed_case(next);
+        let (sql, expected) = bench.question(case, next);
+        let queries = Arc::clone(&queries);
+        async move {
+            let trace = request_trace();
+            let id = trace.trace_id.clone();
+            let sent = std::time::Instant::now();
+            let result = with_caller_trace(Some(trace), ask(&queries, sql, &expected))
+                .await
+                .map(|()| micros(sent));
+            Asked {
+                at: Instant::now(),
+                case,
+                trace: id,
+                result,
+                server: None,
             }
-            asked
-        });
-    }
-    let mut asked = Vec::new();
-    while let Some(joined) = clients.join_next().await {
-        asked.extend(joined.into_iter().flatten());
-    }
-    asked
+        }
+    })
+    .await
 }
 
 /// Exact server times, nanoseconds, of `asked` answered under `phase` for
@@ -587,14 +627,14 @@ fn read_queries(repetition: &mut Repetition, asked: &[Asked], phases: &Phases) {
 /// Sets every ingest reading: per-phase server acknowledgement p99 over
 /// the successful observation of every offered write, matched by trace id,
 /// that ended in the phase, the
-/// diagnostic visibility, and rows; totals; the drain; arrivals; and adds
+/// diagnostic visibility, and rows; totals; the drain; and adds
 /// ingest failures and undeclared query refusals to `errors`. The row total
 /// credits only acknowledgements before the window end, the endpoint of the
 /// measured CPU; drain acknowledgements are counted separately and every
 /// failure stays an error.
 fn read_ingest(
     repetition: &mut Repetition,
-    offered: &[Offered],
+    offered: &[Offered<Acked>],
     visibility: &[(Instant, Option<u64>)],
     population: &Population,
     phases: &Phases,
@@ -681,25 +721,58 @@ fn read_ingest(
         });
     repetition.set("drain_s", Reading::exact(drained));
     let failed = acked.iter().filter(|acked| acked.result.is_err()).count();
-    let lateness: Vec<u64> = offered
+    repetition.set("errors", Reading::count(failed.to_u64().unwrap_or(0)));
+}
+
+/// Sets the arrivals of every ingest path's open loop and the mixed
+/// queries' together, and names each loop that missed a due arrival.
+fn read_arrivals(
+    repetition: &mut Repetition,
+    offered: &[Offered<Acked>],
+    queries: &Offered<Asked>,
+) {
+    let loops = offered
         .iter()
-        .flat_map(|offered| offered.lateness_us.iter().copied())
-        .collect();
-    let arrivals = Arrivals {
-        scheduled: offered.iter().map(|offered| offered.scheduled).sum(),
-        sent: offered.iter().map(|offered| offered.sent).sum(),
-        completed: acked.len().to_u64().unwrap_or(0),
-        missed: offered.iter().map(|offered| offered.missed).sum(),
-        lateness_p99_us: Percentiles::raw(&lateness, 1.0).p99,
-    };
-    if arrivals.missed > 0 {
+        .map(|offered| {
+            (
+                offered.scheduled,
+                offered.sent,
+                offered.missed,
+                &offered.lateness_us,
+                offered.acked.len(),
+            )
+        })
+        .chain([(
+            queries.scheduled,
+            queries.sent,
+            queries.missed,
+            &queries.lateness_us,
+            queries.acked.len(),
+        )]);
+    let mut arrivals = Arrivals::default();
+    let mut lateness = Vec::new();
+    for (scheduled, sent, missed, late, completed) in loops {
+        arrivals.scheduled += scheduled;
+        arrivals.sent += sent;
+        arrivals.missed += missed;
+        arrivals.completed += completed.to_u64().unwrap_or(0);
+        lateness.extend(late);
+    }
+    arrivals.lateness_p99_us = Percentiles::raw(&lateness, 1.0).p99;
+    let ingest_missed: u64 = offered.iter().map(|offered| offered.missed).sum();
+    if ingest_missed > 0 {
         repetition.invalid.push(format!(
-            "the driver missed {} of {} scheduled ingest arrivals with {MAX_PENDING} pending",
-            arrivals.missed, arrivals.scheduled
+            "the driver missed {ingest_missed} of {} scheduled ingest arrivals with {MAX_PENDING} pending",
+            arrivals.scheduled - queries.scheduled
+        ));
+    }
+    if queries.missed > 0 {
+        repetition.invalid.push(format!(
+            "the driver missed {} of {} scheduled mixed queries with {QUERY_CLIENTS} in flight",
+            queries.missed, queries.scheduled
         ));
     }
     repetition.arrivals = Some(arrivals);
-    repetition.set("errors", Reading::count(failed.to_u64().unwrap_or(0)));
 }
 
 /// Sets the overload readings, and adds every query failure except a
@@ -974,7 +1047,45 @@ mod tests {
     use wyrd_testing::capacity::Population;
     use wyrd_testing::experiment::Repetition;
 
-    use super::{Acked, Asked, Case, Offered, Phases, mixed_case, read_ingest, read_queries};
+    use num_traits::ToPrimitive;
+
+    use super::{
+        Acked, Asked, Case, Offered, Phases, QUERY_CLIENTS, QUERY_RATE, mixed_case, open_loop,
+        read_ingest, read_queries,
+    };
+
+    /// A slow answer never postpones a due query: the open loop sends every
+    /// arrival on schedule and keeps every answer, misses arrivals once its
+    /// bound is pending, and the declared rate offers at least 4,000 mixed
+    /// queries and 200 full scans per 360 s repetition.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an answer delays an arrival or a count is wrong.
+    #[tokio::test(start_paused = true)]
+    async fn mixed_queries_are_offered_at_a_fixed_rate() {
+        let slow = || tokio::time::sleep(Duration::from_secs(5));
+        let second = Duration::from_secs(1);
+        let interval = Duration::from_millis(100);
+        let start = Instant::now();
+        let offered = open_loop(start, start + second, interval, QUERY_CLIENTS, slow).await;
+        assert_eq!(
+            (offered.scheduled, offered.sent, offered.missed),
+            (10, 10, 0)
+        );
+        assert_eq!(offered.acked.len(), 10);
+        let start = Instant::now();
+        let capped = open_loop(start, start + second, interval, 2, slow).await;
+        assert_eq!((capped.scheduled, capped.sent, capped.missed), (10, 2, 8));
+        let offered = (QUERY_RATE * 360.0).to_u64().expect("a whole count");
+        let scans = (0..offered)
+            .filter(|sequence| mixed_case(*sequence) == Case::FullScan)
+            .count();
+        assert!(
+            offered >= 4_000 && scans >= 200,
+            "{offered} queries, {scans} scans"
+        );
+    }
 
     /// Only queries and ingest rows answered before the window end, the
     /// measured CPU's endpoint, are credited as work; later answers are

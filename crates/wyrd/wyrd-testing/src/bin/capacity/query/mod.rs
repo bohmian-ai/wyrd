@@ -883,7 +883,7 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
         "workload".to_owned(),
         json!({
             "ingest": "open loop by rows: 50% OTLP spans, 30% OTLP logs, 20% native writes; Forge compaction enabled (trigger 2 snapshots) on every ingest table",
-            "queries": "32 closed-loop clients: 60% point lookup, 25% dashboard (15% 100k-row, 10% 1M-row aggregate), 10% whole-table aggregate, 5% full scan",
+            "queries": "open loop at 12 queries/s independent of answers, at most 32 in flight (a due query finding 32 unanswered is missed): 60% point lookup, 25% dashboard (15% 100k-row, 10% 1M-row aggregate), 10% whole-table aggregate, 5% full scan",
             "dashboard_split": { "small": 0.6, "million": 0.4 },
             "client_queue": "three lanes, each a fresh WyrdState per repetition: headroom 1,000 obs/s, ack-delay 500 obs/s behind a 50 ms acknowledgement proxy, in-flight 500 obs/s with max_in_flight 1",
             "phases": "capacity 5/12 of the window; overload fills Oracle's 1,000 queue places behind held slots while ingest continues, then one more query; recovery to the window's end",
@@ -892,7 +892,7 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
     );
     base.steps = vec![Step::measured(
         COMPETING,
-        json!({ "op": "competing", "query_clients": competing::QUERY_CLIENTS, "ingest_rows_per_s": rate }),
+        json!({ "op": "competing", "query_clients": competing::QUERY_CLIENTS, "query_rate": competing::QUERY_RATE, "ingest_rows_per_s": rate }),
     )];
     let mut metrics = Vec::new();
     let mut criteria = Vec::new();
@@ -905,7 +905,7 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
         Metric::raw("overload.queued", "queries", "highest `oracle_queries_queued` while filling"),
         Metric::raw("overload.overflow_refused", "count", "1 when the query sent into the full queue was refused with the queue-full code"),
         Metric::raw("overload.queue_drain_s", "s", "disconnecting the waiters until the queue is empty"),
-        Metric::raw("overload.queue_full", "refusals", "queue-full refusals mixed clients saw from overload start until 30 s after it"),
+        Metric::raw("overload.queue_full", "refusals", "queue-full refusals mixed queries saw from overload start until 30 s after it"),
         Metric::raw("errors", "errors", "failed requests of every code, except queue-full during overload and its 30 s grace"),
         Metric::raw("wrong_results", "queries", "answered queries whose rows differ from the exact answer"),
         Metric::raw("drain_s", "s", "window end until every in-flight ingest request is acknowledged"),
@@ -914,9 +914,9 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
         Metric::raw("ingest_rows", "rows", "durably acknowledged ingest rows in the window"),
         Metric::raw("queries_after_window", "queries", "exactly answered mixed queries in flight at the window end, answered after it and outside every work-per-CPU metric"),
         Metric::raw("ingest_rows_after_window", "rows", "ingest rows in flight at the window end, acknowledged during the drain and outside every work-per-CPU metric"),
-        Metric::raw("p50_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (32 clients, not the L1 64-client objective)"),
-        Metric::raw("p95_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (32 clients)"),
-        Metric::raw("p99_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (32 clients)"),
+        Metric::raw("p50_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (12 queries/s, at most 32 in flight, not the L1 64-client objective)"),
+        Metric::raw("p95_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (12 queries/s, at most 32 in flight)"),
+        Metric::raw("p99_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (12 queries/s, at most 32 in flight)"),
         Metric::derived("rate", "queries/s", "exactly answered mixed queries per wall second", Direction::Higher, Derive::Rate { work: "queries".to_owned(), scale: 1.0 }),
         Metric::derived("queries_per_cpu_s", "queries/cpu-s", "mixed queries per server CPU-second; the denominator also pays for ingest", Direction::Higher, Derive::PerCpu { work: "queries".to_owned(), scale: 1.0 }),
         Metric::derived("table_aggregates_per_cpu_s", "queries/cpu-s", "whole-table aggregates per server CPU-second; the denominator also pays for everything else", Direction::Higher, Derive::PerCpu { work: "table_aggregates".to_owned(), scale: 1.0 }),

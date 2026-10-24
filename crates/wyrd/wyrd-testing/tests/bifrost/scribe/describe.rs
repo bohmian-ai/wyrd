@@ -1373,6 +1373,73 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
     cluster.shutdown().await.expect("cluster shutdown");
 }
 
+/// An edit returns the definition it committed even when the next edit is
+/// already waiting.
+///
+/// Edit A is paused right after its native publication commits. Edit B, built
+/// from A's new version, cannot publish while A is paused, because A still
+/// holds the table's registration lock and projects its response under it.
+/// Released, A returns its own version and Bloom list, B then returns the
+/// next version, and describe reads B's.
+///
+/// # Panics
+///
+/// Panics when A returns another version or layout, B commits while A is
+/// paused, or describe reads anything but B's definition.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn an_edit_returns_its_own_committed_definition() {
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+    use vala_bifrost_redux::catalog::pause_next_alter_after_publication_for_test;
+
+    let server = start_scribe_server().await;
+    let tenant = server.data_tenant_id();
+    let name = unique_table("own_result");
+    super::support::register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
+    let client = tenant_client(&server, tenant).await;
+    let bifrost = Bifrost::query_only(&client);
+    let before = bifrost
+        .describe_table("vala.datasets", &name)
+        .await
+        .expect("describe the registered table");
+    let next = before.table_version.next().expect("next version");
+
+    let (published, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    pause_next_alter_after_publication_for_test(Arc::clone(&published), Arc::clone(&release));
+    let first_edit = bloom_edit(before.table_version, &["value"]);
+    let second_edit = bloom_edit(next, &[]);
+    let first = bifrost.alter_table("vala.datasets", &name, &first_edit);
+    let second = async {
+        published.notified().await;
+        let mut second = std::pin::pin!(bifrost.alter_table("vala.datasets", &name, &second_edit));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut second)
+                .await
+                .is_err(),
+            "the next edit waits while the first has not projected its result"
+        );
+        release.notify_one();
+        second.await
+    };
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("the first edit commits");
+    let second = second.expect("the next edit commits after it");
+
+    assert_eq!(first.table_version, next);
+    assert_eq!(first.physical_layout.bloom_columns, ["value"]);
+    assert_eq!(second.table_version, next.next().expect("next version"));
+    assert!(second.physical_layout.bloom_columns.is_empty());
+    assert_eq!(
+        bifrost
+            .describe_table("vala.datasets", &name)
+            .await
+            .expect("describe the table"),
+        second,
+        "describe reads the current head"
+    );
+}
+
 /// The real `PATCH` route decodes strictly, authorizes DDL, compares the
 /// version, and refuses every negative class with one stable code.
 ///

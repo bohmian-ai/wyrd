@@ -429,6 +429,48 @@ pub fn inject_metadata_not_found_for_test(count: usize) {
     TEST_METADATA_NOT_FOUND_FAULTS.store(count, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// The pause armed by [`pause_next_alter_after_publication_for_test`]: the
+/// alteration signals the first notify once its native publication commits,
+/// then waits on the second.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_ALTER_PAUSE: std::sync::Mutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+> = std::sync::Mutex::new(None);
+
+/// Pauses the next [`BifrostCatalog::alter_table`] right after its native
+/// publication commits, before its response is projected.
+///
+/// The alteration notifies `published` and then waits for `release`, so a
+/// test can place a competing edit at exactly that point.
+///
+/// # Panics
+/// Panics only if a thread panicked while holding the pause lock.
+#[cfg(any(test, feature = "test-support"))]
+pub fn pause_next_alter_after_publication_for_test(
+    published: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) {
+    *TEST_ALTER_PAUSE
+        .lock()
+        .expect("the alteration pause lock is never poisoned") = Some((published, release));
+}
+
+/// Takes and honors the pause armed for this alteration, if any.
+///
+/// # Panics
+/// Panics only if a thread panicked while holding the pause lock.
+#[cfg(any(test, feature = "test-support"))]
+async fn pause_after_alter_publication_for_test() {
+    let armed = TEST_ALTER_PAUSE
+        .lock()
+        .expect("the alteration pause lock is never poisoned")
+        .take();
+    if let Some((published, release)) = armed {
+        published.notify_one();
+        release.notified().await;
+    }
+}
+
 impl BifrostCatalog {
     /// Reads one query's complete cut in one read-only tenant statement.
     ///
@@ -1148,28 +1190,8 @@ impl BifrostCatalog {
             )]
             .into(),
         });
-        let transaction = Transaction::new(&physical);
-        let action = updates.into_iter().fold(
-            transaction
-                .apply_updates()
-                .requirement(iceberg::TableRequirement::UuidMatch {
-                    uuid: physical.metadata().uuid(),
-                }),
-            iceberg::transaction::ApplyUpdatesAction::update,
-        );
-        let committed = ApplyTransactionAction::apply(action, transaction)?
-            .commit(self.catalog.as_ref())
-            .await;
-        if let Err(error) = committed {
-            if error.kind() != iceberg::ErrorKind::CatalogCommitConflicts {
-                return Err(error.into());
-            }
-            let reloaded = self.catalog.load_table(&identifier).await?;
-            let version = crate::catalog::layout::table_version(&fqn, reloaded.metadata())
-                .map_err(BifrostCatalogError::Registration)?;
-            return Err(conflict(version));
-        }
-
+        // Every fallible projection value is derived before the native
+        // publication, so nothing between it and the tenant commit can refuse.
         let fingerprint = match (builtin, &edited_arrow) {
             (None, Some(schema)) => {
                 let user_fields = schema
@@ -1194,6 +1216,31 @@ impl BifrostCatalog {
             ))
         })?;
         let table_uid = TableUid::from_row(&row.table_uid, &fqn)?;
+        let transaction = Transaction::new(&physical);
+        let action = updates.into_iter().fold(
+            transaction
+                .apply_updates()
+                .requirement(iceberg::TableRequirement::UuidMatch {
+                    uuid: physical.metadata().uuid(),
+                }),
+            iceberg::transaction::ApplyUpdatesAction::update,
+        );
+        let committed = match ApplyTransactionAction::apply(action, transaction)?
+            .commit(self.catalog.as_ref())
+            .await
+        {
+            Ok(committed) => committed,
+            Err(error) if error.kind() == iceberg::ErrorKind::CatalogCommitConflicts => {
+                let reloaded = self.catalog.load_table(&identifier).await?;
+                let version = crate::catalog::layout::table_version(&fqn, reloaded.metadata())
+                    .map_err(BifrostCatalogError::Registration)?;
+                return Err(conflict(version));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        pause_after_alter_publication_for_test().await;
+
         // The conflict update keeps the row's stored creator attribution.
         vala_sql::queries::olap_catalog::upsert_table(
             &mut conn,
@@ -1212,9 +1259,15 @@ impl BifrostCatalog {
             table_name: &binding.table_name,
         })
         .await?;
+        // The result is this edit's own committed metadata and control row,
+        // projected while the registration lock still excludes a later edit.
+        let projected = vala_sql::queries::olap_catalog::get_by_fqn(&mut conn, &fqn)
+            .await?
+            .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
+        let description = describe_metadata(&fqn, builtin, &projected, committed.metadata())?;
         conn.commit().await?;
         self.evict_current_definition(table, tenant);
-        self.describe_table(table, tenant).await
+        Ok(description)
     }
 
     /// Ensure one canonical built-in exists for a tenant.
@@ -1811,32 +1864,7 @@ impl BifrostCatalog {
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
-        let arrow_schema = if let Some(definition) = builtin {
-            (definition.schema)()
-        } else {
-            Arc::new(iceberg::arrow::schema_to_arrow_schema(
-                iceberg_table.metadata().current_schema(),
-            )?)
-        };
-        let described = described_fields_from_stored_schema(&arrow_schema)?;
-        // The version and the layout come from one metadata document, so a
-        // definition edit is never described with another version's layout.
-        let definition = TableDefinition::of_metadata(&fqn, iceberg_table.metadata())?;
-        Ok(BifrostTableDescription {
-            entry: entry_from_row(&row)?,
-            table_version: definition.table_version,
-            user_fields: described.user_fields,
-            correlation_fields: described.correlation_fields,
-            canonical_physical_fingerprint: builtin
-                .and_then(|definition| (definition.canonical_physical_fingerprint)())
-                .map(crate::tables::CanonicalPhysicalFingerprint::to_hex),
-            physical_layout: definition.layout.to_wire(),
-            compaction_target_file_size_bytes: explicit_compaction_target(
-                iceberg_table.metadata(),
-            )?,
-            compaction_type: explicit_compaction_type(iceberg_table.metadata())?
-                .map(CompactionTypeWire::from),
-        })
+        describe_metadata(&fqn, builtin, &row, iceberg_table.metadata())
     }
 
     /// Build an execution provider for one authenticated tenant's table.
@@ -1987,6 +2015,48 @@ impl BifrostCatalog {
         conn.commit().await?;
         Ok(row)
     }
+}
+
+/// Projects one table's description from a control row and one metadata
+/// document.
+///
+/// The version and the layout come from that one document, so a definition
+/// edit is never described with another version's layout. A canonical
+/// built-in's fields come from its own declaration (see
+/// [`BifrostCatalog::describe_table`]); every other table's come from the
+/// document's current schema.
+///
+/// # Errors
+/// Returns [`BifrostCatalogError::MetadataMismatch`] when the row or the
+/// document does not rebuild a description, and the Iceberg error when the
+/// stored schema does not convert to Arrow.
+fn describe_metadata(
+    fqn: &str,
+    builtin: Option<&BuiltinTableDefinition>,
+    row: &vala_sql::row_types::olap_catalog::BifrostTableRow,
+    metadata: &TableMetadata,
+) -> Result<BifrostTableDescription, BifrostCatalogError> {
+    let arrow_schema = if let Some(definition) = builtin {
+        (definition.schema)()
+    } else {
+        Arc::new(iceberg::arrow::schema_to_arrow_schema(
+            metadata.current_schema(),
+        )?)
+    };
+    let described = described_fields_from_stored_schema(&arrow_schema)?;
+    let definition = TableDefinition::of_metadata(fqn, metadata)?;
+    Ok(BifrostTableDescription {
+        entry: entry_from_row(row)?,
+        table_version: definition.table_version,
+        user_fields: described.user_fields,
+        correlation_fields: described.correlation_fields,
+        canonical_physical_fingerprint: builtin
+            .and_then(|definition| (definition.canonical_physical_fingerprint)())
+            .map(crate::tables::CanonicalPhysicalFingerprint::to_hex),
+        physical_layout: definition.layout.to_wire(),
+        compaction_target_file_size_bytes: explicit_compaction_target(metadata)?,
+        compaction_type: explicit_compaction_type(metadata)?.map(CompactionTypeWire::from),
+    })
 }
 
 /// Resolves the physical schema and canonical layout one registration writes.

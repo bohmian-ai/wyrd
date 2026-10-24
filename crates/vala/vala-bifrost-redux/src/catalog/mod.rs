@@ -31,8 +31,8 @@ pub use bifrost_catalog::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use bifrost_catalog::{
-    inject_metadata_not_found_for_test, reset_cut_reads_for_test, reset_sealed_pin_count_for_test,
-    sealed_pin_count_for_test,
+    inject_metadata_not_found_for_test, pause_next_alter_after_publication_for_test,
+    reset_cut_reads_for_test, reset_sealed_pin_count_for_test, sealed_pin_count_for_test,
 };
 pub use error::BifrostCatalogError;
 pub use layout::{

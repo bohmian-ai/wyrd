@@ -73,7 +73,7 @@ class WyrdClient:
 
     @property
     def deployment_environment(self) -> str | None:
-        """The configured deployment environment requests carry, or ``None`` when unknown."""
+        """The deployment environment correlation tag requests carry, or ``None``."""
         ...
 
     def for_workload(self, workload_uid: str) -> WyrdClient:

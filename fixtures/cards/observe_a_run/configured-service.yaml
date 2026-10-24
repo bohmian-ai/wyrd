@@ -7,7 +7,6 @@ spec:
   service_type: agent
   verified_by:
     - verifier: ./service-check.yaml
-      deployment_environment: prod
   components:
     - alias: agent
       ref: ./observed-agent.yaml

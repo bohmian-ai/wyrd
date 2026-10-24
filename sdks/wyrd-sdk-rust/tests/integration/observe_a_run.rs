@@ -278,11 +278,11 @@ async fn unsealable_byte_budget_is_refused_at_connect() {
 }
 
 /// Two states of one Service, configured for `prod` and `staging`, verify the
-/// Service-bound `service-check` (whose binding selects `prod`) on the root
-/// and the unscoped Agent-bound `agent-check` on the Agent component. Each
-/// result names its own subject and the effective environment, directly and
-/// queued; the `staging` state's root check conflicts with the binding and is
-/// refused before any execution; a late configure is refused.
+/// Service-bound `service-check` on the root and the Agent-bound
+/// `agent-check` on the Agent component. Both environments run every check
+/// with the same verdict; each result names its own subject and echoes the
+/// supplied environment tag unchanged, directly and queued; a late configure
+/// is refused.
 ///
 /// # Panics
 /// Panics when a step fails or a result names another subject or
@@ -318,6 +318,7 @@ async fn configured_service_context_reaches_both_verification_subjects() {
             .await
             .expect("the Agent check runs");
         assert_eq!(&result.subject, agent.subject());
+        assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
         assert_eq!(result.deployment_environment.as_deref(), Some(*environment));
         let Submission::Queued(execution) = agent
             .observe()
@@ -334,16 +335,14 @@ async fn configured_service_context_reaches_both_verification_subjects() {
         assert_eq!(&queued.subject, agent.subject());
         assert_eq!(queued.deployment_environment.as_deref(), Some(*environment));
 
-        let root = run.observe().verify("service-check", json!("yes")).await;
-        if *environment == "prod" {
-            let result = root.expect("the Service check runs");
-            assert_eq!(&result.subject, state.root_ref());
-            assert_eq!(result.deployment_environment.as_deref(), Some("prod"));
-        } else {
-            let refused = root.expect_err("the staging Service check conflicts");
-            assert_eq!(refused.code(), "WYRD_SPEC_400_VALIDATION");
-            assert_eq!(refused.problem().details["field"], "deployment_environment");
-        }
+        let root = run
+            .observe()
+            .verify("service-check", json!("yes"))
+            .await
+            .expect("the Service check runs in every environment");
+        assert_eq!(&root.subject, state.root_ref());
+        assert_eq!(root.outcome.verdict, VerificationVerdict::Passed);
+        assert_eq!(root.deployment_environment.as_deref(), Some(*environment));
         assert_eq!(
             state
                 .configure(ConfigureOptions::default())

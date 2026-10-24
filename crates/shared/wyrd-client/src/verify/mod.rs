@@ -281,8 +281,8 @@ pub(crate) struct Target<'a> {
     pub(crate) run_id: RunId,
     /// The caller group the execution belongs to, when grouped.
     pub(crate) group_id: Option<GroupId>,
-    /// The state's configured deployment environment, which the server
-    /// reconciles with the binding's selector; `None` when unknown.
+    /// The state's configured deployment environment, sent as the
+    /// execution's correlation tag; `None` when unknown.
     pub(crate) deployment_environment: Option<String>,
 }
 

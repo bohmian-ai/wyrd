@@ -177,7 +177,6 @@ impl OutboxSink for SubmissionSink {
                     tenant,
                     &request.verifier_card_uid,
                     &request.card_uid,
-                    None,
                 )
                 .await?
             {

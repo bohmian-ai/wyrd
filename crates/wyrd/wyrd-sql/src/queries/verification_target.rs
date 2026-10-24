@@ -32,9 +32,6 @@ pub struct VerificationTarget {
     pub readiness: VerifierReadiness,
     /// The Card under verification.
     pub subject: Option<CardRow>,
-    /// The caller's owner Service Card, when one was requested and exists;
-    /// its bindings select the effective deployment environment.
-    pub owner: Option<CardRow>,
     /// The tenant's active SYSTEM principal, which executes the Verifier.
     pub system_principal: Option<Uuid>,
 }
@@ -64,7 +61,7 @@ impl VerificationTarget {
 /// One `wyrd.verification_target` row: a Card and the tenant's principal.
 #[derive(FromRow)]
 struct TargetRow {
-    /// One of the requested Cards.
+    /// One of the two requested Cards.
     #[sqlx(flatten)]
     card: CardRow,
     /// The Verifier's stored [`VerifierReadiness`] name, repeated on every row.
@@ -98,11 +95,10 @@ impl<'conn> VerificationTargets<'conn> {
         }
     }
 
-    /// Reads the Verifier Card, its readiness, the subject Card, the
-    /// caller's `owner` Service Card when given, and the SYSTEM principal in
-    /// one statement.
+    /// Reads the Verifier Card, its readiness, the subject Card, and the
+    /// SYSTEM principal in one statement.
     ///
-    /// A Card named by several UIDs fills every side it names. The readiness
+    /// When both UIDs name the same Card, it fills both sides. The readiness
     /// and principal are known only when at least one Card exists, which is
     /// the only case a caller can use them.
     ///
@@ -114,21 +110,18 @@ impl<'conn> VerificationTargets<'conn> {
         &mut self,
         verifier: &CardUid,
         subject: &CardUid,
-        owner: Option<&CardUid>,
     ) -> Result<VerificationTarget, sqlx::Error> {
         let rows: Vec<TargetRow> =
-            sqlx::query_as("SELECT * FROM wyrd.verification_target($1, $2, $3, $4)")
+            sqlx::query_as("SELECT * FROM wyrd.verification_target($1, $2, $3)")
                 .bind(self.data_tenant_id.as_uuid())
                 .bind(verifier.as_uuid())
                 .bind(subject.as_uuid())
-                .bind(owner.map(CardUid::as_uuid))
                 .fetch_all(&mut *self.conn)
                 .await?;
         let mut target = VerificationTarget {
             verifier: None,
             readiness: VerifierReadiness::VerifierUnavailable,
             subject: None,
-            owner: None,
             system_principal: None,
         };
         for row in rows {
@@ -138,14 +131,14 @@ impl<'conn> VerificationTargets<'conn> {
                 .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
             target.system_principal = row.system_principal_id;
             let uid = row.card.card_uid;
-            if owner.is_some_and(|owner| owner.as_uuid() == uid) {
-                target.owner = Some(row.card.clone());
-            }
-            if uid == subject.as_uuid() {
-                target.subject = Some(row.card.clone());
-            }
             if uid == verifier.as_uuid() {
+                if uid == subject.as_uuid() {
+                    // A Verifier verifying itself: the one row fills both sides.
+                    target.subject = Some(row.card.clone());
+                }
                 target.verifier = Some(row.card);
+            } else {
+                target.subject = Some(row.card);
             }
         }
         Ok(target)

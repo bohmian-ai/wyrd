@@ -898,11 +898,6 @@ pub struct VerificationBinding {
     /// nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on_verdict_change: Vec<InlineableRef<OperatorSpec>>,
-    /// The deployment environment this binding evaluates, a non-empty
-    /// selector an invocation must agree with; absent leaves the binding
-    /// unscoped. Descriptive context, never permission.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deployment_environment: Option<String>,
 }
 
 impl VerificationBinding {

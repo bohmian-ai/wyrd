@@ -309,8 +309,8 @@ impl PyWyrdState {
             .map_err(WyrdPyError::from)
     }
 
-    /// The configured deployment environment, or `None` when unknown;
-    /// reading it fixes an unconfigured state's defaults.
+    /// The configured deployment environment correlation tag, or `None` when
+    /// none is set; reading it fixes an unconfigured state's defaults.
     #[getter]
     fn deployment_environment(&self) -> Option<&str> {
         self.inner.deployment_environment()

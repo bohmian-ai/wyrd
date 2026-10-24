@@ -363,7 +363,8 @@ pub struct NativeConfigureOptions {
     pub service_name: Option<String>,
     /// The loaded Service's exact version, which must match it.
     pub service_version: Option<String>,
-    /// The workload's deployment environment.
+    /// The deployment environment correlation tag copied onto rows; it never
+    /// selects or refuses execution.
     pub deployment_environment: Option<String>,
 }
 
@@ -387,8 +388,8 @@ impl NativeWyrdState {
         })
     }
 
-    /// The configured deployment environment, or `null` when unknown; reading
-    /// it fixes an unconfigured state's defaults.
+    /// The configured deployment environment correlation tag, or `null` when
+    /// none is set; reading it fixes an unconfigured state's defaults.
     ///
     /// # Errors
     ///

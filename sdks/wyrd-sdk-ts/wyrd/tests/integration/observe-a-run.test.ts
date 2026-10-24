@@ -115,6 +115,7 @@ test("configured service context reaches both verification subjects", async ({ s
   await cards.pull(root, bundle);
   const { key } = await runtimeAccount({ kind: "Service", name: "configured-service" });
 
+  const verdicts = new Set<string>();
   for (const environment of ["prod", "staging"]) {
     const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: key }) });
     state.configure({ deploymentEnvironment: environment });
@@ -132,17 +133,12 @@ test("configured service context reaches both verification subjects", async ({ s
     expect(queued.subject).toEqual(state.cardRef("agent"));
     expect(queued.deployment_environment).toBe(environment);
 
-    const rootCheck = run.observe.verify("service-check", "yes");
-    if (environment === "prod") {
-      const checked = await rootCheck;
-      expect(checked.subject).toEqual(state.rootRef);
-      expect(checked.deployment_environment).toBe("prod");
-    } else {
-      await expect(rootCheck).rejects.toMatchObject({
-        code: "WYRD_SPEC_400_VALIDATION",
-        details: { field: "deployment_environment" },
-      });
-    }
+    const checked = await run.observe.verify("service-check", "yes");
+    expect(checked.subject).toEqual(state.rootRef);
+    expect(checked.deployment_environment).toBe(environment);
+    verdicts.add(checked.outcome.verdict);
     expect(() => state.configure()).toThrow(expect.objectContaining({ code: "WYRD_SDK_409_STATE_CONFIG_FROZEN" }));
   }
+  // A differing correlation tag never changes the verdict.
+  expect(verdicts.size).toBe(1);
 });

@@ -1616,7 +1616,7 @@ export class WyrdClient {
     return this.#native.workloadUid ?? undefined;
   }
 
-  /** The configured deployment environment requests carry, or `undefined` when unknown. */
+  /** The deployment environment correlation tag requests carry, or `undefined`. */
   get deploymentEnvironment(): string | undefined {
     return this.#native.deploymentEnvironment ?? undefined;
   }
@@ -2215,12 +2215,7 @@ interface ScopedRun {
 const STATE_RUNS = new AsyncLocalStorage<readonly ScopedRun[]>();
 
 /** Identity headers a state-bound `httpAuth` owns; an explicit differing value conflicts. */
-const CONTEXT_HEADERS = [
-  "x-wyrd-workload-uid",
-  "wyrd-card-uid",
-  "wyrd-run-id",
-  "x-wyrd-deployment-environment",
-] as const;
+const CONTEXT_HEADERS = ["x-wyrd-workload-uid", "wyrd-card-uid", "wyrd-run-id"] as const;
 
 /** The application's `@opentelemetry/api`, or `null` when it is not installed. */
 function otel(): typeof import("@opentelemetry/api") | null {
@@ -2882,7 +2877,7 @@ export type ConfigureOptions = {
   readonly serviceName?: string;
   /** The loaded Service's exact version; must match it. */
   readonly serviceVersion?: string;
-  /** The workload's deployment environment. */
+  /** The deployment environment correlation tag copied onto rows; it never selects or refuses execution. */
   readonly deploymentEnvironment?: string;
 };
 
@@ -3179,7 +3174,7 @@ export class WyrdState {
    *
    * Omitted `serviceName` and `serviceVersion` default to the loaded Service;
    * an omitted `deploymentEnvironment` defaults to a non-empty
-   * `WYRD_DEPLOYMENT_ENVIRONMENT`, else stays unknown. Without a call, the
+   * `WYRD_DEPLOYMENT_ENVIRONMENT`, else stays `undefined`. Without a call, the
    * first Run, client, Bifrost, telemetry, or shutdown use applies the same
    * defaults. Another loaded state keeps its own configuration.
    *
@@ -3199,7 +3194,7 @@ export class WyrdState {
     );
   }
 
-  /** The configured deployment environment, or `undefined` when unknown; reading it fixes defaults. */
+  /** The configured deployment environment correlation tag, or `undefined`; reading it fixes defaults. */
   get deploymentEnvironment(): string | undefined {
     return lifecycleValue<string | null>(this.#native.deploymentEnvironment()) ?? undefined;
   }
@@ -3217,6 +3212,10 @@ export class WyrdState {
    * unless the request names its own `traceparent`. The context is read when
    * the request starts, before any token refresh. Reading it fixes defaults
    * and resolves the client without network IO.
+   *
+   * The deployment environment is a pass-through correlation tag, never an
+   * identity: the state's configured tag replaces an explicit one, and an
+   * unconfigured state sends the request's own tag, if any, unchanged.
    *
    * @returns The authenticating `fetch`; a request rejects with
    * `WYRD_CLIENT_400_CONFIG_INVALID`, before it is sent, when an explicit
@@ -3237,7 +3236,6 @@ export class WyrdState {
         "x-wyrd-workload-uid": service,
         "wyrd-card-uid": run?.cardUid ?? service,
         "wyrd-run-id": run?.runId,
-        "x-wyrd-deployment-environment": environment,
       };
       for (const name of CONTEXT_HEADERS) {
         const explicit = headers.get(name);
@@ -3254,6 +3252,7 @@ export class WyrdState {
         const value = context[name];
         if (value !== undefined) headers.set(name, value);
       }
+      if (environment !== undefined) headers.set("x-wyrd-deployment-environment", environment);
       const trace = headers.has("traceparent") ? null : activeTraceContext();
       if (trace !== null) {
         headers.set("traceparent", trace.traceparent);

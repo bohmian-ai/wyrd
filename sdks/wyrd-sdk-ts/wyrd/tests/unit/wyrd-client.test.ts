@@ -115,7 +115,6 @@ test("state httpAuth carries its own service, run, and environment", async () =>
     for (const conflict of [
       { "wyrd-card-uid": agent },
       { "wyrd-run-id": run.runId },
-      { "x-wyrd-deployment-environment": "staging" },
       { "x-wyrd-workload-uid": agent },
     ]) {
       await expect(prodFetch("http://wyrd/v1/models", { headers: conflict })).rejects.toMatchObject({
@@ -123,6 +122,10 @@ test("state httpAuth carries its own service, run, and environment", async () =>
       });
     }
     expect(sent).toHaveLength(1);
+
+    // A differing deployment environment is a correlation tag, never a conflict.
+    await prodFetch("http://wyrd/v1/models", { headers: { "x-wyrd-deployment-environment": "staging" } });
+    expect(sentContext(sent.pop())["x-wyrd-deployment-environment"]).toBe("prod");
   } finally {
     context.disable();
     vi.unstubAllGlobals();

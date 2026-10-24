@@ -413,7 +413,7 @@ const CLAIM_SQL: &str = r"
               e.run_id, e.inputs, e.route_overrides,
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
               e.max_attempts, e.lease_expires_at, e.cause_trace_id, e.cause_span_id,
-              e.cause_sampled, e.group_id, e.group_sources,
+              e.cause_sampled, e.group_id, e.group_sources, e.deployment_environment,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
@@ -1367,6 +1367,10 @@ pub struct ClaimedExecution {
     /// The Verifier's ready fitted Drift baselines keyed by requirement ID,
     /// read in the claim transaction; empty when it has none.
     pub fitted_baselines: BTreeMap<TaskId, Value>,
+    /// The deployment environment tag accepted with the execution, written
+    /// unchanged to its result rows; `None` when it carried none. Never an
+    /// execution input.
+    pub deployment_environment: Option<String>,
 }
 
 /// Outcome of a token-fenced settlement.
@@ -1428,8 +1432,8 @@ pub struct ExecutionStatus {
     pub card_uid: CardUid,
     /// Result pointer of a completed execution.
     pub result_id: Option<VerificationResultId>,
-    /// The effective deployment environment frozen at acceptance; `None`
-    /// for unscoped work.
+    /// The deployment environment tag the execution was accepted with;
+    /// `None` when the invocation carried none.
     pub deployment_environment: Option<String>,
 }
 
@@ -2984,6 +2988,8 @@ struct ClaimedRow {
     group_id: Option<String>,
     /// A group execution's pinned source selections.
     group_sources: Option<Json<BTreeMap<SlotName, GroupSourceSnapshot>>>,
+    /// Accepted deployment environment tag.
+    deployment_environment: Option<String>,
     /// Milliseconds the execution was claimable before this claim.
     queue_wait_ms: i64,
     /// Milliseconds since the execution was admitted.
@@ -3086,6 +3092,7 @@ impl ClaimedRow {
                 .fitted_baselines
                 .map(|Json(fitted)| fitted)
                 .unwrap_or_default(),
+            deployment_environment: self.deployment_environment,
         })
     }
 }
@@ -3134,7 +3141,7 @@ struct StatusRow {
     owner_card_uid: Option<Uuid>,
     /// A group execution's pinned source selections.
     group_sources: Option<Json<BTreeMap<SlotName, GroupSourceSnapshot>>>,
-    /// Effective deployment environment frozen at acceptance.
+    /// Deployment environment tag supplied at acceptance.
     deployment_environment: Option<String>,
 }
 

@@ -113,6 +113,7 @@ def test_configured_service_context_reaches_both_verification_subjects(
     declare(cards, "cards/observe_a_run/configured-service.yaml")
     bundle = pull(cards, "configured-service", tmp_path)
     key = service_key("configured-service")
+    verdicts: set[str] = set()
     for environment in ("prod", "staging"):
         state = WyrdState.from_path(bundle, WyrdClient(credential=key))
         state.configure(deployment_environment=environment)
@@ -128,15 +129,11 @@ def test_configured_service_context_reaches_both_verification_subjects(
         assert queued.subject == state.card_ref("agent")
         assert queued.deployment_environment == environment
 
-        if environment == "prod":
-            root = run.observe.verify("service-check", "yes")
-            assert root.subject == state.root_ref
-            assert root.deployment_environment == "prod"
-        else:
-            with pytest.raises(WyrdError) as refused:
-                run.observe.verify("service-check", "yes")
-            assert refused.value.code == "WYRD_SPEC_400_VALIDATION"
-            assert refused.value.details["field"] == "deployment_environment"
+        root = run.observe.verify("service-check", "yes")
+        assert root.subject == state.root_ref
+        assert root.deployment_environment == environment
+        verdicts.add(root.verdict)
         with pytest.raises(WyrdError) as frozen:
             state.configure()
         assert frozen.value.code == "WYRD_SDK_409_STATE_CONFIG_FROZEN"
+    assert len(verdicts) == 1, "a differing correlation tag never changes the verdict"

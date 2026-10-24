@@ -953,7 +953,6 @@ mod tests {
                 "{dir}/operator.yaml"
             )))],
             on_verdict_change: Vec::new(),
-            deployment_environment: None,
         }
     }
 

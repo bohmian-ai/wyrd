@@ -244,9 +244,7 @@ async fn enqueue(
 ) -> Result<(StatusCode, Json<EnqueueVerificationResponse>), WyrdErrorResponse> {
     let key = extract_idempotency_key(&headers)?;
     let request: VerificationRequest = decode_body(body).await?;
-    let response = VerificationControl::new(&state)
-        .enqueue(&caller, request, key.as_ref())
-        .await;
+    let response = VerificationControl::new(&state).enqueue(&caller, request, key.as_ref());
     let outcome = if response.is_ok() {
         "staged"
     } else {

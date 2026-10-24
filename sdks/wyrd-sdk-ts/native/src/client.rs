@@ -196,8 +196,8 @@ impl NativeWyrdClient {
             .map(|uid| uid.as_str().to_owned())
     }
 
-    /// Returns the configured deployment environment this client's requests
-    /// carry, or `null` when unknown.
+    /// Returns the deployment environment correlation tag this client's
+    /// requests carry, or `null` when none is configured.
     #[napi(getter)]
     pub fn deployment_environment(&self) -> Option<String> {
         self.client

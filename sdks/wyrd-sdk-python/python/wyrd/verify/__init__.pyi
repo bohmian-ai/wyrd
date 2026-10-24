@@ -475,7 +475,7 @@ class VerificationResult(Generic[DataT]):
 
     @property
     def deployment_environment(self) -> str | None:
-        """The effective deployment environment, or ``None`` when unscoped."""
+        """The deployment environment correlation tag the request supplied, or ``None``."""
         ...
 
     @property

@@ -206,6 +206,7 @@ impl EvidenceInvestigation {
                 card_uid: subject_uid,
                 owner_card_uid: Some(subject_uid),
                 group_id: None,
+                deployment_environment: None,
                 binding_id: None,
                 trigger: None,
                 window,

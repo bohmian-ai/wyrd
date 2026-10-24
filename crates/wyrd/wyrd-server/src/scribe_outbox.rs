@@ -1558,6 +1558,7 @@ mod tests {
                 card_uid: subject,
                 owner_card_uid: None,
                 group_id: None,
+                deployment_environment: None,
                 binding_id: None,
                 trigger: None,
                 window: Some(&window),

@@ -2194,16 +2194,14 @@ mod pg_tests {
         Ok(())
     }
 
-    /// A Service's configured deployment environment reaches both of its
-    /// verification subjects over MCP, reconciled with each binding.
+    /// A Service's configured deployment environment is a pass-through tag on
+    /// both of its verification subjects over MCP.
     ///
-    /// Against `configured-service`, whose Service check is bound to `prod`
-    /// and whose Agent component's check is unscoped: an equal `prod` execute
-    /// and a sole (unrequested) enqueue of the Service check both run in
-    /// `prod` on the Service; a `staging` enqueue of the Agent check runs in
-    /// `staging` on the Agent; `verification.get_execution` reads each frozen
-    /// environment back. A `staging` request for the Service check conflicts
-    /// with its binding, is refused on both write tools, and stages nothing.
+    /// Against `configured-service`: the Service check and the Agent
+    /// component's check run directly and queued under `prod`, `staging`, and
+    /// no tag, with the same verdict; each result, `verification.get_execution`
+    /// read, and stored `execution_inputs` and `results` row carries exactly
+    /// the supplied tag, or none.
     ///
     /// # Errors
     ///
@@ -2212,8 +2210,8 @@ mod pg_tests {
     ///
     /// # Panics
     ///
-    /// Panics when a result names another subject or environment, or a
-    /// conflicting request is accepted or leaves staged input.
+    /// Panics when a call is refused, a verdict differs between tags, or a
+    /// result or stored row names another subject or environment.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn configured_service_context_keeps_subject_and_environment()
@@ -2262,59 +2260,64 @@ mod pg_tests {
             body
         };
 
-        let equal = structured(
-            caller_client
-                .call_tool(call(
-                    EXECUTE,
-                    request(&service_check, &service, Some("prod")),
-                )?)
-                .await?,
-        )?;
-        assert_eq!(text(&equal, "/subject/uid")?, service, "{equal}");
-        assert_eq!(text(&equal, "/deployment_environment")?, "prod", "{equal}");
-        for (verifier, subject, requested, effective) in [
-            (&service_check, &service, None, "prod"),
-            (&agent_check, &agent, Some("staging"), "staging"),
-        ] {
-            let accepted = structured(
-                caller_client
-                    .call_tool(call(ENQUEUE, request(verifier, subject, requested))?)
-                    .await?,
-            )?;
-            let state = settle(&caller_client, text(&accepted, "/execution_id")?).await?;
-            assert_eq!(state["status"], "completed", "{state}");
-            assert_eq!(text(&state, "/result/subject/uid")?, subject.as_str());
-            assert_eq!(
-                text(&state, "/result/deployment_environment")?,
-                effective,
-                "{state}"
-            );
+        let mut recorded = Vec::new();
+        for (verifier, subject) in [(&service_check, &service), (&agent_check, &agent)] {
+            for environment in [Some("prod"), Some("staging"), None] {
+                let direct = structured(
+                    caller_client
+                        .call_tool(call(EXECUTE, request(verifier, subject, environment))?)
+                        .await?,
+                )?;
+                assert_eq!(text(&direct, "/subject/uid")?, subject.as_str(), "{direct}");
+                assert_eq!(text(&direct, "/outcome/verdict")?, "passed", "{direct}");
+                assert_eq!(
+                    direct["deployment_environment"].as_str(),
+                    environment,
+                    "{direct}"
+                );
+                recorded.push((text(&direct, "/execution_id")?.to_owned(), environment));
+
+                let accepted = structured(
+                    caller_client
+                        .call_tool(call(ENQUEUE, request(verifier, subject, environment))?)
+                        .await?,
+                )?;
+                let execution_id = text(&accepted, "/execution_id")?.to_owned();
+                let state = settle(&caller_client, &execution_id).await?;
+                assert_eq!(state["status"], "completed", "{state}");
+                assert_eq!(text(&state, "/result/subject/uid")?, subject.as_str());
+                assert_eq!(
+                    text(&state, "/result/outcome/verdict")?,
+                    "passed",
+                    "{state}"
+                );
+                assert_eq!(
+                    state["result"]["deployment_environment"].as_str(),
+                    environment,
+                    "{state}"
+                );
+                recorded.push((execution_id, environment));
+            }
         }
 
         server.flush_bifrost().await?;
-        let staged = "SELECT count(*) FROM vala.verification.execution_inputs".to_owned();
-        let before = rows(&caller_client, staged.clone()).await?;
-        for tool in [EXECUTE, ENQUEUE] {
-            let refused = refusal(
-                caller_client
-                    .call_tool(call(
-                        tool,
-                        request(&service_check, &service, Some("staging")),
-                    )?)
-                    .await,
-            )?;
-            assert!(
-                refused.contains("WYRD_SPEC_400_VALIDATION")
-                    && refused.contains("deployment_environment"),
-                "{tool} refuses an environment its binding conflicts with: {refused}"
-            );
+        for (execution_id, environment) in recorded {
+            for table in ["execution_inputs", "results"] {
+                let stored = rows(
+                    &caller_client,
+                    format!(
+                        "SELECT deployment_environment FROM vala.verification.{table} \
+                         WHERE execution_id = '{execution_id}'"
+                    ),
+                )
+                .await?;
+                assert_eq!(
+                    stored,
+                    serde_json::json!([[environment]]),
+                    "{table} row of {execution_id}"
+                );
+            }
         }
-        server.flush_bifrost().await?;
-        assert_eq!(
-            rows(&caller_client, staged).await?,
-            before,
-            "a refused call stages nothing"
-        );
         caller_client.cancel().await?;
         server.shutdown().await?;
         Ok(())

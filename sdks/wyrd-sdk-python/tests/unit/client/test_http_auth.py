@@ -180,13 +180,16 @@ def test_state_auth_snapshots_context_before_token_refresh(fixtures_dir: Path) -
         for conflict in (
             {"wyrd-card-uid": agent},
             {"wyrd-run-id": run.run_id},
-            {"x-wyrd-deployment-environment": "staging"},
             {"x-wyrd-workload-uid": agent},
         ):
             with pytest.raises(WyrdError) as refused:
                 http.get("http://wyrd/v1/models", headers=conflict)
             assert refused.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
-    assert len(sent) == 1, "a matching explicit header is accepted; a conflict sends nothing"
+        http.get("http://wyrd/v1/models", headers={"x-wyrd-deployment-environment": "staging"})
+    assert len(sent) == 2, "a matching identity is accepted; an identity conflict sends nothing"
+    assert sent[1]["x-wyrd-deployment-environment"] == "prod", (
+        "a differing tag is never a conflict; the configured tag is sent"
+    )
 
 
 class Refreshing:

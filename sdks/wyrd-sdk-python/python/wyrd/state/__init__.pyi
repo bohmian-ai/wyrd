@@ -236,14 +236,15 @@ class WyrdState:
 
         Local, with no network IO. Omitted name and version default to the
         loaded Service; an omitted environment defaults to a non-empty
-        ``WYRD_DEPLOYMENT_ENVIRONMENT``, else stays unknown. Without a call,
+        ``WYRD_DEPLOYMENT_ENVIRONMENT``, else stays ``None``. Without a call,
         the first Run, client, Bifrost, telemetry, or shutdown use applies the
         same defaults. Another loaded state keeps its own configuration.
 
         Args:
             service_name: the loaded Service's name; must match it.
             service_version: the loaded Service's exact version; must match it.
-            deployment_environment: the workload's deployment environment.
+            deployment_environment: the deployment environment correlation tag
+                copied onto rows; it never selects or refuses execution.
 
         Raises:
             WyrdError: ``WYRD_SDK_409_STATE_CONFIG_FROZEN`` once configuration
@@ -254,7 +255,7 @@ class WyrdState:
 
     @property
     def deployment_environment(self) -> str | None:
-        """The configured deployment environment, or ``None`` when unknown; reading it fixes defaults."""
+        """The configured deployment environment correlation tag, or ``None``; reading it fixes defaults."""
         ...
 
     @property

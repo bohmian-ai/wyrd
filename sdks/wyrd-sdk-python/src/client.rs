@@ -358,8 +358,8 @@ impl PyWyrdClient {
         self.inner.workload_uid().map(CardUid::as_str)
     }
 
-    /// The configured deployment environment this client's requests carry,
-    /// or `None` when unknown.
+    /// The deployment environment correlation tag this client's requests
+    /// carry, or `None` when none is configured.
     #[getter]
     fn deployment_environment(&self) -> Option<String> {
         self.inner

@@ -26,7 +26,8 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// and from sample window time. `owner_card_uid` is the authenticated
 /// caller's owner Service, null when none was available, and `group_id` the
 /// caller's group, null when ungrouped; grouped bindings discover source rows
-/// by both. The managed `run_id` is the application Run,
+/// by both. `deployment_environment` is the correlation tag the execution
+/// was accepted with, null when it carried none. The managed `run_id` is the application Run,
 /// null when there is none; the managed `card_uid` is the subject verified.
 pub struct ExecutionInputsTable;
 
@@ -56,6 +57,7 @@ impl DomainTable for ExecutionInputsTable {
             utf8("verifier_card_uid", false),
             utf8("binding_id", true),
             utf8("group_id", true),
+            utf8("deployment_environment", true),
             boolean("queue_execution", false),
             variant_field(INPUTS, false),
             variant_field(ACTIVATION, true),

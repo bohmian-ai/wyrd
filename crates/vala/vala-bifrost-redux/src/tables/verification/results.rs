@@ -29,6 +29,8 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// and `binding_id` the binding, both null for an execution with no binding;
 /// a caller execution records its authenticated owner Service instead, when
 /// one was available. `group_id` is the caller's group, null when ungrouped.
+/// `deployment_environment` is the correlation tag the execution was accepted
+/// with, null when it carried none.
 /// The managed `sub_principal_id`/`act_principal_id` pair records whom the
 /// execution served and who executed it.
 pub struct ResultsTable;
@@ -63,6 +65,7 @@ impl DomainTable for ResultsTable {
             utf8("verifier_card_uid", false),
             utf8("binding_id", true),
             utf8("group_id", true),
+            utf8("deployment_environment", true),
             utf8("trigger_identity", true),
             ts_us_utc("window_start", true),
             ts_us_utc("window_end", true),

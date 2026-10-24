@@ -6090,12 +6090,6 @@ export interface UpdateOperatorConnectionRequestSlack {
  */
 export interface VerificationBinding {
   /**
-   * The deployment environment this binding evaluates, a non-empty
-   * selector an invocation must agree with; absent leaves the binding
-   * unscoped. Descriptive context, never permission.
-   */
-  readonly deployment_environment?: string | null;
-  /**
    * Operators dispatched independently after a `failed` verdict.
    *
    * Empty means a failed result stays durable with no reaction. A
@@ -6224,8 +6218,8 @@ export interface VerificationOutcome {
  */
 export interface VerificationResult {
   /**
-   * The effective deployment environment the execution was accepted
-   * under, or absent when unscoped.
+   * The deployment environment tag the execution was invoked with, or
+   * absent when the invocation carried none.
    */
   readonly deployment_environment?: string | null;
   /**

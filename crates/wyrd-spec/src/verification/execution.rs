@@ -56,10 +56,10 @@ pub struct VerificationRequest {
     /// Whole execution-route replacements keyed by Agent block ID.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub execution_route_overrides: BTreeMap<TaskId, ExecutionRoute>,
-    /// The invoking workload's deployment environment, a non-empty
-    /// evaluation selector. It must agree with the binding's own selector
-    /// when both are set; the accepted execution freezes the effective one.
-    /// Descriptive context, never permission.
+    /// The invoking workload's deployment environment: an optional,
+    /// non-empty correlation tag copied onto the accepted execution and its
+    /// result. It never selects, filters, or changes the execution and is
+    /// never permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_environment: Option<String>,
 }
@@ -211,8 +211,8 @@ pub struct VerificationResult<T = Map<String, Value>> {
     pub verifier: CardRef,
     /// The exact subject judged.
     pub subject: CardRef,
-    /// The effective deployment environment the execution was accepted
-    /// under, or absent when unscoped.
+    /// The deployment environment tag the execution was invoked with, or
+    /// absent when the invocation carried none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_environment: Option<String>,
     /// Verdict, breakdown, and evidence.

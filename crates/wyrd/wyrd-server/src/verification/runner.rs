@@ -323,7 +323,6 @@ impl VerifierRunner {
                 tenant,
                 &run.verifier_card_uid,
                 &run.card_uid,
-                None,
             )
             .await?;
         Ok(resolved.map_err(|refusal| {
@@ -863,6 +862,7 @@ fn result(
                 .as_ref()
                 .or_else(|| run.authority.owning_root()),
             group_id: run.group_id.as_ref(),
+            deployment_environment: run.deployment_environment.as_deref(),
             binding_id: run.binding_id,
             trigger: run.trigger.as_ref(),
             window,

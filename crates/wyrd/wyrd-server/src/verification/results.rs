@@ -180,6 +180,9 @@ pub struct ResultRun<'a> {
     pub owner_card_uid: Option<&'a CardUid>,
     /// Caller group the execution belongs to; `None` when ungrouped.
     pub group_id: Option<&'a GroupId>,
+    /// Deployment environment tag the execution was accepted with, stored
+    /// unchanged as `deployment_environment`; `None` when it carried none.
+    pub deployment_environment: Option<&'a str>,
     /// Binding; `None` for an execution with no binding.
     pub binding_id: Option<BindingId>,
     /// Frozen Trigger; `None` for an execution with no binding.
@@ -304,6 +307,10 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             ("binding_id", text([self.binding()])),
             ("group_id", text([self.group()])),
+            (
+                "deployment_environment",
+                text([self.run.deployment_environment]),
+            ),
             ("trigger_identity", text([trigger])),
             (
                 "window_start",
@@ -366,6 +373,10 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             ("binding_id", text([self.binding()])),
             ("group_id", text([self.group()])),
+            (
+                "deployment_environment",
+                text([self.run.deployment_environment]),
+            ),
             (
                 "queue_execution",
                 Arc::new(BooleanArray::from(vec![submission.is_some()])),
@@ -708,6 +719,7 @@ mod tests {
                     card_uid: &self.subject,
                     owner_card_uid: Some(&self.owner),
                     group_id: None,
+                    deployment_environment: None,
                     binding_id: Some(self.binding),
                     trigger: Some(&self.trigger),
                     window: Some(&self.window),

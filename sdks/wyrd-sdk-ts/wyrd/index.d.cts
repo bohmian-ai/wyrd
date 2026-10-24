@@ -778,8 +778,8 @@ export declare class NativeWyrdClient {
    */
   get workloadUid(): string | null
   /**
-   * Returns the configured deployment environment this client's requests
-   * carry, or `null` when unknown.
+   * Returns the deployment environment correlation tag this client's
+   * requests carry, or `null` when none is configured.
    */
   get deploymentEnvironment(): string | null
   /**
@@ -890,8 +890,8 @@ export declare class NativeWyrdState {
    */
   configure(options: NativeConfigureOptions): NativeLifecycleResult
   /**
-   * The configured deployment environment, or `null` when unknown; reading
-   * it fixes an unconfigured state's defaults.
+   * The configured deployment environment correlation tag, or `null` when
+   * none is set; reading it fixes an unconfigured state's defaults.
    *
    * # Errors
    *
@@ -1102,7 +1102,10 @@ export interface NativeConfigureOptions {
   serviceName?: string
   /** The loaded Service's exact version, which must match it. */
   serviceVersion?: string
-  /** The workload's deployment environment. */
+  /**
+   * The deployment environment correlation tag copied onto rows; it never
+   * selects or refuses execution.
+   */
   deploymentEnvironment?: string
 }
 

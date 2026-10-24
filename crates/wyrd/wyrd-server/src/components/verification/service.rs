@@ -6,7 +6,7 @@
 //! authorization, audit, tenancy, idempotency, and error mapping have exactly
 //! one implementation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,7 +47,7 @@ use crate::http::middleware::metrics::RequestArrival;
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::{ScribeSink, ScribeWrite};
 use crate::state::{AppState, registry_db_error};
-use crate::verification::cache::{Db, Target, effective_environment, exact_ref};
+use crate::verification::cache::{Db, Target, exact_ref};
 use crate::verification::hosted::blocks::{Execution, HostedBlocks};
 use crate::verification::results::{ResultPayloadBuilder, ResultPayloadError, ResultRun};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
@@ -110,6 +110,26 @@ fn staging_full(full: OutboxFull) -> WyrdError {
         message: "this server has no verification staging capacity now".to_owned(),
         details: serde_json::json!({ "retry_after_seconds": STAGING_RETRY_AFTER_SECONDS }),
     }
+}
+
+/// Refuse an empty `deployment_environment` tag.
+///
+/// The tag is optional correlation context copied onto the accepted
+/// execution and its result; it never selects, filters, or changes the
+/// execution. An empty value is not a tag, so it is refused at admission
+/// rather than stored. Pure: no IO.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` naming `deployment_environment` when the
+/// request carries an empty value.
+fn environment_tag(request: &VerificationRequest) -> Result<(), WyrdError> {
+    if request.deployment_environment.as_deref() == Some("") {
+        return Err(WyrdError::Validation {
+            message: "deployment_environment must be non-empty or omitted".to_owned(),
+            details: serde_json::json!({ "field": "deployment_environment" }),
+        });
+    }
+    Ok(())
 }
 
 /// Owner of the Verification control plane for one request.
@@ -496,6 +516,7 @@ impl<'a> VerificationControl<'a> {
             request.verifier_card_uid, request.card_uid
         );
         let admitted = telemetry.time(Phase::Admit, || {
+            environment_tag(request)?;
             self.authorize_run(
                 caller,
                 &request.verifier_card_uid,
@@ -523,13 +544,6 @@ impl<'a> VerificationControl<'a> {
             .await
         {
             Ok(target) => target,
-            Err(error) => return ("refused", Err(error)),
-        };
-        let deployment_environment = match effective_environment(
-            request.deployment_environment.as_deref(),
-            &target.binding_environments,
-        ) {
-            Ok(environment) => environment,
             Err(error) => return ("refused", Err(error)),
         };
         if let Some(edge_timer) = edge_timer {
@@ -645,25 +659,21 @@ impl<'a> VerificationControl<'a> {
                 verifier: target.verifier.clone(),
                 subject: target.subject.clone(),
                 outcome,
-                deployment_environment,
+                deployment_environment: request.deployment_environment.clone(),
             }),
         )
     }
 
     /// Stage one background execution and return its identity.
     ///
-    /// Evaluates `verifier:run` on the requested Verifier UID, freezes the
-    /// request's effective deployment environment against the bindings of the
-    /// caller's owner Service (a target that cannot run keeps the requested
-    /// value; the writer settles its refusal), assigns the
+    /// Evaluates `verifier:run` on the requested Verifier UID, assigns the
     /// execution ID (derived from `key` and the canonical request when keyed,
     /// so identical retries share it), and stages the pinned inputs marked
     /// `queue_execution` on the Scribe outbox with the [`Submission`]. Once
     /// Scribe acknowledges the inputs, the submission is queued through the
     /// batched writer, which decides replay, conflict, and refusal; until
-    /// then status reads not found. Writes no Postgres and reads it only for
-    /// a target the cache misses. The execution runs as the caller, never as
-    /// a binding owner. The request's
+    /// then status reads not found. Reads and writes no Postgres. The
+    /// execution runs as the caller, never as a binding owner. The request's
     /// span and the caller's own sampled flag become the execution's
     /// [`Cause`], which its attempts link to.
     ///
@@ -671,16 +681,15 @@ impl<'a> VerificationControl<'a> {
     /// Returns [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on
     /// the Verifier or when a Card-bound caller's signed scope does not carry
     /// the subject's UID, [`WyrdError::VerificationInputTooLarge`] for inputs
-    /// past a Variant limit, `WYRD_SPEC_400_VALIDATION` for an empty or
-    /// conflicting deployment environment, a registry unavailability error
-    /// when the target read fails, [`WyrdError::ServiceUnavailable`] when this
+    /// past a Variant limit, `WYRD_SPEC_400_VALIDATION` for an empty
+    /// `deployment_environment`, [`WyrdError::ServiceUnavailable`] when this
     /// process hosts no Verifier queue, and
     /// [`WyrdError::VerificationStagingFull`] when the submission or Scribe
     /// outbox cannot reserve its slot, before any input is staged.
-    pub(crate) async fn enqueue(
+    pub(crate) fn enqueue(
         &self,
         caller: &Caller,
-        mut request: VerificationRequest,
+        request: VerificationRequest,
         key: Option<&IdempotencyKey>,
     ) -> Result<EnqueueVerificationResponse, WyrdError> {
         let submissions = self
@@ -702,25 +711,7 @@ impl<'a> VerificationControl<'a> {
             ENQUEUE,
             &resource,
         )?;
-        let bound = match self
-            .state
-            .verification
-            .verifier_cards()
-            .resolve(
-                Db::Pool(self.state.postgres.wyrd()),
-                caller.data_tenant_id,
-                &request.verifier_card_uid,
-                &request.card_uid,
-                wyrd_runtime::owning_root(&caller.principal, &caller.delegation_chain),
-            )
-            .await
-            .map_err(registry_db_error)?
-        {
-            Ok(target) => target.binding_environments.clone(),
-            Err(_) => BTreeSet::new(),
-        };
-        request.deployment_environment =
-            effective_environment(request.deployment_environment.as_deref(), &bound)?;
+        environment_tag(&request)?;
         let cause = wyrd_telemetry::current_context().and_then(|context| {
             Some(Cause {
                 trace_id: TraceId::from_hex(&context.trace_id).ok()?,
@@ -751,6 +742,7 @@ impl<'a> VerificationControl<'a> {
                     &caller.delegation_chain,
                 ),
                 group_id: submission.request.group_id.as_ref(),
+                deployment_environment: submission.request.deployment_environment.as_deref(),
                 binding_id: None,
                 trigger: None,
                 window: None,
@@ -812,6 +804,7 @@ impl<'a> VerificationControl<'a> {
                     &caller.delegation_chain,
                 ),
                 group_id: request.group_id.as_ref(),
+                deployment_environment: request.deployment_environment.as_deref(),
                 binding_id: None,
                 trigger: None,
                 window: None,
@@ -881,7 +874,6 @@ impl<'a> VerificationControl<'a> {
                 caller.data_tenant_id,
                 &request.verifier_card_uid,
                 &request.card_uid,
-                wyrd_runtime::owning_root(&caller.principal, &caller.delegation_chain),
             )
             .await
             .map_err(registry_db_error)?;

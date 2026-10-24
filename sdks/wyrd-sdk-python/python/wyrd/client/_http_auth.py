@@ -26,7 +26,6 @@ _CONTEXT_HEADERS = (
     "x-wyrd-workload-uid",
     "wyrd-card-uid",
     "wyrd-run-id",
-    "x-wyrd-deployment-environment",
 )
 """Identity headers a state-bound adapter owns; an explicit differing value conflicts."""
 
@@ -48,8 +47,11 @@ class HttpAuth(httpx.Auth, httpx2.Auth):
     ``wyrd-run-id`` (the Service and no Run outside one), plus the active W3C
     trace context unless the request names its own ``traceparent``. That
     context is read when the request starts, before the token is, and an
-    explicit header that differs from it fails the request locally with
-    ``WYRD_CLIENT_400_CONFIG_INVALID``.
+    explicit identity header that differs from it fails the request locally
+    with ``WYRD_CLIENT_400_CONFIG_INVALID``. The deployment environment is a
+    pass-through correlation tag, never an identity: the state's configured
+    tag replaces an explicit one, and an unconfigured state sends the
+    request's own tag, if any, unchanged.
     """
 
     def __init__(

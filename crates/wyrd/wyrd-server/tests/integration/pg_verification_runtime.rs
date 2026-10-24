@@ -4526,22 +4526,21 @@ async fn only_associated_account_activity_activates_exact_root() {
     );
 }
 
-/// A configured deployment environment is reconciled with the binding's
-/// selector before acceptance and frozen through restart.
+/// A supplied deployment environment tag is carried unchanged from
+/// acceptance through restart to the stored result rows.
 ///
-/// The root Service binds one Verifier with `deployment_environment: prod`
-/// and its Agent component another, unscoped. Its runtime account, rooted
-/// at the Service, enqueues the Service-bound check with no environment (the
-/// binding's sole value is frozen), with an equal one, and the Agent-bound
-/// check with `staging` (the invocation's sole value). A conflicting value
-/// and an empty one are refused with `WYRD_SPEC_400_VALIDATION` before any
-/// execution exists. The runtime stops with every accepted execution
-/// unfinished; a fresh runtime completes them, and status reads return each
-/// one's own subject and frozen environment.
+/// The root Service binds one Verifier and its Agent component another. Its
+/// runtime account, rooted at the Service, enqueues the Service-bound check
+/// with no tag, `prod`, and `staging`, and the Agent-bound check with
+/// `staging`; every one is accepted. An empty tag is refused with
+/// `WYRD_SPEC_400_VALIDATION` before any execution exists. The runtime stops
+/// with every accepted execution unfinished; a fresh runtime completes them,
+/// and status reads and the retained `execution_inputs` and `results` rows
+/// return each one's own subject and exactly its supplied tag.
 ///
 /// # Panics
-/// Panics when a refusal is accepted or leaves an execution, an accepted
-/// execution freezes another environment or subject, or recovery fails.
+/// Panics when the empty tag is accepted or leaves an execution, an accepted
+/// execution records another tag or subject, or recovery fails.
 #[tokio::test]
 async fn configured_service_context_survives_acceptance_and_restart() {
     let harness = Harness::start().await;
@@ -4593,7 +4592,6 @@ async fn configured_service_context_survives_acceptance_and_restart() {
         .service_with("ask-service", &serde_json::json!({
             "verified_by": [{
                 "verifier": pinned("Verifier", "service-check", &service_check),
-                "deployment_environment": "prod",
             }],
             "components": [{
                 "alias": "ask",
@@ -4625,36 +4623,21 @@ async fn configured_service_context_survives_acceptance_and_restart() {
     };
     let post = axum::http::Method::POST;
     let before = harness.seed.executions().await.expect("executions read");
-    for (body, why) in [
-        (
-            enqueue(&service_check, &service, Some("staging")),
-            "conflicts with prod",
-        ),
-        (enqueue(&service_check, &service, Some("")), "is empty"),
-    ] {
-        let (code, problem) = send(
-            server,
-            &jwt,
-            post.clone(),
-            "/v1/verification/enqueue",
-            Some(body),
-        )
-        .await;
-        assert_eq!(
-            code,
-            axum::http::StatusCode::BAD_REQUEST,
-            "{why}: {problem}"
-        );
-        assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION", "{why}");
-        assert_eq!(
-            problem["details"]["field"], "deployment_environment",
-            "{why}"
-        );
-    }
+    let (code, problem) = send(
+        server,
+        &jwt,
+        post.clone(),
+        "/v1/verification/enqueue",
+        Some(enqueue(&service_check, &service, Some(""))),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::BAD_REQUEST, "{problem}");
+    assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION");
+    assert_eq!(problem["details"]["field"], "deployment_environment");
 
     let script = EngineScript::default();
     script.hold();
-    for _ in 0..3 {
+    for _ in 0..4 {
         script.push(EngineOutcome::Completed(unscored_report()));
     }
     let runtime = harness.spawn(
@@ -4665,17 +4648,18 @@ async fn configured_service_context_survives_acceptance_and_restart() {
         &script,
     );
     let mut accepted = Vec::new();
-    for (verifier, subject, requested, frozen) in [
-        (&service_check, &service, None, "prod"),
-        (&service_check, &service, Some("prod"), "prod"),
-        (&agent_check, &agent, Some("staging"), "staging"),
+    for (verifier, subject, supplied) in [
+        (&service_check, &service, None),
+        (&service_check, &service, Some("prod")),
+        (&service_check, &service, Some("staging")),
+        (&agent_check, &agent, Some("staging")),
     ] {
         let (code, body) = send(
             server,
             &jwt,
             post.clone(),
             "/v1/verification/enqueue",
-            Some(enqueue(verifier, subject, requested)),
+            Some(enqueue(verifier, subject, supplied)),
         )
         .await;
         assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{body}");
@@ -4684,13 +4668,17 @@ async fn configured_service_context_survives_acceptance_and_restart() {
             .and_then(|id| id.parse().ok())
             .unwrap_or_else(|| panic!("the run is accepted: {body}"));
         harness.wait_execution(run, |_| true).await;
-        accepted.push((run, subject.clone(), frozen));
+        accepted.push((run, subject.clone(), supplied));
     }
     let after = harness.seed.executions().await.expect("executions read");
-    assert_eq!(after.len(), before.len() + 3, "refusals leave no execution");
+    assert_eq!(
+        after.len(),
+        before.len() + 4,
+        "the refusal leaves no execution"
+    );
     runtime.stop().await;
 
-    for (run, subject, frozen) in &accepted {
+    for (run, subject, supplied) in &accepted {
         let (environment, card_uid): (Option<String>, Uuid) = sqlx::query_as(
             "SELECT deployment_environment, card_uid FROM wyrd.verifier_executions \
              WHERE execution_id = $1",
@@ -4701,7 +4689,7 @@ async fn configured_service_context_survives_acceptance_and_restart() {
         .expect("execution reads");
         assert_eq!(
             (environment.as_deref(), card_uid),
-            (Some(*frozen), subject.as_uuid())
+            (*supplied, subject.as_uuid())
         );
         assert_ne!(
             harness
@@ -4722,7 +4710,7 @@ async fn configured_service_context_survives_acceptance_and_restart() {
     }
     restarted.stop().await;
     harness.durable_rows().await;
-    for (run, subject, frozen) in &accepted {
+    for (run, subject, supplied) in &accepted {
         let (code, state) = send(
             server,
             &jwt,
@@ -4733,7 +4721,8 @@ async fn configured_service_context_survives_acceptance_and_restart() {
         .await;
         assert_eq!(code, axum::http::StatusCode::OK, "{state}");
         assert_eq!(
-            state["result"]["deployment_environment"], *frozen,
+            state["result"]["deployment_environment"].as_str(),
+            *supplied,
             "{state}"
         );
         assert_eq!(
@@ -4741,5 +4730,25 @@ async fn configured_service_context_survives_acceptance_and_restart() {
             subject.as_str(),
             "{state}"
         );
+        for table in ["execution_inputs", "results"] {
+            let stored = server
+                .retained_records(
+                    server.data_tenant_id(),
+                    format!(
+                        "SELECT deployment_environment FROM vala.verification.{table} \
+                         WHERE execution_id = '{run}'"
+                    ),
+                )
+                .await
+                .expect("stored rows read");
+            assert!(!stored.is_empty(), "{run} has a {table} row");
+            for row in stored {
+                assert_eq!(
+                    row,
+                    vec![supplied.map(str::to_owned)],
+                    "{table} row of {run}"
+                );
+            }
+        }
     }
 }

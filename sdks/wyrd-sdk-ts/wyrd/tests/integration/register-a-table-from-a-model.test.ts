@@ -205,6 +205,8 @@ test("table configuration preserves versions and values", async ({ server }) => 
   for (const version of [0n, -1n, 2n ** 63n]) {
     await expect(edit(version)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
   }
-  await expect(edit(2n ** 53n + 1n)).rejects.toMatchObject({ code: "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT" });
+  for (const version of [2n ** 53n + 1n, 2n ** 63n - 1n]) {
+    await expect(edit(version)).rejects.toMatchObject({ code: "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT" });
+  }
   await expect(scored.describeTable("vala.datasets", "scored")).resolves.toEqual(cleared);
 });

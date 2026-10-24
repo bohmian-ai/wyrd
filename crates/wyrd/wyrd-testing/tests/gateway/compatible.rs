@@ -209,6 +209,11 @@ async fn openai_compatible_streams_terminate_and_survive_a_capture_outage() {
 /// accepted subject UID and descriptors, Run, and account, and a new call
 /// about either deleted Card is refused.
 ///
+/// Two failover calls from different origins, the signed Service and the
+/// rootless caller, each make two attempts; every attempt span, and the
+/// streamed call's, keeps exactly its call's workload, subject, Run,
+/// environment, request, and account, in its call's one trace.
+///
 /// # Panics
 ///
 /// Panics when a status, refusal, captured row, deletion, or upstream
@@ -679,6 +684,111 @@ async fn configured_gateway_headers_are_authorized_and_captured() {
             openai_code,
         )
         .await;
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/first/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(
+            json!({"error": {"message": "upstream busy", "type": "server_error"}}),
+        ))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&journey.upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/second/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()))
+        .mount(&journey.upstream)
+        .await;
+    for (name, prefix) in [("acme-first", "/first"), ("acme-second", "/second")] {
+        journey
+            .put(
+                &format!("provider-deployments/{name}"),
+                json!({"name": name, "auth": "none", "capabilities": ["chat_completions"],
+                       "adapter": {"openai_compatible": {
+                           "base_url": format!("{}{prefix}/v1", journey.upstream.uri())}}}),
+            )
+            .await;
+    }
+    journey
+        .put(
+            "fallback-policy",
+            json!({"rules": [{"scope": {"model": {"model": {"deployment": "acme-first", "model": "m"}}},
+                              "candidates": [{"deployment": "acme-second", "model": "m"}]}]}),
+        )
+        .await;
+    let failover = json!({"model": "acme-first/m", "messages": [{"role": "user", "content": "hi"}]});
+    let mut unowned = rootless(&service, "attempt-run-b");
+    unowned.push(("x-wyrd-deployment-environment", "staging".to_owned()));
+    for headers in [
+        openai(&[
+            ("wyrd-card-uid", &agent),
+            ("wyrd-run-id", "attempt-run-a"),
+            ("x-wyrd-deployment-environment", "prod"),
+        ]),
+        unowned,
+    ] {
+        let answer = journey
+            .post("/v1/chat/completions", &headers, &failover)
+            .await;
+        assert_eq!(answer.status().as_u16(), 200, "the sibling answers");
+    }
+    journey.drain_calls().await;
+    let origin = "CAST(wyrd_request_id AS VARCHAR) AS request, \
+                  CAST(workload_card_uid AS VARCHAR) AS workload, \
+                  CAST(subject_card_uid AS VARCHAR) AS subject, run_id, deployment_environment, \
+                  CAST(sub_principal_id AS VARCHAR) AS sub, CAST(act_principal_id AS VARCHAR) AS act";
+    let attempted = "run_id IN ('agent-run', 'attempt-run-a', 'attempt-run-b')";
+    let origin_of = |row: &Value| {
+        ["request", "workload", "subject", "run_id", "deployment_environment", "sub", "act"]
+            .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
+    };
+    let calls: std::collections::BTreeMap<String, [Value; 7]> = journey
+        .captured_json(
+            &inspector,
+            &format!("SELECT {origin} FROM bifrost.gateway.calls WHERE {attempted}"),
+            3,
+        )
+        .await
+        .iter()
+        .map(|call| (call["run_id"].as_str().expect("run").to_owned(), origin_of(call)))
+        .collect();
+    assert_eq!(calls["attempt-run-a"][1], json!(service));
+    assert_eq!(calls["attempt-run-b"][1], Value::Null);
+    assert_ne!(
+        calls["attempt-run-a"][5], calls["attempt-run-b"][5],
+        "the two origins are different accounts"
+    );
+    let spans = journey
+        .captured_json(
+            &inspector,
+            &format!(
+                "SELECT {origin}, trace_id, span_id, name FROM bifrost.traces.spans \
+                 WHERE {attempted} ORDER BY start_time_unix_nano"
+            ),
+            5,
+        )
+        .await;
+    for (run, attempts) in [("agent-run", 1), ("attempt-run-a", 2), ("attempt-run-b", 2)] {
+        let own = spans
+            .iter()
+            .filter(|span| span["run_id"] == json!(run))
+            .collect::<Vec<_>>();
+        assert_eq!(own.len(), attempts, "{run} keeps one span per attempt");
+        for span in &own {
+            assert_eq!(
+                origin_of(span),
+                calls[run],
+                "each attempt keeps its call's accepted origin and request"
+            );
+            assert_eq!(span["trace_id"], own[0]["trace_id"], "one trace per call");
+            assert_eq!(span["name"], json!("chat"), "the GenAI operation is exact");
+        }
+        let ids = own
+            .iter()
+            .map(|span| span["span_id"].as_str().expect("span id"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), attempts, "each attempt has its own span");
     }
 }
 

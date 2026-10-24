@@ -40,7 +40,9 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::vala::{DEPLOYMENT_ENVIRONMENT, RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID};
+use wyrd_spec::vala::{
+    DEPLOYMENT_ENVIRONMENT, RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID, WYRD_REQUEST_ID,
+};
 use wyrd_storage::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 use wyrd_tonic::otlp::common::v1::any_value::Value as AnyValueKind;
@@ -431,14 +433,25 @@ impl CallCapture {
     /// standard GenAI operation, provider, and request-model attributes.
     /// Returns `None` when no capture made an attempt.
     ///
+    /// Every attempt also carries its call's admitted [`GatewayCallContext`]
+    /// and request, as [`Self::calls_batch`] does: the canonical
+    /// `deployment_environment` and the projection's `subject_card_uid` and
+    /// `run_id` correlation columns hold the call's, and `workload_card_uid`
+    /// and `wyrd_request_id` follow them, so Scribe stamps each attempt with
+    /// the same accepted origin as its call. The gateway resource labels stay
+    /// as projected.
+    ///
     /// # Errors
     ///
     /// Returns [`CaptureDrop::Projection`] when the canonical projection fails
     /// or rejects any span, so every span of the batch lands or none does.
     pub(crate) fn spans_batch(captures: &[&Self]) -> Result<Option<RecordBatch>, CaptureDrop> {
         let mut spans = Vec::new();
+        let mut attempts = Vec::new();
         for capture in captures {
-            spans.extend(capture.otlp_spans()?);
+            let projected = capture.otlp_spans()?;
+            attempts.extend(std::iter::repeat_n(*capture, projected.len()));
+            spans.extend(projected);
         }
         if spans.is_empty() {
             return Ok(None);
@@ -461,9 +474,45 @@ impl CallCapture {
             }],
             ..Default::default()
         };
-        project_spans(&resource)
+        let projected = project_spans(&resource).ok_or(CaptureDrop::Projection)?;
+        let context = |pick: fn(&GatewayCallContext) -> Option<&str>| -> ArrayRef {
+            Arc::new(StringArray::from_iter(
+                attempts
+                    .iter()
+                    .map(|capture| capture.subject.as_ref().and_then(pick)),
+            ))
+        };
+        let schema = projected.schema();
+        let mut fields = schema.fields().to_vec();
+        let mut columns = projected.columns().to_vec();
+        for (name, column) in [
+            (
+                DEPLOYMENT_ENVIRONMENT,
+                context(|context| context.deployment_environment.as_deref()),
+            ),
+            (
+                SUBJECT_CARD_UID,
+                context(|context| context.subject_card_uid.as_ref().map(CardUid::as_str)),
+            ),
+            (
+                RUN_ID,
+                context(|context| context.run_id.as_ref().map(RunId::as_str)),
+            ),
+        ] {
+            let index = schema.index_of(name).map_err(|_| CaptureDrop::Projection)?;
+            columns[index] = column;
+        }
+        fields.push(Arc::new(Field::new(WORKLOAD_CARD_UID, DataType::Utf8, true)));
+        columns.push(context(|context| {
+            context.workload_card_uid.as_ref().map(CardUid::as_str)
+        }));
+        fields.push(Arc::new(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false)));
+        columns.push(Arc::new(StringArray::from_iter_values(
+            attempts.iter().map(|capture| capture.request_id()),
+        )));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map(Some)
-            .ok_or(CaptureDrop::Projection)
+            .map_err(|_| CaptureDrop::Projection)
     }
 
     /// Projects the captures of `group`, each with its slice position, into

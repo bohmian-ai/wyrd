@@ -606,7 +606,12 @@ fn decode_rows(
         None => rows,
     };
     if let Some(definition) = context.definition {
-        enforce_builtin_source_contract(rows, definition, trusted)?;
+        enforce_builtin_source_contract(
+            rows,
+            definition,
+            trusted,
+            context.attribution == StampedAttribution::Rows,
+        )?;
         if matches!(context.attribution, StampedAttribution::Frame(_))
             && (definition.canonical_fields)().is_none()
         {
@@ -941,6 +946,13 @@ fn enforce_dynamic_variants(
 /// were built; for them the reserved-column refusal still runs but the value
 /// validator does not walk the batch a second time.
 ///
+/// `carried` marks a row-attributed frame, whose producer accepted each row's
+/// origin: its `wyrd_request_id` is that row's admitting request, and on a
+/// canonical signal its `deployment_environment` is that request's accepted
+/// environment rather than a resource promotion, so the validator judges
+/// every other field against the environment the resource derives. A public
+/// frame supplies neither.
+///
 /// # Errors
 ///
 /// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column,
@@ -951,24 +963,60 @@ fn enforce_builtin_source_contract(
     rows: &RecordBatch,
     definition: &'static crate::tables::BuiltinTableDefinition,
     trusted: bool,
+    carried: bool,
 ) -> Result<(), ScribeError> {
     let canonical = (definition.canonical_fields)().is_some();
     let schema = rows.schema();
     if canonical
-        && schema
-            .fields()
-            .iter()
-            .any(|field| field.name().starts_with("wyrd_"))
+        && schema.fields().iter().any(|field| {
+            field.name().starts_with("wyrd_") && !(carried && field.name() == WYRD_REQUEST_ID)
+        })
     {
         return Err(ScribeError::InvalidFrame);
     }
     if trusted {
         return Ok(());
     }
-    let user = RecordBatch::try_new(Arc::new(Schema::new(user_fields(rows))), user_columns(rows))
+    let fields = user_fields(rows);
+    let mut columns = user_columns(rows);
+    if carried
+        && canonical
+        && let Some(environment) = fields
+            .iter()
+            .position(|field| field.name() == DEPLOYMENT_ENVIRONMENT)
+    {
+        columns[environment] = resource_environment(rows).map_err(ScribeError::ContractViolation)?;
+    }
+    let user = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|_| ScribeError::InvalidFrame)?;
     (definition.canonical_validator)(&user).map_err(ScribeError::ContractViolation)?;
     Ok(())
+}
+
+/// The `deployment_environment` each row of a canonical signal batch derives
+/// from its `resource_attributes`, as the signal's projection promotes it.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] when the batch has no
+/// `resource_attributes` column, and the
+/// [`crate::tables::signal::stored_attributes`] refusal of a row whose
+/// attributes cannot be read.
+fn resource_environment(rows: &RecordBatch) -> Result<ArrayRef, BifrostError> {
+    use crate::tables::signal::{ResourcePromotions, stored_attributes, utf8_opt_column};
+
+    let column = rows
+        .column_by_name("resource_attributes")
+        .ok_or_else(|| BifrostError::SchemaParse {
+            detail: "canonical batch is missing column resource_attributes".to_owned(),
+        })?;
+    let environments = (0..rows.num_rows())
+        .map(|row| {
+            stored_attributes(column.as_ref(), row)
+                .map(|set| ResourcePromotions::extract(&set).deployment_environment)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(utf8_opt_column(&environments))
 }
 
 /// Refuses a public non-signal built-in batch that supplies a shared
@@ -3203,6 +3251,103 @@ mod tests {
             decode_rows(&rows("not-a-principal"), &context, false),
             Err(ScribeError::InvalidFrame)
         ));
+    }
+
+    /// A row-attributed canonical span decodes with its producer's accepted
+    /// environment and request, while a public frame supplying either is
+    /// refused: a forged environment as a contract violation and a request as
+    /// a reserved column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the span fixture does not project, or a decode outcome or
+    /// carried value differs.
+    #[test]
+    fn row_attributed_spans_carry_their_accepted_environment_and_request() {
+        use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let definition =
+            crate::tables::builtin_table("traces", "spans").expect("spans is built in");
+        let resource = ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![1; 16],
+                    span_id: vec![2; 8],
+                    name: "chat".to_owned(),
+                    start_time_unix_nano: 1,
+                    end_time_unix_nano: 2,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        };
+        let (projected, _) =
+            crate::tables::traces::project_resource_spans(&[resource], None, usize::MAX)
+                .expect("the span projects");
+        let with = |carried: &[(&str, &str)]| {
+            let schema = projected.schema();
+            let mut fields: Vec<Field> =
+                schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+            let mut columns = projected.columns().to_vec();
+            for (name, value) in carried {
+                let column = Arc::new(StringArray::from(vec![*value])) as ArrayRef;
+                if let Ok(index) = schema.index_of(name) {
+                    columns[index] = column;
+                } else {
+                    fields.push(Field::new(*name, DataType::Utf8, false));
+                    columns.push(column);
+                }
+            }
+            batch(fields, columns)
+        };
+        let request = RequestId::now_v7();
+        let pair = PrincipalId::new(Uuid::now_v7()).to_string();
+        let principal = principal();
+        let frame_request = RequestId::now_v7();
+        let mut context = stamping_context(&principal, None, &frame_request);
+        context.definition = Some(definition);
+        context.expected_schema_fingerprint =
+            Some(SchemaFingerprint((definition.schema_fingerprint)()));
+        context.attribution = StampedAttribution::Rows;
+        let stamped = decode_rows(
+            &with(&[
+                (DEPLOYMENT_ENVIRONMENT, "prod"),
+                (WYRD_REQUEST_ID, request.as_str()),
+                (SUB_PRINCIPAL_ID, &pair),
+                (ACT_PRINCIPAL_ID, &pair),
+            ]),
+            &context,
+            false,
+        )
+        .expect("an accepted origin decodes");
+        let text = |name: &str| {
+            stamped
+                .column_by_name(name)
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .expect("the column is Utf8")
+                .value(0)
+                .to_owned()
+        };
+        assert_eq!(text(DEPLOYMENT_ENVIRONMENT), "prod");
+        assert_eq!(text(WYRD_REQUEST_ID), request.as_str());
+
+        context.attribution = Attribution::direct(principal.id).into();
+        let forged = decode_rows(&with(&[(DEPLOYMENT_ENVIRONMENT, "prod")]), &context, false);
+        assert!(
+            matches!(
+                forged,
+                Err(ScribeError::ContractViolation(BifrostError::SchemaParse { .. }))
+            ),
+            "a public environment must derive from the resource: {forged:?}"
+        );
+        assert!(
+            matches!(
+                decode_rows(&with(&[(WYRD_REQUEST_ID, request.as_str())]), &context, false),
+                Err(ScribeError::InvalidFrame)
+            ),
+            "a public frame never supplies its request"
+        );
     }
 
     #[test]

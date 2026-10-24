@@ -1081,7 +1081,8 @@ impl Chunk {
     ///
     /// A gateway call row also carries its admitting request as content, so
     /// that request is appended as the row's `wyrd_request_id`, the key that
-    /// joins the call to its audit decisions; every other row takes the
+    /// joins the call to its audit decisions. A gateway attempt span arrives
+    /// already carrying its call's request; every other row takes the
     /// frame's request.
     ///
     /// # Errors

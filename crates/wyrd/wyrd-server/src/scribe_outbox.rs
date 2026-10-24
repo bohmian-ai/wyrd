@@ -501,6 +501,7 @@ impl ScribeBatch {
             attributed_cards: Some(native_card_uids(&self.ipc)).filter(|uids| !uids.is_empty()),
             dimensions,
             attribution: StampedAttribution::Rows,
+            workload: None,
             principal: Principal::new(
                 PLATFORM_AUDIT_PRINCIPAL,
                 PrincipalKind::User,

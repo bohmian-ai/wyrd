@@ -989,10 +989,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             auth.tenant,
             auth.attribution(),
             [
-                auth.principal
-                    .workload_uid
-                    .as_ref()
-                    .map(wyrd_spec::ids::CardUid::as_str),
+                auth.workload().map(wyrd_spec::ids::CardUid::as_str),
                 auth.deployment_environment.as_deref(),
             ],
             &table,
@@ -1013,6 +1010,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
                 attribution: auth.attribution().into(),
+                workload: auth.workload().cloned(),
                 authenticated_tenant: auth.tenant,
                 attributed_cards,
                 dimensions,
@@ -1101,6 +1099,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
             attribution: auth.attribution().into(),
+            workload: auth.workload().cloned(),
             authenticated_tenant: auth.tenant,
             attributed_cards,
             dimensions,

@@ -211,6 +211,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             attributed_cards: None,
             dimensions: None,
             authenticated_tenant: tenant,
+            workload: principal.workload_uid.clone(),
             attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             principal,
             table,

@@ -19,13 +19,15 @@ use std::sync::Arc;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_verify::{TokenAudience, TokenVerifier, VerifiedToken};
-use wyrd_runtime::{DelegationStep, Principal, delegated_attribution, needs_root_resolution};
+use wyrd_runtime::{
+    DelegationStep, Principal, delegated_attribution, needs_root_resolution, owning_root,
+};
 use wyrd_spec::auth::{
     Attribution, DEPLOYMENT_ENVIRONMENT_HEADER, WORKLOAD_UID_HEADER,
     deployment_environment_selector, workload_uid_selector,
 };
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::ids::{CardUid, DataTenantId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::metadata::MetadataMap;
 
@@ -105,6 +107,18 @@ impl AuthContext {
     #[must_use]
     pub fn attribution(&self) -> Attribution {
         delegated_attribution(&self.principal, &self.delegation_chain)
+    }
+
+    /// The exact Service release that owns this request's accepted work.
+    ///
+    /// The one execution-owner selection for public ingest: the current
+    /// delegated actor's root, or the principal's own for direct work, by
+    /// [`wyrd_runtime::owning_root`]. Batch identity, descriptors, and the
+    /// stamped `workload_card_uid` all take it from here, so none rereads the
+    /// subject principal's root; `None` for rootless work.
+    #[must_use]
+    pub fn workload(&self) -> Option<&CardUid> {
+        owning_root(&self.principal, &self.delegation_chain)
     }
 }
 

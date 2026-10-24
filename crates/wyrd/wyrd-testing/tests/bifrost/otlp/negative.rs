@@ -325,7 +325,11 @@ mod pg_tests {
     use arrow::record_batch::RecordBatch;
     use reqwest::StatusCode;
     use wyrd_runtime::Permission;
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::auth::TokenAudience;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, CardUid};
+    use wyrd_spec::reference::CardRef;
     use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
     use wyrd_tonic::otlp::metrics_service::{
         ExportMetricsServiceRequest, ExportMetricsServiceResponse,
@@ -798,6 +802,161 @@ mod pg_tests {
                 markers,
                 SPAN_MARKERS.map(str::to_owned).to_vec(),
                 "{attribution:?} stores every accepted sibling exactly once"
+            );
+        }
+
+        journey.shutdown().await;
+    }
+
+    /// A delegated export is owned by the current actor's exact root.
+    ///
+    /// One actor Service account runs two registered releases of its Card and
+    /// receives delegation from a Service subject rooted at its own, different
+    /// Card and from the journey's rootless User. Each delegation exports the
+    /// same spans over gRPC and OTLP/HTTP. Every delegation must store its own
+    /// row set, exactly once, owned by the actor's selected release
+    /// (`workload_card_uid` and its canonical Service name and version), never
+    /// by the subject's root and never left unowned, while the account pair
+    /// keeps naming the subject and the actor.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture cannot be provisioned, a delegation or export is
+    /// refused, or the stored ownership, pair, or row counts differ.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn delegated_exports_are_owned_by_the_current_actors_root() {
+        let journey = OtlpJourney::start().await;
+        let anchor = support::anchor_nanos();
+        let server = journey.server();
+        let role = "otlp_owner_writer";
+        server
+            .seed_role(role, &[Permission::bifrost_record_write()])
+            .await
+            .expect("the writer role is seeded");
+        let subject = server
+            .bootstrap_service("otlp-owner-subject", &[role])
+            .await
+            .expect("the subject Service registers");
+        let subject_token = server
+            .exchange_rooted(&subject)
+            .await
+            .expect("the subject selects its own Card as root");
+        let releases = ["1.0.0", "2.0.0"].map(|version| CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("otlp-owner-actor").expect("a valid Card name"),
+            version: VersionBlock::parse(version).expect("a valid version"),
+            uid: Some(CardUid::new(uuid::Uuid::now_v7().to_string()).expect("a UUIDv7 Card UID")),
+        });
+        for release in &releases {
+            server
+                .seed_card_principal(release, &[role])
+                .await
+                .expect("the actor release registers");
+        }
+        let actor = server
+            .credential_registered_service(&releases[0], &[])
+            .await
+            .expect("the actor family account is credentialed");
+        let actor_key = actor.api_key().expect("the actor carries an API key");
+        let mut rooted = Vec::new();
+        for release in &releases {
+            let root = release.uid.clone().expect("a seeded release has a UID");
+            let token = server
+                .exchange_api_key_for_workload(actor_key, &root)
+                .await
+                .expect("one actor account selects either release");
+            rooted.push((root, release.version.to_string(), token));
+        }
+
+        let subject_id = subject.id().to_string();
+        let mut expected = BTreeSet::new();
+        for (delegator, (root, version, actor_token)) in [
+            (subject_token.as_str(), &rooted[0]),
+            (subject_token.as_str(), &rooted[1]),
+            (journey.token(), &rooted[0]),
+        ] {
+            let delegated = server
+                .delegate(delegator, actor_token, TokenAudience::Wyrd)
+                .await
+                .expect("the subject delegates to the actor release");
+            for _ in 0..2 {
+                export_traces_over_grpc_as(
+                    &journey,
+                    &delegated,
+                    negative_resource_spans(anchor, &[]),
+                )
+                .await;
+            }
+            let (status, body) = post_otlp_raw(
+                &journey,
+                "/v1/traces",
+                HttpEncoding::Protobuf,
+                HttpEncoding::Protobuf.encode(&ExportTraceServiceRequest {
+                    resource_spans: negative_resource_spans(anchor, &[]),
+                }),
+                Some(&delegated),
+            )
+            .await;
+            assert!(
+                status.is_success(),
+                "the delegated HTTP export is accepted ({status}): {}",
+                String::from_utf8_lossy(&body)
+            );
+            expected.insert((
+                delegator == subject_token,
+                root.to_string(),
+                version.clone(),
+            ));
+        }
+
+        journey.publish().await;
+        let rows = journey
+            .query(&format!(
+                "SELECT trace_state, sub_principal_id, act_principal_id, workload_card_uid, \
+                 service_name, service_version \
+                 FROM {SPANS_TABLE} WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}'"
+            ))
+            .await;
+        let mut owned: BTreeMap<(bool, String, String), Vec<String>> = BTreeMap::new();
+        for batch in &rows {
+            let text = |name: &str, index: usize| {
+                let column = support::column::<StringArray>(batch, name);
+                (!column.is_null(index)).then(|| column.value(index).to_owned())
+            };
+            for index in 0..batch.num_rows() {
+                assert_eq!(
+                    text("act_principal_id", index),
+                    Some(actor.id().to_string()),
+                    "the actor account is the stamped actor"
+                );
+                assert_eq!(
+                    text("service_name", index).as_deref(),
+                    Some("otlp-owner-actor"),
+                    "the actor's release, not the resource or the subject, names the Service"
+                );
+                let workload = text("workload_card_uid", index).expect("a delegated row is owned");
+                owned
+                    .entry((
+                        text("sub_principal_id", index) == Some(subject_id.clone()),
+                        workload,
+                        text("service_version", index).expect("a release version"),
+                    ))
+                    .or_default()
+                    .push(text("trace_state", index).expect("a marker"));
+            }
+        }
+        assert_eq!(
+            owned.keys().cloned().collect::<BTreeSet<_>>(),
+            expected,
+            "each delegation is owned by the actor release it selected"
+        );
+        for (ownership, mut markers) in owned {
+            markers.sort();
+            assert_eq!(
+                markers,
+                SPAN_MARKERS.map(str::to_owned).to_vec(),
+                "{ownership:?} stores every span exactly once"
             );
         }
 

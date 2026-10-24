@@ -725,7 +725,7 @@ impl ScribeImpl {
                         .attributed_cards
                         .or_else(|| frame.principal.card_scope().map(<[_]>::to_vec)),
                     attribution: frame.attribution,
-                    workload: frame.principal.workload_uid.clone(),
+                    workload: frame.workload,
                     dimensions: frame.dimensions,
                     expected_schema_fingerprint,
                     request_id: frame.request_id,
@@ -1136,6 +1136,7 @@ fn unclaimed_retry(frame: &ScribeIngressFrame) -> ScribeIngressFrame {
     ScribeIngressFrame {
         principal: frame.principal.clone(),
         attribution: frame.attribution,
+        workload: frame.workload.clone(),
         authenticated_tenant: frame.authenticated_tenant,
         attributed_cards: frame.attributed_cards.clone(),
         dimensions: frame.dimensions.clone(),
@@ -1452,6 +1453,7 @@ mod tests {
             attributed_cards: None,
             dimensions: None,
             authenticated_tenant: tenant,
+            workload: principal.workload_uid.clone(),
             attribution: Attribution::direct(principal.id).into(),
             principal: principal.clone(),
             table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),

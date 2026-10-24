@@ -72,7 +72,8 @@ impl CardRegistry {
 
     /// Resolves the shared-dimension context of one public frame.
     ///
-    /// The validated workload Service and every Card in `subjects` are
+    /// The accepted workload Service ([`AuthContext::workload`]) and every
+    /// Card in `subjects` are
     /// described from the tenant registry, each distinct UID read at most
     /// once per process; the request environment is carried unchanged. A UID
     /// the registry does not hold is left out, so a row naming it as subject
@@ -87,7 +88,7 @@ impl CardRegistry {
         auth: &AuthContext,
         subjects: &[CardUid],
     ) -> Result<FrameDimensions, IngestError> {
-        let workload = auth.principal.workload_uid.as_ref();
+        let workload = auth.workload();
         Ok(FrameDimensions {
             environment: auth.deployment_environment.clone(),
             cards: self

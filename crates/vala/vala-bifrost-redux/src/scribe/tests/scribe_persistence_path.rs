@@ -333,6 +333,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
         ScribeIngressFrame {
             attributed_cards: None,
             dimensions: None,
+            workload: principal.workload_uid.clone(),
             attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             authenticated_tenant: tenant,
             principal,
@@ -440,6 +441,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         ScribeIngressFrame {
             attributed_cards: None,
             dimensions: None,
+            workload: principal.workload_uid.clone(),
             attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             authenticated_tenant: tenant,
             principal,
@@ -568,6 +570,7 @@ async fn append_one(
         ScribeIngressFrame {
             attributed_cards: None,
             dimensions: None,
+            workload: principal.workload_uid.clone(),
             attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             authenticated_tenant: tenant,
             principal,
@@ -743,6 +746,7 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
         ScribeIngressFrame {
             attributed_cards: None,
             dimensions: None,
+            workload: principal.workload_uid.clone(),
             attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             authenticated_tenant: tenant,
             principal,
@@ -837,6 +841,7 @@ mod pg_tests {
             ScribeIngressFrame {
                 attributed_cards: None,
                 dimensions: None,
+                workload: principal.workload_uid.clone(),
                 attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
                 authenticated_tenant: tenant,
                 principal,

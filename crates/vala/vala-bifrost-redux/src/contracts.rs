@@ -95,6 +95,14 @@ pub struct ScribeIngressFrame {
     /// never from its transport identity. No client row or header value can
     /// set it.
     pub attribution: StampedAttribution,
+    /// The accepted Service release a [`StampedAttribution::Frame`] write
+    /// stamps as every row's `workload_card_uid`.
+    ///
+    /// Gate selects it once from the verified token's current actor, so
+    /// Scribe never rereads [`Self::principal`] for it. A
+    /// [`StampedAttribution::Rows`] frame leaves it `None`: each row carries
+    /// its own accepted workload.
+    pub workload: Option<wyrd_spec::ids::CardUid>,
     /// Authenticated tenant selected by the transport boundary.
     pub authenticated_tenant: wyrd_spec::DataTenantId,
     /// Card UIDs the frame's rows may correlate to, when the principal's

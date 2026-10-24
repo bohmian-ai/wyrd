@@ -1,14 +1,13 @@
 ---
 id: SPEC-benchmark-experiments
 revision: 3
-status: draft
+status: approved
 ---
 
 # Benchmarks as experiments
 
-Draft awaiting maintainer approval. The maintainer's supplied intent is fixed;
-this revision proposes its precise behavioral and persisted contracts. It does
-not authorize implementation, tasks, benchmark execution, staging, or commits.
+Approved by the maintainer at revision 3. This revision fixes the behavioral
+and persisted contracts that implementation tasks follow.
 
 ## Problem, proposed change, and value
 
@@ -56,12 +55,9 @@ than server work. These alternatives are rejected.
 
 This packet owns benchmark structure, recording, measurement definitions,
 criteria, and command levels across `bifrost`, `verification`, and `gateway`.
-It replaces conflicting benchmark-harness and criteria provisions in the older
-[draft optimization packet](../opitimization-and-benchmarks/spec.md), including
-its instruction to delete capacity coverage. That packet's optimization goals
-and possible future ClickBench work are not implemented here. Its architecture
-waiver, cache-dropping procedure, output format, and host-envelope proposals do
-not apply to this change. Repository architecture remains authoritative.
+Capacity coverage is kept and rebuilt, not deleted. Engine optimization and
+ClickBench reproduction are not part of this change. Repository architecture
+remains authoritative.
 
 “Experiment” here means a repository performance experiment, not a new Card
 kind or a requirement to register an Experiment Card. There is no new server,
@@ -560,11 +556,10 @@ fallback entries. No missing Verification or Gateway baseline is invented.
 Remaining D-3 question: can contemporaneous clean-source/build evidence be
 recovered for these primary reports? Until then they are excluded.
 
-Approval requested: revision 3 as a whole, including the selected baseline
-values and eligibility statuses incorporated from the research mapping, and
-its explicit provenance exclusions.
-Status remains **draft awaiting maintainer approval**. No implementation or
-benchmark execution is authorized by this revision.
+The maintainer approved revision 3 as a whole, including the selected
+baseline values and eligibility statuses incorporated from the research
+mapping, and its explicit provenance exclusions. The D-3 primary reports stay
+excluded unless clean-source evidence is recovered.
 
 ## Revision history and authority
 
@@ -583,6 +578,8 @@ benchmark execution is authorized by this revision.
   samply diagnostics, explicit Linux-only retirement, advisory cross-OS
   comparison and three-platform L1 proof. Whole-spec status remains draft;
   the existing D-3 evidence gap is unchanged. No code or benchmarks changed/run.
+  Approved by the maintainer as a whole on 2026-10-23; the older optimization
+  draft packet was deleted.
 
 Authority: [AGENTS.md](../../../AGENTS.md),
 [spec-driven development](../../spec-driven-development.md),

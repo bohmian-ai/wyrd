@@ -158,6 +158,42 @@ def _description(wire: Any) -> TableDescription:
     return cast("TableDescription", wire)
 
 
+def _alter_json(
+    expected_table_version: int,
+    partition_by: list[PartitionField] | None,
+    sort_keys: list[SortKey] | None,
+    bloom_columns: list[str] | None,
+    add_columns: list[FieldSpec] | None,
+    rename_columns: Mapping[str, str] | None,
+) -> str:
+    """Assemble one table edit for the native edge.
+
+    ``None`` omits a field, so the server keeps that part of the definition;
+    a supplied list, even an empty one, replaces it. The version travels as
+    the canonical decimal string the wire requires.
+    """
+
+    layout = {
+        key: value
+        for key, value in (
+            ("partition_by", partition_by),
+            ("sort_keys", sort_keys),
+            ("bloom_columns", bloom_columns),
+        )
+        if value is not None
+    }
+    request: dict[str, Any] = {"expected_table_version": str(expected_table_version)}
+    if layout:
+        request["physical_layout"] = layout
+    if add_columns is not None:
+        request["add_columns"] = add_columns
+    if rename_columns is not None:
+        request["rename_columns"] = [
+            {"from": old, "to": new} for old, new in rename_columns.items()
+        ]
+    return json.dumps(request)
+
+
 def _row_json(row: Any) -> str:
     """Serialize one row the three ways a caller supplies it.
 
@@ -1046,6 +1082,57 @@ class Bifrost(_BifrostBase):
 
         return _description(self._native.describe_table(namespace, name))
 
+    def alter_table(
+        self,
+        namespace: str,
+        name: str,
+        *,
+        expected_table_version: int,
+        partition_by: list[PartitionField] | None = None,
+        sort_keys: list[SortKey] | None = None,
+        bloom_columns: list[str] | None = None,
+        add_columns: list[FieldSpec] | None = None,
+        rename_columns: Mapping[str, str] | None = None,
+    ) -> TableDescription:
+        """Alter the registered ``namespace.name`` table at its described version.
+
+        The server validates the whole edited definition and commits it once
+        at the next table version. An omitted argument keeps that part of the
+        definition; a supplied list, including an empty one, replaces it.
+
+        Args:
+            namespace: the table namespace.
+            name: the table name.
+            expected_table_version: the ``table_version`` last described.
+            partition_by: the complete new partition list.
+            sort_keys: the complete new sort order.
+            bloom_columns: the complete new Bloom column set.
+            add_columns: nullable top-level custom columns to append.
+            rename_columns: top-level custom columns to rename, old name to
+                new; each keeps its values.
+
+        Returns:
+            The committed description at its new version.
+
+        Raises:
+            WyrdError: ``WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT`` for a
+                superseded version, ``WYRD_VALA_400_BIFROST_INVALID_TABLE_EDIT``
+                or ``WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT`` for a
+                refused edit, or an authorization, not-found, or transport
+                failure. A refused edit changes nothing.
+
+        """
+
+        request = _alter_json(
+            expected_table_version,
+            partition_by,
+            sort_keys,
+            bloom_columns,
+            add_columns,
+            rename_columns,
+        )
+        return _description(self._native.alter_table(namespace, name, request))
+
 
 class AsyncBifrost(_BifrostBase):
     """The ``await`` surface over the same native client.
@@ -1303,6 +1390,49 @@ class AsyncBifrost(_BifrostBase):
         """
 
         return _description(await asyncio.to_thread(self._native.describe_table, namespace, name))
+
+    async def alter_table(
+        self,
+        namespace: str,
+        name: str,
+        *,
+        expected_table_version: int,
+        partition_by: list[PartitionField] | None = None,
+        sort_keys: list[SortKey] | None = None,
+        bloom_columns: list[str] | None = None,
+        add_columns: list[FieldSpec] | None = None,
+        rename_columns: Mapping[str, str] | None = None,
+    ) -> TableDescription:
+        """Alter the registered ``namespace.name`` table at its described version.
+
+        Args:
+            namespace: the table namespace.
+            name: the table name.
+            expected_table_version: the ``table_version`` last described.
+            partition_by: the complete new partition list.
+            sort_keys: the complete new sort order.
+            bloom_columns: the complete new Bloom column set.
+            add_columns: nullable top-level custom columns to append.
+            rename_columns: top-level custom columns to rename, old name to new.
+
+        Returns:
+            The committed description at its new version.
+
+        Raises:
+            WyrdError: As for ``Bifrost.alter_table()``.
+        """
+
+        request = _alter_json(
+            expected_table_version,
+            partition_by,
+            sort_keys,
+            bloom_columns,
+            add_columns,
+            rename_columns,
+        )
+        return _description(
+            await asyncio.to_thread(self._native.alter_table, namespace, name, request)
+        )
 
 
 class DataTypeSpecVariants(TypedDict, total=False):

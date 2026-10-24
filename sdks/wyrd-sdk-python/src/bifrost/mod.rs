@@ -34,7 +34,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, CompactionTypeWire, PhysicalLayoutWire, QueryParam, QueryTerminalFrame,
+    AlterTableRequest, BifrostQueryRequest, CompactionTypeWire, PhysicalLayoutWire, QueryParam, QueryTerminalFrame,
 };
 use wyrd_spec::vala::ids::{RunId, TraceId};
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
@@ -966,6 +966,34 @@ impl Bifrost {
         let description =
             crate::trace::block_on(py, self.handle(py)?.describe_table(namespace, name))
                 .map_err(client_error)?;
+        to_python_json(py, serde_json::to_value(description))
+    }
+
+    /// Alters one registered table's definition at its observed table version
+    /// and returns the committed description.
+    ///
+    /// `request_json` is one serialized `AlterTableRequest`; it is decoded
+    /// strictly here and every edit decision belongs to the server.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WYRD_SPEC_400_VALIDATION` when `request_json` is not one
+    /// `AlterTableRequest`, and `WyrdError` carrying the server's invalid-edit,
+    /// version-conflict, authorization, not-found, or transport code.
+    fn alter_table(
+        &self,
+        py: Python<'_>,
+        namespace: &str,
+        name: &str,
+        request_json: &str,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let request: AlterTableRequest = serde_json::from_str(request_json)
+            .map_err(|error| invalid_argument("request_json", error))?;
+        let description = crate::trace::block_on(
+            py,
+            self.handle(py)?.alter_table(namespace, name, &request),
+        )
+        .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(description))
     }
 

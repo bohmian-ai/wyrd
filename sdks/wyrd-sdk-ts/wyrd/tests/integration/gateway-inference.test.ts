@@ -404,25 +404,40 @@ test("state httpAuth supplies service and agent context", async ({ server, provi
   }
 
   server.flushBifrost();
+  const columns = [
+    "subject_card_uid",
+    "run_id",
+    "deployment_environment",
+    "workload_card_uid",
+    "service_name",
+    "service_version",
+    "subject_kind",
+    "subject_name",
+    "subject_version",
+  ];
   const calls = (
     await (
       await Bifrost.connect()
-    ).sql(
-      "SELECT subject_card_uid, run_id FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at",
-      [issued.principalId],
-    )
+    ).sql(`SELECT ${columns.join(", ")} FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at`, [
+      issued.principalId,
+    ])
   ).toArrow();
-  const runIds = columnValues(calls.getChild("run_id")) as unknown[];
-  const rows = (columnValues(calls.getChild("subject_card_uid")) as unknown[]).map((cardUid, index) => [
-    cardUid,
-    runIds[index],
-  ]);
+  const values = columns.map((name) => columnValues(calls.getChild(name)) as unknown[]);
+  const rows = (values[0] ?? []).map((_, index) => values.map((column) => column[index]));
+  const owner = [service, "configured-service", "1.0.0"];
+  const asService = [...owner, "Service", "configured-service", "1.0.0"];
+  const asAgent = [...owner, "Agent", "observed-agent", "1.0.0"];
   expect(rows.slice(0, 3)).toEqual([
-    [service, null],
-    [service, serviceRun.runId],
-    [agent, agentRun.runId],
+    [service, null, "prod", ...asService],
+    [service, serviceRun.runId, "prod", ...asService],
+    [agent, agentRun.runId, "prod", ...asAgent],
   ]);
-  expect(rows.slice(3).sort()).toEqual(concurrentRuns.map((runId) => [agent, runId]).sort());
+  expect(rows.slice(3).sort()).toEqual(
+    [
+      [agent, concurrentRuns[0], "prod", ...asAgent],
+      [agent, concurrentRuns[1], "staging", ...asAgent],
+    ].sort(),
+  );
 });
 
 /** An Agents SDK agent on the Gateway's Responses API whose `echo` tool returns content parts. */

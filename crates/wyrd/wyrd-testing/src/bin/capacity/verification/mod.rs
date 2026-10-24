@@ -443,6 +443,11 @@ fn competing(
     ));
     base.metrics.extend([
         Metric::raw(
+            "verifications_after_window",
+            "verifications",
+            "calls in flight at the window end, acknowledged after it and outside every work-per-CPU metric",
+        ),
+        Metric::raw(
             "drain_seconds",
             "s",
             "load stopping until the verification queue and the Scribe and Verifier submission outboxes are empty",

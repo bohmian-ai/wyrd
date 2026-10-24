@@ -137,16 +137,21 @@ struct Measured {
     errors: BTreeMap<String, u64>,
     /// Direct judgments whose verdict was not the expected one.
     wrong: u64,
+    /// Acknowledged calls that answered at or after the window end, outside
+    /// the measured CPU; still in `latencies_us`.
+    late: u64,
 }
 
 impl Measured {
     /// Records one call acknowledged after `latency_us` with a right or wrong
-    /// verdict, or refused with its error.
-    fn record(&mut self, latency_us: u64, outcome: Result<bool, WyrdError>) {
+    /// verdict, `late` when it answered after the window end, or refused with
+    /// its error.
+    fn record(&mut self, latency_us: u64, outcome: Result<bool, WyrdError>, late: bool) {
         match outcome {
             Ok(right) => {
                 self.latencies_us.push(latency_us);
                 self.wrong += u64::from(!right);
+                self.late += u64::from(late);
             }
             Err(error) => *self.errors.entry(error.code().to_owned()).or_default() += 1,
         }
@@ -156,6 +161,7 @@ impl Measured {
     fn merge(&mut self, other: Self) {
         self.latencies_us.extend(other.latencies_us);
         self.wrong += other.wrong;
+        self.late += other.late;
         for (code, count) in other.errors {
             *self.errors.entry(code).or_default() += count;
         }
@@ -548,16 +554,14 @@ impl Bench {
             ),
         );
         repetition.set("errors", Reading::count(errors));
-        repetition.set(
-            "verifications",
-            Reading::count(
-                tallies
-                    .iter()
-                    .flatten()
-                    .map(|tally| tally.latencies_us.len() as u64)
-                    .sum(),
-            ),
-        );
+        let late: u64 = tallies.iter().flatten().map(|tally| tally.late).sum();
+        let acknowledged: u64 = tallies
+            .iter()
+            .flatten()
+            .map(|tally| tally.latencies_us.len() as u64)
+            .sum();
+        repetition.set("verifications", Reading::count(acknowledged - late));
+        repetition.set("verifications_after_window", Reading::count(late));
         repetition.set(
             "capacity.backlog_growth_seconds",
             schedule.backlog_seconds(observed.backlog[0] - backlog_start),
@@ -604,7 +608,7 @@ impl Workload for Bench {
             }
             let sent = Instant::now();
             let outcome = call(state, Op::Verify, sequence).await;
-            measured.record(micros(sent), outcome);
+            measured.record(micros(sent), outcome, false);
         }
         let (usage, _) = window
             .close(server)
@@ -799,8 +803,9 @@ struct Offered {
 }
 
 /// Sends `op` arrivals at each phase's rate of `schedule` from `start`,
-/// rotating across `states`, recording each answer into its phase's tally,
-/// and waits for every sent arrival to answer.
+/// rotating across `states`, recording each answer into its phase's tally
+/// and marking one after the window end late, and waits for every sent
+/// arrival to answer.
 async fn arrivals(
     op: Op,
     schedule: Schedule,
@@ -812,6 +817,7 @@ async fn arrivals(
     let mut offered = Offered::default();
     let mut tasks = JoinSet::new();
     let slot = usize::from(op == Op::Submit);
+    let end = start + schedule.window;
     for (index, stage) in schedule.stages().into_iter().enumerate() {
         let rate = match op {
             Op::Verify => stage.direct_rate,
@@ -839,7 +845,8 @@ async fn arrivals(
             tasks.spawn(async move {
                 let called = Instant::now();
                 let outcome = call(&state, op, next).await;
-                lock(&tallies[index][slot]).record(micros(called), outcome);
+                let late = Instant::now() >= end;
+                lock(&tallies[index][slot]).record(micros(called), outcome, late);
             });
             offered.sent += 1;
         }
@@ -904,7 +911,7 @@ async fn drive(states: &[WyrdState], window: Duration) -> Measured {
                 let next = sequence.fetch_add(1, Ordering::Relaxed);
                 let sent = Instant::now();
                 let outcome = call(&state, Op::Verify, next).await;
-                measured.record(micros(sent), outcome);
+                measured.record(micros(sent), outcome, false);
             }
             measured
         });
@@ -1017,8 +1024,9 @@ mod tests {
 
     use super::{ADMISSION_REFUSAL, Measured};
 
-    /// Answers count acknowledged and refused calls, and only undeclared
-    /// refusals are unexpected.
+    /// Answers count acknowledged and refused calls, only undeclared
+    /// refusals are unexpected, and an acknowledgement after the window end
+    /// stays answered while it is counted late; merging keeps every count.
     ///
     /// # Panics
     ///
@@ -1032,6 +1040,7 @@ mod tests {
                 ("WYRD_OTHER".to_owned(), 1),
             ]),
             wrong: 1,
+            late: 0,
         };
         assert_eq!(measured.answered(), 6);
         assert_eq!(measured.unexpected(Some(ADMISSION_REFUSAL)), 1);
@@ -1040,8 +1049,13 @@ mod tests {
             latencies_us: vec![300],
             errors: BTreeMap::new(),
             wrong: 2,
+            late: 1,
         });
+        measured.record(400, Ok(true), true);
+        measured.record(50, Ok(true), false);
         assert_eq!(measured.wrong, 3);
+        assert_eq!((measured.late, measured.answered()), (2, 9));
         assert_eq!(measured.percentile(0.5).value, Some(0.2));
+        assert_eq!(measured.unexpected(None), 4);
     }
 }

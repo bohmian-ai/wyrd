@@ -517,6 +517,8 @@ fn slowest(samples: &[u64], what: &str) -> Reading {
 /// Sets every query reading: per-phase server latencies and counts, the
 /// capacity-phase point percentiles, totals, errors, and wrong answers; an
 /// answered query without its server timing invalidates the repetition.
+/// Totals credit only queries answered before the window end, the endpoint
+/// of the measured CPU; later answers are counted separately.
 fn read_queries(repetition: &mut Repetition, asked: &[Asked], phases: &Phases) {
     let phase_readings: [(&str, &dyn Fn(Instant) -> bool); 2] = [
         ("capacity", &|at| phases.capacity(at)),
@@ -552,9 +554,19 @@ fn read_queries(repetition: &mut Repetition, asked: &[Asked], phases: &Phases) {
             "{untimed} answered queries have no successful `bifrost.query` server timing"
         ));
     }
-    let answered = asked.iter().filter(|asked| asked.result.is_ok()).count();
-    repetition.set("queries", Reading::count(answered.to_u64().unwrap_or(0)));
-    let tables = latencies(asked, Case::TableAggregate, |_| true).len();
+    let (answered, late): (Vec<&Asked>, Vec<&Asked>) = asked
+        .iter()
+        .filter(|asked| asked.result.is_ok())
+        .partition(|asked| asked.at < phases.end);
+    repetition.set(
+        "queries",
+        Reading::count(answered.len().to_u64().unwrap_or(0)),
+    );
+    repetition.set(
+        "queries_after_window",
+        Reading::count(late.len().to_u64().unwrap_or(0)),
+    );
+    let tables = latencies(asked, Case::TableAggregate, |at| at < phases.end).len();
     repetition.set(
         "table_aggregates",
         Reading::count(tables.to_u64().unwrap_or(0)),
@@ -576,7 +588,10 @@ fn read_queries(repetition: &mut Repetition, asked: &[Asked], phases: &Phases) {
 /// the successful observation of every offered write, matched by trace id,
 /// that ended in the phase, the
 /// diagnostic visibility, and rows; totals; the drain; arrivals; and adds
-/// ingest failures and undeclared query refusals to `errors`.
+/// ingest failures and undeclared query refusals to `errors`. The row total
+/// credits only acknowledgements before the window end, the endpoint of the
+/// measured CPU; drain acknowledgements are counted separately and every
+/// failure stays an error.
 fn read_ingest(
     repetition: &mut Repetition,
     offered: &[Offered],
@@ -648,12 +663,15 @@ fn read_ingest(
         };
         repetition.set(&id("visibility_max_ms"), reading);
     }
-    let rows: u64 = acked
-        .iter()
-        .filter(|acked| acked.result.is_ok())
-        .map(|acked| acked.rows)
-        .sum();
-    repetition.set("ingest_rows", Reading::count(rows));
+    let rows = |late: bool| {
+        acked
+            .iter()
+            .filter(|acked| acked.result.is_ok() && (acked.at >= phases.end) == late)
+            .map(|acked| acked.rows)
+            .sum()
+    };
+    repetition.set("ingest_rows", Reading::count(rows(false)));
+    repetition.set("ingest_rows_after_window", Reading::count(rows(true)));
     let drained = offered
         .iter()
         .filter_map(|offered| offered.drained)
@@ -949,7 +967,78 @@ impl Workload for Competing {
 
 #[cfg(test)]
 mod tests {
-    use super::{Case, mixed_case};
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use wyrd_testing::capacity::Population;
+    use wyrd_testing::experiment::Repetition;
+
+    use super::{Acked, Asked, Case, Offered, Phases, mixed_case, read_ingest, read_queries};
+
+    /// Only queries and ingest rows answered before the window end, the
+    /// measured CPU's endpoint, are credited as work; later answers are
+    /// counted apart and a late failure stays an error.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a late answer is credited or lost.
+    #[test]
+    fn only_answers_before_the_window_end_are_work() {
+        let start = Instant::now();
+        let end = start + Duration::from_secs(12);
+        let phases = Phases {
+            start,
+            start_unix: 0,
+            overload: start + Duration::from_secs(5),
+            overloaded: start + Duration::from_secs(7),
+            end,
+        };
+        let early = end - Duration::from_secs(1);
+        let late = end + Duration::from_secs(1);
+        let asked = |at, case, result| Asked {
+            at,
+            case,
+            trace: String::new(),
+            result,
+            server: Some(1),
+        };
+        let asked = [
+            asked(early, Case::TableAggregate, Ok(1)),
+            asked(end, Case::TableAggregate, Ok(1)),
+            asked(late, Case::Selective, Ok(1)),
+        ];
+        let acked = |at, rows, result| Acked {
+            at,
+            rows,
+            result,
+            trace: String::new(),
+        };
+        let offered = [Offered {
+            acked: vec![
+                acked(early, 10, Ok(1)),
+                acked(late, 20, Ok(1)),
+                acked(late, 40, Err("WYRD_X".to_owned())),
+            ],
+            ..Offered::default()
+        }];
+        let population = Population {
+            timings: Vec::new(),
+            invalid: Vec::new(),
+            exports: 0,
+            spans: 0,
+        };
+        let mut repetition = Repetition::default();
+        read_queries(&mut repetition, &asked, &phases);
+        read_ingest(&mut repetition, &offered, &[], &population, &phases);
+        let value = |id: &str| repetition.reading(id).value;
+        assert_eq!(value("queries"), Some(1.0));
+        assert_eq!(value("table_aggregates"), Some(1.0));
+        assert_eq!(value("queries_after_window"), Some(2.0));
+        assert_eq!(value("ingest_rows"), Some(10.0));
+        assert_eq!(value("ingest_rows_after_window"), Some(20.0));
+        assert_eq!(value("errors"), Some(1.0));
+    }
 
     /// Every 20 consecutive sequences send the declared mix: 60% point,
     /// 15% small and 10% 1M-row dashboard aggregates, 10% whole-table

@@ -912,6 +912,8 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
         Metric::raw("queries", "queries", "exactly answered mixed queries in the window"),
         Metric::raw("table_aggregates", "queries", "exactly answered whole-table aggregates in the window"),
         Metric::raw("ingest_rows", "rows", "durably acknowledged ingest rows in the window"),
+        Metric::raw("queries_after_window", "queries", "exactly answered mixed queries in flight at the window end, answered after it and outside every work-per-CPU metric"),
+        Metric::raw("ingest_rows_after_window", "rows", "ingest rows in flight at the window end, acknowledged during the drain and outside every work-per-CPU metric"),
         Metric::raw("p50_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (32 clients, not the L1 64-client objective)"),
         Metric::raw("p95_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (32 clients)"),
         Metric::raw("p99_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (32 clients)"),
@@ -919,6 +921,10 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
         Metric::derived("queries_per_cpu_s", "queries/cpu-s", "mixed queries per server CPU-second; the denominator also pays for ingest", Direction::Higher, Derive::PerCpu { work: "queries".to_owned(), scale: 1.0 }),
         Metric::derived("table_aggregates_per_cpu_s", "queries/cpu-s", "whole-table aggregates per server CPU-second; the denominator also pays for everything else", Direction::Higher, Derive::PerCpu { work: "table_aggregates".to_owned(), scale: 1.0 }),
         Metric::derived("ingest_rows_per_cpu_s", "rows/cpu-s", "ingest rows per server CPU-second; the denominator also pays for queries", Direction::Higher, Derive::PerCpu { work: "ingest_rows".to_owned(), scale: 1.0 }),
+        Metric::derived("queries_per_s_per_vcpu", "queries/s/vCPU", "mixed queries per wall second per provisioned logical CPU, (W/T)/P", Direction::Higher, Derive::PerVcpu { work: "queries".to_owned(), scale: 1.0 }),
+        Metric::derived("cpu_ms_per_query", "cpu-ms/query", "server CPU per mixed query, C/W; the numerator also pays for ingest", Direction::Lower, Derive::CpuPer { work: "queries".to_owned(), scale: 1e3 }),
+        Metric::derived("ingest_rows_per_s_per_vcpu", "rows/s/vCPU", "ingest rows per wall second per provisioned logical CPU, (W/T)/P", Direction::Higher, Derive::PerVcpu { work: "ingest_rows".to_owned(), scale: 1.0 }),
+        Metric::derived("cpu_us_per_ingest_row", "cpu-µs/row", "server CPU per ingest row, C/W; the numerator also pays for queries", Direction::Lower, Derive::CpuPer { work: "ingest_rows".to_owned(), scale: 1e6 }),
     ]);
     criteria.extend([
         Criterion::every(

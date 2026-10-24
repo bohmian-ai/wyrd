@@ -88,12 +88,15 @@ impl Isolated {
     /// server timings, client diagnostics, and server and driver usage.
     ///
     /// Every request the window sent must have exactly one server timing at
-    /// its boundary; the judged percentiles are the successful ones'.
+    /// its boundary; the judged percentiles are the successful ones'. A write
+    /// step's warmup first waits for every earlier row to publish, so no
+    /// step's server CPU pays for another step's backlog.
     ///
     /// # Errors
     ///
     /// Returns a workload error for an unprepared workload, an undeclared
-    /// step, a scrape failure, or, in `hot`, a row that left its memtable.
+    /// step, a scrape failure, earlier rows not published within the settle
+    /// timeout, or, in `hot`, a row that left its memtable.
     async fn closed(
         &self,
         step: &Step,
@@ -110,6 +113,11 @@ impl Isolated {
             .ok_or_else(|| {
                 ExperimentError::workload(format!("step `{}` declares no clients", step.id))
             })?;
+        if phase == Phase::Warmup && WriteOp::parse(op).is_some() {
+            Residence::settle(server, SETTLE_TIMEOUT)
+                .await
+                .map_err(ExperimentError::workload)?;
+        }
         let from = SystemTime::now();
         let (opened, before) = Window::open(server, collector, Selection::RESOURCES)
             .await

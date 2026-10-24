@@ -160,7 +160,11 @@ reference. Its Iceberg SQL catalog fork publishes the reference in the same
 catalog transaction as the metadata-pointer CAS, including creation. Assert
 the expected version and base pointer at that publication boundary; native
 schema/spec/order checks alone cannot protect concurrent Bloom-only edits.
-A losing CAS rolls back the reference and refreshes no cache. A data-only
+A losing CAS rolls back the reference and refreshes no cache. A committed
+edit notifies every node on the existing `bifrost_cut` channel in the same
+tenant transaction as its control-row projection; each node drops its cached
+current definition, and an admission naming a newer version than its cache
+reloads once. Describe always reads the current native metadata. A data-only
 head move may retry after all assumptions and the unchanged expected version
 are revalidated; a definition conflict cannot silently rebase. Uncertain
 COMMIT reconciles exact pointer/reference evidence before reporting success.
@@ -1646,10 +1650,12 @@ The surface includes:
 - authorized `PATCH /v1/bifrost/tables/{namespace}/{name}` with
   `expected_table_version`, optional partial layout, nullable custom-column
   additions and stable-ID custom renames. Validate the complete result; omitted
-  lists preserve values and supplied lists replace them. A stale edit is a
-  typed HTTP 409 with no mutation; malformed/unsupported edits are 400 and
-  missing DDL authority is 403. Time-column identity and canonical/managed
-  schemas remain protected; re-registration never alters a table;
+  lists preserve values and supplied lists replace them. Supplied lists name
+  columns after the edit's renames, and kept lists follow a rename by field
+  ID. A stale edit is a typed HTTP 409 with no mutation; malformed/unsupported
+  edits are 400 and missing `bifrost_table:write` is 403, audited as
+  `vala.bifrost.alter`. Time-column identity and canonical/managed schemas
+  remain protected; re-registration never alters a table;
 - `AppendReceipt { batch_id, accepted_rows, durability }`, where `durability`
   is the closed `AppendDurability::Acknowledged` value; the synchronous append
   response never reports staged, published, promoted, or rewritten state;

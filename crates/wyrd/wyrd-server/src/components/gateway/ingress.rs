@@ -14,7 +14,7 @@
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, RawQuery, Request, State};
-use axum::http::{HeaderMap, HeaderName, Method};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -24,6 +24,7 @@ use skald_spec::ProviderName;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use wyrd_gateway::IngressDialect;
+use wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::native::{
     AnthropicErrorEnvelope, GatewayAnthropicMessage, GatewayAnthropicMessagesRequest,
@@ -41,7 +42,7 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
 use super::invocation::{
-    GatewayCallAttribution, GatewayCallRequest, GatewayCallSubject, GatewayInvocation,
+    GatewayCallAttribution, GatewayCallContext, GatewayCallRequest, GatewayInvocation,
     invalid_request,
 };
 use super::routes::{self, PUBLIC_CALL_TIMEOUT, openai_error, relay, token_bound, typed_body};
@@ -345,19 +346,23 @@ pub(super) fn requested_prompt_provider(
         .transpose()
 }
 
-/// Reads the optional Run and Card attribution of a call from its
-/// independent `wyrd-run-id` and `wyrd-card-uid` headers.
+/// Reads the optional Run, Card, and deployment environment of a call from
+/// its independent `wyrd-run-id`, `wyrd-card-uid`, and
+/// `x-wyrd-deployment-environment` headers.
 ///
-/// Both headers are consumed here and never reach a provider; either may
-/// appear alone, and their joint absence leaves the call uncorrelated. The
-/// Card is only parsed here, as a [`GatewayCallAttribution::Requested`]
-/// attribution admission authorizes against the caller.
+/// Every header is consumed here and never reaches a provider; each may
+/// appear alone, and their joint absence leaves the request context empty.
+/// The Card is only parsed here, as a [`GatewayCallAttribution::Requested`]
+/// context admission authorizes against the caller and completes with the
+/// caller's verified workload root. The environment is descriptive and grants
+/// nothing.
 ///
 /// # Errors
-/// Returns `GatewayInvalidRequest` naming the offending header when either
-/// repeats or is not visible ASCII, the Run is empty or longer than
-/// [`MAX_RUN_HEADER_BYTES`], or the Card is not a Card UID.
-pub(super) fn requested_subject(
+/// Returns `GatewayInvalidRequest` naming the offending header when any
+/// repeats, the Run or Card is not visible ASCII, the Run is empty or longer
+/// than [`MAX_RUN_HEADER_BYTES`], the Card is not a Card UID, or the
+/// environment is empty or not UTF-8.
+pub(super) fn requested_context(
     headers: &HeaderMap,
 ) -> Result<Option<GatewayCallAttribution>, WyrdError> {
     let invalid = |field, reason| invalid_request(GatewayContractError::new(field, reason));
@@ -389,10 +394,27 @@ pub(super) fn requested_subject(
                 .map_err(|_| invalid(CARD_UID_HEADER, "must be a Card UID"))
         })
         .transpose()?;
+    let deployment_environment = wyrd_spec::auth::deployment_environment_selector(
+        headers
+            .get_all(DEPLOYMENT_ENVIRONMENT_HEADER)
+            .iter()
+            .map(HeaderValue::as_bytes),
+    )
+    .map_err(|_| {
+        invalid(
+            DEPLOYMENT_ENVIRONMENT_HEADER,
+            "must appear at most once as one non-empty UTF-8 value",
+        )
+    })?;
     Ok(
-        (run_id.is_some() || card_uid.is_some()).then_some(GatewayCallAttribution::Requested(
-            GatewayCallSubject { run_id, card_uid },
-        )),
+        (run_id.is_some() || card_uid.is_some() || deployment_environment.is_some()).then_some(
+            GatewayCallAttribution::Requested(GatewayCallContext {
+                workload_card_uid: None,
+                subject_card_uid: card_uid,
+                run_id,
+                deployment_environment,
+            }),
+        ),
     )
 }
 
@@ -470,7 +492,7 @@ pub(crate) async fn anthropic_messages(
                     batch: None,
                     deployment: None,
                     timeout: PUBLIC_CALL_TIMEOUT,
-                    subject: requested_subject(&headers)?,
+                    subject: requested_context(&headers)?,
                     prompt_provider: requested_prompt_provider(&headers)?,
                 })
             });
@@ -563,7 +585,7 @@ pub(crate) async fn jev_systemone(
 /// # Errors
 /// Returns `GatewayInvalidRequest` naming `body` or the missing member for a
 /// body that is not a Jev request, `model` for an invalid model id, and every
-/// error of [`requested_fallback`], [`requested_subject`], and [`requested_prompt_provider`].
+/// error of [`requested_fallback`], [`requested_context`], and [`requested_prompt_provider`].
 fn jev_call(
     headers: &HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
@@ -586,7 +608,7 @@ fn jev_call(
         batch: None,
         deployment: None,
         timeout: PUBLIC_CALL_TIMEOUT,
-        subject: requested_subject(headers)?,
+        subject: requested_context(headers)?,
         prompt_provider: requested_prompt_provider(headers)?,
     })
 }
@@ -694,7 +716,7 @@ async fn gemini_generate_content_without_deployment() -> Response {
 /// `generateContent` or `streamGenerateContent`, `alt` when it repeats or the
 /// response format does not match the method, `model` for an invalid model id,
 /// `body` or the missing member for a body that is not a `GenerateContent`
-/// request, and every error of [`requested_fallback`], [`requested_subject`],
+/// request, and every error of [`requested_fallback`], [`requested_context`],
 /// and [`requested_prompt_provider`].
 fn gemini_call(
     target: &str,
@@ -748,7 +770,7 @@ fn gemini_call(
         batch: None,
         deployment: None,
         timeout: PUBLIC_CALL_TIMEOUT,
-        subject: requested_subject(headers)?,
+        subject: requested_context(headers)?,
         prompt_provider: requested_prompt_provider(headers)?,
     })
 }
@@ -831,40 +853,58 @@ mod tests {
         }
     }
 
-    /// Absent headers leave a call uncorrelated, each header decodes alone or
-    /// with the other into its Run and Card, and every repeated, empty,
-    /// oversized, or malformed value is refused naming the offending header.
+    /// Absent headers leave the request context empty, each header decodes
+    /// alone or with the others into its Run, Card, and environment, and every
+    /// repeated, empty, oversized, or malformed value is refused naming the
+    /// offending header. A workload is never read from these headers.
     ///
     /// # Panics
     /// Panics when a header set decodes differently than documented.
     #[test]
-    fn subject_headers_decode_independently() {
+    fn context_headers_decode_independently() {
         let card = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00";
         assert!(
-            requested_subject(&HeaderMap::new())
+            requested_context(&HeaderMap::new())
                 .expect("absent")
                 .is_none()
         );
-        for (pairs, run, uid) in [
+        for (pairs, run, uid, environment) in [
             (
-                vec![(RUN_HEADER, "run-1"), (CARD_UID_HEADER, card)],
+                vec![
+                    (RUN_HEADER, "run-1"),
+                    (CARD_UID_HEADER, card),
+                    (DEPLOYMENT_ENVIRONMENT_HEADER, "production"),
+                ],
                 Some("run-1"),
                 Some(card),
+                Some("production"),
             ),
-            (vec![(RUN_HEADER, "run-1")], Some("run-1"), None),
-            (vec![(CARD_UID_HEADER, card)], None, Some(card)),
+            (vec![(RUN_HEADER, "run-1")], Some("run-1"), None, None),
+            (vec![(CARD_UID_HEADER, card)], None, Some(card), None),
+            (
+                vec![(DEPLOYMENT_ENVIRONMENT_HEADER, "staging")],
+                None,
+                None,
+                Some("staging"),
+            ),
         ] {
-            let Some(GatewayCallAttribution::Requested(subject)) =
-                requested_subject(&headers(&pairs)).expect("a valid header set")
+            let Some(GatewayCallAttribution::Requested(context)) =
+                requested_context(&headers(&pairs)).expect("a valid header set")
             else {
-                panic!("{pairs:?} is a requested subject");
+                panic!("{pairs:?} is a requested context");
             };
-            assert_eq!(subject.run_id.as_ref().map(RunId::as_str), run, "{pairs:?}");
+            assert_eq!(context.run_id.as_ref().map(RunId::as_str), run, "{pairs:?}");
             assert_eq!(
-                subject.card_uid.as_ref().map(CardUid::as_str),
+                context.subject_card_uid.as_ref().map(CardUid::as_str),
                 uid,
                 "{pairs:?}"
             );
+            assert_eq!(
+                context.deployment_environment.as_deref(),
+                environment,
+                "{pairs:?}"
+            );
+            assert!(context.workload_card_uid.is_none(), "{pairs:?}");
         }
         let long = "r".repeat(MAX_RUN_HEADER_BYTES + 1);
         for (pairs, field) in [
@@ -890,8 +930,19 @@ mod tests {
                 ],
                 RUN_HEADER,
             ),
+            (
+                vec![(DEPLOYMENT_ENVIRONMENT_HEADER, "")],
+                DEPLOYMENT_ENVIRONMENT_HEADER,
+            ),
+            (
+                vec![
+                    (DEPLOYMENT_ENVIRONMENT_HEADER, "production"),
+                    (DEPLOYMENT_ENVIRONMENT_HEADER, "staging"),
+                ],
+                DEPLOYMENT_ENVIRONMENT_HEADER,
+            ),
         ] {
-            let error = requested_subject(&headers(&pairs)).expect_err("refused");
+            let error = requested_context(&headers(&pairs)).expect_err("refused");
             assert_eq!(error.code(), "WYRD_GATEWAY_400_INVALID_REQUEST");
             assert_eq!(
                 error.as_problem_json()["details"]["field"],

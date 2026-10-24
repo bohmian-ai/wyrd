@@ -40,7 +40,7 @@ use super::tools::HostedTools;
 use super::traces::CallerTraces;
 use super::workspace::Workspaces;
 use crate::components::auth::Caller;
-use crate::components::gateway::{GatewayCallSubject, ServerWyrdGatewayCaller};
+use crate::components::gateway::{GatewayCallContext, ServerWyrdGatewayCaller};
 use crate::state::AppState;
 
 /// Most steps or checks one execution runs at once.
@@ -68,7 +68,7 @@ pub struct Execution<'a> {
     /// Per-requirement or per-step Agent route overrides.
     pub routes: &'a BTreeMap<TaskId, ExecutionRoute>,
     /// The Card and application Run model calls are attributed to.
-    pub subject: GatewayCallSubject,
+    pub subject: GatewayCallContext,
     /// When the execution was accepted, anchoring trace reads.
     pub accepted_at: DateTime<Utc>,
     /// The resolved drift evidence of a scheduled window.

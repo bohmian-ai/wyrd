@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::json::ReaderBuilder;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -40,7 +40,7 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::vala::{RUN_ID, SUBJECT_CARD_UID};
+use wyrd_spec::vala::{DEPLOYMENT_ENVIRONMENT, RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID};
 use wyrd_storage::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 use wyrd_tonic::otlp::common::v1::any_value::Value as AnyValueKind;
@@ -50,7 +50,7 @@ use wyrd_tonic::otlp::trace::v1::span::SpanKind;
 use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
-use super::invocation::GatewayCallSubject;
+use super::invocation::GatewayCallContext;
 use crate::scribe_outbox::{Owner, ScribeTable, project_spans};
 use crate::state::AppState;
 
@@ -150,7 +150,7 @@ pub(crate) struct CallFacts {
     /// Capture policy admitted with the call.
     pub(crate) policy: GatewayCapturePolicy,
     /// Authorized Run and Card attribution, its Card carrying the UID.
-    pub(crate) subject: Option<GatewayCallSubject>,
+    pub(crate) subject: Option<GatewayCallContext>,
     /// Context of the call's `gateway.call` span when the call continued a
     /// caller's trace, the parent of every attempt span.
     pub(crate) trace: Option<TraceContext>,
@@ -184,7 +184,7 @@ pub struct CallCapture {
     /// Subject and actor pair both batches are stamped with.
     attribution: Attribution,
     /// Authorized Run and Card the row is correlated to.
-    subject: Option<GatewayCallSubject>,
+    subject: Option<GatewayCallContext>,
     /// Context of the `gateway.call` span the attempt spans are children of,
     /// when the call continued a caller's trace.
     trace: Option<TraceContext>,
@@ -314,13 +314,14 @@ impl CallCapture {
     }
 
     /// Builds one `bifrost.gateway.calls` batch holding one row per capture, in
-    /// order, over the table's user fields followed by its `subject_card_uid` and
-    /// `run_id` correlation inputs.
+    /// order, over the table's user fields followed by its `workload_card_uid`,
+    /// `subject_card_uid`, and `run_id` correlation inputs.
     ///
-    /// The correlation inputs carry each authorized subject's Card UID, which
-    /// Scribe confirms against the frame's attributed UIDs, and its Run, each
-    /// null when the subject names none; both are null for an uncorrelated
-    /// call.
+    /// Each row carries its admitted [`GatewayCallContext`]: the owning
+    /// workload, the authorized subject Card, which Scribe confirms against the
+    /// frame's attributed UIDs, the Run, and the request's deployment
+    /// environment, each null when absent. The readable Service and subject
+    /// dimensions stay null here; Scribe derives them from the carried UIDs.
     ///
     /// The scalar columns decode from the serialized payloads in one decoder
     /// pass; the `request_payload` and `response_payload` Variant columns
@@ -350,7 +351,7 @@ impl CallCapture {
             .ok()
             .flatten()
             .ok_or(CaptureDrop::Projection)?;
-        let subject = |pick: fn(&GatewayCallSubject) -> Option<&str>| -> ArrayRef {
+        let subject = |pick: fn(&GatewayCallContext) -> Option<&str>| -> ArrayRef {
             Arc::new(StringArray::from_iter(
                 captures
                     .iter()
@@ -371,12 +372,18 @@ impl CallCapture {
                         .iter()
                         .map(|capture| capture.payload.response_payload_json.as_deref()),
                 ),
-                SUBJECT_CARD_UID => Ok(subject(|subject| {
-                    subject.card_uid.as_ref().map(CardUid::as_str)
+                WORKLOAD_CARD_UID => Ok(subject(|context| {
+                    context.workload_card_uid.as_ref().map(CardUid::as_str)
                 })),
-                RUN_ID => Ok(subject(|subject| {
-                    subject.run_id.as_ref().map(RunId::as_str)
+                SUBJECT_CARD_UID => Ok(subject(|context| {
+                    context.subject_card_uid.as_ref().map(CardUid::as_str)
                 })),
+                RUN_ID => Ok(subject(|context| {
+                    context.run_id.as_ref().map(RunId::as_str)
+                })),
+                DEPLOYMENT_ENVIRONMENT => {
+                    Ok(subject(|context| context.deployment_environment.as_deref()))
+                }
                 name => decoded
                     .column_by_name(name)
                     .cloned()
@@ -719,6 +726,7 @@ impl PayloadObjects {
 /// compare by pointer and no row rebuilds or frees the schema tree.
 static CALLS_SCHEMAS: LazyLock<(Arc<Schema>, Arc<Schema>)> = LazyLock::new(|| {
     let mut fields = CallsTable::arrow_fields();
+    fields.push(Field::new(WORKLOAD_CARD_UID, DataType::Utf8, true));
     fields.extend(correlation_fields());
     let scalars = fields
         .iter()

@@ -40,7 +40,7 @@ use wyrd_storage::tenant_path;
 
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::components::gateway::GatewayCallSubject;
+use crate::components::gateway::GatewayCallContext;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::http::middleware::metrics::RequestArrival;
@@ -566,9 +566,15 @@ impl<'a> VerificationControl<'a> {
                 caller: &executor,
                 evidence: &request.inputs,
                 routes: &request.execution_route_overrides,
-                subject: GatewayCallSubject {
+                subject: GatewayCallContext {
+                    workload_card_uid: wyrd_runtime::owning_root(
+                        &caller.principal,
+                        &caller.delegation_chain,
+                    )
+                    .cloned(),
+                    subject_card_uid: Some(request.card_uid.clone()),
                     run_id: request.run_id.clone(),
-                    card_uid: Some(request.card_uid.clone()),
+                    deployment_environment: request.deployment_environment.clone(),
                 },
                 accepted_at: started_at,
                 drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),

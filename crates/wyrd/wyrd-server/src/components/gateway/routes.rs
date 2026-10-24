@@ -44,7 +44,7 @@ use super::batches::{BatchAnswer, GatewayBatches};
 use super::capture::object_path;
 use super::ingress::{
     CARD_UID_HEADER_DOC, FALLBACK_HEADER_DOC, PROMPT_PROVIDER_HEADER_DOC, RUN_HEADER_DOC,
-    requested_fallback, requested_prompt_provider, requested_subject,
+    requested_context, requested_fallback, requested_prompt_provider,
 };
 use super::invocation::{
     GatewayCallRequest, GatewayCallResponse, GatewayInvocation, invalid_request,
@@ -1536,6 +1536,10 @@ fn events_body(events: wyrd_gateway::EventStream) -> Body {
 #[utoipa::path(
     post,
     path = "/v1/files",
+    params(
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+    ),
     request_body(content = GatewayFileUploadForm, content_type = "multipart/form-data", description = "OpenAI-compatible file upload form: `purpose` `batch` and exactly one batch JSONL `file` whose request lines all target one endpoint and one exact `<provider>/<model>` projection"),
     responses(
         (status = 200, description = "OpenAI file object with a Wyrd file id", body = GatewayFile),
@@ -1561,17 +1565,17 @@ pub(crate) async fn upload_file(
     headers: HeaderMap,
     request: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let answer = match (caller, request) {
-        (Err(WyrdErrorResponse(error)), _) => Err(error),
-        (Ok(_), Err(_)) => Err(invalid_request(GatewayContractError::new(
+    let answer = match (caller, requested_context(&headers), request) {
+        (Err(WyrdErrorResponse(error)), _, _) | (Ok(_), Err(error), _) => Err(error),
+        (Ok(_), Ok(_), Err(_)) => Err(invalid_request(GatewayContractError::new(
             "body",
             "could not be read",
         ))),
-        (Ok(caller), Ok(bytes)) => {
+        (Ok(caller), Ok(context), Ok(bytes)) => {
             let content_type = headers
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok());
-            GatewayBatches::new(&state)
+            GatewayBatches::new(&state, context)
                 .upload(&caller, content_type, bytes)
                 .await
         }
@@ -1603,7 +1607,11 @@ pub(crate) async fn get_file(
     Path(file_id): Path<String>,
 ) -> Response {
     let answer = match caller {
-        Ok(caller) => GatewayBatches::new(&state).file(&caller, &file_id).await,
+        Ok(caller) => {
+            GatewayBatches::new(&state, None)
+                .file(&caller, &file_id)
+                .await
+        }
         Err(WyrdErrorResponse(error)) => Err(error),
     };
     batch_response(answer)
@@ -1612,7 +1620,11 @@ pub(crate) async fn get_file(
 #[utoipa::path(
     get,
     path = "/v1/files/{file_id}/content",
-    params(("file_id" = String, Path, description = "Wyrd id of an uploaded file, or of a batch output or error file")),
+    params(
+        ("file_id" = String, Path, description = "Wyrd id of an uploaded file, or of a batch output or error file"),
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+    ),
     responses(
         (status = 200, description = "File bytes in the provider's content type", content(
             (String = "application/octet-stream")
@@ -1638,15 +1650,16 @@ pub(crate) async fn get_file(
 pub(crate) async fn file_content(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> Response {
-    let answer = match caller {
-        Ok(caller) => {
-            GatewayBatches::new(&state)
+    let answer = match (caller, requested_context(&headers)) {
+        (Err(WyrdErrorResponse(error)), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(caller), Ok(context)) => {
+            GatewayBatches::new(&state, context)
                 .file_content(&caller, &file_id)
                 .await
         }
-        Err(WyrdErrorResponse(error)) => Err(error),
     };
     batch_response(answer)
 }
@@ -1654,7 +1667,11 @@ pub(crate) async fn file_content(
 #[utoipa::path(
     delete,
     path = "/v1/files/{file_id}",
-    params(("file_id" = String, Path, description = "Wyrd id of an uploaded batch input file")),
+    params(
+        ("file_id" = String, Path, description = "Wyrd id of an uploaded batch input file"),
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+    ),
     responses(
         (status = 200, description = "OpenAI file deletion object", body = GatewayFileDeleted),
         (status = 404, description = "Unknown file, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
@@ -1677,15 +1694,16 @@ pub(crate) async fn file_content(
 pub(crate) async fn delete_file(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> Response {
-    let answer = match caller {
-        Ok(caller) => {
-            GatewayBatches::new(&state)
+    let answer = match (caller, requested_context(&headers)) {
+        (Err(WyrdErrorResponse(error)), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(caller), Ok(context)) => {
+            GatewayBatches::new(&state, context)
                 .delete_file(&caller, &file_id)
                 .await
         }
-        Err(WyrdErrorResponse(error)) => Err(error),
     };
     batch_response(answer)
 }
@@ -1693,6 +1711,10 @@ pub(crate) async fn delete_file(
 #[utoipa::path(
     post,
     path = "/v1/batches",
+    params(
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+    ),
     request_body(content = GatewayBatchCreateRequest, description = "OpenAI-compatible batch creation: a Wyrd `input_file_id`, the file's `endpoint`, `completion_window`, and optional `metadata`; an identical request converges on one batch"),
     responses(
         (status = 200, description = "OpenAI batch object with Wyrd batch and file ids", body = GatewayBatch),
@@ -1721,11 +1743,22 @@ pub(crate) async fn delete_file(
 pub(crate) async fn create_batch(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    headers: HeaderMap,
     request: Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    let answer = match (caller, typed_body::<GatewayBatchCreateRequest>(request)) {
-        (Err(WyrdErrorResponse(error)), _) | (Ok(_), Err(error)) => Err(error),
-        (Ok(caller), Ok(body)) => GatewayBatches::new(&state).create(&caller, body).await,
+    let answer = match (
+        caller,
+        requested_context(&headers),
+        typed_body::<GatewayBatchCreateRequest>(request),
+    ) {
+        (Err(WyrdErrorResponse(error)), _, _)
+        | (Ok(_), Err(error), _)
+        | (Ok(_), Ok(_), Err(error)) => Err(error),
+        (Ok(caller), Ok(context), Ok(body)) => {
+            GatewayBatches::new(&state, context)
+                .create(&caller, body)
+                .await
+        }
     };
     batch_response(answer)
 }
@@ -1760,7 +1793,7 @@ pub(crate) async fn list_batches(
             "must carry an optional after id and a numeric limit",
         ))),
         (Ok(caller), Ok(Query(query))) => {
-            GatewayBatches::new(&state)
+            GatewayBatches::new(&state, None)
                 .list(&caller, query.after.as_deref(), query.limit)
                 .await
         }
@@ -1771,7 +1804,11 @@ pub(crate) async fn list_batches(
 #[utoipa::path(
     get,
     path = "/v1/batches/{batch_id}",
-    params(("batch_id" = String, Path, description = "Wyrd batch id")),
+    params(
+        ("batch_id" = String, Path, description = "Wyrd batch id"),
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+    ),
     responses(
         (status = 200, description = "OpenAI batch object refreshed from the provider", body = GatewayBatch),
         (status = 404, description = "Unknown batch, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
@@ -1793,15 +1830,16 @@ pub(crate) async fn list_batches(
 pub(crate) async fn get_batch(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    headers: HeaderMap,
     Path(batch_id): Path<String>,
 ) -> Response {
-    let answer = match caller {
-        Ok(caller) => {
-            GatewayBatches::new(&state)
+    let answer = match (caller, requested_context(&headers)) {
+        (Err(WyrdErrorResponse(error)), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(caller), Ok(context)) => {
+            GatewayBatches::new(&state, context)
                 .retrieve(&caller, &batch_id)
                 .await
         }
-        Err(WyrdErrorResponse(error)) => Err(error),
     };
     batch_response(answer)
 }
@@ -1809,7 +1847,11 @@ pub(crate) async fn get_batch(
 #[utoipa::path(
     post,
     path = "/v1/batches/{batch_id}/cancel",
-    params(("batch_id" = String, Path, description = "Wyrd batch id")),
+    params(
+        ("batch_id" = String, Path, description = "Wyrd batch id"),
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+    ),
     responses(
         (status = 200, description = "OpenAI batch object after cancellation was requested", body = GatewayBatch),
         (status = 404, description = "Unknown batch, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
@@ -1831,11 +1873,16 @@ pub(crate) async fn get_batch(
 pub(crate) async fn cancel_batch(
     State(state): State<AppState>,
     caller: Result<Caller, WyrdErrorResponse>,
+    headers: HeaderMap,
     Path(batch_id): Path<String>,
 ) -> Response {
-    let answer = match caller {
-        Ok(caller) => GatewayBatches::new(&state).cancel(&caller, &batch_id).await,
-        Err(WyrdErrorResponse(error)) => Err(error),
+    let answer = match (caller, requested_context(&headers)) {
+        (Err(WyrdErrorResponse(error)), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(caller), Ok(context)) => {
+            GatewayBatches::new(&state, context)
+                .cancel(&caller, &batch_id)
+                .await
+        }
     };
     batch_response(answer)
 }
@@ -1923,7 +1970,7 @@ async fn form_body(
 /// # Errors
 /// Returns the decoding error of `request`, `GatewayInvalidRequest` for a
 /// `model` that is not an exact projection, every error of
-/// [`requested_fallback`], [`requested_subject`], and
+/// [`requested_fallback`], [`requested_context`], and
 /// [`requested_prompt_provider`] for `headers`, and every
 /// error of
 /// [`GatewayInvocation::invoke`].
@@ -1945,7 +1992,7 @@ async fn invoke_openai(
     let (fallback, subject, prompt_provider) = match headers {
         Some(headers) => (
             requested_fallback(headers, &model)?,
-            requested_subject(headers)?,
+            requested_context(headers)?,
             requested_prompt_provider(headers)?,
         ),
         None => (None, None, None),

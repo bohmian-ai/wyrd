@@ -1952,7 +1952,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             "voice",
         ),
         (
-            |s, c, r| Box::pin(super::routes::create_batch(s, c, r)),
+            |s, c, r| Box::pin(super::routes::create_batch(s, c, HeaderMap::new(), r)),
             json!({"endpoint": "/v1/chat/completions", "completion_window": "24h"}),
             "input_file_id",
         ),
@@ -2628,6 +2628,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
         super::routes::create_batch(
             State(state.clone()),
             Ok(caller.clone()),
+            HeaderMap::new(),
             Ok(Json(json!({
                 "input_file_id": file_id,
                 "endpoint": "/v1/chat/completions",
@@ -2693,6 +2694,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let read = super::routes::get_batch(
         State(b.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         axum::extract::Path(batch_id.clone()),
     )
     .await;
@@ -2719,6 +2721,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let content = super::routes::file_content(
         State(a.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         axum::extract::Path(output),
     )
     .await;
@@ -2732,6 +2735,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let cancelled = super::routes::cancel_batch(
         State(a.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         axum::extract::Path(batch_id.clone()),
     )
     .await;
@@ -2752,6 +2756,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let hidden = super::routes::get_batch(
         State(a.clone()),
         Ok(outsider.clone()),
+        HeaderMap::new(),
         axum::extract::Path(batch_id.clone()),
     )
     .await;
@@ -2787,6 +2792,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let deleted = super::routes::delete_file(
         State(b.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         axum::extract::Path(file_id.clone()),
     )
     .await;
@@ -2801,8 +2807,13 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     )
     .await;
     assert_eq!(gone.status(), StatusCode::NOT_FOUND);
-    let kept =
-        super::routes::get_batch(State(a.clone()), Ok(caller), axum::extract::Path(batch_id)).await;
+    let kept = super::routes::get_batch(
+        State(a.clone()),
+        Ok(caller),
+        HeaderMap::new(),
+        axum::extract::Path(batch_id),
+    )
+    .await;
     assert_eq!(kept.status(), StatusCode::OK);
     drain_gateway(&a).await;
     drain_gateway(&b).await;
@@ -2933,6 +2944,7 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
         super::routes::create_batch(
             State(state.clone()),
             Ok(caller.clone()),
+            HeaderMap::new(),
             Ok(Json(json!({
                 "input_file_id": file_id, "endpoint": "/v1/chat/completions",
                 "completion_window": "24h", "metadata": {"n": n},
@@ -3004,6 +3016,7 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
     let denied = super::routes::create_batch(
         State(c.clone()),
         Ok(invoker(tenant, 9, [])),
+        HeaderMap::new(),
         Ok(Json(json!({
             "input_file_id": file_id, "endpoint": "/v1/chat/completions",
             "completion_window": "24h", "metadata": {"n": "denied"},
@@ -3173,6 +3186,7 @@ async fn gateway_batch_dispatch_reauthorizes_against_its_routing_snapshot() {
         super::routes::create_batch(
             State(state.clone()),
             Ok(caller.clone()),
+            HeaderMap::new(),
             Ok(Json(json!({
                 "input_file_id": file_id, "endpoint": "/v1/chat/completions",
                 "completion_window": "24h", "metadata": {"n": n},
@@ -3442,9 +3456,10 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     let run = RunId::new();
     let call = |card_uid: &CardUid| GatewayCallRequest {
         subject: Some(super::GatewayCallAttribution::Requested(
-            super::GatewayCallSubject {
+            super::GatewayCallContext {
                 run_id: Some(run.clone()),
-                card_uid: Some(card_uid.clone()),
+                subject_card_uid: Some(card_uid.clone()),
+                ..super::GatewayCallContext::default()
             },
         )),
         ..request("dep-a/a", Some((1000, 500)), Duration::from_secs(10))

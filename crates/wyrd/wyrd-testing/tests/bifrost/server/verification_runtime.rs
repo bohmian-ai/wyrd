@@ -3651,9 +3651,9 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
         timeout: Duration::from_secs(10),
         subject: subject.map(|card_uid| {
             wyrd_server::components::gateway::GatewayCallAttribution::Resolved(
-                wyrd_server::components::gateway::GatewayCallSubject {
-                    run_id: None,
-                    card_uid: Some(card_uid),
+                wyrd_server::components::gateway::GatewayCallContext {
+                    subject_card_uid: Some(card_uid),
+                    ..Default::default()
                 },
             )
         }),

@@ -41,7 +41,7 @@ use wyrd_runtime::{
     PermissionScope, Principal, PrincipalKind, PrincipalRef,
 };
 use wyrd_server::components::auth::Caller;
-use wyrd_server::components::gateway::GatewayCallSubject;
+use wyrd_server::components::gateway::GatewayCallContext;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::blocks::{Execution, HostedBlocks};
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
@@ -1142,10 +1142,7 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
                         caller,
                         evidence: &evidence,
                         routes: &routes,
-                        subject: GatewayCallSubject {
-                            run_id: None,
-                            card_uid: None,
-                        },
+                        subject: GatewayCallContext::default(),
                         accepted_at: chrono::Utc::now(),
                         drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                         clock: BlockClock::default(),

@@ -903,6 +903,7 @@ mod sdk {
             Bifrost::status,
             Bifrost::cancel,
             Bifrost::describe_table,
+            Bifrost::alter_table,
         );
         let _ = (
             crate::bifrost::blocking::Bifrost::query,
@@ -913,6 +914,7 @@ mod sdk {
             crate::bifrost::blocking::Bifrost::status,
             crate::bifrost::blocking::Bifrost::cancel,
             crate::bifrost::blocking::Bifrost::describe_table,
+            crate::bifrost::blocking::Bifrost::alter_table,
         );
     }
 }

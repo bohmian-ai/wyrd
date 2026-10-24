@@ -34,7 +34,7 @@ use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkE
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse,
+    AlterTableRequest, BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse,
     QueryParam, QueryTerminalFrame, RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
 };
 use wyrd_spec::vala::ids::TraceId;
@@ -1186,6 +1186,57 @@ impl Bifrost {
         name: &str,
     ) -> Result<BifrostTableDescription, BifrostClientError> {
         self.query.describe_table(namespace, name).await
+    }
+
+    /// Alter one registered table's definition at its observed table version.
+    ///
+    /// Sends `PATCH /v1/bifrost/tables/{namespace}/{name}`: the server
+    /// validates the whole post-edit schema and layout, commits it once at the
+    /// next table version, and returns the committed description. The server
+    /// owns every decision; this method only carries the request and drops
+    /// this client's cached destination for the table, so the next write
+    /// describes the committed definition.
+    ///
+    /// # Arguments
+    /// * `namespace` - The table's namespace.
+    /// * `name` - The table's name within `namespace`.
+    /// * `request` - The expected table version and the edits to apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable invalid-edit, version-conflict, version-exhausted,
+    /// not-found, authentication, authorization, availability, or protocol
+    /// error the server reported; a refused edit changes nothing.
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future may leave the edit committed server-side;
+    /// describe the table to observe its current version.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the described-table lock is poisoned.
+    pub async fn alter_table(
+        &self,
+        namespace: &str,
+        name: &str,
+        request: &AlterTableRequest,
+    ) -> Result<BifrostTableDescription, BifrostClientError> {
+        let description = self
+            .query
+            .client()
+            .http
+            .request_json(
+                reqwest::Method::PATCH,
+                &format!("/v1/bifrost/tables/{namespace}/{name}"),
+                Some(request),
+            )
+            .await?;
+        self.described
+            .lock()
+            .expect("described table lock poisoned")
+            .remove(format!("{namespace}.{name}").as_str());
+        Ok(description)
     }
 
     /// The client scope every pooled producer is keyed under.

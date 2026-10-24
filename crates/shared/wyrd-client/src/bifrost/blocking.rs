@@ -13,7 +13,7 @@ use wyrd_spec::request_id::RequestId;
 #[cfg(feature = "internal")]
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::api::{
-    BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse, QueryParam,
+    AlterTableRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse, QueryParam,
     RegisterOutcome, RunningQuerySummary,
 };
 
@@ -229,6 +229,25 @@ impl Bifrost {
         name: &str,
     ) -> Result<BifrostTableDescription, BifrostClientError> {
         block_on(self.inner.describe_table(namespace, name))
+    }
+
+    /// Alter one registered table's definition at its observed table version.
+    ///
+    /// # Arguments
+    /// * `namespace` - The table's namespace.
+    /// * `name` - The table's name within `namespace`.
+    /// * `request` - The expected table version and the edits to apply.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::bifrost::Bifrost::alter_table`].
+    pub fn alter_table(
+        &self,
+        namespace: &str,
+        name: &str,
+        request: &AlterTableRequest,
+    ) -> Result<BifrostTableDescription, BifrostClientError> {
+        block_on(self.inner.alter_table(namespace, name, request))
     }
 
     /// Start one query from a complete request and iterate its batches.

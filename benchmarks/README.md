@@ -6,6 +6,7 @@ an append-only record in this directory. They are not part of any test lane,
 `gate`, verify lane, or CI job.
 
 ```bash
+mise run bench:smoke                 # every path's release smoke, in seconds
 mise run bench:l1                    # Level 1, all three engines in order
 mise run bench:l1:bifrost            # Level 1, one engine
 mise run bench:l1:verification
@@ -15,6 +16,10 @@ mise run bench:l2:verification
 mise run bench:l2:gateway
 mise run bench:l1:gateway -- --profile --steps chat.c64
 ```
+
+`bench:smoke` proves every timing boundary, CPU reading and counter is
+collected, records nothing, and exits 0 or 2. Run it first. An L1 engine takes
+up to 15 minutes (`bench:l1` about 45). An L2 engine takes 20 to 30 minutes.
 
 ## Prerequisites
 
@@ -43,9 +48,17 @@ configuration declares server limits.
   union of its own provider or Verifier waits, from the same span.
 - **Throughput is reported twice.** `(W/T)/P` is work per wall second per
   provisioned vCPU (`work/s/vCPU`, P = logical CPUs available to the server).
-  `W/C` is work per server CPU-second used (`work/cpu-s`). Writes report rows
-  and uncompressed MiB; queries report queries plus scanned rows and bytes per
-  query. Baselines compare `W/C`.
+  `W/C` is work per server CPU-second used (`work/cpu-s`), and `C/W` is CPU
+  per operation. The report's server CPU column reads `C s / C/T cores used /
+  P vCPU`: cores used is measured, P is what the host offered. Only work
+  completed before the window end counts as W, and later completions are
+  reported apart. In L2, C is the server's total CPU, so every class's `W/C`
+  also pays for the competing work. Baselines compare `W/C`.
+- **Bytes have declared sources.** Writes report rows, retained Arrow MiB
+  (uncompressed), and encoded OTLP wire MiB. Queries report the mean scanned
+  rows and bytes of each query's own executed plan, joined by trace. The L1
+  storage ratio is published Parquet bytes over retained Arrow bytes of one
+  settled sample per path, excluding WAL, staging, and catalog bytes.
 - The `timing` control records the method, the server's span exporter
   settings, and the host's measured timer resolution.
 
@@ -73,8 +86,8 @@ What each engine covers:
     MiB per server CPU-second.
   - L2 `competing` runs the 100M-row fixture with Forge compaction on:
     - open-loop ingest split 50% spans, 30% logs, 20% native;
-    - 32 query clients (60% point, 25% dashboard, 10% table aggregate, 5%
-      scan);
+    - mixed queries offered open loop at 12/s with at most 32 in flight
+      (60% point, 25% dashboard, 10% table aggregate, 5% scan);
     - a full query queue, and three client-queue lanes.
   - L2 heavy scans must hold a server p95 below 2 s, with at least 200
     samples per repetition.
@@ -159,8 +172,11 @@ a `-<n>` suffix. A record holds:
   CPU;
 - every reason, and the verdict.
 
-The report printed at the end is regenerated from the record alone, so it can
-be reproduced after `target/` is gone:
+Raw evidence stays under `target/benchmarks/<engine>/<experiment>/`:
+`timings.jsonl` holds every server timing in nanoseconds, beside the server
+and collector logs and any profiles. The next run of that experiment replaces
+it. The report printed at the end is regenerated from the record alone, so it
+can be reproduced after `target/` is gone:
 
 ```bash
 target/profiling/release/capacity report benchmarks/bifrost/isolated/<record>.json

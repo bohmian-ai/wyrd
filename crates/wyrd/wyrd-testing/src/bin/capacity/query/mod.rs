@@ -17,8 +17,8 @@
 //! - **L2, `competing`** ([`competing`]): the heavy 100M-row fixture with
 //!   Forge compaction on, one stateful step whose every repetition runs open
 //!   loop mixed ingest at a rate calibrated from the newest compatible L1
-//!   record, 32 mixed query clients, and three client-queue lanes, through
-//!   capacity → overload → recovery.
+//!   record, mixed queries open loop at 12/s with at most 32 in flight, and
+//!   three client-queue lanes, through capacity → overload → recovery.
 
 mod competing;
 mod isolated;
@@ -840,7 +840,7 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
     let step = vec![COMPETING.to_owned()];
     COMPETING.clone_into(&mut base.experiment);
     base.question = String::from(
-        "With 100M events rows published as Parquet and Forge compaction on, does open-loop mixed ingest at 70% of calibrated capacity beside 32 mixed query clients keep point p99 under 5 ms, dashboard p95 under 100/300 ms, heavy scan p95 under 2 s, server write acknowledgements p99 within 100 ms, with every answer exact, every client-queue row durable exactly once, a bounded backlog, a declared queue-full refusal only under overload, and the SLOs restored within 30 s after it?",
+        "With 100M events rows published as Parquet and Forge compaction on, does open-loop mixed ingest at 70% of calibrated capacity beside mixed queries offered open loop at 12/s with at most 32 in flight keep point p99 under 5 ms, dashboard p95 under 100/300 ms, heavy scan p95 under 2 s, server write acknowledgements p99 within 100 ms, with every answer exact, every client-queue row durable exactly once, a bounded backlog, a declared queue-full refusal only under overload, and the SLOs restored within 30 s after it?",
     );
     let calibration = calibrate(records, &base);
     let rate = match &calibration {

@@ -174,7 +174,9 @@ async fn first_settled(
 /// result through the Scribe outbox's peer ingest RPC and completes
 /// the run. Its summary and both feature rows are queryable through the
 /// Oracle and carry the exact tenant SYSTEM principal, Verifier, subject,
-/// owner, binding, run, result, and one shared event time.
+/// owner, binding, run, result, and one shared event time, with the owner
+/// Service and subject described by name and version by the peer that
+/// admitted them.
 ///
 /// # Errors
 /// Returns cluster, seeding, runtime, publication, or query errors, or a
@@ -245,7 +247,9 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
             "{alias}{RUN_ID} IS NULL AND {alias}result_id = '{result}' \
              AND {alias}{ACT_PRINCIPAL_ID} = '{system}' AND {alias}verifier_card_uid = '{verifier}' \
              AND {alias}{SUBJECT_CARD_UID} = '{subject}' AND {alias}{WORKLOAD_CARD_UID} = '{owner}' \
-             AND {alias}binding_id = '{binding}'"
+             AND {alias}binding_id = '{binding}' AND {alias}service_name = 'remote-owner' \
+             AND {alias}service_version = '1.0.0' AND {alias}subject_kind = 'Service' \
+             AND {alias}subject_name = 'remote-subject' AND {alias}subject_version = '1.0.0'"
         )
     };
     let checks = [

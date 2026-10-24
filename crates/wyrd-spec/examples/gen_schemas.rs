@@ -75,12 +75,13 @@ use wyrd_spec::storage::{
     UploadInitRequest, UploadInitResponse, UploadPlan, VerificationGuarantee, WireProtocol,
 };
 use wyrd_spec::vala::api::{
-    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, BifrostTableDescription,
-    BifrostTableEntry, CancelRunningQueryRequest, CancelRunningQueryResponse, DataTypeSpec,
-    FieldSpec as BifrostFieldSpec, GetRunningQueryRequest, ListRunningQueriesResponse,
-    NullOrderWire, PhysicalLayoutWire, QueryTerminalFrame, RegisterOutcome, RegisterTableRequest,
-    RegisterTableResponse, RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
-    SortDirectionWire, SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
+    AlterTableRequest, AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest,
+    BifrostTableDescription, BifrostTableEntry, CancelRunningQueryRequest,
+    CancelRunningQueryResponse, DataTypeSpec, FieldSpec as BifrostFieldSpec,
+    GetRunningQueryRequest, ListRunningQueriesResponse, NullOrderWire, PhysicalLayoutWire,
+    QueryTerminalFrame, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
+    RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary, SortDirectionWire,
+    SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
 };
 use wyrd_spec::vala::trace::SpanRecord;
 use wyrd_spec::verification::VerificationBindingStatus;
@@ -281,6 +282,7 @@ fn contracts() -> Value {
         RegisterTableRequest,
         RegisterOutcome,
         RegisterTableResponse,
+        AlterTableRequest,
         BifrostQueryRequest,
         RunningQueryLifecycleState,
         RunningQueryProgress,

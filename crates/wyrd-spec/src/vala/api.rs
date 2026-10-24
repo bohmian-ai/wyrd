@@ -587,16 +587,28 @@ pub struct AlterTableRequest {
     /// The table version this edit was built from, as last described.
     pub expected_table_version: TableVersion,
     /// Layout lists to replace; an omitted list keeps the current one.
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(with = "PhysicalLayoutEdit")]
     pub physical_layout: Option<PhysicalLayoutEdit>,
     /// Nullable top-level custom columns to append, in the field-declaration
     /// shape registration uses.
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(with = "Vec<FieldSpec>")]
     pub add_columns: Option<Vec<FieldSpec>>,
     /// Top-level custom columns to rename; each keeps its field id and values.
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(with = "Vec<ColumnRename>")]
     pub rename_columns: Option<Vec<ColumnRename>>,
 }
@@ -613,16 +625,28 @@ pub struct AlterTableRequest {
 pub struct PhysicalLayoutEdit {
     /// The complete new partition list, holding exactly one `hour` or `day`
     /// field over the time column.
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(with = "Vec<PartitionFieldWire>")]
     pub partition_by: Option<Vec<PartitionFieldWire>>,
     /// The complete new sort order; an empty list sorts by the time column
     /// descending, nulls last.
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(with = "Vec<SortKeyWire>")]
     pub sort_keys: Option<Vec<SortKeyWire>>,
     /// The complete new Bloom column set, which may be empty.
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(with = "Vec<String>")]
     pub bloom_columns: Option<Vec<String>>,
 }
@@ -2641,10 +2665,11 @@ mod bifrost_wire_tests {
     use std::collections::BTreeMap;
 
     use crate::vala::api::{
-        AlterTableRequest, BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, DataTypeSpec, FieldSpec,
-        NullOrderWire, PARQUET_FIELD_ID_KEY, PartitionFieldWire, PartitionTransformWire,
-        PhysicalLayoutEdit, PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest,
-        RegisterTableResponse, SortDirectionWire, SortKeyWire, TableStatus, TimeUnit,
+        AlterTableRequest, BifrostTableDescription, BifrostTableEntry, CompactionTypeWire,
+        DataTypeSpec, FieldSpec, NullOrderWire, PARQUET_FIELD_ID_KEY, PartitionFieldWire,
+        PartitionTransformWire, PhysicalLayoutEdit, PhysicalLayoutWire, RegisterOutcome,
+        RegisterTableRequest, RegisterTableResponse, SortDirectionWire, SortKeyWire, TableStatus,
+        TimeUnit,
     };
     use schemars::schema_for;
 
@@ -3055,7 +3080,10 @@ mod bifrost_wire_tests {
             serde_json::json!({"expected_table_version": "1", "physical_layout": {"time_column": "t"}}),
             serde_json::json!({"expected_table_version": "1", "rename_columns": [{"from": "a", "to": "b", "x": 1}]}),
         ] {
-            assert!(decode(refused.clone()).is_err(), "{refused} must be refused");
+            assert!(
+                decode(refused.clone()).is_err(),
+                "{refused} must be refused"
+            );
         }
     }
 

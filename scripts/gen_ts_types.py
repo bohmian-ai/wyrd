@@ -50,6 +50,7 @@ WIRE_ROOTS = [
     "ListCardsResponse",
     "DeclarationReceipt",
     # Bifrost.
+    "AlterTableRequest",
     "BifrostQueryRequest",
     "BifrostTableDescription",
     "CancelRunningQueryResponse",
@@ -85,6 +86,8 @@ WIRE_ROOTS = [
 # Wire roots the SDK sends. Every definition reachable from one of these or
 # from the Card envelope keeps input optionality; every other definition is
 # only read from a response, so a field the server always serializes is required.
+# `AlterTableRequest` stays out: it reaches `FieldSpec`, which `BifrostTableDescription`
+# returns, and its own optional fields stay optional in output mode.
 REQUEST_ROOTS = {
     "BifrostQueryRequest",
     "CreateOperatorConnectionRequest",

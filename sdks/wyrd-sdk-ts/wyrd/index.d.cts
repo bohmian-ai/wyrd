@@ -216,6 +216,20 @@ export declare class NativeBifrost {
    * Wyrd control failures are returned in [`NativeLifecycleResult`].
    */
   describeTable(namespace: string, name: string): Promise<NativeLifecycleResult>
+  /**
+   * Alters one registered table's definition at its observed table version
+   * and resolves to the committed description.
+   *
+   * `request_json` is one serialized `AlterTableRequest`, decoded strictly
+   * here; every edit decision belongs to the server.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the native result cannot be projected;
+   * a malformed request and every Wyrd control failure are returned in
+   * [`NativeLifecycleResult`].
+   */
+  alterTable(namespace: string, name: string, requestJson: string): Promise<NativeLifecycleResult>
 }
 
 /** Native query stream that retains Rust terminal validation and emits raw IPC. */

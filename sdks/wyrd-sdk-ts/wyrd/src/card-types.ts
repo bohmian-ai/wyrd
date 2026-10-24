@@ -121,6 +121,35 @@ export interface AgentSpec {
 }
 
 /**
+ * Explicitly alter one table's definition (`PATCH /v1/bifrost/tables/{namespace}/{name}`).
+ *
+ * The whole request applies atomically against `expected_table_version` and
+ * publishes exactly one new table version; a stale version changes nothing.
+ * At least one field besides the version must make an effective change.
+ * Unknown fields and explicit `null`s are refused, so a field is either
+ * omitted or carries a value.
+ */
+export interface AlterTableRequest {
+  /**
+   * Nullable top-level custom columns to append, in the field-declaration
+   * shape registration uses.
+   */
+  readonly add_columns?: readonly FieldSpec2[];
+  /**
+   * The table version this edit was built from, as last described.
+   */
+  readonly expected_table_version: TableVersion;
+  /**
+   * Layout lists to replace; an omitted list keeps the current one.
+   */
+  readonly physical_layout?: PhysicalLayoutEdit;
+  /**
+   * Top-level custom columns to rename; each keeps its field id and values.
+   */
+  readonly rename_columns?: readonly ColumnRename[];
+}
+
+/**
  * Validated value for free-form Card annotations.
  */
 export type AnnotationValue = string;
@@ -733,6 +762,20 @@ export type ColorMode = "Rgb" | "Rgba" | "Grayscale";
  * DataCard column name.
  */
 export type ColumnName = string;
+
+/**
+ * One top-level custom column rename in an [`AlterTableRequest`].
+ */
+export interface ColumnRename {
+  /**
+   * The column's current name.
+   */
+  readonly from: string;
+  /**
+   * The column's new name, unused by any other column.
+   */
+  readonly to: string;
+}
 
 export type CommitSha = string;
 
@@ -3600,6 +3643,31 @@ export interface PartitionFieldWire {
  * transform semantics, including null preservation.
  */
 export type PartitionTransformWire = "hour" | "day" | "identity" | "bucket" | "truncate";
+
+/**
+ * The layout lists one [`AlterTableRequest`] replaces.
+ *
+ * Each supplied list replaces the table's complete current list and an
+ * omitted one is kept; `bloom_columns: []` removes every Bloom column. The
+ * time column is fixed at creation, so `time_column` is an unknown field
+ * here.
+ */
+export interface PhysicalLayoutEdit {
+  /**
+   * The complete new Bloom column set, which may be empty.
+   */
+  readonly bloom_columns?: readonly string[];
+  /**
+   * The complete new partition list, holding exactly one `hour` or `day`
+   * field over the time column.
+   */
+  readonly partition_by?: readonly PartitionFieldWire[];
+  /**
+   * The complete new sort order; an empty list sorts by the time column
+   * descending, nulls last.
+   */
+  readonly sort_keys?: readonly SortKeyWire[];
+}
 
 /**
  * The authoritative physical layout of one Bifrost table.

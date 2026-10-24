@@ -676,18 +676,18 @@ async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
         evidence.is_none(),
         "an exhausted pass retires its cursor: {evidence:?}"
     );
-    // The route checkpointed a durable resume point inside its own table-version root
-    // while the worker was restarted around it, and never moved that point
-    // backward. Cursor page ordering itself is owned by
+    // The route checkpointed a durable resume point inside its own table's
+    // Forge root, which cleanup scans across every table version, while the
+    // worker was restarted around it, and never moved that point backward. Cursor page ordering itself is owned by
     // `orphan_cleanup::bounded_retry_resumes_after_cursor_without_starvation`.
     assert!(
         !cursors.is_empty(),
         "the bounded route checkpointed no resumable cursor"
     );
-    let root = format!("{}/data/forge/1", promoted.fixture.binding.object_prefix);
+    let root = format!("{}/data/forge/", promoted.fixture.binding.object_prefix);
     assert!(
         cursors.iter().all(|cursor| cursor.starts_with(&root)),
-        "a durable cursor left the table-version root: {cursors:?}"
+        "a durable cursor left the table's Forge root: {cursors:?}"
     );
     assert!(
         cursors.windows(2).all(|pair| pair[0] < pair[1]),

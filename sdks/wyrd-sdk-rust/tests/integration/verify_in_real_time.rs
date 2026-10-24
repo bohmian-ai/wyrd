@@ -1056,7 +1056,8 @@ async fn caller_without_the_verifier_grant_is_refused() {
 /// The retired verification contracts are unknown at the server: a principal
 /// whose stored role still grants `evals:run` or `evals:invoke` is refused by
 /// issuance before anything runs — the token endpoint's ordinary RFC 6749
-/// `server_error` for a role that no longer decodes — and the retired Eval
+/// `server_error` carrying `WYRD_PERMISSION_500_ROLE_CORRUPT` for a role that
+/// no longer decodes — and the retired Eval
 /// tables are listed nowhere and refused for describe, read, and write exactly
 /// as a never-existing namespace is, while the current verification table
 /// still answers.
@@ -1084,7 +1085,11 @@ async fn retired_verification_contracts_are_refused() {
             .verify("answer-check", json!("yes"))
             .await
             .expect_err("a stale evals grant is no grant");
-        assert_eq!(refused.code(), "WYRD_SPEC_500_INTERNAL", "{action}");
+        assert_eq!(
+            refused.code(),
+            "WYRD_PERMISSION_500_ROLE_CORRUPT",
+            "{action}"
+        );
     }
 
     let bifrost = Bifrost::connect_with(&assistant.deployment.admin(), BifrostOptions::default())
@@ -1151,11 +1156,14 @@ async fn exact_verifier_grant_verifies_only_that_verifier() {
     assistant.deployment.shutdown().await;
 }
 
-/// Another tenant's administrator cannot verify this tenant's assistant with
-/// either its assertion or its Agent-check Verifier.
+/// Another tenant's administrator cannot use this tenant's assistant: the
+/// state's root is foreign to that administrator's tenant, so it is refused
+/// exactly as an unknown root is, both when Bifrost starts and when either the
+/// assertion or the Agent-check Verifier is asked to judge.
 ///
 /// # Panics
-/// Panics when the verify succeeds or is refused with another code.
+/// Panics when Bifrost starts or a verify succeeds, or either is refused with
+/// another code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn another_tenant_cannot_verify_the_assistant() {
@@ -1165,7 +1173,11 @@ async fn another_tenant_cannot_verify_the_assistant() {
         .other_tenant_admin("other-tenant")
         .await;
     let state = assistant.state_as(assistant.deployment.client(&foreign));
-    state.start_bifrost().await.expect("Bifrost starts");
+    let refused = state
+        .start_bifrost()
+        .await
+        .expect_err("a foreign root starts no Bifrost");
+    assert_eq!(refused.code(), "WYRD_AUTH_401_WORKLOAD_UID_REFUSED");
     let run = state.run_for_card("agent").expect("agent run opens");
 
     for verifier in ["answer-check", "answer-judged"] {
@@ -1176,7 +1188,7 @@ async fn another_tenant_cannot_verify_the_assistant() {
             .expect_err("another tenant cannot verify");
         assert_eq!(
             refused.code(),
-            "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+            "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
             "{verifier}"
         );
     }
@@ -1273,33 +1285,43 @@ impl Grouped {
         idempotency_key: &str,
         body: &serde_json::Value,
     ) -> ExecutionId {
-        let token = self
-            .client
-            .access_token()
-            .await
-            .expect("access token mints");
-        let response = reqwest::Client::new()
-            .post(format!(
-                "{}/v1/verification/enqueue",
-                deployment
-                    .server()
-                    .base_url()
-                    .expect("bound server has a URL")
-            ))
-            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
-            .header("idempotency-key", idempotency_key)
-            .json(body)
-            .send()
-            .await
-            .expect("the server answers");
-        let status = response.status().as_u16();
-        let accepted: serde_json::Value = response.json().await.expect("the body is JSON");
-        assert_eq!(status, 202, "{accepted}");
-        accepted["execution_id"]
-            .as_str()
-            .and_then(|id| id.parse().ok())
-            .expect("the response names its execution")
+        enqueue_as(&self.client, deployment, idempotency_key, body).await
     }
+}
+
+/// Enqueue `body` over plain HTTP as `client`, with no root it did not sign,
+/// under `idempotency_key`, and return the accepted execution.
+///
+/// # Panics
+/// Panics when no token mints or the submission is not accepted.
+async fn enqueue_as(
+    client: &WyrdClient,
+    deployment: &Deployment,
+    idempotency_key: &str,
+    body: &serde_json::Value,
+) -> ExecutionId {
+    let token = client.access_token().await.expect("access token mints");
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/verification/enqueue",
+            deployment
+                .server()
+                .base_url()
+                .expect("bound server has a URL")
+        ))
+        .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+        .header("idempotency-key", idempotency_key)
+        .json(body)
+        .send()
+        .await
+        .expect("the server answers");
+    let status = response.status().as_u16();
+    let accepted: serde_json::Value = response.json().await.expect("the body is JSON");
+    assert_eq!(status, 202, "{accepted}");
+    accepted["execution_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("the response names its execution")
 }
 
 /// A support conversation populated over three Runs of the Rust SDK, then
@@ -1307,7 +1329,7 @@ impl Grouped {
 /// HTTP enqueue, all as the Service under one `group_id`, is judged once its `after` period expires: the group execution
 /// reads back its group and owner and judges the Service's six turns in call
 /// order. The replay counts once; an ungrouped key conflict joins no group,
-/// and a same-group verify the administrator made with no owning Service and
+/// and a same-group enqueue the administrator made with no owning Service and
 /// a turn from a principal without `verifier:run` on the source Verifier are
 /// excluded, and the binding status names the execution.
 /// A standalone or inline `group_end` Trigger longer than one year is refused
@@ -1398,13 +1420,19 @@ async fn grouped_support_resumes() {
         .wait(WAIT)
         .await
         .expect("the enqueued turn is judged");
-    WyrdState::from_path_with(support.bundle.path().join("bundle"), deployment.admin())
-        .expect("bundle loads")
-        .run_for_card("agent")
-        .expect("agent run opens")
-        .observe()
-        .group_id(group.clone())
-        .verify("turn-check", json!({"answer": ""}))
+    // A WyrdState would carry its Service root for the administrator too, so
+    // the ownerless turn is the administrator's rootless enqueue.
+    let ownerless = enqueue_as(
+        &deployment.admin(),
+        deployment,
+        "support-turn-ownerless",
+        &body(&json!({"answer": ""})),
+    )
+    .await;
+    Execution::connect_with(ownerless, &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(WAIT)
         .await
         .expect("an ownerless turn is judged");
     let unauthorized = deployment

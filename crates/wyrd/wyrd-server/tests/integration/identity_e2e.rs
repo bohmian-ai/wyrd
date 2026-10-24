@@ -200,12 +200,13 @@ async fn card_write_status(srv: &WyrdTestServer, jwt: &str, label: &str) -> Stat
 
 /// Exchange `subject_jwt` through a fresh `writer` actor into a delegated token.
 ///
-/// Returns the delegated token and the actor. The actor's API-key exchange is
-/// a qualifying machine exchange, so it is the one runtime activation this
-/// helper causes.
+/// Returns the delegated token and the actor. A delegating actor must present
+/// a direct Service token bound to its root, so the actor exchanges its key
+/// for its own fixture Card. The actor is unrestricted, not that Card
+/// family's runtime account, so the helper records no runtime activity.
 ///
 /// # Panics
-/// Panics when bootstrap, key exchange, or delegation fails.
+/// Panics when bootstrap, rooted key exchange, or delegation fails.
 async fn delegate_through_writer(
     srv: &WyrdTestServer,
     subject_jwt: &str,
@@ -216,9 +217,9 @@ async fn delegate_through_writer(
         .await
         .expect("actor bootstraps");
     let actor_jwt = srv
-        .exchange_api_key(actor.api_key().expect("actor has key"))
+        .exchange_rooted(&actor)
         .await
-        .expect("actor key exchanges");
+        .expect("actor key exchanges for its root");
     let delegated = srv
         .delegate(subject_jwt, &actor_jwt, TokenAudience::Wyrd)
         .await
@@ -233,24 +234,16 @@ async fn delegate_through_writer(
 /// a Card with the delegated token, which Wyrd authorizes only when
 /// `card_write` survives the subject/actor intersection.
 ///
-/// Returns the actor's principal id, so a journey asserting on activity names
-/// the one activation this helper causes.
-///
 /// # Panics
 /// Panics when bootstrap, exchange, or delegation fails, or the write is not
 /// `201`.
-async fn assert_v1_delegated_write_ok(
-    srv: &WyrdTestServer,
-    subject_jwt: &str,
-    label: &str,
-) -> PrincipalId {
-    let (delegated, actor) = delegate_through_writer(srv, subject_jwt, label).await;
+async fn assert_v1_delegated_write_ok(srv: &WyrdTestServer, subject_jwt: &str, label: &str) {
+    let (delegated, _) = delegate_through_writer(srv, subject_jwt, label).await;
     assert_eq!(
         card_write_status(srv, &delegated, label).await,
         StatusCode::CREATED,
         "{label}: the subject/actor intersection allows card_write"
     );
-    actor.id()
 }
 
 fn response_code(body: &Value) -> &str {
@@ -2057,7 +2050,7 @@ async fn human_oidc_login_journey() {
     assert!(!access_token.is_empty(), "access token is non-empty");
 
     // Step 5: human token reaches a real authenticated /v1 200 via delegation.
-    let first_actor = assert_v1_delegated_write_ok(&srv, access_token, "human-sso").await;
+    assert_v1_delegated_write_ok(&srv, access_token, "human-sso").await;
 
     // Step 6: the CLI session carries a refresh token and renews by rotating
     // it. The grant does not consult the clock, so presenting the refresh
@@ -2081,20 +2074,17 @@ async fn human_oidc_login_journey() {
 
     // Step 7: the successor reaches the same protected /v1 200, proving the
     // renewed session kept the authority the provider asserted at login.
-    let second_actor =
-        assert_v1_delegated_write_ok(&srv, rotated.access_token().secret(), "human-sso-rotated")
-            .await;
+    assert_v1_delegated_write_ok(&srv, rotated.access_token().secret(), "human-sso-rotated").await;
 
     // Neither the human login, refresh, nor delegation records new machine
-    // activity. Connection setup may have activated its card-bound admin;
-    // after login, only the two writer actors may be added to that baseline.
-    let mut expected_actors = baseline_activity;
-    expected_actors.extend([first_actor.as_uuid(), second_actor.as_uuid()]);
-    expected_actors.sort_unstable();
+    // activity, and neither do the unrestricted writer actors' rooted key
+    // exchanges: only a root family's runtime account activates it.
+    // Connection setup may have activated its card-bound admin, so the set
+    // after login must equal that baseline exactly.
     assert_eq!(
         activated_principals(&srv).await,
-        expected_actors,
-        "only the delegation actors' own key exchanges record runtime activity"
+        baseline_activity,
+        "no login, refresh, delegation, or unrestricted actor exchange records runtime activity"
     );
 
     // Step 8: replaying the consumed token is refused and contains the theft.

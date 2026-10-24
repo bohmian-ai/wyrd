@@ -408,7 +408,7 @@ def test_retired_verification_contracts_are_refused(
         state = hydrated(assistant_bundle, WyrdClient(credential=stale))
         with pytest.raises(WyrdError) as raised:
             state.run("agent").observe.verify("answer-check", "yes")
-        assert raised.value.code == "WYRD_SPEC_500_INTERNAL", action
+        assert raised.value.code == "WYRD_PERMISSION_500_ROLE_CORRUPT", action
 
     assert all(table["namespace"] != "vala.eval" for table in bifrost.list_tables())
 
@@ -448,15 +448,17 @@ def test_another_tenant_cannot_verify_the_assistant(
     for verifier in ["answer-check", "answer-judged"]:
         with pytest.raises(WyrdError) as raised:
             run.observe.verify(verifier, "yes")
-        assert raised.value.code == "WYRD_VERIFICATION_404_TARGET_NOT_FOUND"
+        assert raised.value.code == "WYRD_AUTH_401_WORKLOAD_UID_REFUSED"
 
 
-def enqueue_over_http(server: WyrdTestServer, key: str, idempotency_key: str, body: dict) -> str:
-    """Enqueue ``body`` over plain HTTP as ``key`` with ``idempotency_key``; return the execution."""
+def enqueue_over_http(
+    server: WyrdTestServer, client: WyrdClient, idempotency_key: str, body: dict
+) -> str:
+    """Enqueue ``body`` over plain HTTP as ``client`` with ``idempotency_key``; return the execution."""
     response = httpx.post(
         f"{server.base_url}/v1/verification/enqueue",
         headers={
-            "x-wyrd-access-token": f"Bearer {WyrdClient(credential=key).access_token()}",
+            "x-wyrd-access-token": f"Bearer {client.access_token()}",
             "idempotency-key": idempotency_key,
         },
         json=body,
@@ -494,13 +496,17 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
         }
 
     idempotency_key = f"support-turn-{group}"
-    replayed = enqueue_over_http(wyrd_server, key, idempotency_key, body(turns[5]))
-    assert enqueue_over_http(wyrd_server, key, idempotency_key, body(turns[5])) == replayed
+    service = WyrdClient(credential=key, workload_uid=str(registered["support"].uid))
+    replayed = enqueue_over_http(wyrd_server, service, idempotency_key, body(turns[5]))
+    assert enqueue_over_http(wyrd_server, service, idempotency_key, body(turns[5])) == replayed
     admin = client_of(wyrd_server)
     verify.Execution.connect(replayed, admin).wait(WAIT_SECONDS)
-    WyrdState.from_path(bundle, admin).run("agent").observe.verify(
-        "turn-check", {"answer": ""}, group_id=group
+    # A WyrdState would carry its Service root for the administrator too, so
+    # the ownerless turn is the administrator's rootless enqueue.
+    ownerless = enqueue_over_http(
+        wyrd_server, admin, f"support-ownerless-{group}", body({"answer": ""})
     )
+    verify.Execution.connect(ownerless, admin).wait(WAIT_SECONDS)
     other = wyrd_server.scoped_api_key("py_group_other", [verifier_run(cards, "answer-check")])
     with pytest.raises(WyrdError) as denied:
         WyrdState.from_path(bundle, WyrdClient(credential=other)).run("agent").observe.verify(
@@ -524,7 +530,7 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
     # A conflicting replay is refused by the queue after staging; it is sent
     # to its own group so the conversation above keeps its six turns.
     conflicting = {**body({"answer": ""}), "group_id": f"{group}-conflict"}
-    conflict = enqueue_over_http(wyrd_server, key, idempotency_key, conflicting)
+    conflict = enqueue_over_http(wyrd_server, service, idempotency_key, conflicting)
     with pytest.raises(WyrdError) as conflicted:
         verify.Execution.connect(conflict, admin).wait(WAIT_SECONDS)
     assert conflicted.value.code == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
@@ -927,7 +933,7 @@ def test_grouped_conversations_coexist_with_drift(
     newer = declare(cards, "cards/verify_in_real_time/turn-check-newer.yaml")
     late = enqueue_over_http(
         wyrd_server,
-        key,
+        WyrdClient(credential=key, workload_uid=str(registered["support"].uid)),
         f"support-newer-{suffix}",
         {
             "verifier_card_uid": str(newer["turn-check"].uid),

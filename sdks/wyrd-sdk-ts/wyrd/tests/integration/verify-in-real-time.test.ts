@@ -425,7 +425,7 @@ test("retired verification contracts are refused", async ({ server, assistant })
     const run = assistantAs(assistant, WyrdClient.connect({ credential })).run("agent");
 
     await expect(run.observe.verify("answer-check", { answer: "yes" })).rejects.toMatchObject({
-      code: "WYRD_SPEC_500_INTERNAL",
+      code: "WYRD_PERMISSION_500_ROLE_CORRUPT",
     });
   }
 
@@ -470,7 +470,7 @@ test("another tenant cannot verify the assistant", async ({ server, assistant })
 
   for (const verifier of ["answer-check", "answer-judged"]) {
     await expect(run.observe.verify(verifier, { answer: "yes" })).rejects.toMatchObject({
-      code: "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+      code: "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
     });
   }
 });
@@ -561,9 +561,15 @@ test("grouped support resumes", async ({ server, assistant }) => {
     code: "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
   });
   await (await verify.Execution.connect(replayed)).wait({ timeoutMs: WAIT_MS });
-  await WyrdState.fromPath(bundle, { client: WyrdClient.connect() })
-    .run("agent")
-    .observe.verify("turn-check", { answer: "" }, grouping);
+  // A WyrdState would carry its Service root for the administrator too, so
+  // the ownerless turn is the administrator's rootless enqueue.
+  const ownerless = await enqueueOverHttp(
+    server.baseUrl,
+    WyrdClient.connect(),
+    "support-turn-ownerless",
+    body({ answer: "" }),
+  );
+  await (await verify.Execution.connect(ownerless)).wait({ timeoutMs: WAIT_MS });
   const other = server.scopedApiKey("other_verifier", [
     { resource: "verifier", action: "run", scope: { verifier: assistant.answerCheck.uid } },
   ]);

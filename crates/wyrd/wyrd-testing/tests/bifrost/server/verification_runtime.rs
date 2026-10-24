@@ -1291,16 +1291,17 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// bucket set keeps a child value is refused as a partial Struct.
 /// Precedence is pinned: an oversized value that is also
 /// malformed reports its size, a wrong marker on one field outranks invalid
-/// bytes in another, and an undeclared column or a non-Variant type change
-/// outranks each of invalid, over-deep, and oversized Variant bytes. A JSON
+/// bytes in another, and an undeclared column or a non-Variant type change,
+/// each a schema-conformance conflict with the registered schema, outranks
+/// each of invalid, over-deep, and oversized Variant bytes. A JSON
 /// row whose Variant holds an out-of-range integer beside an over-deep branch
 /// is refused for numeric range in both key orders, and also when the integer
 /// sits inside the over-deep branch, before any ACK; that JSON row encodes
 /// against `vala.verification.execution_inputs` on the client.
 /// `vala.traces.spans` covers the Variant nested in `events`, with a missing
 /// marker and with foreign extension metadata, named by its top-level column.
-/// A non-Variant type change on a signal column is refused as an unsupported
-/// type. Afterward the same server accepts the valid sentinel frames and only
+/// A non-Variant type change on a signal column is refused as a
+/// schema-conformance conflict. Afterward the same server accepts the valid sentinel frames and only
 /// they are readable, so no refused frame persisted a row; the accepted log
 /// record's scale-zero `u64::MAX` decimal reads back with every digit.
 ///
@@ -1627,17 +1628,8 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     };
     let frame =
         admission.records_frame(&refused, (inputs(), valid()?), (activation(), valid()?))?;
-    let retyped = BifrostError::UnsupportedType {
-        field: "severity_number".to_owned(),
-        data_type: DataType::Int64.to_string(),
-    };
     admission
-        .refuse(
-            "a non-Variant type change",
-            RECORDS,
-            &wide_severity(frame)?,
-            &retyped,
-        )
+        .refuse_conformance("a non-Variant type change", RECORDS, &wide_severity(frame)?)
         .await?;
     let variant_defects = [
         ("invalid", invalid()?),
@@ -1656,22 +1648,17 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             )
         };
         admission
-            .refuse(
+            .refuse_conformance(
                 &format!("an undeclared column outranks {defect} Variant bytes"),
                 RECORDS,
                 &undeclared(frame()?)?,
-                &BifrostError::UndeclaredField {
-                    field: "undeclared".to_owned(),
-                    row: 0,
-                },
             )
             .await?;
         admission
-            .refuse(
+            .refuse_conformance(
                 &format!("a non-Variant type change outranks {defect} Variant bytes"),
                 RECORDS,
                 &wide_severity(frame()?)?,
-                &retyped,
             )
             .await?;
     }
@@ -2172,6 +2159,27 @@ impl VariantAdmissionJourney {
     ) -> Result<(), ServerJourneyError> {
         match self.refusal(table, batch).await? {
             WyrdError::Vala { error } => expect_eq(what, &error, expected),
+            other => Err(format!("{what} was refused as {other:?}").into()),
+        }
+    }
+
+    /// Require that `batch` is refused as a schema-conformance conflict
+    /// against its table's registered schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description naming `what` when the frame is acked or the
+    /// refusal is any other error.
+    async fn refuse_conformance(
+        &self,
+        what: &str,
+        table: &str,
+        batch: &RecordBatch,
+    ) -> Result<(), ServerJourneyError> {
+        match self.refusal(table, batch).await? {
+            WyrdError::Vala {
+                error: BifrostError::FingerprintMismatch { .. },
+            } => Ok(()),
             other => Err(format!("{what} was refused as {other:?}").into()),
         }
     }

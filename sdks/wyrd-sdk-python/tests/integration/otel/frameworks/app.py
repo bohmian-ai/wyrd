@@ -361,7 +361,9 @@ def main(framework: str, setup: str, scenario: str) -> None:
         from wyrd.otel import install_run_correlation, span_exporter
 
         provider = TracerProvider()
-        provider.add_span_processor(BatchSpanProcessor(span_exporter(WyrdClient())))
+        provider.add_span_processor(
+            BatchSpanProcessor(span_exporter(WyrdClient(), workload_uid=str(state.root_ref.uid)))
+        )
         install_run_correlation(provider)
         trace.set_tracer_provider(provider)
     builders = {

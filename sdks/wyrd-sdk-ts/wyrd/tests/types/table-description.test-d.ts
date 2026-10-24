@@ -1,7 +1,7 @@
 // Compile-only: `mise run ts:typecheck` fails when an assertion here breaks.
 import { expectTypeOf } from "vitest";
 
-import type { TableDescription } from "wyrd-ai";
+import type { TableAlteration, TableDescription } from "wyrd-ai";
 
 type DataType = TableDescription["user_fields"][number]["data_type"];
 
@@ -19,3 +19,9 @@ expectTypeOf<TableDescription["user_fields"][number]["metadata"]>().toEqualTypeO
 expectTypeOf<Extract<DataType, { Timestamp: unknown }>["Timestamp"]["tz"]>().toEqualTypeOf<string | undefined>();
 // The version is an exact integer; only the wire spells it as a string.
 expectTypeOf<TableDescription["table_version"]>().toEqualTypeOf<bigint>();
+// An added column may omit `nullable`, which the server defaults to true, while
+// a description always carries it.
+expectTypeOf<{ name: "note"; data_type: "Utf8" }>().toMatchTypeOf<
+  NonNullable<TableAlteration["add_columns"]>[number]
+>();
+expectTypeOf<TableDescription["user_fields"][number]["nullable"]>().toEqualTypeOf<boolean>();

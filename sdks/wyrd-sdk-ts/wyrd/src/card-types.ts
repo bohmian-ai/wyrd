@@ -134,7 +134,7 @@ export interface AlterTableRequest {
    * Nullable top-level custom columns to append, in the field-declaration
    * shape registration uses.
    */
-  readonly add_columns?: readonly FieldSpec2[];
+  readonly add_columns?: readonly FieldSpec2Input[];
   /**
    * The table version this edit was built from, as last described.
    */
@@ -1313,6 +1313,139 @@ export interface DataTypeSpecFixedSizeBinaryFixedSizeBinary {
 }
 
 /**
+ * Arrow-free logical column type. The exhaustive set Bifrost accepts on the
+ * register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the
+ * server/engine, never in `wyrd-spec`.
+ *
+ * A parameterized variant refuses unknown members, so a misspelled
+ * parameter fails decoding instead of being dropped.
+ */
+export type DataTypeSpecInput = "Bool" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Float32" | "Float64" | "Utf8" | "LargeUtf8" | "Binary" | "LargeBinary" | DataTypeSpecInputFixedSizeBinary | "Date32" | "Date64" | DataTypeSpecInputTimestamp | DataTypeSpecInputTime32 | DataTypeSpecInputTime64 | DataTypeSpecInputDecimal128 | DataTypeSpecInputList | DataTypeSpecInputStruct | DataTypeSpecInputMap | "Variant";
+
+/**
+ * 128-bit fixed-point decimal.
+ */
+export interface DataTypeSpecInputDecimal128 {
+  readonly Decimal128: DataTypeSpecInputDecimal128Decimal128;
+}
+
+export interface DataTypeSpecInputDecimal128Decimal128 {
+  /**
+   * Total number of digits.
+   */
+  readonly precision: number;
+  /**
+   * Number of fractional digits.
+   */
+  readonly scale: number;
+}
+
+/**
+ * Fixed-width binary.
+ */
+export interface DataTypeSpecInputFixedSizeBinary {
+  readonly FixedSizeBinary: DataTypeSpecInputFixedSizeBinaryFixedSizeBinary;
+}
+
+export interface DataTypeSpecInputFixedSizeBinaryFixedSizeBinary {
+  /**
+   * Byte width.
+   */
+  readonly len: number;
+}
+
+/**
+ * Variable-length list whose boxed element declaration carries the child's
+ * name, nullability, metadata, and stable field id.
+ *
+ * The element is a full [`FieldSpec`] rather than a bare type so a nested
+ * child keeps the same identity the physical schema stores; a client that
+ * rebuilds an Arrow schema from a description reproduces the stored list
+ * child exactly instead of inventing a nullable `item`.
+ */
+export interface DataTypeSpecInputList {
+  readonly List: FieldSpec2Input;
+}
+
+/**
+ * Unordered key/value entries, the Iceberg `map` type.
+ *
+ * Key and value are full [`FieldSpec`]s for the same reason as
+ * [`Self::List`]'s element: each keeps its name, nullability, metadata,
+ * and stable field id. An Iceberg map key is always required, so register
+ * stores a key declared nullable as non-nullable.
+ */
+export interface DataTypeSpecInputMap {
+  readonly Map: DataTypeSpecInputMapMap;
+}
+
+export interface DataTypeSpecInputMapMap {
+  /**
+   * Declaration of every entry's key.
+   */
+  readonly key: FieldSpec2Input;
+  /**
+   * Declaration of every entry's value.
+   */
+  readonly value: FieldSpec2Input;
+}
+
+/**
+ * Nested struct of named fields.
+ */
+export interface DataTypeSpecInputStruct {
+  readonly Struct: readonly FieldSpec2Input[];
+}
+
+/**
+ * Time-of-day at second/millisecond precision.
+ */
+export interface DataTypeSpecInputTime32 {
+  readonly Time32: DataTypeSpecInputTime32Time32;
+}
+
+export interface DataTypeSpecInputTime32Time32 {
+  /**
+   * Precision.
+   */
+  readonly unit: TimeUnit;
+}
+
+/**
+ * Time-of-day at microsecond/nanosecond precision.
+ */
+export interface DataTypeSpecInputTime64 {
+  readonly Time64: DataTypeSpecInputTime64Time64;
+}
+
+export interface DataTypeSpecInputTime64Time64 {
+  /**
+   * Precision.
+   */
+  readonly unit: TimeUnit;
+}
+
+/**
+ * Timestamp with explicit precision and optional timezone.
+ */
+export interface DataTypeSpecInputTimestamp {
+  readonly Timestamp: DataTypeSpecInputTimestampTimestamp;
+}
+
+export interface DataTypeSpecInputTimestampTimestamp {
+  /**
+   * IANA timezone string, or `None` for timezone-naive.
+   *
+   * Omitted when `None`; an explicit `null` is refused.
+   */
+  readonly tz?: string;
+  /**
+   * Precision.
+   */
+  readonly unit: TimeUnit;
+}
+
+/**
  * Variable-length list whose boxed element declaration carries the child's
  * name, nullability, metadata, and stable field id.
  *
@@ -1882,6 +2015,35 @@ export interface FieldSpec2 {
    * Whether the column is nullable. Defaults to `true`.
    */
   readonly nullable: boolean;
+}
+
+/**
+ * Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
+ * but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
+ *
+ * Unknown members are refused, so a misspelled key fails decoding instead of
+ * being dropped.
+ */
+export interface FieldSpec2Input {
+  /**
+   * Logical column type.
+   */
+  readonly data_type: DataTypeSpecInput;
+  /**
+   * String metadata carried verbatim through every schema conversion.
+   *
+   * [`PARQUET_FIELD_ID_KEY`] is meaningful to Bifrost: it holds the stored
+   * stable field id as decimal text.
+   */
+  readonly metadata?: Readonly<Record<string, string>>;
+  /**
+   * Column name.
+   */
+  readonly name: string;
+  /**
+   * Whether the column is nullable. Defaults to `true`.
+   */
+  readonly nullable?: boolean;
 }
 
 /**

@@ -153,16 +153,18 @@ test("table configuration preserves versions and values", async ({ server }) => 
   const described = await scored.describeTable("vala.datasets", "scored");
   expect(described.table_version).toBe(1n);
 
-  // Supplied layout lists name columns as they are after this edit's renames.
+  // Supplied layout lists name columns as they are after this edit's renames;
+  // an added column omitting `nullable` takes the server's nullable default.
   const edited = await scored.alterTable("vala.datasets", "scored", {
     expected_table_version: described.table_version,
     physical_layout: { bloom_columns: ["area"] },
-    add_columns: [{ name: "note", data_type: "Utf8", nullable: true }],
+    add_columns: [{ name: "note", data_type: "Utf8" }],
     rename_columns: [{ from: "region", to: "area" }],
   });
 
   expect(edited.table_version).toBe(2n);
   expect(edited.user_fields.map((field) => field.name)).toEqual(["request_id", "area", "note"]);
+  expect(edited.user_fields.find((field) => field.name === "note")?.nullable).toBe(true);
   expect(edited.physical_layout.bloom_columns).toEqual(["area"]);
   expect(edited.physical_layout.partition_by).toEqual(described.physical_layout.partition_by);
   await expect(scored.describeTable("vala.datasets", "scored")).resolves.toEqual(edited);

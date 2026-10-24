@@ -28,7 +28,7 @@ use reqwest::Client;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_testing::capacity::{
@@ -307,14 +307,17 @@ pub struct Driven {
 }
 
 /// Launches every arrival of `schedule` from `start` as its instant comes,
-/// never waiting on a response: each sent arrival holds one of `slots`
-/// (sized `cap`) until the future `launch` returns for it completes. Returns
-/// once every sent call has completed.
+/// never waiting on a response: each sent arrival runs in `calls`, the
+/// measurement's owned task set, and holds one of `slots` (sized `cap`)
+/// until the future `launch` returns for it completes. Returns once every
+/// sent call has completed. Dropping the future stops launching at once;
+/// calls still in flight stay in `calls` for their owner to abort and join.
 pub async fn open_loop<F, Fut>(
     schedule: &Schedule,
     start: Instant,
     slots: Arc<Semaphore>,
     cap: usize,
+    calls: &Mutex<JoinSet<()>>,
     mut launch: F,
 ) -> Driven
 where
@@ -339,7 +342,9 @@ where
         driven.lateness_us.push(crate::gateway::run::micros(late));
         driven.sent += 1;
         let call = launch(planned);
-        tokio::spawn(async move {
+        let mut calls = calls.lock().unwrap_or_else(PoisonError::into_inner);
+        while calls.try_join_next().is_some() {}
+        calls.spawn(async move {
             call.await;
             drop(slot);
         });
@@ -803,53 +808,51 @@ impl Driver {
         }
     }
 
-    /// Spawns the [`contention`] arrivals of `schedule` from `start`, each
-    /// marked `<label>-<index>` so its upstream send times match, holding at
-    /// most [`MAX_IN_FLIGHT`] of `slots`. Resolves with the driver's counts
-    /// and every sent call once all have completed.
-    pub fn spawn(
+    /// Launches the [`contention`] arrivals of `schedule` from `start` into
+    /// `calls`, each marked `<label>-<index>` so its upstream send times
+    /// match, holding at most [`MAX_IN_FLIGHT`] of `slots`. Resolves with the
+    /// driver's counts and every sent call once all have completed; the
+    /// caller's future owns the schedule, so cancelling it stops launching.
+    pub async fn drive(
         &self,
         schedule: Schedule,
         start: Instant,
-        label: String,
+        label: &str,
         slots: Arc<Semaphore>,
-    ) -> JoinHandle<(Driven, Vec<Arrived>)> {
-        let driver = self.clone();
-        tokio::spawn(async move {
-            let arrived = Arc::new(Mutex::new(Vec::new()));
-            let launch = |planned: Planned| {
-                let (tenant, stream) = contention(planned.index);
-                let keys = &driver.keys[tenant];
-                let key = keys[usize::try_from(planned.index).unwrap_or(0) % keys.len()].clone();
-                let marker = format!("{label}-{}", planned.index);
-                let shape = driver.shapes[usize::from(stream)].clone();
-                let body = shape.body(&marker);
-                let (http, upstream, arrived) = (
-                    driver.http.clone(),
-                    Arc::clone(&driver.upstream),
-                    Arc::clone(&arrived),
-                );
-                async move {
-                    let timed = call(&http, &key, &shape, body).await;
-                    let sends = upstream.take(&marker);
-                    arrived
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push(Arrived {
-                            tenant,
-                            stream,
-                            offset: planned.offset,
-                            timed,
-                            sends,
-                            server: Vec::new(),
-                        });
-                }
-            };
-            let driven = open_loop(&schedule, start, slots, MAX_IN_FLIGHT, launch).await;
-            let arrived =
-                std::mem::take(&mut *arrived.lock().unwrap_or_else(PoisonError::into_inner));
-            (driven, arrived)
-        })
+        calls: &Mutex<JoinSet<()>>,
+    ) -> (Driven, Vec<Arrived>) {
+        let arrived = Arc::new(Mutex::new(Vec::new()));
+        let launch = |planned: Planned| {
+            let (tenant, stream) = contention(planned.index);
+            let keys = &self.keys[tenant];
+            let key = keys[usize::try_from(planned.index).unwrap_or(0) % keys.len()].clone();
+            let marker = format!("{label}-{}", planned.index);
+            let shape = self.shapes[usize::from(stream)].clone();
+            let body = shape.body(&marker);
+            let (http, upstream, arrived) = (
+                self.http.clone(),
+                Arc::clone(&self.upstream),
+                Arc::clone(&arrived),
+            );
+            async move {
+                let timed = call(&http, &key, &shape, body).await;
+                let sends = upstream.take(&marker);
+                arrived
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(Arrived {
+                        tenant,
+                        stream,
+                        offset: planned.offset,
+                        timed,
+                        sends,
+                        server: Vec::new(),
+                    });
+            }
+        };
+        let driven = open_loop(&schedule, start, slots, MAX_IN_FLIGHT, calls, launch).await;
+        let arrived = std::mem::take(&mut *arrived.lock().unwrap_or_else(PoisonError::into_inner));
+        (driven, arrived)
     }
 }
 
@@ -908,12 +911,16 @@ pub struct Capacity {
     collector: Option<Collector>,
     /// Where the server log is copied when it stops.
     log: PathBuf,
+    /// Every call the measurement launched; a cancelled measurement leaves
+    /// its in-flight calls here for [`Workload::finish`] to abort and join
+    /// before the drain.
+    calls: Mutex<JoinSet<()>>,
 }
 
 impl Capacity {
     /// An unprepared workload that will copy the server log to `log`.
     #[must_use]
-    pub const fn new(log: PathBuf) -> Self {
+    pub fn new(log: PathBuf) -> Self {
         Self {
             server: None,
             upstream: None,
@@ -921,6 +928,7 @@ impl Capacity {
             driver: None,
             collector: None,
             log,
+            calls: Mutex::new(JoinSet::new()),
         }
     }
 
@@ -996,14 +1004,16 @@ impl Capacity {
         let (traffic, baseline) = Window::open(server, collector, Selection::RESOURCES).await?;
         let start = Instant::now() + LEAD;
         let label = format!("{}-{phase:?}", step.id);
-        let driving = driver.spawn(
-            phases.schedule(rate),
-            start,
-            label.clone(),
-            Arc::clone(&slots),
-        );
         let driving = async {
-            let driven = driving.await;
+            let driven = driver
+                .drive(
+                    phases.schedule(rate),
+                    start,
+                    &label,
+                    Arc::clone(&slots),
+                    &self.calls,
+                )
+                .await;
             stop.cancel();
             driven
         };
@@ -1014,7 +1024,7 @@ impl Capacity {
         };
         let (driven, backlog, boundaries) =
             tokio::join!(driving, sample(server, &slots, start, &stop), boundaries);
-        let (driven, mut calls) = driven?;
+        let (driven, mut calls) = driven;
         let (usage, ended) = traffic.close(server).await?;
         let drain = settle(server).await?;
         let last = server.metrics().await?;
@@ -1150,12 +1160,19 @@ impl Workload for Capacity {
             .map_err(ExperimentError::workload)
     }
 
-    /// Settles and stops the server loss-free.
+    /// Aborts and joins every call a cancelled measurement left in flight,
+    /// so no request arrives during the drain, then settles and stops the
+    /// server loss-free.
     ///
     /// # Errors
     ///
     /// Returns every reason the stop was not loss-free.
     async fn finish(&mut self) -> std::result::Result<(), ExperimentError> {
+        self.calls
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .shutdown()
+            .await;
         let Some(server) = self.server.take() else {
             return Ok(());
         };
@@ -1167,10 +1184,12 @@ impl Workload for Capacity {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
     use tokio::time::Instant;
     use wyrd_testing::capacity::{Population, Timing, Usage};
     use wyrd_testing::experiment::Reading;
@@ -1181,6 +1200,51 @@ mod tests {
     };
     use crate::gateway::run::{BUFFERED, Drain, Integrity, STREAM_END, STREAM_HEAD, SUCCEEDED};
     use crate::gateway::workload::{Outcome, Timed};
+
+    /// Cancelling the scheduler before a later due arrival launches nothing
+    /// more, leaves the calls in flight in the measurement's owned set, and
+    /// aborting and joining that set, as finish does before its drain,
+    /// leaves no live call.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an arrival launches after cancellation or a call
+    /// outlives the join.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_scheduler_launches_nothing_and_its_calls_are_joined() {
+        let calls = Mutex::new(JoinSet::new());
+        let launched = AtomicU64::new(0);
+        let live = Arc::new(());
+        let schedule = Schedule::new(vec![(10.0, Duration::from_secs(1))]);
+        let driving = open_loop(
+            &schedule,
+            Instant::now(),
+            Arc::new(Semaphore::new(100)),
+            100,
+            &calls,
+            |_| {
+                launched.fetch_add(1, Ordering::Relaxed);
+                let held = Arc::clone(&live);
+                async move {
+                    std::future::pending::<()>().await;
+                    drop(held);
+                }
+            },
+        );
+        let cut = tokio::time::timeout(Duration::from_millis(250), driving).await;
+        assert!(cut.is_err(), "the schedule outlasts the cut");
+        let at_cancel = launched.load(Ordering::Relaxed);
+        assert_eq!(at_cancel, 3, "arrivals at 0, 100, and 200 ms");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(launched.load(Ordering::Relaxed), at_cancel);
+        assert_eq!(Arc::strong_count(&live), 4, "three calls stay owned");
+        calls
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown()
+            .await;
+        assert_eq!(Arc::strong_count(&live), 1, "no call outlives the join");
+    }
 
     /// Open-loop arrivals keep the offered rate whatever responses do,
     /// count a stalled driver's late arrivals missed instead of bursting
@@ -1222,6 +1286,7 @@ mod tests {
             .build()
             .expect("a paused test runtime");
         runtime.block_on(async {
+            let calls = Mutex::new(JoinSet::new());
             let schedule = Schedule::new(vec![(100.0, Duration::from_secs(1))]);
             let slow = || async { tokio::time::sleep(Duration::from_secs(5)).await };
             let driven = open_loop(
@@ -1229,6 +1294,7 @@ mod tests {
                 Instant::now(),
                 Arc::new(Semaphore::new(1_000)),
                 1_000,
+                &calls,
                 |_| slow(),
             )
             .await;
@@ -1244,6 +1310,7 @@ mod tests {
                 Instant::now(),
                 Arc::new(Semaphore::new(2)),
                 2,
+                &calls,
                 |_| slow(),
             )
             .await;
@@ -1254,12 +1321,14 @@ mod tests {
             .build()
             .expect("a test runtime");
         runtime.block_on(async {
+            let calls = Mutex::new(JoinSet::new());
             let schedule = Schedule::new(vec![(1_000.0, Duration::from_millis(100))]);
             let driven = open_loop(
                 &schedule,
                 Instant::now(),
                 Arc::new(Semaphore::new(1_000)),
                 1_000,
+                &calls,
                 |planned| {
                     if planned.index == 10 {
                         std::thread::sleep(Duration::from_millis(60));

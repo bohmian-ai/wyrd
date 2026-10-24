@@ -198,9 +198,10 @@ pub async fn describe_table(
 ///
 /// # Cancellation and partial progress
 ///
-/// As [`vala_bifrost_redux::catalog::BifrostCatalog::alter_table`]: a request
-/// dropped after the catalog's native publication commits may leave the new
-/// version committed without its control projection or notification.
+/// As [`vala_bifrost_redux::catalog::BifrostCatalog::alter_table`]: the edit
+/// commits or rolls back as one, so a dropped request changes nothing or
+/// leaves the whole edit committed, and a lost response can hide only a
+/// complete commit.
 pub async fn alter_table(
     state: &AppState,
     caller: Caller,

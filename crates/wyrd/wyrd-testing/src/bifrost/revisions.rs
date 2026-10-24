@@ -159,6 +159,15 @@ impl WyrdTestServer {
     /// described version and current layout, and returns the committed
     /// description.
     ///
+    /// # Repetition, cancellation, and retry
+    ///
+    /// Every revision helper commits through this one. Each call describes
+    /// the table anew and edits from that version, so it is not idempotent:
+    /// repeating an effective call commits a further version, never a retry
+    /// of the first. The edit commits or rolls back as one, so dropping the
+    /// future before it returns either changes nothing or leaves the whole
+    /// edit committed; it is not retried, and a refused edit panics.
+    ///
     /// # Panics
     ///
     /// Panics when the table cannot be described or the edit does not commit.
@@ -183,6 +192,8 @@ impl WyrdTestServer {
     /// Bloom-only definition edit that leaves every schema, spec, and sort
     /// order id unchanged and still advances the table version by one.
     ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
+    ///
     /// # Panics
     ///
     /// Panics when the revision does not commit.
@@ -201,6 +212,8 @@ impl WyrdTestServer {
 
     /// Commits a new default sort order — the current keys plus `value`
     /// descending — and returns the id the committed order carries.
+    ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
     ///
     /// # Panics
     ///
@@ -240,6 +253,8 @@ impl WyrdTestServer {
     /// Commits a partition spec that keeps the current fields except the
     /// `shard` bucket.
     ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
+    ///
     /// # Panics
     ///
     /// Panics when the revision does not commit.
@@ -253,6 +268,8 @@ impl WyrdTestServer {
     /// Commits a partition spec that keeps the current fields and adds an
     /// identity partition on `column`, so rows the old spec grouped together
     /// can fan out into one tuple per distinct `column` value.
+    ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
     ///
     /// # Panics
     ///
@@ -276,6 +293,8 @@ impl WyrdTestServer {
     /// `shard` into `buckets`, so the new spec's tuples have the same shape
     /// and can hold the same values as the old spec's.
     ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
+    ///
     /// # Panics
     ///
     /// Panics when the revision does not commit.
@@ -296,6 +315,8 @@ impl WyrdTestServer {
     /// Commits a schema that renames `customer` to `client` under its field
     /// id and adds a nullable `note` string.
     ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
+    ///
     /// # Panics
     ///
     /// Panics when the revision does not commit.
@@ -314,6 +335,8 @@ impl WyrdTestServer {
 
     /// Commits the complete layout lists `edit` derives from the current
     /// layout, with no schema change.
+    ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
     ///
     /// # Panics
     ///
@@ -334,6 +357,8 @@ impl WyrdTestServer {
     }
 
     /// Commits the current partition fields as `revise` changes them.
+    ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
     ///
     /// # Panics
     ///

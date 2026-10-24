@@ -1391,7 +1391,7 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
 /// An edit returns the definition it committed even when the next edit is
 /// already waiting.
 ///
-/// Edit A is paused right after its native publication commits. Edit B, built
+/// Edit A is paused right after its native publication is staged. Edit B, built
 /// from A's new version, cannot publish while A is paused, because A still
 /// holds the table's registration lock and projects its response under it.
 /// Released, A returns its own version and Bloom list, B then returns the

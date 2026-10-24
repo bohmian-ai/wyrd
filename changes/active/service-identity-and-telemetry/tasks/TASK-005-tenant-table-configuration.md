@@ -278,3 +278,40 @@ Limits:
 - FIND-4 needs a spec revision. `architecture/wyrd-security-posture.md` bars the operator pool from handlers. Migration `20260619000000_iceberg_catalog.sql` grants the tenant login no access to `iceberg_catalog`; tenant work reaches a pointer only through the read-only definer `vala.oracle_catalog_metadata_location`. So the native pointer CAS on the catalog login and the TenantConn/RLS projection cannot share one transaction without a new security decision: either a write-capable definer, or tenant SQL on the catalog login. The partial-progress window is documented on every entry point.
 - Without a live listener, the registration and definition caches no longer serve. Admission then reads its authority uncached, as the cut cache already does.
 - Non-goals stayed excluded. No unrelated files changed.
+
+## Remediation R2 Evidence
+
+Remediation: `review/TASK-005-a9d1fd2c2/TASK-005-R2-tenant-bound-atomic-publication.md`. Commits `b39e4fb5e..1a34d4ded` on prior candidate `a9d1fd2c2`.
+
+Reuse: `BifrostCatalog::alter_table` stays the one publisher. It stages the edited metadata with public Iceberg APIs (`TableUpdate::apply`, `MetadataLocation`, `TableMetadata::write_to`). It then publishes inside its existing TenantConn transaction through one new narrow definer, `vala.bifrost_publish_table_definition`, which follows the `oracle_catalog_metadata_location` pattern. That definer is the only gap. Neither fork pin changed: the definer does the pointer CAS and records the retained version reference, and the unchanged fork still owns every other catalog commit.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-4 single commit/rollback | `alter_table`: definer swap + `upsert_table` + `announce_definition_change` + projection in one TenantConn; uncertain COMMIT resolved from the pointer | `catalog::bifrost_catalog::production_pin_tests::a_dropped_edit_publishes_nothing` (RED at a9d1fd2c2: described `TableVersion(2)` after the drop; GREEN after) | PASS |
+| FIND-4 committed edit, restart, peer refresh, accepted retry | unchanged R1 listener/cache owners | `describe::tenant_layout_overrides_survive_restart_and_refresh`, `describe::an_edit_returns_its_own_committed_definition`, `scribe::accepted_retry::an_unheard_edit_still_governs_new_admission` | PASS |
+| FIND-4 separate-login boundary and CAS | migration `20261026000000_bifrost_definition_publication.sql`; `olap_catalog::publish_definition` | `pg_oracle_membership::pg_tests::definition_publication_is_tenant_bound_and_transactional`: direct catalog write denied; refuses another tenant, an unregistered table, another identity, a foreign directory, a skipped version and a stale pointer; rollback publishes nothing; commit records exactly v2 | PASS |
+| FIND-4 concurrent data commits | bounded replan (`PUBLICATION_ATTEMPTS`) when the swap misses at an unchanged version | the six revision journeys and the describe suite (red before the replan, see diagnosis) | PASS |
+| FIND-5 helper contract | `revisions.rs::alter_table_from_current` "Repetition, cancellation, and retry" section, referenced by all 8 helpers; `alter_table` and `service.rs` cancellation prose matches the single commit | `mise run lints` | PASS |
+
+Diagnosis (unexpected journey failures after the first atomic cut):
+- **Symptom:** `describe::tenant_layout_overrides_survive_restart_and_refresh` and `write_read::mixed_runtime_specifications_preserve_rows_and_pins` failed with `TableVersionConflict` at the unchanged version 1.
+- **Evidence:** a `Forge commit notice recorded` line for the same table appears right before each failure. The definer's `metadata_location = p_expected_location` swap missed.
+- **Cause:** Forge promotion commits move the pointer without changing the definition. The old `Transaction::commit` path rebased the edit through the fork's `update_table`; the fixed-base swap did not.
+- **Fix site:** `BifrostCatalog::alter_table` replans from the moved pointer. All callers (server, SDKs, `revisions.rs`) route through it.
+- **Independent diagnostician:** same cause and fix site; no SQL change needed.
+
+A second red came from an inverted swap condition in the replan. Instrumentation showed the pointer unchanged after a "successful" edit. It was fixed in the same commit.
+
+Commands, each run under `scripts/postgres/with-test-postgres.sh` after `db:migrate:all:inner`:
+- `cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support -E 'test(/a_dropped_edit_publishes_nothing$/)'`: 1 passed.
+- `cargo nextest run --locked -p vala-sql --test integration`: 66 passed.
+- `cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'test(/^describe::/)'`: 7 passed.
+- The six revision journeys (R1 selectors, `test(/::name$/)` form): 6 passed.
+- `mise run test:bifrost:integration:redux`: 934 passed.
+- `mise run fmt`, `lints`, `check:deps`, `check:tenant-isolation`, `git diff --check`: pass.
+
+Limits:
+- The TS/Python edit journeys were not rerun. Client code is unchanged, and the server path is covered by the Rust/HTTP describe journeys.
+- No native or Python declaration changed, so codegen was not rerun.
+- An unreferenced staged metadata file is left behind on a dropped or replanned edit; storage cleanup is a non-goal.
+- Non-goals stayed excluded: no grants, no role, no operator transaction, no fork change, no journal, no public contract change.

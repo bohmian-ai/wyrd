@@ -10863,6 +10863,7 @@ name = "wyrd-telemetry"
 version = "0.3.0"
 dependencies = [
  "http",
+ "metrics",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-proto",

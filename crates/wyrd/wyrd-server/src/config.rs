@@ -3521,13 +3521,9 @@ impl WyrdServerConfig {
         }
 
         // 15. telemetry.sample_ratio, when set, must be in [0.0, 1.0].
-        if let Some(ratio) = self.telemetry.sample_ratio
-            && !(0.0..=1.0).contains(&ratio)
-        {
-            return Err(ConfigError::Invalid {
-                message: format!("telemetry.sample_ratio must be in [0.0, 1.0], got {ratio}"),
-            });
-        }
+        self.telemetry
+            .operator_sample_ratio()
+            .map_err(|message| ConfigError::Invalid { message })?;
 
         // 16. Each trusted_issuers entry must have non-empty required fields and
         //     coherent client_auth (secret present iff secret_basic/secret_post).

@@ -228,6 +228,11 @@ export declare class NativeBifrost {
    * Returns a napi error only when the native result cannot be projected;
    * a malformed request and every Wyrd control failure are returned in
    * [`NativeLifecycleResult`].
+   *
+   * # Cancellation
+   *
+   * The edit runs to completion once started; a lost or abandoned result
+   * may leave it committed, so describe the table before retrying.
    */
   alterTable(namespace: string, name: string, requestJson: string): Promise<NativeLifecycleResult>
 }

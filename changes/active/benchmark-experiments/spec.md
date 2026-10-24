@@ -65,7 +65,7 @@ SDK, HTTP, MCP, or UI product workflow. The public contributor surfaces are
 `mise` commands, documentation, JSON records, and baseline configuration.
 
 Non-goals: optimize an engine; change durability, authorization, or admission;
-add benchmark CI wiring or any gate dependency; run benchmarks during drafting;
+add benchmark CI wiring or any gate dependency;
 reproduce ClickBench; publish marketing rankings; add platform-specific resource
 isolation; import historical results as records; commit samples or profiles;
 automatically stage or commit benchmark output. L1 and L2 remain opt-in and
@@ -302,7 +302,7 @@ forwarded through mise (for example, `mise run bench:l1:bifrost -- --profile`);
 experiment or alternative command. `benchmarks/README.md` explains levels, budgets, prerequisites,
 validity, metrics/units, baseline eligibility, exits, examples, and how to read
 a record, with a pointer from `TESTING.md`. Commands and documentation above
-are future implementation obligations, not edits authorized during this draft.
+are implementation obligations.
 
 ### Historical baselines and regression
 
@@ -317,8 +317,7 @@ reports; PR 150 pre-merge `cfe21dc90` supplies metrics without eligible primary
 evidence. The [eligible/excluded value mapping](research.md#eligible-and-excluded-baseline-mapping)
 is incorporated into REQ-011: its selected values, units, source identities and
 eligibility/exclusion statuses specify the initial `baselines.toml` entries
-being approved. Its provenance narrative remains supporting evidence. Do not
-create TOML in this draft. Exclude merged `5c775110f` telemetry (uncommitted fork patch);
+being approved. Its provenance narrative remains supporting evidence. Exclude merged `5c775110f` telemetry (uncommitted fork patch);
 its standard reads are superseded. Never divide by host core count. Preserve
 absent/incompatible evidence explicitly; do not invent, overwrite, or average
 baselines from different setups. Historical latency and total-rate figures
@@ -378,7 +377,7 @@ never stages or commits automatically. Raw samples, logs, and profiles remain
 under `target/` with optional record references, not embedded in the summary.
 
 Schema version 1 is an explicit persisted contract. The following field names
-and meanings are proposed for approval; nested metric/criterion entries carry
+and meanings are approved; nested metric/criterion entries carry
 stable identifiers and explicit units rather than formatted table strings.
 
 | Required JSON field | Meaning |
@@ -497,7 +496,7 @@ or into `wyrd-spec`. No new dependency is required: sysinfo is already in the
 workspace and samply is an optional external tool. The approved tools are
 constraints; private implementation choices remain open.
 
-## Expensive-to-reverse decisions proposed for approval
+## Approved expensive-to-reverse decisions
 
 1. **Ownership:** one `wyrd-testing::experiment` workflow for all three engines;
    engine-specific workload behavior remains with existing owners.
@@ -515,14 +514,12 @@ constraints; private implementation choices remain open.
 7. **Validity versus failure:** INVALID has precedence and exit 2; valid criterion
    misses exit 1; every step is judged, including overload/recovery.
 
-The maintainer approved the D-1–D-4 decisions and OS-agnostic benchmark decision
-reflected here; the whole revision still awaits separate approval. Changing these meanings after approval needs a spec
+The maintainer approved these decisions with revision 3. Changing these meanings after approval needs a spec
 revision; choosing private functions, algorithms, and fixture file structure does not.
 
 ## Acceptance: user and agent journeys
 
-These are future evidence obligations, not claims that verification ran while
-writing the draft. Stable IDs map promises once in the final column. Real
+These are evidence obligations, not claims that verification has run. Stable IDs map promises once in the final column. Real
 workload journeys use the actual release server through public SDK/OTLP/Gateway
 surfaces and repository Postgres/storage dependencies. Where suitable, existing
 `WyrdTestServer` journeys verify production seams; they do not substitute for
@@ -542,7 +539,7 @@ MCP API that would require a new product-surface projection.
 | AC-009 — Maintainer checks migration and discoverability | README and TESTING explain invocation and records; coverage mapping has no lost workload; old tasks/aliases, dead thresholds/SloGate/load exports and duplicate code are gone. Every client-queue step judges criteria; Gateway has declared capacity SLO constants. Static consumer/task/docs inventory plus relevant existing correctness lanes; no benchmark added to CI/gates. | REQ-010, REQ-016 |
 | AC-010 — Operator checks preserved production guarantees | Wrong results and unexpected loss fail valid runs; tenant-negative journeys cannot expose data; acknowledged writes survive existing durability checks; audit stays non-blocking and accounted; fixture cleanup remains scoped and credentials never enter summaries. Existing security/storage journeys and focused record privacy/cancellation checks are credible evidence. | INV-001, INV-002, INV-003, INV-006 |
 
-No benchmark execution is needed to review this draft. Implementation planning
+Implementation planning
 must select exact focused commands and evidence under approved decisions; no
 new test names or speculative task packet is prescribed here.
 

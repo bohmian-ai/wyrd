@@ -858,14 +858,14 @@ mod pg_tests {
         journey.publish().await;
         let rows = journey
             .query(&format!(
-                "SELECT trace_state, card_uid FROM {SPANS_TABLE} \
+                "SELECT trace_state, subject_card_uid FROM {SPANS_TABLE} \
                  WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}' ORDER BY trace_state"
             ))
             .await;
         let mut stored = Vec::new();
         for batch in &rows {
             let markers = support::column::<StringArray>(batch, "trace_state");
-            let cards = support::column::<StringArray>(batch, "card_uid");
+            let cards = support::column::<StringArray>(batch, "subject_card_uid");
             for index in 0..batch.num_rows() {
                 stored.push((
                     markers.value(index).to_owned(),
@@ -1306,7 +1306,7 @@ mod pg_tests {
         let (table, scope, marker) = signal.ledger();
         let rows = journey
             .query(&format!(
-                "SELECT {marker}, sub_principal_id, card_uid FROM {table} \
+                "SELECT {marker}, sub_principal_id, subject_card_uid FROM {table} \
                  WHERE scope_name = '{scope}'"
             ))
             .await;
@@ -1314,7 +1314,7 @@ mod pg_tests {
         for batch in &rows {
             let markers = support::column::<StringArray>(batch, marker);
             let publishers = support::column::<StringArray>(batch, "sub_principal_id");
-            let cards = support::column::<StringArray>(batch, "card_uid");
+            let cards = support::column::<StringArray>(batch, "subject_card_uid");
             for index in 0..batch.num_rows() {
                 stored
                     .entry(publishers.value(index).to_owned())

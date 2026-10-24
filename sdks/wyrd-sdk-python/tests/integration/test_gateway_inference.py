@@ -151,12 +151,12 @@ def test_gateway_call_records_a_lone_run_or_card(server: WyrdTestServer, admin: 
 
     server.flush_bifrost()
     calls = Bifrost(client=admin).sql(
-        "SELECT run_id, card_uid FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id",
+        "SELECT run_id, subject_card_uid FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id",
         [principal_id],
     )
     assert calls.to_arrow().to_pylist() == [
-        {"run_id": "run-alone", "card_uid": None},
-        {"run_id": None, "card_uid": card_uid},
+        {"run_id": "run-alone", "subject_card_uid": None},
+        {"run_id": None, "subject_card_uid": card_uid},
     ]
 
 
@@ -212,7 +212,7 @@ def test_agent_prompt_routes(
             expected.append(
                 {
                     "run_id": run.run_id,
-                    "card_uid": str(state.card_ref(alias).uid),
+                    "subject_card_uid": str(state.card_ref(alias).uid),
                     "sub_principal_id": principal_id,
                     "deployment": deployment,
                 }
@@ -225,7 +225,7 @@ def test_agent_prompt_routes(
         calls(
             server,
             f"sub_principal_id = '{principal_id}'",
-            "run_id, card_uid, sub_principal_id, requested_model.deployment AS deployment",
+            "run_id, subject_card_uid, sub_principal_id, requested_model.deployment AS deployment",
         )
         == expected
     )

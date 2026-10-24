@@ -132,7 +132,7 @@ async function assertCalledAsSystem(executionId: string, principal: string, run:
     `SELECT r.sub_principal_id AS result_subject, r.act_principal_id AS result_actor, r.run_id AS result_run,
             c.sub_principal_id AS call_subject, c.act_principal_id AS call_actor, c.run_id AS call_run
        FROM bifrost.verification.results r
-       JOIN bifrost.gateway.calls c ON c.card_uid = r.card_uid
+       JOIN bifrost.gateway.calls c ON c.subject_card_uid = r.subject_card_uid
       WHERE r.execution_id = $1`,
     [executionId],
     ResultJudgeCall,
@@ -234,7 +234,7 @@ test("judge call is attributed to the run and card", async ({ server, assistant,
     calls.every((call) => call.act_principal_id !== assistant.principal),
     JSON.stringify(calls),
   ).toBe(true);
-  expect(calls.map((call) => [call.sub_principal_id, call.run_id, call.card_uid])).toEqual([
+  expect(calls.map((call) => [call.sub_principal_id, call.run_id, call.subject_card_uid])).toEqual([
     [assistant.principal, run.runId, result.subject.uid],
   ]);
   await assertCalledAsSystem(result.execution_id, assistant.principal, run.runId);
@@ -244,7 +244,7 @@ test("judge call without a run joins the callers trace attributed to the card", 
   const execution = await verifyOverHttp(server.baseUrl, assistant, `00-${CALLER_TRACE}-${CALLER_SPAN}-01`);
 
   const calls = await judgeCalls(server);
-  expect(calls.map((call) => [call.sub_principal_id, call.run_id, call.card_uid])).toEqual([
+  expect(calls.map((call) => [call.sub_principal_id, call.run_id, call.subject_card_uid])).toEqual([
     [assistant.principal, null, assistant.agent.uid],
   ]);
   const spans = await timeline(server, CALLER_TRACE);

@@ -861,19 +861,19 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Encodes one complete `bifrost.verification.results` row with `card_uid`.
+/// Encodes one complete `bifrost.verification.results` row with `subject_card_uid`.
 ///
 /// Carries every authored column of the built-in result table, taken from
 /// [`ResultsTable::arrow_fields`] so the row tracks the canonical declaration:
 /// a completed passing result with an empty outcome, every optional column
-/// null, and `card_uid` in the correlation column.
+/// null, and `subject_card_uid` in the correlation column.
 ///
 /// # Panics
 ///
 /// Panics when the fixed Arrow batch or IPC stream cannot be constructed.
-fn verification_result_ipc(card_uid: &str) -> Vec<u8> {
+fn verification_result_ipc(subject_card_uid: &str) -> Vec<u8> {
     let mut fields = ResultsTable::arrow_fields();
-    fields.push(Field::new("card_uid", DataType::Utf8, true));
+    fields.push(Field::new("subject_card_uid", DataType::Utf8, true));
     let now = Utc::now().timestamp_micros();
     let columns: Vec<ArrayRef> = fields
         .iter()
@@ -887,7 +887,7 @@ fn verification_result_ipc(card_uid: &str) -> Vec<u8> {
             ("started_at" | "ended_at", data_type) => Arc::new(
                 TimestampMicrosecondArray::from(vec![now]).with_data_type(data_type.clone()),
             ),
-            ("card_uid", _) => Arc::new(StringArray::from(vec![card_uid])),
+            ("subject_card_uid", _) => Arc::new(StringArray::from(vec![subject_card_uid])),
             ("outcome", _) => {
                 VariantColumnBuilder::encode("outcome", [Some(serde_json::json!({}))], |value| {
                     EncodedVariant::from_json(&value)

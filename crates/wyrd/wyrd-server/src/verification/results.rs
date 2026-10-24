@@ -5,10 +5,11 @@
 //! `bifrost.drift.result_features`, and the execution's pinned inputs onto
 //! `bifrost.verification.execution_inputs`, taken from the tables' own declarations so
 //! the payload can never drift from the registered contract. Every batch also
-//! carries the two correlation columns Scribe admits from a native payload:
-//! `card_uid` (the Card verified; the Verifier is the authored
-//! `verifier_card_uid`) and `run_id` (the application Run judged, null when
-//! none, as for scheduled drift).
+//! carries the three correlation columns Scribe admits from a row-attributed
+//! payload: `workload_card_uid` (the binding owner), `subject_card_uid` (the
+//! Card verified; the Verifier is the authored `verifier_card_uid`), and
+//! `run_id` (the application Run judged, null when none, as for scheduled
+//! drift).
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap};
@@ -33,7 +34,10 @@ use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, Verific
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::UTC_TIME_ZONE;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::vala::managed_columns::{CARD_UID, RUN_ID};
+use wyrd_spec::vala::managed_columns::{
+    DEPLOYMENT_ENVIRONMENT, RUN_ID, SERVICE_NAME, SERVICE_VERSION, SUBJECT_CARD_UID, SUBJECT_KIND,
+    SUBJECT_NAME, SUBJECT_VERSION, WORKLOAD_CARD_UID,
+};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
     CallProvenance, InputDeclaration, RequirementDetail, RequirementResult, VerificationOutcome,
@@ -78,7 +82,7 @@ pub enum ResultPayloadError {
 type NamedColumn = (&'static str, ArrayRef);
 
 /// The one schema every row of each result table shares: the table's fields
-/// followed by `card_uid` and `run_id`, keyed by its table type.
+/// followed by the [`CORRELATION`] columns, keyed by its table type.
 ///
 /// Each result row is its own batch until the Scribe outbox concatenates a
 /// slice of them, so one shared schema lets the outbox group rows by pointer
@@ -87,10 +91,7 @@ static SCHEMAS: LazyLock<[(TypeId, SchemaRef); 3]> = LazyLock::new(|| {
     /// `T`'s fields followed by the correlation columns, keyed by `T`.
     fn schema<T: DomainTable + 'static>() -> (TypeId, SchemaRef) {
         let mut fields = T::arrow_fields();
-        fields.extend([
-            Field::new(CARD_UID, DataType::Utf8, true),
-            Field::new(RUN_ID, DataType::Utf8, true),
-        ]);
+        fields.extend(CORRELATION.map(|name| Field::new(name, DataType::Utf8, true)));
         (TypeId::of::<T>(), Arc::new(Schema::new(fields)))
     }
     [
@@ -99,6 +100,10 @@ static SCHEMAS: LazyLock<[(TypeId, SchemaRef); 3]> = LazyLock::new(|| {
         schema::<ExecutionInputsTable>(),
     ]
 });
+
+/// The correlation columns every result row carries after its table's
+/// fields, in this order.
+const CORRELATION: [&str; 3] = [WORKLOAD_CARD_UID, SUBJECT_CARD_UID, RUN_ID];
 
 /// One sealed-ready batch and the table it is written to.
 #[derive(Debug, Clone)]
@@ -173,15 +178,17 @@ pub struct ResultRun<'a> {
     pub run_id: Option<&'a RunId>,
     /// Exact Verifier Card version used.
     pub verifier_version: &'a str,
-    /// The Card verified, stored as the managed `card_uid`.
+    /// The Card verified, stored as the managed `subject_card_uid`.
     pub card_uid: &'a CardUid,
-    /// Owner Service: the binding owner for binding-created work, else the
-    /// authenticated caller's owner Service; `None` when neither is known.
+    /// Owner Service, stored as the managed `workload_card_uid`: the binding
+    /// owner for binding-created work, else the authenticated caller's owner
+    /// Service; `None` when neither is known.
     pub owner_card_uid: Option<&'a CardUid>,
     /// Caller group the execution belongs to; `None` when ungrouped.
     pub group_id: Option<&'a GroupId>,
     /// Deployment environment tag the execution was accepted with, stored
-    /// unchanged as `deployment_environment`; `None` when it carried none.
+    /// unchanged as every row's `deployment_environment`; `None` when it
+    /// carried none.
     pub deployment_environment: Option<&'a str>,
     /// Binding; `None` for an execution with no binding.
     pub binding_id: Option<BindingId>,
@@ -300,17 +307,12 @@ impl<'a> ResultPayloadBuilder<'a> {
             ("execution_status", text([Some("completed")])),
             ("verdict", text([Some(verdict)])),
             ("verifier_version", text([Some(self.run.verifier_version)])),
-            ("owner_card_uid", text([self.owner()])),
             (
                 "verifier_card_uid",
                 text([Some(self.verifier_uid.as_str())]),
             ),
             ("binding_id", text([self.binding()])),
             ("group_id", text([self.group()])),
-            (
-                "deployment_environment",
-                text([self.run.deployment_environment]),
-            ),
             ("trigger_identity", text([trigger])),
             (
                 "window_start",
@@ -366,17 +368,12 @@ impl<'a> ResultPayloadBuilder<'a> {
                 "execution_id",
                 text([Some(self.run.execution_id.to_string())]),
             ),
-            ("owner_card_uid", text([self.owner()])),
             (
                 "verifier_card_uid",
                 text([Some(self.verifier_uid.as_str())]),
             ),
             ("binding_id", text([self.binding()])),
             ("group_id", text([self.group()])),
-            (
-                "deployment_environment",
-                text([self.run.deployment_environment]),
-            ),
             (
                 "queue_execution",
                 Arc::new(BooleanArray::from(vec![submission.is_some()])),
@@ -458,10 +455,6 @@ impl<'a> ResultPayloadBuilder<'a> {
                 text(rows.iter().map(|row| Some(row.requirement))),
             ),
             (
-                "owner_card_uid",
-                text(std::iter::repeat_n(self.owner(), count)),
-            ),
-            (
                 "verifier_card_uid",
                 text(std::iter::repeat_n(Some(self.verifier_uid.as_str()), count)),
             ),
@@ -535,11 +528,12 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Order named columns by `schema`'s table fields, then append the
     /// correlation columns.
     ///
-    /// `schema` is a table's fields followed by `card_uid` and `run_id`.
+    /// `schema` is a table's fields followed by the [`CORRELATION`] columns.
     /// Every authored column must fill exactly one table field by name; the
     /// arrays are placed in field order, never in authoring order, so a
-    /// reordered declaration keeps each value under its own name. The
-    /// correlation columns repeat for the authored row count.
+    /// reordered declaration keeps each value under its own name. The shared
+    /// dimensions and correlation columns repeat the run's context for the
+    /// authored row count.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::ColumnMismatch`] with problem
@@ -561,9 +555,20 @@ impl<'a> ResultPayloadBuilder<'a> {
                 });
             }
         }
+        named.extend(
+            [
+                (SERVICE_NAME, None),
+                (SERVICE_VERSION, None),
+                (DEPLOYMENT_ENVIRONMENT, self.run.deployment_environment),
+                (SUBJECT_KIND, None),
+                (SUBJECT_NAME, None),
+                (SUBJECT_VERSION, None),
+            ]
+            .map(|(name, value)| (name, text(std::iter::repeat_n(value, rows)))),
+        );
         let fields = schema.fields();
         let mut arrays = Vec::with_capacity(fields.len());
-        for field in &fields[..fields.len().saturating_sub(2)] {
+        for field in &fields[..fields.len().saturating_sub(CORRELATION.len())] {
             let array = named.remove(field.name().as_str()).ok_or_else(|| {
                 ResultPayloadError::ColumnMismatch {
                     column: field.name().clone(),
@@ -578,6 +583,7 @@ impl<'a> ResultPayloadBuilder<'a> {
                 problem: "unexpected",
             });
         }
+        arrays.push(text(std::iter::repeat_n(self.owner(), rows)));
         arrays.push(text(std::iter::repeat_n(
             Some(self.run.card_uid.as_str()),
             rows,

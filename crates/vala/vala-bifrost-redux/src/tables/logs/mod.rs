@@ -622,7 +622,7 @@ mod tests {
             "only the two defective records are lost"
         );
 
-        let card_uids = typed::<StringArray>(&batch, "card_uid");
+        let card_uids = typed::<StringArray>(&batch, "subject_card_uid");
         assert!(
             card_uids.is_null(0),
             "a missing wyrd.card_uid projects null"

@@ -182,7 +182,7 @@ mod tests {
     /// The canonical union a traces table resolves: managed floor plus the
     /// declaration-only correlation columns.
     fn declared_recipe() -> Vec<String> {
-        ["run_id", "card_uid", "trace_id", "span_id"]
+        ["run_id", "subject_card_uid", "trace_id", "span_id"]
             .into_iter()
             .map(str::to_owned)
             .collect()
@@ -198,7 +198,7 @@ mod tests {
         let bloom_columns = declared_recipe();
         let properties = bifrost_writer_properties(TIME_COLUMN, &bloom_columns);
 
-        for column in ["service_name", "run_id", "message", "card_uid"] {
+        for column in ["service_name", "run_id", "message", "subject_card_uid"] {
             let path = ColumnPath::from(column);
             assert!(
                 properties.dictionary_enabled(&path),
@@ -303,7 +303,7 @@ mod tests {
     /// footer recipe.
     #[test]
     fn writer_recipe_blooms_exactly_the_resolved_union() {
-        let floor = ["card_uid".to_owned(), "run_id".to_owned()];
+        let floor = ["subject_card_uid".to_owned(), "run_id".to_owned()];
         let properties = bifrost_writer_properties(TIME_COLUMN, &floor);
         for column in &floor {
             assert!(

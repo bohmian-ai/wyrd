@@ -611,7 +611,7 @@ impl Bifrost {
         correlation: Correlation,
     ) -> Result<(), BifrostClientError> {
         self.writer
-            .insert(table, row, correlation.card_uid, correlation.run_id)
+            .insert(table, row, correlation.subject_card_uid, correlation.run_id)
             .map_err(Into::into)
     }
 
@@ -667,7 +667,12 @@ impl Bifrost {
         correlation: Correlation,
     ) -> Result<(), BifrostClientError> {
         self.writer
-            .insert_rows(table, rows, correlation.card_uid, correlation.run_id)
+            .insert_rows(
+                table,
+                rows,
+                correlation.subject_card_uid,
+                correlation.run_id,
+            )
             .map_err(Into::into)
     }
 
@@ -716,7 +721,12 @@ impl Bifrost {
             .and_then(TableConfig::writer_table)
             .ok_or(BifrostClientError::NoActiveTable)?;
         self.writer
-            .insert(&table, row, correlation.card_uid, correlation.run_id)
+            .insert(
+                &table,
+                row,
+                correlation.subject_card_uid,
+                correlation.run_id,
+            )
             .map_err(Into::into)
     }
 

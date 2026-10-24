@@ -15,8 +15,7 @@ use arrow::datatypes::Field;
 use crate::tables::fields::{CanonicalField as F, CanonicalType as T, canonical_arrow_fields};
 use crate::tables::signal;
 use crate::tables::{
-    CanonicalBatchValidator, CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc,
-    sort_desc,
+    CanonicalBatchValidator, DomainTable, PayloadClass, attributed_layout, hourly_layout,
 };
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::PhysicalLayoutWire;
@@ -110,6 +109,9 @@ pub static SPAN_FIELDS: &[F] = &[
     F::meta("gen_ai_usage_output_tokens", T::Int64, true),
     F::meta("service_version", T::Utf8, true),
     F::meta("deployment_environment", T::Utf8, true),
+    F::meta("subject_kind", T::Utf8, true),
+    F::meta("subject_name", T::Utf8, true),
+    F::meta("subject_version", T::Utf8, true),
     F::meta("http_request_method", T::Utf8, true),
     F::meta("http_route", T::Utf8, true),
     F::meta("http_response_status_code", T::Int64, true),
@@ -125,7 +127,6 @@ pub struct SpansTable;
 impl DomainTable for SpansTable {
     const NAMESPACE: &'static str = "traces";
     const NAME: &'static str = "spans";
-    const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[
         "attributes",
@@ -147,19 +148,7 @@ impl DomainTable for SpansTable {
     }
 
     fn physical_layout() -> PhysicalLayoutWire {
-        hourly_layout(
-            "start_time_unix_nano",
-            vec![sort_desc("start_time_unix_nano"), sort_asc("trace_id")],
-            &[
-                "run_id",
-                "card_uid",
-                "sub_principal_id",
-                "act_principal_id",
-                "trace_id",
-                "span_id",
-                "service_name",
-            ],
-        )
+        attributed_layout(hourly_layout, "start_time_unix_nano", &["trace_id"])
     }
 }
 

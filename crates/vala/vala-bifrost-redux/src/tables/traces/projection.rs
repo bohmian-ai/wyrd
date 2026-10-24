@@ -678,6 +678,18 @@ impl SpanColumns {
             i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
             utf8_opt_column(&self.service_version),
             utf8_opt_column(&self.deployment_environment),
+            arrow::array::new_null_array(
+                &arrow::datatypes::DataType::Utf8,
+                self.service_name.len(),
+            ),
+            arrow::array::new_null_array(
+                &arrow::datatypes::DataType::Utf8,
+                self.service_name.len(),
+            ),
+            arrow::array::new_null_array(
+                &arrow::datatypes::DataType::Utf8,
+                self.service_name.len(),
+            ),
             utf8_opt_column(&self.http_request_method),
             utf8_opt_column(&self.http_route),
             i64_opt_column(self.http_response_status_code),

@@ -168,9 +168,9 @@ test("table configuration preserves versions and values", async ({ server }) => 
   expect(edited.physical_layout.bloom_columns).toEqual(["area"]);
   expect(edited.physical_layout.partition_by).toEqual(described.physical_layout.partition_by);
   await expect(scored.describeTable("bifrost.datasets", "scored")).resolves.toEqual(edited);
-  await expect(scored.sql("SELECT request_id, area, note FROM bifrost.datasets.scored", [], Labelled)).resolves.toEqual([
-    { request_id: "req-1", area: "us-east", note: null },
-  ]);
+  await expect(scored.sql("SELECT request_id, area, note FROM bifrost.datasets.scored", [], Labelled)).resolves.toEqual(
+    [{ request_id: "req-1", area: "us-east", note: null }],
+  );
 
   const cleared = await scored.alterTable("bifrost.datasets", "scored", {
     expected_table_version: edited.table_version,

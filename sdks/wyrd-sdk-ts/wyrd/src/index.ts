@@ -660,7 +660,7 @@ export interface TableLayout {
 
 /** Optional per-row correlation; an omitted field is a null on the wire. */
 export interface Correlation {
-  cardUid?: string;
+  subjectCardUid?: string;
   runId?: string;
 }
 
@@ -1234,12 +1234,12 @@ export class Bifrost {
    * saturated queue throws the stable refusal rather than dropping the row.
    *
    * @param row - One row object matching the active table's columns.
-   * @param correlation - Optional `cardUid` and `runId` stamped on the row.
+   * @param correlation - Optional `subjectCardUid` and `runId` stamped on the row.
    * @throws {@link WyrdError} with no active table, for a malformed
-   * `cardUid`, or when the queue is full.
+   * `subjectCardUid`, or when the queue is full.
    */
   insert(row: Readonly<Record<string, unknown>>, correlation: Correlation = {}): void {
-    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardUid, correlation.runId));
+    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.subjectCardUid, correlation.runId));
   }
 
   /**
@@ -1543,11 +1543,11 @@ function cardRefText(ref: CardRef | string): string {
  * @param schema - The table's JSON Schema, or a schema that emits one, mapped
  * to the Arrow schema of the row.
  * @param row - One row object matching `schema`.
- * @param correlation - Optional `cardUid` and `runId` stamped on the row;
+ * @param correlation - Optional `subjectCardUid` and `runId` stamped on the row;
  * omitted, the row is uncorrelated.
  * @throws {@link WyrdError} `WYRD_VALA_400_SCHEMA_PARSE` for a schema that
  * does not map to Arrow, or `WYRD_SPEC_400_VALIDATION` for unparsable schema
- * text or a malformed `cardUid`.
+ * text or a malformed `subjectCardUid`.
  */
 export function record(
   bifrost: Bifrost,
@@ -1561,7 +1561,7 @@ export function record(
       table,
       jsonSchemaText(schema),
       JSON.stringify(row),
-      correlation.cardUid,
+      correlation.subjectCardUid,
       correlation.runId,
     ),
   );

@@ -360,7 +360,7 @@ impl Sources {
             .iter()
             .map(|(card, verifier)| {
                 format!(
-                    "(card_uid = {} AND verifier_card_uid = {})",
+                    "(subject_card_uid = {} AND verifier_card_uid = {})",
                     ObservationWindow::text(card),
                     ObservationWindow::text(verifier)
                 )
@@ -368,7 +368,7 @@ impl Sources {
             .collect::<Vec<_>>()
             .join(" OR ");
         let eligible = format!(
-            "owner_card_uid = {} AND ({})",
+            "workload_card_uid = {} AND ({})",
             ObservationWindow::text(owner),
             if any.is_empty() { "false" } else { &any }
         );
@@ -398,7 +398,7 @@ impl Sources {
     }
 
     /// The one statement reading every visible source row matching `group`:
-    /// `(surface, card_uid, verifier_card_uid, execution_id, result_id, at,
+    /// `(surface, subject_card_uid, verifier_card_uid, execution_id, result_id, at,
     /// recorded, payload)`, inputs alone without a `results` table. `at` is
     /// the managed `wyrd_ingested_at`; `recorded` is the server-recorded
     /// input time, or a result's execution start; `payload` is the input
@@ -409,7 +409,7 @@ impl Sources {
     fn read(&self, group: &str, results: bool) -> String {
         let input = |slot: &SourceSlot| matches!(slot.field, SourceField::Input(_));
         let inputs = format!(
-            "SELECT 'i' AS surface, card_uid, verifier_card_uid, execution_id, \
+            "SELECT 'i' AS surface, subject_card_uid, verifier_card_uid, execution_id, \
              CAST(NULL AS VARCHAR) AS result_id, wyrd_ingested_at AS at, \
              recorded_at AS recorded, CASE WHEN {} THEN inputs END AS payload \
              FROM bifrost.verification.execution_inputs WHERE {} AND {group}",
@@ -420,7 +420,7 @@ impl Sources {
             return inputs;
         }
         format!(
-            "{inputs} UNION ALL SELECT 'r' AS surface, card_uid, verifier_card_uid, \
+            "{inputs} UNION ALL SELECT 'r' AS surface, subject_card_uid, verifier_card_uid, \
              execution_id, result_id, wyrd_ingested_at AS at, \
              started_at AS recorded, CASE WHEN {} THEN outcome END AS payload \
              FROM bifrost.verification.results WHERE {} AND {group}",
@@ -435,7 +435,7 @@ impl Sources {
     /// Returns [`GroupPollError::Read`] when a tuple column is missing or
     /// malformed.
     fn tuple(&self, batch: &RecordBatch, row: usize) -> Result<Option<usize>, GroupPollError> {
-        let card = text(batch, "card_uid", row)?;
+        let card = text(batch, "subject_card_uid", row)?;
         let verifier = text(batch, "verifier_card_uid", row)?;
         Ok(self.tuples.iter().position(|(c, v)| {
             card.as_deref() == Some(c.as_str()) && verifier.as_deref() == Some(v.as_str())

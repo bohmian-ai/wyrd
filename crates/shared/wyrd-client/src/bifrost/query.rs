@@ -1937,7 +1937,7 @@ mod tests {
     /// the user fields, supplies the correlation inputs, and may supply the
     /// managed candidate. Building a schema from that description must append
     /// each correlation column exactly once — a writer that also re-declared
-    /// `card_uid` would collide with the one the write path resolves.
+    /// `subject_card_uid` would collide with the one the write path resolves.
     ///
     /// # Panics
     ///
@@ -1962,7 +1962,7 @@ mod tests {
                   "metadata": { "PARQUET:field_id": "1" } }
             ],
             "correlation_fields": [
-                { "name": "card_uid", "data_type": "Utf8", "nullable": true,
+                { "name": "subject_card_uid", "data_type": "Utf8", "nullable": true,
                   "metadata": { "PARQUET:field_id": "1001" } },
                 { "name": "run_id", "data_type": "Utf8", "nullable": true,
                   "metadata": { "PARQUET:field_id": "1000" } }
@@ -1995,7 +1995,7 @@ mod tests {
                 .iter()
                 .map(|field| field.name().as_str())
                 .collect::<Vec<_>>(),
-            ["trace_id", "card_uid", "run_id"],
+            ["trace_id", "subject_card_uid", "run_id"],
             "user fields precede correlation inputs and no managed column is writable"
         );
         assert!(
@@ -2013,14 +2013,14 @@ mod tests {
                 .output_schema()
                 .fields()
                 .iter()
-                .filter(|field| field.name() == "card_uid")
+                .filter(|field| field.name() == "subject_card_uid")
                 .count(),
             1,
             "the write path appends each correlation column exactly once"
         );
         assert!(
             writable.field(1).is_nullable(),
-            "card_uid is nullable: a writer may submit a row with no Card correlation"
+            "subject_card_uid is nullable: a writer may submit a row with no Card correlation"
         );
         assert!(
             builder.output_schema().field(1).is_nullable(),

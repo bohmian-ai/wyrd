@@ -2115,7 +2115,6 @@ fn resolve_registration_layout(
         || {
             Schema::new(crate::tables::managed_columns::ensure_managed_columns(
                 user_fields.to_vec(),
-                crate::tables::CorrelationPolicy::Observation,
             ))
         },
         Clone::clone,

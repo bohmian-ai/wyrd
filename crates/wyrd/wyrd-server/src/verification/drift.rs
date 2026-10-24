@@ -113,12 +113,12 @@ fn retry(code: &str, message: impl Into<String>) -> EngineOutcome {
 /// One run's subject and frozen `created_at` window over the observation table.
 ///
 /// A pure value: it renders the fixed SQL and never executes it. Every
-/// statement filters the exact subject `card_uid`, one feature `series`, and
+/// statement filters the exact `subject_card_uid`, one feature `series`, and
 /// `created_at`, the table's time column, in `[start, end)` before its
 /// method-specific aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationWindow {
-    /// Observed subject Card UID as the managed `card_uid` column stores it.
+    /// Observed subject Card UID as the managed `subject_card_uid` column stores it.
     subject: String,
     /// Inclusive window start.
     start: DateTime<Utc>,
@@ -157,7 +157,7 @@ impl ObservationWindow {
     /// also satisfy `filter`.
     fn rows_in(&self, filter: &str) -> String {
         format!(
-            "FROM {OBSERVATIONS} WHERE card_uid = {} AND {filter} \
+            "FROM {OBSERVATIONS} WHERE subject_card_uid = {} AND {filter} \
              AND created_at >= {} AND created_at < {}",
             Self::text(&self.subject),
             Self::instant(self.start),
@@ -1036,7 +1036,9 @@ mod tests {
             .iter()
             .map(|field| -> Arc<dyn Array> {
                 match field.name().as_str() {
-                    "card_uid" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0))),
+                    "subject_card_uid" => {
+                        Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0)))
+                    }
                     "series" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
                     "num_value" => Arc::new(rows.iter().map(|r| r.2).collect::<Float64Array>()),
                     "str_value" => Arc::new(rows.iter().map(|r| r.3).collect::<StringArray>()),

@@ -331,12 +331,12 @@ test("gateway call records a lone run or card", async ({ server, ask }) => {
   const calls = (
     await (
       await Bifrost.connect()
-    ).sql("SELECT run_id, card_uid FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id", [
+    ).sql("SELECT run_id, subject_card_uid FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id", [
       issued.principalId,
     ])
   ).toArrow();
   expect(columnValues(calls.getChild("run_id"))).toEqual(["run-alone", null]);
-  expect(columnValues(calls.getChild("card_uid"))).toEqual([null, cardUid]);
+  expect(columnValues(calls.getChild("subject_card_uid"))).toEqual([null, cardUid]);
 });
 
 test("state httpAuth supplies service and agent context", async ({ server, provider, ask: _ }) => {
@@ -407,12 +407,13 @@ test("state httpAuth supplies service and agent context", async ({ server, provi
   const calls = (
     await (
       await Bifrost.connect()
-    ).sql("SELECT card_uid, run_id FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at", [
-      issued.principalId,
-    ])
+    ).sql(
+      "SELECT subject_card_uid, run_id FROM bifrost.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at",
+      [issued.principalId],
+    )
   ).toArrow();
   const runIds = columnValues(calls.getChild("run_id")) as unknown[];
-  const rows = (columnValues(calls.getChild("card_uid")) as unknown[]).map((cardUid, index) => [
+  const rows = (columnValues(calls.getChild("subject_card_uid")) as unknown[]).map((cardUid, index) => [
     cardUid,
     runIds[index],
   ]);

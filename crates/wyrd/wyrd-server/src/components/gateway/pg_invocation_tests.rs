@@ -3466,7 +3466,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     assert_eq!(
         calls.card_scope,
         std::slice::from_ref(&uid),
-        "Scribe stamps card_uid from exactly the attributed Agent"
+        "Scribe stamps subject_card_uid from exactly the attributed Agent"
     );
     let row =
         arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(calls.ipc.clone()), None)
@@ -3481,7 +3481,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
             .value(0)
             .to_owned()
     };
-    assert_eq!(text("card_uid"), uid.as_str());
+    assert_eq!(text("subject_card_uid"), uid.as_str());
     assert_eq!(text("run_id"), run.as_str());
 
     let ghost = CardUid::new(Uuid::now_v7().to_string()).expect("a UUID is a Card UID");

@@ -1195,6 +1195,18 @@ impl PointColumns {
             utf8_opt_column(&self.service_name),
             utf8_opt_column(&self.service_version),
             utf8_opt_column(&self.deployment_environment),
+            arrow::array::new_null_array(
+                &arrow::datatypes::DataType::Utf8,
+                self.service_name.len(),
+            ),
+            arrow::array::new_null_array(
+                &arrow::datatypes::DataType::Utf8,
+                self.service_name.len(),
+            ),
+            arrow::array::new_null_array(
+                &arrow::datatypes::DataType::Utf8,
+                self.service_name.len(),
+            ),
             utf8_opt_column(&self.card_uid),
             utf8_opt_column(&self.run_id),
         ];

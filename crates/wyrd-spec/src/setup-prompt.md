@@ -89,7 +89,7 @@ write a machine-specific path into a project file.
    `bifrost.query` with this SQL, replacing `<uid>`:
 
    ```sql
-   SELECT result_id, run_id, card_uid, verdict FROM bifrost.verification.results WHERE card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
+   SELECT result_id, run_id, subject_card_uid, verdict FROM bifrost.verification.results WHERE subject_card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
    ```
 
    Rows become queryable shortly after the server publishes them; repeat the

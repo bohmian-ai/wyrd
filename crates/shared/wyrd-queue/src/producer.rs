@@ -482,8 +482,8 @@ impl Producer {
 
     /// Admits one row without waiting.
     ///
-    /// `card_uid` is optional because Card correlation is: an omitted value
-    /// becomes a null in the sealed batch's `card_uid` column, which the server
+    /// `subject_card_uid` is optional because Card correlation is: an omitted value
+    /// becomes a null in the sealed batch's `subject_card_uid` column, which the server
     /// stores against the authenticated principal with no Card. `trace` is as
     /// for [`Self::enqueue_prepared`].
     ///
@@ -493,11 +493,11 @@ impl Producer {
     pub fn enqueue(
         &self,
         json: Vec<u8>,
-        card_uid: Option<CardUid>,
+        subject_card_uid: Option<CardUid>,
         run_id: Option<RunId>,
         trace: Option<TraceContext>,
     ) -> Result<(), WyrdQueueError> {
-        self.enqueue_rows(vec![json], card_uid, run_id, trace)
+        self.enqueue_rows(vec![json], subject_card_uid, run_id, trace)
     }
 
     /// Prepares and admits every row of one logical record, or none of them,
@@ -515,13 +515,13 @@ impl Producer {
     pub fn enqueue_rows(
         &self,
         rows: Vec<Vec<u8>>,
-        card_uid: Option<CardUid>,
+        subject_card_uid: Option<CardUid>,
         run_id: Option<RunId>,
         trace: Option<TraceContext>,
     ) -> Result<(), WyrdQueueError> {
         let prepared = self
             .preflight
-            .prepare(&rows, card_uid.as_ref(), run_id.as_ref())?;
+            .prepare(&rows, subject_card_uid.as_ref(), run_id.as_ref())?;
         drop(rows);
         self.enqueue_prepared(prepared, trace)
     }

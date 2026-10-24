@@ -2,8 +2,8 @@
 //!
 //! The user fields are the `GatewayCallPayloadV1` record in declaration order,
 //! except that its two canonical payload JSON texts are stored as the Variant
-//! columns `request_payload` and `response_payload`; the Observation policy appends the canonical
-//! managed envelope. Only the gateway capture principal may write the table,
+//! columns `request_payload` and `response_payload`, followed by the shared
+//! Service and subject dimensions; the catalog appends the managed envelope. Only the gateway capture principal may write the table,
 //! which Gate enforces, and the two payload columns require the additional
 //! payload-read permission, which Oracle enforces.
 
@@ -15,7 +15,7 @@ use wyrd_types::variant::variant_field;
 
 use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8};
 use crate::tables::{
-    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
+    DomainTable, PayloadClass, attributed_layout, hourly_layout, with_shared_dimensions,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
@@ -82,7 +82,6 @@ impl CallsTable {
 impl DomainTable for CallsTable {
     const NAMESPACE: &'static str = "gateway";
     const NAME: &'static str = "calls";
-    const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     /// Both Variant payload columns require payload-read authority.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[REQUEST_PAYLOAD, RESPONSE_PAYLOAD];
@@ -95,7 +94,7 @@ impl DomainTable for CallsTable {
     /// managed subject/actor pair; enums are their snake-case wire names; unsigned integers
     /// widen to the next signed Iceberg type; decimals stay exact strings.
     fn arrow_fields() -> Vec<Field> {
-        vec![
+        with_shared_dimensions(vec![
             int32("schema_version", false),
             utf8("call_id", false),
             utf8("request_id", false),
@@ -140,22 +139,13 @@ impl DomainTable for CallsTable {
                 Self::payload_object_refs_type(),
                 false,
             ),
-        ]
+        ])
     }
 
-    /// Partitions hourly on `started_at` and clusters by call identity.
+    /// Hourly partitions on `started_at`, attribution-sorted, Bloom-pruned on
+    /// the shared attribution set and `call_id`.
     fn physical_layout() -> PhysicalLayoutWire {
-        hourly_layout(
-            "started_at",
-            vec![sort_desc("started_at"), sort_asc("call_id")],
-            &[
-                "run_id",
-                "card_uid",
-                "sub_principal_id",
-                "act_principal_id",
-                "call_id",
-            ],
-        )
+        attributed_layout(hourly_layout, "started_at", &["call_id"])
     }
 }
 
@@ -166,7 +156,8 @@ mod tests {
     use super::{CallsTable, RESOLVED_MODEL};
     use crate::tables::{DomainTable, builtin_table};
     use wyrd_spec::vala::{
-        ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+        ACT_PRINCIPAL_ID, RUN_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID,
+        WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
 
     /// Pins the exact contract columns, their nullability, the two model
@@ -210,8 +201,15 @@ mod tests {
                 ("request_payload", true),
                 ("response_payload", true),
                 ("payload_object_refs", false),
+                ("service_name", true),
+                ("service_version", true),
+                ("deployment_environment", true),
+                ("subject_kind", true),
+                ("subject_name", true),
+                ("subject_version", true),
+                (WORKLOAD_CARD_UID, true),
+                (SUBJECT_CARD_UID, true),
                 (RUN_ID, true),
-                (CARD_UID, true),
                 (SUB_PRINCIPAL_ID, false),
                 (ACT_PRINCIPAL_ID, false),
                 (WYRD_REQUEST_ID, false),

@@ -240,8 +240,9 @@ fn assert_payload_modes_agree(
 
 /// The managed envelope every canonical signal table owns, in schema order.
 const MANAGED_COLUMNS: &[&str] = &[
+    "workload_card_uid",
+    "subject_card_uid",
     "run_id",
-    "card_uid",
     "sub_principal_id",
     "act_principal_id",
     "wyrd_request_id",

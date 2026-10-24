@@ -739,7 +739,7 @@ mod pg_tests {
     /// `verification.get_execution` reaches `completed` with a failed result
     /// naming the exact Verifier and subject, and no Operator dispatch.
     /// `bifrost.query` returns exactly one failed summary row for that
-    /// execution, stamped with the calling Service as `owner_card_uid`, a null
+    /// execution, stamped with the calling Service as `workload_card_uid`, a null
     /// `binding_id` and the exact subject UID. A reader is refused the enqueue; another tenant's
     /// administrator cannot read the execution back, and its `bifrost.query`
     /// reads its own provisioned, empty result table.
@@ -830,7 +830,7 @@ mod pg_tests {
         let summary = rows(
             &agent_client,
             format!(
-                "SELECT execution_status, verdict, card_uid, owner_card_uid, binding_id \
+                "SELECT execution_status, verdict, subject_card_uid, workload_card_uid, binding_id \
                  FROM bifrost.verification.results WHERE execution_id = '{execution_id}'"
             ),
         )

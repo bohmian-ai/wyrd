@@ -27,9 +27,20 @@ use crate::observe::{ProjectedColumn, invalid_observation, require_projection, r
 /// the caller never emitted.
 const MAX_EXACT_INT: i64 = 1 << 53;
 
+/// The shared Service and subject dimensions every projected row leaves
+/// null for the server to derive from its validated context.
+const DIMENSIONS: [&str; 6] = [
+    "service_name",
+    "service_version",
+    "deployment_environment",
+    "subject_kind",
+    "subject_name",
+    "subject_version",
+];
+
 /// The user columns `drift(...)` projects, in `bifrost.drift.observations` order.
-fn projection_columns() -> [ProjectedColumn; 6] {
-    [
+fn projection_columns() -> Vec<ProjectedColumn> {
+    let mut columns = vec![
         ("record_id", DataType::Utf8, false),
         ("series", DataType::Utf8, false),
         ("num_value", DataType::Float64, true),
@@ -43,7 +54,9 @@ fn projection_columns() -> [ProjectedColumn; 6] {
             ),
             false,
         ),
-    ]
+    ];
+    columns.extend(DIMENSIONS.map(|name| (name, DataType::Utf8, true)));
+    columns
 }
 
 /// Verify a described fixed Drift table accepts this projection.
@@ -107,7 +120,8 @@ pub(crate) fn observation(
 /// Project one canonical observation into one tall row per feature.
 ///
 /// Each row repeats the logical `record_id`, optional `session_id`, and
-/// `created_at`; `series` is the validated feature name. `Cat` and `Bool` set
+/// `created_at`, and leaves the shared dimensions null; `series` is the
+/// validated feature name. `Cat` and `Bool` set
 /// only `str_value`. `Int` and `Float` set `num_value` and the Arrow-canonical
 /// string of the value in its own type, so a categorical baseline fitted over
 /// that column's keys matches an originally numeric feature.
@@ -132,14 +146,18 @@ pub(crate) fn rows(record: &DriftRecordObservation) -> Result<Vec<Vec<u8>>, Wyrd
         .iter()
         .map(|(series, value)| {
             let (num_value, str_value) = projected_value(series, value)?;
-            row_bytes(&json!({
+            let mut row = json!({
                 "record_id": record.record_id.0.to_string(),
                 "series": series.as_str(),
                 "num_value": num_value,
                 "str_value": str_value,
                 "session_id": session_id,
                 "created_at": created_at,
-            }))
+            });
+            for name in DIMENSIONS {
+                row[name] = Value::Null;
+            }
+            row_bytes(&row)
         })
         .collect()
 }

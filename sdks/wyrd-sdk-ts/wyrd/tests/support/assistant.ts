@@ -50,7 +50,7 @@ export const JudgeCall = z.object({
   sub_principal_id: z.string(),
   act_principal_id: z.string(),
   run_id: z.string().nullable(),
-  card_uid: z.string().nullable(),
+  subject_card_uid: z.string().nullable(),
 });
 
 /** The declared assistant Service, its Card bundle, and its runtime account's key and principal. */
@@ -73,7 +73,7 @@ export function assistantAs(assistant: Assistant, client: WyrdClient): WyrdState
 export async function judgeCalls(server: { flushBifrost(): void }): Promise<z.infer<typeof JudgeCall>[]> {
   server.flushBifrost();
   return (await Bifrost.connect()).sql(
-    "SELECT call_id, sub_principal_id, act_principal_id, run_id, card_uid FROM bifrost.gateway.calls",
+    "SELECT call_id, sub_principal_id, act_principal_id, run_id, subject_card_uid FROM bifrost.gateway.calls",
     [],
     JudgeCall,
   );

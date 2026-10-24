@@ -172,7 +172,7 @@ impl Run {
     /// This view's row correlation: the subject Card's UID plus invocation.
     fn correlation(&self) -> Correlation {
         Correlation {
-            card_uid: Some(self.subject_uid().clone()),
+            subject_card_uid: Some(self.subject_uid().clone()),
             run_id: Some(self.run_id.clone()),
         }
     }

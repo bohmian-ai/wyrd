@@ -17,7 +17,7 @@ use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::vala::CARD_UID;
+use wyrd_spec::vala::SUBJECT_CARD_UID;
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_tonic::otlp::common::v1::KeyValue;
@@ -138,7 +138,7 @@ pub fn native_card_uids(ipc: &[u8]) -> Vec<CardUid> {
     let Ok(reader) = StreamReader::try_new(Cursor::new(ipc), None) else {
         return Vec::new();
     };
-    let Ok(column) = reader.schema().index_of(CARD_UID) else {
+    let Ok(column) = reader.schema().index_of(SUBJECT_CARD_UID) else {
         return Vec::new();
     };
     let Ok(reader) = StreamReader::try_new(Cursor::new(ipc), Some(vec![column])) else {
@@ -263,7 +263,7 @@ mod tests {
         let rows = cards.as_ref().map_or(1, Vec::len);
         let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1; rows]))];
         if let Some(cards) = cards {
-            fields.push(Field::new(CARD_UID, DataType::Utf8, true));
+            fields.push(Field::new(SUBJECT_CARD_UID, DataType::Utf8, true));
             columns.push(Arc::new(StringArray::from(cards)));
         }
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)

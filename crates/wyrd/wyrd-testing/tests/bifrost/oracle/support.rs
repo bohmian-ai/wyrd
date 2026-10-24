@@ -19,7 +19,6 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
 use vala_bifrost_redux::parquet::footer::tenant_key_value;
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
-use vala_bifrost_redux::tables::CorrelationPolicy;
 use vala_bifrost_redux::tables::managed_columns::ensure_managed_columns;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -422,14 +421,11 @@ pub(crate) async fn seed_foreign_hot_row(
 ) -> Result<(), JourneyError> {
     let table_ref = TableRef::new(BifrostNamespace::Bifrost, table);
     let binding = TenantTableBinding::resolve((owner, table_ref))?;
-    let schema = Arc::new(Schema::new(ensure_managed_columns(
-        vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("filter_key", DataType::Utf8, false),
-            Field::new("unused_payload", DataType::Utf8, false),
-        ],
-        CorrelationPolicy::Observation,
-    )));
+    let schema = Arc::new(Schema::new(ensure_managed_columns(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("filter_key", DataType::Utf8, false),
+        Field::new("unused_payload", DataType::Utf8, false),
+    ])));
     let principal = uuid::Uuid::now_v7().to_string();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -437,6 +433,7 @@ pub(crate) async fn seed_foreign_hot_row(
             Arc::new(Int64Array::from(vec![999_i64])) as ArrayRef,
             Arc::new(StringArray::from(vec!["foreign"])),
             Arc::new(StringArray::from(vec![unused_payload(999)])),
+            Arc::new(StringArray::from(vec![None::<String>])),
             Arc::new(StringArray::from(vec![None::<String>])),
             Arc::new(StringArray::from(vec![None::<String>])),
             Arc::new(StringArray::from(vec![principal.clone()])),

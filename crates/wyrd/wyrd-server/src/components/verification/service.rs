@@ -778,7 +778,7 @@ impl<'a> VerificationControl<'a> {
     /// Both rows are staged on the slots `staged` reserved before the
     /// execution ran. The payload mints its own result identity and
     /// correlates with the execution through `execution_id`. Its rows name the subject
-    /// as `card_uid` and the exact Verifier as `verifier_card_uid`, are
+    /// as `subject_card_uid` and the exact Verifier as `verifier_card_uid`, are
     /// attributed to the caller, carry the caller's application Run, group,
     /// and authenticated owner Service, and have no binding or Trigger. The inputs row never queues work. The
     /// verdict is already decided, so an unbuildable payload is logged and

@@ -32,7 +32,7 @@ use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, VariantViolation
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
-use wyrd_spec::vala::managed_columns::{CARD_UID, RUN_ID};
+use wyrd_spec::vala::managed_columns::{RUN_ID, SUBJECT_CARD_UID};
 use wyrd_tonic::otlp::common::v1::any_value::Value;
 use wyrd_tonic::otlp::common::v1::{AnyValue, EntityRef, InstrumentationScope, KeyValue};
 use wyrd_tonic::otlp::resource::v1::Resource;
@@ -641,7 +641,7 @@ fn correlation_text<'a>(
 #[must_use]
 pub fn correlation_fields() -> [Field; 2] {
     [
-        Field::new(CARD_UID, DataType::Utf8, true),
+        Field::new(SUBJECT_CARD_UID, DataType::Utf8, true),
         Field::new(RUN_ID, DataType::Utf8, true),
     ]
 }

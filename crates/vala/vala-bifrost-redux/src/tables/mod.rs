@@ -18,7 +18,10 @@ use wyrd_spec::vala::api::{
     NullOrderWire, PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire,
     SortDirectionWire, SortKeyWire,
 };
-use wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT;
+use wyrd_spec::vala::managed_columns::{
+    DEPLOYMENT_ENVIRONMENT, RUN_ID, SERVICE_NAME, SERVICE_VERSION, SUBJECT_CARD_UID, SUBJECT_KIND,
+    SUBJECT_NAME, SUBJECT_VERSION, WORKLOAD_CARD_UID, WYRD_INGESTED_AT,
+};
 use wyrd_types::is_extension_key;
 use wyrd_types::variant::is_variant;
 
@@ -59,15 +62,6 @@ pub enum TableError {
         /// Expanded-data limit in bytes.
         limit: usize,
     },
-}
-
-/// Correlation columns appended to a built-in table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CorrelationPolicy {
-    /// Traces, metrics, logs, `GenAI`, verification, and drift rows.
-    Observation,
-    /// Audit content has its own identity columns.
-    None,
 }
 
 /// Payload handling classification for a built-in table.
@@ -162,6 +156,68 @@ pub fn hourly_layout(
     }
 }
 
+/// The six nullable Utf8 Service and subject dimensions every system table
+/// declares once, in ledger order.
+///
+/// They are domain columns, not managed ones: a dynamic table never carries
+/// them, and the canonical signals already declare the three Service
+/// columns among their resource fields.
+pub const SHARED_DIMENSIONS: [&str; 6] = [
+    SERVICE_NAME,
+    SERVICE_VERSION,
+    DEPLOYMENT_ENVIRONMENT,
+    SUBJECT_KIND,
+    SUBJECT_NAME,
+    SUBJECT_VERSION,
+];
+
+/// Appends the [`SHARED_DIMENSIONS`] to a system table's own fields.
+#[must_use]
+pub fn with_shared_dimensions(mut fields: Vec<Field>) -> Vec<Field> {
+    fields.extend(
+        SHARED_DIMENSIONS
+            .iter()
+            .map(|name| Field::new(*name, DataType::Utf8, true)),
+    );
+    fields
+}
+
+/// The attribution Bloom columns every attributable system table's creation
+/// default starts with.
+pub const ATTRIBUTION_BLOOMS: [&str; 5] = [
+    SERVICE_NAME,
+    SUBJECT_NAME,
+    WORKLOAD_CARD_UID,
+    SUBJECT_CARD_UID,
+    RUN_ID,
+];
+
+/// Builds an attributable system table's creation-default layout.
+///
+/// `granularity` is [`hourly_layout`] or [`daily_layout`] on `time_column`.
+/// Rows sort by environment, Service name, and Service version, nulls first,
+/// then newest first on the time column; the Bloom set is
+/// [`ATTRIBUTION_BLOOMS`] followed by the table's own `lookup` keys. It is a
+/// complete, replaceable default, never a validation floor.
+#[must_use]
+pub fn attributed_layout(
+    granularity: fn(&str, Vec<SortKeyWire>, &[&str]) -> PhysicalLayoutWire,
+    time_column: &str,
+    lookup: &[&str],
+) -> PhysicalLayoutWire {
+    let blooms: Vec<&str> = ATTRIBUTION_BLOOMS.iter().chain(lookup).copied().collect();
+    granularity(
+        time_column,
+        vec![
+            sort_asc_nulls_first(DEPLOYMENT_ENVIRONMENT),
+            sort_asc_nulls_first(SERVICE_NAME),
+            sort_asc_nulls_first(SERVICE_VERSION),
+            sort_desc(time_column),
+        ],
+        &blooms,
+    )
+}
+
 /// The one hourly layout Scribe's unit fixtures encode under.
 ///
 /// Fixture schemas carry a non-null `event_time` timestamp as their time
@@ -204,8 +260,6 @@ pub struct BuiltinTableDefinition {
     pub namespace: &'static str,
     /// Logical table name.
     pub name: &'static str,
-    /// Correlation policy.
-    pub correlation_policy: CorrelationPolicy,
     /// Payload classification.
     pub payload_class: PayloadClass,
     /// Sensitive payload columns.
@@ -463,8 +517,6 @@ pub trait DomainTable: Send + Sync + 'static {
     const NAMESPACE: &'static str;
     /// Logical table name.
     const NAME: &'static str;
-    /// Correlation policy.
-    const CORRELATION_POLICY: CorrelationPolicy;
     /// Payload classification.
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Standard;
     /// Sensitive payload fields.
@@ -510,7 +562,6 @@ pub trait DomainTable: Send + Sync + 'static {
             )),
             None => SchemaRef::new(Schema::new(managed_columns::ensure_managed_columns(
                 Self::arrow_fields(),
-                Self::CORRELATION_POLICY,
             ))),
         }
     }
@@ -1170,7 +1221,6 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
     BuiltinTableDefinition {
         namespace: T::NAMESPACE,
         name: T::NAME,
-        correlation_policy: T::CORRELATION_POLICY,
         payload_class: T::PAYLOAD_CLASS,
         sensitive_payload_columns: T::SENSITIVE_PAYLOAD_COLUMNS,
         arrow_fields: T::arrow_fields,
@@ -1236,7 +1286,7 @@ mod tests {
     use fields::{boolean, float64, ts_us_utc, utf8};
     use wyrd_queue::variant::VariantViolation;
     use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
-    use wyrd_spec::vala::{ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT};
+    use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
     use wyrd_types::variant::variant_field;
 
     /// The registry owns three `OTel` signal tables and no removed physical name.
@@ -1336,40 +1386,81 @@ mod tests {
         }
     }
 
-    /// Every built-in partitions and sorts on its pinned time column.
-    ///
-    /// Continuous high-rate `OTel` signals and gateway calls partition hourly;
-    /// retained audit history and the five verification tables are low-rate,
-    /// read over date ranges, and partition daily. Each
-    /// table's time column is a non-null timestamp in its own schema, OTLP
-    /// instants are nanosecond UTC, and the resolved layout leads its sort
-    /// order with that column descending.
+    /// Every built-in matches the storage ledger: its pinned time column is a
+    /// non-null zoned timestamp, partitioned alone at the ledger granularity;
+    /// attributable tables sort environment, Service name, and Service version
+    /// nulls first, then time newest first, while audit sorts on time alone;
+    /// each Bloom default is exactly the ledger's; and every table declares
+    /// the six shared dimensions once.
     ///
     /// # Panics
     ///
-    /// Panics when a built-in declares no pinned time column, or drifts from
-    /// its pinned column, granularity, type, or leading sort key.
+    /// Panics when a built-in drifts from its ledger row.
     #[test]
     fn every_builtin_partitions_and_sorts_on_its_time_column() {
+        const ATTRIBUTION: [&str; 5] = [
+            "service_name",
+            "subject_name",
+            "workload_card_uid",
+            "subject_card_uid",
+            "run_id",
+        ];
         let otlp_instant = DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("+00:00".into()));
         for definition in builtin_tables() {
             let fqn = format!("bifrost.{}.{}", definition.namespace, definition.name);
-            let (column, transform) = match (definition.namespace, definition.name) {
-                ("traces", "spans") => ("start_time_unix_nano", PartitionTransformWire::Hour),
-                ("metrics", "points") | ("logs", "records") => {
-                    ("time_unix_nano", PartitionTransformWire::Hour)
-                }
-                ("gateway", "calls") => ("started_at", PartitionTransformWire::Hour),
-                ("drift", "observations") | ("system", "audit_log") => {
-                    ("created_at", PartitionTransformWire::Day)
-                }
-                ("verification", "results") => ("ended_at", PartitionTransformWire::Day),
-                ("verification", "execution_inputs") => {
-                    ("recorded_at", PartitionTransformWire::Day)
-                }
-                ("drift", "result_features") => (WYRD_INGESTED_AT, PartitionTransformWire::Day),
-                _ => panic!("{fqn} declares no pinned time column"),
-            };
+            let (column, transform, lookup): (_, _, &[&str]) =
+                match (definition.namespace, definition.name) {
+                    ("traces", "spans") => (
+                        "start_time_unix_nano",
+                        PartitionTransformWire::Hour,
+                        &["trace_id"],
+                    ),
+                    ("logs", "records") => (
+                        "time_unix_nano",
+                        PartitionTransformWire::Hour,
+                        &["trace_id"],
+                    ),
+                    ("metrics", "points") => (
+                        "time_unix_nano",
+                        PartitionTransformWire::Hour,
+                        &["metric_name"],
+                    ),
+                    ("gateway", "calls") => {
+                        ("started_at", PartitionTransformWire::Hour, &["call_id"])
+                    }
+                    ("drift", "observations") => {
+                        ("created_at", PartitionTransformWire::Day, &["series"])
+                    }
+                    ("verification", "results") => (
+                        "ended_at",
+                        PartitionTransformWire::Day,
+                        &[
+                            "result_id",
+                            "execution_id",
+                            "verifier_card_uid",
+                            "binding_id",
+                            "group_id",
+                        ],
+                    ),
+                    ("verification", "execution_inputs") => (
+                        "recorded_at",
+                        PartitionTransformWire::Day,
+                        &[
+                            "execution_id",
+                            "verifier_card_uid",
+                            "binding_id",
+                            "group_id",
+                        ],
+                    ),
+                    ("drift", "result_features") => (
+                        WYRD_INGESTED_AT,
+                        PartitionTransformWire::Day,
+                        &["result_id"],
+                    ),
+                    ("system", "audit_log") => ("created_at", PartitionTransformWire::Day, &[]),
+                    _ => panic!("{fqn} declares no pinned time column"),
+                };
+            let audit = definition.name == "audit_log";
             let declared = (definition.physical_layout)();
             assert_eq!(declared.time_column.as_deref(), Some(column), "{fqn}");
             assert_eq!(
@@ -1377,7 +1468,43 @@ mod tests {
                 vec![PartitionFieldWire::new(column, transform)],
                 "{fqn} partitions only on its time column"
             );
+            let sort = if audit {
+                vec![sort_desc(column)]
+            } else {
+                vec![
+                    sort_asc_nulls_first("deployment_environment"),
+                    sort_asc_nulls_first("service_name"),
+                    sort_asc_nulls_first("service_version"),
+                    sort_desc(column),
+                ]
+            };
+            assert_eq!(declared.sort_keys, sort, "{fqn} sort keys");
+            let blooms: Vec<&str> = if audit {
+                vec![
+                    "sub_principal_id",
+                    "act_principal_id",
+                    "wyrd_request_id",
+                    "resource",
+                ]
+            } else {
+                ATTRIBUTION.iter().chain(lookup).copied().collect()
+            };
+            assert_eq!(declared.bloom_columns, blooms, "{fqn} Bloom defaults");
             let schema = (definition.schema)();
+            for dimension in SHARED_DIMENSIONS {
+                let declared: Vec<_> = schema
+                    .fields()
+                    .iter()
+                    .filter(|field| field.name() == dimension)
+                    .collect();
+                assert_eq!(declared.len(), 1, "{fqn} declares {dimension} once");
+                assert_eq!(
+                    declared[0].data_type(),
+                    &DataType::Utf8,
+                    "{fqn}.{dimension}"
+                );
+                assert!(declared[0].is_nullable(), "{fqn}.{dimension} is nullable");
+            }
             let field = schema
                 .field_with_name(column)
                 .unwrap_or_else(|_| panic!("{fqn} has its time column {column}"));
@@ -1396,13 +1523,6 @@ mod tests {
                 crate::catalog::layout::PhysicalLayout::resolve(&fqn, &schema, Some(&declared))
                     .unwrap_or_else(|error| panic!("{fqn} resolves: {error}"));
             assert_eq!(resolved.time_column(), column, "{fqn}");
-            let first = resolved.sort_keys().first().expect("a leading sort key");
-            assert_eq!(
-                first.column(),
-                column,
-                "{fqn} sorts first on its time column"
-            );
-            assert!(first.is_descending(), "{fqn} sorts newest first");
         }
     }
 
@@ -1431,12 +1551,19 @@ mod tests {
                     utf8("str_value", true),
                     utf8("session_id", true),
                     ts_us_utc("created_at", false),
+                    utf8("service_name", true),
+                    utf8("service_version", true),
+                    utf8("deployment_environment", true),
+                    utf8("subject_kind", true),
+                    utf8("subject_name", true),
+                    utf8("subject_version", true),
                 ],
                 blooms: &[
+                    "service_name",
+                    "subject_name",
+                    WORKLOAD_CARD_UID,
+                    SUBJECT_CARD_UID,
                     RUN_ID,
-                    CARD_UID,
-                    SUB_PRINCIPAL_ID,
-                    ACT_PRINCIPAL_ID,
                     "series",
                 ],
             },
@@ -1446,22 +1573,29 @@ mod tests {
                 name: "execution_inputs",
                 columns: vec![
                     utf8("execution_id", false),
-                    utf8("owner_card_uid", true),
                     utf8("verifier_card_uid", false),
                     utf8("binding_id", true),
                     utf8("group_id", true),
-                    utf8("deployment_environment", true),
                     boolean("queue_execution", false),
                     variant_field("inputs", false),
                     variant_field("activation", true),
                     ts_us_utc("recorded_at", false),
+                    utf8("service_name", true),
+                    utf8("service_version", true),
+                    utf8("deployment_environment", true),
+                    utf8("subject_kind", true),
+                    utf8("subject_name", true),
+                    utf8("subject_version", true),
                 ],
                 blooms: &[
+                    "service_name",
+                    "subject_name",
+                    WORKLOAD_CARD_UID,
+                    SUBJECT_CARD_UID,
                     RUN_ID,
-                    CARD_UID,
-                    SUB_PRINCIPAL_ID,
-                    ACT_PRINCIPAL_ID,
                     "execution_id",
+                    "verifier_card_uid",
+                    "binding_id",
                     "group_id",
                 ],
             },
@@ -1471,7 +1605,6 @@ mod tests {
                 columns: vec![
                     utf8("result_id", false),
                     utf8("requirement_id", false),
-                    utf8("owner_card_uid", true),
                     utf8("verifier_card_uid", false),
                     utf8("binding_id", true),
                     ts_us_utc("window_start", false),
@@ -1481,12 +1614,19 @@ mod tests {
                     float64("score", true),
                     float64("threshold", true),
                     utf8("verdict", false),
+                    utf8("service_name", true),
+                    utf8("service_version", true),
+                    utf8("deployment_environment", true),
+                    utf8("subject_kind", true),
+                    utf8("subject_name", true),
+                    utf8("subject_version", true),
                 ],
                 blooms: &[
+                    "service_name",
+                    "subject_name",
+                    WORKLOAD_CARD_UID,
+                    SUBJECT_CARD_UID,
                     RUN_ID,
-                    CARD_UID,
-                    SUB_PRINCIPAL_ID,
-                    ACT_PRINCIPAL_ID,
                     "result_id",
                 ],
             },
@@ -1505,23 +1645,28 @@ mod tests {
                 utf8("execution_status", false),
                 utf8("verdict", false),
                 utf8("verifier_version", false),
-                utf8("owner_card_uid", true),
                 utf8("verifier_card_uid", false),
                 utf8("binding_id", true),
                 utf8("group_id", true),
-                utf8("deployment_environment", true),
                 utf8("trigger_identity", true),
                 ts_us_utc("window_start", true),
                 ts_us_utc("window_end", true),
                 ts_us_utc("started_at", false),
                 ts_us_utc("ended_at", false),
                 variant_field("outcome", false),
+                utf8("service_name", true),
+                utf8("service_version", true),
+                utf8("deployment_environment", true),
+                utf8("subject_kind", true),
+                utf8("subject_name", true),
+                utf8("subject_version", true),
             ],
             blooms: &[
+                "service_name",
+                "subject_name",
+                WORKLOAD_CARD_UID,
+                SUBJECT_CARD_UID,
                 RUN_ID,
-                CARD_UID,
-                SUB_PRINCIPAL_ID,
-                ACT_PRINCIPAL_ID,
                 "result_id",
                 "execution_id",
                 "verifier_card_uid",
@@ -1534,16 +1679,17 @@ mod tests {
     /// The managed envelope Bifrost appends after a verification table's
     /// authored columns, in physical order.
     ///
-    /// This is the `CorrelationPolicy::Observation` envelope the Bifrost design
-    /// fixes for every table: nullable `run_id` and `card_uid`, the required
-    /// `sub_principal_id`/`act_principal_id` pair, and the required request and ingestion-time
-    /// columns. The tenant is a property of
+    /// This is the seven-field envelope the Bifrost design fixes for every
+    /// table: nullable `workload_card_uid`, `subject_card_uid`, and `run_id`,
+    /// the required `sub_principal_id`/`act_principal_id` pair, and the
+    /// required request and ingestion-time columns. The tenant is a property of
     /// the physical table and of each Parquet footer, never a row column, and
     /// Bifrost stamps no per-row position.
     fn verification_managed_envelope() -> Vec<Field> {
         vec![
+            utf8(WORKLOAD_CARD_UID, true),
+            utf8(SUBJECT_CARD_UID, true),
             utf8(RUN_ID, true),
-            utf8(CARD_UID, true),
             utf8(SUB_PRINCIPAL_ID, false),
             utf8(ACT_PRINCIPAL_ID, false),
             utf8(wyrd_spec::vala::WYRD_REQUEST_ID, false),
@@ -1553,14 +1699,14 @@ mod tests {
 
     /// The five verification tables carry exactly their approved physical
     /// contract: authored columns, the appended managed envelope, order, types,
-    /// nullability, daily partition, Observation correlation, and the resolved
+    /// nullability, daily partition, and the resolved
     /// Bloom-column union.
     ///
     /// These schemas are a published contract — three SDKs project rows into
     /// them and dashboards query them — so a reordered, retyped, renamed, or
     /// newly nullable column is a breaking change rather than an
     /// implementation detail. Pinning the whole physical list here, including
-    /// nullable `owner_card_uid` and the `outcome` Variant, is what makes that break
+    /// the shared dimensions and the `outcome` Variant, is what makes that break
     /// fail in this crate instead of at a caller's insert.
     ///
     /// # Panics
@@ -1593,11 +1739,6 @@ mod tests {
                 physical,
                 "bifrost.{namespace}.{name} complete physical schema"
             );
-            assert_eq!(
-                definition.correlation_policy,
-                CorrelationPolicy::Observation,
-                "bifrost.{namespace}.{name} appends run_id, card_uid, and the subject/actor pair"
-            );
 
             let layout = (definition.physical_layout)();
             assert_eq!(
@@ -1623,7 +1764,7 @@ mod tests {
     /// binding, or a user-authored correlation column.
     ///
     /// `drift_ref` is the retired Verifier pointer, and
-    /// `run_id`/`card_uid` are managed correlation the queue appends. Any of
+    /// the workload, subject, and Run columns are managed correlation. Any of
     /// them reappearing as an authored payload column would let one raw input
     /// be attributed to, or duplicated per, a Verifier binding.
     ///
@@ -1632,7 +1773,10 @@ mod tests {
     /// Panics when the observation table authors a forbidden column.
     #[test]
     fn observation_tables_author_no_verifier_or_correlation_columns() {
-        for (namespace, forbidden) in [("drift", ["drift_ref", "run_id", "card_uid"])] {
+        for (namespace, forbidden) in [(
+            "drift",
+            ["drift_ref", RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID],
+        )] {
             let authored: Vec<String> = (builtin_table(namespace, "observations")
                 .expect("observation table")
                 .arrow_fields)()

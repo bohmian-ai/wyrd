@@ -107,7 +107,9 @@ pub(crate) struct NativeAdmittedRows {
     /// Source of the trusted subject/actor pair stamped as managed
     /// correlation columns.
     pub(crate) attribution: crate::contracts::StampedAttribution,
-    /// Card UIDs every row's `card_uid` is authorized against: the frame's
+    /// Verified workload Service release a frame-attributed write stamps.
+    pub(crate) workload: Option<wyrd_spec::ids::CardUid>,
+    /// Card UIDs every row's `subject_card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
     /// Caller-supplied fingerprint validated independently for every source
@@ -409,6 +411,7 @@ fn stamp_native_source(
         rows,
         &crate::scribe::execution_lanes::DecodeContext {
             attribution: source.attribution,
+            workload: source.workload.as_ref(),
             card_scope: source.card_scope.as_deref(),
             expected_schema_fingerprint: source.expected_schema_fingerprint,
             request_id: &source.request_id,
@@ -1137,6 +1140,7 @@ mod tests {
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,
             attribution: Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())).into(),
+            workload: None,
             expected_schema_fingerprint: Some(fingerprint),
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),

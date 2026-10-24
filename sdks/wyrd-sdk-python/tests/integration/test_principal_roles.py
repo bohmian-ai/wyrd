@@ -134,7 +134,7 @@ class Attributed(BaseModel):
     """One drift row's run, subject Card, and account pair."""
 
     run_id: str
-    card_uid: str
+    subject_card_uid: str
     sub_principal_id: str
     act_principal_id: str
 
@@ -173,7 +173,7 @@ def attributed(server: WyrdTestServer, run_ids: list[str]) -> list[Attributed]:
     server.flush_bifrost()
     placeholders = ", ".join(f"${index}" for index in range(1, len(run_ids) + 1))
     return Bifrost(client=client_of(server)).sql(
-        "SELECT run_id, card_uid, sub_principal_id, act_principal_id "
+        "SELECT run_id, subject_card_uid, sub_principal_id, act_principal_id "
         f"FROM bifrost.drift.observations WHERE run_id IN ({placeholders}) ORDER BY run_id",
         run_ids,
         model=Attributed,
@@ -193,7 +193,9 @@ def test_stable_accounts_preserve_execution_identity(
 
     model = str(states[0].card_ref("model").uid)
     assert attributed(server, run_ids) == [
-        Attributed(run_id=run, card_uid=model, sub_principal_id=account, act_principal_id=account)
+        Attributed(
+            run_id=run, subject_card_uid=model, sub_principal_id=account, act_principal_id=account
+        )
         for run in sorted(run_ids)
     ]
 

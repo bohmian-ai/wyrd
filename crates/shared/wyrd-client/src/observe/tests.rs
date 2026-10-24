@@ -180,7 +180,7 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
             .expect("the fixture schema is representable"),
         correlation_fields: vec![
             FieldSpec {
-                name: "card_uid".to_owned(),
+                name: "subject_card_uid".to_owned(),
                 data_type: wyrd_spec::vala::api::DataTypeSpec::Utf8,
                 nullable: true,
                 metadata: [(PARQUET_FIELD_ID_KEY.to_owned(), "1001".to_owned())].into(),
@@ -1295,11 +1295,11 @@ fn drift_projects_one_tall_row_per_feature() {
         assert!(row["created_at"].is_string());
         assert_eq!(
             row.as_object().expect("row is an object").len(),
-            6,
+            12,
             "a row carries exactly the fixed user columns"
         );
         assert!(
-            row.get("run_id").is_none() && row.get("card_uid").is_none(),
+            row.get("run_id").is_none() && row.get("subject_card_uid").is_none(),
             "correlation is not a row field"
         );
     }

@@ -61,7 +61,7 @@ export declare class NativeBifrost {
    * Card UID, no-active-table, and queue-full refusals are returned in
    * [`NativeLifecycleResult`].
    */
-  insert(row: string, cardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
+  insert(row: string, subjectCardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
    * Writes one already-built Arrow batch to `table` and awaits durability.
    *
@@ -124,7 +124,7 @@ export declare class NativeBifrost {
    * unparsable or unmappable schema and an invalid Card UID are
    * returned in [`NativeLifecycleResult`].
    */
-  record(table: string, schemaJson: string, row: string, cardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
+  record(table: string, schemaJson: string, row: string, subjectCardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
    * Starts one terminal-safe query through the Rust SDK owner.
    *

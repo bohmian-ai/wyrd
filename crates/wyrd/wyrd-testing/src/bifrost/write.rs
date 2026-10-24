@@ -122,7 +122,7 @@ impl BifrostWriter {
                 &table,
                 row,
                 Correlation {
-                    card_uid: self.card_ref.uid.clone(),
+                    subject_card_uid: self.card_ref.uid.clone(),
                     run_id: run_id.cloned(),
                 },
             )

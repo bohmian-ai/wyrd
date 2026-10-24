@@ -8,31 +8,29 @@
 
 use arrow::datatypes::{Field, TimeUnit};
 
-use crate::tables::CorrelationPolicy;
 use crate::tables::fields::{CanonicalField, CanonicalType, canonical_arrow_fields};
 use wyrd_spec::vala::{
-    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    ACT_PRINCIPAL_ID, RUN_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
-/// Which tables a managed column is appended to.
+/// How a managed column's value relates to one accepted batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedScope {
-    /// Attribution that is the same on every retry of a batch, appended only
-    /// by a table's correlation policy.
+    /// Attribution that is the same on every retry of a batch.
     Correlation,
-    /// The request that carried the rows, fresh on every attempt and appended
-    /// alongside the correlation columns.
+    /// The request that carried or produced the rows.
     Request,
-    /// Ingestion time appended to every table, whatever its correlation policy.
+    /// The admission instant.
     Time,
 }
 
-/// One server-managed column: its physical declaration and where it applies.
+/// One server-managed column: its physical declaration and its scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManagedColumn {
     /// Name, physical type, and nullability of the column.
     pub field: CanonicalField,
-    /// Which tables append the column.
+    /// How the column's value relates to one accepted batch.
     pub scope: ManagedScope,
 }
 
@@ -45,7 +43,7 @@ impl ManagedColumn {
         }
     }
 
-    /// Declare one non-null UTC microsecond time column every table appends.
+    /// Declare one non-null UTC microsecond time column.
     const fn time(name: &'static str) -> Self {
         Self {
             field: CanonicalField::meta(
@@ -73,11 +71,15 @@ impl ManagedColumn {
     }
 }
 
-/// Every server-managed column, in physical order.
+/// Every server-managed column, in physical order; every table appends all
+/// of them after its own fields.
 ///
-/// Correlation columns come first, then the ingestion time:
+/// Correlation columns come first, then the request and ingestion time:
 ///
-/// - `run_id`, `card_uid`: optional correlation to a run and a Card version;
+/// - `workload_card_uid`: the validated exact Service release the work ran
+///   under, null without proof;
+/// - `subject_card_uid`: the exact Card observed or judged;
+/// - `run_id`: optional application Run correlation;
 /// - `sub_principal_id`: the principal the row's work was for;
 /// - `act_principal_id`: the principal that performed it;
 /// - `wyrd_request_id`: the request that wrote the row, the join key to audit;
@@ -88,57 +90,14 @@ impl ManagedColumn {
 /// metadata. Field ids are assigned by each registered Iceberg table, never
 /// declared here.
 pub static MANAGED_COLUMNS: &[ManagedColumn] = &[
+    ManagedColumn::identity(WORKLOAD_CARD_UID, true, ManagedScope::Correlation),
+    ManagedColumn::identity(SUBJECT_CARD_UID, true, ManagedScope::Correlation),
     ManagedColumn::identity(RUN_ID, true, ManagedScope::Correlation),
-    ManagedColumn::identity(CARD_UID, true, ManagedScope::Correlation),
     ManagedColumn::identity(SUB_PRINCIPAL_ID, false, ManagedScope::Correlation),
     ManagedColumn::identity(ACT_PRINCIPAL_ID, false, ManagedScope::Correlation),
     ManagedColumn::identity(WYRD_REQUEST_ID, false, ManagedScope::Request),
     ManagedColumn::time(WYRD_INGESTED_AT),
 ];
-
-impl CorrelationPolicy {
-    /// Report whether a table under this policy appends `column`.
-    ///
-    /// The ingestion time is always appended. Correlation and request columns are
-    /// appended by `Observation` tables; `None` tables carry their own identity
-    /// columns and append neither.
-    #[must_use]
-    pub fn appends(self, column: &ManagedColumn) -> bool {
-        match (self, column.scope) {
-            (_, ManagedScope::Time) | (Self::Observation, _) => true,
-            (Self::None, _) => false,
-        }
-    }
-
-    /// The managed columns a table under this policy appends, in physical order.
-    pub fn managed_columns(self) -> impl Iterator<Item = &'static ManagedColumn> {
-        MANAGED_COLUMNS
-            .iter()
-            .filter(move |column| self.appends(column))
-    }
-
-    /// Report whether a write to a table under this policy may not supply `name`.
-    ///
-    /// Every [`RESERVED_PREFIX`] name and every managed column the policy
-    /// stamps is server-owned. A `None` table declares its own identity
-    /// columns, so the audit log's `sub_principal_id` and `act_principal_id`
-    /// are server-built content there rather than stamped correlation.
-    #[must_use]
-    pub fn reserves(self, name: &str) -> bool {
-        name.starts_with(RESERVED_PREFIX) || self.stamps(name)
-    }
-
-    /// Report whether a table under this policy stamps the managed column
-    /// `name`, so a row's own value of it is replaced rather than kept.
-    ///
-    /// A `None` table stamps only the ingestion time; its identity columns,
-    /// such as the audit log's subject/actor pair, are content.
-    #[must_use]
-    pub fn stamps(self, name: &str) -> bool {
-        self.managed_columns()
-            .any(|column| column.field.name == name)
-    }
-}
 
 /// Report whether `name` is a server-managed column.
 ///
@@ -167,7 +126,8 @@ pub fn is_reserved_column(name: &str) -> bool {
 
 /// Report whether `name` is a managed correlation column.
 ///
-/// Correlation columns attribute rows to a run, a Card version, and a writer.
+/// Correlation columns attribute rows to a workload, a subject Card, a Run, and
+/// an account pair.
 /// They are identical on every retry of one batch, unlike the request and time
 /// columns, which is what lets a retry be recognised as the same write.
 #[must_use]
@@ -177,35 +137,28 @@ pub fn is_correlation_column(name: &str) -> bool {
         .any(|column| column.scope == ManagedScope::Correlation && column.field.name == name)
 }
 
-/// Append the managed columns a policy declares to a table's user fields.
+/// Append every managed column to a table's user fields.
 ///
-/// User fields stay first, in their declared order, followed by the policy's
-/// managed columns in [`MANAGED_COLUMNS`] order. The appended fields carry no
-/// field metadata. The user-schema fingerprint hashes the user fields alone,
-/// so appending them never perturbs it.
+/// User fields stay first, in their declared order, followed by the managed
+/// columns in [`MANAGED_COLUMNS`] order. The appended fields carry no field
+/// metadata. The user-schema fingerprint hashes the user fields alone, so
+/// appending them never perturbs it.
 #[must_use]
-pub fn ensure_managed_columns(
-    mut user_fields: Vec<Field>,
-    policy: CorrelationPolicy,
-) -> Vec<Field> {
-    user_fields.extend(policy.managed_columns().map(ManagedColumn::untagged_arrow));
+pub fn ensure_managed_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
+    user_fields.extend(MANAGED_COLUMNS.iter().map(ManagedColumn::untagged_arrow));
     user_fields
 }
 
 /// Build one canonical signal table's complete physical Arrow fields.
 ///
 /// The declared signal ledger comes first in declaration order, then the
-/// `Observation` managed columns. Every field — ledger and managed, at every
+/// managed columns. Every field — ledger and managed, at every
 /// nesting depth — carries its sensitivity metadata, which is what lets the
 /// canonical physical fingerprint cover the whole schema.
 #[must_use]
 pub fn canonical_physical_fields(declared: &[CanonicalField]) -> Vec<Field> {
     let mut physical = canonical_arrow_fields(declared);
-    physical.extend(
-        CorrelationPolicy::Observation
-            .managed_columns()
-            .map(|column| column.field.to_arrow()),
-    );
+    physical.extend(MANAGED_COLUMNS.iter().map(|column| column.field.to_arrow()));
     physical
 }
 
@@ -213,60 +166,36 @@ pub fn canonical_physical_fields(declared: &[CanonicalField]) -> Vec<Field> {
 mod tests {
     use super::*;
 
-    /// Names of `fields` in order.
-    fn field_names(fields: &[Field]) -> Vec<&str> {
-        fields.iter().map(|f| f.name().as_str()).collect()
-    }
-
-    /// Observation tables append every managed column in declared order.
+    /// Every table appends the seven-field envelope in declared order.
     ///
     /// # Panics
     ///
-    /// Panics when the order changes, a retired column reappears, or a
-    /// required identity becomes nullable.
+    /// Panics when the order changes, a retired column reappears, or an
+    /// envelope field's nullability differs from the contract.
     #[test]
     fn observation_policy_appends_every_managed_column_in_order() {
-        let fields = ensure_managed_columns(vec![], CorrelationPolicy::Observation);
+        let fields = ensure_managed_columns(vec![]);
+        let shape: Vec<(&str, bool)> = fields
+            .iter()
+            .map(|field| (field.name().as_str(), field.is_nullable()))
+            .collect();
         assert_eq!(
-            field_names(&fields),
+            shape,
             vec![
-                RUN_ID,
-                CARD_UID,
-                SUB_PRINCIPAL_ID,
-                ACT_PRINCIPAL_ID,
-                WYRD_REQUEST_ID,
-                WYRD_INGESTED_AT,
+                (WORKLOAD_CARD_UID, true),
+                (SUBJECT_CARD_UID, true),
+                (RUN_ID, true),
+                (SUB_PRINCIPAL_ID, false),
+                (ACT_PRINCIPAL_ID, false),
+                (WYRD_REQUEST_ID, false),
+                (WYRD_INGESTED_AT, false),
             ]
         );
-        assert!(!fields[2].is_nullable());
-        assert!(!fields[3].is_nullable());
-        assert!(!fields[4].is_nullable());
-    }
-
-    /// Tables without a correlation policy append only the ingestion time.
-    ///
-    /// # Panics
-    ///
-    /// Panics when anything other than the ingestion time column is appended.
-    #[test]
-    fn none_policy_appends_only_the_ingestion_time() {
-        let fields = ensure_managed_columns(vec![], CorrelationPolicy::None);
-        assert_eq!(field_names(&fields), vec![WYRD_INGESTED_AT]);
-    }
-
-    /// A `None` table keeps its own subject/actor pair as content and stamps
-    /// only the ingestion time; an observation table stamps both.
-    ///
-    /// # Panics
-    ///
-    /// Panics when either policy stamps a different set of columns.
-    #[test]
-    fn none_policy_keeps_its_own_identity_columns() {
-        for name in [SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID, CARD_UID, RUN_ID] {
-            assert!(!CorrelationPolicy::None.stamps(name), "{name}");
-            assert!(CorrelationPolicy::Observation.stamps(name), "{name}");
-        }
-        assert!(CorrelationPolicy::None.stamps(WYRD_INGESTED_AT));
+        assert!(
+            !is_managed_column("card_uid"),
+            "the retired name is ordinary"
+        );
+        assert!(!is_managed_column("owner_card_uid"));
     }
 
     /// Caller-declared fields remain ahead of every server-managed field.
@@ -277,7 +206,7 @@ mod tests {
     #[test]
     fn user_fields_come_before_managed_columns() {
         let user = vec![Field::new("my_col", arrow::datatypes::DataType::Utf8, true)];
-        let fields = ensure_managed_columns(user, CorrelationPolicy::Observation);
+        let fields = ensure_managed_columns(user);
         assert_eq!(fields[0].name(), "my_col");
     }
 
@@ -304,6 +233,7 @@ mod tests {
         assert!(is_reserved_column(SUB_PRINCIPAL_ID));
         assert!(is_reserved_column(ACT_PRINCIPAL_ID));
         assert!(!is_reserved_column("value"));
+        assert!(is_correlation_column(WORKLOAD_CARD_UID));
         assert!(is_correlation_column(RUN_ID));
         assert!(is_correlation_column(SUB_PRINCIPAL_ID));
         assert!(is_correlation_column(ACT_PRINCIPAL_ID));

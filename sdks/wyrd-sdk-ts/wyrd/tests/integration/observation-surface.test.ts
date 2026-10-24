@@ -14,7 +14,7 @@ const ANSWERS = "bifrost.datasets.observed_answers";
 const SCORES = "bifrost.datasets.observed_scores";
 const VALUE_ROW = { type: "object", properties: { value: { type: "integer" } }, required: ["value"] } as const;
 
-const RecordRow = z.object({ value: z.bigint(), card_uid: z.string() });
+const RecordRow = z.object({ value: z.bigint(), subject_card_uid: z.string() });
 
 test("records land in their tables under the view that wrote them", async ({ server, reader, state }) => {
   for (const table of [ANSWERS, SCORES]) {
@@ -31,9 +31,9 @@ test("records land in their tables under the view that wrote them", async ({ ser
   server.flushBifrost();
 
   const read = (table: string) =>
-    reader.sql(`SELECT value, card_uid FROM ${table} WHERE run_id = $1`, [run.runId], RecordRow);
-  expect(await read(ANSWERS)).toEqual([{ value: 41n, card_uid: state.cardRef("agent").uid }]);
-  expect(await read(SCORES)).toEqual([{ value: 42n, card_uid: state.cardRef("model").uid }]);
+    reader.sql(`SELECT value, subject_card_uid FROM ${table} WHERE run_id = $1`, [run.runId], RecordRow);
+  expect(await read(ANSWERS)).toEqual([{ value: 41n, subject_card_uid: state.cardRef("agent").uid }]);
+  expect(await read(SCORES)).toEqual([{ value: 42n, subject_card_uid: state.cardRef("model").uid }]);
 });
 
 /** One emit a run refuses, and the catalog code it raises. */

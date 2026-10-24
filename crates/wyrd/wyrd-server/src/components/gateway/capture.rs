@@ -40,7 +40,7 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::vala::{CARD_UID, RUN_ID};
+use wyrd_spec::vala::{RUN_ID, SUBJECT_CARD_UID};
 use wyrd_storage::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 use wyrd_tonic::otlp::common::v1::any_value::Value as AnyValueKind;
@@ -314,7 +314,7 @@ impl CallCapture {
     }
 
     /// Builds one `bifrost.gateway.calls` batch holding one row per capture, in
-    /// order, over the table's user fields followed by its `card_uid` and
+    /// order, over the table's user fields followed by its `subject_card_uid` and
     /// `run_id` correlation inputs.
     ///
     /// The correlation inputs carry each authorized subject's Card UID, which
@@ -371,7 +371,7 @@ impl CallCapture {
                         .iter()
                         .map(|capture| capture.payload.response_payload_json.as_deref()),
                 ),
-                CARD_UID => Ok(subject(|subject| {
+                SUBJECT_CARD_UID => Ok(subject(|subject| {
                     subject.card_uid.as_ref().map(CardUid::as_str)
                 })),
                 RUN_ID => Ok(subject(|subject| {
@@ -1170,7 +1170,12 @@ pub(crate) mod tests {
 
         let calls = CallCapture::calls_batch(&[&capture]).expect("calls batch");
         assert_eq!(calls.num_rows(), 1);
-        for column in ["card_uid", "run_id", "request_payload", "response_payload"] {
+        for column in [
+            "subject_card_uid",
+            "run_id",
+            "request_payload",
+            "response_payload",
+        ] {
             let array = calls.column_by_name(column).expect(column);
             assert_eq!(array.null_count(), 1, "{column} is null");
         }
@@ -1805,7 +1810,7 @@ pub(crate) mod recording {
                 let required = |name: &str| text(name, row).unwrap_or_else(|| panic!("{name}"));
                 AuditDecision {
                     tenant,
-                    request_id: required("request_id"),
+                    request_id: required("wyrd_request_id"),
                     operation: required("operation"),
                     resource: required("resource"),
                     sub_principal_id: uuid(required("sub_principal_id")),

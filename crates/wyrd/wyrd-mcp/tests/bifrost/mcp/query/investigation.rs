@@ -333,7 +333,7 @@ impl EvidenceInvestigation {
             assert_eq!(response.card.metadata.uid, reference.uid);
         }
         let uid = self.subject.uid.as_ref().ok_or("subject UID")?;
-        let rows = self.query(&format!("SELECT result_id, verdict FROM bifrost.verification.results WHERE card_uid = '{uid}' ORDER BY result_id LIMIT 20")).await?;
+        let rows = self.query(&format!("SELECT result_id, verdict FROM bifrost.verification.results WHERE subject_card_uid = '{uid}' ORDER BY result_id LIMIT 20")).await?;
         let mut expected = [
             self.drift_result.to_string(),
             self.assertion_result.to_string(),

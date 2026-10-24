@@ -65,7 +65,8 @@ use wyrd_spec::vala::api::{
     VARIANT_MAX_ENCODED_BYTES,
 };
 use wyrd_spec::vala::managed_columns::{
-    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
+    ACT_PRINCIPAL_ID, RUN_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID,
+    WYRD_INGESTED_AT,
 };
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::TaskId;
@@ -243,7 +244,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
         format!(
             "{alias}{RUN_ID} IS NULL AND {alias}result_id = '{result}' \
              AND {alias}{ACT_PRINCIPAL_ID} = '{system}' AND {alias}verifier_card_uid = '{verifier}' \
-             AND {alias}{CARD_UID} = '{subject}' AND {alias}owner_card_uid = '{owner}' \
+             AND {alias}{SUBJECT_CARD_UID} = '{subject}' AND {alias}{WORKLOAD_CARD_UID} = '{owner}' \
              AND {alias}binding_id = '{binding}'"
         )
     };
@@ -275,7 +276,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
                 "SELECT f.result_id FROM bifrost.drift.result_features f \
                  JOIN bifrost.verification.results r \
                    ON f.result_id = r.result_id \
-                  AND f.{ACT_PRINCIPAL_ID} = r.{ACT_PRINCIPAL_ID} AND f.{CARD_UID} = r.{CARD_UID} \
+                  AND f.{ACT_PRINCIPAL_ID} = r.{ACT_PRINCIPAL_ID} AND f.{SUBJECT_CARD_UID} = r.{SUBJECT_CARD_UID} \
                  WHERE {}",
                 identity("f.")
             ),
@@ -534,7 +535,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         oracle,
         tenant,
         format!(
-            "SELECT {SUB_PRINCIPAL_ID}, {CARD_UID}, series FROM bifrost.drift.observations \
+            "SELECT {SUB_PRINCIPAL_ID}, {SUBJECT_CARD_UID}, series FROM bifrost.drift.observations \
              WHERE record_id = '{record}' ORDER BY series"
         ),
     )
@@ -571,7 +572,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
             oracle,
             tenant,
             format!(
-                "SELECT verifier_card_uid, {CARD_UID}, verdict, {RUN_ID} \
+                "SELECT verifier_card_uid, {SUBJECT_CARD_UID}, verdict, {RUN_ID} \
                  FROM bifrost.verification.results WHERE binding_id = '{binding}'"
             ),
         )
@@ -619,7 +620,7 @@ fn observation_batch(
         Field::new("str_value", DataType::Utf8, true),
         Field::new("session_id", DataType::Utf8, true),
         Field::new("created_at", utc(), false),
-        Field::new(CARD_UID, DataType::Utf8, true),
+        Field::new(SUBJECT_CARD_UID, DataType::Utf8, true),
     ]));
     let event_time = event_time.timestamp_micros();
     Ok(RecordBatch::try_new(
@@ -976,7 +977,7 @@ impl<'a> ResultLayoutJourney<'a> {
     /// Returns a filesystem or Parquet error, or names the first table with
     /// no file or the first column chunk without a Bloom filter.
     fn assert_blooms(&self) -> Result<(), ServerJourneyError> {
-        let floor = [RUN_ID, CARD_UID, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID];
+        let floor = [RUN_ID, SUBJECT_CARD_UID, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID];
         let tables: [(&str, &str, &[&str]); 2] = [
             (
                 "bifrost.verification.results",
@@ -4608,7 +4609,7 @@ async fn user_state_native_io_selects_validated_root() -> Result<(), ServerJourn
     server.flush_bifrost().await?;
     let landed: Vec<Value> = Bifrost::query_only(&admin)
         .sql_as(
-            "SELECT CAST(card_uid AS VARCHAR) AS card_uid, \
+            "SELECT CAST(subject_card_uid AS VARCHAR) AS subject_card_uid, \
              CAST(sub_principal_id AS VARCHAR) AS sub_principal_id \
              FROM bifrost.drift.observations",
             &[],
@@ -4616,7 +4617,9 @@ async fn user_state_native_io_selects_validated_root() -> Result<(), ServerJourn
         .await?;
     assert_eq!(
         landed,
-        vec![json!({ "card_uid": model.to_string(), "sub_principal_id": editor_id.to_string() })],
+        vec![
+            json!({ "subject_card_uid": model.to_string(), "sub_principal_id": editor_id.to_string() })
+        ],
         "the User's state observation lands on its Model under the User"
     );
 

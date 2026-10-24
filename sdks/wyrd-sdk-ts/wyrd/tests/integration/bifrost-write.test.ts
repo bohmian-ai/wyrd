@@ -101,7 +101,7 @@ test.for<Refusal>([
     "malformed Card UID",
     (bifrost) => {
       bifrost.useTable(TableConfig.fromJsonSchema("bifrost.datasets.refused", Value));
-      bifrost.insert({ value: 82 }, { cardUid: "not-a-uid" });
+      bifrost.insert({ value: 82 }, { subjectCardUid: "not-a-uid" });
     },
     "WYRD_SPEC_400_VALIDATION",
   ],
@@ -116,7 +116,9 @@ test.for<Refusal>([
 test("compaction target is recorded and a different one is refused", async () => {
   const target = 256 * 1024 * 1024;
 
-  expect(await registerValueTable("bifrost.datasets.target", { compactionTargetFileSizeBytes: target })).toBe("created");
+  expect(await registerValueTable("bifrost.datasets.target", { compactionTargetFileSizeBytes: target })).toBe(
+    "created",
+  );
   expect(await registerValueTable("bifrost.datasets.target")).toBe("already_exists");
   await expect(
     registerValueTable("bifrost.datasets.target", { compactionTargetFileSizeBytes: target * 2 }),

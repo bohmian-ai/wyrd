@@ -27,7 +27,7 @@ struct DriftRow {
     /// The session of the sample; `submit` names none.
     session_id: Option<String>,
     /// The observed Card.
-    card_uid: String,
+    subject_card_uid: String,
     /// The run every row of one invocation shares.
     run_id: String,
 }
@@ -107,7 +107,7 @@ async fn run_observations_read_back_by_run_id() {
         .await
         .expect("Bifrost connects")
         .sql_as(
-            "SELECT series, num_value, str_value, session_id, card_uid, run_id \
+            "SELECT series, num_value, str_value, session_id, subject_card_uid, run_id \
              FROM bifrost.drift.observations WHERE run_id = $1 ORDER BY series",
             &[QueryParam::String(run_id.clone())],
         )
@@ -127,7 +127,7 @@ async fn run_observations_read_back_by_run_id() {
             num_value: Some(12.5),
             str_value: Some("12.5".to_owned()),
             session_id: None,
-            card_uid: model,
+            subject_card_uid: model,
             run_id,
         }]
     );

@@ -239,7 +239,7 @@ const PAST_REUSE_WINDOW: Duration = Duration::from_secs(6);
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct Observed {
     /// The observed Card.
-    card_uid: String,
+    subject_card_uid: String,
     /// The run the sample belongs to.
     run_id: String,
 }
@@ -349,13 +349,13 @@ async fn stable_accounts_preserve_execution_identity() {
         let run_id = run.run_id().to_string();
         let rows: Vec<Observed> = bifrost
             .sql_as(
-                "SELECT card_uid, run_id FROM bifrost.drift.observations WHERE run_id = $1",
+                "SELECT subject_card_uid, run_id FROM bifrost.drift.observations WHERE run_id = $1",
                 &[QueryParam::String(run_id.clone())],
             )
             .await
             .expect("rows read back");
         let expected = Observed {
-            card_uid: model.clone(),
+            subject_card_uid: model.clone(),
             run_id,
         };
         assert_eq!(rows, [expected.clone(), expected]);

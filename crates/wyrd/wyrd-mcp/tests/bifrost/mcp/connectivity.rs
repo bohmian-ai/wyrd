@@ -549,9 +549,9 @@ mod pg_tests {
         let denial_rows = server
             .retained_audit_records(
                 tenant,
-                "permission, sub_principal_id, request_id, outcome",
+                "permission, sub_principal_id, wyrd_request_id, outcome",
                 &format!(
-                    "operation = '{}' AND request_id = '{}'",
+                    "operation = '{}' AND wyrd_request_id = '{}'",
                     probe::TOOL_NAME,
                     denied_request_id.as_str()
                 ),

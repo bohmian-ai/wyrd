@@ -21,7 +21,7 @@ const ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(2);
 #[derive(Debug, serde::Deserialize)]
 struct Attributed {
     /// The stamped Card UID.
-    card_uid: Option<String>,
+    subject_card_uid: Option<String>,
 }
 
 /// Alice's saved administrator login completes the workflow, and the stock
@@ -90,13 +90,13 @@ async fn saved_login_completes_the_workflow_past_token_expiry() {
         .await
         .expect("Bifrost connects")
         .sql_as(
-            "SELECT card_uid FROM bifrost.traces.spans WHERE run_id = $1",
+            "SELECT subject_card_uid FROM bifrost.traces.spans WHERE run_id = $1",
             &[QueryParam::String(run.run_id().to_string())],
         )
         .await
         .expect("the later span reads back");
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].card_uid.as_ref(), Some(&worked.agent_uid));
+    assert_eq!(rows[0].subject_card_uid.as_ref(), Some(&worked.agent_uid));
 
     local.deployment.shutdown().await;
 }

@@ -2335,7 +2335,7 @@ impl WyrdTestServer {
         self.await_audit_retained().await?;
         self.retained_audit_count(
             tenant,
-            &format!("operation = '{READ_DECISION}' AND request_id = '{request_id}'"),
+            &format!("operation = '{READ_DECISION}' AND wyrd_request_id = '{request_id}'"),
         )
         .await
     }

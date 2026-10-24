@@ -159,7 +159,7 @@ mod sdk {
     /// One row correlated to the harness card.
     fn correlated() -> Correlation {
         Correlation {
-            card_uid: Some(card()),
+            subject_card_uid: Some(card()),
             run_id: None,
         }
     }
@@ -314,10 +314,10 @@ mod sdk {
         assert_eq!(bifrost.producer_count(), 2, "a new table is a new producer");
     }
 
-    /// An omitted `card_uid` is a valid write, not a client-side refusal.
+    /// An omitted `subject_card_uid` is a valid write, not a client-side refusal.
     ///
     /// The server stores an uncorrelated row against the authenticated
-    /// principal with a null `card_uid`; the pool must reach it, so this proves
+    /// principal with a null `subject_card_uid`; the pool must reach it, so this proves
     /// the client no longer forces a correlation the wire never required.
     #[test]
     fn omitted_card_uid_is_accepted() {
@@ -785,7 +785,7 @@ mod sdk {
     #[test]
     fn table_config_rejects_a_reserved_column() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "card_uid",
+            "subject_card_uid",
             DataType::Utf8,
             true,
         )]));

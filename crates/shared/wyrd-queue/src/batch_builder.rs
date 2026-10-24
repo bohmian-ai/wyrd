@@ -4,7 +4,7 @@
 //! converts a complete input against the destination schema before any queue
 //! or budget state is touched, and yields [`PreparedRows`] whose exact charge
 //! the producer reserves once. The client batch carries **user columns plus
-//! the two per-row correlation columns `card_uid` and `run_id`**; the server
+//! the two per-row correlation columns `subject_card_uid` and `run_id`**; the server
 //! stamps the per-request system columns.
 
 use std::collections::BTreeMap;
@@ -24,7 +24,7 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::BifrostTableDescription;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::vala::managed_columns::{ACT_PRINCIPAL_ID, CARD_UID, SUB_PRINCIPAL_ID};
+use wyrd_spec::vala::managed_columns::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID};
 
 use crate::error::WyrdQueueError;
 use crate::queue::Row;
@@ -44,7 +44,13 @@ const RESERVED_PREFIX: &str = "wyrd_";
 #[must_use]
 pub fn is_reserved_column(name: &str) -> bool {
     name.starts_with(RESERVED_PREFIX)
-        || [CARD_UID, RUN_ID_COLUMN, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID].contains(&name)
+        || [
+            SUBJECT_CARD_UID,
+            RUN_ID_COLUMN,
+            SUB_PRINCIPAL_ID,
+            ACT_PRINCIPAL_ID,
+        ]
+        .contains(&name)
 }
 
 /// Converts complete row inputs against one destination schema.
@@ -58,7 +64,7 @@ pub fn is_reserved_column(name: &str) -> bool {
 pub struct RowPreflight {
     /// Declared user columns, in logical-schema order.
     fields: Fields,
-    /// User columns followed by `card_uid` and `run_id`.
+    /// User columns followed by `subject_card_uid` and `run_id`.
     output: SchemaRef,
 }
 
@@ -110,7 +116,7 @@ impl RowPreflight {
     pub fn new(schema: &Schema) -> Self {
         let fields = schema.fields().clone();
         let mut output: Vec<FieldRef> = fields.iter().cloned().collect();
-        output.push(Arc::new(Field::new(CARD_UID, DataType::Utf8, true)));
+        output.push(Arc::new(Field::new(SUBJECT_CARD_UID, DataType::Utf8, true)));
         output.push(Arc::new(Field::new(RUN_ID_COLUMN, DataType::Utf8, true)));
         Self {
             fields,
@@ -162,12 +168,12 @@ impl RowPreflight {
     /// Variant takes any JSON value through [`EncodedVariant::from_json_text`],
     /// so a string stays a Variant string and integers keep their exact
     /// digits. JSON `null` or an absent key is a null value. Every row carries
-    /// the same `card_uid` and `run_id`.
+    /// the same `subject_card_uid` and `run_id`.
     ///
     /// # Errors
     ///
     /// Returns the first refusal in that order:
-    /// [`WyrdQueueError::ReservedColumn`] for a `wyrd_*`, `card_uid`,
+    /// [`WyrdQueueError::ReservedColumn`] for a `wyrd_*`, `subject_card_uid`,
     /// `run_id`, `sub_principal_id`, or `act_principal_id` key,
     /// [`WyrdQueueError::Contract`] with
     /// `BIFROST_UNDECLARED_FIELD` for any other key the schema does not
@@ -178,7 +184,7 @@ impl RowPreflight {
     pub fn prepare(
         &self,
         rows: &[impl AsRef<[u8]>],
-        card_uid: Option<&CardUid>,
+        subject_card_uid: Option<&CardUid>,
         run_id: Option<&RunId>,
     ) -> Result<PreparedRows, WyrdQueueError> {
         let mut cells = Vec::with_capacity(rows.len());
@@ -199,9 +205,12 @@ impl RowPreflight {
         if let Some(failure) = failure {
             return Err(failure.error);
         }
-        let card_uid = card_uid.map(|uid| uid.as_str().to_owned());
+        let subject_card_uid = subject_card_uid.map(|uid| uid.as_str().to_owned());
         let run_id = run_id.map(|run| run.as_str().to_owned());
-        columns.push(Arc::new(StringArray::from(vec![card_uid; rows.len()])));
+        columns.push(Arc::new(StringArray::from(vec![
+            subject_card_uid;
+            rows.len()
+        ])));
         columns.push(Arc::new(StringArray::from(vec![run_id; rows.len()])));
         let batch = RecordBatch::try_new(Arc::clone(&self.output), columns).map_err(|e| {
             WyrdQueueError::SchemaParse(format!("record batch assembly failed: {e}"))
@@ -765,7 +774,7 @@ fn parse_date_days(text: &str) -> Option<i32> {
 
 #[cfg(test)]
 mod batch_builder_tests {
-    //! `RowPreflight` proof: user cols + `card_uid`/`run_id`, nested types,
+    //! `RowPreflight` proof: user cols + `subject_card_uid`/`run_id`, nested types,
     //! reserved/undeclared/type-mismatch rejection, and Arrow IPC round-trip.
 
     use arrow::array::{Array, AsArray, FixedSizeBinaryArray, Int64Array, ListArray, StructArray};
@@ -843,7 +852,7 @@ mod batch_builder_tests {
         let batch = prepared.batch();
         assert_eq!((batch.num_columns(), batch.num_rows()), (4, 2));
         let schema = batch.schema();
-        assert_eq!(schema.field(2).name(), "card_uid");
+        assert_eq!(schema.field(2).name(), "subject_card_uid");
         assert_eq!(schema.field(3).name(), "run_id");
         assert!(schema.field(2).is_nullable() && schema.field(3).is_nullable());
         assert_eq!(
@@ -871,7 +880,7 @@ mod batch_builder_tests {
     fn invalid_rows_are_refused_with_stable_codes() {
         for (row, code) in [
             (
-                r#"{"id": 1, "card_uid": "x"}"#,
+                r#"{"id": 1, "subject_card_uid": "x"}"#,
                 "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
             ),
             (

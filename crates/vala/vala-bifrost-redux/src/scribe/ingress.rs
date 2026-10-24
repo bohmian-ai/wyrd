@@ -104,7 +104,9 @@ struct AdmittedRowContext {
     /// Source of the trusted subject/actor pair moved into the retained
     /// source.
     attribution: StampedAttribution,
-    /// Card UIDs every row's `card_uid` is authorized against.
+    /// Verified workload Service release a frame-attributed write stamps.
+    workload: Option<wyrd_spec::ids::CardUid>,
+    /// Card UIDs every row's `subject_card_uid` is authorized against.
     card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
     /// Caller-supplied fingerprint required of the projected source schema;
     /// `None` leaves the selected definition's conformance as the only
@@ -119,9 +121,9 @@ struct AdmittedRowContext {
     /// Fixed material ceiling admitted for the current slice.
     material_limit: usize,
     /// Server-owned built-in whose declared physical contract the decode must
-    /// preserve, including its correlation policy.
+    /// preserve.
     ///
-    /// `None` for a dynamic table, which keeps the default envelope.
+    /// `None` for a dynamic table.
     definition: Option<&'static crate::tables::BuiltinTableDefinition>,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
     ///
@@ -368,6 +370,7 @@ impl ScribeImpl {
     ) -> Result<AdmittedRows, ScribeError> {
         let AdmittedRowContext {
             attribution,
+            workload,
             card_scope,
             expected_schema_fingerprint,
             request_id,
@@ -382,6 +385,7 @@ impl ScribeImpl {
                 Ok(AdmittedRows::Native(Box::new(NativeAdmittedRows {
                     bytes,
                     attribution,
+                    workload,
                     card_scope,
                     expected_schema_fingerprint,
                     request_id,
@@ -401,6 +405,7 @@ impl ScribeImpl {
                         IngressPayload::Canonical(canonical),
                         crate::scribe::execution_lanes::IngressDecodeInputs {
                             attribution,
+                            workload,
                             card_scope,
                             expected_schema_fingerprint,
                             request_id,
@@ -714,6 +719,7 @@ impl ScribeImpl {
                         .attributed_cards
                         .or_else(|| frame.principal.card_scope().map(<[_]>::to_vec)),
                     attribution: frame.attribution,
+                    workload: frame.principal.workload_uid.clone(),
                     expected_schema_fingerprint,
                     request_id: frame.request_id,
                     batch_id: frame.batch_id,

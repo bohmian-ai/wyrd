@@ -13,12 +13,12 @@ use super::support::{start_scribe_server, tenant_client, unique_table};
 ///
 /// For a canonical signal table the description's projected Arrow schema is
 /// the registry's physical schema — every name, type shape, and nullability —
-/// including the `card_uid` correlation input a writer supplies, and the
+/// including the `subject_card_uid` correlation input a writer supplies, and the
 /// exact canonical physical fingerprint. Types compare exactly, because the
 /// description projects the registry's own physical schema. For a dynamic
 /// table, batches prepared straight from the description are accepted by the
 /// real ingest wire and land with optional Card correlation: the correlated
-/// row keeps its `card_uid`, the uncorrelated row stores none and still
+/// row keeps its `subject_card_uid`, the uncorrelated row stores none and still
 /// carries its authenticated principal.
 ///
 /// # Panics
@@ -118,16 +118,17 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
             "`{name}` sends no field identity beyond its extension type; ingress compares by shape"
         );
     }
-    let card_uid = canonical
+    let subject_card_uid = canonical
         .correlation_fields
         .iter()
-        .find(|field| field.name == "card_uid")
+        .find(|field| field.name == "subject_card_uid")
         .expect("the Card correlation input is described");
     assert!(
-        card_uid.nullable && card_uid.data_type == wyrd_spec::vala::api::DataTypeSpec::Utf8,
-        "card_uid is the optional text column the writer supplies"
+        subject_card_uid.nullable
+            && subject_card_uid.data_type == wyrd_spec::vala::api::DataTypeSpec::Utf8,
+        "subject_card_uid is the optional text column the writer supplies"
     );
-    for name in ["card_uid", "run_id"] {
+    for name in ["subject_card_uid", "run_id"] {
         assert_eq!(
             described_schema
                 .fields()
@@ -151,7 +152,7 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     assert!(
         wyrd_types::writable_schema(&dynamic)
             .expect("the dynamic description projects an Arrow schema")
-            .field_with_name("card_uid")
+            .field_with_name("subject_card_uid")
             .expect("the Card correlation input is described")
             .is_nullable(),
         "Card correlation is optional, so describe must not demand it"
@@ -201,25 +202,27 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     let mut stream = query
         .query(&BifrostQueryRequest {
             params: Vec::new(),
-            sql: format!("SELECT id, card_uid, sub_principal_id FROM {fqn} ORDER BY id"),
+            sql: format!("SELECT id, subject_card_uid, sub_principal_id FROM {fqn} ORDER BY id"),
             deadline_ms: None,
         })
         .await
         .expect("Oracle reads the stored correlation columns");
     let mut correlation = Vec::new();
     while let Some(batch) = stream.next_batch().await.expect("valid terminal stream") {
-        let card_uid = batch.column_by_name("card_uid").expect("card_uid column");
+        let subject_card_uid = batch
+            .column_by_name("subject_card_uid")
+            .expect("subject_card_uid column");
         let principal_id = batch
             .column_by_name("sub_principal_id")
             .expect("sub_principal_id column");
         for row in 0..batch.num_rows() {
-            correlation.push((card_uid.is_null(row), principal_id.is_null(row)));
+            correlation.push((subject_card_uid.is_null(row), principal_id.is_null(row)));
         }
     }
     assert_eq!(
         correlation,
         vec![(false, false), (true, false)],
-        "both described rows land; only the correlated one carries a card_uid"
+        "both described rows land; only the correlated one carries a subject_card_uid"
     );
     server.shutdown().await.expect("server shutdown");
 }
@@ -1055,9 +1058,9 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
             "RequiredColumn",
         ),
         (
-            schema_edit(version, vec![string_column("card_uid", true)], &[]),
+            schema_edit(version, vec![string_column("subject_card_uid", true)], &[]),
             "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
-            "card_uid",
+            "subject_card_uid",
         ),
         (
             schema_edit(

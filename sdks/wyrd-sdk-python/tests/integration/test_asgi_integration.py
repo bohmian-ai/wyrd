@@ -65,17 +65,17 @@ def submit(run: Any, latency: float) -> str:
 
 
 def drift(server: WyrdTestServer, bifrost: Bifrost, run_ids: list[str]) -> dict[str, set]:
-    """Publish captured rows, then map each of ``run_ids`` to its ``(latency, card_uid)`` rows."""
+    """Publish captured rows, then map each of ``run_ids`` to its ``(latency, subject_card_uid)`` rows."""
     server.flush_bifrost()
     placeholders = ", ".join(f"${index}" for index in range(1, len(run_ids) + 1))
     rows = bifrost.sql(
-        "SELECT run_id, num_value, card_uid FROM bifrost.drift.observations "
+        "SELECT run_id, num_value, subject_card_uid FROM bifrost.drift.observations "
         f"WHERE series = 'latency' AND run_id IN ({placeholders})",
         run_ids,
     )
     stored: dict[str, set] = {}
     for row in rows.to_arrow().to_pylist():
-        stored.setdefault(row["run_id"], set()).add((row["num_value"], row["card_uid"]))
+        stored.setdefault(row["run_id"], set()).add((row["num_value"], row["subject_card_uid"]))
     return stored
 
 

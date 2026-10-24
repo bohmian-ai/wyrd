@@ -1660,11 +1660,11 @@ mod tests {
             let mut handed = self.card_uids.lock().expect("card log is not poisoned");
             for batch in &canonical.batches {
                 let column = batch
-                    .column_by_name("card_uid")
+                    .column_by_name("subject_card_uid")
                     .expect("a canonical signal batch carries its correlation column")
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
-                    .expect("card_uid is Utf8");
+                    .expect("subject_card_uid is Utf8");
                 for row in 0..column.len() {
                     if column.is_null(row) {
                         handed.push(None);

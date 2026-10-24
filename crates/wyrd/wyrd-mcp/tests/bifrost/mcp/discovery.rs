@@ -271,7 +271,7 @@ mod pg_tests {
                 .as_str()
                 .ok_or("query example has sql")?
                 .replace("<custom_table>", &self.table)
-                .replace("<card_uid>", "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
+                .replace("<subject_card_uid>", "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
                 .replace("<result_id>", "guide-absent-result")
                 .replace("<trace_id>", &trace_id);
             arguments["sql"] = json!(sql);
@@ -480,7 +480,8 @@ mod pg_tests {
             .filter_map(|field| field["name"].as_str())
             .collect();
         assert!(
-            correlation_names.contains(&"card_uid") && correlation_names.contains(&"run_id"),
+            correlation_names.contains(&"subject_card_uid")
+                && correlation_names.contains(&"run_id"),
             "the server-resolved correlation columns are their own class: {correlation_names:?}"
         );
         assert!(

@@ -307,7 +307,7 @@ mod tests {
             );
         }
 
-        let card_uids = typed::<StringArray>(&batch, "card_uid");
+        let card_uids = typed::<StringArray>(&batch, "subject_card_uid");
         let run_ids = typed::<StringArray>(&batch, "run_id");
         assert!(
             card_uids.is_null(0) && run_ids.is_null(0),
@@ -635,7 +635,7 @@ mod tests {
         );
         assert_eq!(batch.num_rows(), 3, "only the two defective spans are lost");
 
-        let card_uids = typed::<StringArray>(&batch, "card_uid");
+        let card_uids = typed::<StringArray>(&batch, "subject_card_uid");
         assert!(
             card_uids.is_null(0),
             "a missing wyrd.card_uid projects null"

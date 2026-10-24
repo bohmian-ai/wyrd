@@ -378,7 +378,7 @@ async fn oracle_only_gateway_captures_through_the_peer_scribe() {
             .retained_audit_records(
                 gateway.data_tenant_id(),
                 "outcome",
-                &format!("request_id = '{request_id}'"),
+                &format!("wyrd_request_id = '{request_id}'"),
             )
             .await
             .expect("retained audit reads");

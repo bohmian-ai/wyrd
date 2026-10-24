@@ -15,8 +15,7 @@ use crate::tables::fields::{
 };
 use crate::tables::signal;
 use crate::tables::{
-    CanonicalBatchValidator, CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc,
-    sort_desc,
+    CanonicalBatchValidator, DomainTable, PayloadClass, attributed_layout, hourly_layout,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
@@ -153,6 +152,9 @@ pub static METRIC_FIELDS: &[CanonicalField] = &[
     F::meta("service_name", T::Utf8, true),
     F::meta("service_version", T::Utf8, true),
     F::meta("deployment_environment", T::Utf8, true),
+    F::meta("subject_kind", T::Utf8, true),
+    F::meta("subject_name", T::Utf8, true),
+    F::meta("subject_version", T::Utf8, true),
 ];
 
 /// The canonical durable table for the `OTLP` metric signal.
@@ -161,7 +163,6 @@ pub struct PointsTable;
 impl DomainTable for PointsTable {
     const NAMESPACE: &'static str = "metrics";
     const NAME: &'static str = "points";
-    const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[
         "metadata",
@@ -184,17 +185,6 @@ impl DomainTable for PointsTable {
     }
 
     fn physical_layout() -> PhysicalLayoutWire {
-        hourly_layout(
-            "time_unix_nano",
-            vec![sort_desc("time_unix_nano"), sort_asc("metric_name")],
-            &[
-                "run_id",
-                "card_uid",
-                "sub_principal_id",
-                "act_principal_id",
-                "metric_name",
-                "metric_type",
-            ],
-        )
+        attributed_layout(hourly_layout, "time_unix_nano", &["metric_name"])
     }
 }

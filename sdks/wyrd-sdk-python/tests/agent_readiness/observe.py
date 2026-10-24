@@ -163,7 +163,7 @@ class Observer:
         cards = ", ".join(f"${index}" for index in range(1, len(uids) + 1))
         evidence.telemetry_runs = self.runs(
             f"SELECT DISTINCT run_id FROM bifrost.traces.spans "
-            f"WHERE run_id IS NOT NULL AND card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
+            f"WHERE run_id IS NOT NULL AND subject_card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
             uids,
             evidence,
         )
@@ -173,7 +173,7 @@ class Observer:
                 continue
             evidence.custom_runs[table] = self.runs(
                 f"SELECT DISTINCT run_id FROM bifrost.datasets.{table} "
-                f"WHERE run_id IS NOT NULL AND card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
+                f"WHERE run_id IS NOT NULL AND subject_card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
                 uids,
                 evidence,
             )
@@ -183,14 +183,14 @@ class Observer:
                 "SELECT r.execution_id, r.execution_status, r.verdict, r.run_id "
                 "FROM bifrost.verification.results r "
                 "JOIN bifrost.verification.execution_inputs i ON i.execution_id = r.execution_id "
-                f"WHERE NOT i.queue_execution AND r.card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
+                f"WHERE NOT i.queue_execution AND r.subject_card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
                 uids,
                 evidence,
             )
         ]
         queued = self.rows(
             "SELECT DISTINCT execution_id FROM bifrost.verification.execution_inputs "
-            f"WHERE queue_execution AND card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
+            f"WHERE queue_execution AND subject_card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
             uids,
             evidence,
         )

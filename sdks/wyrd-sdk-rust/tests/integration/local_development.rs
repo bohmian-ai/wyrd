@@ -36,7 +36,7 @@ use crate::support::{Deployment, declare, pull};
 #[derive(Debug, Deserialize)]
 struct Attributed {
     /// The stamped Card UID.
-    card_uid: Option<String>,
+    subject_card_uid: Option<String>,
 }
 
 /// The local upstream every Gateway call and its server.
@@ -169,13 +169,13 @@ pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
     ] {
         let rows: Vec<Attributed> = bifrost
             .sql_as(
-                &format!("SELECT card_uid FROM {table} WHERE run_id = $1"),
+                &format!("SELECT subject_card_uid FROM {table} WHERE run_id = $1"),
                 &[QueryParam::String(run_id.clone())],
             )
             .await
             .unwrap_or_else(|error| panic!("{table} reads back: {error}"));
         assert_eq!(rows.len(), 1, "{table}: {rows:?}");
-        assert_eq!(rows[0].card_uid.as_ref(), Some(uid), "{table}");
+        assert_eq!(rows[0].subject_card_uid.as_ref(), Some(uid), "{table}");
     }
     Worked {
         state,

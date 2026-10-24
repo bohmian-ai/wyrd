@@ -4258,7 +4258,7 @@ async fn accepted_authority_survives_account_and_context_changes() {
         panic!("one result is published: {}", results.len());
     };
     assert_eq!(
-        sent_values(result, "owner_card_uid"),
+        sent_values(result, "workload_card_uid"),
         std::collections::BTreeSet::from([harness.subject.to_string()]),
         "the shared component's other owner never becomes the result owner"
     );

@@ -99,7 +99,9 @@ async fn read_decision_detail(
         .retained_audit_records(
             tenant,
             "detail",
-            &format!("operation = 'bifrost.query.read_decision' AND request_id = '{request_id}'"),
+            &format!(
+                "operation = 'bifrost.query.read_decision' AND wyrd_request_id = '{request_id}'"
+            ),
         )
         .await?;
     let [record] = records.as_slice() else {

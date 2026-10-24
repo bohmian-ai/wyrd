@@ -96,6 +96,8 @@ def test_a_type_bifrost_cannot_store_is_refused_when_declared(
     column_type: pyarrow.DataType,
 ) -> None:
     with pytest.raises(WyrdError) as refused:
-        TableConfig.from_arrow("bifrost.datasets.no_wire_form", pyarrow.schema([("c", column_type)]))
+        TableConfig.from_arrow(
+            "bifrost.datasets.no_wire_form", pyarrow.schema([("c", column_type)])
+        )
 
     assert refused.value.code == UNSUPPORTED_TYPE

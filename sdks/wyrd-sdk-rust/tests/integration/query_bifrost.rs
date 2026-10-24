@@ -92,7 +92,7 @@ async fn live() -> (Deployment, Bifrost) {
             .insert(
                 serde_json::to_vec(&row).expect("row serializes"),
                 Correlation {
-                    card_uid: None,
+                    subject_card_uid: None,
                     run_id: Some(run_id.clone()),
                 },
             )

@@ -47,7 +47,7 @@ pub(crate) fn projected_source_schema_fingerprint(
         .filter(|field| {
             !matches!(
                 field.name().as_str(),
-                wyrd_spec::vala::CARD_UID
+                wyrd_spec::vala::SUBJECT_CARD_UID
                     | wyrd_spec::vala::SUB_PRINCIPAL_ID
                     | wyrd_spec::vala::ACT_PRINCIPAL_ID
                     | "run_id"

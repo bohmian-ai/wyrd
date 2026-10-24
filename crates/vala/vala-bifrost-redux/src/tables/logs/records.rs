@@ -13,8 +13,7 @@ use crate::tables::fields::{
 };
 use crate::tables::signal;
 use crate::tables::{
-    CanonicalBatchValidator, CorrelationPolicy, DomainTable, PayloadClass, hourly_layout,
-    sort_asc_nulls_first, sort_desc,
+    CanonicalBatchValidator, DomainTable, PayloadClass, attributed_layout, hourly_layout,
 };
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::PhysicalLayoutWire;
@@ -61,6 +60,9 @@ pub static LOG_FIELDS: &[CanonicalField] = &[
     F::meta("service_name", T::Utf8, true),
     F::meta("service_version", T::Utf8, true),
     F::meta("deployment_environment", T::Utf8, true),
+    F::meta("subject_kind", T::Utf8, true),
+    F::meta("subject_name", T::Utf8, true),
+    F::meta("subject_version", T::Utf8, true),
     F::meta("exception_type", T::Utf8, true),
     F::meta("exception_message", T::Utf8, true),
     F::meta("exception_stacktrace", T::Utf8, true),
@@ -73,7 +75,6 @@ pub struct RecordsTable;
 impl DomainTable for RecordsTable {
     const NAMESPACE: &'static str = "logs";
     const NAME: &'static str = "records";
-    const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[
         "body",
@@ -94,21 +95,7 @@ impl DomainTable for RecordsTable {
     }
 
     fn physical_layout() -> PhysicalLayoutWire {
-        hourly_layout(
-            "time_unix_nano",
-            vec![
-                sort_desc("time_unix_nano"),
-                sort_asc_nulls_first("event_name"),
-            ],
-            &[
-                "run_id",
-                "card_uid",
-                "sub_principal_id",
-                "act_principal_id",
-                "severity_number",
-                "trace_id",
-            ],
-        )
+        attributed_layout(hourly_layout, "time_unix_nano", &["trace_id"])
     }
 }
 

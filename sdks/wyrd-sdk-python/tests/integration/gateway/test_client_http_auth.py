@@ -308,12 +308,12 @@ def test_state_http_auth_supplies_service_and_agent_context(
         assert not any(name.startswith(("x-wyrd", "wyrd-")) for name in delivery.headers)
         assert key not in repr(delivery.headers)
 
-    rows = calls(server, "TRUE", "card_uid, run_id, outcome")
-    assert [(str(row["card_uid"]), row["run_id"], row["outcome"]) for row in rows[:3]] == [
+    rows = calls(server, "TRUE", "subject_card_uid, run_id, outcome")
+    assert [(str(row["subject_card_uid"]), row["run_id"], row["outcome"]) for row in rows[:3]] == [
         (service, None, "succeeded"),
         (service, service_run.run_id, "succeeded"),
         (agent, agent_run.run_id, "succeeded"),
     ]
-    assert sorted((str(row["card_uid"]), row["run_id"]) for row in rows[3:]) == sorted(
+    assert sorted((str(row["subject_card_uid"]), row["run_id"]) for row in rows[3:]) == sorted(
         (agent, run_id) for run_id in concurrent_runs
     )

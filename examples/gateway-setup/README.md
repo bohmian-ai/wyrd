@@ -102,7 +102,7 @@ fixtures.
    ```
 
    Every call is retained in `bifrost.gateway.calls` under its `run_id` and the
-   Agent's `card_uid`. The Jev deployment returns keyed `answers`.
+   Agent's `subject_card_uid`. The Jev deployment returns keyed `answers`.
 
 `wyrd gateway credential revoke <name>` is permanent: every deployment using
 that credential stops serving, and the name cannot be put again. To recover,

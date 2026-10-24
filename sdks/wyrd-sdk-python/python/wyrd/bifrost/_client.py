@@ -244,7 +244,7 @@ class ResolvedTable(TypedDict):
 class Correlation(TypedDict, total=False):
     """Optional per-row correlation; an omitted key is a null on the wire."""
 
-    card_uid: str
+    subject_card_uid: str
     run_id: str
 
 
@@ -283,8 +283,9 @@ class TableConfig:
                 Datetime fields declare the timestamp types in
                 ``wyrd.types``: ``NaiveDatetime`` is ``TIMESTAMP_NTZ`` and any
                 other ``datetime`` is ``TIMESTAMP_LTZ``.
-                ``card_uid``, ``run_id``, ``sub_principal_id``,
-                ``act_principal_id``, and ``wyrd_*`` names are reserved.
+                ``workload_card_uid``, ``subject_card_uid``, ``run_id``,
+                ``sub_principal_id``, ``act_principal_id``, and ``wyrd_*`` names
+                are reserved.
             table: the ``"<namespace>.<name>"`` name SQL uses.
             partition_by: up to three ``PartitionField`` mappings: exactly
                 one ``"hour"`` or ``"day"`` transform of the time column plus
@@ -374,8 +375,9 @@ class TableConfig:
         Args:
             table: the ``"<namespace>.<name>"`` name SQL uses.
             schema: a JSON Schema object with a ``properties`` mapping.
-                ``card_uid``, ``run_id``, ``sub_principal_id``,
-                ``act_principal_id``, and ``wyrd_*`` names are reserved.
+                ``workload_card_uid``, ``subject_card_uid``, ``run_id``,
+                ``sub_principal_id``, ``act_principal_id``, and ``wyrd_*`` names
+                are reserved.
             partition_by: up to three ``PartitionField`` mappings, as for
                 ``TableConfig()``.
             sort_keys: up to four ``SortKey`` mappings, as for
@@ -757,13 +759,13 @@ class _BifrostBase:
         Args:
             row: a Pydantic model instance, a mapping, or a JSON object string
                 holding the table's declared columns.
-            correlation: optional ``card_uid`` and ``run_id`` for this row.
+            correlation: optional ``subject_card_uid`` and ``run_id`` for this row.
                 Omitted keys are stored as null.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an unparsable
-                ``card_uid``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
-                is bound; ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
+                ``subject_card_uid``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no
+                table is bound; ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
                 queue is full; or, on a handle not yet connected, the error
                 ``connect`` raises.
 
@@ -772,7 +774,7 @@ class _BifrostBase:
         correlation = correlation or {}
         self._native.insert(
             _row_json(row),
-            correlation.get("card_uid"),
+            correlation.get("subject_card_uid"),
             correlation.get("run_id"),
         )
 
@@ -1548,7 +1550,7 @@ class TableDescription(_TableDescriptionOptional):
     ``table_version`` is the exact version the schema and layout describe;
     a writer sends it with every batch, and a batch naming any other version
     is refused. ``user_fields`` are the declared columns,
-    ``correlation_fields`` the write-time ``card_uid``/``run_id`` inputs.
+    ``correlation_fields`` the write-time ``subject_card_uid``/``run_id`` inputs.
     """
 
     entry: TableEntry

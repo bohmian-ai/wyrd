@@ -5,7 +5,7 @@ from wyrd.bifrost import TableConfig
 
 
 class Reserved(BaseModel):
-    card_uid: str
+    subject_card_uid: str
 
 
 def test_a_server_owned_column_is_refused_before_any_request() -> None:

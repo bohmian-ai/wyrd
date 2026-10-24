@@ -98,8 +98,8 @@ wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql
 It prints one JSON row per stored verdict, newest first:
 
 ```text
-{"result_id":"<id>","run_id":"<run_id>","card_uid":"<uid>","verdict":"failed"}
-{"result_id":"<id>","run_id":"<run_id>","card_uid":"<uid>","verdict":"passed"}
+{"result_id":"<id>","run_id":"<run_id>","subject_card_uid":"<uid>","verdict":"failed"}
+{"result_id":"<id>","run_id":"<run_id>","subject_card_uid":"<uid>","verdict":"passed"}
 ```
 
 The `failed` and `passed` rows with the same `run_id` are your program's two verdicts, and that `run_id` identifies its Run. The server publishes rows shortly after the program ends: if a verdict is missing, repeat the query for up to a minute.

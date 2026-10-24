@@ -273,7 +273,7 @@ def test_uncorrelated_row_is_a_valid_write(wyrd_server: WyrdTestServer, bifrost:
 def test_negative_bad_card_uid_raises(wyrd_server: WyrdTestServer) -> None:
     writer = Bifrost(TableConfig(Item, "bifrost.datasets.bad_card_uid"))
     with pytest.raises(WyrdError) as raised:
-        writer.insert(Item(id=1, value="bad"), {"card_uid": "not-a-uid"})
+        writer.insert(Item(id=1, value="bad"), {"subject_card_uid": "not-a-uid"})
     assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
@@ -454,7 +454,8 @@ def test_subject_actor_rows_and_reserved_columns(
     assert actor.sub_principal_id == actor.act_principal_id != direct.sub_principal_id
     with pytest.raises(WyrdError) as declared:
         TableConfig.from_json_schema(
-            "bifrost.datasets.spoofed", {"type": "object", "properties": {column: {"type": "string"}}}
+            "bifrost.datasets.spoofed",
+            {"type": "object", "properties": {column: {"type": "string"}}},
         )
     assert declared.value.code == "WYRD_VALA_400_BIFROST_RESERVED_COLUMN"
 

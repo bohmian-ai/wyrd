@@ -80,7 +80,9 @@ use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 use wyrd_spec::ids::{CardUid, GroupId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, NodeId};
-use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
+use wyrd_spec::vala::{
+    ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID, WYRD_REQUEST_ID,
+};
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::verifier_executions::{GroupActivity, Submission, VerifierExecutionQueue};
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
@@ -160,7 +162,7 @@ pub enum ScribeWrite {
     /// One Verifier judgment's summary and detail rows.
     Result {
         /// The result's rows, details before the summary, each naming the
-        /// Card verified as its `card_uid`.
+        /// Card verified as its `subject_card_uid`.
         payload: ResultPayload,
         /// The run's subject and actor, which Scribe stamps on every row.
         attribution: Attribution,
@@ -303,8 +305,8 @@ impl ScribeWrite {
         };
         let group_id = GroupId::new(cell("group_id")?).ok()?;
         Some(GroupActivity {
-            owner_card_uid: CardUid::new(cell("owner_card_uid")?).ok()?,
-            card_uid: CardUid::new(cell("card_uid")?).ok()?,
+            owner_card_uid: CardUid::new(cell(WORKLOAD_CARD_UID)?).ok()?,
+            card_uid: CardUid::new(cell(SUBJECT_CARD_UID)?).ok()?,
             verifier_card_uid: CardUid::new(cell("verifier_card_uid")?).ok()?,
             group_id,
         })
@@ -467,23 +469,18 @@ pub(crate) struct ScribeBatch {
 impl ScribeBatch {
     /// Builds the Scribe frame for this batch.
     ///
-    /// Scribe stamps each row's own subject and actor, which it carries as
-    /// content, and authorizes each row's `card_uid` against the UID-bearing
-    /// Cards the rows name, which the producing owner authorized before
-    /// staging. Every frame names the platform audit principal, the
-    /// no-verified-caller marker, as its required tenant principal; it grants
-    /// nothing, since every write here is server-internal and evaluates no
-    /// permission. Audit decisions carry their pair as content, so an audit
-    /// frame submits the unresolved pair; every other frame is row-attributed
-    /// with each row's verified subject and actor.
+    /// Every frame is row-attributed: Scribe stamps each row's own carried
+    /// subject and actor, workload, and request — an audit decision's being
+    /// the decision's own — and authorizes each row's `subject_card_uid`
+    /// against the UID-bearing Cards the rows name, which the producing owner
+    /// authorized before staging. Every frame names the platform audit
+    /// principal, the no-verified-caller marker, as its required tenant
+    /// principal; it grants nothing, since every write here is server-internal
+    /// and evaluates no permission.
     pub(crate) fn into_frame(self) -> ScribeIngressFrame {
-        let attribution = match self.table {
-            ScribeTable::AuditLog => Attribution::unresolved().into(),
-            _ => StampedAttribution::Rows,
-        };
         ScribeIngressFrame {
             attributed_cards: Some(native_card_uids(&self.ipc)).filter(|uids| !uids.is_empty()),
-            attribution,
+            attribution: StampedAttribution::Rows,
             principal: Principal::new(
                 PLATFORM_AUDIT_PRINCIPAL,
                 PrincipalKind::User,
@@ -1300,7 +1297,7 @@ impl OutboxSink for ScribeSink {
         let request_id = match item {
             ScribeWrite::Capture(capture) => Some(capture.request_id()),
             ScribeWrite::Audit(Some(batch)) => batch
-                .column_by_name("request_id")
+                .column_by_name(WYRD_REQUEST_ID)
                 .and_then(|column| column.as_string_opt::<i32>())
                 .filter(|column| !column.is_empty() && column.is_valid(0))
                 .map(|column| column.value(0)),

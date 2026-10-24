@@ -248,7 +248,7 @@ export async function explain(client: WyrdClient, runId: string): Promise<Record
   }
   const sql =
     "SELECT t.run_id, s.trace_id, t.ticket_id, t.answer, s.name AS span, " +
-    "g.call_id, g.card_uid AS call_card_uid, r.verdict " +
+    "g.call_id, g.subject_card_uid AS call_card_uid, r.verdict " +
     "FROM bifrost.datasets.tickets t " +
     "JOIN bifrost.traces.spans s ON s.run_id = t.run_id " +
     "JOIN bifrost.gateway.calls g ON g.run_id = t.run_id " +

@@ -860,7 +860,7 @@ async fn scribe_unbound_writer_card_attribution_journey() {
     let stamped = read_correlation(&client, &table)
         .await
         .into_iter()
-        .map(|(value, card_uid, _principal)| (value, card_uid))
+        .map(|(value, subject_card_uid, _principal)| (value, subject_card_uid))
         .collect::<Vec<_>>();
     assert_eq!(
         stamped,
@@ -1038,7 +1038,7 @@ async fn append_correlated(
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new(
-            wyrd_spec::vala::managed_columns::CARD_UID,
+            wyrd_spec::vala::managed_columns::SUBJECT_CARD_UID,
             DataType::Utf8,
             true,
         ),
@@ -1080,7 +1080,8 @@ async fn read_correlation(
     client: &wyrd_client::WyrdClient,
     table: &str,
 ) -> Vec<(i64, Option<String>, String)> {
-    let sql = format!("SELECT value, card_uid, sub_principal_id FROM {table} ORDER BY value");
+    let sql =
+        format!("SELECT value, subject_card_uid, sub_principal_id FROM {table} ORDER BY value");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             params: Vec::new(),
@@ -1100,9 +1101,9 @@ async fn read_correlation(
             .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
             .expect("value is Int64");
         let uids = batch
-            .column_by_name("card_uid")
+            .column_by_name("subject_card_uid")
             .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>())
-            .expect("card_uid is Utf8");
+            .expect("subject_card_uid is Utf8");
         let principals = batch
             .column_by_name("sub_principal_id")
             .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>())

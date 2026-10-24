@@ -89,7 +89,7 @@ def result_with_its_judge_calls(
             "r.run_id AS result_run, c.sub_principal_id AS call_subject, "
             "c.act_principal_id AS call_actor, c.run_id AS call_run "
             "FROM bifrost.verification.results r "
-            "JOIN bifrost.gateway.calls c ON c.card_uid = r.card_uid "
+            "JOIN bifrost.gateway.calls c ON c.subject_card_uid = r.subject_card_uid "
             f"WHERE r.execution_id = $1 AND {on} = $2",
             [execution_id, value],
         )
@@ -182,7 +182,7 @@ def test_judge_call_is_attributed_to_the_run_and_card(
     caller = principal()
     calls = (
         bifrost.sql(
-            "SELECT sub_principal_id, act_principal_id, card_uid FROM bifrost.gateway.calls "
+            "SELECT sub_principal_id, act_principal_id, subject_card_uid FROM bifrost.gateway.calls "
             "WHERE run_id = $1",
             [run.run_id],
         )
@@ -190,7 +190,7 @@ def test_judge_call_is_attributed_to_the_run_and_card(
         .to_pylist()
     )
     [call] = calls
-    assert (call["sub_principal_id"], call["card_uid"]) == (caller, str(result.subject.uid))
+    assert (call["sub_principal_id"], call["subject_card_uid"]) == (caller, str(result.subject.uid))
     assert call["act_principal_id"] not in (None, caller)
     assert_called_as_system(
         result_with_its_judge_calls(bifrost, result.execution_id, run.run_id), caller, run.run_id
@@ -214,7 +214,7 @@ def test_judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
     call_id = attempt["attributes"]["gateway_call_id"]
     [call] = (
         bifrost.sql(
-            "SELECT sub_principal_id, run_id, card_uid FROM bifrost.gateway.calls WHERE call_id = $1",
+            "SELECT sub_principal_id, run_id, subject_card_uid FROM bifrost.gateway.calls WHERE call_id = $1",
             [call_id],
         )
         .to_arrow()
@@ -222,7 +222,7 @@ def test_judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
     )
     caller = principal()
     agent = declare(cards, "cards/verify_in_real_time/assistant.yaml")["assistant-agent"]
-    assert (call["sub_principal_id"], call["run_id"], call["card_uid"]) == (
+    assert (call["sub_principal_id"], call["run_id"], call["subject_card_uid"]) == (
         caller,
         None,
         str(agent.uid),

@@ -90,7 +90,10 @@ const INVESTIGATION = [
   toolCall("call-card", TOOLS[0], {
     card_ref: { kind: "Service", name: "policy-desk", version: "1.0.0" },
   }),
-  toolCall("call-query", TOOLS[1], { sql: "SELECT execution_id FROM bifrost.verification.results LIMIT 1", max_rows: 1 }),
+  toolCall("call-query", TOOLS[1], {
+    sql: "SELECT execution_id FROM bifrost.verification.results LIMIT 1",
+    max_rows: 1,
+  }),
   toolCall("call-code", TOOLS[2], { source: "6 * 7" }),
 ];
 

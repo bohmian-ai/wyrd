@@ -244,7 +244,7 @@ impl Assistant {
             .await
             .expect("Bifrost connects")
             .sql_as(
-                "SELECT call_id, sub_principal_id, act_principal_id, run_id, card_uid \
+                "SELECT call_id, sub_principal_id, act_principal_id, run_id, subject_card_uid \
                  FROM bifrost.gateway.calls",
                 &[],
             )
@@ -269,7 +269,7 @@ impl Assistant {
                         c.sub_principal_id AS call_subject, \
                         c.act_principal_id AS call_actor, c.run_id AS call_run \
                    FROM bifrost.verification.results r \
-                   JOIN bifrost.gateway.calls c ON c.card_uid = r.card_uid \
+                   JOIN bifrost.gateway.calls c ON c.subject_card_uid = r.subject_card_uid \
                   WHERE r.execution_id = $1",
                 &[QueryParam::String(execution_id.to_owned())],
             )
@@ -332,7 +332,7 @@ struct JudgeCall {
     /// The application Run the call is attributed to.
     run_id: Option<String>,
     /// The Card UID the call is attributed to.
-    card_uid: Option<String>,
+    subject_card_uid: Option<String>,
 }
 
 impl JudgeCall {
@@ -553,7 +553,7 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
             .map(|call| (
                 call.sub_principal_id.as_str(),
                 call.run_id.as_deref(),
-                call.card_uid.clone()
+                call.subject_card_uid.clone()
             ))
             .collect::<Vec<_>>(),
         [(
@@ -601,7 +601,7 @@ async fn judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
         (
             call.sub_principal_id.as_str(),
             call.run_id.as_deref(),
-            call.card_uid.clone()
+            call.subject_card_uid.clone()
         ),
         (
             principal.as_str(),

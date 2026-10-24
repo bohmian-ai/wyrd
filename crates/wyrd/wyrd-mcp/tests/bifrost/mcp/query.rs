@@ -858,10 +858,7 @@ mod pg_tests {
         // The tool renders a Variant cell as its JSON value.
         assert_eq!(
             messages["rows"][0][0],
-            serde_json::json!({
-                "gen_ai.input.messages": fixture::INPUT_MESSAGES,
-                "gen_ai.output.messages": fixture::OUTPUT_MESSAGES,
-            }),
+            fixture::root_span_attributes(),
             "an authorized agent reads the structured GenAI messages"
         );
         reader.cancel().await?;
@@ -928,10 +925,7 @@ mod pg_tests {
             serde_json::json!([[
                 fixture::INPUT_MESSAGES,
                 null,
-                {
-                    "gen_ai.input.messages": fixture::INPUT_MESSAGES,
-                    "gen_ai.output.messages": fixture::OUTPUT_MESSAGES,
-                },
+                fixture::root_span_attributes(),
                 fixture::EVENT_NAME,
                 "stop",
                 {"n": 9_007_199_254_740_993_i64, "u": u64::MAX},

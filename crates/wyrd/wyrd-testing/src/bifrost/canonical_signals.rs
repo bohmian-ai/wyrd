@@ -376,6 +376,23 @@ fn default_cell(field: &Field) -> Cell {
 /// Typed resource environment both fixture spans report.
 pub const SPAN_ENVIRONMENT: &str = "fixture";
 
+/// Raw `attributes` of the fixture's root GenAI span: the message payloads
+/// plus every source key its promoted `gen_ai_*` columns derive from, retained
+/// unchanged as the stored Variant reads back.
+#[must_use]
+pub fn root_span_attributes() -> Value {
+    serde_json::json!({
+        "gen_ai.input.messages": INPUT_MESSAGES,
+        "gen_ai.output.messages": OUTPUT_MESSAGES,
+        "gen_ai.operation.name": "chat",
+        "gen_ai.provider.name": "anthropic",
+        "gen_ai.request.model": MODEL,
+        "gen_ai.conversation.id": "conversation-fixture",
+        "gen_ai.usage.input_tokens": INPUT_TOKENS,
+        "gen_ai.usage.output_tokens": OUTPUT_TOKENS,
+    })
+}
+
 /// Build the two-span parent/child trace batch over a described span schema.
 ///
 /// The parent is the GenAI chat operation carrying promoted operation,
@@ -401,19 +418,7 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         ("status_present", Cell::Bool(true)),
         ("status_code", Cell::Int32(1)),
         ("status_message", Cell::Text("ok".to_owned())),
-        (
-            "attributes",
-            Cell::Variant(serde_json::json!({
-                "gen_ai.input.messages": INPUT_MESSAGES,
-                "gen_ai.output.messages": OUTPUT_MESSAGES,
-                "gen_ai.operation.name": "chat",
-                "gen_ai.provider.name": "anthropic",
-                "gen_ai.request.model": MODEL,
-                "gen_ai.conversation.id": "conversation-fixture",
-                "gen_ai.usage.input_tokens": INPUT_TOKENS,
-                "gen_ai.usage.output_tokens": OUTPUT_TOKENS,
-            })),
-        ),
+        ("attributes", Cell::Variant(root_span_attributes())),
         ("resource_present", Cell::Bool(true)),
         (
             "resource_attributes",

@@ -26,7 +26,7 @@ use arrow::array::{
     StructArray, TimestampMicrosecondArray,
 };
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::writer::StreamWriter;
 use arrow::json::writer::{JsonArray, WriterBuilder};
 use arrow::record_batch::RecordBatch;
@@ -602,10 +602,12 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     Ok(())
 }
 
-/// One Drift observation `record` of the Card `card_uid` at `event_time`: a
+/// One Drift observation `record` of the Card `subject` at `event_time`: a
 /// drifting `score` and a `latency` feature, as the SDK's tall projection
 /// writes them.
 ///
+/// The batch carries the table's own authored columns, its shared dimensions
+/// left null for the server to derive, and the `subject_card_uid` correlation.
 /// `event_time` is the rows' `created_at`, the observation table's time
 /// column, which Scribe keeps verbatim.
 ///
@@ -613,36 +615,36 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
 /// Returns an Arrow error when the batch cannot be assembled.
 fn observation_batch(
     record: &str,
-    card_uid: &CardUid,
+    subject: &CardUid,
     event_time: DateTime<Utc>,
 ) -> Result<RecordBatch, ServerJourneyError> {
-    let utc = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("record_id", DataType::Utf8, false),
-        Field::new("series", DataType::Utf8, false),
-        Field::new("num_value", DataType::Float64, true),
-        Field::new("str_value", DataType::Utf8, true),
-        Field::new("session_id", DataType::Utf8, true),
-        Field::new("created_at", utc(), false),
-        Field::new(SUBJECT_CARD_UID, DataType::Utf8, true),
-    ]));
+    use vala_bifrost_redux::tables::DomainTable;
+    use vala_bifrost_redux::tables::drift::ObservationsTable;
+
+    let mut fields = ObservationsTable::arrow_fields();
+    fields.push(Field::new(SUBJECT_CARD_UID, DataType::Utf8, true));
     let event_time = event_time.timestamp_micros();
+    let columns = fields
+        .iter()
+        .map(|field| -> ArrayRef {
+            match field.name().as_str() {
+                "record_id" => Arc::new(StringArray::from(vec![record, record])),
+                "series" => Arc::new(StringArray::from(vec!["score", "latency"])),
+                "num_value" => Arc::new(Float64Array::from(vec![3.0, 120.0])),
+                "created_at" => Arc::new(
+                    TimestampMicrosecondArray::from(vec![event_time, event_time])
+                        .with_data_type(field.data_type().clone()),
+                ),
+                SUBJECT_CARD_UID => {
+                    Arc::new(StringArray::from(vec![subject.as_str(), subject.as_str()]))
+                }
+                _ => arrow::array::new_null_array(field.data_type(), 2),
+            }
+        })
+        .collect();
     Ok(RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec![record, record])),
-            Arc::new(StringArray::from(vec!["score", "latency"])),
-            Arc::new(Float64Array::from(vec![3.0, 120.0])),
-            Arc::new(StringArray::from(vec![None::<&str>, None])),
-            Arc::new(StringArray::from(vec![None::<&str>, None])),
-            Arc::new(
-                TimestampMicrosecondArray::from(vec![event_time, event_time]).with_timezone("UTC"),
-            ),
-            Arc::new(StringArray::from(vec![
-                card_uid.as_str(),
-                card_uid.as_str(),
-            ])),
-        ],
+        Arc::new(Schema::new(fields)),
+        columns,
     )?)
 }
 
@@ -657,8 +659,8 @@ fn observation_batch(
 /// retrieved by `result_id` alone from both daily partitions; the straddling
 /// result's summary partitions on its `ended_at` while its details partition
 /// on a `wyrd_ingested_at` that falls on a different day. Every published Parquet file of
-/// the two tables carries a physical Bloom filter for its declared and
-/// managed-floor columns, and Oracle's scan metrics show a day-range
+/// the two tables carries a physical Bloom filter for every default Bloom
+/// column of its table's layout, and Oracle's scan metrics show a day-range
 /// predicate dropping the previous day's file and a `result_id` lookup
 /// selecting strictly fewer files or row groups than a full scan.
 ///
@@ -971,8 +973,8 @@ impl<'a> ResultLayoutJourney<'a> {
         })
     }
 
-    /// Require a physical Bloom filter on every declared and managed-floor
-    /// Bloom column in every published file of the two result tables.
+    /// Require a physical Bloom filter on every default Bloom column of each
+    /// result table's own layout, in every published file of the two tables.
     ///
     /// Files are found under the cluster's storage root and classified by a
     /// column only their table carries; each table must have at least one.
@@ -981,14 +983,21 @@ impl<'a> ResultLayoutJourney<'a> {
     /// Returns a filesystem or Parquet error, or names the first table with
     /// no file or the first column chunk without a Bloom filter.
     fn assert_blooms(&self) -> Result<(), ServerJourneyError> {
-        let floor = [RUN_ID, SUBJECT_CARD_UID, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID];
-        let tables: [(&str, &str, &[&str]); 2] = [
+        use vala_bifrost_redux::tables::DomainTable;
+        use vala_bifrost_redux::tables::drift::ResultFeaturesTable;
+        use vala_bifrost_redux::tables::verification::ResultsTable;
+
+        let tables = [
             (
                 "bifrost.verification.results",
                 "execution_status",
-                &["result_id", "verifier_card_uid", "binding_id"],
+                ResultsTable::physical_layout().bloom_columns,
             ),
-            ("bifrost.drift.result_features", "feature", &["result_id"]),
+            (
+                "bifrost.drift.result_features",
+                "feature",
+                ResultFeaturesTable::physical_layout().bloom_columns,
+            ),
         ];
         let mut found = [0_usize; 2];
         let mut pending = vec![self.cluster.storage_root().to_path_buf()];
@@ -1013,9 +1022,9 @@ impl<'a> ResultLayoutJourney<'a> {
                     continue;
                 };
                 found[index] += 1;
-                let (table, _, declared) = tables[index];
+                let (table, _, declared) = &tables[index];
                 for group in metadata.row_groups() {
-                    for name in declared.iter().chain(&floor) {
+                    for name in declared {
                         let chunk = group
                             .columns()
                             .iter()

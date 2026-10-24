@@ -1,4 +1,5 @@
-//! Registry resolution of the Cards an unbound writer attributes evidence to.
+//! Registry resolution of the Cards an unbound writer attributes evidence to,
+//! and of the descriptors every admitted frame's shared dimensions carry.
 //!
 //! A principal with a selected root attributes only within its signed scope,
 //! which Scribe checks without IO. A rootless unrestricted principal may
@@ -29,6 +30,7 @@ use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 use super::auth::AuthContext;
 use super::error::IngestError;
 use crate::tables::signal::card_uid_text;
+use crate::tables::{CardDescriptor, FrameDimensions};
 
 /// Most distinct Cards one frame may attribute to through registry
 /// resolution.
@@ -38,22 +40,137 @@ use crate::tables::signal::card_uid_text;
 /// reads one frame can cause.
 pub const MAX_ATTRIBUTED_CARDS: usize = 32;
 
-/// Tenant registry reader resolving unbound writers' Card attribution.
+/// Most Card descriptors one process keeps resolved.
+const DESCRIPTOR_CACHE_ENTRIES: u64 = 16_384;
+
+/// Tenant registry reader resolving unbound writers' Card attribution and the
+/// descriptors every admitted frame's shared dimensions are stamped from.
 ///
 /// Gate holds one per process; it is absent where no registry is composed,
 /// in which case an unbound writer's `card_uid` resolves to nothing and is
-/// refused exactly as an unauthorized reference.
+/// refused exactly as an unauthorized reference, and no frame carries
+/// descriptors.
 #[derive(Clone)]
 pub struct CardRegistry {
     /// The Wyrd registry database every lookup reads tenant-scoped.
     postgres: WyrdPostgres,
+    /// Descriptors already read, by tenant and UID. A UID never changes its
+    /// kind, name, or version, so an entry never goes stale; the bound only
+    /// limits memory.
+    descriptors: mini_moka::sync::Cache<(DataTenantId, CardUid), CardDescriptor>,
 }
 
 impl CardRegistry {
     /// Builds the reader over the Wyrd registry database.
     #[must_use]
-    pub const fn new(postgres: WyrdPostgres) -> Self {
-        Self { postgres }
+    pub fn new(postgres: WyrdPostgres) -> Self {
+        Self {
+            postgres,
+            descriptors: mini_moka::sync::Cache::new(DESCRIPTOR_CACHE_ENTRIES),
+        }
+    }
+
+    /// Resolves the shared-dimension context of one frame.
+    ///
+    /// The validated workload Service and every Card in `subjects` are
+    /// described from the tenant registry, each distinct UID read at most
+    /// once per process; the request environment is carried unchanged. A UID
+    /// the registry does not hold is left out, so a row naming it cannot be
+    /// stamped and is refused downstream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Internal`] when the tenant registry cannot be
+    /// read.
+    pub async fn frame_dimensions(
+        &self,
+        auth: &AuthContext,
+        subjects: &[CardUid],
+    ) -> Result<FrameDimensions, IngestError> {
+        let workload = auth.principal.workload_uid.as_ref();
+        let mut described = self
+            .described(auth.tenant, workload.into_iter().chain(subjects))
+            .await?;
+        let service = workload.and_then(|root| {
+            described
+                .iter()
+                .find(|(uid, _)| uid == root)
+                .map(|(_, descriptor)| descriptor.clone())
+        });
+        described.retain(|(uid, _)| subjects.contains(uid));
+        Ok(FrameDimensions {
+            service,
+            environment: auth.deployment_environment.clone(),
+            subjects: described,
+        })
+    }
+
+    /// Describes each distinct registered Card among `uids`, reading only the
+    /// UIDs this process has not described before.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Internal`] when the connection or a lookup fails
+    /// for any reason other than the Card being absent.
+    async fn described<'a>(
+        &self,
+        tenant: DataTenantId,
+        uids: impl IntoIterator<Item = &'a CardUid>,
+    ) -> Result<Vec<(CardUid, CardDescriptor)>, IngestError> {
+        let mut described = Vec::new();
+        let mut unread = Vec::new();
+        for uid in uids {
+            if described.iter().any(|(seen, _)| seen == uid) || unread.contains(uid) {
+                continue;
+            }
+            match self.descriptors.get(&(tenant, uid.clone())) {
+                Some(descriptor) => described.push((uid.clone(), descriptor)),
+                None => unread.push(uid.clone()),
+            }
+        }
+        if unread.is_empty() {
+            return Ok(described);
+        }
+        let mut conn = self
+            .postgres
+            .tenant_conn(tenant)
+            .await
+            .map_err(|error| registry_unavailable(&error))?;
+        for uid in unread {
+            if let Some(descriptor) = self.read_descriptor(&mut conn, tenant, &uid).await? {
+                described.push((uid, descriptor));
+            }
+        }
+        Ok(described)
+    }
+
+    /// Reads one Card's descriptor and remembers it; `None` when the tenant
+    /// registry does not hold the UID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Internal`] when the lookup fails for any reason
+    /// other than the Card being absent.
+    async fn read_descriptor(
+        &self,
+        conn: &mut wyrd_sql::TenantConn<'_>,
+        tenant: DataTenantId,
+        uid: &CardUid,
+    ) -> Result<Option<CardDescriptor>, IngestError> {
+        match get_card_by_uid(conn, uid).await {
+            Ok(row) => {
+                let descriptor = CardDescriptor {
+                    kind: row.kind,
+                    name: row.name.to_string(),
+                    version: row.version.to_string(),
+                };
+                self.descriptors
+                    .insert((tenant, uid.clone()), descriptor.clone());
+                Ok(Some(descriptor))
+            }
+            Err(WyrdError::RegistryCardNotFound { .. }) => Ok(None),
+            Err(error) => Err(registry_unavailable(&error)),
+        }
     }
 
     /// Resolves the Cards `auth` attributes a frame to, when it is unbound.
@@ -95,6 +212,9 @@ impl CardRegistry {
     /// Reads each Card by UID on one tenant-scoped connection, keeping the
     /// UIDs of observation targets.
     ///
+    /// Membership is always read fresh, so a Card removed from the registry
+    /// stops being attributable; each read also refreshes its descriptor.
+    ///
     /// # Errors
     ///
     /// Returns [`IngestError::Internal`] when the connection or a lookup fails
@@ -111,10 +231,12 @@ impl CardRegistry {
             .map_err(|error| registry_unavailable(&error))?;
         let mut members = Vec::with_capacity(cards.len());
         for uid in cards {
-            match get_card_by_uid(&mut conn, &uid).await {
-                Ok(row) if row.kind.is_observation_target() => members.push(uid),
-                Ok(_) | Err(WyrdError::RegistryCardNotFound { .. }) => {}
-                Err(error) => return Err(registry_unavailable(&error)),
+            if self
+                .read_descriptor(&mut conn, tenant, &uid)
+                .await?
+                .is_some_and(|descriptor| descriptor.kind.is_observation_target())
+            {
+                members.push(uid);
             }
         }
         Ok(members)

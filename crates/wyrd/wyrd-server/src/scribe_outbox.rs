@@ -480,6 +480,7 @@ impl ScribeBatch {
     pub(crate) fn into_frame(self) -> ScribeIngressFrame {
         ScribeIngressFrame {
             attributed_cards: Some(native_card_uids(&self.ipc)).filter(|uids| !uids.is_empty()),
+            dimensions: None,
             attribution: StampedAttribution::Rows,
             principal: Principal::new(
                 PLATFORM_AUDIT_PRINCIPAL,

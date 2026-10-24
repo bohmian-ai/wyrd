@@ -209,6 +209,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             .as_ref(),
         ScribeIngressFrame {
             attributed_cards: None,
+            dimensions: None,
             authenticated_tenant: tenant,
             attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             principal,

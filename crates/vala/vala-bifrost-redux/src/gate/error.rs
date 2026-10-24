@@ -50,11 +50,13 @@ pub enum IngestError {
     /// selected a root.
     #[error("Card attribution requires a selected workload root")]
     WorkloadContextRequired,
-    /// An `x-wyrd-workload-uid` selector was malformed, contradicted the
-    /// bearer's signed root, or named a root native ingest cannot resolve;
-    /// carries the shared selector refusal unchanged.
-    #[error("workload selector refused: {0}")]
-    WorkloadSelector(WyrdError),
+    /// The request's context headers were refused: an `x-wyrd-workload-uid`
+    /// selector was malformed, contradicted the bearer's signed root, or named
+    /// a root native ingest cannot resolve, or an
+    /// `x-wyrd-deployment-environment` was repeated, empty, or not UTF-8;
+    /// carries the shared refusal unchanged.
+    #[error("request context refused: {0}")]
+    RequestContext(WyrdError),
     /// A per-row `card_ref` was present but could not be resolved to a `card_uid`
     /// by the server (unknown card, cross-tenant, or uid not available). Fail-closed
     /// (M-11): an authenticated write with an unresolvable `card_ref` is always rejected.
@@ -181,7 +183,7 @@ impl IngestError {
             Self::TableNotFound { .. } | Self::SchemaMismatch { .. } => "catalog",
             Self::IngressClosed => "role_unavailable",
             Self::IngestBusy { .. } | Self::WalDiskFull => "scribe_admission",
-            Self::Unauthenticated(_) | Self::PrincipalUnresolved | Self::WorkloadSelector(_) => {
+            Self::Unauthenticated(_) | Self::PrincipalUnresolved | Self::RequestContext(_) => {
                 "auth"
             }
             Self::Internal(_) => return None,
@@ -210,7 +212,7 @@ impl IngestError {
             }
             .into(),
             Self::PrincipalUnresolved => BifrostError::PrincipalUnresolved.into(),
-            Self::WorkloadSelector(error) => error.clone(),
+            Self::RequestContext(error) => error.clone(),
             Self::ContractViolation(error) => error.clone().into(),
             Self::RequestValidation(detail) | Self::Decode(detail) => {
                 BifrostError::OtlpRequestMalformed {
@@ -472,7 +474,7 @@ mod tests {
                 Code::PermissionDenied,
             ),
             (
-                IngestError::WorkloadSelector(wyrd_spec::error::WyrdError::WorkloadUidRefused {
+                IngestError::RequestContext(wyrd_spec::error::WyrdError::WorkloadUidRefused {
                     message: "refused".to_owned(),
                     details: serde_json::json!({}),
                 }),

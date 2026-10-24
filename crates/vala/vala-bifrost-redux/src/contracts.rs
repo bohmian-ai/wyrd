@@ -106,6 +106,13 @@ pub struct ScribeIngressFrame {
     /// subjects the gateway already authorized. `None` leaves the principal's
     /// signed scope in force.
     pub attributed_cards: Option<Vec<wyrd_spec::ids::CardUid>>,
+    /// The accepted context a public frame's shared Service, environment, and
+    /// subject dimensions are stamped from.
+    ///
+    /// Gate resolves it for client ingest; `None` leaves every row's own
+    /// dimension values, as a server-internal writer that built them from its
+    /// accepted origin supplies.
+    pub dimensions: Option<crate::tables::FrameDimensions>,
     /// Requested logical table, unchanged by physical resolution.
     pub table: TableRef,
     /// Fingerprint asserted by an engine-internal producer with no catalog.

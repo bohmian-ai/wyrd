@@ -104,7 +104,9 @@ fn record_write_rejection(error: &IngestError) {
 /// metadata. The identity is the SHA-256 of a domain separator, the
 /// authenticated tenant, the verified publisher's subject and current actor
 /// (the pair Scribe stamps on the rows), the logical table FQN,
-/// the canonical batch's logical Arrow digest from
+/// the accepted `context` — workload root and deployment environment — that
+/// the shared dimensions are stamped from, the canonical batch's logical
+/// Arrow digest from
 /// [`LogicalIdentity`], and the accepted correlation attribution that
 /// digest deliberately excludes ([`correlation_data_identity`]). The logical
 /// digest omits the per-request managed columns (request id, ingest time) that
@@ -133,6 +135,7 @@ fn record_write_rejection(error: &IngestError) {
 fn otlp_batch_id(
     tenant: DataTenantId,
     publisher: Attribution,
+    context: [Option<&str>; 2],
     table: &TableRef,
     identity: &LogicalIdentity,
 ) -> Result<Uuid, IngestError> {
@@ -144,6 +147,14 @@ fn otlp_batch_id(
     digest.update(tenant.as_uuid().as_bytes());
     digest.update(publisher.sub_principal_id.as_uuid().as_bytes());
     digest.update(publisher.act_principal_id.as_uuid().as_bytes());
+    // The accepted context stamps the workload and the shared dimensions, so
+    // a replay under another root or environment is another batch. Each part
+    // is length-prefixed so adjacent values cannot run together.
+    for context in context {
+        let context = context.unwrap_or_default();
+        digest.update((context.len() as u64).to_be_bytes());
+        digest.update(context.as_bytes());
+    }
     digest.update(table.fqn().as_bytes());
     digest.update(logical_digest);
     digest.update(correlation_digest);
@@ -501,6 +512,26 @@ impl<A: GateAudit + 'static> Gate<A> {
         Ok(attributed.or_else(|| auth.principal.card_scope().map(<[_]>::to_vec)))
     }
 
+    /// Resolves the shared-dimension context of one frame whose rows may name
+    /// `subjects`, or `None` where no registry is composed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry's unavailability error.
+    async fn frame_dimensions(
+        &self,
+        auth: &AuthContext,
+        subjects: Option<&[wyrd_spec::ids::CardUid]>,
+    ) -> Result<Option<crate::tables::FrameDimensions>, IngestError> {
+        match &self.cards {
+            Some(registry) => registry
+                .frame_dimensions(auth, subjects.unwrap_or_default())
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Attaches the sink every write decision is staged on.
     ///
     /// A Gate with a Scribe but no sink refuses every write as an internal
@@ -706,14 +737,15 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// # Errors
     ///
     /// Returns the ingress-closed refusal when the Gate is closed or its
-    /// Scribe is not ready.
+    /// Scribe is not ready, and [`IngestError::RequestContext`] for a
+    /// malformed deployment environment.
     pub fn admit_verified(
         &self,
         verified: VerifiedToken,
         metadata: &MetadataMap,
     ) -> Result<AuthContext, IngestError> {
         self.ensure_open()?;
-        Ok(AuthContext::from_verified(verified, metadata))
+        AuthContext::from_verified(verified, metadata)
     }
 
     /// Mount the Gate on the shared tonic router.
@@ -953,7 +985,22 @@ impl<A: GateAudit + 'static> Gate<A> {
             return Ok(());
         }
         let identity = LogicalIdentity::of(&batch).map_err(IngestError::from_scribe)?;
-        let batch_id = otlp_batch_id(auth.tenant, auth.attribution(), &table, &identity)?;
+        let batch_id = otlp_batch_id(
+            auth.tenant,
+            auth.attribution(),
+            [
+                auth.principal
+                    .workload_uid
+                    .as_ref()
+                    .map(wyrd_spec::ids::CardUid::as_str),
+                auth.deployment_environment.as_deref(),
+            ],
+            &table,
+            &identity,
+        )?;
+        let dimensions = self
+            .frame_dimensions(auth, attributed_cards.as_deref())
+            .await?;
         let payload = IngressPayload::Canonical(
             match owner {
                 Some(owner) => CanonicalIngress::new(vec![batch], owner),
@@ -968,6 +1015,7 @@ impl<A: GateAudit + 'static> Gate<A> {
                 attribution: auth.attribution().into(),
                 authenticated_tenant: auth.tenant,
                 attributed_cards,
+                dimensions,
                 table,
                 expected_schema_fingerprint: None,
                 table_version: None,
@@ -1046,12 +1094,16 @@ impl<A: GateAudit + 'static> Gate<A> {
         let attributed_cards = self
             .attributed_cards(auth, || attribution::native_card_uids(&frame.arrow_ipc))
             .await?;
+        let dimensions = self
+            .frame_dimensions(auth, attributed_cards.as_deref())
+            .await?;
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
             attribution: auth.attribution().into(),
             authenticated_tenant: auth.tenant,
             attributed_cards,
+            dimensions,
             table,
             expected_schema_fingerprint: None,
             table_version: Some(table_version),
@@ -1827,6 +1879,7 @@ mod tests {
             tenant,
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
+            deployment_environment: None,
         }
     }
 
@@ -1854,6 +1907,7 @@ mod tests {
             tenant,
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
+            deployment_environment: None,
         }
     }
 
@@ -1873,6 +1927,7 @@ mod tests {
             tenant,
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
+            deployment_environment: None,
         }
     }
 
@@ -2607,6 +2662,7 @@ mod tests {
             tenant,
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
+            deployment_environment: None,
         }
     }
 
@@ -2934,7 +2990,8 @@ mod otlp_batch_id_tests {
     ///
     /// Retry suppression depends on a repeated export converging on one
     /// `wyrd_batch_id`, and on any other tenant, table, row order, payload,
-    /// verified publisher subject or current actor, or accepted correlation
+    /// verified publisher subject or current actor, accepted workload root or
+    /// environment, or accepted correlation
     /// attribution diverging so identity never correlates across those
     /// boundaries and two authorized publishers never collapse onto one fence. The value must also remain a
     /// `UUIDv7`, which is the contract the native ingest path validates.
@@ -2954,12 +3011,16 @@ mod otlp_batch_id_tests {
         let other_actor = Attribution::new(subject, PrincipalId::new(uuid::Uuid::now_v7()));
         let spans = TableRef::new(BifrostNamespace::Traces, "spans");
         let records = TableRef::new(BifrostNamespace::Logs, "records");
-        let id = |tenant, principal, table: &TableRef, values: &[i32], run| {
+        let in_context = |context, tenant, principal, table: &TableRef, values: &[i32], run| {
             let identity = crate::scribe::preprocess::LogicalIdentity::of(&batch(values, run))
                 .expect("the fixture batch has a logical identity");
-            otlp_batch_id(tenant, principal, table, &identity)
+            otlp_batch_id(tenant, principal, context, table, &identity)
                 .expect("the fixture batch has an identity")
         };
+        let id = |tenant, principal, table: &TableRef, values: &[i32], run| {
+            in_context([None, None], tenant, principal, table, values, run)
+        };
+        let root = uuid::Uuid::now_v7().to_string();
 
         let baseline = id(tenant, principal, &spans, &[1, 2, 3], Some("run-a"));
         assert_eq!(
@@ -2987,11 +3048,35 @@ mod otlp_batch_id_tests {
             id(tenant, principal, &spans, &[1, 2, 4], Some("run-a")),
             id(tenant, principal, &spans, &[1, 2, 3], Some("run-b")),
             id(tenant, principal, &spans, &[1, 2, 3], None),
+            in_context(
+                [Some(&root), None],
+                tenant,
+                principal,
+                &spans,
+                &[1, 2, 3],
+                Some("run-a"),
+            ),
+            in_context(
+                [None, Some("prod")],
+                tenant,
+                principal,
+                &spans,
+                &[1, 2, 3],
+                Some("run-a"),
+            ),
+            in_context(
+                [Some("prod"), None],
+                tenant,
+                principal,
+                &spans,
+                &[1, 2, 3],
+                Some("run-a"),
+            ),
         ] {
             assert_ne!(
                 baseline, divergent,
-                "a different tenant, publisher, table, row order, payload, or accepted \
-                 correlation attribution is a different batch"
+                "a different tenant, publisher, workload root, environment, table, row \
+                 order, payload, or accepted correlation attribution is a different batch"
             );
         }
         assert_ne!(

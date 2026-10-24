@@ -108,6 +108,9 @@ struct AdmittedRowContext {
     workload: Option<wyrd_spec::ids::CardUid>,
     /// Card UIDs every row's `subject_card_uid` is authorized against.
     card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
+    /// Accepted context the shared Service, environment, and subject
+    /// dimensions are stamped from; `None` keeps each row's own values.
+    dimensions: Option<crate::tables::FrameDimensions>,
     /// Caller-supplied fingerprint required of the projected source schema;
     /// `None` leaves the selected definition's conformance as the only
     /// schema authority.
@@ -372,6 +375,7 @@ impl ScribeImpl {
             attribution,
             workload,
             card_scope,
+            dimensions,
             expected_schema_fingerprint,
             request_id,
             batch_id,
@@ -387,6 +391,7 @@ impl ScribeImpl {
                     attribution,
                     workload,
                     card_scope,
+                    dimensions,
                     expected_schema_fingerprint,
                     request_id,
                     batch_id,
@@ -407,6 +412,7 @@ impl ScribeImpl {
                             attribution,
                             workload,
                             card_scope,
+                            dimensions,
                             expected_schema_fingerprint,
                             request_id,
                             receipt_micros,
@@ -720,6 +726,7 @@ impl ScribeImpl {
                         .or_else(|| frame.principal.card_scope().map(<[_]>::to_vec)),
                     attribution: frame.attribution,
                     workload: frame.principal.workload_uid.clone(),
+                    dimensions: frame.dimensions,
                     expected_schema_fingerprint,
                     request_id: frame.request_id,
                     batch_id: frame.batch_id,
@@ -1131,6 +1138,7 @@ fn unclaimed_retry(frame: &ScribeIngressFrame) -> ScribeIngressFrame {
         attribution: frame.attribution,
         authenticated_tenant: frame.authenticated_tenant,
         attributed_cards: frame.attributed_cards.clone(),
+        dimensions: frame.dimensions.clone(),
         table: frame.table.clone(),
         expected_schema_fingerprint: frame.expected_schema_fingerprint,
         table_version: None,
@@ -1442,6 +1450,7 @@ mod tests {
         let request_id = RequestId::now_v7();
         ScribeIngressFrame {
             attributed_cards: None,
+            dimensions: None,
             authenticated_tenant: tenant,
             attribution: Attribution::direct(principal.id).into(),
             principal: principal.clone(),

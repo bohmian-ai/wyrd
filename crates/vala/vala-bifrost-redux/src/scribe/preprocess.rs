@@ -112,6 +112,9 @@ pub(crate) struct NativeAdmittedRows {
     /// Card UIDs every row's `subject_card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
+    /// Accepted context the shared Service, environment, and subject
+    /// dimensions are stamped from; `None` keeps each row's own values.
+    pub(crate) dimensions: Option<crate::tables::FrameDimensions>,
     /// Caller-supplied fingerprint validated independently for every source
     /// batch, when one was supplied.
     pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
@@ -413,6 +416,7 @@ fn stamp_native_source(
             attribution: source.attribution,
             workload: source.workload.as_ref(),
             card_scope: source.card_scope.as_deref(),
+            dimensions: source.dimensions.as_ref(),
             expected_schema_fingerprint: source.expected_schema_fingerprint,
             request_id: &source.request_id,
             receipt_micros: source.receipt_micros,
@@ -1135,6 +1139,7 @@ mod tests {
         let source = NativeAdmittedRows {
             definition: None,
             card_scope: None,
+            dimensions: None,
             registered_schema: None,
             conform: Arc::default(),
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),

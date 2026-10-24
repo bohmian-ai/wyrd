@@ -247,7 +247,8 @@ async fn export_traces(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let auth = caller_auth_context(&caller);
+    let auth = caller_auth_context(&caller, &headers)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
 
     let bifrost = Arc::clone(&state.bifrost);
     let (owner, request) = match encoding {
@@ -361,7 +362,8 @@ async fn export_metrics(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let auth = caller_auth_context(&caller);
+    let auth = caller_auth_context(&caller, &headers)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
 
     let bifrost = Arc::clone(&state.bifrost);
     let (owner, request) = match encoding {
@@ -476,7 +478,8 @@ async fn export_logs(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let auth = caller_auth_context(&caller);
+    let auth = caller_auth_context(&caller, &headers)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
 
     let bifrost = Arc::clone(&state.bifrost);
     let (owner, request) = match encoding {
@@ -527,14 +530,29 @@ async fn export_logs(
 ///
 /// Tenant, principal, and request id all come from the verified [`Caller`] — the
 /// tenant is token-derived, never taken from the request body, so the HTTP and
-/// gRPC transports preserve tenant isolation identically.
-fn caller_auth_context(caller: &Caller) -> AuthContext {
-    AuthContext {
+/// gRPC transports preserve tenant isolation identically. The request's
+/// accepted deployment environment is the one descriptive value read from
+/// `headers`.
+///
+/// # Errors
+///
+/// Returns [`IngestError::RequestContext`] when the deployment-environment
+/// header is repeated, empty, or not UTF-8.
+fn caller_auth_context(caller: &Caller, headers: &HeaderMap) -> Result<AuthContext, IngestError> {
+    let deployment_environment = wyrd_spec::auth::deployment_environment_selector(
+        headers
+            .get_all(wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER)
+            .iter()
+            .map(axum::http::HeaderValue::as_bytes),
+    )
+    .map_err(IngestError::RequestContext)?;
+    Ok(AuthContext {
         principal: caller.principal.clone(),
         tenant: caller.data_tenant_id,
         request_id: caller.request_id.clone(),
         delegation_chain: caller.delegation_chain.clone(),
-    }
+        deployment_environment,
+    })
 }
 
 /// Map an [`IngestError`] onto the single Gate-owned HTTP error projection.

@@ -53,6 +53,39 @@ pub fn workload_uid_selector<'a>(
         .ok_or_else(refused)
 }
 
+/// Parse a request's optional deployment environment from every value it sent
+/// under [`DEPLOYMENT_ENVIRONMENT_HEADER`].
+///
+/// HTTP headers and gRPC metadata on every surface route through here, so an
+/// environment is refused identically everywhere. It is descriptive context
+/// stamped on the request's rows, never permission.
+///
+/// # Errors
+/// Returns [`crate::error::WyrdError::Validation`] naming the header when it
+/// is repeated, empty, or not UTF-8.
+pub fn deployment_environment_selector<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<Option<String>, crate::error::WyrdError> {
+    let refused = || crate::error::WyrdError::Validation {
+        message: format!(
+            "{DEPLOYMENT_ENVIRONMENT_HEADER} must be sent at most once as one non-empty UTF-8 value"
+        ),
+        details: serde_json::json!({ "header": DEPLOYMENT_ENVIRONMENT_HEADER }),
+    };
+    let mut values = values.into_iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(refused());
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| Some(value.to_owned()))
+        .ok_or_else(refused)
+}
+
 /// Most Card UIDs one signed scope may carry.
 ///
 /// Matches the graph resolver's membership bound, so every resolvable root
@@ -371,6 +404,31 @@ mod tests {
             assert!(matches!(
                 super::workload_uid_selector(values),
                 Err(crate::error::WyrdError::WorkloadUidRefused { .. })
+            ));
+        }
+    }
+
+    /// No environment is unknown; one non-empty UTF-8 value is kept verbatim;
+    /// a repeated, empty, or non-UTF-8 value refuses the request.
+    ///
+    /// # Panics
+    /// Panics when an absent environment is not `None`, one value is not kept
+    /// verbatim, or a malformed value is not refused as `Validation`.
+    #[test]
+    fn deployment_environment_selector_accepts_one_value() {
+        assert_eq!(super::deployment_environment_selector([]).expect("absent"), None);
+        assert_eq!(
+            super::deployment_environment_selector([b"prod".as_slice()]).expect("one value"),
+            Some("prod".to_owned())
+        );
+        for values in [
+            vec![b"prod".as_slice(), b"prod".as_slice()],
+            vec![b"".as_slice()],
+            vec![b"\xff".as_slice()],
+        ] {
+            assert!(matches!(
+                super::deployment_environment_selector(values),
+                Err(crate::error::WyrdError::Validation { .. })
             ));
         }
     }

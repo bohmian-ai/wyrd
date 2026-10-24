@@ -182,6 +182,38 @@ pub fn with_shared_dimensions(mut fields: Vec<Field>) -> Vec<Field> {
     fields
 }
 
+/// The registered identity one Card UID names.
+///
+/// A Card UID never changes kind, name, or version, so a descriptor read once
+/// from the tenant registry stays true for that UID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardDescriptor {
+    /// The Card's kind.
+    pub kind: wyrd_spec::envelope::CardKind,
+    /// The Card's registered name.
+    pub name: String,
+    /// The Card's registered version.
+    pub version: String,
+}
+
+/// The accepted request context a public frame's [`SHARED_DIMENSIONS`] are
+/// stamped from.
+///
+/// Gate resolves it once per frame, before Scribe admits the rows: the
+/// validated workload's Service descriptor, the request's accepted
+/// deployment environment, and the descriptor of every Card the frame's rows
+/// may name as subject. Labels in the rows never contribute to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrameDimensions {
+    /// The validated workload Service; `None` for unowned rows, which keep
+    /// their observed Service promotions.
+    pub service: Option<CardDescriptor>,
+    /// The accepted request environment; `None` keeps each row's own.
+    pub environment: Option<String>,
+    /// Descriptors of the Cards the frame's rows may name as subject.
+    pub subjects: Vec<(wyrd_spec::ids::CardUid, CardDescriptor)>,
+}
+
 /// The attribution Bloom columns every attributable system table's creation
 /// default starts with.
 pub const ATTRIBUTION_BLOOMS: [&str; 5] = [

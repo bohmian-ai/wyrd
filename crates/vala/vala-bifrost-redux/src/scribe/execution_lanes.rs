@@ -30,8 +30,9 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::managed_columns::{
-    ACT_PRINCIPAL_ID, RUN_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID,
-    WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    ACT_PRINCIPAL_ID, DEPLOYMENT_ENVIRONMENT, RUN_ID, SERVICE_NAME, SERVICE_VERSION,
+    SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME, SUBJECT_VERSION,
+    WORKLOAD_CARD_UID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
 use crate::tables::managed_columns::{
@@ -225,6 +226,7 @@ impl ScribeIngressCpuPool {
             attribution,
             workload,
             card_scope,
+            dimensions,
             expected_schema_fingerprint,
             request_id,
             receipt_micros,
@@ -259,6 +261,7 @@ impl ScribeIngressCpuPool {
                         attribution,
                         workload: workload.as_ref(),
                         card_scope: card_scope.as_deref(),
+                        dimensions: dimensions.as_ref(),
                         expected_schema_fingerprint,
                         request_id: &request_id,
                         receipt_micros,
@@ -472,6 +475,9 @@ pub(crate) struct IngressDecodeInputs {
     /// Card UIDs every row's `subject_card_uid` is authorized against: the
     /// frame's attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<CardUid>>,
+    /// Accepted context the shared Service, environment, and subject
+    /// dimensions are stamped from; `None` keeps each row's own values.
+    pub(crate) dimensions: Option<crate::tables::FrameDimensions>,
     /// Caller-supplied fingerprint required of the caller-owned source
     /// schema; `None` leaves conformance to the registered schema as the only
     /// schema authority.
@@ -503,6 +509,9 @@ pub(crate) struct DecodeContext<'a> {
     /// Card UIDs every row's `subject_card_uid` is authorized against: the
     /// frame's attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<&'a [CardUid]>,
+    /// Accepted context the shared Service, environment, and subject
+    /// dimensions are stamped from; `None` keeps each row's own values.
+    pub(crate) dimensions: Option<&'a crate::tables::FrameDimensions>,
     /// Caller-supplied fingerprint required of the caller-owned source
     /// schema; `None` leaves conformance to the registered schema as the only
     /// schema authority.
@@ -1113,6 +1122,8 @@ fn caller_run_id_column(rows: &RecordBatch) -> Result<Option<ArrayRef>, ScribeEr
 /// `context`, read once per batch at admission. Projected payloads retain
 /// their remaining correlation values unchanged. Each row's `card_uid` is
 /// authorized against `context.card_scope` before anything is stamped.
+/// A built-in table's shared dimensions are then stamped from
+/// `context.dimensions` by [`stamp_dimensions`].
 ///
 /// # Errors
 /// Returns [`ScribeError::CardScopeDenied`] when a row's `card_uid` is not
@@ -1135,6 +1146,9 @@ fn stamp_correlation_columns(
     let caller_run_id = caller_run_id_column(rows)?;
     let mut fields = user_fields(rows);
     let mut columns = user_columns(rows);
+    if let (Some(dimensions), Some(_)) = (context.dimensions, context.definition) {
+        stamp_dimensions(&fields, &mut columns, dimensions, &card_uids)?;
+    }
     fields.extend(ensure_managed_columns(Vec::new()));
     columns.extend(managed_arrays(
         rows,
@@ -1190,6 +1204,73 @@ fn stamp_correlation_columns(
         enforce_canonical_physical_identity(&stamped, definition)?;
     }
     Ok(stamped)
+}
+
+/// Overwrites a built-in table's shared dimensions with the frame's accepted
+/// context.
+///
+/// Only a dimension the payload declares is replaced, and only from a value
+/// the context owns: the validated workload Service's name and version, the
+/// accepted request environment, and each row's subject descriptor, null for
+/// a row without a subject. A Service or environment the context does not own
+/// keeps the row's observed value; subject columns never do.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::CardScopeDenied`] when a row's authorized subject
+/// has no registered descriptor in the context.
+fn stamp_dimensions(
+    fields: &[Field],
+    columns: &mut [ArrayRef],
+    dimensions: &crate::tables::FrameDimensions,
+    subjects: &[Option<String>],
+) -> Result<(), ScribeError> {
+    let descriptors = subjects
+        .iter()
+        .map(|uid| {
+            uid.as_deref()
+                .map(|uid| {
+                    dimensions
+                        .subjects
+                        .iter()
+                        .find(|(owned, _)| owned.as_str() == uid)
+                        .map(|(_, descriptor)| descriptor)
+                        .ok_or(ScribeError::CardScopeDenied)
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let constant =
+        |value: &str| -> ArrayRef { Arc::new(StringArray::from(vec![value; subjects.len()])) };
+    let per_subject = |value: fn(&crate::tables::CardDescriptor) -> &str| -> ArrayRef {
+        Arc::new(
+            descriptors
+                .iter()
+                .map(|descriptor| descriptor.map(value))
+                .collect::<StringArray>(),
+        )
+    };
+    for (field, column) in fields.iter().zip(columns.iter_mut()) {
+        let stamped = match field.name().as_str() {
+            SERVICE_NAME => dimensions
+                .service
+                .as_ref()
+                .map(|service| constant(&service.name)),
+            SERVICE_VERSION => dimensions
+                .service
+                .as_ref()
+                .map(|service| constant(&service.version)),
+            DEPLOYMENT_ENVIRONMENT => dimensions.environment.as_deref().map(constant),
+            SUBJECT_KIND => Some(per_subject(|descriptor| descriptor.kind.wire_name())),
+            SUBJECT_NAME => Some(per_subject(|descriptor| &descriptor.name)),
+            SUBJECT_VERSION => Some(per_subject(|descriptor| &descriptor.version)),
+            _ => None,
+        };
+        if let Some(stamped) = stamped {
+            *column = stamped;
+        }
+    }
+    Ok(())
 }
 
 /// Returns the caller's user fields, in order, without the managed columns.
@@ -2305,7 +2386,9 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::managed_columns::{
-        ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+        ACT_PRINCIPAL_ID, DEPLOYMENT_ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION, SUB_PRINCIPAL_ID,
+        SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME, SUBJECT_VERSION, WYRD_INGESTED_AT,
+        WYRD_REQUEST_ID,
     };
 
     use bytes::Bytes;
@@ -2350,6 +2433,7 @@ mod tests {
             attribution: Attribution::direct(principal.id).into(),
             workload: principal.workload_uid.as_ref(),
             card_scope,
+            dimensions: None,
             expected_schema_fingerprint: Some(SchemaFingerprint([0_u8; 32])),
             request_id,
             receipt_micros: receipt_now(),
@@ -2459,6 +2543,7 @@ mod tests {
                 attribution: Attribution::direct(principal().id).into(),
                 workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(&Schema::new(
                     cast_table_columns(),
                 ))),
@@ -2720,6 +2805,7 @@ mod tests {
                 attribution: Attribution::direct(principal().id).into(),
                 workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(SchemaFingerprint((definition
                     .schema_fingerprint)(
                 ))),
@@ -2781,6 +2867,7 @@ mod tests {
                 attribution: StampedAttribution::Rows,
                 workload: None,
                 card_scope: None,
+                dimensions: None,
                 expected_schema_fingerprint: Some(SchemaFingerprint((definition
                     .schema_fingerprint)(
                 ))),
@@ -2811,6 +2898,124 @@ mod tests {
             text(WYRD_REQUEST_ID),
             Some(event.request_id.as_str().to_owned()),
             "the decision's request, not the delivering frame's"
+        );
+    }
+
+    /// A built-in table's shared dimensions are stamped from the frame's
+    /// accepted context over whatever the rows carried, a row without a subject
+    /// gets null subject columns, and a subject without a descriptor refuses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a stamped dimension or the refusal differs.
+    #[test]
+    fn built_in_rows_take_their_dimensions_from_the_frame_context() {
+        let definition =
+            crate::tables::builtin_table("system", "audit_log").expect("audit_log is built in");
+        let event = wyrd_spec::vala::api::AuditEvent::new(
+            RequestId::now_v7(),
+            None,
+            "cards.read".to_owned(),
+            "cards".to_owned(),
+            None,
+            Attribution::direct(PrincipalId::new(Uuid::now_v7())),
+            wyrd_spec::auth::PrincipalKindTag::User,
+            "cards:read".to_owned(),
+            wyrd_spec::vala::api::AuditOutcome::Allowed,
+        );
+        let projected =
+            crate::tables::audit::projection::project_audit_event(&event, chrono::Utc::now())
+                .expect("valid projection");
+        let subject = CardUid::new(Uuid::now_v7().to_string()).expect("card uid");
+        let labelled = |name: &str, value: Option<&str>| -> ArrayRef {
+            let forged = if name == SUBJECT_CARD_UID {
+                value
+            } else {
+                Some("forged")
+            };
+            Arc::new(StringArray::from(vec![forged, forged]))
+        };
+        let rows = |uid: Option<&str>| {
+            let schema = projected.schema();
+            let mut fields: Vec<Field> =
+                schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+            let mut columns: Vec<ArrayRef> = fields
+                .iter()
+                .zip(projected.columns())
+                .map(|(field, column)| {
+                    if crate::tables::SHARED_DIMENSIONS.contains(&field.name().as_str()) {
+                        labelled(field.name(), uid)
+                    } else {
+                        arrow::compute::concat(&[column.as_ref(), column.as_ref()])
+                            .expect("two rows")
+                    }
+                })
+                .collect();
+            fields.push(Field::new(SUBJECT_CARD_UID, DataType::Utf8, true));
+            columns.push(labelled(SUBJECT_CARD_UID, uid));
+            batch(fields, columns)
+        };
+        let descriptor = |name: &str| crate::tables::CardDescriptor {
+            kind: wyrd_spec::envelope::CardKind::Agent,
+            name: name.to_owned(),
+            version: "2".to_owned(),
+        };
+        let mut dimensions = crate::tables::FrameDimensions {
+            service: Some(descriptor("checkout")),
+            environment: Some("prod".to_owned()),
+            subjects: vec![(subject.clone(), descriptor("planner"))],
+        };
+        let scope = [subject.clone()];
+        let request_id = RequestId::now_v7();
+        let principal = principal();
+        let stamp = |uid: Option<&str>, dimensions: &crate::tables::FrameDimensions| {
+            let mut context = stamping_context(&principal, Some(&scope), &request_id);
+            context.attribution = StampedAttribution::Rows;
+            context.definition = Some(definition);
+            context.dimensions = Some(dimensions);
+            stamp_correlation_columns(&rows(uid), &context)
+        };
+        let text = |stamped: &RecordBatch, name: &str| {
+            stamped
+                .column_by_name(name)
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .expect("a dimension is Utf8")
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let both = |value: &str| vec![Some(value.to_owned()); 2];
+
+        let stamped = stamp(Some(subject.as_str()), &dimensions).expect("attributed rows stamp");
+        assert_eq!(text(&stamped, SERVICE_NAME), both("checkout"));
+        assert_eq!(text(&stamped, SERVICE_VERSION), both("2"));
+        assert_eq!(text(&stamped, DEPLOYMENT_ENVIRONMENT), both("prod"));
+        assert_eq!(text(&stamped, SUBJECT_KIND), both("Agent"));
+        assert_eq!(text(&stamped, SUBJECT_NAME), both("planner"));
+        assert_eq!(text(&stamped, SUBJECT_VERSION), both("2"));
+
+        dimensions.service = None;
+        dimensions.environment = None;
+        let unowned = stamp(None, &dimensions).expect("unattributed rows stamp");
+        assert_eq!(
+            text(&unowned, SERVICE_NAME),
+            both("forged"),
+            "unowned rows keep their Service"
+        );
+        assert_eq!(text(&unowned, DEPLOYMENT_ENVIRONMENT), both("forged"));
+        assert_eq!(
+            text(&unowned, SUBJECT_NAME),
+            vec![None, None],
+            "no subject, no label"
+        );
+
+        dimensions.subjects.clear();
+        assert!(
+            matches!(
+                stamp(Some(subject.as_str()), &dimensions),
+                Err(ScribeError::CardScopeDenied)
+            ),
+            "a subject without a descriptor refuses"
         );
     }
 
@@ -3288,6 +3493,7 @@ mod tests {
                 attribution: Attribution::direct(principal().id).into(),
                 workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                 )),
@@ -3337,6 +3543,7 @@ mod tests {
                 attribution: Attribution::direct(principal.id).into(),
                 workload: None,
                 card_scope: principal.card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(schema)),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
@@ -3462,6 +3669,7 @@ mod tests {
                 attribution: Attribution::direct(principal.id).into(),
                 workload: None,
                 card_scope: principal.card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                 )),
@@ -3512,6 +3720,7 @@ mod tests {
                 attribution: Attribution::direct(principal().id).into(),
                 workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                 )),
@@ -3554,6 +3763,7 @@ mod tests {
                 attribution: Attribution::direct(principal().id).into(),
                 workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                 )),
@@ -3610,6 +3820,7 @@ mod tests {
                 attribution: Attribution::direct(principal().id).into(),
                 workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                 )),
@@ -3716,6 +3927,7 @@ mod tests {
                 attribution: Attribution::direct(principal.id).into(),
                 workload: None,
                 card_scope: principal.card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
                 )),
@@ -3768,6 +3980,7 @@ mod tests {
                     attribution: Attribution::direct(principal.id).into(),
                     workload: None,
                     card_scope: principal.card_scope(),
+                    dimensions: None,
                     expected_schema_fingerprint: Some(source_schema_fingerprint(
                         rows.schema().as_ref(),
                     )),

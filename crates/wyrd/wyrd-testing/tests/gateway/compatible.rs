@@ -203,10 +203,16 @@ async fn openai_compatible_streams_terminate_and_survive_a_capture_outage() {
 /// signed one are refused with their stable codes before any provider call,
 /// and no Wyrd credential or context reaches the provider.
 ///
+/// A rootless caller's calls about two standalone Cards, one already
+/// described by a delivered capture and one never described, are held at the
+/// provider while both Cards are deleted; each capture still lands with its
+/// accepted subject UID and descriptors, Run, and account, and a new call
+/// about either deleted Card is refused.
+///
 /// # Panics
 ///
-/// Panics when a status, refusal, captured row, or upstream expectation
-/// fails.
+/// Panics when a status, refusal, captured row, deletion, or upstream
+/// expectation fails.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn configured_gateway_headers_are_authorized_and_captured() {
@@ -265,13 +271,11 @@ async fn configured_gateway_headers_are_authorized_and_captured() {
     let configured = Box::pin(cards.declare_from_path(fixtures.join("configured-service.yaml")))
         .await
         .expect("the configured Service registers");
-    let outside = Box::pin(cards.declare_from_path(fixtures.join("observed-model.yaml")))
+    let model = Box::pin(cards.declare_from_path(fixtures.join("observed-model.yaml")))
         .await
         .expect("a Card outside the Service's graph registers")
-        .root
-        .uid
-        .expect("the Model has a UID")
-        .to_string();
+        .root;
+    let outside = model.uid.clone().expect("the Model has a UID").to_string();
     let service = configured.root.uid.clone().expect("the Service has a UID");
     let agent = configured
         .outcomes
@@ -541,6 +545,141 @@ async fn configured_gateway_headers_are_authorized_and_captured() {
         .map(canonical),
         "each call keeps its own admitted context with registry-derived names"
     );
+
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let prompt_path = scratch.path().join("held-prompt.yaml");
+    std::fs::write(
+        &prompt_path,
+        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: held-prompt\n  version: 1.0.0\n\
+         spec:\n  provider: openai\n  model: gpt-test\n  messages:\n  - role: user\n    content: hi\n",
+    )
+    .expect("the Prompt declaration writes");
+    let prompt = Box::pin(cards.declare_from_path(&prompt_path))
+        .await
+        .expect("a standalone Prompt registers")
+        .root;
+    let warm = prompt.uid.clone().expect("the Prompt has a UID").to_string();
+    let rootless = |card: &str, run: &str| {
+        vec![
+            ("authorization", format!("Bearer {}", journey.caller)),
+            ("wyrd-card-uid", card.to_owned()),
+            ("wyrd-run-id", run.to_owned()),
+        ]
+    };
+    let described = journey
+        .post(
+            "/v1/chat/completions",
+            &rootless(&warm, "warm-run"),
+            &chat(false, "hi"),
+        )
+        .await;
+    assert_eq!(described.status().as_u16(), 200);
+    journey.drain_calls().await;
+    let account = "CAST(sub_principal_id AS VARCHAR) AS account";
+    let warmed = journey
+        .captured_json(
+            &inspector,
+            &format!("SELECT {account} FROM bifrost.gateway.calls WHERE run_id = 'warm-run'"),
+            1,
+        )
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("held-call"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(GatewayCapture::completion())
+                .set_delay(std::time::Duration::from_secs(3)),
+        )
+        .with_priority(1)
+        .mount(&journey.upstream)
+        .await;
+    let deleted = std::sync::atomic::AtomicBool::new(false);
+    let held = |card: String| {
+        let (journey, deleted) = (&journey, &deleted);
+        let headers = rootless(&card, "held-run");
+        async move {
+            let answer = journey
+                .post("/v1/chat/completions", &headers, &chat(false, "held-call"))
+                .await;
+            assert!(
+                deleted.load(std::sync::atomic::Ordering::SeqCst),
+                "both Cards are deleted while the provider holds the call"
+            );
+            answer.status().as_u16()
+        }
+    };
+    let delete = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while journey
+            .upstream_calls()
+            .await
+            .iter()
+            .filter(|call| String::from_utf8_lossy(&call.body).contains("held-call"))
+            .count()
+            < 2
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held calls reach the provider"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        for card in [&model, &prompt] {
+            cards
+                .delete(wyrd_client::cards::CardSelector::exact(card.clone()))
+                .await
+                .expect("an unreferenced standalone Card deletes");
+        }
+        deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+    let (cold_status, warm_status, ()) =
+        tokio::join!(held(outside.clone()), held(warm.clone()), delete);
+    assert_eq!((cold_status, warm_status), (200, 200));
+    journey.drain_calls().await;
+    let delivered = journey
+        .captured_json(
+            &inspector,
+            &format!(
+                "SELECT CAST(subject_card_uid AS VARCHAR) AS subject, subject_kind, \
+                 subject_name, subject_version, run_id, {account}, \
+                 wyrd_request_id IS NOT NULL AS requested \
+                 FROM bifrost.gateway.calls WHERE run_id = 'held-run' ORDER BY subject_name"
+            ),
+            2,
+        )
+        .await;
+    let held_row = |subject: &str, kind: &str, name: &str| {
+        json!({
+            "subject": subject, "subject_kind": kind, "subject_name": name,
+            "subject_version": "1.0.0", "run_id": "held-run",
+            "account": warmed[0]["account"], "requested": true,
+        })
+    };
+    assert_eq!(
+        delivered,
+        [
+            held_row(&warm, "Prompt", "held-prompt"),
+            held_row(&outside, "Model", "observed-model"),
+        ],
+        "cold and warm delivery keep each accepted deleted subject"
+    );
+    for card in [&outside, &warm] {
+        refusal(
+            journey
+                .post(
+                    "/v1/chat/completions",
+                    &rootless(card, "after-delete"),
+                    &chat(false, "hi"),
+                )
+                .await,
+            403,
+            scope,
+            openai_code,
+        )
+        .await;
+    }
 }
 
 /// Provider key the administrator rotates the managed credential to.

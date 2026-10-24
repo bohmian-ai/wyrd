@@ -20,7 +20,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::{SUBJECT_CARD_UID, WORKLOAD_CARD_UID};
 use wyrd_sql::WyrdPostgres;
-use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_sql::queries::cards::{get_card_by_uid, get_card_for_reconciliation};
 use wyrd_tonic::otlp::common::v1::KeyValue;
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics::v1::{Metric, metric};
@@ -42,6 +42,18 @@ pub const MAX_ATTRIBUTED_CARDS: usize = 32;
 
 /// Most Card descriptors one process keeps resolved.
 const DESCRIPTOR_CACHE_ENTRIES: u64 = 16_384;
+
+/// Which registry rows a descriptor lookup may read.
+#[derive(Clone, Copy)]
+enum Lookup {
+    /// Only live Cards: a public action's Cards must still be registered.
+    Live,
+    /// Live Cards and retained deleted tombstones: a trusted row's Cards were
+    /// accepted when its producer admitted the action, and only their
+    /// immutable descriptor is projected now, so a later deletion cannot
+    /// refuse that accepted work.
+    Retained,
+}
 
 /// Tenant registry reader resolving unbound writers' Card attribution and the
 /// descriptors every admitted frame's shared dimensions are stamped from.
@@ -92,7 +104,11 @@ impl CardRegistry {
         Ok(FrameDimensions {
             environment: auth.deployment_environment.clone(),
             cards: self
-                .described(auth.tenant, workload.into_iter().chain(subjects))
+                .described(
+                    auth.tenant,
+                    workload.into_iter().chain(subjects),
+                    Lookup::Live,
+                )
                 .await?,
         })
     }
@@ -105,7 +121,9 @@ impl CardRegistry {
     /// `subject_card_uid` columns name is described, and each row keeps its
     /// own carried environment. A UID never changes its descriptor, so a
     /// retried or recovered frame resolves exactly the context its producer
-    /// accepted.
+    /// accepted, also from a retained tombstone when the Card was deleted
+    /// after acceptance. This projects frozen identity and decides no
+    /// membership.
     ///
     /// # Errors
     ///
@@ -120,13 +138,17 @@ impl CardRegistry {
         Ok(FrameDimensions {
             environment: None,
             cards: self
-                .described(tenant, uids.iter().chain(&native_card_uids(ipc)))
+                .described(
+                    tenant,
+                    uids.iter().chain(&native_card_uids(ipc)),
+                    Lookup::Retained,
+                )
                 .await?,
         })
     }
 
-    /// Describes each distinct registered Card among `uids`, reading only the
-    /// UIDs this process has not described before.
+    /// Describes each distinct registered Card among `uids` that `lookup`
+    /// may read, reading only the UIDs this process has not described before.
     ///
     /// # Errors
     ///
@@ -136,6 +158,7 @@ impl CardRegistry {
         &self,
         tenant: DataTenantId,
         uids: impl IntoIterator<Item = &'a CardUid>,
+        lookup: Lookup,
     ) -> Result<Vec<(CardUid, CardDescriptor)>, IngestError> {
         let mut described = Vec::new();
         let mut unread = Vec::new();
@@ -157,7 +180,7 @@ impl CardRegistry {
             .await
             .map_err(|error| registry_unavailable(&error))?;
         for uid in unread {
-            if let Some(descriptor) = self.read_descriptor(&mut conn, tenant, &uid).await? {
+            if let Some(descriptor) = self.read_descriptor(&mut conn, tenant, &uid, lookup).await? {
                 described.push((uid, descriptor));
             }
         }
@@ -165,7 +188,7 @@ impl CardRegistry {
     }
 
     /// Reads one Card's descriptor and remembers it; `None` when the tenant
-    /// registry does not hold the UID.
+    /// registry holds no row for the UID that `lookup` may read.
     ///
     /// # Errors
     ///
@@ -176,8 +199,13 @@ impl CardRegistry {
         conn: &mut wyrd_sql::TenantConn<'_>,
         tenant: DataTenantId,
         uid: &CardUid,
+        lookup: Lookup,
     ) -> Result<Option<CardDescriptor>, IngestError> {
-        match get_card_by_uid(conn, uid).await {
+        let row = match lookup {
+            Lookup::Live => get_card_by_uid(conn, uid).await,
+            Lookup::Retained => get_card_for_reconciliation(conn, uid).await,
+        };
+        match row {
             Ok(row) => {
                 let descriptor = CardDescriptor {
                     kind: row.kind,
@@ -252,7 +280,7 @@ impl CardRegistry {
         let mut members = Vec::with_capacity(cards.len());
         for uid in cards {
             if self
-                .read_descriptor(&mut conn, tenant, &uid)
+                .read_descriptor(&mut conn, tenant, &uid, Lookup::Live)
                 .await?
                 .is_some_and(|descriptor| descriptor.kind.is_observation_target())
             {

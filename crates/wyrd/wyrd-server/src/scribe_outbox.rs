@@ -1052,6 +1052,11 @@ impl Chunk {
     /// `rows` with each row's owner's subject and actor appended as the
     /// `sub_principal_id` and `act_principal_id` columns Scribe stamps from.
     ///
+    /// A gateway call row also carries its admitting request as content, so
+    /// that request is appended as the row's `wyrd_request_id`, the key that
+    /// joins the call to its audit decisions; every other row takes the
+    /// frame's request.
+    ///
     /// # Errors
     ///
     /// Returns the Arrow error when the columns cannot be appended.
@@ -1075,6 +1080,11 @@ impl Chunk {
         let mut columns = rows.columns().to_vec();
         columns.push(column(|pair| pair.sub_principal_id));
         columns.push(column(|pair| pair.act_principal_id));
+        if let (ScribeTable::Calls, Some(request)) = (self.table, rows.column_by_name("request_id"))
+        {
+            fields.push(Arc::new(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false)));
+            columns.push(Arc::clone(request));
+        }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
     }
 

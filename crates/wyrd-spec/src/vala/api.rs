@@ -118,12 +118,12 @@ pub struct BifrostTableDescription {
     pub user_fields: Vec<FieldSpec>,
     /// The correlation inputs a writer supplies alongside its user fields.
     ///
-    /// Exactly nullable `card_uid: Utf8` then nullable `run_id: Utf8`, each
+    /// Exactly nullable `subject_card_uid: Utf8` then nullable `run_id: Utf8`, each
     /// with the field id its physical column holds.
     ///
-    /// Card correlation is optional, so a writer may omit `card_uid` entirely;
+    /// Card correlation is optional, so a writer may omit `subject_card_uid` entirely;
     /// the server then stores the row with its authenticated subject/actor
-    /// pair and a null `card_uid`. A supplied UID is stored only once the server has
+    /// pair and a null `subject_card_uid`. A supplied UID is stored only once the server has
     /// confirmed the writer may correlate to that Card.
     pub correlation_fields: Vec<FieldSpec>,
     /// Lower-case 64-character hex of the complete canonical physical
@@ -536,7 +536,7 @@ pub struct RegisterTableRequest {
     pub namespace: String,
     /// Table name.
     pub name: String,
-    /// User fields only; `wyrd_*`, `card_uid`, `run_id`, `sub_principal_id`, and
+    /// User fields only; `wyrd_*`, `workload_card_uid`, `subject_card_uid`, `run_id`, `sub_principal_id`, and
     /// `act_principal_id` reserved names are rejected.
     pub fields: Vec<FieldSpec>,
     /// Optional physical layout declaration.
@@ -2595,7 +2595,7 @@ pub enum AuditOutcome {
 ///
 /// `card_ref` is the **writer-identity card** (who performed the op), derived
 /// from the resolved `Principal`; it is `None` only for a `User` principal.
-/// This is decoupled from the per-row `card_uid` data column.
+/// This is decoupled from the per-row `subject_card_uid` data column.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct AuditEvent {
@@ -2769,7 +2769,7 @@ mod bifrost_wire_tests {
     #[test]
     fn bifrost_wire_field_spec_carries_correlation_metadata() {
         let mut spec = FieldSpec {
-            name: "card_uid".to_string(),
+            name: "subject_card_uid".to_string(),
             data_type: DataTypeSpec::Utf8,
             nullable: true,
             metadata: BTreeMap::default(),
@@ -3009,7 +3009,7 @@ mod bifrost_wire_tests {
             }],
             correlation_fields: vec![
                 FieldSpec {
-                    name: "card_uid".to_string(),
+                    name: "subject_card_uid".to_string(),
                     data_type: DataTypeSpec::Utf8,
                     nullable: true,
                     metadata: BTreeMap::from([(

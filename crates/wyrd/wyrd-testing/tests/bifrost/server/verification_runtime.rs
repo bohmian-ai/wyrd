@@ -1278,6 +1278,205 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     Ok(())
 }
 
+/// Every built-in and a dynamic table share one attribution envelope.
+///
+/// Each of the nine freshly provisioned built-ins describes, through the
+/// public HTTP route, exactly `subject_card_uid` then `run_id` as writer
+/// correlation inputs, its declared ledger layout as the resolved layout, and
+/// the six shared dimensions once each as nullable text, with no managed or
+/// retired `card_uid`/`owner_card_uid` name among its own fields. A dynamic
+/// table describes its two declared fields and the same correlation inputs,
+/// and no shared dimension. All ten tables plan a read of the seven managed
+/// columns, and the dynamic table refuses a read of a shared dimension.
+/// Rows written by three producers carry their own origin: a verification
+/// result names its binding owner as workload and its subject Card, written
+/// by the tenant SYSTEM principal; a gateway call stores its own request as
+/// `wyrd_request_id`; and an audit decision keeps its decision pair and
+/// request, with no workload or subject.
+///
+/// # Errors
+/// Returns a server, describe, registration, publication, or query error, or a
+/// description of the first table or row that differs from its contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn system_and_dynamic_tables_share_attribution() -> Result<(), ServerJourneyError> {
+    use vala_bifrost_redux::tables::managed_columns::{MANAGED_COLUMNS, is_managed_column};
+    use vala_bifrost_redux::tables::{SHARED_DIMENSIONS, builtin_tables};
+
+    let journey = TypedPayloadJourney::start().await?;
+    let server = &journey.gateway.server;
+    for table in builtin_tables() {
+        server
+            .ensure_builtin_table_for_test(journey.gateway.tenant, table.namespace, table.name)
+            .await?;
+    }
+    let bootstrap = server
+        .bootstrap_service("attribution_describer", &["admin"])
+        .await?;
+    let client = super::query::client_for(server, bootstrap.api_key().ok_or("a machine API key")?)?;
+    let dynamic = format!(
+        "bifrost.datasets.attributed_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let declared = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, true),
+    ]));
+    Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(TableConfig::from_arrow(&dynamic, declared)?),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?
+    .register()
+    .await?;
+    let query = Bifrost::query_only(&client);
+    let correlation = |description: &wyrd_spec::vala::api::BifrostTableDescription| {
+        description
+            .correlation_fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let mut fqns = Vec::new();
+    for table in builtin_tables() {
+        let fqn = format!("bifrost.{}.{}", table.namespace, table.name);
+        let description = query
+            .describe_table(&format!("bifrost.{}", table.namespace), table.name)
+            .await?;
+        expect_eq(
+            &format!("{fqn} correlation inputs"),
+            &correlation(&description),
+            &vec![SUBJECT_CARD_UID.to_owned(), RUN_ID.to_owned()],
+        )?;
+        expect_eq(
+            &format!("{fqn} resolved layout"),
+            &description.physical_layout,
+            &(table.physical_layout)(),
+        )?;
+        for dimension in SHARED_DIMENSIONS {
+            let declared: Vec<_> = description
+                .user_fields
+                .iter()
+                .filter(|field| field.name == dimension)
+                .map(|field| (field.data_type.clone(), field.nullable))
+                .collect();
+            expect_eq(
+                &format!("{fqn} {dimension}"),
+                &declared,
+                &vec![(wyrd_spec::vala::api::DataTypeSpec::Utf8, true)],
+            )?;
+        }
+        if let Some(field) = description.user_fields.iter().find(|field| {
+            is_managed_column(&field.name) || ["card_uid", "owner_card_uid"].contains(&&*field.name)
+        }) {
+            return Err(format!("{fqn} declares server-owned `{}`", field.name).into());
+        }
+        fqns.push(fqn);
+    }
+    let (namespace, name) = dynamic
+        .rsplit_once('.')
+        .ok_or("the dynamic FQN names its table")?;
+    let description = query.describe_table(namespace, name).await?;
+    expect_eq(
+        "dynamic declared fields",
+        &description
+            .user_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        &vec!["id", "value"],
+    )?;
+    expect_eq(
+        "dynamic correlation inputs",
+        &correlation(&description),
+        &vec![SUBJECT_CARD_UID.to_owned(), RUN_ID.to_owned()],
+    )?;
+    fqns.push(dynamic.clone());
+    let managed = MANAGED_COLUMNS
+        .iter()
+        .map(|column| column.field.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    for fqn in &fqns {
+        journey
+            .rows(format!("SELECT {managed} FROM {fqn} LIMIT 1"))
+            .await
+            .map_err(|error| format!("{fqn} does not read the managed envelope: {error}"))?;
+    }
+    if journey
+        .rows(format!("SELECT {} FROM {dynamic}", SHARED_DIMENSIONS[0]))
+        .await
+        .is_ok()
+    {
+        return Err("a dynamic table reads a shared dimension".into());
+    }
+
+    let results = journey.publish_results().await?;
+    let call = journey.gateway.capture_call().await?;
+    let decision = journey.stage_audit_decision().await?;
+    server.flush_bifrost().await?;
+    let envelope = format!(
+        "{WORKLOAD_CARD_UID}, {SUBJECT_CARD_UID}, {SUB_PRINCIPAL_ID}, {ACT_PRINCIPAL_ID}, \
+         {WYRD_INGESTED_AT} IS NOT NULL"
+    );
+    let writer = json!(results.writer.to_string());
+    let subject = json!(results.subject.as_str());
+    expect_eq(
+        "result envelope",
+        &journey
+            .rows(format!(
+                "SELECT {envelope} FROM bifrost.verification.results WHERE result_id = '{}'",
+                results.scored_drift.0
+            ))
+            .await?,
+        &vec![vec![
+            subject.clone(),
+            subject,
+            writer.clone(),
+            writer,
+            json!(true),
+        ]],
+    )?;
+    let calls = journey
+        .rows(format!(
+            "SELECT wyrd_request_id = request_id, {SUB_PRINCIPAL_ID} IS NOT NULL \
+             FROM bifrost.gateway.calls WHERE request_id = '{}'",
+            call.request_id
+        ))
+        .await?;
+    expect_eq(
+        "call envelope",
+        &calls,
+        &vec![vec![json!(true), json!(true)]],
+    )?;
+    let principal = json!(decision.principal);
+    expect_eq(
+        "audit envelope",
+        &journey
+            .rows(format!(
+                "SELECT {envelope}, wyrd_request_id FROM bifrost.system.audit_log \
+                 WHERE operation = '{}'",
+                decision.operation
+            ))
+            .await?,
+        &vec![vec![
+            Value::Null,
+            Value::Null,
+            principal.clone(),
+            principal,
+            json!(true),
+            json!(decision.request_id.as_str()),
+        ]],
+    )?;
+
+    journey.gateway.server.shutdown().await?;
+    Ok(())
+}
+
 /// Raw Arrow IPC that bypasses every client-side Variant check reaches Scribe
 /// admission for a top-level and a nested signal Variant, and each malformed
 /// frame is refused with its exact catalogued error before any ACK.
@@ -2428,6 +2627,10 @@ struct PublishedResults {
     scored_drift: (VerificationResultId, VerificationOutcome),
     /// A Drift result whose window could not be scored.
     unscored_drift: (VerificationResultId, VerificationOutcome),
+    /// The Service both results judge, which also owns their bindings.
+    subject: CardUid,
+    /// The tenant SYSTEM principal that wrote both results.
+    writer: uuid::Uuid,
 }
 
 /// The staged audit decision and its native detail.
@@ -2436,6 +2639,10 @@ struct StagedDecision {
     operation: String,
     /// The detail's canonical JSON, the value the retained row must decode to.
     detail: Value,
+    /// The principal the decision was for and by.
+    principal: PrincipalId,
+    /// The request that made the decision.
+    request_id: RequestId,
 }
 
 /// The typed-payload journey's server, mock upstream, and tenant.
@@ -2520,6 +2727,8 @@ impl TypedPayloadJourney {
         Ok(PublishedResults {
             scored_drift,
             unscored_drift,
+            subject,
+            writer: seed.system_principal(),
         })
     }
 
@@ -2537,13 +2746,15 @@ impl TypedPayloadJourney {
             analytical_slots: 4,
             total_slots: 7,
         };
+        let principal = PrincipalId::new(uuid::Uuid::now_v7());
+        let request_id = RequestId::now_v7();
         let event = AuditEvent::new(
-            RequestId::now_v7(),
+            request_id.clone(),
             None,
             operation.clone(),
             "vala.oracle.admission".to_owned(),
             None,
-            Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
+            Attribution::direct(principal),
             PrincipalKindTag::User,
             "bifrost:query:read".to_owned(),
             AuditOutcome::Allowed,
@@ -2559,6 +2770,8 @@ impl TypedPayloadJourney {
         Ok(StagedDecision {
             operation,
             detail: serde_json::from_str(&audit_detail_canonical_json(&detail))?,
+            principal,
+            request_id,
         })
     }
 

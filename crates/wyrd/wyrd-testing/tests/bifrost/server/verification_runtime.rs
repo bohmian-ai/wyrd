@@ -4892,6 +4892,169 @@ async fn native_row(
         .map(|_request_id| ())
 }
 
+/// A native batch id names one accepted origin, not only one user payload.
+///
+/// One row of a dynamic table is written under an explicit batch id by a
+/// Service account rooted at a registered Service, correlated to a Model and
+/// a Run. An exact retry is acknowledged without a second row. Reusing that
+/// batch id with the same user payload but another workload (the account
+/// rootless), another account pair, no subject, or another Run is refused,
+/// while each of those writes is accepted under a fresh batch id. After a
+/// restart empties the warm duplicate cache, the durable fence alone gives
+/// the same answers, and the original row keeps its original origin.
+///
+/// # Errors
+/// Returns [`ServerJourneyError`] when the server, a fixture, a restart, or a
+/// query fails.
+///
+/// # Panics
+/// Panics when a retry or fresh write is refused, a reused batch id with a
+/// changed origin is acknowledged, or the stored rows differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn native_batch_replay_is_bound_to_its_accepted_origin() -> Result<(), ServerJourneyError> {
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let key = async |name: &str, role: &str| -> Result<String, ServerJourneyError> {
+        Ok(server
+            .bootstrap_service(name, &[role])
+            .await?
+            .api_key()
+            .ok_or("a Service has an API key")?
+            .expose_secret()
+            .to_owned())
+    };
+    let [admin_key, writer_key, other_key] = [
+        key("native-replay-admin", "admin").await?,
+        key("native-replay-writer", "editor").await?,
+        key("native-replay-other", "editor").await?,
+    ];
+    let admin = native_client(&server, &admin_key)?;
+    let cards = wyrd_client::cards::Cards::connect_with(&admin).await?;
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    let model = Box::pin(cards.declare_from_path(&fixtures.join("observed-model.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Model has a UID")?;
+    let service = Box::pin(cards.declare_from_path(&fixtures.join("observed-service.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Service has a UID")?;
+    let fqn = format!(
+        "bifrost.datasets.native_replay_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    Bifrost::connect_with(
+        &admin,
+        BifrostOptions {
+            table: Some(TableConfig::from_arrow(
+                &fqn,
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ])),
+            )?),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?
+    .register()
+    .await?;
+    let (namespace, name) = fqn.rsplit_once('.').ok_or("the table is qualified")?;
+    let preflight = wyrd_queue::RowPreflight::from_description(
+        &Bifrost::query_only(&admin)
+            .describe_table(namespace, name)
+            .await?,
+    )?;
+    let [run, other_run] = ["replay-run", "other-run"]
+        .map(|run| wyrd_spec::vala::ids::RunId::from_string(run.to_owned()));
+    let payload = |subject: Option<&CardUid>, run: &wyrd_spec::vala::ids::RunId| {
+        preflight
+            .prepare(&[r#"{"id": 1, "value": "replayed"}"#], subject, Some(run))
+            .expect("the row prepares")
+            .to_ipc()
+            .expect("the row encodes")
+    };
+    let insert = async |client: &wyrd_client::WyrdClient, batch: uuid::Uuid, ipc: Vec<u8>| {
+        RawIngest::connect(client)
+            .await?
+            .insert(&fqn, batch, ipc)
+            .await
+    };
+    let batch = uuid::Uuid::now_v7();
+    let original = payload(Some(&model), &run);
+
+    let mut server = server;
+    for phase in ["warm", "cold"] {
+        let writer = native_client(&server, &writer_key)?;
+        let rooted = writer.for_workload(service.clone());
+        insert(&rooted, batch, original.clone()).await?;
+        insert(&rooted, batch, original.clone()).await?;
+        let changed = [
+            ("workload", writer.clone(), original.clone()),
+            (
+                "account pair",
+                native_client(&server, &other_key)?.for_workload(service.clone()),
+                original.clone(),
+            ),
+            ("subject", rooted.clone(), payload(None, &run)),
+            ("run", rooted.clone(), payload(Some(&model), &other_run)),
+        ];
+        for (origin, client, ipc) in changed {
+            insert(&client, batch, ipc.clone())
+                .await
+                .expect_err(&format!(
+                    "{phase}: a batch id reused under a changed {origin} is refused"
+                ));
+            if phase == "warm" {
+                insert(&client, uuid::Uuid::now_v7(), ipc).await?;
+            }
+        }
+        server.flush_bifrost().await?;
+        if phase == "warm" {
+            server = Box::pin(server.restart_bound(WyrdTestServer::builder())).await?;
+        }
+    }
+
+    let admin = native_client(&server, &admin_key)?;
+    let stored: Vec<Value> = Bifrost::query_only(&admin)
+        .sql_as(
+            &format!(
+                "SELECT CAST(workload_card_uid AS VARCHAR) AS workload_card_uid, \
+                 CAST(subject_card_uid AS VARCHAR) AS subject_card_uid, run_id, \
+                 COUNT(*) AS n FROM {fqn} \
+                 GROUP BY workload_card_uid, subject_card_uid, run_id, sub_principal_id \
+                 ORDER BY n DESC, run_id, workload_card_uid, subject_card_uid"
+            ),
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        stored.len(),
+        5,
+        "the original and each fresh write are distinct row sets: {stored:?}"
+    );
+    assert!(
+        stored.iter().all(|row| row["n"] == json!(1)),
+        "every write is stored exactly once: {stored:?}"
+    );
+    assert!(
+        stored.contains(&json!({
+            "workload_card_uid": service.to_string(),
+            "subject_card_uid": model.to_string(),
+            "run_id": "replay-run",
+            "n": 1,
+        })),
+        "the original row keeps its original origin: {stored:?}"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
 /// A normal User bearer with a loaded `WyrdState` writes native observations:
 /// the state selects its Service root on every frame, the server narrows the
 /// rootless User bearer to that validated root before Gate admission, and the

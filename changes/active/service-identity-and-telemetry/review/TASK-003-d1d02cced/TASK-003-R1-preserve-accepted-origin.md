@@ -239,3 +239,26 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:mig
 Run the existing format/lint checks required by the actual write set (`mise run fmt`, `mise run lints` for Rust; owning SDK checks only if those sources change). Documentation correction itself needs static inventory inspection and formatting/lints, not new runtime tests. Regenerate and check consumed declarations only if the correction changes their sources; no new public contract is intended. Any focused positive regression added to protect a correction boundary should use the same existing harness and exact command rather than a broad capability lane.
 
 Record a short shared ownership flow from each affected Bifrost/gateway/verification admission owner to its consumers, identifying where the shared selection happens and where accepted values are carried. This is evidence of root-cause closure, not permission to inventory or refactor unrelated authentication machinery. Include focused positive coverage for direct/queued verification through existing accepted-context seams where the write set touches them. Preserve all six stable finding IDs for remediation review.
+
+## Implementation evidence
+
+### Diagnoses
+
+**`admission_clock` lane note.**
+- Symptom: `admission_clock` failed when run bare.
+- Evidence: the lane only runs under the Postgres wrapper.
+- Cause: it was invoked without `with-test-postgres.sh`, so there was no database; the code is not defective.
+- Fix site: none. It passes under its lane wrapper.
+
+**`scribe::accepted_retry` fixture principal.**
+- Symptom: three tests in `vala-bifrost-redux::integration` failed with `ContractViolation(TableVersionConflict)` after FIND-4 bound correlation columns into the logical identity:
+  - `scribe::accepted_retry::pg_tests::a_retry_the_current_layout_refuses_is_acknowledged_under_its_own`
+  - `scribe::accepted_retry::pg_tests::a_held_unclaimed_write_keeps_its_retained_input_charged_once`
+  - `scribe::accepted_retry::pg_tests::an_unheard_edit_still_governs_new_admission`
+- Evidence: the trace shows `sub_principal_id` and `act_principal_id` digests differing between the first attempt and its retry under one batch id. For example, batch `01a16f9a…` goes from `f6b29a21…` to `2dbef399…`.
+- Cause: `tests/integration/forge/support.rs::ingest_at` minted `PrincipalId::new(Uuid::now_v7())` on every call. As a result, each "retry" came from a different account pair, which FIND-4 now correctly refuses.
+- Fix site: `ingest_at`, which now uses one fixture writer per tenant (`PrincipalId::new(tenant.as_uuid())`).
+  - Callers checked: `ingest_unclaimed` and `append_only`/`append_and_seal`. Both always use fresh batch ids, so only the stored principal value changes.
+  - Other per-call principal builders (`forge_harness.rs::scribe_append_and_seal`, `oracle/peer_cluster.rs`, `oracle/capacity.rs`) never retry under one batch id.
+  - No production change.
+- Independent diagnostician report: it confirmed the same cause and fix site. It also noted that a changed origin under a reused batch id surfaces as `TableVersionConflict`. That refusal is the existing fence path and is out of scope here: the outcome is a refusal, as required.

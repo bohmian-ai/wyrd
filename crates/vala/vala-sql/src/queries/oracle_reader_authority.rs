@@ -118,6 +118,10 @@ impl ExclusiveTableAuthority<'_, '_> {
     }
 }
 
+/// Suffix a `bifrost_cut` payload carries when the table's definition, not
+/// only its cut, changed.
+pub const DEFINITION_CHANGE_SUFFIX: &str = "|definition";
+
 /// The single SQL serialization boundary for one tenant-qualified table.
 ///
 /// Destructive Forge preparation locks this one row exclusively, so Forge's
@@ -179,8 +183,32 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
     ///
     /// Returns [`SqlError`] when the statement fails.
     pub async fn announce_cut_change(&mut self, table: CutTableRef<'_>) -> Result<(), SqlError> {
+        self.announce(table, "").await
+    }
+
+    /// Tells every node that `table`'s definition changed.
+    ///
+    /// Sends the `bifrost_cut` notification with [`DEFINITION_CHANGE_SUFFIX`]
+    /// appended, so a listener drops both the table's cut and its cached
+    /// current definition, and new admission everywhere binds the committed
+    /// table version. `NOTIFY` is transactional, so the notification is
+    /// delivered only if this owner's transaction commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError`] when the statement fails.
+    pub async fn announce_definition_change(
+        &mut self,
+        table: CutTableRef<'_>,
+    ) -> Result<(), SqlError> {
+        self.announce(table, DEFINITION_CHANGE_SUFFIX).await
+    }
+
+    /// Sends one `bifrost_cut` notification naming `table`, followed by
+    /// `suffix`.
+    async fn announce(&mut self, table: CutTableRef<'_>, suffix: &str) -> Result<(), SqlError> {
         let payload = format!(
-            "{}|{}|{}",
+            "{}|{}|{}{suffix}",
             self.conn.data_tenant_id().as_uuid(),
             table.namespace_name,
             table.table_name

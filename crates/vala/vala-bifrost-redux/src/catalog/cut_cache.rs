@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Instant;
 
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::oracle_reader_authority::{CutTableRef, TableCut};
 use wyrd_spec::DataTenantId;
@@ -146,7 +145,7 @@ impl CutCache {
 
     /// Drops the cut a notification names, or every cut when the payload is
     /// not `tenant|namespace|table`.
-    fn invalidate(&self, payload: &str) {
+    pub(crate) fn invalidate(&self, payload: &str) {
         let Ok(mut entries) = self.entries.write() else {
             return;
         };
@@ -167,32 +166,12 @@ impl CutCache {
     }
 
     /// Clears every cut and records whether the node is now listening.
-    fn reset(&self, live: bool) {
+    pub(crate) fn reset(&self, live: bool) {
         if let Ok(mut entries) = self.entries.write() {
             entries.generation = entries.generation.wrapping_add(1);
             entries.cuts.clear();
             entries.live = live;
         }
-    }
-
-    /// Listens for cut invalidations through `listener` until `shutdown`.
-    ///
-    /// The cache serves only while the listener is subscribed and its
-    /// heartbeat answers: each loss or silent stall clears it and switches it
-    /// off before a replacement subscribes, and serving resumes from an
-    /// empty cache; see [`vala_sql::NotificationListener::watch`].
-    pub(crate) async fn watch(
-        &self,
-        listener: &vala_sql::NotificationListener,
-        shutdown: CancellationToken,
-    ) {
-        listener
-            .watch(
-                shutdown,
-                |live| self.reset(live),
-                |payload| self.invalidate(payload),
-            )
-            .await;
     }
 }
 

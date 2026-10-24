@@ -9,6 +9,7 @@
 /// of trusting a literal repeated at each call site.
 pub const BIFROST_CATALOG_NAME: &str = "wyrd-redux";
 
+mod alteration;
 mod bifrost_catalog;
 mod cut_cache;
 mod error;
@@ -23,6 +24,7 @@ pub mod table_ref;
 pub mod tenant_table;
 mod wire;
 
+pub use alteration::TableAlteration;
 pub use bifrost_catalog::{
     BifrostCatalog, CompactionRegistration, CreateTableRequest, MAX_PHYSICAL_LEAF_COLUMNS,
     PinnedIcebergFile, PinnedSealedTable, TableDefinition, TableUid,

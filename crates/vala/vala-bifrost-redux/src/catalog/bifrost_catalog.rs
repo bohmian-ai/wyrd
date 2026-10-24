@@ -7,7 +7,7 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::spec::{
-    self, FormatVersion, TableMetadata, TableMetadataRef, TableProperties, Transform,
+    self, FormatVersion, TableMetadata, TableMetadataRef, TableProperties,
 };
 use iceberg::table::Table;
 use iceberg::{Catalog as _, Error as IcebergError, TableCreation, TableIdent};
@@ -39,7 +39,7 @@ use crate::catalog::wire::{
     described_fields_from_stored_schema, entry_from_row, layout_wire_from_row,
     reject_reserved_field_names,
 };
-use crate::catalog::{TableRef, TenantTableBinding};
+use crate::catalog::{TableAlteration, TableRef, TenantTableBinding};
 use crate::forge::{COMPACTION_TYPE_PROPERTY, ForgeCompactionType};
 use crate::namespaces::BifrostNamespace;
 use crate::schema::SchemaFingerprint;
@@ -520,12 +520,54 @@ impl BifrostCatalog {
         Ok(cut)
     }
 
-    /// Keeps the node's cut cache coherent until `shutdown`: listens on one
-    /// Vala pool connection for the `vala.file_list` trigger's notifications
-    /// and drops each cut they name. See [`CutCache::watch`].
+    /// Keeps the node's cut and definition caches coherent until `shutdown`:
+    /// listens on one Vala pool connection for `bifrost_cut` notifications and
+    /// drops each cut they name. The cut cache serves only while the
+    /// subscription is live; see [`vala_sql::NotificationListener::watch`].
+    ///
+    /// A notification an edit sends also drops that table's cached current
+    /// definition, so this node's next admission binds the committed version.
+    /// Losing the subscription clears every cached definition as well, since
+    /// a missed edit could otherwise leave one current forever.
+    ///
+    /// # Panics
+    /// Panics only if a thread panicked while holding a cache lock.
     pub async fn watch_cuts(&self, shutdown: tokio_util::sync::CancellationToken) {
-        self.cut_cache
-            .watch(&self.postgres.listener(CUT_CHANNEL), shutdown)
+        self.postgres
+            .listener(CUT_CHANNEL)
+            .watch(
+                shutdown,
+                |live| {
+                    self.cut_cache.reset(live);
+                    self.current_definitions
+                        .write()
+                        .expect("the current definition cache lock is never poisoned")
+                        .clear();
+                    self.registrations
+                        .write()
+                        .expect("the registration cache lock is never poisoned")
+                        .clear();
+                },
+                |payload| {
+                    let Some(cut) = payload.strip_suffix(
+                        vala_sql::queries::oracle_reader_authority::DEFINITION_CHANGE_SUFFIX,
+                    ) else {
+                        self.cut_cache.invalidate(payload);
+                        return;
+                    };
+                    self.cut_cache.invalidate(cut);
+                    let mut parts = cut.splitn(3, '|');
+                    if let (Some(tenant), Some(namespace), Some(name)) =
+                        (parts.next(), parts.next(), parts.next())
+                        && let Some(tenant) = Uuid::parse_str(tenant)
+                            .ok()
+                            .and_then(|tenant| DataTenantId::new(tenant).ok())
+                        && let Some(namespace) = BifrostNamespace::from_wire(namespace)
+                    {
+                        self.evict_current_definition(&TableRef::new(namespace, name), tenant);
+                    }
+                },
+            )
             .await;
     }
 
@@ -996,6 +1038,185 @@ impl BifrostCatalog {
         })
     }
 
+    /// Explicitly edit one table's definition and describe the committed
+    /// result.
+    ///
+    /// Serves dynamic and built-in tables alike: a built-in's schema stays
+    /// canonical, while its partition, sort, and Bloom lists may change. Under
+    /// the table's registration lock the edit is planned from the current
+    /// Iceberg definition, the whole edited schema and layout are validated
+    /// through the one layout validator, and every native update commits
+    /// with the next table version in one catalog publication, which refuses
+    /// it unless the table is still at `expected_table_version`. A refused
+    /// edit changes nothing and consumes no version.
+    ///
+    /// After the commit the control row's fingerprint and layout projection
+    /// are refreshed and a definition-change notification is sent in the
+    /// same tenant transaction, so every listening node drops its cached
+    /// definition, and this node drops its own.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::TableNotFound`] when the tenant has no
+    /// such table, [`BifrostCatalogError::Registration`] carrying
+    /// `TableVersionConflict` for a stale version, `TableVersionExhausted` at
+    /// the maximum version, `InvalidTableEdit`, `InvalidPhysicalLayout`,
+    /// `ReservedColumn`, `UnsupportedType`, or `SchemaParse` for an edit
+    /// outside the contract, and metadata, SQL, or Iceberg errors otherwise.
+    pub async fn alter_table(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+        alteration: TableAlteration,
+    ) -> Result<BifrostTableDescription, BifrostCatalogError> {
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use wyrd_spec::vala::BifrostError;
+
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        let fqn = binding.table_ref.fqn();
+        let builtin = builtin_table(
+            table
+                .namespace
+                .as_str()
+                .strip_prefix("vala.")
+                .unwrap_or_default(),
+            &table.name,
+        );
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
+        acquire_table_advisory_lock(&mut conn, tenant, &fqn).await?;
+        let row = vala_sql::queries::olap_catalog::get_by_fqn(&mut conn, &fqn)
+            .await?
+            .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
+        let identifier = binding.table_ident();
+        let physical = self.catalog.load_table(&identifier).await?;
+        let current = TableDefinition::of_metadata(&fqn, physical.metadata())?;
+        let conflict = |table_version| {
+            BifrostCatalogError::Registration(BifrostError::TableVersionConflict {
+                table: fqn.clone(),
+                table_version,
+            })
+        };
+        if current.table_version != alteration.expected_table_version {
+            return Err(conflict(current.table_version));
+        }
+        let edited = crate::catalog::alteration::edited_definition(
+            &fqn,
+            &current,
+            physical.metadata(),
+            builtin.is_some(),
+            &alteration,
+        )
+        .map_err(BifrostCatalogError::Registration)?;
+        let edited_arrow = edited
+            .schema
+            .as_ref()
+            .map(iceberg::arrow::schema_to_arrow_schema)
+            .transpose()?;
+        let current_arrow;
+        let arrow_schema = if let Some(schema) = &edited_arrow {
+            schema
+        } else {
+            current_arrow = iceberg::arrow::schema_to_arrow_schema(&current.schema)?;
+            &current_arrow
+        };
+        let (_, layout) =
+            resolve_registration_layout(&fqn, &[], Some(&edited.layout), Some(arrow_schema))?;
+        let mut updates = crate::catalog::alteration::definition_updates(
+            &fqn,
+            physical.metadata(),
+            &current,
+            edited.schema,
+            &layout,
+        )
+        .map_err(BifrostCatalogError::Registration)?;
+        if updates.is_empty() {
+            return Err(BifrostCatalogError::Registration(
+                BifrostError::InvalidTableEdit {
+                    table: fqn,
+                    violation: wyrd_spec::vala::TableEditViolation::NoEffectiveChange,
+                    column: None,
+                },
+            ));
+        }
+        let next = current.table_version.next().ok_or_else(|| {
+            BifrostCatalogError::Registration(BifrostError::TableVersionExhausted {
+                table: fqn.clone(),
+            })
+        })?;
+        updates.push(iceberg::TableUpdate::SetProperties {
+            updates: [(
+                crate::catalog::layout::TABLE_VERSION_PROPERTY.to_owned(),
+                next.to_string(),
+            )]
+            .into(),
+        });
+        let transaction = Transaction::new(&physical);
+        let action = updates.into_iter().fold(
+            transaction
+                .apply_updates()
+                .requirement(iceberg::TableRequirement::UuidMatch {
+                    uuid: physical.metadata().uuid(),
+                }),
+            iceberg::transaction::ApplyUpdatesAction::update,
+        );
+        let committed = ApplyTransactionAction::apply(action, transaction)?
+            .commit(self.catalog.as_ref())
+            .await;
+        if let Err(error) = committed {
+            if error.kind() != iceberg::ErrorKind::CatalogCommitConflicts {
+                return Err(error.into());
+            }
+            let reloaded = self.catalog.load_table(&identifier).await?;
+            let version = crate::catalog::layout::table_version(&fqn, reloaded.metadata())
+                .map_err(BifrostCatalogError::Registration)?;
+            return Err(conflict(version));
+        }
+
+        let fingerprint = match (builtin, &edited_arrow) {
+            (None, Some(schema)) => {
+                let user_fields = schema
+                    .fields()
+                    .iter()
+                    .filter(|field| !crate::tables::managed_columns::is_managed_column(field.name()))
+                    .map(|field| crate::tables::iceberg_form(field))
+                    .collect::<Result<Vec<_>, _>>()?;
+                SchemaFingerprint::from_arrow_schema(&Schema::new(user_fields)).0
+            }
+            _ => row.fingerprint.as_slice().try_into().map_err(|_| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "schema fingerprint length mismatch for {fqn}"
+                ))
+            })?,
+        };
+        let layout_json = serde_json::to_value(layout.to_wire()).map_err(|error| {
+            BifrostCatalogError::MetadataMismatch(format!(
+                "canonical physical layout for {fqn} is not encodable: {error}"
+            ))
+        })?;
+        let table_uid = TableUid::from_row(&row.table_uid, &fqn)?;
+        // The conflict update keeps the row's stored creator attribution.
+        vala_sql::queries::olap_catalog::upsert_table(
+            &mut conn,
+            table_uid.as_bytes(),
+            &fqn,
+            &fingerprint,
+            &layout_json,
+            Attribution::unresolved(),
+        )
+        .await?;
+        vala_sql::queries::oracle_reader_authority::BifrostTableMaintenanceAuthority::new(
+            &mut conn,
+        )
+        .announce_definition_change(CutTableRef {
+            namespace_name: &binding.logical_namespace,
+            table_name: &binding.table_name,
+        })
+        .await?;
+        conn.commit().await?;
+        self.evict_current_definition(table, tenant);
+        self.describe_table(table, tenant).await
+    }
+
     /// Ensure one canonical built-in exists for a tenant.
     ///
     /// This is the only path that creates a built-in, and tenant provisioning
@@ -1135,21 +1356,19 @@ impl BifrostCatalog {
             if row.fingerprint.as_slice() != fingerprint.as_ref() {
                 return Err(BifrostCatalogError::FingerprintMismatch(fqn));
             }
-            if layout_wire_from_row(&row)? != layout_wire {
-                return Err(BifrostCatalogError::Registration(
-                    wyrd_spec::vala::BifrostError::PhysicalLayoutMismatch { table: fqn },
-                ));
-            }
             if !physical_exists {
                 return Err(BifrostCatalogError::MetadataMismatch(format!(
                     "control registration exists without physical table: {table_ident}"
                 )));
             }
             let physical = self.catalog.load_table(&table_ident).await?;
-            self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
+            let table_version = self.validate_physical_table(
+                &physical,
+                &binding,
+                &arrow_schema,
+                (canonical_schema.is_none()).then_some(&layout),
+            )?;
             compaction.assert_matches(physical.metadata(), &fqn)?;
-            let table_version = crate::catalog::layout::table_version(&fqn, physical.metadata())
-                .map_err(BifrostCatalogError::Registration)?;
             conn.commit().await?;
             return Ok(Registration {
                 table_uid: TableUid::from_row(&row.table_uid, &row.fqn)?,
@@ -1162,10 +1381,14 @@ impl BifrostCatalog {
         self.ensure_namespace(binding.physical_namespace()).await?;
         let table_version = if physical_exists {
             let physical = self.catalog.load_table(&table_ident).await?;
-            self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
+            let table_version = self.validate_physical_table(
+                &physical,
+                &binding,
+                &arrow_schema,
+                (canonical_schema.is_none()).then_some(&layout),
+            )?;
             compaction.assert_matches(physical.metadata(), &fqn)?;
-            crate::catalog::layout::table_version(&fqn, physical.metadata())
-                .map_err(BifrostCatalogError::Registration)?
+            table_version
         } else {
             self.create_physical_table(&binding, &arrow_schema, &layout, compaction)
                 .await?;
@@ -1250,20 +1473,25 @@ impl BifrostCatalog {
         Ok(())
     }
 
-    /// Verify that a registered table still carries Bifrost's complete physical recipe.
+    /// Verify that a registered table is the physical table its registration
+    /// declares, and return its current version.
     ///
-    /// Registration and reconciliation call this before accepting existing
-    /// physical state, preventing a control-plane row from silently pointing at
-    /// a table with a different location, schema, time partition, or Forge sort
-    /// recipe. Every physical assertion is derived from `layout`, so the
-    /// canonical layout is the single authority for what "correct" means.
+    /// Registration and startup reconciliation call this before accepting
+    /// existing physical state, preventing a control-plane row from silently
+    /// pointing at a table with a different location or schema. The current
+    /// definition must rebuild through the one layout validator. A caller
+    /// registration passes its resolved `layout`, which must equal the
+    /// committed one, so re-registration never alters a table. A built-in
+    /// passes `None`: its schema stays canonical, but its layout is whatever
+    /// the tenant last committed, and startup never reimposes the default.
     /// Bifrost tables exist only as Iceberg format v3, so any other format
     /// version is refused rather than migrated.
     ///
     /// # Errors
     ///
     /// Returns a metadata mismatch when the location, format version, schema,
-    /// partition, or sort recipe diverges, or an Iceberg error when its schema
+    /// or current definition diverges, a layout mismatch when `layout`
+    /// differs from the committed one, or an Iceberg error when its schema
     /// has no Arrow form. The schema must equal the expected one exactly, by
     /// name, order, nullability, and type at every depth, because registration
     /// only ever declares Iceberg's own Arrow form.
@@ -1272,8 +1500,8 @@ impl BifrostCatalog {
         table: &Table,
         binding: &TenantTableBinding,
         expected_schema: &Schema,
-        layout: &PhysicalLayout,
-    ) -> Result<(), BifrostCatalogError> {
+        layout: Option<&PhysicalLayout>,
+    ) -> Result<TableVersion, BifrostCatalogError> {
         let expected_location = format!(
             "{}/{}",
             self.warehouse.trim_end_matches('/'),
@@ -1298,73 +1526,14 @@ impl BifrostCatalog {
                 "physical table schema mismatch: expected {expected_schema:?}, actual {actual_schema:?}"
             )));
         }
-        let schema = table.metadata().current_schema();
-        let expected_partition_fields = layout
-            .partition_by()
-            .iter()
-            .map(|field| {
-                schema.field_by_name(field.column()).map(|source| {
-                    (
-                        source.id,
-                        field.transform().iceberg_field_name(field.column()),
-                        field.transform().to_iceberg(),
-                    )
-                })
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                BifrostCatalogError::MetadataMismatch(
-                    "physical schema lacks a partition source column".to_owned(),
-                )
-            })?;
-        let fields = table.metadata().default_partition_spec().fields();
-        if fields.len() != expected_partition_fields.len()
-            || fields.iter().zip(&expected_partition_fields).any(
-                |(field, (source_id, name, transform))| {
-                    field.source_id != *source_id
-                        || &field.name != name
-                        || field.transform != *transform
-                },
-            )
-        {
-            return Err(BifrostCatalogError::MetadataMismatch(
-                "physical table partition spec mismatch".to_owned(),
+        let fqn = binding.table_ref.fqn();
+        let definition = TableDefinition::of_metadata(&fqn, table.metadata())?;
+        if layout.is_some_and(|layout| *layout != definition.layout) {
+            return Err(BifrostCatalogError::Registration(
+                wyrd_spec::vala::BifrostError::PhysicalLayoutMismatch { table: fqn },
             ));
         }
-        let expected_sort_fields = layout
-            .sort_keys()
-            .iter()
-            .map(|key| {
-                schema.field_by_name(&key.column).map(|field| {
-                    (
-                        field.id,
-                        key.direction.to_iceberg(),
-                        key.null_order.to_iceberg(),
-                    )
-                })
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                BifrostCatalogError::MetadataMismatch(
-                    "physical schema lacks Forge sort columns".to_owned(),
-                )
-            })?;
-        let sort_fields = &table.metadata().default_sort_order().fields;
-        if sort_fields.len() != expected_sort_fields.len()
-            || sort_fields.iter().zip(expected_sort_fields).any(
-                |(field, (source_id, direction, null_order))| {
-                    field.source_id != source_id
-                        || field.transform != Transform::Identity
-                        || field.direction != direction
-                        || field.null_order != null_order
-                },
-            )
-        {
-            return Err(BifrostCatalogError::MetadataMismatch(
-                "physical table sort order mismatch".to_owned(),
-            ));
-        }
-        Ok(())
+        Ok(definition.table_version)
     }
 
     /// Return the registered schema fingerprint and canonical physical layout

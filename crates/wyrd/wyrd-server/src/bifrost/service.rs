@@ -1,4 +1,5 @@
-//! RBAC-gated Bifrost catalog service functions (register / list / describe).
+//! RBAC-gated Bifrost catalog service functions (register / alter / list /
+//! describe).
 //!
 //! Each function authorizes the caller against the runtime RBAC model *before*
 //! touching the Redux catalog, mirroring `storage::service`. Engine errors cross
@@ -6,11 +7,14 @@
 //! rendered by the single `WyrdErrorResponse`.
 
 use arrow::datatypes::Field;
-use vala_bifrost_redux::catalog::{BifrostCatalogError, CompactionRegistration, TableRef};
+use vala_bifrost_redux::catalog::{
+    BifrostCatalogError, CompactionRegistration, TableAlteration, TableRef,
+};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    BifrostTableDescription, BifrostTableEntry, RegisterTableRequest, RegisterTableResponse,
+    AlterTableRequest, BifrostTableDescription, BifrostTableEntry, RegisterTableRequest,
+    RegisterTableResponse,
 };
 use wyrd_types::spec_to_field;
 
@@ -169,6 +173,64 @@ pub async fn describe_table(
         .catalog()
         .ok_or(wyrd_spec::vala::BifrostError::ScribeRoleUnavailable)?
         .describe_table(&table, caller.data_tenant_id)
+        .await
+        .map_err(map_engine_error)
+}
+
+/// Explicitly alter one table's definition in the caller's tenant.
+///
+/// Altering requires `bifrost_table:write`, the tenant-wide table
+/// administration grant, for built-in and dynamic tables alike; record and
+/// query grants never authorize it. Exactly one canonical audit row records
+/// the verdict, staged before validation, so the edit never waits on the
+/// audit commit. The table is looked up in the caller's own tenant only, so
+/// another tenant's same-named table is never seen.
+///
+/// # Errors
+///
+/// Returns a permission error when the caller lacks `bifrost_table:write`,
+/// a validation error for an unknown namespace,
+/// [`wyrd_spec::vala::BifrostError::UnsupportedType`] for an added column
+/// Bifrost cannot store,
+/// [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
+/// carries no catalog, and the mapped catalog error (not found, stale or
+/// exhausted version, invalid edit or layout) otherwise.
+pub async fn alter_table(
+    state: &AppState,
+    caller: Caller,
+    namespace: String,
+    name: String,
+    body: AlterTableRequest,
+) -> Result<BifrostTableDescription, WyrdError> {
+    let requested_fqn = format!("{namespace}.{name}");
+    audit::authorize(
+        state,
+        &caller,
+        &Permission::bifrost_table_write(),
+        "vala.bifrost.alter",
+        &requested_fqn,
+    )?;
+    let ns = convert::namespace_from_wire(&namespace)?;
+    let add_columns = body.add_columns.unwrap_or_default();
+    wyrd_types::schema::check_supported(&add_columns)?;
+    let table = TableRef::new(ns, name);
+    state
+        .bifrost
+        .catalog()
+        .ok_or(wyrd_spec::vala::BifrostError::ScribeRoleUnavailable)?
+        .alter_table(
+            caller.data_tenant_id,
+            &table,
+            TableAlteration {
+                expected_table_version: body.expected_table_version,
+                physical_layout: body.physical_layout.unwrap_or_default(),
+                add_columns: add_columns
+                    .iter()
+                    .map(|spec| spec_to_field(spec, true))
+                    .collect(),
+                rename_columns: body.rename_columns.unwrap_or_default(),
+            },
+        )
         .await
         .map_err(map_engine_error)
 }

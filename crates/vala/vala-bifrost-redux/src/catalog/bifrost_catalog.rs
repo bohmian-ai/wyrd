@@ -431,6 +431,10 @@ pub fn inject_metadata_not_found_for_test(count: usize) {
     TEST_METADATA_NOT_FOUND_FAULTS.store(count, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// How many times [`BifrostCatalog::alter_table`] plans and swaps an edit
+/// whose pointer concurrent data commits keep moving.
+const PUBLICATION_ATTEMPTS: usize = 4;
+
 /// The pause armed by [`pause_next_alter_after_publication_for_test`]: the
 /// alteration signals the first notify once its native publication is staged
 /// in its tenant transaction, then waits on the second.
@@ -1084,7 +1088,9 @@ impl BifrostCatalog {
     /// control row's fingerprint and layout projection, sends the
     /// definition-change notification, and projects the response. The swap
     /// refuses unless the table is still at `expected_table_version` and its
-    /// pointer has not moved since the edit was planned. On commit every
+    /// pointer has not moved since the edit was planned; an ingest or Forge
+    /// commit that moved it changes no definition, so the edit is planned
+    /// again from the moved pointer, up to four attempts. On commit every
     /// listening node drops its cached definition, and this node drops its
     /// own. The response is therefore this edit's own definition, never a
     /// later edit's.
@@ -1097,11 +1103,6 @@ impl BifrostCatalog {
     /// from the pointer, so a returned edit committed. A dropped response can
     /// still hide a committed edit, after which a retry at the old version
     /// conflicts; describe the table to observe which version committed.
-    ///
-    /// # Retries
-    /// A concurrent ingest commit that moves the pointer while the edit runs
-    /// refuses it as a version conflict at the unchanged version; repeating
-    /// the same request then succeeds.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::TableNotFound`] when the tenant has no
@@ -1137,124 +1138,133 @@ impl BifrostCatalog {
             .await?
             .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
         let identifier = binding.table_ident();
-        let physical = self.catalog.load_table(&identifier).await?;
-        let current = TableDefinition::of_metadata(&fqn, physical.metadata())?;
         let conflict = |table_version| {
             BifrostCatalogError::Registration(BifrostError::TableVersionConflict {
                 table: fqn.clone(),
                 table_version,
             })
         };
-        if current.table_version != alteration.expected_table_version {
-            return Err(conflict(current.table_version));
-        }
-        let edited = crate::catalog::alteration::edited_definition(
-            &fqn,
-            &current,
-            physical.metadata(),
-            builtin.is_some(),
-            &alteration,
-        )
-        .map_err(BifrostCatalogError::Registration)?;
-        let edited_arrow = edited
-            .schema
-            .as_ref()
-            .map(iceberg::arrow::schema_to_arrow_schema)
-            .transpose()?;
-        let current_arrow;
-        let arrow_schema = if let Some(schema) = &edited_arrow {
-            schema
-        } else {
-            current_arrow = iceberg::arrow::schema_to_arrow_schema(&current.schema)?;
-            &current_arrow
-        };
-        let (_, layout) =
-            resolve_registration_layout(&fqn, &[], Some(&edited.layout), Some(arrow_schema))?;
-        let mut updates = crate::catalog::alteration::definition_updates(
-            &fqn,
-            physical.metadata(),
-            &current,
-            edited.schema,
-            &layout,
-        )
-        .map_err(BifrostCatalogError::Registration)?;
-        if updates.is_empty() {
-            return Err(BifrostCatalogError::Registration(
-                BifrostError::InvalidTableEdit {
-                    table: fqn,
-                    violation: wyrd_spec::vala::TableEditViolation::NoEffectiveChange,
-                    column: None,
-                },
-            ));
-        }
-        let next = current.table_version.next().ok_or_else(|| {
-            BifrostCatalogError::Registration(BifrostError::TableVersionExhausted {
-                table: fqn.clone(),
-            })
-        })?;
-        updates.push(iceberg::TableUpdate::SetProperties {
-            updates: [(
-                crate::catalog::layout::TABLE_VERSION_PROPERTY.to_owned(),
-                next.to_string(),
-            )]
-            .into(),
-        });
-        let fingerprint = match (builtin, &edited_arrow) {
-            (None, Some(schema)) => {
-                let user_fields = schema
-                    .fields()
-                    .iter()
-                    .filter(|field| {
-                        !crate::tables::managed_columns::is_managed_column(field.name())
-                    })
-                    .map(|field| crate::tables::iceberg_form(field))
-                    .collect::<Result<Vec<_>, _>>()?;
-                SchemaFingerprint::from_arrow_schema(&Schema::new(user_fields)).0
+        // Ingest and Forge commits move the pointer without changing the
+        // definition, so an edit whose swap misses is planned again from the
+        // moved pointer; a changed version is refused at the top of the loop.
+        // ponytail: a fixed attempt bound without backoff, as Iceberg's
+        // default commit retry count; add backoff if hot tables exhaust it.
+        let mut attempts = 0;
+        let (metadata, location, fingerprint, layout_json, table_uid) = loop {
+            let physical = self.catalog.load_table(&identifier).await?;
+            let current = TableDefinition::of_metadata(&fqn, physical.metadata())?;
+            if current.table_version != alteration.expected_table_version {
+                return Err(conflict(current.table_version));
             }
-            _ => row.fingerprint.as_slice().try_into().map_err(|_| {
+            let edited = crate::catalog::alteration::edited_definition(
+                &fqn,
+                &current,
+                physical.metadata(),
+                builtin.is_some(),
+                &alteration,
+            )
+            .map_err(BifrostCatalogError::Registration)?;
+            let edited_arrow = edited
+                .schema
+                .as_ref()
+                .map(iceberg::arrow::schema_to_arrow_schema)
+                .transpose()?;
+            let current_arrow;
+            let arrow_schema = if let Some(schema) = &edited_arrow {
+                schema
+            } else {
+                current_arrow = iceberg::arrow::schema_to_arrow_schema(&current.schema)?;
+                &current_arrow
+            };
+            let (_, layout) =
+                resolve_registration_layout(&fqn, &[], Some(&edited.layout), Some(arrow_schema))?;
+            let mut updates = crate::catalog::alteration::definition_updates(
+                &fqn,
+                physical.metadata(),
+                &current,
+                edited.schema,
+                &layout,
+            )
+            .map_err(BifrostCatalogError::Registration)?;
+            if updates.is_empty() {
+                return Err(BifrostCatalogError::Registration(
+                    BifrostError::InvalidTableEdit {
+                        table: fqn,
+                        violation: wyrd_spec::vala::TableEditViolation::NoEffectiveChange,
+                        column: None,
+                    },
+                ));
+            }
+            let next = current.table_version.next().ok_or_else(|| {
+                BifrostCatalogError::Registration(BifrostError::TableVersionExhausted {
+                    table: fqn.clone(),
+                })
+            })?;
+            updates.push(iceberg::TableUpdate::SetProperties {
+                updates: [(
+                    crate::catalog::layout::TABLE_VERSION_PROPERTY.to_owned(),
+                    next.to_string(),
+                )]
+                .into(),
+            });
+            let fingerprint = match (builtin, &edited_arrow) {
+                (None, Some(schema)) => {
+                    let user_fields = schema
+                        .fields()
+                        .iter()
+                        .filter(|field| {
+                            !crate::tables::managed_columns::is_managed_column(field.name())
+                        })
+                        .map(|field| crate::tables::iceberg_form(field))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    SchemaFingerprint::from_arrow_schema(&Schema::new(user_fields)).0
+                }
+                _ => row.fingerprint.as_slice().try_into().map_err(|_| {
+                    BifrostCatalogError::MetadataMismatch(format!(
+                        "schema fingerprint length mismatch for {fqn}"
+                    ))
+                })?,
+            };
+            let layout_json = serde_json::to_value(layout.to_wire()).map_err(|error| {
                 BifrostCatalogError::MetadataMismatch(format!(
-                    "schema fingerprint length mismatch for {fqn}"
+                    "canonical physical layout for {fqn} is not encodable: {error}"
                 ))
-            })?,
+            })?;
+            let table_uid = TableUid::from_row(&row.table_uid, &fqn)?;
+            // The new metadata is written beside the current one; it becomes the
+            // table's definition only when the tenant transaction below commits.
+            let base_location = physical.metadata_location_result()?;
+            let mut builder = physical
+                .metadata()
+                .clone()
+                .into_builder(Some(base_location.to_owned()));
+            for update in updates {
+                builder = update.apply(builder)?;
+            }
+            let metadata = builder.build()?.metadata;
+            let location = iceberg::MetadataLocation::from_str(base_location)?
+                .with_next_version()
+                .try_with_new_metadata(&metadata)?;
+            metadata.write_to(physical.file_io(), &location).await?;
+            let location = location.to_string();
+            if vala_sql::queries::olap_catalog::publish_definition(
+                &mut conn,
+                &binding.logical_namespace,
+                &binding.table_name,
+                &metadata.uuid().to_string(),
+                next.get(),
+                base_location,
+                &location,
+            )
+            .await?
+            {
+                break (metadata, location, fingerprint, layout_json, table_uid);
+            }
+            attempts += 1;
+            if attempts == PUBLICATION_ATTEMPTS {
+                return Err(conflict(current.table_version));
+            }
         };
-        let layout_json = serde_json::to_value(layout.to_wire()).map_err(|error| {
-            BifrostCatalogError::MetadataMismatch(format!(
-                "canonical physical layout for {fqn} is not encodable: {error}"
-            ))
-        })?;
-        let table_uid = TableUid::from_row(&row.table_uid, &fqn)?;
-        // The new metadata is written beside the current one; it becomes the
-        // table's definition only when the tenant transaction below commits.
-        let base_location = physical.metadata_location_result()?;
-        let mut builder = physical
-            .metadata()
-            .clone()
-            .into_builder(Some(base_location.to_owned()));
-        for update in updates {
-            builder = update.apply(builder)?;
-        }
-        let metadata = builder.build()?.metadata;
-        let location = iceberg::MetadataLocation::from_str(base_location)?
-            .with_next_version()
-            .try_with_new_metadata(&metadata)?;
-        metadata.write_to(physical.file_io(), &location).await?;
-        let location = location.to_string();
-        if !vala_sql::queries::olap_catalog::publish_definition(
-            &mut conn,
-            &binding.logical_namespace,
-            &binding.table_name,
-            &metadata.uuid().to_string(),
-            next.get(),
-            base_location,
-            &location,
-        )
-        .await?
-        {
-            let reloaded = self.catalog.load_table(&identifier).await?;
-            let version = crate::catalog::layout::table_version(&fqn, reloaded.metadata())
-                .map_err(BifrostCatalogError::Registration)?;
-            return Err(conflict(version));
-        }
         #[cfg(any(test, feature = "test-support"))]
         pause_after_alter_publication_for_test().await;
 

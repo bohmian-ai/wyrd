@@ -5,7 +5,7 @@ use std::sync::Arc;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
-use wyrd_auth_oidc::WorkloadBindingResolver;
+use wyrd_auth_oidc::{WorkloadBinding, WorkloadBindingResolver};
 use wyrd_auth_verify::{ExternalVerifier, VerifiedExternalIdentity};
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
@@ -14,20 +14,18 @@ use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
-use wyrd_sql::queries::auth::service_account_by_card_ref;
-use wyrd_sql::{TenantConn, WyrdPostgres};
+use wyrd_sql::WyrdPostgres;
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event, auth_failure_code};
 use crate::error::{auth_error_to_wyrd, store_error};
 use crate::issuance::{ExchangedToken, IssuanceError, TenantGrant, TenantTokenIssuer};
-use crate::issue_api_key::principal_kind_for_card;
 use crate::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 
 /// Workload OIDC `jwt-bearer` exchange service.
 ///
-/// Owns only the workload evidence: the provider assertion and its Card
+/// Owns only the workload evidence: the provider assertion and its account
 /// binding. The token itself is minted by the shared [`TenantTokenIssuer`].
 #[derive(Clone)]
 pub struct JwtBearer {
@@ -48,13 +46,24 @@ impl std::fmt::Debug for JwtBearer {
 }
 
 impl JwtBearer {
-    /// Exchange a platform-attested workload assertion for a Wyrd token pair.
+    /// Exchange a platform-attested workload assertion for a Wyrd token.
+    ///
+    /// The configured binding selects the account; the root is the explicit
+    /// `workload_uid`, else the binding's pinned default, else none. Either
+    /// root is validated at issuance under the account's restriction.
+    ///
+    /// # Errors
+    /// Returns `InvalidToken` for an unverifiable or non-workload assertion,
+    /// `PrincipalNotFound` for an unbound subject or inactive bound account,
+    /// `AuthVerifyUnavailable` when the binding store is unavailable, and
+    /// every issuance refusal, including an unusable root.
     #[tracing::instrument(level = "debug", skip(self, postgres, assertion))]
     pub async fn execute(
         &self,
         postgres: &WyrdPostgres,
         tenant_id: DataTenantId,
         assertion: SecretString,
+        workload_uid: Option<CardUid>,
         request_id: &str,
     ) -> Result<ExchangedToken, WyrdError> {
         let mut sub_principal_id = None;
@@ -62,16 +71,21 @@ impl JwtBearer {
             let verified = self
                 .verify_workload_assertion(tenant_id, assertion.expose_secret())
                 .await?;
-            let card_ref = self.resolve_workload_binding(tenant_id, &verified).await?;
-            let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
-            let principal_id = bound_service_account(&mut conn, &card_ref).await?;
+            let binding = self.resolve_workload_binding(tenant_id, &verified).await?;
+            let principal_id = binding.principal_id.as_uuid();
             sub_principal_id = Some(principal_id);
+            let grant = TenantGrant::JwtBearer {
+                workload_uid: workload_uid.or(binding.workload_uid),
+            };
+            let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
             let exchanged = self
                 .issuer
-                .issue(&mut conn, principal_id, TenantGrant::JwtBearer, request_id)
+                .issue(&mut conn, principal_id, grant, request_id)
                 .await
                 .map_err(|error| match error {
-                    IssuanceError::PrincipalInactive => principal_not_found_for_card_ref(&card_ref),
+                    IssuanceError::PrincipalInactive => {
+                        principal_not_found(&verified.subject, &verified.issuer)
+                    }
                     error => error.into(),
                 })?;
             conn.commit().await.map_err(store_error)?;
@@ -136,11 +150,23 @@ impl JwtBearer {
         Ok(verified)
     }
 
+    /// Map a verified workload assertion to its server-owned binding.
+    ///
+    /// Looks the tenant's binding up by issuer, subject, and the verifier's
+    /// expected audience, so the token exchange mints only for the Service
+    /// account an operator bound to this workload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the binding lookup
+    /// fails (the cause is logged, not returned), and
+    /// [`WyrdError::PrincipalNotFound`] when no active binding matches the
+    /// subject.
     async fn resolve_workload_binding(
         &self,
         tenant_id: DataTenantId,
         verified: &VerifiedExternalIdentity,
-    ) -> Result<CardRef, WyrdError> {
+    ) -> Result<WorkloadBinding, WyrdError> {
         self.workload_binding_resolver
             .binding(
                 &tenant_id,
@@ -166,40 +192,15 @@ impl JwtBearer {
     }
 }
 
-/// Resolve the service account bound to the workload's Card.
-///
-/// The binding lookup only selects active rows; the shared issuer re-reads
-/// the principal inside the issuing transaction and decides activity there.
-///
-/// # Errors
-/// Returns `PrincipalNotFound` when no Service or Agent principal is bound to
-/// `card_ref`, and `AuthVerifyUnavailable` when the store read fails.
-async fn bound_service_account(
-    conn: &mut TenantConn<'_>,
-    card_ref: &CardRef,
-) -> Result<Uuid, WyrdError> {
-    let principal_kind = principal_kind_for_card(card_ref).map_err(WyrdError::from)?;
-    service_account_by_card_ref(conn, principal_kind, card_ref)
-        .await
-        .map_err(store_error)?
-        .map(|row| row.id)
-        .ok_or_else(|| principal_not_found_for_card_ref(card_ref))
-}
-
+/// The refusal for an unbound subject or an inactive bound account, kept
+/// identical so neither is distinguishable.
 fn principal_not_found(subject: &str, issuer: &IssuerUrl) -> WyrdError {
     WyrdError::PrincipalNotFound {
-        message: "no active Service or Agent principal is bound to card_ref".to_owned(),
+        message: "no active Service account is bound to this workload subject".to_owned(),
         details: json!({
             "issuer": issuer.as_str(),
             "subject": subject,
         }),
-    }
-}
-
-fn principal_not_found_for_card_ref(card_ref: &CardRef) -> WyrdError {
-    WyrdError::PrincipalNotFound {
-        message: "no active Service or Agent principal is bound to card_ref".to_owned(),
-        details: json!({ "card_ref": card_ref }),
     }
 }
 

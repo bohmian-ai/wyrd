@@ -351,7 +351,7 @@ impl PolicyDesk {
         let cards = deployment.cards().await;
         let desk = declare(&cards, "cards/verifier_building_blocks/policy-desk.yaml").await;
         let bundle = pull(&cards, &desk.root).await;
-        let client = deployment.client(&deployment.service_key(&desk.root).await);
+        let client = deployment.service_client(&desk.root).await;
         let state = WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
             .expect("bundle loads offline");
         state.start_bifrost().await.expect("Bifrost starts");
@@ -1249,11 +1249,12 @@ async fn delegated_tools_keep_the_narrower_authority() {
         .expect("the subject's token exchanges");
     let delegated = desk
         .deployment
-        .client(
+        .rooted(
             actor
                 .api_key()
                 .expect("the delegate has a key")
                 .expose_secret(),
+            &desk.root,
         )
         .on_behalf_of(SecretString::from(token), TokenAudience::Wyrd)
         .await

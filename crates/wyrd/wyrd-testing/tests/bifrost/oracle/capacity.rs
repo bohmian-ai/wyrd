@@ -850,14 +850,13 @@ async fn seed_scheduling_tables(
 
 /// Builds the tenant-bound principal one fixture ingest is admitted under.
 fn fixture_principal(tenant: DataTenantId) -> wyrd_runtime::principal::Principal {
-    wyrd_runtime::principal::Principal {
-        id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: wyrd_runtime::principal::PrincipalKind::User,
-        tenant_id: tenant,
-        roles: Vec::new(),
-        effective_permissions: wyrd_runtime::PermissionSet::new(),
-        credential_id: None,
-    }
+    wyrd_runtime::principal::Principal::new(
+        wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+        wyrd_runtime::principal::PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        wyrd_runtime::PermissionSet::new(),
+    )
 }
 
 /// Encodes `rows` deterministic `(id, filter_key)` rows as one Arrow IPC stream.

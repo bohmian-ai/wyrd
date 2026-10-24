@@ -284,21 +284,15 @@ mod pg_tests {
     use wyrd_auth_verify::{AccessTokenClaims, Kid, public_key_from_pem, verify_eddsa};
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::PrincipalId;
-    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag};
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::CardName;
-    use wyrd_spec::reference::CardRef;
     use wyrd_sql::row_types::auth::HumanSessionBinding;
 
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
-        insert_human_refresh_token, insert_refresh_token, insert_role, insert_service_account,
-        list_user_roles, refresh_by_hash, replace_idp_user_roles,
+        insert_human_refresh_token, insert_refresh_token, insert_role, list_user_roles,
+        refresh_by_hash, replace_idp_user_roles,
     };
-
-    use wyrd_dev_fixtures::cards::seed_backing_card;
 
     use wyrd_auth_oidc::ScreenedHttp;
     use wyrd_spec::vala::api::AuditOutcome;
@@ -309,6 +303,7 @@ mod pg_tests {
         REFRESH_FAMILY_REVOKE_OPERATION, TOKEN_EXCHANGE_OPERATION, principal_event,
     };
     use crate::connections::HumanConnections;
+    use crate::exchange_api_key::pg_tests::insert_test_service_account;
     use crate::issuance::{IssuanceError, TenantTokenIssuer, TokenExchangeSettings};
     use crate::revoke::pg_tests::wait_for_advisory_lock_wait;
 
@@ -359,15 +354,6 @@ mod pg_tests {
         }
     }
 
-    fn service_card_ref() -> CardRef {
-        CardRef {
-            kind: CardKind::Service,
-            name: CardName::new("test-service").expect("static name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            uid: None,
-        }
-    }
-
     fn issue_refresh_jwt(
         key: &IssuingKey,
         principal_kind: PrincipalKindTag,
@@ -399,27 +385,6 @@ mod pg_tests {
         .await
         .expect("test user inserts");
         user_id
-    }
-
-    async fn insert_test_service_account(
-        conn: &mut TenantConn<'_>,
-        creator: Uuid,
-        card_ref: &CardRef,
-    ) -> Uuid {
-        seed_backing_card(conn, card_ref, creator).await;
-        let sa_id = Uuid::new_v4();
-        insert_service_account(
-            conn,
-            sa_id,
-            "service",
-            Some(card_ref),
-            "test-sa",
-            None,
-            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
-        )
-        .await
-        .expect("service account inserts");
-        sa_id
     }
 
     /// Seed one active refresh row and return its durable id.
@@ -1396,17 +1361,20 @@ mod pg_tests {
     /// a refresh token. A row claiming otherwise is either pre-split residue or
     /// a forgery, and rotating it would hand out a long-lived successor to a
     /// holder the split says should not have one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture or seeding fails, or rotation is not refused
+    /// with `InvalidPrincipalKind`.
     #[tokio::test]
     async fn a_machine_refresh_row_cannot_rotate() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
-        let card_ref = service_card_ref();
-
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
+        let sa_id = insert_test_service_account(&mut conn, user_id, None).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
         let hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());

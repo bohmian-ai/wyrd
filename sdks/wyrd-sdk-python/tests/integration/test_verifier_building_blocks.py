@@ -42,6 +42,7 @@ from .support import (
     client_of,
     declare,
     pull,
+    rooted,
     service_key,
     timeline,
 )
@@ -473,7 +474,10 @@ def test_submitted_review_is_judged_in_the_background(
     )
     assert isinstance(execution, verify.Execution)
 
-    resumed = verify.Execution.connect(execution.id, WyrdClient(credential=policy_desk_key))
+    resumed = verify.Execution.connect(
+        execution.id,
+        WyrdClient(credential=policy_desk_key, workload_uid=str(desk.root_ref.uid)),
+    )
     result = resumed.wait(WAIT_SECONDS)
     status = resumed.status()
 
@@ -583,8 +587,8 @@ def test_delegated_tools_keep_the_narrower_authority(
     policy_desk_bundle: Path, wyrd_server: WyrdTestServer, receiver: Receiver
 ) -> None:
     subject = WyrdClient(credential=wyrd_server.scoped_api_key("tool_subject", grants("all")))
-    actor = WyrdClient(
-        credential=wyrd_server.scoped_api_key("tool_delegate", grants({"tool": TOOLS[0]}))
+    actor = rooted(
+        wyrd_server.scoped_api_key("tool_delegate", grants({"tool": TOOLS[0]})), "policy-desk"
     )
     delegated = actor.on_behalf_of(subject.access_token(), audience="wyrd")
 

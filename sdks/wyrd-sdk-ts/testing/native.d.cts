@@ -262,18 +262,6 @@ export declare function cliDeleteProviderCredential(name: string, connection?: N
 export declare function cliGet(selector: NativeCardSelector, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
 
 /**
- * Issues an API key bound to one exact Card (`wyrd auth issue-key`).
- *
- * The outcome holds the plaintext key exactly once.
- *
- * # Errors
- *
- * Returns a napi error only when the response cannot be serialized;
- * coordinate, client, and server failures are returned in the outcome.
- */
-export declare function cliIssueKey(options: NativeIssueKey, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
-
-/**
  * Connects the named MCP hosts to Wyrd (`wyrd mcp install --host ...`).
  *
  * Hosts are located from the process environment; a host that cannot be
@@ -362,20 +350,6 @@ export interface NativeCliOutcome {
    * `remediation`, `details`), when it failed.
    */
   problemJson?: string
-}
-
-/** Options for `issueKey`: the bound Card and the key's label and lifetime. */
-export interface NativeIssueKey {
-  /** Card kind, such as `Service` or `Agent`. */
-  kind: string
-  /** Card name. */
-  name: string
-  /** Exact Card version. */
-  version: string
-  /** Optional label stored with the key row. */
-  label?: string
-  /** Optional lifetime override in seconds. */
-  expiresInSeconds?: number
 }
 
 /**

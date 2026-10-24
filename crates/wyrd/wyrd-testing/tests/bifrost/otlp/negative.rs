@@ -7,8 +7,9 @@
 
 use arrow::array::StringArray;
 use arrow::record_batch::RecordBatch;
+use wyrd_tonic::otlp::common::v1::KeyValue;
 use wyrd_tonic::otlp::logs::v1::{ResourceLogs, ScopeLogs};
-use wyrd_tonic::otlp::metrics::v1::{ResourceMetrics, ScopeMetrics};
+use wyrd_tonic::otlp::metrics::v1::{ResourceMetrics, ScopeMetrics, metric};
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans};
 
 use super::support::{self, RESOURCE_SCHEMA_URL, SCOPE_SCHEMA_URL, SpanIdentity, column};
@@ -225,20 +226,77 @@ fn correlated_resource_spans(anchor: i64) -> Vec<ResourceSpans> {
     resource_spans
 }
 
-/// Builds the negative trace export with each span naming its own `card_uid`.
+/// Appends `cards[i]` as the final `wyrd.card_uid` of the `i`th record.
 ///
-/// Position `i` carries `cards[i]` as its final `wyrd.card_uid`, and a `None`
-/// position names no Card, so one export mixes attributable, unattributable,
-/// and uncorrelated siblings.
-fn card_attributed_resource_spans(anchor: i64, cards: [Option<&str>; 3]) -> Vec<ResourceSpans> {
-    let mut resource_spans = negative_resource_spans(anchor, &[]);
-    for (span, card) in resource_spans[0].scope_spans[0].spans.iter_mut().zip(cards) {
+/// A `None` position names no Card, so one export mixes attributable,
+/// unattributable, and uncorrelated siblings on every signal alike.
+fn attribute_cards<'record>(
+    records: impl IntoIterator<Item = &'record mut Vec<KeyValue>>,
+    cards: [Option<&str>; 3],
+) {
+    for (attributes, card) in records.into_iter().zip(cards) {
         if let Some(card) = card {
-            span.attributes
-                .push(support::string_attribute("wyrd.card_uid", card));
+            attributes.push(support::string_attribute("wyrd.card_uid", card));
         }
     }
+}
+
+/// Builds the negative trace export with each span naming its own `card_uid`.
+///
+/// # Panics
+///
+/// Panics when the negative trace fixture has no first resource or no first
+/// scope to attribute.
+fn card_attributed_resource_spans(anchor: i64, cards: [Option<&str>; 3]) -> Vec<ResourceSpans> {
+    let mut resource_spans = negative_resource_spans(anchor, &[]);
+    attribute_cards(
+        resource_spans[0].scope_spans[0]
+            .spans
+            .iter_mut()
+            .map(|span| &mut span.attributes),
+        cards,
+    );
     resource_spans
+}
+
+/// Builds the negative log export with each record naming its own `card_uid`.
+///
+/// # Panics
+///
+/// Panics when the negative log fixture has no first resource or no first
+/// scope to attribute.
+fn card_attributed_resource_logs(anchor: i64, cards: [Option<&str>; 3]) -> Vec<ResourceLogs> {
+    let mut resource_logs = negative_resource_logs(anchor, &[]);
+    attribute_cards(
+        resource_logs[0].scope_logs[0]
+            .log_records
+            .iter_mut()
+            .map(|record| &mut record.attributes),
+        cards,
+    );
+    resource_logs
+}
+
+/// Builds the negative metric export with each point naming its own `card_uid`.
+///
+/// # Panics
+///
+/// Panics when a negative metric is not the single-point gauge or sum the
+/// fixture defines.
+fn card_attributed_resource_metrics(anchor: i64, cards: [Option<&str>; 3]) -> Vec<ResourceMetrics> {
+    let mut resource_metrics = negative_resource_metrics(anchor, &[]);
+    attribute_cards(
+        resource_metrics[0].scope_metrics[0]
+            .metrics
+            .iter_mut()
+            .map(|metric| match &mut metric.data {
+                Some(metric::Data::Gauge(gauge)) => &mut gauge.data_points[0].attributes,
+                Some(metric::Data::Sum(sum)) => &mut sum.data_points[0].attributes,
+                other => panic!("a negative metric is a single-point gauge or sum: {other:?}"),
+            }),
+        cards,
+    );
+    resource_metrics
 }
 
 /// Reads the sorted `discriminator` markers of one query.
@@ -272,20 +330,24 @@ mod pg_tests {
     use wyrd_tonic::otlp::metrics_service::{
         ExportMetricsServiceRequest, ExportMetricsServiceResponse,
     };
-    use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+    use wyrd_tonic::otlp::trace_service::{ExportTraceServiceRequest, ExportTraceServiceResponse};
     use wyrd_tonic::prost::Message as _;
 
     use super::super::support::{self, LOGS_TABLE, METRICS_TABLE, OtlpJourney, SPANS_TABLE};
     use super::super::trace_export::export_traces_over_grpc;
-    use super::super::trace_export::export_traces_over_grpc_as;
-    use super::super::trace_export_http::{HttpEncoding, post_otlp, post_otlp_raw};
+    use super::super::trace_export::{export_traces_over_grpc_as, export_traces_over_grpc_with};
+    use super::super::trace_export_http::{
+        HttpEncoding, post_otlp, post_otlp_raw, post_otlp_with_headers,
+    };
     use super::{
         ATTRIBUTION_RUN, FAN_OUT_TRACE_SCOPE, GROUPING_TRACE_SCOPE, LOG_MARKERS, LOG_REJECTION,
         METRIC_REJECTION, NEGATIVE_LOG_SCOPE, NEGATIVE_METRIC_SCOPE, NEGATIVE_TRACE_SCOPE,
-        SPAN_MARKERS, SPAN_REJECTION, card_attributed_resource_spans, correlated_resource_spans,
-        fan_out_resource_spans, negative_resource_logs, negative_resource_metrics,
-        negative_resource_spans, scoped_resource_spans, sorted_markers,
+        SPAN_MARKERS, SPAN_REJECTION, card_attributed_resource_logs,
+        card_attributed_resource_metrics, card_attributed_resource_spans,
+        correlated_resource_spans, fan_out_resource_spans, negative_resource_logs,
+        negative_resource_metrics, negative_resource_spans, scoped_resource_spans, sorted_markers,
     };
+    use wyrd_testing::Bootstrap;
 
     /// A mixed request commits its complete siblings and reports exactly one.
     ///
@@ -579,8 +641,9 @@ mod pg_tests {
     /// as: the journey's own principal over gRPC twice and OTLP/HTTP once (the
     /// at-least-once replay, across transports); a second authorized principal
     /// in the same tenant; the first principal again under a different
-    /// accepted `wyrd.run_id`; and two actors each delegated by the first
-    /// principal, each replaying over both transports. Every replay must
+    /// accepted `wyrd.run_id`; and two actors, each under its own Card as the
+    /// workload root a delegated actor must select, delegated by the first
+    /// principal and each replaying over both transports. Every replay must
     /// converge on one fence and store one row set, while every distinct
     /// publisher pair or run correlation must reach its own fence and store its
     /// own rows with its own `sub_principal_id`, `act_principal_id`, and
@@ -628,24 +691,28 @@ mod pg_tests {
         }
         export_over_http(journey.token()).await;
 
-        let second = journey
-            .token_with_permissions(
-                "otlp_attribution_writer",
-                &[Permission::bifrost_record_write()],
-            )
-            .await;
-        export_traces_over_grpc_as(&journey, &second, negative_resource_spans(anchor, &[])).await;
+        let server = journey.server();
+        let mut actors = Vec::new();
+        for name in ["otlp_attribution_writer", "otlp_attribution_actor"] {
+            let api_key = journey
+                .api_key_with_permissions(name, &[Permission::bifrost_record_write()])
+                .await;
+            let rootless = server
+                .exchange_api_key(&api_key)
+                .await
+                .expect("the actor exchanges its API key for a bearer");
+            let rooted = server
+                .exchange_api_key_for_workload(&api_key, &registered_uid(server, name).await)
+                .await
+                .expect("the actor selects its own Card as the workload root");
+            actors.push((rootless, rooted));
+        }
+        let second = &actors[0].0;
+        export_traces_over_grpc_as(&journey, second, negative_resource_spans(anchor, &[])).await;
         export_traces_over_grpc(&journey, correlated_resource_spans(anchor)).await;
 
-        let third = journey
-            .token_with_permissions(
-                "otlp_attribution_actor",
-                &[Permission::bifrost_record_write()],
-            )
-            .await;
-        for actor in [&second, &third] {
-            let delegated = journey
-                .server()
+        for (_, actor) in &actors {
+            let delegated = server
                 .delegate(journey.token(), actor, TokenAudience::Wyrd)
                 .await
                 .expect("the journey principal delegates to the actor");
@@ -762,14 +829,10 @@ mod pg_tests {
             .card_ref()
             .expect("a bootstrapped Service is bound to its Card")
             .clone();
-        let uid: uuid::Uuid = sqlx::query_scalar(
-            "SELECT card_uid FROM wyrd.cards WHERE kind = 'Service' AND name = $1",
-        )
-        .bind(observed.name.as_str())
-        .fetch_one(&server.pg_fixture().superuser_pool().expect("registry pool"))
-        .await
-        .expect("the observed Service is registered");
-        let uid = uid.to_string();
+        let uid = registered_uid(server, observed.name.as_str())
+            .await
+            .as_str()
+            .to_owned();
         let never_registered = uuid::Uuid::now_v7().to_string();
         let admin = server
             .exchange_api_key(&server.tenant_admin_key().await.expect("tenant admin key"))
@@ -819,6 +882,453 @@ mod pg_tests {
         );
 
         journey.shutdown().await;
+    }
+
+    /// The Card-scope rejection reason a rooted caller's foreign Card gets.
+    const CARD_SCOPE_REJECTION: &str = "wyrd.card_uid is outside the principal's Card scope";
+
+    /// An optional workload root narrows ingest without replacing authentication.
+    ///
+    /// Every export goes to traces, logs, and metrics over OTLP/HTTP, and the
+    /// selector cases also go to traces over OTLP/gRPC. A rootless User and a
+    /// rootless unrestricted Service each store generic telemetry under no
+    /// Card. A caller without the write grant is refused even with a usable
+    /// root. A rootless family Service stores generic telemetry, but naming
+    /// a Card refuses the whole request until it selects a root. With
+    /// `x-wyrd-workload-uid` its bearer resolves the family's root, so a
+    /// record naming that root keeps it and a record naming a foreign Card is
+    /// rejected alone. An unknown root and a foreign family's root are refused
+    /// with one public error. A bearer signed for the root accepts the equal
+    /// selector and refuses a different one, and a direct API key with the
+    /// selector resolves the same root. The rooted exports all name one
+    /// publisher and one accepted row set, so the fence stores them once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture cannot be provisioned, when an export is accepted
+    /// or refused other than expected, or when the stored rows, their
+    /// publishers, or their Card UIDs differ from the expectation.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn optional_workload_context_preserves_authentication() {
+        let journey = OtlpJourney::start().await;
+        let anchor = support::anchor_nanos();
+        let server = journey.server();
+        server
+            .seed_role(
+                "otlp_workload_writer",
+                &[Permission::bifrost_record_write()],
+            )
+            .await
+            .expect("the writer role is seeded");
+        let observed = server
+            .bootstrap_service("otlp-workload-observed", &["viewer"])
+            .await
+            .expect("the observed Service registers");
+        let observed = observed
+            .card_ref()
+            .expect("a bootstrapped Service is bound to its Card");
+        server
+            .bootstrap_service("otlp-workload-foreign", &["viewer"])
+            .await
+            .expect("the foreign Service registers");
+        let root = registered_uid(server, observed.name.as_str()).await;
+        let foreign = registered_uid(server, "otlp-workload-foreign").await;
+        let unknown = wyrd_spec::ids::CardUid::from_uuid(uuid::Uuid::now_v7())
+            .expect("a fresh UUIDv7 is a Card UID");
+        let family = server
+            .credential_registered_service(observed, &["otlp_workload_writer"])
+            .await
+            .expect("the observed family's runtime account is credentialed");
+        let family_key = family
+            .api_key()
+            .expect("the family account carries an API key");
+        let family_bearer = bearer(
+            &server
+                .exchange_api_key(family_key)
+                .await
+                .expect("the family account exchanges without a root"),
+        );
+        let rooted_bearer = bearer(
+            &server
+                .exchange_api_key_for_workload(family_key, &root)
+                .await
+                .expect("the family account exchanges for its root"),
+        );
+        let unrestricted = server
+            .bootstrap_service("otlp-workload-unrestricted", &["otlp_workload_writer"])
+            .await
+            .expect("the unrestricted Service bootstraps");
+        let unrestricted_bearer = bearer(
+            &server
+                .exchange_api_key(
+                    unrestricted
+                        .api_key()
+                        .expect("the unrestricted Service carries an API key"),
+                )
+                .await
+                .expect("the unrestricted Service exchanges without a root"),
+        );
+        let user = server
+            .bootstrap_user("otlp-workload-user", &["admin"])
+            .await
+            .expect("the rootless User bootstraps");
+        let Bootstrap::User { jwt, .. } = &user else {
+            panic!("bootstrap_user returns a User");
+        };
+        let user_bearer = bearer(jwt);
+        let reader_bearer = bearer(
+            &journey
+                .token_with_permissions("otlp_workload_reader", &[Permission::bifrost_query_read()])
+                .await,
+        );
+        let api_key = secrecy::ExposeSecret::expose_secret(family_key);
+        let (root, foreign, unknown) = (root.as_str(), foreign.as_str(), unknown.as_str());
+        let generic = [None; 3];
+        let rooted = [Some(root), Some(foreign), Some(root)];
+        let token = "x-wyrd-access-token";
+        let selector = wyrd_spec::auth::WORKLOAD_UID_HEADER;
+
+        for headers in [
+            [(token, user_bearer.as_str())],
+            [(token, unrestricted_bearer.as_str())],
+        ] {
+            export_everywhere(&journey, anchor, generic, &headers, Ok((0, ""))).await;
+        }
+        export_everywhere(
+            &journey,
+            anchor,
+            rooted,
+            &[(token, reader_bearer.as_str()), (selector, root)],
+            Err((StatusCode::FORBIDDEN, "WYRD_PERMISSION_403_DENIED_RBAC")),
+        )
+        .await;
+        export_everywhere(
+            &journey,
+            anchor,
+            generic,
+            &[(token, family_bearer.as_str())],
+            Ok((0, "")),
+        )
+        .await;
+        export_everywhere(
+            &journey,
+            anchor,
+            [Some(root), None, None],
+            &[(token, family_bearer.as_str())],
+            Err((
+                StatusCode::FORBIDDEN,
+                "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED",
+            )),
+        )
+        .await;
+        for refused in [unknown, foreign] {
+            export_everywhere(
+                &journey,
+                anchor,
+                rooted,
+                &[(token, family_bearer.as_str()), (selector, refused)],
+                Err((
+                    StatusCode::UNAUTHORIZED,
+                    "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
+                )),
+            )
+            .await;
+        }
+        export_everywhere(
+            &journey,
+            anchor,
+            rooted,
+            &[(token, rooted_bearer.as_str()), (selector, foreign)],
+            Err((
+                StatusCode::BAD_REQUEST,
+                "WYRD_AUTH_400_SIGNED_WORKLOAD_MISMATCH",
+            )),
+        )
+        .await;
+        for headers in [
+            [(token, family_bearer.as_str()), (selector, root)],
+            [(token, rooted_bearer.as_str()), (selector, root)],
+            [("x-wyrd-api-key", api_key), (selector, root)],
+        ] {
+            export_everywhere(
+                &journey,
+                anchor,
+                rooted,
+                &headers,
+                Ok((1, CARD_SCOPE_REJECTION)),
+            )
+            .await;
+        }
+
+        journey.publish().await;
+        for signal in Signal::ALL {
+            let [first, second, last] = signal.markers().map(str::to_owned);
+            let mut generic: Vec<(String, Option<String>)> = [&first, &second, &last]
+                .map(|marker| (marker.clone(), None))
+                .to_vec();
+            generic.sort_unstable();
+            let mut family_rows = generic.clone();
+            family_rows.extend([first, last].map(|marker| (marker, Some(root.to_owned()))));
+            family_rows.sort_unstable();
+            assert_eq!(
+                stored_attribution(&journey, signal).await,
+                BTreeMap::from([
+                    (user.id().to_string(), generic.clone()),
+                    (unrestricted.id().to_string(), generic),
+                    (family.id().to_string(), family_rows),
+                ]),
+                "{signal:?} stores each accepted record once under its publisher and Card"
+            );
+        }
+
+        journey.shutdown().await;
+    }
+
+    /// Formats `token` as the bearer value an exporter sends.
+    fn bearer(token: &str) -> String {
+        format!("Bearer {token}")
+    }
+
+    /// Reads the registry UID of the registered Service Card named `name`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the registry cannot be read or `card` is not registered.
+    async fn registered_uid(
+        server: &wyrd_testing::WyrdTestServer,
+        name: &str,
+    ) -> wyrd_spec::ids::CardUid {
+        let uid: uuid::Uuid = sqlx::query_scalar(
+            "SELECT card_uid FROM wyrd.cards WHERE kind = 'Service' AND name = $1",
+        )
+        .bind(name)
+        .fetch_one(&server.pg_fixture().superuser_pool().expect("registry pool"))
+        .await
+        .expect("the Card is registered");
+        wyrd_spec::ids::CardUid::from_uuid(uid).expect("a registry UID is a Card UID")
+    }
+
+    /// One OTLP signal a workload-context case exports and reads back.
+    #[derive(Clone, Copy, Debug)]
+    enum Signal {
+        /// `vala.traces.spans`, the only signal also exported over gRPC here.
+        Traces,
+        /// `vala.logs.records`.
+        Logs,
+        /// `vala.metrics.points`.
+        Metrics,
+    }
+
+    impl Signal {
+        /// Every signal, in the order a case exports them.
+        const ALL: [Self; 3] = [Self::Traces, Self::Logs, Self::Metrics];
+
+        /// The OTLP/HTTP route the signal is posted to.
+        const fn path(self) -> &'static str {
+            match self {
+                Self::Traces => "/v1/traces",
+                Self::Logs => "/v1/logs",
+                Self::Metrics => "/v1/metrics",
+            }
+        }
+
+        /// The table, scope, and marker column the signal's rows are read by.
+        const fn ledger(self) -> (&'static str, &'static str, &'static str) {
+            match self {
+                Self::Traces => (SPANS_TABLE, NEGATIVE_TRACE_SCOPE, "trace_state"),
+                Self::Logs => (LOGS_TABLE, NEGATIVE_LOG_SCOPE, "event_name"),
+                Self::Metrics => (METRICS_TABLE, NEGATIVE_METRIC_SCOPE, "metric_name"),
+            }
+        }
+
+        /// The marker each export position is stored under.
+        const fn markers(self) -> [&'static str; 3] {
+            match self {
+                Self::Traces => SPAN_MARKERS,
+                Self::Logs => LOG_MARKERS,
+                Self::Metrics => [
+                    support::GAUGE_INT_METRIC,
+                    support::GAUGE_DOUBLE_METRIC,
+                    support::SUM_INT_METRIC,
+                ],
+            }
+        }
+
+        /// The protobuf export whose `i`th record names `cards[i]`.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the signal's card-attributed fixture builder panics: a
+        /// fixture without a first resource or scope, or a metric that is not
+        /// the single-point gauge or sum the fixture defines.
+        fn body(self, anchor: i64, cards: [Option<&str>; 3]) -> Vec<u8> {
+            match self {
+                Self::Traces => ExportTraceServiceRequest {
+                    resource_spans: card_attributed_resource_spans(anchor, cards),
+                }
+                .encode_to_vec(),
+                Self::Logs => ExportLogsServiceRequest {
+                    resource_logs: card_attributed_resource_logs(anchor, cards),
+                }
+                .encode_to_vec(),
+                Self::Metrics => ExportMetricsServiceRequest {
+                    resource_metrics: card_attributed_resource_metrics(anchor, cards),
+                }
+                .encode_to_vec(),
+            }
+        }
+
+        /// The rejected count and first reason of one accepted protobuf answer.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `body` does not decode as the signal's protobuf export
+        /// response.
+        fn rejected(self, body: &[u8]) -> (i64, String) {
+            let encoding = HttpEncoding::Protobuf;
+            match self {
+                Self::Traces => encoding
+                    .decode::<ExportTraceServiceResponse>(body)
+                    .partial_success
+                    .map(|partial| (partial.rejected_spans, partial.error_message)),
+                Self::Logs => encoding
+                    .decode::<ExportLogsServiceResponse>(body)
+                    .partial_success
+                    .map(|partial| (partial.rejected_log_records, partial.error_message)),
+                Self::Metrics => encoding
+                    .decode::<ExportMetricsServiceResponse>(body)
+                    .partial_success
+                    .map(|partial| (partial.rejected_data_points, partial.error_message)),
+            }
+            .unwrap_or_default()
+        }
+    }
+
+    /// Exports `cards` on every signal under `headers` and asserts `expected`.
+    ///
+    /// `Ok((rejected, reason))` is an accepted export reporting exactly that
+    /// partial success; `Err((status, code))` is a whole-request refusal with
+    /// that public error. Every signal goes over OTLP/HTTP protobuf, and a
+    /// selector case also sends traces over OTLP/gRPC so the selector is
+    /// proven on both transports.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any transport answers other than `expected`.
+    async fn export_everywhere(
+        journey: &OtlpJourney,
+        anchor: i64,
+        cards: [Option<&str>; 3],
+        headers: &[(&'static str, &str)],
+        expected: Result<(i64, &str), (StatusCode, &str)>,
+    ) {
+        for signal in Signal::ALL {
+            let (status, body) = post_otlp_with_headers(
+                journey,
+                signal.path(),
+                HttpEncoding::Protobuf,
+                signal.body(anchor, cards),
+                headers,
+            )
+            .await;
+            match expected {
+                Ok((rejected, reason)) => {
+                    assert!(
+                        status.is_success(),
+                        "{signal:?} over HTTP is accepted ({status}): {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                    assert_eq!(
+                        signal.rejected(&body),
+                        (rejected, reason.to_owned()),
+                        "{signal:?} over HTTP reports the exact partial success"
+                    );
+                }
+                Err((expected_status, code)) => {
+                    assert_refusal(status, &body, expected_status, code);
+                }
+            }
+        }
+        if !headers
+            .iter()
+            .any(|(name, _)| *name == wyrd_spec::auth::WORKLOAD_UID_HEADER)
+        {
+            return;
+        }
+        let answer = export_traces_over_grpc_with(
+            journey,
+            headers,
+            card_attributed_resource_spans(anchor, cards),
+        )
+        .await;
+        match (expected, answer) {
+            (Ok((rejected, reason)), Ok(partial)) => {
+                let partial = partial.unwrap_or_default();
+                assert_eq!(
+                    (partial.rejected_spans, partial.error_message.as_str()),
+                    (rejected, reason),
+                    "traces over gRPC report the exact partial success"
+                );
+            }
+            (Err((_, code)), Err(status)) => {
+                let problem: serde_json::Value = serde_json::from_slice(
+                    status
+                        .metadata()
+                        .get_bin(wyrd_tonic::error::WYRD_ERROR_HEADER)
+                        .expect("a public gRPC refusal carries its problem document")
+                        .to_bytes()
+                        .expect("the problem document is valid base64")
+                        .as_ref(),
+                )
+                .expect("the problem document is JSON");
+                assert_eq!(
+                    problem.get("code").and_then(serde_json::Value::as_str),
+                    Some(code),
+                    "the gRPC refusal keeps its public error code: {status:?}"
+                );
+            }
+            (expected, answer) => {
+                panic!("traces over gRPC answered {answer:?}, expected {expected:?}")
+            }
+        }
+    }
+
+    /// Reads `signal`'s stored rows as sorted (marker, Card UID) per publisher.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the query fails or a column is not the canonical type.
+    async fn stored_attribution(
+        journey: &OtlpJourney,
+        signal: Signal,
+    ) -> BTreeMap<String, Vec<(String, Option<String>)>> {
+        let (table, scope, marker) = signal.ledger();
+        let rows = journey
+            .query(&format!(
+                "SELECT {marker}, sub_principal_id, card_uid FROM {table} \
+                 WHERE scope_name = '{scope}'"
+            ))
+            .await;
+        let mut stored: BTreeMap<String, Vec<(String, Option<String>)>> = BTreeMap::new();
+        for batch in &rows {
+            let markers = support::column::<StringArray>(batch, marker);
+            let publishers = support::column::<StringArray>(batch, "sub_principal_id");
+            let cards = support::column::<StringArray>(batch, "card_uid");
+            for index in 0..batch.num_rows() {
+                stored
+                    .entry(publishers.value(index).to_owned())
+                    .or_default()
+                    .push((
+                        markers.value(index).to_owned(),
+                        (!cards.is_null(index)).then(|| cards.value(index).to_owned()),
+                    ));
+            }
+        }
+        for rows in stored.values_mut() {
+            rows.sort_unstable();
+        }
+        stored
     }
 
     /// Asserts the sorted stored markers are exactly `accepted`, once each.
@@ -1075,7 +1585,25 @@ mod pg_tests {
     ) {
         let (status, response) =
             post_otlp_raw(journey, path, encoding, body, token.as_deref()).await;
-        let text = String::from_utf8_lossy(&response);
+        assert_refusal(status, &response, expected_status, expected_code);
+    }
+
+    /// Asserts one collector answer is the whole-request refusal it names.
+    ///
+    /// `code` is empty when the refusal is owned by the transport's own
+    /// authentication shell rather than by the public error catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the answer has a different status or public error code, or
+    /// carries a partial success.
+    fn assert_refusal(
+        status: StatusCode,
+        response: &[u8],
+        expected_status: StatusCode,
+        expected_code: &str,
+    ) {
+        let text = String::from_utf8_lossy(response);
         assert_eq!(
             status, expected_status,
             "the collector refuses the whole request: {text}"
@@ -1085,7 +1613,7 @@ mod pg_tests {
             "a whole-request refusal carries no partial success: {text}"
         );
         if !expected_code.is_empty() {
-            let problem: serde_json::Value = serde_json::from_slice(&response)
+            let problem: serde_json::Value = serde_json::from_slice(response)
                 .expect("a public refusal answers with the problem document");
             assert_eq!(
                 problem.get("code").and_then(serde_json::Value::as_str),

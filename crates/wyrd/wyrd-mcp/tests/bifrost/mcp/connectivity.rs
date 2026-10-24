@@ -143,13 +143,25 @@ pub(crate) fn transport_with_headers(
         .base_url()
         .ok_or("journey requires a bound test server")?
         .to_owned();
+    Ok(client_transport(
+        &base_url,
+        &client(server, credential)?,
+        headers,
+    ))
+}
+
+/// Build the MCP client transport over an already configured `client`, such
+/// as one [`WyrdClient::for_workload`] bound to an exact root, at the
+/// server's `base_url`.
+pub(crate) fn client_transport(
+    base_url: &str,
+    client: &WyrdClient,
+    headers: impl IntoIterator<Item = (HeaderName, HeaderValue)>,
+) -> StreamableHttpClientTransport<WyrdMcpHttpClient> {
     let mut transport_config =
         StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp"));
     transport_config.custom_headers.extend(headers);
-    Ok(StreamableHttpClientTransport::with_client(
-        WyrdMcpHttpClient::new(&client(server, credential)?),
-        transport_config,
-    ))
+    StreamableHttpClientTransport::with_client(WyrdMcpHttpClient::new(client), transport_config)
 }
 
 /// Build the first-party tenant principal handle for `server` using `credential`.
@@ -236,9 +248,7 @@ mod pg_tests {
         let subject_jwt = server
             .exchange_api_key(subject.api_key().ok_or("service bootstrap carries a key")?)
             .await?;
-        let actor_jwt = server
-            .exchange_api_key(actor.api_key().ok_or("service bootstrap carries a key")?)
-            .await?;
+        let actor_jwt = server.exchange_rooted(&actor).await?;
         let delegated_jwt = server
             .delegate(&subject_jwt, &actor_jwt, TokenAudience::Wyrd)
             .await?;
@@ -277,6 +287,7 @@ mod pg_tests {
                 "gateway.get_provider_deployment",
                 "wyrd.guide",
                 "principals.revoke_credential",
+                "principals.set_workload_restriction",
                 "verification.evidence",
                 "verification.execute",
                 "verification.enqueue",

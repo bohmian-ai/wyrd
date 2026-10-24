@@ -42,7 +42,7 @@ use wyrd_spec::auth::{
     TokenAudience, TokenRequest, TokenResponse, TokenType,
 };
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::TenantSlug;
+use wyrd_spec::ids::{CardUid, TenantSlug};
 use wyrd_spec::operator_connection::HttpsOrigin;
 
 use crate::config::{ClientConfig, TokenCacheMode};
@@ -318,6 +318,7 @@ impl TokenExchange {
                 actor_token: None,
                 actor_token_type: None,
                 audience: None,
+                workload_uid: None,
             },
         )
         .await
@@ -593,14 +594,19 @@ fn decode_failure(error: &serde_json::Error) -> AuthError {
 
 /// The catalog error for an RFC 6749 §5.2 / RFC 8628 §3.5 refusal.
 ///
-/// The device-flow codes become [`WyrdError::DeviceAuthorization`] carrying
-/// the code in `details.error`, so a poller can keep polling; the rest map to
-/// the nearest catalog error with the server's description as its message.
+/// A refusal carrying its Wyrd `code` extension member is that catalog error.
+/// Otherwise the device-flow codes become [`WyrdError::DeviceAuthorization`]
+/// carrying the code in `details.error`, so a poller can keep polling; the
+/// rest map to the nearest catalog error. Every error keeps the OAuth code in
+/// `details.error` and the server's description as its message.
 fn oauth_error(error: OAuthErrorResponse) -> WyrdError {
     let message = error
         .error_description
         .unwrap_or_else(|| "the authorization server refused the request".to_owned());
     let details = serde_json::json!({ "error": error.error });
+    if let Some(code) = error.code {
+        return crate::error::code_to_wyrd_error(&code, message, details);
+    }
     match error.error {
         OAuthErrorCode::AuthorizationPending
         | OAuthErrorCode::SlowDown
@@ -655,6 +661,19 @@ pub struct AuthMiddleware {
     /// Set once the first short-TTL token is observed, so the operational
     /// warning fires at most once per middleware instance (see [`Self::exchange`]).
     short_ttl_warned: AtomicBool,
+    /// The exact Service root this middleware's requests run as, or
+    /// `None` for rootless work. An exchanged credential requests it in the
+    /// grant; every request also carries it on [`WORKLOAD_UID_HEADER`]. Fixed
+    /// for the middleware's lifetime, so its one cache never mixes contexts.
+    ///
+    /// [`WORKLOAD_UID_HEADER`]: wyrd_spec::auth::WORKLOAD_UID_HEADER
+    workload_uid: Option<CardUid>,
+    /// The configured deployment environment every request carries on
+    /// [`DEPLOYMENT_ENVIRONMENT_HEADER`], or `None` when unknown. Descriptive
+    /// context only: it never enters a grant, so renewal cannot change it.
+    ///
+    /// [`DEPLOYMENT_ENVIRONMENT_HEADER`]: wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER
+    deployment_environment: Option<String>,
 }
 
 impl Debug for AuthMiddleware {
@@ -668,6 +687,8 @@ impl Debug for AuthMiddleware {
             .field("credential", &self.credential)
             .field("http_base_url", &self.exchange.origin)
             .field("credentials", &self.credentials)
+            .field("workload_uid", &self.workload_uid)
+            .field("deployment_environment", &self.deployment_environment)
             .finish_non_exhaustive()
     }
 }
@@ -680,15 +701,20 @@ impl AuthMiddleware {
     /// `credentials.toml` beside that same API key is loaded as the initial
     /// cache, so the token survives process restarts.
     ///
+    /// A non-empty `WYRD_WORKLOAD_UID` in [`ClientConfig::environment`] binds
+    /// the middleware to that exact root, as [`Self::for_workload`] does; a
+    /// rooted middleware caches in memory only.
+    ///
     /// # Arguments
     /// * `config` - Client configuration supplying the HTTP base URL, timeout, token-cache
     ///   mode, and environment.
     /// * `credential` - Resolved credential this middleware exchanges or presents.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
-    /// already owns the process or the underlying Reqwest client cannot be
-    /// constructed.
+    /// Returns [`WyrdClientError::Config`] when `WYRD_WORKLOAD_UID` is not a
+    /// UUIDv7, and [`WyrdClientError::TransportDown`] when another Rustls
+    /// provider already owns the process or the underlying Reqwest client
+    /// cannot be constructed.
     pub fn new(
         config: &ClientConfig,
         credential: ResolvedCredential,
@@ -708,9 +734,7 @@ impl AuthMiddleware {
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
-    /// already owns the process or the authentication HTTP client cannot be
-    /// built.
+    /// The errors of [`Self::new`].
     fn build(
         config: &ClientConfig,
         credential: ResolvedCredential,
@@ -718,6 +742,20 @@ impl AuthMiddleware {
     ) -> Result<Arc<Self>, WyrdClientError> {
         let exchange = TokenExchange::new(&config.http.base_url, config.http.timeout_ms)?;
         let exchange_timeout = Duration::from_millis(config.http.timeout_ms);
+        // ponytail: the disk cache holds one token per API key, so only rootless
+        // work uses it; a rooted token is re-exchanged once per process. Key the
+        // file entry by root if that exchange shows up in startup latency.
+        let workload_uid = config
+            .environment
+            .var("WYRD_WORKLOAD_UID")
+            .map(|uid| {
+                CardUid::new(uid).map_err(|error| WyrdClientError::Config {
+                    field: "WYRD_WORKLOAD_UID".to_owned(),
+                    reason: error.to_string(),
+                })
+            })
+            .transpose()?;
+        let credentials = credentials.filter(|_| workload_uid.is_none());
 
         let initial = match (&credentials, &credential) {
             (Some(file), ResolvedCredential::ApiKey(api_key)) => file
@@ -738,6 +776,8 @@ impl AuthMiddleware {
             pending_mint: Mutex::new(None),
             credentials,
             short_ttl_warned: AtomicBool::new(false),
+            workload_uid,
+            deployment_environment: None,
         }))
     }
 
@@ -785,7 +825,93 @@ impl AuthMiddleware {
             pending_mint: Mutex::new(None),
             credentials: None,
             short_ttl_warned: AtomicBool::new(false),
+            workload_uid: None,
+            deployment_environment: None,
         })
+    }
+
+    /// Derive a middleware whose requests run as the exact Service
+    /// root `uid`.
+    ///
+    /// The derived middleware shares this one's `/auth` connection pool and
+    /// credential but starts with its own empty in-memory cache, so rootless,
+    /// R1, and R2 tokens never collide; it never reads or writes the disk
+    /// cache. An exchanged credential requests `uid` in its grant and renewal
+    /// keeps it; every request carries it on
+    /// [`WORKLOAD_UID_HEADER`](wyrd_spec::auth::WORKLOAD_UID_HEADER), which
+    /// selects context for a bearer presented as-is. A delegated middleware
+    /// rebinds its actor, which does the work, to `uid`. No network call is
+    /// made here; the server validates the root on first use.
+    ///
+    /// # Arguments
+    /// * `uid` - Exact Service Card UID the derived middleware runs as.
+    #[must_use]
+    pub fn for_workload(self: &Arc<Self>, uid: CardUid) -> Arc<Self> {
+        self.for_service(uid, self.deployment_environment.clone())
+    }
+
+    /// Derive a middleware whose requests run as the exact Service root
+    /// `uid` in `deployment_environment`, as [`Self::for_workload`] does.
+    ///
+    /// The environment rides beside the root on every request and never
+    /// enters the grant, so the derived token cache is the root's alone.
+    ///
+    /// # Arguments
+    /// * `uid` - Exact Service Card UID the derived middleware runs as.
+    /// * `deployment_environment` - The non-empty configured environment, or
+    ///   `None` when unknown.
+    #[must_use]
+    pub fn for_service(
+        self: &Arc<Self>,
+        uid: CardUid,
+        deployment_environment: Option<String>,
+    ) -> Arc<Self> {
+        let (credential, workload_uid) = match &self.credential {
+            ResolvedCredential::Delegated {
+                subject_token,
+                audience,
+                actor,
+            } => (
+                ResolvedCredential::Delegated {
+                    subject_token: subject_token.clone(),
+                    audience: *audience,
+                    actor: actor.for_workload(uid),
+                },
+                None,
+            ),
+            credential => (credential.clone(), Some(uid)),
+        };
+        Arc::new(Self {
+            credential,
+            exchange: self.exchange.clone(),
+            exchange_timeout: self.exchange_timeout,
+            cache: Mutex::new(None),
+            pending_mint: Mutex::new(None),
+            credentials: None,
+            short_ttl_warned: AtomicBool::new(false),
+            workload_uid,
+            deployment_environment,
+        })
+    }
+
+    /// The configured deployment environment requests carry on
+    /// [`DEPLOYMENT_ENVIRONMENT_HEADER`](wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER),
+    /// or `None` when unknown.
+    #[must_use]
+    pub fn deployment_environment(&self) -> Option<&str> {
+        self.deployment_environment.as_deref()
+    }
+
+    /// The exact root this middleware's requests run as, or `None` for
+    /// rootless work.
+    ///
+    /// Transports send it on
+    /// [`WORKLOAD_UID_HEADER`](wyrd_spec::auth::WORKLOAD_UID_HEADER) beside
+    /// every bearer, and the Bifrost `ClientScope` keys its producer pool on
+    /// it.
+    #[must_use]
+    pub fn workload_uid(&self) -> Option<&CardUid> {
+        self.workload_uid.as_ref()
     }
 
     /// The credential this middleware authenticates with.
@@ -1038,7 +1164,12 @@ impl AuthMiddleware {
         id
     }
 
-    /// Exchange the API key for an access token at `/auth/token`.
+    /// Exchange the API key for an access token at `/auth/token`, requesting
+    /// this middleware's workload root when it has one.
+    ///
+    /// # Errors
+    /// Returns the [`AuthError`] the exchange produced: a transport failure, or
+    /// [`AuthError::Server`] carrying the server's refusal of the key.
     async fn exchange(&self, api_key: &SecretString) -> Result<CachedToken, AuthError> {
         let request = TokenRequest::TokenExchange {
             subject_token: SecretBearer::new(api_key.expose_secret().to_owned()),
@@ -1046,15 +1177,22 @@ impl AuthMiddleware {
             actor_token: None,
             actor_token_type: None,
             audience: None,
+            workload_uid: self.workload_uid.clone(),
         };
         self.post_token_request(request).await
     }
 
     /// Exchange the workload OIDC assertion for an access token at `/auth/token`
-    /// via the `jwt-bearer` grant.
+    /// via the `jwt-bearer` grant, requesting this middleware's workload root
+    /// when it has one.
     ///
     /// The tenant slug is validated client-side first: an invalid slug is a
     /// client-local [`WyrdClientError::Config`] surfaced before any network call.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Client`] wrapping [`WyrdClientError::Config`] when
+    /// `tenant` is not a valid tenant slug, and otherwise the exchange's
+    /// transport failure or [`AuthError::Server`] carrying the server's refusal.
     async fn exchange_workload(
         &self,
         jwt: &SecretString,
@@ -1069,6 +1207,7 @@ impl AuthMiddleware {
         let request = TokenRequest::JwtBearer {
             assertion: SecretBearer::new(jwt.expose_secret().to_owned()),
             tenant: Some(tenant),
+            workload_uid: self.workload_uid.clone(),
         };
         self.post_token_request(request).await
     }
@@ -1093,6 +1232,7 @@ impl AuthMiddleware {
             actor_token: Some(Box::pin(actor.bearer()).await?),
             actor_token_type: Some(ExchangeTokenType::AccessToken),
             audience: Some(audience),
+            workload_uid: None,
         };
         self.post_token_request(request).await
     }
@@ -1172,10 +1312,11 @@ fn transport_down(err: reqwest::Error) -> AuthError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1185,11 +1326,12 @@ mod tests {
     use super::{AuthError, AuthMiddleware, CachedToken, TokenExchange};
     use crate::config::{ClientConfig, TokenCacheMode};
     use crate::credentials_file::CredentialsFile;
+    use crate::environment::Environment;
     use crate::error::WyrdClientError;
     use crate::saved_login::{SavedLogin, SavedLogins};
     use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
     use wyrd_spec::auth::{SecretBearer, TokenRequest};
-    use wyrd_spec::ids::TenantSlug;
+    use wyrd_spec::ids::{CardUid, TenantSlug};
 
     struct MockServer {
         base_url: String,
@@ -1883,6 +2025,7 @@ mod tests {
                     &TokenRequest::JwtBearer {
                         assertion: SecretBearer::new("workload-secret".to_owned()),
                         tenant: None,
+                        workload_uid: None,
                     },
                 )
                 .await
@@ -1920,5 +2063,203 @@ mod tests {
             7,
             "minted request id must be UUIDv7"
         );
+    }
+
+    /// Answers `/auth/token` with a token named after the requested
+    /// `workload_uid` (`token-rootless` without one), or a
+    /// `WYRD_AUTH_401_WORKLOAD_UID_REFUSED` problem for `refused`, recording
+    /// every request body.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the loopback listener cannot bind or report its address, or
+    /// when the recorded-bodies lock is poisoned inside a connection task.
+    async fn spawn_workload_mock(refused: String) -> (MockServer, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let (hits_loop, bodies_loop) = (hits.clone(), bodies.clone());
+        let handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                hits_loop.fetch_add(1, Ordering::SeqCst);
+                let (refused, bodies) = (refused.clone(), bodies_loop.clone());
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    let body = loop {
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        request.extend_from_slice(&buf[..read]);
+                        let text = String::from_utf8_lossy(&request).into_owned();
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                            continue;
+                        };
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length || read == 0 {
+                            break body.to_owned();
+                        }
+                    };
+                    let root = body
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("workload_uid="))
+                        .map(str::to_owned);
+                    bodies.lock().expect("bodies lock").push(body);
+                    let (status_line, reply) = if root.as_deref() == Some(refused.as_str()) {
+                        (
+                            "HTTP/1.1 401 Unauthorized",
+                            serde_json::json!({
+                                "type": "about:blank",
+                                "title": "Workload root refused",
+                                "status": 401,
+                                "code": "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
+                                "detail": "the workload root is refused",
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        let name = root.unwrap_or_else(|| "rootless".to_owned());
+                        (
+                            "HTTP/1.1 200 OK",
+                            token_body(&format!("token-{name}"), 3600),
+                        )
+                    };
+                    let response = format!(
+                        "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                        reply.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        let mock = MockServer {
+            base_url: format!("http://{addr}"),
+            hits,
+            _handle: handle,
+        };
+        (mock, bodies)
+    }
+
+    /// Rootless, R1, and R2 middlewares over one credential each request their
+    /// own root, serve only their own cache, and never reuse or overwrite the
+    /// rootless disk token; `WYRD_WORKLOAD_UID` binds a root like
+    /// `for_workload`; renewal re-requests the root; and a refused root costs
+    /// exactly one exchange per call instead of a renewal loop.
+    ///
+    /// # Panics
+    /// Panics when contexts share a token, renewal drops the root, or a
+    /// refusal is retried.
+    #[tokio::test]
+    async fn renewal_and_caches_keep_workload_context_separate() {
+        let uid = || CardUid::from_uuid(Uuid::now_v7()).expect("v7");
+        let (r1, r2, refused) = (uid(), uid(), uid());
+        let (mock, bodies) = spawn_workload_mock(refused.as_str().to_owned()).await;
+        let hits = || mock.hits.load(Ordering::SeqCst);
+        let last_body = || {
+            bodies
+                .lock()
+                .expect("bodies lock")
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        };
+        let dir = credentials_dir();
+        let path = dir.path().join("credentials.toml");
+        let file = || Some(CredentialsFile::at(dir.path().to_path_buf()));
+        let disk = config_for(mock.base_url.clone(), TokenCacheMode::Disk);
+
+        let rootless = AuthMiddleware::new_with_credentials(&disk, api_key_credential(), file())
+            .expect("middleware builds");
+        assert_eq!(rootless.workload_uid(), None);
+        assert_eq!(
+            rootless.bearer().await.expect("rootless").expose(),
+            "token-rootless"
+        );
+        assert!(!last_body().contains("workload_uid"), "{}", last_body());
+
+        let mut rooted = config_for(mock.base_url.clone(), TokenCacheMode::Disk);
+        rooted.environment = Environment::Fixed(HashMap::from([(
+            "WYRD_WORKLOAD_UID".to_owned(),
+            r1.as_str().to_owned(),
+        )]));
+        let from_env = AuthMiddleware::new_with_credentials(&rooted, api_key_credential(), file())
+            .expect("middleware builds");
+        assert_eq!(from_env.workload_uid(), Some(&r1));
+        assert_eq!(
+            from_env.bearer().await.expect("R1").expose(),
+            format!("token-{}", r1.as_str()),
+            "a rooted middleware never reuses the rootless disk token"
+        );
+        let r2_auth = rootless.for_workload(r2.clone());
+        assert_eq!(
+            r2_auth.bearer().await.expect("R2").expose(),
+            format!("token-{}", r2.as_str())
+        );
+        assert_eq!(hits(), 3);
+
+        for (auth, expected) in [
+            (&rootless, "token-rootless".to_owned()),
+            (&from_env, format!("token-{}", r1.as_str())),
+            (&r2_auth, format!("token-{}", r2.as_str())),
+        ] {
+            assert_eq!(auth.bearer().await.expect("cached").expose(), expected);
+        }
+        assert_eq!(hits(), 3, "each context serves its own cache");
+        let contents = std::fs::read_to_string(&path).expect("read credentials");
+        assert!(
+            contents.contains("access_token = \"token-rootless\""),
+            "{contents}"
+        );
+        assert!(!contents.contains(r1.as_str()) && !contents.contains(r2.as_str()));
+
+        assert_eq!(
+            from_env.force_refresh().await.expect("renewal").expose(),
+            format!("token-{}", r1.as_str())
+        );
+        assert_eq!(hits(), 4);
+        assert!(last_body().contains(&format!("workload_uid={}", r1.as_str())));
+
+        let workload = AuthMiddleware::new(
+            &config_for(mock.base_url.clone(), TokenCacheMode::InMemory),
+            workload_jwt_credential("acme"),
+        )
+        .expect("middleware builds")
+        .for_workload(r2.clone());
+        assert_eq!(
+            workload.bearer().await.expect("jwt-bearer R2").expose(),
+            format!("token-{}", r2.as_str())
+        );
+        assert!(last_body().contains("jwt-bearer"), "{}", last_body());
+        assert!(last_body().contains(&format!("workload_uid={}", r2.as_str())));
+        assert_eq!(hits(), 5);
+
+        let denied = rootless.for_workload(refused);
+        for expected in [6, 7] {
+            let error = denied.bearer().await.expect_err("the root is refused");
+            assert_eq!(
+                error.into_wyrd().code(),
+                "WYRD_AUTH_401_WORKLOAD_UID_REFUSED"
+            );
+            assert_eq!(hits(), expected, "one refused exchange per call");
+        }
+        denied
+            .force_refresh()
+            .await
+            .expect_err("renewal is refused too");
+        assert_eq!(hits(), 8, "a refused renewal is not retried");
+        assert_eq!(
+            r2_auth.bearer().await.expect("unaffected").expose(),
+            format!("token-{}", r2.as_str())
+        );
+        assert_eq!(hits(), 8, "a refused root never evicts another context");
     }
 }

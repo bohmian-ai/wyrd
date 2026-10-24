@@ -81,14 +81,13 @@ fn batch(value: i64) -> RecordBatch {
 
 /// Build the tenant principal used by public-shaped append cases.
 fn principal(tenant: DataTenantId) -> Principal {
-    Principal {
-        id: PrincipalId::new(Uuid::now_v7()),
-        kind: PrincipalKind::User,
-        tenant_id: tenant,
-        roles: Vec::new(),
-        effective_permissions: PermissionSet::new(),
-        credential_id: None,
-    }
+    Principal::new(
+        PrincipalId::new(Uuid::now_v7()),
+        PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        PermissionSet::new(),
+    )
 }
 
 /// Build the projected metric batch this fixture drives.

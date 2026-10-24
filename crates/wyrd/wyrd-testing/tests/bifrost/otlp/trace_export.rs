@@ -53,24 +53,55 @@ pub(super) async fn export_traces_over_grpc_as(
     token: &str,
     resource_spans: Vec<wyrd_tonic::otlp::trace::v1::ResourceSpans>,
 ) -> Option<wyrd_tonic::otlp::trace_service::ExportTracePartialSuccess> {
+    export_traces_over_grpc_with(
+        journey,
+        &[("x-wyrd-access-token", &format!("Bearer {token}"))],
+        resource_spans,
+    )
+    .await
+    .expect("the collector accepts the trace export")
+}
+
+/// Sends one OTLP trace export under exactly `metadata` and returns the answer.
+///
+/// The credential and workload-selector journeys vary which authentication
+/// metadata an exporter sends and assert refusals as outcomes, so this form
+/// sends `metadata` verbatim and hands back the collector's status unjudged.
+///
+/// # Errors
+///
+/// Returns the collector's refusal status unchanged.
+///
+/// # Panics
+///
+/// Panics when the transport cannot be dialed or a metadata pair is not valid
+/// ASCII metadata.
+pub(super) async fn export_traces_over_grpc_with(
+    journey: &OtlpJourney,
+    metadata: &[(&'static str, &str)],
+    resource_spans: Vec<wyrd_tonic::otlp::trace::v1::ResourceSpans>,
+) -> Result<
+    Option<wyrd_tonic::otlp::trace_service::ExportTracePartialSuccess>,
+    wyrd_tonic::tonic::Status,
+> {
     let channel = Channel::from_shared(journey.grpc_url())
         .expect("the bound gRPC URL is a valid endpoint")
         .connect()
         .await
         .expect("the OTLP exporter dials the bound collector");
     let mut request = Request::new(ExportTraceServiceRequest { resource_spans });
-    request.metadata_mut().insert(
-        "x-wyrd-access-token",
-        format!("Bearer {token}")
-            .parse()
-            .expect("the minted bearer is valid ASCII metadata"),
-    );
+    for (name, value) in metadata {
+        request.metadata_mut().insert(
+            *name,
+            value
+                .parse()
+                .expect("the credential is valid ASCII metadata"),
+        );
+    }
     TraceServiceClient::new(channel)
         .export(request)
         .await
-        .expect("the collector accepts the trace export")
-        .into_inner()
-        .partial_success
+        .map(|response| response.into_inner().partial_success)
 }
 
 /// Asserts the maximal span's stored row against the fixture values directly.

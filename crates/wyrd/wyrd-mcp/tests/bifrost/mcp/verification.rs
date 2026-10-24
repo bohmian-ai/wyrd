@@ -22,8 +22,8 @@
 /// The Postgres-backed half of the verification journey.
 mod pg_tests {
     use crate::connectivity::{
-        McpJourneyError, client, discover, problem, refusal, structured, transport,
-        transport_with_headers,
+        McpJourneyError, client, client_transport, discover, problem, refusal, structured,
+        transport,
     };
 
     use std::collections::BTreeSet;
@@ -215,7 +215,7 @@ mod pg_tests {
         async fn start() -> Result<Self, McpJourneyError> {
             let server = WyrdTestServer::start_bound().await?;
             let admin = server
-                .bootstrap_agent("mcp-card-discovery", &["admin"])
+                .bootstrap_service("mcp-card-discovery", &["admin"])
                 .await?;
             let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
             let fixtures = Path::new(concat!(
@@ -279,7 +279,9 @@ mod pg_tests {
             Ok(serde_json::from_value(structured(response)?)?)
         }
 
-        /// Select the named Service and follow opaque continuation without repeating a Card.
+        /// Select the named Service, then follow opaque continuation over every
+        /// Service, the administrator's fixture Service included, without
+        /// repeating or skipping one.
         ///
         /// # Errors
         /// Returns MCP or response decoding failures.
@@ -291,19 +293,24 @@ mod pg_tests {
             assert_eq!(Some(&named.items[0].card_uid), self.service.uid.as_ref());
             assert_eq!(named.items[0].version, self.service.version);
 
-            let first = self
-                .list(serde_json::json!({ "kind": "Service", "limit": 1 }))
-                .await?;
-            assert_eq!(first.items.len(), 1);
-            let cursor = first
-                .next_cursor
-                .ok_or("two Services require continuation")?;
-            let second = self
-                .list(serde_json::json!({ "kind": "Service", "limit": 1, "cursor": cursor }))
-                .await?;
-            assert_eq!(second.items.len(), 1);
-            assert_ne!(first.items[0].card_uid, second.items[0].card_uid);
-            assert!(second.next_cursor.is_none());
+            // The two shared graphs' Services and the administrator's own
+            // fixture Service.
+            let all = self.list(serde_json::json!({ "kind": "Service" })).await?;
+            assert_eq!(all.items.len(), 3, "{all:?}");
+            assert!(all.next_cursor.is_none());
+            let mut paged = Vec::new();
+            let mut arguments = serde_json::json!({ "kind": "Service", "limit": 1 });
+            loop {
+                let page = self.list(arguments.clone()).await?;
+                assert_eq!(page.items.len(), 1);
+                paged.push(page.items[0].card_uid.clone());
+                let Some(cursor) = page.next_cursor else {
+                    break;
+                };
+                arguments["cursor"] = serde_json::json!(cursor);
+            }
+            let listed: Vec<_> = all.items.iter().map(|item| item.card_uid.clone()).collect();
+            assert_eq!(paged, listed, "continuation repeats and skips no Service");
             Ok(())
         }
 
@@ -484,6 +491,44 @@ mod pg_tests {
         )
     }
 
+    /// The first-party client for a family runtime account, bound to the root
+    /// its registered Card names, since owned work needs that root selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `principal` names no Card uid or the client cannot
+    /// be constructed.
+    fn rooted_client(
+        server: &WyrdTestServer,
+        principal: &Bootstrap,
+    ) -> Result<wyrd_client::WyrdClient, McpJourneyError> {
+        let root = principal
+            .card_ref()
+            .and_then(|card| card.uid.clone())
+            .ok_or("a family runtime account names its registered root")?;
+        Ok(client(server, api_key(principal)?)?.for_workload(root))
+    }
+
+    /// Connect an MCP client as a family runtime account at its root.
+    ///
+    /// # Errors
+    ///
+    /// Returns client construction or MCP handshake failures.
+    async fn connect_rooted(
+        server: &WyrdTestServer,
+        principal: &Bootstrap,
+    ) -> Result<RunningService<RoleClient, ()>, McpJourneyError> {
+        let base_url = server
+            .base_url()
+            .ok_or("journey requires a bound test server")?;
+        Ok(()
+            .serve_with_lifecycle(
+                client_transport(base_url, &rooted_client(server, principal)?, []),
+                discover(),
+            )
+            .await?)
+    }
+
     /// Render a refused tool call, whether `rmcp` returned a transport error
     /// or a tool result carrying a problem.
     ///
@@ -531,7 +576,7 @@ mod pg_tests {
         let writer = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let writer_client = connect(&server, &writer).await?;
+        let writer_client = connect_rooted(&server, &writer).await?;
         let tools = writer_client.list_all_tools().await?;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         for tool in [CARDS_GET, GET_BINDING, GET_EXECUTION]
@@ -727,7 +772,7 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let agent_client = connect(&server, &agent).await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
         let verifier = structured(
             agent_client
                 .call_tool(call(
@@ -900,7 +945,7 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let agent_client = connect(&server, &agent).await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
         let tools = agent_client.list_all_tools().await?;
         for tool in [EXECUTE, ENQUEUE, GET_EXECUTION, QUERY] {
             assert!(
@@ -1044,7 +1089,7 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let agent_client = connect(&server, &agent).await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
         for (answer, verdict) in [(PASSING_ANSWER, "passed"), (FAILING_ANSWER, "failed")] {
             let judged = structured(
                 agent_client
@@ -1144,6 +1189,74 @@ mod pg_tests {
         Ok(())
     }
 
+    /// `verification.execute` admits the subject through the caller's signed
+    /// Card limit before it judges anything: the subject's runtime account
+    /// at its root judges it, the same account without a root is refused as
+    /// needing workload context, and an unrelated Service rooted at its own
+    /// Card is refused as out of scope, while that Service without a root,
+    /// which may attribute to any registered Card, still judges it.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport, or
+    /// tool-call failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the administrator's Cards handle cannot connect or a
+    /// verdict or refusal code differs from the expectation.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn direct_execution_enforces_card_access() -> Result<(), McpJourneyError> {
+        let server = Box::pin(WyrdTestServer::start_bound()).await?;
+        let admin = server
+            .bootstrap_service("mcp-access-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
+        let fixture = register_fixture(&cards).await?;
+        let owner = server
+            .credential_registered_service(&fixture.service_ref, &["editor"])
+            .await?;
+        let foreign = server
+            .bootstrap_service("mcp-access-foreign", &["editor"])
+            .await?;
+
+        for (agent, code) in [
+            (
+                connect(&server, &owner).await?,
+                "WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED",
+            ),
+            (
+                connect_rooted(&server, &foreign).await?,
+                "WYRD_PERMISSION_403_DENIED_RBAC",
+            ),
+        ] {
+            let refused = refusal(
+                agent
+                    .call_tool(call(EXECUTE, fixture.assert_request(PASSING_ANSWER))?)
+                    .await,
+            )?;
+            assert!(refused.contains(code), "{code}: {refused}");
+            agent.cancel().await?;
+        }
+        for agent in [
+            connect_rooted(&server, &owner).await?,
+            connect(&server, &foreign).await?,
+        ] {
+            let judged = structured(
+                agent
+                    .call_tool(call(EXECUTE, fixture.assert_request(PASSING_ANSWER))?)
+                    .await?,
+            )?;
+            assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+            agent.cancel().await?;
+        }
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// Trace id of the caller span the continuity journey sends.
     const CALLER_TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
 
@@ -1233,7 +1346,7 @@ mod pg_tests {
     /// Panics when the verdict is not `passed`.
     async fn execute_traced(
         server: &WyrdTestServer,
-        credential: ResolvedCredential,
+        caller: &wyrd_client::WyrdClient,
         request: &JsonValue,
         headers: [(&'static str, &str); 2],
     ) -> Result<(), McpJourneyError> {
@@ -1241,12 +1354,12 @@ mod pg_tests {
             .into_iter()
             .map(|(name, value)| Ok((http::HeaderName::from_static(name), value.parse()?)))
             .collect::<Result<Vec<_>, McpJourneyError>>()?;
-        let agent = ()
-            .serve_with_lifecycle(
-                transport_with_headers(server, credential, headers)?,
-                discover(),
-            )
-            .await?;
+        let base_url = server
+            .base_url()
+            .ok_or("journey requires a bound test server")?;
+        let agent =
+            ().serve_with_lifecycle(client_transport(base_url, caller, headers), discover())
+                .await?;
         let judged = structured(agent.call_tool(call(EXECUTE, request.clone())?).await?)?;
         assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
         agent.cancel().await?;
@@ -1279,42 +1392,45 @@ mod pg_tests {
         let (_telemetry, traces) =
             wyrd_server::install_capture_runtime(wyrd_telemetry::TelemetryConfig::default())?;
         let (server, _judge, agent, request) = judging_server().await?;
-        let credential = api_key(&agent)?;
+        let caller = rooted_client(&server, &agent)?;
         let actor = server
             .bootstrap_service("mcp-traced-actor", &["editor", "mcp_judge_invoker"])
             .await?;
-        let jwt = async |principal: &Bootstrap| -> Result<String, McpJourneyError> {
-            let key = principal
-                .api_key()
-                .ok_or("a service bootstraps with a machine key")?;
-            Ok(server.exchange_api_key(key).await?)
-        };
-        let delegated = server
-            .delegate(
-                &jwt(&agent).await?,
-                &jwt(&actor).await?,
-                TokenAudience::Wyrd,
+        // The subject is A's family runtime account at A's root; the actor is
+        // an unrestricted account that selects A's root too, since delegation
+        // needs a rooted actor and narrows the Card scope to both graphs.
+        let subject_jwt = server.exchange_rooted(&agent).await?;
+        let actor_jwt = server
+            .exchange_api_key_for_workload(
+                actor.api_key().ok_or("the actor has an API key")?,
+                agent
+                    .card_ref()
+                    .and_then(|card| card.uid.as_ref())
+                    .ok_or("A has a registered root")?,
             )
+            .await?;
+        let delegated = server
+            .delegate(&subject_jwt, &actor_jwt, TokenAudience::Wyrd)
             .await?;
         let checkpoint = traces.checkpoint();
         let parent = format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01");
         execute_traced(
             &server,
-            credential.clone(),
+            &caller,
             &request,
             [("traceparent", &parent), ("tracestate", "wyrd=caller")],
         )
         .await?;
         execute_traced(
             &server,
-            credential,
+            &caller,
             &request,
             [("traceparent", "00-not-a-trace-01"), ("tracestate", "@@")],
         )
         .await?;
         execute_traced(
             &server,
-            ResolvedCredential::BearerToken(delegated.into()),
+            &client(&server, ResolvedCredential::BearerToken(delegated.into()))?,
             &request,
             [
                 (
@@ -1583,7 +1699,7 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&receipt.root, &["editor"])
             .await?;
-        let agent_client = connect(&server, &agent).await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
 
         // Discover: the Service's Card names the binding whose status pins group_end.
         let binding_id = &group_binding(&agent_client, &service_uid).await?;
@@ -1883,8 +1999,8 @@ mod pg_tests {
                 .await?;
             agents.push((
                 FrameAgent {
-                    client: connect(&server, &principal).await?,
-                    http: client(&server, api_key(&principal)?)?,
+                    client: connect_rooted(&server, &principal).await?,
+                    http: rooted_client(&server, &principal)?,
                     base_url: server
                         .base_url()
                         .ok_or("a bound server has a URL")?
@@ -2059,7 +2175,7 @@ mod pg_tests {
         let agent = server
             .credential_registered_service(&fixture.service_ref, &["editor"])
             .await?;
-        let agent_client = connect(&server, &agent).await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
         let offered = agent_client.list_all_tools().await?;
         for tool in [EXECUTE, ENQUEUE] {
             assert!(
@@ -2090,6 +2206,135 @@ mod pg_tests {
             "a refused call stages nothing"
         );
         agent_client.cancel().await?;
+        Ok(())
+    }
+
+    /// A Service's configured deployment environment is a pass-through tag on
+    /// both of its verification subjects over MCP.
+    ///
+    /// Against `configured-service`: the Service check and the Agent
+    /// component's check run directly and queued under `prod`, `staging`, and
+    /// no tag, with the same verdict; each result, `verification.get_execution`
+    /// read, and stored `execution_inputs` and `results` row carries exactly
+    /// the supplied tag, or none.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport, flush,
+    /// or tool-call failures, or an error when an execution never settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a call is refused, a verdict differs between tags, or a
+    /// result or stored row names another subject or environment.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn configured_service_context_keeps_subject_and_environment()
+    -> Result<(), McpJourneyError> {
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .start_bound(),
+        )
+        .await?;
+        let admin = server
+            .bootstrap_service("mcp-configured-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?)
+            .await
+            .expect("handle connects");
+        let receipt = Box::pin(cards.declare_from_path(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/observe_a_run/configured-service.yaml"
+        ))))
+        .await?;
+        let uid = |name: &str| -> Result<String, McpJourneyError> {
+            Ok(receipt
+                .outcomes
+                .iter()
+                .find(|outcome| outcome.card_ref.name.as_str() == name)
+                .and_then(|outcome| outcome.card_ref.uid.as_ref())
+                .ok_or("the fixture registers the named Card")?
+                .to_string())
+        };
+        let (service, agent) = (uid("configured-service")?, uid("observed-agent")?);
+        let (service_check, agent_check) = (uid("service-check")?, uid("agent-check")?);
+        let caller = server
+            .credential_registered_service(&receipt.root, &["editor"])
+            .await?;
+        let caller_client = connect_rooted(&server, &caller).await?;
+        let request = |verifier: &str, subject: &str, environment: Option<&str>| {
+            let mut body = serde_json::json!({
+                "verifier_card_uid": verifier,
+                "card_uid": subject,
+                "inputs": { "answer": { "kind": "json", "value": "yes" } },
+            });
+            if let Some(environment) = environment {
+                body["deployment_environment"] = environment.into();
+            }
+            body
+        };
+
+        let mut recorded = Vec::new();
+        for (verifier, subject) in [(&service_check, &service), (&agent_check, &agent)] {
+            for environment in [Some("prod"), Some("staging"), None] {
+                let direct = structured(
+                    caller_client
+                        .call_tool(call(EXECUTE, request(verifier, subject, environment))?)
+                        .await?,
+                )?;
+                assert_eq!(text(&direct, "/subject/uid")?, subject.as_str(), "{direct}");
+                assert_eq!(text(&direct, "/outcome/verdict")?, "passed", "{direct}");
+                assert_eq!(
+                    direct["deployment_environment"].as_str(),
+                    environment,
+                    "{direct}"
+                );
+                recorded.push((text(&direct, "/execution_id")?.to_owned(), environment));
+
+                let accepted = structured(
+                    caller_client
+                        .call_tool(call(ENQUEUE, request(verifier, subject, environment))?)
+                        .await?,
+                )?;
+                let execution_id = text(&accepted, "/execution_id")?.to_owned();
+                let state = settle(&caller_client, &execution_id).await?;
+                assert_eq!(state["status"], "completed", "{state}");
+                assert_eq!(text(&state, "/result/subject/uid")?, subject.as_str());
+                assert_eq!(
+                    text(&state, "/result/outcome/verdict")?,
+                    "passed",
+                    "{state}"
+                );
+                assert_eq!(
+                    state["result"]["deployment_environment"].as_str(),
+                    environment,
+                    "{state}"
+                );
+                recorded.push((execution_id, environment));
+            }
+        }
+
+        server.flush_bifrost().await?;
+        for (execution_id, environment) in recorded {
+            for table in ["execution_inputs", "results"] {
+                let stored = rows(
+                    &caller_client,
+                    format!(
+                        "SELECT deployment_environment FROM vala.verification.{table} \
+                         WHERE execution_id = '{execution_id}'"
+                    ),
+                )
+                .await?;
+                assert_eq!(
+                    stored,
+                    serde_json::json!([[environment]]),
+                    "{table} row of {execution_id}"
+                );
+            }
+        }
+        caller_client.cancel().await?;
+        server.shutdown().await?;
         Ok(())
     }
 }

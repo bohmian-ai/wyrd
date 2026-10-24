@@ -23,7 +23,7 @@ import {
 } from "wyrd-ai";
 import { cli } from "@wyrd/testing";
 
-import { ancestry, columnValues, fixture, declared, serverTest, timeline } from "../support/server.js";
+import { ancestry, columnValues, fixture, declared, runtimeAccount, serverTest, timeline } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -54,6 +54,21 @@ const ANTHROPIC_MESSAGE = {
 };
 
 /** Responses usage the upstream reports. */
+/** {@link ANTHROPIC_MESSAGE} as the Anthropic Messages event stream a `stream: true` request receives. */
+const ANTHROPIC_STREAM = [
+  ["message_start", { type: "message_start", message: { ...ANTHROPIC_MESSAGE, content: [], stop_reason: null } }],
+  ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+  ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } }],
+  ["content_block_stop", { type: "content_block_stop", index: 0 }],
+  [
+    "message_delta",
+    { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } },
+  ],
+  ["message_stop", { type: "message_stop" }],
+]
+  .map(([name, data]) => `event: ${String(name)}\ndata: ${JSON.stringify(data)}\n\n`)
+  .join("");
+
 const RESPONSE_USAGE = {
   input_tokens: 5,
   output_tokens: 3,
@@ -119,10 +134,14 @@ function openaiDeployment(name: string, access: ProviderDeployment["access"] = "
  * `ask-agent` Agent.
  */
 const test = serverTest({
-  provider: ({ path, body }) => ({
-    status: 200,
-    body: path === "/v1/responses" ? responsesTurn(body) : path === "/v1/messages" ? ANTHROPIC_MESSAGE : COMPLETION,
-  }),
+  provider: ({ path, body }) =>
+    path === "/v1/messages" && body.includes('"stream":true')
+      ? { status: 200, body: ANTHROPIC_STREAM, contentType: "text/event-stream" }
+      : {
+          status: 200,
+          body:
+            path === "/v1/responses" ? responsesTurn(body) : path === "/v1/messages" ? ANTHROPIC_MESSAGE : COMPLETION,
+        },
 }).extend<{
   ask: DeclarationReceipt;
 }>({
@@ -297,10 +316,11 @@ test("caller without gateway invoke is refused", async ({ server, ask: _ }) => {
 });
 
 test("gateway call records a lone run or card", async ({ server, ask }) => {
-  const issued = await cli.issueKey({ kind: "Agent", name: "ask-agent", version: "1.0.0" });
-  const caller = WyrdClient.connect({ credential: issued.key });
-  const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: caller.httpAuth });
+  const service = await (await Cards.connect()).declareFromPath(fixture("cards/gateway_inference/ask-service.yaml"));
   const cardUid = declared(ask, "ask-agent").uid;
+  const issued = await runtimeAccount({ kind: "Service", name: "ask-service" });
+  const caller = WyrdClient.connect({ credential: issued.key }).forWorkload(declared(service).uid);
+  const client = new OpenAI({ baseURL: `${caller.serverUrl}/v1`, apiKey: "wyrd", fetch: caller.httpAuth });
 
   for (const headers of [{ "wyrd-run-id": "run-alone" }, { "wyrd-card-uid": cardUid }]) {
     const reply = await client.chat.completions.create(ASK, { headers });
@@ -312,11 +332,96 @@ test("gateway call records a lone run or card", async ({ server, ask }) => {
     await (
       await Bifrost.connect()
     ).sql("SELECT run_id, card_uid FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY run_id", [
-      issued.principal_id,
+      issued.principalId,
     ])
   ).toArrow();
   expect(columnValues(calls.getChild("run_id"))).toEqual(["run-alone", null]);
   expect(columnValues(calls.getChild("card_uid"))).toEqual([null, cardUid]);
+});
+
+test("state httpAuth supplies service and agent context", async ({ server, provider, ask: _ }) => {
+  const cards = await Cards.connect();
+  const { root } = await cards.declareFromPath(fixture("cards/observe_a_run/configured-service.yaml"));
+  const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-http-auth-"));
+  await cards.pull(root, bundle);
+  const issued = await runtimeAccount({ kind: "Service", name: "configured-service" });
+  const configured = (environment: string): WyrdState => {
+    const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: issued.key }) });
+    state.configure({ deploymentEnvironment: environment });
+    return state;
+  };
+  const [prod, staging] = [configured("prod"), configured("staging")];
+  const [service, agent] = [prod.rootRef.uid, prod.cardRef("agent").uid];
+  const openaiOf = (state: WyrdState): OpenAI =>
+    new OpenAI({
+      baseURL: `${WyrdClient.connect().serverUrl}/v1`,
+      apiKey: "wyrd",
+      fetch: state.httpAuth,
+      maxRetries: 0,
+    });
+  const anthropic = new Anthropic({
+    baseURL: WyrdClient.connect().serverUrl,
+    apiKey: "wyrd",
+    fetch: prod.httpAuth,
+    maxRetries: 0,
+  });
+  const before = provider.received.length;
+
+  await openaiOf(prod).chat.completions.create(ASK);
+  const serviceRun = prod.run();
+  await serviceRun.scope(() => openaiOf(prod).chat.completions.create(ASK));
+  const agentRun = prod.run("agent");
+  await agentRun.scope(() =>
+    staging.run().scope(async () => {
+      const stream = anthropic.messages.stream({
+        model: "anthropic/claude-sonnet-5",
+        max_tokens: 16,
+        messages: ASK.messages,
+      });
+      expect(await stream.finalText()).toBe("hi");
+    }),
+  );
+  const concurrentRuns = await Promise.all(
+    [prod, staging].map((state) => {
+      const run = state.run("agent");
+      return run.scope(async () => {
+        await openaiOf(state).chat.completions.create(ASK);
+        return run.runId;
+      });
+    }),
+  );
+
+  // The provider SDK wraps the local refusal as its connection error's cause.
+  const delivered = provider.received.length;
+  await expect(
+    prod.run().scope(() => openaiOf(prod).chat.completions.create(ASK, { headers: { "wyrd-card-uid": agent } })),
+  ).rejects.toMatchObject({ cause: { code: "WYRD_CLIENT_400_CONFIG_INVALID" } });
+  expect(provider.received.length).toBe(delivered);
+  for (const upstream of provider.received.slice(before)) {
+    const names = Object.keys(upstream.headers);
+    expect(names.filter((name) => name.startsWith("x-wyrd") || name.startsWith("wyrd-"))).toEqual([]);
+    expect(Object.values(upstream.headers)).not.toContain(issued.key);
+  }
+
+  server.flushBifrost();
+  const calls = (
+    await (
+      await Bifrost.connect()
+    ).sql("SELECT card_uid, run_id FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at", [
+      issued.principalId,
+    ])
+  ).toArrow();
+  const runIds = columnValues(calls.getChild("run_id")) as unknown[];
+  const rows = (columnValues(calls.getChild("card_uid")) as unknown[]).map((cardUid, index) => [
+    cardUid,
+    runIds[index],
+  ]);
+  expect(rows.slice(0, 3)).toEqual([
+    [service, null],
+    [service, serviceRun.runId],
+    [agent, agentRun.runId],
+  ]);
+  expect(rows.slice(3).sort()).toEqual(concurrentRuns.map((runId) => [agent, runId]).sort());
 });
 
 /** An Agents SDK agent on the Gateway's Responses API whose `echo` tool returns content parts. */
@@ -369,17 +474,13 @@ test("caller without gateway invoke cannot run an agents sdk agent", async ({ se
   expect(provider.received.slice(before)).toEqual([]);
 });
 
-test("cli issues a card scoped key and writes a provider credential", async ({ ask: _ }) => {
-  const agent = { kind: "Agent", name: "ask-agent", version: "1.0.0" } as const;
-  const issued = await cli.issueKey(agent);
+test("cli writes a provider credential", async ({ ask: _ }) => {
   const view = await cli.putProviderCredential({
     name: "managed-openai-key",
     provider: "openai",
     source: { managed_secret: { secret: "sk-managed" } },
   });
 
-  expect(issued.card_ref).toEqual(agent);
-  expect(issued.key.startsWith(issued.prefix)).toBe(true);
   expect(view).toMatchObject({ name: "managed-openai-key", provider: "openai", state: "active" });
   expect(JSON.stringify(view)).not.toContain("sk-managed");
 });
@@ -430,10 +531,24 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   const receipt = await cards.declareFromPath(fixture("cards/gateway_inference/ask-service.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-ask-"));
   await cards.pull(receipt.root, bundle);
-  const issued = await cli.issueKey({ kind: "Service", name: "ask-service", version: "1.0.0" });
-  const caller = WyrdClient.connect({ credential: issued.key });
-  const state = WyrdState.fromPath(bundle, { client: caller });
+  const issued = await runtimeAccount({ kind: "Service", name: "ask-service" });
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential: issued.key }) });
+  const caller = WyrdClient.connect({ credential: issued.key }).forWorkload(declared(receipt).uid);
   const before = provider.received.length;
+  // The Service family's one runtime account is shared with earlier tests in this file.
+  const deployments = async (): Promise<unknown[]> => {
+    server.flushBifrost();
+    const calls = (
+      await (
+        await Bifrost.connect()
+      ).sql(
+        "SELECT requested_model.deployment AS deployment FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at",
+        [issued.principalId],
+      )
+    ).toArrow();
+    return columnValues(calls.getChild("deployment")) as unknown[];
+  };
+  const earlier = (await deployments()).length;
 
   const asked: string[] = [];
   for (const alias of ["agent", "body-agent"]) {
@@ -451,16 +566,7 @@ test("agent prompt routes", async ({ server, provider, ask: _ }) => {
   expect(upstream.map(({ model }) => model)).toEqual(Array(4).fill("gpt-4o"));
   expect(upstream.map(({ messages }) => messages)).toEqual(asked.map((content) => [{ role: "user", content }]));
 
-  server.flushBifrost();
-  const calls = (
-    await (
-      await Bifrost.connect()
-    ).sql(
-      "SELECT requested_model.deployment AS deployment FROM vala.gateway.calls WHERE sub_principal_id = $1 ORDER BY started_at",
-      [issued.principal_id],
-    )
-  ).toArrow();
-  expect(columnValues(calls.getChild("deployment"))).toEqual(["openai", "openai-backup", "openai", "openai-backup"]);
+  expect((await deployments()).slice(earlier)).toEqual(["openai", "openai-backup", "openai", "openai-backup"]);
 
   await expect(askAgent(state, caller, "agent", "openai-granted", "denied")).rejects.toMatchObject({
     code: "WYRD_PERMISSION_403_DENIED_RBAC",

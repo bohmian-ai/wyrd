@@ -21,6 +21,7 @@ use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::routes::TokenGrants;
 use crate::components::auth::token_extract::{
     WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER, verify_authenticated_principal,
+    workload_uid_header,
 };
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -152,9 +153,10 @@ async fn authenticate_browser_session(
 ///
 /// Identical to [`require_authenticated`], except that a request with no
 /// access token may carry its exporter's Wyrd API key in `x-wyrd-api-key`,
-/// since a stock OpenTelemetry exporter sends only static headers. The key is
-/// verified on every request through [`TokenGrants::api_key_principal`] and
-/// yields the principal its exchanged token would carry. An access token, when
+/// since a stock OpenTelemetry exporter sends only static headers, with an
+/// optional `x-wyrd-workload-uid` root. The key is verified on every request
+/// through [`TokenGrants::api_key_principal`] and yields the principal its
+/// exchanged token would carry under that root. An access token, when
 /// present, always wins.
 pub async fn require_otlp_authenticated(
     State(state): State<AppState>,
@@ -171,6 +173,10 @@ pub async fn require_otlp_authenticated(
         return WyrdErrorResponse(api_key_invalid()).into_response();
     };
     let api_key = SecretString::from(presented.to_owned());
+    let workload_uid = match workload_uid_header(request.headers()) {
+        Ok(workload_uid) => workload_uid,
+        Err(error) => return WyrdErrorResponse(error).into_response(),
+    };
     let request_id = request
         .extensions()
         .get::<RequestId>()
@@ -180,7 +186,7 @@ pub async fn require_otlp_authenticated(
         state: &state,
         request_id: request_id.as_str(),
     };
-    match grants.api_key_principal(&api_key).await {
+    match grants.api_key_principal(&api_key, workload_uid).await {
         Ok(verified) => {
             request
                 .extensions_mut()
@@ -191,31 +197,39 @@ pub async fn require_otlp_authenticated(
     }
 }
 
-/// Verify the request's token for `surface`, insert the principal, and run
-/// `next`; any verification failure is returned without calling `next`.
+/// Verify the request's token for `surface`, apply its optional
+/// `x-wyrd-workload-uid` selector, insert the principal, and run `next`; any
+/// verification or selection failure is returned without calling `next`.
 async fn authenticate_on(
     state: &AppState,
     mut request: Request<Body>,
     next: Next,
     surface: TokenAudience,
 ) -> Response {
-    match verify_authenticated_principal(
+    let verified = match verify_authenticated_principal(
         state.auth.token_verifier.as_deref(),
         request.headers(),
         surface,
     ) {
+        Ok(principal) => principal,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let selected = match workload_uid_header(request.headers()) {
+        Ok(root) => verified.select_root(state, root.as_ref()).await,
+        Err(error) => Err(error),
+    };
+    match selected {
         Ok(principal) => {
             request.extensions_mut().insert(principal);
             next.run(request).await
         }
-        Err(rejection) => rejection.into_response(),
+        Err(error) => WyrdErrorResponse(error).into_response(),
     }
 }
 
 #[cfg(test)]
 mod pg_tests {
     use std::collections::HashMap;
-    use wyrd_spec::reference::CardRefScope;
 
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
@@ -393,8 +407,6 @@ mod pg_tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         };
         state
             .auth
@@ -406,6 +418,8 @@ mod pg_tests {
                     principal,
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
+                    card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
+                    workload_uid: None,
                     credential_id: None,
                     act: None,
                     audience: wyrd_spec::auth::TokenAudience::Wyrd,

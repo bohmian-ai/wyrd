@@ -1,0 +1,14 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: configured-service
+  version: 1.0.0
+spec:
+  service_type: agent
+  verified_by:
+    - verifier: ./service-check.yaml
+  components:
+    - alias: agent
+      ref: ./observed-agent.yaml
+      verified_by:
+        - verifier: ./agent-check.yaml

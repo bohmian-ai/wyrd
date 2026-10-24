@@ -9,7 +9,9 @@
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand, ValueEnum};
-use wyrd_spec::auth::{PrincipalKindTag, PrincipalQuery, PrincipalStatus, RoleAssignment};
+use wyrd_spec::auth::{
+    PrincipalKindTag, PrincipalQuery, PrincipalStatus, RoleAssignment, WorkloadRestriction,
+};
 
 use crate::error::WyrdCliError;
 use crate::principal::credential::{PrincipalArgs, TenantEndpoint, principal_id};
@@ -21,8 +23,6 @@ pub enum AssignableKind {
     User,
     /// Service principals.
     Service,
-    /// Agent principals.
-    Agent,
 }
 
 impl From<AssignableKind> for PrincipalKindTag {
@@ -31,7 +31,6 @@ impl From<AssignableKind> for PrincipalKindTag {
         match kind {
             AssignableKind::User => Self::User,
             AssignableKind::Service => Self::Service,
-            AssignableKind::Agent => Self::Agent,
         }
     }
 }
@@ -45,7 +44,7 @@ pub struct ListArgs {
     /// Only the user with this exact email.
     #[arg(long, value_name = "EMAIL")]
     pub email: Option<String>,
-    /// Only the service or agent with this exact name.
+    /// Only the service account with this exact name.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
     /// Page size, 1 to 200; the server defaults to 100.
@@ -109,9 +108,12 @@ pub async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
             .email
             .or(principal.name)
             .unwrap_or_else(|| "-".to_owned());
-        let card = principal
-            .card_ref
-            .map_or_else(String::new, |card_ref| format!("  {card_ref}"));
+        let card = match principal.workload_restriction {
+            Some(WorkloadRestriction::Family(family)) => {
+                format!("  {:?}/{}", family.kind.card_kind(), family.name)
+            }
+            _ => String::new(),
+        };
         println!(
             "{}  {}  {}  {label}{card}",
             principal.principal_id,
@@ -230,9 +232,13 @@ mod tests {
     }
 
     /// Discovery accepts only assignable kinds.
+    ///
+    /// # Panics
+    /// Panics when `user` or `service` is refused, or `agent` or
+    /// `tenant_admin` parses.
     #[test]
     fn list_accepts_only_assignable_kinds() {
-        for kind in ["user", "service", "agent"] {
+        for kind in ["user", "service"] {
             assert!(
                 ListCli::try_parse_from([
                     "wyrd",
@@ -245,15 +251,18 @@ mod tests {
                 "{kind} parses"
             );
         }
-        assert!(
-            ListCli::try_parse_from([
-                "wyrd",
-                "--kind",
-                "tenant_admin",
-                "--server",
-                "https://wyrd.example"
-            ])
-            .is_err()
-        );
+        for kind in ["agent", "tenant_admin"] {
+            assert!(
+                ListCli::try_parse_from([
+                    "wyrd",
+                    "--kind",
+                    kind,
+                    "--server",
+                    "https://wyrd.example"
+                ])
+                .is_err(),
+                "{kind} is refused"
+            );
+        }
     }
 }

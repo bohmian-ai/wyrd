@@ -1,12 +1,15 @@
 ---
 id: TASK-002
 kind: implementation
-status: proposed
+status: review
 spec: SPEC-service-identity-and-telemetry
-spec_revision: 12
+spec_revision: 13
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-027, REQ-028, REQ-030, REQ-031, REQ-032, REQ-033, REQ-040, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, AC-001, AC-002, AC-003, AC-004, AC-005, AC-009, AC-010, AC-011, AC-014]
 depends_on: [TASK-001]
 ---
+
+> Historical baseline task. TASK-002 is treated as implemented by the maintainer's revision-14 instruction; this does not claim new review or test evidence. Revision-14 authority is the current spec and supplements. Service-only roots, configure and immutable environment propagation are assigned to TASK-009; earlier Service/Agent workload instructions below are superseded, not work to repeat.
+
 
 ## Outcome and Value
 
@@ -274,7 +277,7 @@ Run `mise run test:principals:unit` and `mise run test:principals:integration` f
 
 ## Authority Links
 
-- [Approved specification revision 12](../spec.md), [complete auth contracts](../supplements/auth-system.md),
+- [Approved specification revision 13](../spec.md), [complete auth contracts](../supplements/auth-system.md),
   [telemetry production](../supplements/telemetry-schemas.md), and
   [shared tables/origin](../supplements/table-storage-and-correlation.md).
 - [Runtime identity](../../../../architecture/wyrd-design.md#runtime-identity),
@@ -285,3 +288,33 @@ Run `mise run test:principals:unit` and `mise run test:principals:integration` f
 - [Testing](../../../../TESTING.md), [execution discipline](../../../implementation-execution.md),
   [spec workflow](../../../spec-driven-development.md), [agent topic map](../../../../agent_docs/index.md),
   and the SQL/Python/TypeScript directory AGENTS.md rules.
+
+## Implementation Evidence
+
+Commits `036fc48fe`..`c92f46197` on `task/service-identity-and-telemetry/TASK-002`. Postgres selectors run through `scripts/postgres/with-test-postgres.sh` after `db:migrate:all:inner`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-001–006; AC-002/004/009/011 — stable explicit accounts, restriction administration, no registration principals | `20261025000000_stable_service_accounts.sql` (`auth_service_accounts_one_family`); `principals/routes.rs::set_workload_restriction_for`; `wyrd-client` `Principals::set_workload_restriction`; CLI `create-principal --workload-kind/--workload-name`, `set-restriction`; MCP `principals.set_workload_restriction`; Python/TS bindings; registration auth projection and `/auth/issue-key` deleted | `pg_principal_roles::stable_account_restrictions_and_credentials`; `principal_journey::stable_account_context_cli_journey`; `principals::pg_tests::stable_account_context_mcp_journey`; `test:principals:unit`, `test:principals:integration` | PASS |
+| REQ-007–012/033; AC-001/003/011 — exact claims, three Card states, bounded tokens | `wyrd-spec` auth `card_access`/`workload_uid`; `wyrd-auth-verify` fail-closed claims; issuance/exchange root selection | `wyrd-auth-verify tests::explicit_card_access_claims_are_fail_closed`; `issuance::pg_tests::stable_account_root_selection_preserves_grants` | PASS |
+| Scenario 3 — optional context, typed refusals at every ingress | shared selector path (`token_extract.rs`, `WORKLOAD_UID_HEADER`); Bifrost gate rootless-selector refusal; OAuth refusals carry the Wyrd `code` extension member (`oauth.rs`, `OAuthErrorResponse.code`, client `oauth_error`) | `negative::pg_tests::optional_workload_context_preserves_authentication` (otlp 17/17); SDK stories assert `WYRD_AUTH_401_WORKLOAD_UID_REFUSED`, `WYRD_AUTH_401_API_KEY_INVALID`, `WYRD_AUTH_403_WORKLOAD_CONTEXT_REQUIRED` | PASS |
+| REQ-013–014; AC-002/004/011 — concurrent states, context-keyed renewal/cache, delegation intersections | `AuthMiddleware`/`TokenExchange` keyed by root; `WyrdClient::for_workload`; delegation requires actor root | `auth::tests::renewal_and_caches_keep_workload_context_separate`; `exchange_api_key::pg_tests::delegation_preserves_roots_and_exact_intersections`; Rust `principal_roles::stable_accounts_preserve_execution_identity`, `gateway_inference::stable_account_gateway_calls_keep_execution_identity`, `gateway_inference::user_through_service_gateway_delegation_keeps_the_intersection`; Python `test_principal_roles.py::test_stable_accounts_preserve_execution_identity` (+3 split cases); TS `stable accounts preserve execution identity` (+2 split cases) | PASS |
+| Scenario 6 — federation | workload binding by principal + optional pinned default; CLI `--principal/--workload-uid` | `auth::jwt_bearer::pg_tests::stable_account_mapping_selects_only_allowed_context`; `pg_browser_sessions::*`; `saved_user_auth::stale_login_refreshes_and_saves_the_renewal` (identity lane) | PASS |
+| REQ-015–017/040; AC-005/014 — accepted authority, exact-root schedule activity | `record_machine_authentication(owner, root)`; accepted snapshot consumers | `pg_verification_runtime::accepted_authority_survives_account_and_context_changes`; `pg_verification_runtime::only_associated_account_activity_activates_exact_root` | PASS |
+| REQ-027–028/030–032; AC-009/010/011 — same contracts on every surface; architecture/generated contracts agree | `architecture/wyrd-design.md`, `architecture/wyrd-security-posture.md` (`0b65f7ff3`); fixtures provision accounts explicitly; shared `WyrdTestServer::{family_account, exchange_api_key_for_workload, exchange_rooted, seed_workload_issuer}` | `codegen:regen` (no diff), `codegen:check`, `check:deps`, `check:tenant-isolation`, `docs:check`, `fmt:check`, `lints`, `py:{format:check,lints,typecheck}`, `ts:{format:check,lints,typecheck,napi:check}`, `git diff --check` | PASS |
+| INV-001–007 | Covered by the rows above | Owner sweep: mcp 28/28, wyrd-testing server/oracle/scribe/forge/otlp, wyrd-server integration 254/254 | PASS |
+
+### Diagnoses
+
+- **Symptom:** SDK stories saw `WYRD_SPEC_400_VALIDATION` for a refused root or revoked key at `/auth/token`. **Evidence:** server log `wyrd_code="WYRD_AUTH_401_WORKLOAD_UID_REFUSED"`; body `{"error":"invalid_request"}`. **Cause:** `OAuthError` dropped the Wyrd code, so `wyrd-client` `oauth_error` mapped by OAuth code only. **Fix site:** `OAuthErrorResponse` gains the optional `code` extension member (RFC 6749 §8.2), set by `OAuthError::from`; the client prefers it. OAuth envelopes stay at `/auth/token` as the supplement requires.
+- **Symptom:** delegation journeys failed with 400 `actor_has_no_root`. **Cause:** actors exchanged rootless; delegation now requires an actor root. **Fix site:** tests root the actor (`exchange_rooted`, Rust `Deployment::rooted`, Python/TS `rooted`); verification delegates root at the verified subject Card.
+- **Symptom:** `observe_ingest::*` "lacks BifrostTable/Read". **Cause:** registration no longer grants `workload`. **Fix site:** the test grants `workload` explicitly; the now-unused `DEFAULT_CARD_ROLE` constant is deleted.
+
+### Limits
+
+- Not run (environment): wyrd-cli `init_*`/`guided_init` (needs a built UI), `cli_device_login_journey` (needs an IdP), two gateway Vault tests (`test:gateway:vault`), `identity_e2e` Keycloak config-binding tests.
+- The off-nest `FromRequestParts` fallback ignores the selector; native Bifrost refuses a rootless selector by design.
+- The `CredentialIssuance` audit detail has no producer after `/auth/issue-key` removal; audit storage belongs to TASK-003. Credential issuance decisions retain the subject/actor pair.
+- Several proofs were written after their production code (no recorded RED).
+- Stored workload-root columns belong to TASK-003; SDK release isolation is shown by run id.
+- Non-goals stayed excluded: no migration of historical state, no compatibility route, no warehouse envelope, audit-storage or docsite change.

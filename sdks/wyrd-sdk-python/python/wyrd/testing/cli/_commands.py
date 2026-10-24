@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from wyrd.cards import PullSummary
     from wyrd.client import WyrdClient
     from wyrd.state import CardEnvelope
-    from wyrd.testing.cli import IssueKeyResponse
 
 
 def get(
@@ -82,32 +81,3 @@ def pull(
             client or server error.
     """
     return _native.pull(output_dir, (kind, name, version, uid), metadata_only, client)
-
-
-def issue_key(
-    *,
-    kind: str,
-    name: str,
-    version: str,
-    label: str | None = None,
-    expires_in_seconds: int | None = None,
-    client: WyrdClient | None = None,
-) -> IssueKeyResponse:
-    """Issue an API key bound to one exact Card (``wyrd auth issue-key``).
-
-    Args:
-        kind: The Card kind.
-        name: The Card name.
-        version: The exact Card version.
-        label: An optional label stored with the key.
-        expires_in_seconds: An optional lifetime override, in seconds.
-        client: The principal to act as. Omitted, the ambient chain.
-
-    Returns:
-        The issued key; its plaintext is returned exactly once.
-
-    Raises:
-        WyrdError: For invalid coordinates, a missing credential, or the
-            server's refusal.
-    """
-    return _native.issue_key((kind, name, version), label, expires_in_seconds, client)

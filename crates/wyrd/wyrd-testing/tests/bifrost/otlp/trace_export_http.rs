@@ -105,12 +105,36 @@ pub(super) async fn post_otlp_raw(
     body: Vec<u8>,
     token: Option<&str>,
 ) -> (reqwest::StatusCode, Vec<u8>) {
+    let bearer = token.map(|token| format!("Bearer {token}"));
+    let headers: Vec<(&str, &str)> = bearer
+        .iter()
+        .map(|bearer| ("x-wyrd-access-token", bearer.as_str()))
+        .collect();
+    post_otlp_with_headers(journey, path, encoding, body, &headers).await
+}
+
+/// Posts one encoded OTLP body under exactly `headers` and returns the answer.
+///
+/// The credential and workload-selector journeys vary which authentication
+/// headers an exporter sends, so this form sends `headers` verbatim beside the
+/// content type and, like [`post_otlp_raw`], judges nothing.
+///
+/// # Panics
+///
+/// Panics when the route cannot be reached or its body cannot be read.
+pub(super) async fn post_otlp_with_headers(
+    journey: &OtlpJourney,
+    path: &str,
+    encoding: HttpEncoding,
+    body: Vec<u8>,
+    headers: &[(&str, &str)],
+) -> (reqwest::StatusCode, Vec<u8>) {
     let mut request = reqwest::Client::new()
         .post(format!("{}{path}", journey.base_url()))
         .header("content-type", encoding.content_type())
         .body(body);
-    if let Some(token) = token {
-        request = request.header("x-wyrd-access-token", format!("Bearer {token}"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
     }
     let response = request
         .send()

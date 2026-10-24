@@ -752,7 +752,7 @@ fn query_audit_event(
         context.trace_id.clone(),
         operation.to_owned(),
         "bifrost.query".to_owned(),
-        context.principal.card_ref().cloned(),
+        None,
         context.served_subject.map_or_else(
             || {
                 let verified = wyrd_runtime::delegated_attribution(
@@ -4194,14 +4194,13 @@ mod tests {
             effective_permissions.insert(permission.clone());
         }
         AuthorizedQueryContext::try_new(
-            Principal {
-                id: wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: wyrd_runtime::PrincipalKind::User,
-                tenant_id: tenant,
-                roles: Vec::new(),
+            Principal::new(
+                wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7()),
+                wyrd_runtime::PrincipalKind::User,
+                tenant,
+                Vec::new(),
                 effective_permissions,
-                credential_id: None,
-            },
+            ),
             tenant,
             RequestId::now_v7(),
             None,

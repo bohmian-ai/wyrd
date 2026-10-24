@@ -571,7 +571,10 @@ async fn subject_actor_rows_and_reserved_columns() {
         .await
         .expect("A's token exchanges");
     let delegated = deployment
-        .client(b_key.expose_secret())
+        .rooted(
+            b_key.expose_secret(),
+            b.card_ref().expect("B has its fixture root"),
+        )
         .on_behalf_of(
             secrecy::SecretString::from(subject),
             wyrd_spec::auth::TokenAudience::Bifrost,

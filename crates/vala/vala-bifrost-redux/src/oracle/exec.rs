@@ -3586,14 +3586,13 @@ pub(super) mod tests {
         tenant: wyrd_spec::DataTenantId,
         live_routes: Option<crate::oracle::live::LiveTableRoutes>,
     ) -> (OracleTableProvider, RecordBatch) {
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: wyrd_runtime::PrincipalKind::User,
-            tenant_id: tenant,
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::default(),
-            credential_id: None,
-        };
+        let principal = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            wyrd_runtime::PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            PermissionSet::default(),
+        );
         let context = AuthorizedQueryContext::try_new(
             principal,
             tenant,

@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 use reqwest::Method;
 use url::Url;
 use wyrd_spec::auth::{CreateWorkloadBindingRequest, IssuerUrl, WorkloadBindingView};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::CardUid;
 
 use crate::error::WyrdCliError;
 
@@ -34,9 +34,13 @@ pub struct AddArgs {
     /// Optional audience constraint.
     #[arg(long, value_name = "AUD")]
     pub audience: Option<String>,
-    /// Card the bound workload acts as (Kind/name@version[#uid]).
-    #[arg(long, value_name = "CARD_REF")]
-    pub card: String,
+    /// Active Service account the bound workload authenticates as.
+    #[arg(long, value_name = "UUID")]
+    pub principal: String,
+    /// Optional default workload root (a Service Card uid) selected
+    /// when the assertion exchange names none.
+    #[arg(long, value_name = "CARD_UID")]
+    pub workload_uid: Option<CardUid>,
     /// Wyrd server base URL. The credential is read from the ambient chain
     /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
     /// `credentials.toml`), never from an argument.
@@ -79,7 +83,7 @@ pub struct RmArgs {
 /// Run one `wyrd auth workload-binding` subcommand.
 ///
 /// # Errors
-/// Returns the selected operation's error: an invalid card ref or issuer URL,
+/// Returns the selected operation's error: an invalid principal id or issuer URL,
 /// a client-construction failure, or the server's stable Wyrd error.
 pub async fn dispatch(command: WorkloadBindingCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
@@ -89,18 +93,16 @@ pub async fn dispatch(command: WorkloadBindingCommand) -> Result<ExitCode, WyrdC
     }
 }
 
-/// Bind one issuer subject to a card, so its workload token authenticates.
+/// Bind one issuer subject to a Service account, so its workload token
+/// authenticates.
 ///
 /// # Errors
-/// Returns [`WyrdCliError::InvalidArgument`] for a malformed card ref or issuer
+/// Returns [`WyrdCliError::InvalidArgument`] for a malformed principal id or issuer
 /// URL, a client-construction error for a rejected endpoint, and the server's
 /// stable Wyrd error when the caller is unauthorized or the issuer is untrusted.
 async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
-    // Validate the card ref and issuer locally, before any HTTP call.
-    let card_ref: CardRef = args
-        .card
-        .parse()
-        .map_err(|error| invalid("card", &args.card, &format!("a card ref: {error}")))?;
+    // Validate the principal and issuer locally, before any HTTP call.
+    let principal_id = crate::principal::credential::principal_id(&args.principal)?;
     let issuer: IssuerUrl = args
         .issuer
         .parse()
@@ -114,7 +116,8 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
                 issuer,
                 subject: args.subject,
                 audience: args.audience,
-                card_ref,
+                principal_id,
+                workload_uid: args.workload_uid,
             }),
         )
         .await
@@ -125,7 +128,10 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
     if let Some(ref aud) = view.audience {
         println!("audience:{aud}");
     }
-    println!("card_ref:{}", view.card_ref);
+    println!("principal_id: {}", view.principal_id);
+    if let Some(ref uid) = view.workload_uid {
+        println!("workload_uid: {uid}");
+    }
 
     Ok(ExitCode::SUCCESS)
 }
@@ -156,7 +162,7 @@ async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
     for view in &views {
         println!(
             "{} / {} \u{2192} {}",
-            view.issuer, view.subject, view.card_ref
+            view.issuer, view.subject, view.principal_id
         );
     }
 
@@ -216,6 +222,11 @@ mod tests {
         command: WorkloadBindingCommand,
     }
 
+    /// `add` parses with its required `--issuer`, `--subject`, `--principal`,
+    /// and `--server` arguments.
+    ///
+    /// # Panics
+    /// Panics when the complete argument list fails to parse.
     #[test]
     fn add_parses_required_args() {
         let parsed = Cli::try_parse_from([
@@ -225,16 +236,20 @@ mod tests {
             "https://idp.example.com",
             "--subject",
             "system:ci-runner",
-            "--card",
-            "prod/service/my-svc@1.0.0",
+            "--principal",
+            "00000000-0000-7000-8000-000000000001",
             "--server",
             "https://acme.wyrd.cloud",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
     }
 
+    /// `add` refuses an argument list that omits `--principal`.
+    ///
+    /// # Panics
+    /// Panics when the list without `--principal` parses.
     #[test]
-    fn add_requires_card() {
+    fn add_requires_principal() {
         let parsed = Cli::try_parse_from([
             "wyrd",
             "add",
@@ -245,9 +260,13 @@ mod tests {
             "--server",
             "https://acme.wyrd.cloud",
         ]);
-        assert!(parsed.is_err(), "must require --card");
+        assert!(parsed.is_err(), "must require --principal");
     }
 
+    /// `add` refuses an argument list that omits `--subject`.
+    ///
+    /// # Panics
+    /// Panics when the list without `--subject` parses.
     #[test]
     fn add_requires_subject() {
         let parsed = Cli::try_parse_from([
@@ -255,14 +274,20 @@ mod tests {
             "add",
             "--issuer",
             "https://idp.example.com",
-            "--card",
-            "prod/service/my-svc@1.0.0",
+            "--principal",
+            "00000000-0000-7000-8000-000000000001",
             "--server",
             "https://acme.wyrd.cloud",
         ]);
         assert!(parsed.is_err(), "must require --subject");
     }
 
+    /// `add` accepts an optional `--audience` and carries its value into the
+    /// parsed arguments.
+    ///
+    /// # Panics
+    /// Panics when the list fails to parse, parses to another subcommand, or
+    /// the audience is not `myapp`.
     #[test]
     fn add_accepts_optional_audience() {
         let parsed = Cli::try_parse_from([
@@ -274,8 +299,8 @@ mod tests {
             "system:ci-runner",
             "--audience",
             "myapp",
-            "--card",
-            "prod/service/my-svc@1.0.0",
+            "--principal",
+            "00000000-0000-7000-8000-000000000001",
             "--server",
             "https://acme.wyrd.cloud",
         ]);
@@ -288,10 +313,14 @@ mod tests {
         }
     }
 
+    /// A malformed principal id is refused at dispatch, before any HTTP call,
+    /// and a malformed default workload uid is refused by the parser.
+    ///
+    /// # Panics
+    /// Panics when either malformed value is accepted.
     #[test]
-    fn invalid_card_ref_fails_parse_before_http() {
-        // Clap accepts any string for --card; the rejection is at dispatch time,
-        // before any HTTP call. Confirm that the parse of the card ref itself fails.
+    fn malformed_principal_and_workload_uid_fail_before_http() {
+        assert!(crate::principal::credential::principal_id("not-a-uuid").is_err());
         let parsed = Cli::try_parse_from([
             "wyrd",
             "add",
@@ -299,23 +328,14 @@ mod tests {
             "https://idp.example.com",
             "--subject",
             "system:ci-runner",
-            "--card",
-            "not-a-valid-card-ref",
+            "--principal",
+            "00000000-0000-7000-8000-000000000001",
+            "--workload-uid",
+            "not-a-card-uid",
             "--server",
             "https://acme.wyrd.cloud",
         ]);
-        // Clap itself accepts any string; dispatch() validates and rejects before HTTP.
-        assert!(
-            parsed.is_ok(),
-            "clap parses string args without card validation"
-        );
-        match parsed.unwrap().command {
-            WorkloadBindingCommand::Add(args) => {
-                let result: Result<wyrd_spec::reference::CardRef, _> = args.card.parse();
-                assert!(result.is_err(), "invalid card ref must fail FromStr parse");
-            }
-            _ => panic!("expected Add"),
-        }
+        assert!(parsed.is_err(), "a malformed --workload-uid must not parse");
     }
 
     /// `list` parses with only `--server` and leaves the issuer and subject

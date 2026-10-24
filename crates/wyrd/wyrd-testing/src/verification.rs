@@ -23,7 +23,6 @@ use wyrd_spec::registry::DeclarationOperationId;
 use wyrd_spec::verification::execution::{InputDeclaration, VerificationRequest};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewDeclarationOperation, insert_card_row, insert_declaration_operation,
-    upsert_service_account_from_card,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::verification::{
@@ -130,8 +129,8 @@ impl VerificationFixture {
         self.system_principal
     }
 
-    /// Register one active Service Card named `name` and project its
-    /// principal; returns the Card UID and the owner principal.
+    /// Register one active Service Card named `name` and seed its family's
+    /// runtime account; returns the Card UID and that owner account.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when a write fails.
@@ -139,19 +138,60 @@ impl VerificationFixture {
         &self,
         name: &str,
     ) -> Result<(CardUid, PrincipalId), VerificationFixtureError> {
-        let card = card("Service", name, &serde_json::json!({}))?;
+        self.release(name, "1.0.0").await
+    }
+
+    /// Register one active `version` of the Service Card named `name` and
+    /// seed or reuse its family's runtime account, so releases of one family
+    /// share that account; returns the Card UID and the account.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when a write fails.
+    pub async fn release(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<(CardUid, PrincipalId), VerificationFixtureError> {
+        self.release_with(name, version, &serde_json::json!({}))
+            .await
+    }
+
+    /// Register one active `1.0.0` Service Card named `name` with `spec`, such
+    /// as one whose `verified_by` and component bindings a test exercises,
+    /// and seed or reuse its family's runtime account; returns the Card UID
+    /// and that account.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when `spec` is not a Service spec
+    /// or a write fails.
+    pub async fn service_with(
+        &self,
+        name: &str,
+        spec: &Value,
+    ) -> Result<(CardUid, PrincipalId), VerificationFixtureError> {
+        self.release_with(name, "1.0.0", spec).await
+    }
+
+    /// [`Self::release`] with an explicit Service `spec`.
+    async fn release_with(
+        &self,
+        name: &str,
+        version: &str,
+        spec: &Value,
+    ) -> Result<(CardUid, PrincipalId), VerificationFixtureError> {
+        let card = card("Service", name, version, spec)?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let uid = self.insert(&mut conn, &card).await?;
-        let principal = upsert_service_account_from_card(
+        let principal = crate::server::family_account(
             &mut conn,
-            &uid,
-            &card,
-            Attribution::direct(self.actor.id),
+            &card.kind,
+            &card.metadata.name,
+            self.actor.id.as_uuid(),
         )
         .await
         .map_err(|error| VerificationFixtureError::Card(error.to_string()))?;
         conn.commit().await?;
-        Ok((uid, principal))
+        Ok((uid, PrincipalId::new(principal)))
     }
 
     /// Register one active Custom Drift Verifier Card named `name` whose
@@ -219,7 +259,22 @@ impl VerificationFixture {
         name: &str,
         spec: &Value,
     ) -> Result<CardUid, VerificationFixtureError> {
-        let card = card("Verifier", name, spec)?;
+        self.declare("Verifier", name, spec).await
+    }
+
+    /// Register one active `1.0.0` Card of `kind` named `name` with `spec`,
+    /// such as an Agent a Service component references.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when `spec` is not a `kind` spec
+    /// or a write fails.
+    pub async fn declare(
+        &self,
+        kind: &str,
+        name: &str,
+        spec: &Value,
+    ) -> Result<CardUid, VerificationFixtureError> {
+        let card = card(kind, name, "1.0.0", spec)?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let uid = self.insert(&mut conn, &card).await?;
         conn.commit().await?;
@@ -254,6 +309,7 @@ impl VerificationFixture {
         let data = card(
             "Data",
             &format!("{name}-baseline"),
+            "1.0.0",
             &serde_json::json!({
                 "interface": { "kind": "Pandas",
                                "meta": { "framework_version": "2.2.2", "compression": "Snappy" } },
@@ -293,7 +349,7 @@ impl VerificationFixture {
         name: &str,
         spec: &Value,
     ) -> Result<CardUid, VerificationFixtureError> {
-        let card = card("Operator", name, spec)?;
+        let card = card("Operator", name, "1.0.0", spec)?;
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let uid = self.insert(&mut conn, &card).await?;
         conn.commit().await?;
@@ -349,14 +405,19 @@ impl VerificationFixture {
             .ok_or_else(|| VerificationFixtureError::Card("no binding projected".to_owned()))
     }
 
-    /// Record a qualifying machine authentication of `owner`, which activates
-    /// its bindings and arms their schedule cursors at database time.
+    /// Record a qualifying machine authentication of `owner` at `root`, which
+    /// activates the root's bindings and arms their schedule cursors at
+    /// database time.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when the write fails.
-    pub async fn activate(&self, owner: PrincipalId) -> Result<(), VerificationFixtureError> {
+    pub async fn activate(
+        &self,
+        owner: PrincipalId,
+        root: &CardUid,
+    ) -> Result<(), VerificationFixtureError> {
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
-        record_machine_authentication(&mut conn, owner).await?;
+        record_machine_authentication(&mut conn, owner, root).await?;
         conn.commit().await?;
         Ok(())
     }
@@ -507,6 +568,7 @@ impl VerificationFixture {
                 group_id: None,
                 inputs,
                 execution_route_overrides: BTreeMap::new(),
+                deployment_environment: None,
             },
             None,
             None,
@@ -619,16 +681,21 @@ impl VerificationFixture {
     }
 }
 
-/// Build one `kind` Card named `name` at version 1.0.0 with `spec`.
+/// Build one `kind` Card named `name` at `version` with `spec`.
 ///
 /// # Errors
 /// Returns [`VerificationFixtureError::Card`] when the fixture JSON does not
 /// deserialize as a Card.
-fn card(kind: &str, name: &str, spec: &Value) -> Result<Card, VerificationFixtureError> {
+fn card(
+    kind: &str,
+    name: &str,
+    version: &str,
+    spec: &Value,
+) -> Result<Card, VerificationFixtureError> {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "wyrd/v1",
         "kind": kind,
-        "metadata": { "name": name, "version": "1.0.0" },
+        "metadata": { "name": name, "version": version },
         "spec": spec,
         "relationships": { "outbound": [], "inbound": [] }
     }))

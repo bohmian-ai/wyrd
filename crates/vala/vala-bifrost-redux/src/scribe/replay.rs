@@ -2096,6 +2096,14 @@ mod tests {
     /// digest authenticates the single recovered slice, and the recovered Arrow
     /// payload must still carry the nested canonical columns and exactly the
     /// accepted rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projection fails or does not accept two of three spans
+    /// with nested columns, the durable append or replay fails, replay does not
+    /// yield exactly one fence and append meta for the batch with a non-zero
+    /// digest and the producing request id, or the recovered-slice,
+    /// idempotent-replay, or truncated-Arrow checks fail.
     #[tokio::test]
     async fn nested_accepted_subset_replays_one_fence_and_digest() {
         use crate::contracts::Scribe;
@@ -2138,14 +2146,13 @@ mod tests {
         let table = TableRef::new(crate::namespaces::BifrostNamespace::Traces, "spans");
         let temp_dir = TempDir::new().expect("temp dir");
         let scribe = embedded_scribe(temp_dir.path());
-        let principal = wyrd_runtime::Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: wyrd_runtime::PrincipalKind::User,
-            tenant_id: tenant,
-            roles: Vec::new(),
-            effective_permissions: wyrd_runtime::PermissionSet::new(),
-            credential_id: None,
-        };
+        let principal = wyrd_runtime::Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            wyrd_runtime::PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            wyrd_runtime::PermissionSet::new(),
+        );
         let request_id = RequestId::now_v7();
         let fence_request_id = request_id.clone();
         let batch_id = uuid::Uuid::now_v7();

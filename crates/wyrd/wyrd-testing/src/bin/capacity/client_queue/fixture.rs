@@ -2,20 +2,22 @@
 //! application would through the public client.
 //!
 //! The administrator registers a Service whose one component is a Model
-//! bound to the Window Verifier that routes its Drift samples, issues the Service its Card-bound key, and hydrates the bundle the
-//! application's `WyrdState` loads offline. Registration gives the Service
-//! principal the `workload` role, so its key emits Drift observations; the
+//! bound to the Window Verifier that routes its Drift samples, creates the
+//! Service family's runtime account holding `workload`, and hydrates the
+//! bundle the application's `WyrdState` loads offline. The account's key,
+//! run as the registered Service root, emits Drift observations; the
 //! administrator reads them back through Bifrost.
 
 use std::path::{Path, PathBuf};
 
-use reqwest::Method;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use wyrd_client::cards::{BundleMode, CardGraphPuller, CardSelector, Cards};
 use wyrd_client::config::ClientConfig;
-use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
-use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse};
+use wyrd_client::{Bifrost, GlobalConfig, Principals, WyrdClient};
+use wyrd_spec::auth::{
+    CreateServicePrincipalRequest, WorkloadFamily, WorkloadKind, WorkloadRestriction,
+};
 use wyrd_testing::release_server::{SERVER_URL, SetupTenant};
 
 use crate::client_queue::Result;
@@ -50,7 +52,8 @@ const SERVICE: &str = "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: in
 pub struct Tenant {
     /// Tenant administrator credential: reads the durable rows back.
     admin_key: SecretString,
-    /// The Service's Card-bound API key the emitting application presents.
+    /// The Service family runtime account's API key the emitting
+    /// application presents; its `WyrdState` runs as the bundle's root.
     service_key: SecretString,
     /// Hydrated Service bundle every emitting `WyrdState` loads offline.
     pub bundle: PathBuf,
@@ -65,7 +68,7 @@ struct Count {
 
 impl Tenant {
     /// Registers the Model and Service for `setup`'s tenant under `root`,
-    /// issues the Service key, and hydrates its bundle.
+    /// creates the Service family's runtime account, and hydrates its bundle.
     ///
     /// # Errors
     ///
@@ -79,16 +82,17 @@ impl Tenant {
         let admin = connect(&setup.api_key, None)?;
         let cards = Cards::connect_with(&admin).await?;
         let service = Box::pin(cards.declare_from_path(&root.join("service.yaml"))).await?;
-        let issued: IssueKeyResponse = admin
-            .request_json(
-                Method::POST,
-                "/auth/issue-key",
-                Some(&IssueKeyRequest {
-                    card_ref: service.root.clone(),
-                    label: Some("bifrost-client-queue".to_owned()),
-                    expires_in_seconds: None,
-                }),
-            )
+        let issued = Principals::connect_with(&admin)
+            .await?
+            .create_service_principal(&CreateServicePrincipalRequest {
+                name: "bifrost-client-queue".to_owned(),
+                roles: vec!["workload".to_owned()],
+                description: None,
+                workload_restriction: Some(WorkloadRestriction::Family(WorkloadFamily {
+                    kind: WorkloadKind::Service,
+                    name: service.root.name.clone(),
+                })),
+            })
             .await?;
         let bundle = root.join("bundle");
         Box::pin(CardGraphPuller::new(cards.registry_context()).pull(
@@ -99,7 +103,7 @@ impl Tenant {
         .await?;
         Ok(Self {
             admin_key: SecretString::from(setup.api_key.expose_secret().to_owned()),
-            service_key: SecretString::from(issued.key.expose().to_owned()),
+            service_key: SecretString::from(issued.credential.expose().to_owned()),
             bundle,
         })
     }

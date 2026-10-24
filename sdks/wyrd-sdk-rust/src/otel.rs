@@ -4,7 +4,8 @@
 //! Each factory builds the stock `opentelemetry-otlp` exporter for one signal,
 //! pointed at the client's server, with an HTTP client that asks the
 //! [`WyrdClient`] for its current access token on every export and sends it
-//! as `x-wyrd-access-token`. The token comes from the client's one shared
+//! as `x-wyrd-access-token`, beside the client's workload root, when it has
+//! one, as `x-wyrd-workload-uid`. The token comes from the client's one shared
 //! refresh path, so a long-lived exporter keeps working after any single
 //! access token expires; this module holds no token, cache, retry, or
 //! refresher of its own.
@@ -37,8 +38,9 @@ use wyrd_spec::error::WyrdError;
 /// Header the Wyrd OTLP collector reads the bearer from.
 const ACCESS_TOKEN_HEADER: &str = "x-wyrd-access-token";
 
-/// The provider [`start_telemetry`] installed, which every later call returns.
-static INSTALLED: OnceLock<SdkTracerProvider> = OnceLock::new();
+/// The provider [`start_telemetry`] installed and the pinned client of the
+/// state it exports as, which every later call for that state returns.
+static INSTALLED: OnceLock<(WyrdClient, SdkTracerProvider)> = OnceLock::new();
 
 /// The `tracing` pipeline [`start_telemetry`] installed for this process.
 #[derive(Clone, Debug)]
@@ -78,25 +80,34 @@ impl Telemetry {
 /// spans export, and only tracing is installed. The W3C trace-context
 /// propagator becomes the global propagator, so standard HTTP and gRPC
 /// instrumentation carries the caller's trace to the next service. A later
-/// call in the same process returns the installed pipeline.
+/// call for the same state, or a clone of it, returns the installed pipeline.
+/// Startup is a use of the state, fixing its configuration.
 ///
 /// # Errors
 /// Returns `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when the application
-/// already installed a global subscriber (add [`span_exporter`] to its own
-/// pipeline instead), the credential error when the state's client cannot
+/// already installed a global subscriber, or another state's pipeline is
+/// installed, so no span exports under the wrong Service (add each state's
+/// [`span_exporter`] to the application's own pipeline instead), the
+/// credential error when the state's client cannot
 /// resolve, and `WYRD_CLIENT_400_CONFIG_INVALID` when the exporter cannot be
 /// built, such as outside a Tokio runtime.
 pub fn start_telemetry(state: &WyrdState) -> Result<Telemetry, WyrdError> {
-    if let Some(provider) = INSTALLED.get() {
+    let client = state.client()?;
+    if let Some((installed, provider)) = INSTALLED.get() {
+        if !installed.shares_auth(client) {
+            return Err(WyrdError::SdkTelemetryProviderExists {
+                message: "another WyrdState's telemetry pipeline is already installed".to_owned(),
+                details: json!({ "root": state.root_ref() }),
+            });
+        }
         return Ok(Telemetry {
             provider: provider.clone(),
         });
     }
-    let exporter =
-        span_exporter(state.client()?).map_err(|error| WyrdError::ClientConfigInvalid {
-            message: format!("the telemetry span exporter cannot be built: {error}"),
-            details: json!({ "field": "telemetry" }),
-        })?;
+    let exporter = span_exporter(client).map_err(|error| WyrdError::ClientConfigInvalid {
+        message: format!("the telemetry span exporter cannot be built: {error}"),
+        details: json!({ "field": "telemetry" }),
+    })?;
     let provider = SdkTracerProvider::builder()
         .with_span_processor(RunCorrelation)
         .with_batch_exporter(exporter)
@@ -114,7 +125,7 @@ pub fn start_telemetry(state: &WyrdState) -> Result<Telemetry, WyrdError> {
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
-    let _ = INSTALLED.set(provider.clone());
+    let _ = INSTALLED.set((client.clone(), provider.clone()));
     Ok(Telemetry { provider })
 }
 
@@ -234,7 +245,8 @@ impl TokenHttpClient {
         })
     }
 
-    /// Send one export with a freshly obtained access token.
+    /// Send one export with a freshly obtained access token and the client's
+    /// workload root, when it has one.
     ///
     /// # Errors
     /// Returns the client's error when no token can be obtained, and the
@@ -249,6 +261,18 @@ impl TokenHttpClient {
             ACCESS_TOKEN_HEADER,
             format!("Bearer {}", token.expose()).try_into()?,
         );
+        if let Some(uid) = client.workload_uid() {
+            request.headers_mut().insert(
+                wyrd_spec::auth::WORKLOAD_UID_HEADER,
+                uid.as_str().try_into()?,
+            );
+        }
+        if let Some(environment) = client.deployment_environment() {
+            request.headers_mut().insert(
+                wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER,
+                environment.try_into()?,
+            );
+        }
         let response = http.execute(reqwest::Request::try_from(request)?).await?;
         let mut stock = Response::builder().status(response.status());
         if let Some(headers) = stock.headers_mut() {

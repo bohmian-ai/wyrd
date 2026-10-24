@@ -47,6 +47,7 @@ use wyrd_spec::verification::{
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
+use wyrd_sql::queries::verification::{BindingActivity, InactivityTimeout, binding_activity};
 use wyrd_sql::queries::verifier_executions::TerminalStatus;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::logs::LogCapture;
@@ -184,7 +185,7 @@ impl Harness {
             .await
             .expect("binding projects");
         self.seed
-            .activate(principal)
+            .activate(principal, &owner)
             .await
             .expect("owner activates");
         self.make_due(binding).await;
@@ -1523,26 +1524,34 @@ async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
 /// The `result_id` every row of one submitted result batch carries.
 ///
 /// # Panics
-/// Panics when the batch is not an Arrow IPC stream with a `result_id`
-/// column, or its rows name more than one result.
+/// Panics when [`sent_values`] does, or the batch's rows name more than one
+/// result.
 fn sent_result_id(sent: &SentBatch) -> String {
+    let mut ids = sent_values(sent, "result_id");
+    assert_eq!(ids.len(), 1, "one batch names one result: {ids:?}");
+    ids.pop_first().expect("one result identity")
+}
+
+/// The distinct rendered values of `column` across one submitted batch.
+///
+/// # Panics
+/// Panics when the batch is not an Arrow IPC stream with `column`.
+fn sent_values(sent: &SentBatch, column: &str) -> std::collections::BTreeSet<String> {
     let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&sent.bytes), None)
         .expect("a sent batch is an Arrow IPC stream");
-    let mut ids = std::collections::BTreeSet::new();
+    let mut values = std::collections::BTreeSet::new();
     for batch in reader {
         let batch = batch.expect("the stream decodes");
-        let column = batch
-            .column_by_name("result_id")
-            .expect("a result_id column");
+        let array = batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("a {column} column"));
         for row in 0..batch.num_rows() {
-            ids.insert(
-                arrow::util::display::array_value_to_string(column, row)
-                    .expect("result_id renders"),
+            values.insert(
+                arrow::util::display::array_value_to_string(array, row).expect("the value renders"),
             );
         }
     }
-    assert_eq!(ids.len(), 1, "one batch names one result: {ids:?}");
-    ids.pop_first().expect("one result identity")
+    values
 }
 
 /// An attempt whose result was staged but whose settlement never commits
@@ -1879,7 +1888,7 @@ async fn schedulers_create_one_run_per_occurrence_across_ticks_and_restart() {
         .expect("binding projects");
     harness
         .seed
-        .activate(principal)
+        .activate(principal, &owner)
         .await
         .expect("owner activates");
     harness.make_due(binding).await;
@@ -1988,7 +1997,7 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
         .expect("binding projects");
     harness
         .seed
-        .activate(principal)
+        .activate(principal, &owner)
         .await
         .expect("owner activates");
     harness.make_due(binding).await;
@@ -2070,7 +2079,7 @@ async fn scheduler_awaits_its_selected_commit_before_closing() {
         );
         harness
             .seed
-            .activate(principal)
+            .activate(principal, &owner)
             .await
             .expect("owner activates");
     }
@@ -3964,4 +3973,782 @@ async fn sustained_scribe_outage_caps_tenant_spans() {
         "a copy after recovery is accepted: {recovered:?}"
     );
     assert_eq!(lost_scribe_writes(&cluster), lost_after_recovery);
+}
+
+/// Send one request to `server` as `jwt`, with `body` as JSON when given,
+/// returning the status and the JSON body, `Null` when it is empty.
+///
+/// # Panics
+/// Panics when the request cannot be built, the route does not respond, or a
+/// non-empty body is not JSON.
+async fn send(
+    server: &WyrdTestServer,
+    jwt: &str,
+    method: axum::http::Method,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(body.map_or_else(axum::body::Body::empty, |body| {
+            axum::body::Body::from(body.to_string())
+        }))
+        .expect("request builds");
+    let response = server
+        .oneshot_authenticated(jwt, request)
+        .await
+        .expect("request responds");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body reads");
+    let body = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("response body is JSON")
+    };
+    (status, body)
+}
+
+/// The stored accepted authority of `execution` and its subject/actor pair.
+///
+/// # Panics
+/// Panics when the execution cannot be read.
+async fn stored_authority(
+    harness: &Harness,
+    execution: ExecutionId,
+) -> (serde_json::Value, (Uuid, Uuid)) {
+    let (authority, sub, act) = sqlx::query_as(
+        "SELECT authority, sub_principal_id, act_principal_id FROM wyrd.verifier_executions \
+         WHERE execution_id = $1",
+    )
+    .bind(execution.as_uuid())
+    .fetch_one(&harness.assertion)
+    .await
+    .expect("execution authority reads");
+    (authority, (sub, act))
+}
+
+/// A Service Card reference to `name` at `version`.
+///
+/// # Panics
+/// Panics when the reference does not decode.
+fn service_ref(name: &str, version: &str) -> wyrd_spec::reference::CardRef {
+    serde_json::from_value(serde_json::json!({
+        "kind": "Service", "name": name, "version": version
+    }))
+    .expect("Service reference decodes")
+}
+
+/// Accepted delegated authority is frozen at submission: live account and
+/// context changes never reach claim, retry, or restart.
+///
+/// A User holding `admin` delegates to the subject Service's family runtime
+/// account rooted at the subject, and that token enqueues one run while the
+/// subject is also a component of another owner's binding. The accepted
+/// snapshot is the subject/actor intersection: the actor's root and
+/// credential provenance, a Card scope that carries the subject but not an
+/// unrelated Service (whose enqueue is refused), and none of the User's
+/// excess admin wildcard. The first attempt retries; the runtime stops; the
+/// actor loses its role, its family restriction, and its key; a fresh
+/// runtime reclaims and completes the run. The stored authority and pair are
+/// byte-identical afterwards, and the published result's owner stays the
+/// accepted root rather than the shared component's other owner.
+///
+/// # Panics
+/// Panics when any route, fixture, or runtime step fails, the snapshot moves,
+/// excess authority is admitted, or the result owner swaps.
+#[tokio::test]
+async fn accepted_authority_survives_account_and_context_changes() {
+    let harness = Harness::start().await;
+    let server = &harness.server;
+    let (other, _) = harness
+        .seed
+        .service("elsewhere")
+        .await
+        .expect("other Service registers");
+    let (shared_owner, _) = harness
+        .seed
+        .service("shared-owner")
+        .await
+        .expect("shared owner registers");
+    harness
+        .seed
+        .bind_schedule(
+            &shared_owner,
+            &harness.subject,
+            &harness.verifier,
+            "0 2 * * *",
+            Vec::new(),
+        )
+        .await
+        .expect("the subject is a shared component");
+    let wyrd_testing::Bootstrap::User {
+        id: delegator,
+        jwt: user,
+    } = server
+        .bootstrap_user("delegator", &["admin"])
+        .await
+        .expect("delegator bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let wyrd_testing::Bootstrap::User { jwt: admin, .. } = server
+        .bootstrap_user("account-admin", &["admin"])
+        .await
+        .expect("admin bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let actor = server
+        .credential_registered_service(&service_ref("svc", "1.0.0"), &["editor"])
+        .await
+        .expect("the subject's family account is credentialed");
+    let wyrd_testing::Bootstrap::Machine {
+        id: account,
+        api_key,
+        ..
+    } = &actor
+    else {
+        panic!("credentialed Service returned a user principal");
+    };
+    let actor_jwt = server
+        .exchange_api_key_for_workload(api_key, &harness.subject)
+        .await
+        .expect("the actor exchanges at its root");
+    let delegated = server
+        .delegate(&user, &actor_jwt, wyrd_spec::auth::TokenAudience::Wyrd)
+        .await
+        .expect("the actor acts for the User");
+    let enqueue = |subject: &CardUid| {
+        serde_json::json!({
+            "verifier_card_uid": harness.verifier,
+            "card_uid": subject,
+            "inputs": {},
+        })
+    };
+    let post = axum::http::Method::POST;
+    let (code, problem) = send(
+        server,
+        &delegated,
+        post.clone(),
+        "/v1/verification/enqueue",
+        Some(enqueue(&other)),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    let script = EngineScript::default();
+    script.push(EngineOutcome::Retry(VerificationError {
+        code: "engine_unavailable".to_owned(),
+        message: "the engine did not respond".to_owned(),
+    }));
+    script.push(EngineOutcome::Completed(unscored_report()));
+    let runtime = harness.spawn(&Harness::limits(), &script);
+    let (code, accepted) = send(
+        server,
+        &delegated,
+        post,
+        "/v1/verification/enqueue",
+        Some(enqueue(&harness.subject)),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{accepted}");
+    let run: ExecutionId = accepted["execution_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| panic!("the run is accepted: {accepted}"));
+    harness
+        .wait_execution(run, |row| row.status == "retrying" && row.attempts == 1)
+        .await;
+    runtime.stop().await;
+
+    let snapshot = stored_authority(&harness, run).await;
+    assert_eq!(snapshot.1, (delegator.as_uuid(), account.as_uuid()));
+    let frozen: wyrd_runtime::AcceptedAuthority =
+        serde_json::from_value(snapshot.0.clone()).expect("the stored authority decodes");
+    assert_eq!(
+        (
+            frozen.principal.id,
+            frozen.principal.kind,
+            &frozen.principal.workload_uid
+        ),
+        (delegator, wyrd_runtime::PrincipalKind::User, &None)
+    );
+    let [step] = frozen.delegation_chain.as_slice() else {
+        panic!("one actor step: {:?}", frozen.delegation_chain);
+    };
+    assert_eq!(
+        (
+            step.principal.id,
+            step.principal.kind,
+            &step.principal.workload_uid
+        ),
+        (
+            *account,
+            wyrd_runtime::PrincipalKind::Service,
+            &Some(harness.subject.clone())
+        ),
+        "the actor's account and exact root are recorded"
+    );
+    let credential = step
+        .principal
+        .credential_id
+        .expect("the actor's non-secret credential provenance is recorded");
+    assert!(
+        matches!(
+            &frozen.principal.card_access,
+            wyrd_spec::auth::CardAccess::Scoped { cards }
+                if cards.contains(&harness.subject) && !cards.contains(&other)
+        ),
+        "{:?}",
+        frozen.principal.card_access
+    );
+    assert!(
+        !frozen
+            .principal
+            .effective_permissions
+            .iter()
+            .any(|permission| *permission == wyrd_runtime::Permission::wildcard()),
+        "the User's admin wildcard never passes the actor's roles"
+    );
+
+    server
+        .revoke_role(&actor, "editor")
+        .await
+        .expect("the actor's role is revoked");
+    let (code, body) = send(
+        server,
+        &admin,
+        axum::http::Method::PUT,
+        &format!("/v1/principals/{account}/workload-restriction"),
+        Some(serde_json::json!({ "mode": "unrestricted" })),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+    let (code, body) = send(
+        server,
+        &admin,
+        axum::http::Method::DELETE,
+        &format!("/v1/principals/{account}/credentials/{credential}"),
+        None,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::NO_CONTENT, "{body}");
+    assert!(
+        server.exchange_api_key(api_key).await.is_err(),
+        "the revoked key mints no new authority"
+    );
+
+    harness.expire(run).await;
+    let restarted = harness.spawn(&Harness::limits(), &script);
+    let row = harness.wait_execution(run, status("completed")).await;
+    restarted.stop().await;
+    assert_eq!(row.attempts, 2, "the restarted runtime reclaims the retry");
+    assert_eq!(
+        stored_authority(&harness, run).await,
+        snapshot,
+        "claim, retry, and restart reuse exactly the accepted snapshot"
+    );
+    let results = sent_to(&harness.fault, RESULTS).await;
+    let [result] = results.as_slice() else {
+        panic!("one result is published: {}", results.len());
+    };
+    assert_eq!(
+        sent_values(result, "owner_card_uid"),
+        std::collections::BTreeSet::from([harness.subject.to_string()]),
+        "the shared component's other owner never becomes the result owner"
+    );
+}
+
+/// Every recorded workload activity of the harness tenant as
+/// `(root, account)`, ordered.
+///
+/// # Panics
+/// Panics when the read fails.
+async fn activity(harness: &Harness) -> Vec<(Uuid, Uuid)> {
+    sqlx::query_as(
+        "SELECT workload_card_uid, principal_id FROM wyrd.workload_activity \
+         WHERE data_tenant_id = $1 ORDER BY 1, 2",
+    )
+    .bind(harness.seed.tenant().as_uuid())
+    .fetch_all(&harness.assertion)
+    .await
+    .expect("workload activity reads")
+}
+
+/// `binding`'s admission gate at database time under the default inactivity
+/// window.
+///
+/// # Panics
+/// Panics when the tenant connection or read fails, or the binding is unknown.
+async fn gate(harness: &Harness, binding: BindingId) -> BindingActivity {
+    let mut conn = harness
+        .server
+        .tenant_conn_for(harness.seed.tenant())
+        .await
+        .expect("tenant connection opens");
+    let gate = binding_activity(&mut conn, binding, InactivityTimeout::default())
+        .await
+        .expect("binding activity reads")
+        .expect("the binding exists");
+    conn.commit().await.expect("assertion transaction commits");
+    gate
+}
+
+/// Only the associated family account's own rooted key exchange activates a
+/// root, and only that exact root.
+///
+/// Two releases of one family share its runtime account, each with a
+/// scheduled binding. A User, an unrestricted Service, a delegation whose
+/// actor is another family's rooted account, and the family account's
+/// rootless exchange record no activity at either release. The account's
+/// exchange at the second release activates only it; the first stays gated
+/// until its own exchange, and a delegation by that rooted actor renews
+/// nothing. Reassociating the family to a new account closes the gate until
+/// the new account exchanges at the root, and two runtimes ticking the due
+/// occurrence create one run, accepted for the new account.
+///
+/// # Panics
+/// Panics when any fixture, route, or exchange step fails, a non-qualifying
+/// caller records activity, a gate opens for the wrong root or account, or
+/// the occurrence runs other than once.
+#[tokio::test]
+async fn only_associated_account_activity_activates_exact_root() {
+    let harness = Harness::start().await;
+    let server = &harness.server;
+    let (r1, account) = harness
+        .seed
+        .release("fam", "1.0.0")
+        .await
+        .expect("R1 registers");
+    let (r2, shared) = harness
+        .seed
+        .release("fam", "2.0.0")
+        .await
+        .expect("R2 registers");
+    assert_eq!(shared, account, "releases of one family share its account");
+    let mut bind = Vec::new();
+    for root in [&r1, &r2] {
+        bind.push(
+            harness
+                .seed
+                .bind_schedule(root, root, &harness.verifier, "0 2 * * *", Vec::new())
+                .await
+                .expect("binding projects"),
+        );
+    }
+    let (b1, b2) = (bind[0], bind[1]);
+    let machine = |bootstrap| match bootstrap {
+        wyrd_testing::Bootstrap::Machine { id, api_key, .. } => (id, api_key),
+        wyrd_testing::Bootstrap::User { .. } => panic!("expected a machine principal"),
+    };
+    let (id, key) = machine(
+        server
+            .credential_registered_service(&service_ref("fam", "1.0.0"), &["editor"])
+            .await
+            .expect("the family account is credentialed"),
+    );
+    assert_eq!(id, account);
+    let wyrd_testing::Bootstrap::User { jwt: user, .. } = server
+        .bootstrap_user("activity-admin", &["admin"])
+        .await
+        .expect("User bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let (_, unrestricted) = machine(
+        server
+            .bootstrap_service("activity-automation", &["editor"])
+            .await
+            .expect("unrestricted Service bootstraps"),
+    );
+    let (helper, _) = harness
+        .seed
+        .service("helper")
+        .await
+        .expect("helper registers");
+    let (helper_account, helper_key) = machine(
+        server
+            .credential_registered_service(&service_ref("helper", "1.0.0"), &["editor"])
+            .await
+            .expect("helper is credentialed"),
+    );
+
+    let (code, body) = send(server, &user, axum::http::Method::GET, "/v1/cards", None).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+    server
+        .exchange_api_key(&unrestricted)
+        .await
+        .expect("the unrestricted Service exchanges");
+    server
+        .exchange_api_key_for_workload(&unrestricted, &r1)
+        .await
+        .expect("the unrestricted Service may select another family's root");
+    let helper_jwt = server
+        .exchange_api_key_for_workload(&helper_key, &helper)
+        .await
+        .expect("helper exchanges at its own root");
+    let baseline = activity(&harness).await;
+    assert_eq!(baseline, vec![(helper.as_uuid(), helper_account.as_uuid())]);
+    server
+        .delegate(&user, &helper_jwt, wyrd_spec::auth::TokenAudience::Wyrd)
+        .await
+        .expect("helper acts for the User");
+    server
+        .exchange_api_key(&key)
+        .await
+        .expect("the family account exchanges rootless");
+    assert_eq!(
+        activity(&harness).await,
+        baseline,
+        "User, unrestricted, delegated, and rootless callers never activate"
+    );
+    for binding in [b1, b2] {
+        assert!(!gate(&harness, binding).await.active);
+    }
+
+    server
+        .exchange_api_key_for_workload(&key, &r2)
+        .await
+        .expect("the account exchanges at R2");
+    let (g1, g2) = (gate(&harness, b1).await, gate(&harness, b2).await);
+    assert!(g2.active && g2.principal_id == Some(account), "{g2:?}");
+    assert!(
+        !g1.active && g1.last_authenticated_at.is_none(),
+        "R2 activity never activates R1: {g1:?}"
+    );
+    let actor = server
+        .exchange_api_key_for_workload(&key, &r1)
+        .await
+        .expect("the account exchanges at R1");
+    let g1 = gate(&harness, b1).await;
+    assert!(g1.active && g1.principal_id == Some(account), "{g1:?}");
+    server
+        .delegate(&user, &actor, wyrd_spec::auth::TokenAudience::Wyrd)
+        .await
+        .expect("the rooted account acts for the User");
+    assert_eq!(
+        gate(&harness, b1).await.last_authenticated_at,
+        g1.last_authenticated_at,
+        "delegation never renews activity"
+    );
+
+    let (code, body) = send(
+        server,
+        &user,
+        axum::http::Method::PUT,
+        &format!("/v1/principals/{account}/workload-restriction"),
+        Some(serde_json::json!({ "mode": "unrestricted" })),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+    let (code, created) = send(
+        server,
+        &user,
+        axum::http::Method::POST,
+        "/v1/principals",
+        Some(serde_json::json!({
+            "name": "fam-runtime-next",
+            "roles": ["editor"],
+            "workload_restriction": { "mode": "family", "kind": "Service", "name": "fam" },
+        })),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{created}");
+    let successor: Uuid = created["principal_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("successor id");
+    let successor_key = secrecy::SecretString::from(
+        created["credential"]
+            .as_str()
+            .expect("the successor's credential is returned once")
+            .to_owned(),
+    );
+    let g1 = gate(&harness, b1).await;
+    assert!(
+        !g1.active && g1.principal_id.map(|id| id.as_uuid()) == Some(successor),
+        "the prior account's activity never carries to its successor: {g1:?}"
+    );
+    server
+        .exchange_api_key_for_workload(&key, &r1)
+        .await
+        .expect("the now-unrestricted prior account may still select the root");
+    assert!(
+        !gate(&harness, b1).await.active,
+        "the prior account never reactivates the root"
+    );
+    server
+        .exchange_api_key_for_workload(&successor_key, &r1)
+        .await
+        .expect("the successor exchanges at R1");
+    assert!(gate(&harness, b1).await.active);
+
+    harness.make_due(b1).await;
+    let replicas = [
+        harness.spawn(&Harness::limits(), &EngineScript::default()),
+        harness.spawn(&Harness::limits(), &EngineScript::default()),
+    ];
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while harness
+        .seed
+        .executions()
+        .await
+        .expect("executions read")
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the occurrence was never scheduled"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for replica in replicas {
+        replica.stop().await;
+    }
+    let runs: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT binding_id, sub_principal_id FROM wyrd.verifier_executions \
+         WHERE data_tenant_id = $1",
+    )
+    .bind(harness.seed.tenant().as_uuid())
+    .fetch_all(&harness.assertion)
+    .await
+    .expect("runs read");
+    assert_eq!(
+        runs,
+        vec![(b1.as_uuid(), successor)],
+        "concurrent claims accept one occurrence for the associated account"
+    );
+}
+
+/// A supplied deployment environment tag is carried unchanged from
+/// acceptance through restart to the stored result rows.
+///
+/// The root Service binds one Verifier and its Agent component another. Its
+/// runtime account, rooted at the Service, enqueues the Service-bound check
+/// with no tag, `prod`, and `staging`, and the Agent-bound check with
+/// `staging`; every one is accepted. An empty tag is refused with
+/// `WYRD_SPEC_400_VALIDATION` before any execution exists. The runtime stops
+/// with every accepted execution unfinished; a fresh runtime completes them,
+/// and status reads and the retained `execution_inputs` and `results` rows
+/// return each one's own subject and exactly its supplied tag.
+///
+/// # Panics
+/// Panics when the empty tag is accepted or leaves an execution, an accepted
+/// execution records another tag or subject, or recovery fails.
+#[tokio::test]
+async fn configured_service_context_survives_acceptance_and_restart() {
+    let harness = Harness::start().await;
+    let server = &harness.server;
+    let pinned = |kind: &str, name: &str, uid: &CardUid| serde_json::json!({ "kind": kind, "name": name, "version": "1.0.0", "uid": uid });
+    let service_check = harness
+        .seed
+        .declare("Verifier", "service-check", &serde_json::json!({
+            "requirements": [{ "id": "ok", "statement": "The Service answers.",
+                "check": { "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": 1 } }]
+        }))
+        .await
+        .expect("Service Verifier registers");
+    let agent_check = harness
+        .seed
+        .declare("Verifier", "agent-check", &serde_json::json!({
+            "requirements": [{ "id": "ok", "statement": "The Agent answers.",
+                "check": { "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": 1 } }]
+        }))
+        .await
+        .expect("Agent Verifier registers");
+    harness
+        .seed
+        .declare(
+            "Prompt",
+            "ask-prompt",
+            &serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+                "messages": [{ "role": "user", "content": "Answer." }],
+            }),
+        )
+        .await
+        .expect("Prompt registers");
+    let agent = harness
+        .seed
+        .declare(
+            "Agent",
+            "ask-agent",
+            &serde_json::json!({
+                "prompt": { "kind": "Prompt", "name": "ask-prompt", "version": "1.0.0" },
+                "execution_route": { "kind": "native" },
+            }),
+        )
+        .await
+        .expect("Agent registers");
+    let (service, _) = harness
+        .seed
+        .service_with("ask-service", &serde_json::json!({
+            "verified_by": [{
+                "verifier": pinned("Verifier", "service-check", &service_check),
+            }],
+            "components": [{
+                "alias": "ask",
+                "ref": pinned("Agent", "ask-agent", &agent),
+                "verified_by": [{ "verifier": pinned("Verifier", "agent-check", &agent_check) }],
+            }],
+        }))
+        .await
+        .expect("Service registers");
+    let account = server
+        .credential_registered_service(&service_ref("ask-service", "1.0.0"), &["editor"])
+        .await
+        .expect("the Service's family account is credentialed");
+    let wyrd_testing::Bootstrap::Machine { api_key, .. } = &account else {
+        panic!("credentialed Service returned a user principal");
+    };
+    let jwt = server
+        .exchange_api_key_for_workload(api_key, &service)
+        .await
+        .expect("the account exchanges at the Service root");
+    let enqueue = |verifier: &CardUid, subject: &CardUid, environment: Option<&str>| {
+        let mut body = serde_json::json!({
+            "verifier_card_uid": verifier, "card_uid": subject, "inputs": {},
+        });
+        if let Some(environment) = environment {
+            body["deployment_environment"] = environment.into();
+        }
+        body
+    };
+    let post = axum::http::Method::POST;
+    let before = harness.seed.executions().await.expect("executions read");
+    let (code, problem) = send(
+        server,
+        &jwt,
+        post.clone(),
+        "/v1/verification/enqueue",
+        Some(enqueue(&service_check, &service, Some(""))),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::BAD_REQUEST, "{problem}");
+    assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION");
+    assert_eq!(problem["details"]["field"], "deployment_environment");
+
+    let script = EngineScript::default();
+    script.hold();
+    for _ in 0..4 {
+        script.push(EngineOutcome::Completed(unscored_report()));
+    }
+    let runtime = harness.spawn(
+        &RuntimeLimits {
+            drain_grace: Duration::from_millis(300),
+            ..Harness::limits()
+        },
+        &script,
+    );
+    let mut accepted = Vec::new();
+    for (verifier, subject, supplied) in [
+        (&service_check, &service, None),
+        (&service_check, &service, Some("prod")),
+        (&service_check, &service, Some("staging")),
+        (&agent_check, &agent, Some("staging")),
+    ] {
+        let (code, body) = send(
+            server,
+            &jwt,
+            post.clone(),
+            "/v1/verification/enqueue",
+            Some(enqueue(verifier, subject, supplied)),
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{body}");
+        let run: ExecutionId = body["execution_id"]
+            .as_str()
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_else(|| panic!("the run is accepted: {body}"));
+        harness.wait_execution(run, |_| true).await;
+        accepted.push((run, subject.clone(), supplied));
+    }
+    let after = harness.seed.executions().await.expect("executions read");
+    assert_eq!(
+        after.len(),
+        before.len() + 4,
+        "the refusal leaves no execution"
+    );
+    runtime.stop().await;
+
+    for (run, subject, supplied) in &accepted {
+        let (environment, card_uid): (Option<String>, Uuid) = sqlx::query_as(
+            "SELECT deployment_environment, card_uid FROM wyrd.verifier_executions \
+             WHERE execution_id = $1",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(&harness.assertion)
+        .await
+        .expect("execution reads");
+        assert_eq!(
+            (environment.as_deref(), card_uid),
+            (*supplied, subject.as_uuid())
+        );
+        assert_ne!(
+            harness
+                .seed
+                .execution(*run)
+                .await
+                .expect("execution reads")
+                .status,
+            "completed",
+            "{run} is unfinished when the runtime stops"
+        );
+    }
+
+    script.release();
+    let restarted = harness.spawn(&Harness::limits(), &script);
+    for (run, ..) in &accepted {
+        harness.wait_execution(*run, status("completed")).await;
+    }
+    restarted.stop().await;
+    harness.durable_rows().await;
+    for (run, subject, supplied) in &accepted {
+        let (code, state) = send(
+            server,
+            &jwt,
+            axum::http::Method::GET,
+            &format!("/v1/verification/executions/{run}"),
+            None,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{state}");
+        assert_eq!(
+            state["result"]["deployment_environment"].as_str(),
+            *supplied,
+            "{state}"
+        );
+        assert_eq!(
+            state["result"]["subject"]["uid"],
+            subject.as_str(),
+            "{state}"
+        );
+        for table in ["execution_inputs", "results"] {
+            let stored = server
+                .retained_records(
+                    server.data_tenant_id(),
+                    format!(
+                        "SELECT deployment_environment FROM vala.verification.{table} \
+                         WHERE execution_id = '{run}'"
+                    ),
+                )
+                .await
+                .expect("stored rows read");
+            assert!(!stored.is_empty(), "{run} has a {table} row");
+            for row in stored {
+                assert_eq!(
+                    row,
+                    vec![supplied.map(str::to_owned)],
+                    "{table} row of {run}"
+                );
+            }
+        }
+    }
 }

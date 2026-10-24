@@ -5,6 +5,7 @@ from typing import Any
 from ..bifrost import TableConfig
 from ..cards import AgentCard, CardKind, CardRef, DataLoadArgs, ModelLoadArgs
 from ..client import WyrdClient
+from ..client._http_auth import HttpAuth
 from ..data import DataCard
 from ..model import ModelCard
 from ..observe import Run
@@ -221,6 +222,63 @@ class WyrdState:
                 application already installed its own tracer provider; add
                 ``wyrd.otel.span_exporter`` to it instead.
             ImportError: naming the ``otel`` extra when it is not installed.
+        """
+        ...
+
+    def configure(
+        self,
+        *,
+        service_name: str | None = None,
+        service_version: str | None = None,
+        deployment_environment: str | None = None,
+    ) -> None:
+        """Fix this state's Service release and deployment environment before first use.
+
+        Local, with no network IO. Omitted name and version default to the
+        loaded Service; an omitted environment defaults to a non-empty
+        ``WYRD_DEPLOYMENT_ENVIRONMENT``, else stays ``None``. Without a call,
+        the first Run, client, Bifrost, telemetry, or shutdown use applies the
+        same defaults. Another loaded state keeps its own configuration.
+
+        Args:
+            service_name: the loaded Service's name; must match it.
+            service_version: the loaded Service's exact version; must match it.
+            deployment_environment: the deployment environment correlation tag
+                copied onto rows; it never selects or refuses execution.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_409_STATE_CONFIG_FROZEN`` once configuration
+                is fixed, even after shutdown; ``WYRD_CLIENT_400_CONFIG_INVALID``
+                for an empty field or a mismatched name or version.
+        """
+        ...
+
+    @property
+    def deployment_environment(self) -> str | None:
+        """The configured deployment environment correlation tag, or ``None``; reading it fixes defaults."""
+        ...
+
+    @property
+    def http_auth(self) -> HttpAuth:
+        """An ``httpx.Auth`` / ``httpx2.Auth`` that authenticates to Wyrd in this state's context.
+
+        Hand it to stock provider clients created once, such as
+        ``openai.OpenAI(http_client=openai.DefaultHttpxClient(auth=state.http_auth))``.
+        Each request drops placeholder provider keys and carries a fresh
+        ``X-Wyrd-Access-Token``, the Service as ``x-wyrd-workload-uid``, the
+        configured ``x-wyrd-deployment-environment``, this state's innermost
+        active Run as ``wyrd-card-uid`` and ``wyrd-run-id`` (the Service and no
+        Run outside one), and the active W3C trace context unless the request
+        names its own ``traceparent``. The context is read when the request
+        starts, before any token refresh. Reading it fixes defaults and
+        resolves the client without network IO.
+
+        Raises:
+            WyrdError: ``WYRD_CLIENT_400_CONFIG_INVALID`` on a request whose
+                explicit identity header differs from that context, before it
+                is sent; the credential error when the client cannot resolve.
+            ImportError: naming the ``gateway`` extra when ``httpx`` or
+                ``httpx2`` is not installed.
         """
         ...
 

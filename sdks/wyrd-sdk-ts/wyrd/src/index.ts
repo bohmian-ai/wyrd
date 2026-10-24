@@ -1,5 +1,6 @@
 import type { Span as OtelSpan } from "@opentelemetry/api";
 import { DataType, Table, tableFromIPC, tableToIPC, type Field, type RecordBatch, type Schema } from "apache-arrow";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
@@ -80,6 +81,7 @@ import type {
   VerificationExecutionState as WireVerificationExecutionState,
   VerificationOutcome as WireVerificationOutcome,
   VerificationResult as WireVerificationResult,
+  WorkloadRestriction,
 } from "./card-types.js";
 
 import type {
@@ -233,6 +235,10 @@ export type {
   VerificationStatus,
   VerificationVerdict,
   VerifierSpec,
+  WorkloadKind,
+  WorkloadRestriction,
+  WorkloadRestrictionFamily,
+  WorkloadRestrictionUnrestricted,
 } from "./card-types.js";
 /** The JSON custom `data` a requirement carries when read without a type. */
 export type VerdictData = NonNullable<WireRequirementResult["data"]>;
@@ -1130,11 +1136,6 @@ export class Bifrost {
     this.#native = native;
   }
 
-  /** @internal Wrap one native handle; {@link Bifrost.connect} is the public constructor. */
-  static fromNative(native: NativeBifrost): Bifrost {
-    return new Bifrost(native);
-  }
-
   /**
    * Connect one client, optionally already bound to a write target.
    *
@@ -1585,17 +1586,25 @@ export class WyrdClient {
    * as-is (else `WYRD_ACCESS_TOKEN`, then `WYRD_WORKLOAD_TOKEN` with its
    * tenant, then `WYRD_API_KEY`, then a saved login). `grpcUrl`, the Bifrost
    * ingest endpoint (else `WYRD_GRPC_URL`, else the server's host on port
-   * `50051`).
+   * `50051`). `workloadUid`, the exact Service Card UID the client
+   * runs as, as {@link WyrdClient.forWorkload} selects it (else
+   * `WYRD_WORKLOAD_UID`, else rootless work).
    * @returns The client.
    * @throws {@link WyrdError}: `WYRD_CLIENT_401_NO_CREDENTIALS` when no
-   * credential resolves, and `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when a
+   * credential resolves, `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when a
    * `WYRD_TENANT` matches none of this server's saved logins or a saved login
-   * cannot be used.
+   * cannot be used, and `WYRD_SPEC_400_VALIDATION` when `workloadUid` is not
+   * a UUIDv7.
    */
   static connect(
-    options: { readonly serverUrl?: string; readonly credential?: string; readonly grpcUrl?: string } = {},
+    options: {
+      readonly serverUrl?: string;
+      readonly credential?: string;
+      readonly grpcUrl?: string;
+      readonly workloadUid?: string;
+    } = {},
   ): WyrdClient {
-    const result = connectWyrdClient(options.serverUrl, options.credential, options.grpcUrl);
+    const result = connectWyrdClient(options.serverUrl, options.credential, options.grpcUrl, options.workloadUid);
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
 
@@ -1610,6 +1619,35 @@ export class WyrdClient {
    */
   get grpcUrl(): string {
     return this.#native.grpcUrl;
+  }
+
+  /** The exact Service Card UID this client runs as, or `undefined` for rootless work. */
+  get workloadUid(): string | undefined {
+    return this.#native.workloadUid ?? undefined;
+  }
+
+  /** The deployment environment correlation tag requests carry, or `undefined`. */
+  get deploymentEnvironment(): string | undefined {
+    return this.#native.deploymentEnvironment ?? undefined;
+  }
+
+  /**
+   * Return a client that runs as the exact Service root `workloadUid`.
+   *
+   * The returned client shares this client's credential and connection pools
+   * but keeps its own token cache: an API key or workload token requests the
+   * root in its exchange and every renewal, and every request carries it as
+   * `x-wyrd-workload-uid`. No network call is made; the server validates the
+   * root on first use.
+   *
+   * @param workloadUid - The exact Service Card UID to run as.
+   * @returns The rooted client.
+   * @throws {@link WyrdError}: `WYRD_SPEC_400_VALIDATION` when `workloadUid`
+   * is not a UUIDv7.
+   */
+  forWorkload(workloadUid: string): WyrdClient {
+    const result = this.#native.forWorkload(workloadUid);
+    return new WyrdClient(nativeHandle(result.client, result.error));
   }
 
   /**
@@ -1636,8 +1674,9 @@ export class WyrdClient {
    * or an MCP transport against `/mcp`. Each request drops `authorization`,
    * `x-api-key`, and `x-goog-api-key`, which on a client wired to Wyrd hold
    * only a placeholder provider key, and carries this client's current access
-   * token as `X-Wyrd-Access-Token: Bearer <token>`. The token is read per
-   * request, so a long-lived client keeps working after any one token expires.
+   * token as `X-Wyrd-Access-Token: Bearer <token>`, plus `x-wyrd-workload-uid`
+   * when the client runs as a workload root. The token is read per request,
+   * so a long-lived client keeps working after any one token expires.
    *
    * @returns The authenticating `fetch`; a request rejects with the client's
    * {@link WyrdError} when the credential is missing or refused.
@@ -1647,6 +1686,8 @@ export class WyrdClient {
       const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
       for (const name of ["authorization", "x-api-key", "x-goog-api-key"]) headers.delete(name);
       headers.set("x-wyrd-access-token", `Bearer ${await this.accessToken()}`);
+      const workloadUid = this.workloadUid;
+      if (workloadUid !== undefined) headers.set("x-wyrd-workload-uid", workloadUid);
       return fetch(input, { ...init, headers });
     };
   }
@@ -1916,9 +1957,11 @@ export class Principals {
   }
 
   /**
-   * Create an unbound Service principal; requires `service_accounts:write`.
+   * Create a Service account; requires `service_accounts:write`, and a
+   * family `workload_restriction` also requires tenant administration.
    *
-   * @param request - The principal's name, Roles, and optional description.
+   * @param request - The account's name, Roles, optional description, and
+   * optional workload restriction (omitted means unrestricted).
    * @returns The principal id and its first credential.
    * @throws {@link WyrdError} for a malformed request or a transport or authorization failure.
    */
@@ -1929,7 +1972,7 @@ export class Principals {
   /**
    * Issue one more credential; requires `service_accounts:write`.
    *
-   * @param principalId - The Service or Agent principal.
+   * @param principalId - The Service account.
    * @returns The credential and its plaintext secret.
    * @throws {@link WyrdError} for an unknown principal or a transport or authorization failure.
    */
@@ -1968,6 +2011,20 @@ export class Principals {
    */
   async revokePrincipal(principalId: string, request: RevokePrincipalRequest): Promise<void> {
     lifecycleValue<null>(await this.#native.revokePrincipal(principalId, JSON.stringify(request)));
+  }
+
+  /**
+   * Replace a Service principal's workload restriction. A family restriction
+   * makes the account that family's one runtime account and requires tenant
+   * administration (`*`).
+   *
+   * @param principalId - The Service principal to restrict.
+   * @param restriction - `{ mode: "unrestricted" }` or a family restriction.
+   * @returns The principal with its new restriction.
+   * @throws {@link WyrdError} `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT` when the family already has a runtime account, or for an unknown principal or a transport or authorization failure.
+   */
+  async setWorkloadRestriction(principalId: string, restriction: WorkloadRestriction): Promise<PrincipalSummary> {
+    return lifecycleValue(await this.#native.setWorkloadRestriction(principalId, JSON.stringify(restriction)));
   }
 
   /**
@@ -2156,6 +2213,19 @@ function activeTraceContext(producerTable?: string | null): { traceparent: strin
 }
 
 nativeBinding.setTraceSource(activeTraceContext);
+
+/** One entered {@link Run.scope}: the state it was opened on and its subject and Run. */
+interface ScopedRun {
+  readonly state: WyrdState | undefined;
+  readonly cardUid: string;
+  readonly runId: string;
+}
+
+/** Every entered {@link Run.scope}, innermost last, across awaits. */
+const STATE_RUNS = new AsyncLocalStorage<readonly ScopedRun[]>();
+
+/** Identity headers a state-bound `httpAuth` owns; an explicit differing value conflicts. */
+const CONTEXT_HEADERS = ["x-wyrd-workload-uid", "wyrd-card-uid", "wyrd-run-id"] as const;
 
 /** The application's `@opentelemetry/api`, or `null` when it is not installed. */
 function otel(): typeof import("@opentelemetry/api") | null {
@@ -2478,14 +2548,17 @@ export class Observe {
  */
 export class Run {
   readonly #native: NativeRun;
+  /** The state this view was opened on, so only its `httpAuth` adopts the view. */
+  readonly #state: WyrdState | undefined;
 
-  private constructor(native: NativeRun) {
+  private constructor(native: NativeRun, state: WyrdState | undefined) {
     this.#native = native;
+    this.#state = state;
   }
 
-  /** @internal Unwrap one closed native open result. */
-  static fromOpen(open: NativeRunOpen): Run {
-    return new Run(nativeHandle(open.run, open.error));
+  /** @internal Unwrap one closed native open result of `state`. */
+  static fromOpen(open: NativeRunOpen, state?: WyrdState): Run {
+    return new Run(nativeHandle(open.run, open.error), state);
   }
 
   /** The UUIDv7 invocation identity this run and every view of it share. */
@@ -2515,26 +2588,30 @@ export class Run {
    * network IO occurs.
    */
   forCard(alias: string): Run {
-    return Run.fromOpen(this.#native.forCard(alias));
+    return Run.fromOpen(this.#native.forCard(alias), this.#state);
   }
 
   /**
    * Run `fn` inside this view's scope: spans started in it, across awaits,
    * carry this run and Card once {@link WyrdState.startTelemetry} installed
-   * telemetry. Without `@opentelemetry/api` it only calls `fn`.
+   * telemetry, and requests through the state's {@link WyrdState.httpAuth}
+   * carry this run and Card. Without `@opentelemetry/api` spans are untouched.
    *
    * @param fn - The work to scope.
    * @returns What `fn` returns.
    */
   scope<T>(fn: () => T): T {
-    const api = otel();
-    if (api === null) {
-      return fn();
-    }
-    const scoped = api.context
-      .active()
-      .setValue(api.createContextKey("wyrd.run_scope"), [this.#native.subjectUid, this.#native.runId]);
-    return api.context.with(scoped, fn);
+    const entry: ScopedRun = { state: this.#state, cardUid: this.#native.subjectUid, runId: this.#native.runId };
+    return STATE_RUNS.run([...(STATE_RUNS.getStore() ?? []), entry], () => {
+      const api = otel();
+      if (api === null) {
+        return fn();
+      }
+      const scoped = api.context
+        .active()
+        .setValue(api.createContextKey("wyrd.run_scope"), [this.#native.subjectUid, this.#native.runId]);
+      return api.context.with(scoped, fn);
+    });
   }
 }
 
@@ -2803,6 +2880,16 @@ function suppliedAttributes(supplied: Record<string, unknown>): Record<string, s
   }
   return attributes;
 }
+
+/** The explicit fields {@link WyrdState.configure} fixes; omitted ones default. */
+export type ConfigureOptions = {
+  /** The loaded Service's name; must match it. */
+  readonly serviceName?: string;
+  /** The loaded Service's exact version; must match it. */
+  readonly serviceVersion?: string;
+  /** The deployment environment correlation tag copied onto rows; it never selects or refuses execution. */
+  readonly deploymentEnvironment?: string;
+};
 
 /**
  * Offline view of a hydrated Card bundle over the shared Rust `WyrdState`.
@@ -3088,7 +3175,101 @@ export class WyrdState {
    * @throws {@link WyrdError} when `alias` is not registered in this bundle.
    */
   run(alias?: string): Run {
-    return Run.fromOpen(this.#native.run(alias));
+    return Run.fromOpen(this.#native.run(alias), this);
+  }
+
+  /**
+   * Fix this state's Service release and deployment environment before its
+   * first use. Local, with no network IO.
+   *
+   * Omitted `serviceName` and `serviceVersion` default to the loaded Service;
+   * an omitted `deploymentEnvironment` defaults to a non-empty
+   * `WYRD_DEPLOYMENT_ENVIRONMENT`, else stays `undefined`. Without a call, the
+   * first Run, client, Bifrost, telemetry, or shutdown use applies the same
+   * defaults. Another loaded state keeps its own configuration.
+   *
+   * @param options - The explicit name, version, and environment.
+   * @throws {@link WyrdError} `WYRD_SDK_409_STATE_CONFIG_FROZEN` once
+   * configuration is fixed, even after shutdown, or
+   * `WYRD_CLIENT_400_CONFIG_INVALID` for an empty field or a mismatched name
+   * or version.
+   */
+  configure(options: ConfigureOptions = {}): void {
+    lifecycleValue<null>(
+      this.#native.configure({
+        serviceName: options.serviceName,
+        serviceVersion: options.serviceVersion,
+        deploymentEnvironment: options.deploymentEnvironment,
+      }),
+    );
+  }
+
+  /** The configured deployment environment correlation tag, or `undefined`; reading it fixes defaults. */
+  get deploymentEnvironment(): string | undefined {
+    return lifecycleValue<string | null>(this.#native.deploymentEnvironment()) ?? undefined;
+  }
+
+  /**
+   * A `fetch` that authenticates every request to Wyrd as this state's client,
+   * in this state's context.
+   *
+   * Hand it to provider clients created once:
+   * `new OpenAI({ baseURL, apiKey: "wyrd", fetch: state.httpAuth })`. Each
+   * request carries what {@link WyrdClient.httpAuth} sends, plus the Service as
+   * `x-wyrd-workload-uid`, the configured `x-wyrd-deployment-environment`, this
+   * state's innermost {@link Run.scope} as `wyrd-card-uid` and `wyrd-run-id`
+   * (the Service and no Run outside one), and the active W3C trace context
+   * unless the request names its own `traceparent`. The context is read when
+   * the request starts, before any token refresh. Reading it fixes defaults
+   * and resolves the client without network IO.
+   *
+   * The deployment environment is a pass-through correlation tag, never an
+   * identity: the state's configured tag replaces an explicit one, and an
+   * unconfigured state sends the request's own tag, if any, unchanged.
+   *
+   * @returns The authenticating `fetch`; a request rejects with
+   * `WYRD_CLIENT_400_CONFIG_INVALID`, before it is sent, when an explicit
+   * identity header differs from that context, else as
+   * {@link WyrdClient.httpAuth} does.
+   * @throws {@link WyrdError} the credential error when the state's client
+   * cannot resolve.
+   */
+  get httpAuth(): typeof fetch {
+    const native = this.#native.client();
+    const auth = WyrdClient.fromNative(nativeHandle(native.client, native.error)).httpAuth;
+    const service = this.rootRef.uid ?? undefined;
+    const environment = this.deploymentEnvironment ?? undefined;
+    return async (input, init) => {
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      const run = STATE_RUNS.getStore()?.findLast((entry) => entry.state === this);
+      const context: Partial<Record<(typeof CONTEXT_HEADERS)[number], string>> = {
+        "x-wyrd-workload-uid": service,
+        "wyrd-card-uid": run?.cardUid ?? service,
+        "wyrd-run-id": run?.runId,
+      };
+      for (const name of CONTEXT_HEADERS) {
+        const explicit = headers.get(name);
+        if (explicit !== null && explicit !== context[name]) {
+          throw new WyrdError(
+            "WYRD_CLIENT_400_CONFIG_INVALID",
+            400,
+            "Client configuration is invalid",
+            `${name} ${JSON.stringify(explicit)} conflicts with the state-bound context; select the intended state or Run instead`,
+            "Correct the client configuration field named in details and rebuild the client.",
+            { header: name },
+          );
+        }
+        const value = context[name];
+        if (value !== undefined) headers.set(name, value);
+      }
+      if (environment !== undefined) headers.set("x-wyrd-deployment-environment", environment);
+      const trace = headers.has("traceparent") ? null : activeTraceContext();
+      if (trace !== null) {
+        headers.set("traceparent", trace.traceparent);
+        if (trace.tracestate !== undefined) headers.set("tracestate", trace.tracestate);
+      }
+      return auth(input, { ...init, headers });
+    };
   }
 
   /**

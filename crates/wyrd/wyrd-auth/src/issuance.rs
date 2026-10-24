@@ -22,11 +22,14 @@ use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef, VerifiedToken
 use wyrd_runtime::audit::AuditStage;
 use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef, UnrepresentableIntersection};
 use wyrd_spec::auth::{
-    Attribution, ExchangeTokenType, PrincipalKindTag, SecretBearer, TokenResponse, TokenType,
+    Attribution, CardAccess, ExchangeTokenType, FamilyRestriction, PrincipalKindTag, SecretBearer,
+    TokenResponse, TokenType, WorkloadFamily,
 };
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
+use wyrd_spec::vala::audit_detail::AuditDelegationStep;
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::queries::auth::{
     RoleRow, human_connection_is_active, insert_human_refresh_token, list_service_account_roles,
@@ -41,7 +44,7 @@ use wyrd_sql::{SqlError, TenantConn};
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event};
 use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_JWT_BEARER, issue_scope_error,
-    resolve_card_ref_scope, stage_scope_mint_success_audit,
+    resolve_workload_scope, stage_scope_mint_success_audit,
 };
 use crate::error::{auth_error_to_wyrd, store_error};
 use crate::exchange_api_key::{principal_kind_wire, role_refs};
@@ -114,13 +117,17 @@ impl ExchangedToken {
 ///
 /// Closed on purpose: these are the complete tenant issuance paths. The
 /// variant decides which principal table is read, the credential attribution,
-/// and the Card-scope mint kind — nothing else differs between paths.
+/// the selected workload root, and the Card-scope mint kind — nothing else
+/// differs between paths.
 #[derive(Debug)]
 pub enum TenantGrant {
     /// A verified tenant API key.
     ApiKey {
         /// The API-key row the holder presented.
         credential_id: Uuid,
+        /// Explicitly selected execution root, validated against the owning
+        /// account's restriction; `None` authenticates the account rootless.
+        workload_uid: Option<CardUid>,
     },
     /// A live browser session created with this API key, re-resolved on one
     /// request.
@@ -140,7 +147,11 @@ pub enum TenantGrant {
         consumed: Uuid,
     },
     /// A verified workload `jwt-bearer` assertion.
-    JwtBearer,
+    JwtBearer {
+        /// Root chosen by the explicit request UID, else the binding's pinned
+        /// default; `None` authenticates the mapped account rootless.
+        workload_uid: Option<CardUid>,
+    },
     /// An RFC 8693 exchange: the issued principal is the actor, who acts on
     /// behalf of the verified subject.
     ///
@@ -156,14 +167,24 @@ pub enum TenantGrant {
         /// actor's current permissions that this set also covers, so
         /// delegation can narrow authority but never amplify either party.
         subject_permissions: PermissionSet,
+        /// The subject's signed Card limit, intersected with the actor's
+        /// re-resolved root graph.
+        subject_card_access: CardAccess,
+        /// The subject's own signed root, kept unchanged in the new token.
+        subject_workload_uid: Option<CardUid>,
+        /// The root the actor's own direct token authenticated; the issuer
+        /// revalidates it under the actor's current restriction and never
+        /// selects another.
+        actor_workload_uid: CardUid,
         /// Earlier actors from the subject token, nested inside the new actor.
         prior_act: Option<Box<ActClaim>>,
         /// Audience the delegated token is issued for.
         audience: TokenAudience,
         /// Credential that authenticated the actor's token, when one did.
         ///
-        /// Audit-only: it attributes the exchange to the actor's credential and
-        /// never enters the delegated token.
+        /// Non-secret provenance: it attributes the exchange to the actor's
+        /// credential and travels as the actor layer's `cid`, never the
+        /// top-level one.
         actor_credential_id: Option<Uuid>,
     },
 }
@@ -177,21 +198,38 @@ impl TenantGrant {
     /// The stored credential the token is attributed to, when there is one.
     fn credential_id(&self) -> Option<Uuid> {
         match self {
-            Self::ApiKey { credential_id } | Self::BrowserRecovery { credential_id } => {
+            Self::ApiKey { credential_id, .. } | Self::BrowserRecovery { credential_id } => {
                 Some(*credential_id)
             }
             Self::Refresh { consumed } => Some(*consumed),
-            Self::OidcLogin | Self::JwtBearer | Self::Delegation { .. } => None,
+            Self::OidcLogin | Self::JwtBearer { .. } | Self::Delegation { .. } => None,
         }
     }
 
-    /// Whether this grant is a Card-bound owner's runtime activity.
+    /// The root the issued principal's own Card access is resolved under:
+    /// the direct grant's selection, or a delegation actor's authenticated
+    /// root. Human and browser-recovery grants select none.
+    fn selected_root(&self) -> Option<&CardUid> {
+        match self {
+            Self::ApiKey { workload_uid, .. } | Self::JwtBearer { workload_uid } => {
+                workload_uid.as_ref()
+            }
+            Self::Delegation {
+                actor_workload_uid, ..
+            } => Some(actor_workload_uid),
+            Self::OidcLogin | Self::Refresh { .. } | Self::BrowserRecovery { .. } => None,
+        }
+    }
+
+    /// Whether this grant, once it validates a root, is that root's runtime
+    /// activity for the account.
     ///
-    /// Only a machine's own durable-credential exchange — an API key or a
-    /// workload `jwt-bearer` assertion — proves the workload is running.
-    /// Delegation acts for another caller, and human grants bind no Card.
+    /// Only a machine's own direct durable-credential exchange — an API key
+    /// or a workload `jwt-bearer` assertion — proves a release is running.
+    /// Delegation acts for another caller, and human and browser grants
+    /// select no root.
     fn records_owner_activity(&self) -> bool {
-        matches!(self, Self::ApiKey { .. } | Self::JwtBearer)
+        matches!(self, Self::ApiKey { .. } | Self::JwtBearer { .. })
     }
 
     /// The Card-scope mint kind a Card-bound machine grant records; `None`
@@ -199,7 +237,7 @@ impl TenantGrant {
     fn scope_mint_kind(&self) -> Option<CardScopeMintKind> {
         match self {
             Self::ApiKey { .. } => Some(MINT_KIND_API_KEY_EXCHANGE),
-            Self::JwtBearer => Some(MINT_KIND_JWT_BEARER),
+            Self::JwtBearer { .. } => Some(MINT_KIND_JWT_BEARER),
             // The subject's Card scope was minted with its own token; the
             // exchange confers no new emit authority.
             Self::OidcLogin
@@ -209,46 +247,56 @@ impl TenantGrant {
         }
     }
 
-    /// Build the signed-token contents for `issued`, whose current `roles`
-    /// and `permissions` were just resolved.
+    /// Build the signed-token contents for `issued`, whose current `roles`,
+    /// `permissions`, and own Card `access` were just resolved.
     ///
-    /// Every grant but a delegation names `issued` with its own authority and
-    /// the `wyrd` audience. A delegation names the subject instead, carries
-    /// only the exact intersection of `issued`'s permissions with the
-    /// subject's, and records `issued` as the outermost actor over any earlier
-    /// actors. The actor is attribution only, so its Card scope stays out of
-    /// the token.
+    /// Every grant but a delegation names `issued` with its own authority,
+    /// its selected root, and the `wyrd` audience. A delegation names the
+    /// subject instead, keeps the subject's root, carries only the exact
+    /// intersections of `issued`'s permissions and Card access with the
+    /// subject's, and records `issued` — with its root and credential
+    /// provenance — as the outermost actor over any earlier actors.
     ///
     /// # Errors
     /// Returns [`IssuanceError::UnrepresentableDelegation`] when a
-    /// delegation's exact shared authority has no token representation; the
-    /// caller then signs nothing.
+    /// delegation's exact shared authority has no token representation, and
+    /// [`IssuanceError::Wyrd`] with [`WyrdError::WorkloadContextRequired`]
+    /// when the subject is a restricted account that has selected no root;
+    /// the caller then signs nothing.
     fn into_access_grant(
         self,
         issued: TokenPrincipalRef,
         roles: Vec<RoleRef>,
         permissions: PermissionSet,
+        access: CardAccess,
     ) -> Result<AccessGrant, IssuanceError> {
         let credential_id = self.credential_id();
+        let workload_uid = self.selected_root().cloned();
         Ok(match self {
             Self::Delegation {
                 subject,
                 subject_roles,
                 subject_permissions,
+                subject_card_access,
+                subject_workload_uid,
+                actor_workload_uid,
                 prior_act,
                 audience,
-                ..
+                actor_credential_id,
             } => AccessGrant {
                 principal: *subject,
                 roles: subject_roles,
                 permissions: permissions.intersection(&subject_permissions)?,
+                card_access: subject_card_access
+                    .intersection(&access)
+                    .ok_or_else(subject_context_required)?,
+                workload_uid: subject_workload_uid,
                 credential_id,
                 act: Some(Box::new(ActClaim {
                     sub: issued.id.to_string(),
-                    principal: TokenPrincipalRef {
-                        card_ref_scope: CardRefScope::default(),
-                        ..issued
-                    },
+                    principal: issued,
+                    workload_uid: actor_workload_uid,
+                    cid: actor_credential_id.map(|id| id.to_string()),
                     act: prior_act,
                 })),
                 audience,
@@ -257,12 +305,123 @@ impl TenantGrant {
                 principal: issued,
                 roles,
                 permissions,
+                card_access: access,
+                workload_uid,
                 credential_id,
                 act: None,
                 audience: TokenAudience::Wyrd,
             },
         })
     }
+}
+
+/// The refusal for delegating from a restricted subject that has selected no
+/// root: it holds no Card authority to delegate.
+fn subject_context_required() -> IssuanceError {
+    IssuanceError::Wyrd(WyrdError::workload_context_required(
+        "the subject token is restricted to one workload family and selected no root",
+    ))
+}
+
+/// A principal's resolved current authority, before any root is selected.
+struct ResolvedPrincipal {
+    /// The account reference the token names.
+    principal: TokenPrincipalRef,
+    /// Current role assignments.
+    roles: Vec<RoleRef>,
+    /// Union of the roles' current permissions.
+    permissions: PermissionSet,
+    /// The account's durable restriction; `None` when unrestricted or human.
+    restriction: Option<WorkloadFamily>,
+}
+
+/// The Card context a selected root, or its absence, yields.
+struct ResolvedContext {
+    /// The signed Card access of the issued principal itself.
+    access: CardAccess,
+    /// The root's resolved graph, for the scope-mint audit.
+    scope: Option<CardRefScope>,
+}
+
+impl ResolvedContext {
+    /// Resolve the context for `root` under `restriction`.
+    ///
+    /// A selected root must be usable and yields its exact graph as
+    /// `scoped`; without one a restricted account is `root_required` and any
+    /// other caller `any_registered`.
+    ///
+    /// # Errors
+    /// Every [`resolve_workload_scope`] refusal for a selected root.
+    async fn resolve(
+        conn: &mut TenantConn<'_>,
+        root: Option<&CardUid>,
+        restriction: Option<&WorkloadFamily>,
+    ) -> Result<Self, WyrdError> {
+        let Some(root) = root else {
+            return Ok(Self {
+                access: restriction.map_or(CardAccess::AnyRegistered, |family| {
+                    CardAccess::RootRequired {
+                        restriction: FamilyRestriction::Family(family.clone()),
+                    }
+                }),
+                scope: None,
+            });
+        };
+        let scope = resolve_workload_scope(conn, root, restriction).await?;
+        Ok(Self {
+            access: CardAccess::Scoped {
+                cards: scope
+                    .as_slice()
+                    .iter()
+                    .filter_map(|m| m.uid.clone())
+                    .collect(),
+            },
+            scope: Some(scope),
+        })
+    }
+}
+
+/// Narrow a verified bearer to the workload root its request selects.
+///
+/// Returns `None` when the bearer already signs exactly `root`, which leaves
+/// it unchanged. A rootless bearer's root is resolved under its signed Card
+/// access alone, never broader live grants: a `root_required` account's
+/// family must allow it, and any other access is intersected with the root's
+/// exact graph, so the selector only ever narrows. Identity, grants, and
+/// tenant never change, and no runtime activity is recorded.
+///
+/// # Errors
+/// Returns [`WyrdError::SignedWorkloadMismatch`] when the bearer pins another
+/// root, and every [`resolve_workload_scope`] refusal for `root`, unknown and
+/// foreign roots alike.
+pub async fn select_request_root(
+    conn: &mut TenantConn<'_>,
+    verified: &VerifiedToken,
+    root: &CardUid,
+) -> Result<Option<VerifiedToken>, WyrdError> {
+    if !wyrd_runtime::needs_root_resolution(&verified.principal, &verified.delegation_chain, root)?
+    {
+        return Ok(None);
+    }
+    let signed = &verified.principal.card_access;
+    let restriction = match signed {
+        CardAccess::RootRequired {
+            restriction: FamilyRestriction::Family(family),
+        } => Some(family),
+        CardAccess::AnyRegistered | CardAccess::Scoped { .. } => None,
+    };
+    let selected = ResolvedContext::resolve(conn, Some(root), restriction)
+        .await?
+        .access;
+    let access = signed.intersection(&selected).unwrap_or(selected);
+    Ok(Some(VerifiedToken {
+        principal: verified
+            .principal
+            .clone()
+            .with_card_access(access, Some(root.clone())),
+        delegation_chain: verified.delegation_chain.clone(),
+        exp: verified.exp,
+    }))
 }
 
 /// Tenant issuance refusal or failure.
@@ -423,22 +582,22 @@ impl TenantTokenIssuer {
     /// Reads, in the caller's transaction: whether the tenant admits
     /// credentials; the principal's current row (a user for human grants, a
     /// tenant machine principal otherwise), refusing anything not active; the
-    /// principal's current role assignments and those roles' permissions; and,
-    /// for a Card-bound principal, its transitive Card scope. It then signs a
-    /// token carrying that `PermissionSet` for the configured access TTL and
-    /// stages the canonical token-exchange audit (plus the Card-scope mint
-    /// audit for a Card-bound principal) on the process audit stage without waiting.
+    /// principal's current role assignments and those roles' permissions; and
+    /// its Card access: a selected root's exact graph under the account's
+    /// restriction, else rootless semantics. It then signs a token carrying
+    /// that authority for the configured access TTL and stages the canonical
+    /// token-exchange audit (plus the Card-scope mint audit for a selected
+    /// root) on the process audit stage without waiting.
     ///
     /// For a [`TenantGrant::Delegation`], `principal_id` is the actor: the
     /// token instead names the grant's subject as its principal, carries the
     /// intersection of the actor's current permissions with the subject's, and
     /// records the actor as its outermost `act`.
     ///
-    /// An API-key or workload `jwt-bearer` grant for a Card-bound Service or
-    /// Agent is that owner's runtime activity: it records the issuance time as
-    /// the principal's last authentication and arms the owner's still-unarmed
-    /// verification schedules. No other grant — delegation, OIDC login, human
-    /// refresh — and no Card-free principal touches activity.
+    /// An API-key or workload `jwt-bearer` grant that selects a root, by an
+    /// account that is that root family's runtime account, is the root's
+    /// runtime activity for the account. No other grant — delegation, OIDC
+    /// login, human refresh — and no rootless grant touches activity.
     ///
     /// Nothing is committed here; the caller commits or rolls back the grant
     /// whole.
@@ -462,28 +621,28 @@ impl TenantTokenIssuer {
         request_id: &str,
     ) -> Result<ExchangedToken, IssuanceError> {
         let tenant = conn.data_tenant_id();
-        let (principal, roles, permissions) = self
-            .resolve(
-                conn,
-                principal_id,
-                grant.is_human(),
-                grant.records_owner_activity(),
-            )
-            .await?;
+        let (principal, context) = self.authorize(conn, principal_id, &grant).await?;
         let expires_at = Utc::now() + self.settings.access_ttl;
-        let scope_mint = grant
-            .scope_mint_kind()
-            .zip(principal.card_ref.clone())
-            .map(|(kind, root)| (kind, root, principal.card_ref_scope.clone()));
-        let event = exchange_audit_event(&principal, &grant, expires_at, request_id);
+        let kind = principal.principal.kind;
+        let scope_root = context
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.as_slice().first().cloned());
+        let scope_mint = grant.scope_mint_kind().zip(context.scope);
+        let event = exchange_audit_event(&principal.principal, &grant, expires_at, request_id);
         let access_token = self
             .issuing_key
             .issue_access_token(
-                grant.into_access_grant(principal, roles, permissions)?,
+                grant.into_access_grant(
+                    principal.principal,
+                    principal.roles,
+                    principal.permissions,
+                    context.access,
+                )?,
                 self.settings.access_ttl,
             )
-            .map_err(|error| match &scope_mint {
-                Some((_, root, _)) => match issue_scope_error(error, root) {
+            .map_err(|error| match scope_root {
+                Some(root) => match issue_scope_error(error, &root) {
                     IssueErrorOrWyrd::Issue(error) => IssuanceError::Issue(error),
                     IssueErrorOrWyrd::Wyrd(error) => IssuanceError::Wyrd(error),
                 },
@@ -492,14 +651,14 @@ impl TenantTokenIssuer {
 
         // Two decisions, two records. The exchange says a grant was spent to
         // obtain a token and which credential; the scope mint says what emit
-        // authority the Card conferred.
+        // authority the selected root conferred.
         self.audit.stage(tenant, event);
-        if let Some((mint_kind, root, scope)) = scope_mint {
+        if let Some((mint_kind, scope)) = scope_mint {
             stage_scope_mint_success_audit(
                 &*self.audit,
                 tenant,
                 principal_id,
-                &root,
+                kind,
                 &scope,
                 request_id,
                 mint_kind,
@@ -520,7 +679,7 @@ impl TenantTokenIssuer {
     /// The per-request form of [`Self::issue`]: a caller that authenticates a
     /// durable credential on every request gets the [`VerifiedToken`] the
     /// exchanged token would have yielded, built from the same resolution and
-    /// claim shaping, with the same owner-activity side effect. Nothing is
+    /// claim shaping, with the same root-activity side effect. Nothing is
     /// signed, so no token-exchange or scope-mint audit is staged; the
     /// request's own permission checks record its decisions.
     ///
@@ -535,80 +694,105 @@ impl TenantTokenIssuer {
         principal_id: Uuid,
         grant: TenantGrant,
     ) -> Result<VerifiedToken, IssuanceError> {
-        let (principal, roles, permissions) = self
-            .resolve(
-                conn,
-                principal_id,
-                grant.is_human(),
-                grant.records_owner_activity(),
-            )
-            .await?;
-        let claims = self.issuing_key.access_claims(
-            grant.into_access_grant(principal, roles, permissions)?,
-            self.settings.access_ttl,
+        let (principal, context) = self.authorize(conn, principal_id, &grant).await?;
+        let access = grant.into_access_grant(
+            principal.principal,
+            principal.roles,
+            principal.permissions,
+            context.access,
         )?;
-        Ok(claims.into_verified().map_err(auth_error_to_wyrd)?)
+        self.verified(access)
     }
 
-    /// Recover the current authority of `principal_id`, the stored writer of
-    /// a durable record, for server work queued on its behalf.
+    /// Resolve the fresh authority a scheduled run of the exact `root` is
+    /// accepted under, as the family's runtime `account`.
     ///
-    /// The principal is read as a user when one has that id and as a service
-    /// account otherwise, then resolved exactly as [`Self::verify`] resolves
-    /// it — tenant admission, active status, current roles and permissions,
-    /// and a Card-bound principal's Card scope — so revoking a role or
-    /// suspending the principal takes effect for queued work too. Nothing is
-    /// presented, signed, or recorded: the result carries no credential and
-    /// no delegation, and no owner activity or audit is written.
+    /// The account is read as a Service account and resolved as
+    /// [`Self::verify`] resolves a direct grant — tenant admission, active
+    /// status, current roles and permissions — and `root` is revalidated
+    /// under the account's current restriction, yielding that root's exact
+    /// graph. Nothing is presented, signed, or recorded: the result carries no
+    /// credential and no delegation, and no activity or audit is written.
     ///
     /// # Errors
     /// Every [`Self::verify`] error except the activity write.
-    #[tracing::instrument(level = "debug", skip(self, conn), fields(principal_id = %principal_id), err)]
-    pub async fn recover(
+    #[tracing::instrument(level = "debug", skip(self, conn), fields(account = %account, root = %root), err)]
+    pub async fn scheduled(
         &self,
         conn: &mut TenantConn<'_>,
-        principal_id: Uuid,
+        account: Uuid,
+        root: &CardUid,
     ) -> Result<VerifiedToken, IssuanceError> {
-        let human = user_by_id(conn, principal_id).await?.is_some();
-        let (principal, roles, permissions) =
-            self.resolve(conn, principal_id, human, false).await?;
-        let claims = self.issuing_key.access_claims(
-            AccessGrant {
-                principal,
-                roles,
-                permissions,
-                credential_id: None,
-                act: None,
-                audience: TokenAudience::Wyrd,
-            },
-            self.settings.access_ttl,
-        )?;
+        let principal = self.resolve(conn, account, false).await?;
+        let context =
+            ResolvedContext::resolve(conn, Some(root), principal.restriction.as_ref()).await?;
+        self.verified(AccessGrant {
+            principal: principal.principal,
+            roles: principal.roles,
+            permissions: principal.permissions,
+            card_access: context.access,
+            workload_uid: Some(root.clone()),
+            credential_id: None,
+            act: None,
+            audience: TokenAudience::Wyrd,
+        })
+    }
+
+    /// Shape `access` into the [`VerifiedToken`] its signed token would yield.
+    ///
+    /// # Errors
+    /// [`IssuanceError::Issue`] when the claims are unrepresentable and
+    /// [`IssuanceError::Wyrd`] when they do not convert.
+    fn verified(&self, access: AccessGrant) -> Result<VerifiedToken, IssuanceError> {
+        let claims = self
+            .issuing_key
+            .access_claims(access, self.settings.access_ttl)?;
         Ok(claims.into_verified().map_err(auth_error_to_wyrd)?)
     }
 
-    /// Resolve `principal_id` — a user when `human`, else a service account —
-    /// with its current roles and permissions.
+    /// Resolve `principal_id` and the Card context `grant` selects, recording
+    /// root activity when the grant qualifies.
     ///
-    /// Refuses a tenant that does not admit credentials and a principal that
-    /// is missing or not active, resolves a Card-bound principal's Card scope,
-    /// and records owner activity when `records_activity` is set for a
-    /// Card-bound principal, which only a machine's own durable-credential
-    /// grant sets.
+    /// Activity is recorded only for a direct machine grant whose root
+    /// validated and whose account is that root family's runtime account, so
+    /// an unrestricted caller of another family's release never activates it.
     ///
     /// # Errors
     /// As [`Self::issue`], less the signing errors.
+    async fn authorize(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal_id: Uuid,
+        grant: &TenantGrant,
+    ) -> Result<(ResolvedPrincipal, ResolvedContext), IssuanceError> {
+        let principal = self.resolve(conn, principal_id, grant.is_human()).await?;
+        let root = grant.selected_root();
+        let context = ResolvedContext::resolve(conn, root, principal.restriction.as_ref()).await?;
+        if let Some(root) = root.filter(|_| grant.records_owner_activity()) {
+            record_machine_authentication(conn, principal.principal.id, root).await?;
+        }
+        Ok((principal, context))
+    }
+
+    /// Resolve `principal_id` — a user when `human`, else a service account —
+    /// with its current roles, permissions, and restriction.
+    ///
+    /// Refuses a tenant that does not admit credentials and a principal that
+    /// is missing or not active.
+    ///
+    /// # Errors
+    /// As [`Self::issue`], less the signing and Card-context errors.
     async fn resolve(
         &self,
         conn: &mut TenantConn<'_>,
         principal_id: Uuid,
         human: bool,
-        records_activity: bool,
-    ) -> Result<(TokenPrincipalRef, Vec<RoleRef>, PermissionSet), IssuanceError> {
+    ) -> Result<ResolvedPrincipal, IssuanceError> {
         let tenant = conn.data_tenant_id();
         if !tenant_admits_credentials(conn, tenant).await? {
             return Err(IssuanceError::TenantNotAdmitting);
         }
-        let (principal, role_names) = if human {
+        let (principal, restriction, role_names) = if human {
             let user = user_by_id(conn, principal_id)
                 .await?
                 .filter(|user| user.status == "active")
@@ -617,39 +801,36 @@ impl TenantTokenIssuer {
                 id: PrincipalId::new(user.id),
                 kind: PrincipalKindTag::User,
                 tenant_id: tenant,
-                card_ref: None,
-                card_ref_scope: CardRefScope::default(),
             };
-            (principal, list_user_roles(conn, user.id).await?)
+            (principal, None, list_user_roles(conn, user.id).await?)
         } else {
             let row = service_account_by_id(conn, principal_id)
                 .await?
                 .ok_or(IssuanceError::PrincipalInactive)?;
             let kind =
                 principal_kind_wire(&row.principal_kind).ok_or(IssuanceError::PrincipalInactive)?;
-            let card_ref = row.card_ref.map(|card_ref| card_ref.0);
-            let card_ref_scope = match &card_ref {
-                Some(card_ref) => resolve_card_ref_scope(conn, card_ref).await?,
-                None => CardRefScope::default(),
-            };
             let principal = TokenPrincipalRef {
                 id: PrincipalId::new(row.id),
                 kind,
                 tenant_id: tenant,
-                card_ref,
-                card_ref_scope,
             };
-            (principal, list_service_account_roles(conn, row.id).await?)
+            let restriction = row.workload_family()?;
+            (
+                principal,
+                restriction,
+                list_service_account_roles(conn, row.id).await?,
+            )
         };
         let roles = role_refs(role_names).map_err(|error| IssuanceError::RoleCorrupt {
             role: error.to_string(),
         })?;
         let permissions = resolve_permissions(conn, &roles).await?;
-
-        if records_activity && principal.card_ref.is_some() {
-            record_machine_authentication(conn, principal.id).await?;
-        }
-        Ok((principal, roles, permissions))
+        Ok(ResolvedPrincipal {
+            principal,
+            roles,
+            permissions,
+            restriction,
+        })
     }
 
     /// Establish or renew a human session: an access token from
@@ -818,8 +999,8 @@ fn permission_set_from_rows(rows: Vec<RoleRow>) -> Result<PermissionSet, Issuanc
 /// A direct grant names its principal as both subject and actor, with the
 /// spent credential attached. A delegated grant is recorded under the subject
 /// being acted for, like every request its token later makes, names `issued`
-/// — the actor — as the exchange's actor, records the Card references of the
-/// earlier actors earliest first, targets the requested audience, and
+/// — the actor — as the exchange's actor, records the earlier actors and
+/// their roots earliest first, targets the requested audience, and
 /// attaches the credential that authenticated the actor, when one did.
 fn exchange_audit_event(
     issued: &TokenPrincipalRef,
@@ -840,7 +1021,7 @@ fn exchange_audit_event(
             TOKEN_EXCHANGE_OPERATION,
             Attribution::direct(issued.id),
             issued.kind,
-            issued.card_ref.clone(),
+            None,
             AuditOutcome::Allowed,
             AuditDetail::TokenExchange {
                 subject_principal_id: issued.id,
@@ -854,7 +1035,11 @@ fn exchange_audit_event(
     let mut delegation_chain = Vec::new();
     let mut layer: Option<&ActClaim> = prior_act.as_deref();
     while let Some(act) = layer {
-        delegation_chain.extend(act.principal.card_ref.clone());
+        delegation_chain.push(AuditDelegationStep {
+            principal_id: act.principal.id,
+            principal_kind: act.principal.kind,
+            workload_uid: Some(act.workload_uid.clone()),
+        });
         layer = act.act.as_deref();
     }
     delegation_chain.reverse();
@@ -863,7 +1048,7 @@ fn exchange_audit_event(
         TOKEN_EXCHANGE_OPERATION,
         Attribution::new(subject.id, issued.id),
         subject.kind,
-        subject.card_ref.clone(),
+        None,
         AuditOutcome::Allowed,
         AuditDetail::TokenExchange {
             subject_principal_id: subject.id,
@@ -1041,12 +1226,16 @@ mod pg_tests {
     };
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId};
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{Attribution, OAuthClientId, PrincipalKindTag, RoleSource};
+    use wyrd_spec::auth::{
+        Attribution, CardAccess, FamilyRestriction, OAuthClientId, PrincipalKindTag, RoleSource,
+    };
     use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
     use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::CardUid;
-    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use wyrd_spec::reference::CardRef;
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
         grant_role_to_service_account, grant_role_to_user, insert_role, insert_service_account,
@@ -1061,6 +1250,9 @@ mod pg_tests {
 
     use super::{IssuanceError, TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
     use crate::audit::test_audit::RecordedAudit;
+    use crate::exchange_api_key::pg_tests::{
+        insert_test_service_account, named_service_card_ref, root_uid, seed_root, service_family,
+    };
     use crate::revoke::pg_tests::wait_for_advisory_lock_wait;
     use crate::revoke::revoke_principal_in_conn;
 
@@ -1170,6 +1362,11 @@ mod pg_tests {
     /// The token's authority is the principal's current grants, resolved at
     /// issuance: a grant withdrawn between two issuances is absent from the
     /// second token without any request-time lookup.
+    ///
+    /// # Panics
+    /// Panics when the fixture, seeding, role grant or revoke, or either
+    /// issuance fails, or `card:read` is missing from the first token or
+    /// present in the second.
     #[tokio::test]
     async fn issue_signs_current_grants_and_follows_grant_changes() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1184,7 +1381,12 @@ mod pg_tests {
             .expect("role grants");
 
         let granted = issuer(&audit)
-            .issue(&mut conn, principal, TenantGrant::JwtBearer, "req-granted")
+            .issue(
+                &mut conn,
+                principal,
+                TenantGrant::JwtBearer { workload_uid: None },
+                "req-granted",
+            )
             .await
             .expect("issuance succeeds");
         assert!(grants_card_read(&granted.access_token, tenant));
@@ -1196,7 +1398,7 @@ mod pg_tests {
             .issue(
                 &mut conn,
                 principal,
-                TenantGrant::JwtBearer,
+                TenantGrant::JwtBearer { workload_uid: None },
                 "req-withdrawn",
             )
             .await
@@ -1232,8 +1434,6 @@ mod pg_tests {
             id: PrincipalId::new(Uuid::new_v4()),
             kind: PrincipalKindTag::Service,
             tenant_id: tenant,
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         };
         let cases = [
             (user, TenantGrant::OidcLogin),
@@ -1247,15 +1447,19 @@ mod pg_tests {
                 machine,
                 TenantGrant::ApiKey {
                     credential_id: Uuid::new_v4(),
+                    workload_uid: None,
                 },
             ),
-            (machine, TenantGrant::JwtBearer),
+            (machine, TenantGrant::JwtBearer { workload_uid: None }),
             (
                 machine,
                 TenantGrant::Delegation {
                     subject: Box::new(subject),
                     subject_roles: Vec::new(),
                     subject_permissions: wyrd_runtime::PermissionSet::new(),
+                    subject_card_access: CardAccess::AnyRegistered,
+                    subject_workload_uid: None,
+                    actor_workload_uid: unregistered_uid(),
                     prior_act: None,
                     audience: TokenAudience::Bifrost,
                     actor_credential_id: None,
@@ -1274,40 +1478,23 @@ mod pg_tests {
         }
     }
 
-    /// Seed an active Service Card with one `schedule` binding and its
-    /// Card-bound principal, returning the principal id.
+    /// A fresh UUIDv7 Card UID that names no registered Card.
+    ///
+    /// # Panics
+    /// Panics when a fresh UUIDv7 is not accepted as a Card UID.
+    fn unregistered_uid() -> CardUid {
+        CardUid::from_uuid(Uuid::now_v7()).expect("v7 uuid is a Card UID")
+    }
+
+    /// Seed an active `bound-svc` Service root with one `schedule` binding and
+    /// the family's runtime account, returning the account and the root.
     ///
     /// # Panics
     /// Panics when a generated identity is invalid or any fixture write fails.
-    async fn seed_bound_service(conn: &mut TenantConn<'_>, creator: Uuid) -> Uuid {
-        let card_uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
-        sqlx::query(
-            "INSERT INTO wyrd.cards \
-                (card_uid, data_tenant_id, kind, name, version, spec, spec_hash, status, sub_principal_id, act_principal_id) \
-             VALUES ($1, wyrd.current_tenant(), 'Service', 'bound-svc', '1.0.0', \
-                     '{}'::jsonb, 'spec-hash', 'active', '00000000-0000-7000-8000-000000000000', '00000000-0000-7000-8000-000000000000')",
-        )
-        .bind(card_uid.as_uuid())
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("service card inserts");
-        let card_ref: CardRef = serde_json::from_value(json!({
-            "kind": "Service", "name": "bound-svc", "version": "1.0.0",
-            "uid": card_uid.as_str()
-        }))
-        .expect("card ref decodes");
-        let id = Uuid::now_v7();
-        insert_service_account(
-            conn,
-            id,
-            "service",
-            Some(&card_ref),
-            "bound-svc",
-            None,
-            wyrd_spec::auth::Attribution::direct(wyrd_spec::auth::PrincipalId::new(creator)),
-        )
-        .await
-        .expect("bound service account inserts");
+    async fn seed_bound_service(conn: &mut TenantConn<'_>, creator: Uuid) -> (Uuid, CardUid) {
+        let card_uid = seed_root(conn, &named_service_card_ref("bound-svc"), creator).await;
+        let id =
+            insert_test_service_account(conn, creator, Some(&service_family("bound-svc"))).await;
         let verifier = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
         project_bindings(
             conn,
@@ -1327,31 +1514,44 @@ mod pg_tests {
         )
         .await
         .expect("binding projects");
-        id
+        (id, card_uid)
     }
 
-    /// Read a machine principal's activity and its binding's schedule cursor.
+    /// Read one account's activity under `root` and the root's schedule
+    /// cursor, if the root has a schedule binding.
     ///
     /// # Panics
-    /// Panics when the read fails or the principal has no schedule binding.
+    /// Panics when the read fails.
     async fn activity(
         conn: &mut TenantConn<'_>,
         principal: Uuid,
+        root: &CardUid,
     ) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
         sqlx::query_as(
-            "SELECT p.last_authenticated_at, b.next_run_at \
-               FROM wyrd.auth_service_accounts p \
-               LEFT JOIN wyrd.verification_bindings b ON b.owner_card_uid = p.card_uid \
-              WHERE p.id = $1",
+            "SELECT (SELECT last_authenticated_at FROM wyrd.workload_activity \
+                      WHERE principal_id = $1 AND workload_card_uid = $2), \
+                    (SELECT next_run_at FROM wyrd.verification_bindings \
+                      WHERE owner_card_uid = $2)",
         )
         .bind(principal)
+        .bind(root.as_uuid())
         .fetch_one(&mut **conn.transaction())
         .await
         .expect("activity reads")
     }
 
-    /// An API-key exchange activates a Card-bound owner and arms its schedule;
-    /// a later `jwt-bearer` issuance renews activity without moving the cursor.
+    /// A direct API-key grant selecting a root, issued to that family's
+    /// runtime account.
+    fn api_key(root: Option<CardUid>) -> TenantGrant {
+        TenantGrant::ApiKey {
+            credential_id: Uuid::now_v7(),
+            workload_uid: root,
+        }
+    }
+
+    /// An API-key exchange under the root by the family's runtime account
+    /// activates that root and arms its schedule; a later `jwt-bearer`
+    /// issuance under the same root renews activity without moving the cursor.
     ///
     /// # Panics
     /// Panics when the fixture cannot start or seed, an issuance fails, or an
@@ -1362,21 +1562,19 @@ mod pg_tests {
         let audit = RecordedAudit::new();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let creator = seed_user(&mut conn).await;
-        let principal = seed_bound_service(&mut conn, creator).await;
-        assert_eq!(activity(&mut conn, principal).await, (None, None));
+        let (principal, root) = seed_bound_service(&mut conn, creator).await;
+        assert_eq!(activity(&mut conn, principal, &root).await, (None, None));
 
         issuer(&audit)
             .issue(
                 &mut conn,
                 principal,
-                TenantGrant::ApiKey {
-                    credential_id: Uuid::new_v4(),
-                },
+                api_key(Some(root.clone())),
                 "req-api-key",
             )
             .await
             .expect("api-key issuance succeeds");
-        let (first, armed) = activity(&mut conn, principal).await;
+        let (first, armed) = activity(&mut conn, principal, &root).await;
         let first = first.expect("api-key exchange records activity");
         let armed = armed.expect("first exchange arms the schedule");
         assert!(armed > first, "the cursor is the next future boundary");
@@ -1385,18 +1583,21 @@ mod pg_tests {
             .issue(
                 &mut conn,
                 principal,
-                TenantGrant::JwtBearer,
+                TenantGrant::JwtBearer {
+                    workload_uid: Some(root.clone()),
+                },
                 "req-jwt-bearer",
             )
             .await
             .expect("jwt-bearer issuance succeeds");
-        let (renewed, cursor) = activity(&mut conn, principal).await;
+        let (renewed, cursor) = activity(&mut conn, principal, &root).await;
         assert!(renewed.expect("renewal records activity") >= first);
         assert_eq!(cursor, Some(armed), "renewal never moves an armed cursor");
     }
 
-    /// Delegation for a Card-bound owner and any grant for a Card-free
-    /// principal never record activity or arm a schedule.
+    /// A delegation acting under the root, scheduled resolution, rootless
+    /// grants by the family's account, and rooted grants by an unrestricted
+    /// account never record activity or arm the root's schedule.
     ///
     /// # Panics
     /// Panics when the fixture cannot start or seed, an issuance fails, or any
@@ -1408,14 +1609,12 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let creator = seed_user(&mut conn).await;
-        let bound = seed_bound_service(&mut conn, creator).await;
+        let (bound, root) = seed_bound_service(&mut conn, creator).await;
         let automation = seed_automation(&mut conn, creator).await;
         let subject = TokenPrincipalRef {
             id: PrincipalId::new(Uuid::new_v4()),
             kind: PrincipalKindTag::Service,
             tenant_id: tenant,
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         };
 
         issuer(&audit)
@@ -1426,6 +1625,9 @@ mod pg_tests {
                     subject: Box::new(subject),
                     subject_roles: Vec::new(),
                     subject_permissions: PermissionSet::new(),
+                    subject_card_access: CardAccess::AnyRegistered,
+                    subject_workload_uid: None,
+                    actor_workload_uid: root.clone(),
                     prior_act: None,
                     audience: TokenAudience::Wyrd,
                     actor_credential_id: None,
@@ -1434,20 +1636,200 @@ mod pg_tests {
             )
             .await
             .expect("delegated issuance succeeds");
-        assert_eq!(activity(&mut conn, bound).await, (None, None));
-
+        issuer(&audit)
+            .scheduled(&mut conn, bound, &root)
+            .await
+            .expect("scheduled resolution succeeds");
+        for grant in [api_key(None), TenantGrant::JwtBearer { workload_uid: None }] {
+            issuer(&audit)
+                .issue(&mut conn, bound, grant, "req-rootless")
+                .await
+                .expect("rootless issuance succeeds");
+        }
         for grant in [
-            TenantGrant::ApiKey {
-                credential_id: Uuid::new_v4(),
+            api_key(Some(root.clone())),
+            TenantGrant::JwtBearer {
+                workload_uid: Some(root.clone()),
             },
-            TenantGrant::JwtBearer,
         ] {
             issuer(&audit)
-                .issue(&mut conn, automation, grant, "req-card-free")
+                .issue(&mut conn, automation, grant, "req-unrestricted")
                 .await
-                .expect("card-free issuance succeeds");
+                .expect("an unrestricted account may select the root");
         }
-        assert_eq!(activity(&mut conn, automation).await, (None, None));
+        assert_eq!(activity(&mut conn, bound, &root).await, (None, None));
+        assert_eq!(activity(&mut conn, automation, &root).await, (None, None));
+    }
+
+    /// One stable account keeps its id and grants while each issuance selects
+    /// its own context: a family account signs `root_required` rootless and
+    /// exactly the selected release's graph and root otherwise, roots outside
+    /// the family and unknown roots are refused identically, an unrestricted
+    /// account signs `any_registered` rootless, and only the family account's
+    /// direct grants record activity, per root.
+    ///
+    /// # Panics
+    /// Panics when a fixture write or issuance fails or any signed principal,
+    /// grant, Card access, root, refusal, or activity differs.
+    #[tokio::test]
+    async fn stable_account_root_selection_preserves_grants() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = RecordedAudit::new();
+        let tenant = fixture.data_tenant_id();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let creator = seed_user(&mut conn).await;
+        let role_id = seed_card_reader_role(&mut conn).await;
+        let family = service_family("checkout");
+        let account = insert_test_service_account(&mut conn, creator, Some(&family)).await;
+        let automation = seed_automation(&mut conn, creator).await;
+        for principal in [account, automation] {
+            grant_role_to_service_account(&mut conn, principal, role_id)
+                .await
+                .expect("role grants");
+        }
+        let release_1 = named_service_card_ref("checkout");
+        let release_2 = CardRef {
+            version: VersionBlock::parse("2.0.0").expect("static version is valid"),
+            ..release_1.clone()
+        };
+        let r1 = seed_root(&mut conn, &release_1, creator).await;
+        let r2 = seed_root(&mut conn, &release_2, creator).await;
+        let foreign = seed_root(&mut conn, &named_service_card_ref("billing"), creator).await;
+        assert_eq!(root_uid(&mut conn, &release_2).await, r2);
+
+        let scoped = |root: &CardUid| CardAccess::Scoped {
+            cards: vec![root.clone()],
+        };
+        let cases = [
+            (
+                account,
+                None,
+                CardAccess::RootRequired {
+                    restriction: FamilyRestriction::Family(family.clone()),
+                },
+            ),
+            (account, Some(r1.clone()), scoped(&r1)),
+            (account, Some(r2.clone()), scoped(&r2)),
+            (automation, None, CardAccess::AnyRegistered),
+            (automation, Some(r1.clone()), scoped(&r1)),
+        ];
+        for (principal, root, card_access) in cases {
+            let token = issuer(&audit)
+                .issue(&mut conn, principal, api_key(root.clone()), "req-select")
+                .await
+                .expect("issuance succeeds");
+            let verified = verifier()
+                .verify(&token.access_token, &tenant)
+                .expect("issued token verifies")
+                .principal;
+            assert_eq!(verified.id.as_uuid(), principal, "identity never changes");
+            assert!(
+                verified
+                    .effective_permissions
+                    .contains(&Permission::card_read()),
+                "grants never change with context"
+            );
+            assert_eq!(verified.card_access, card_access);
+            assert_eq!(verified.workload_uid, root);
+        }
+
+        for root in [foreign.clone(), unregistered_uid()] {
+            let refused = issuer(&audit)
+                .issue(&mut conn, account, api_key(Some(root)), "req-refused")
+                .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(IssuanceError::Wyrd(WyrdError::WorkloadUidRefused { .. }))
+                ),
+                "{refused:?}"
+            );
+        }
+
+        assert!(activity(&mut conn, account, &r1).await.0.is_some());
+        assert!(activity(&mut conn, account, &r2).await.0.is_some());
+        assert_eq!(activity(&mut conn, automation, &r1).await.0, None);
+
+        let scheduled = issuer(&audit)
+            .scheduled(&mut conn, account, &r2)
+            .await
+            .expect("scheduled resolution succeeds");
+        assert_eq!(scheduled.principal.card_access, scoped(&r2));
+        let refused = issuer(&audit).scheduled(&mut conn, account, &foreign).await;
+        assert!(
+            matches!(
+                refused,
+                Err(IssuanceError::Wyrd(WyrdError::WorkloadUidRefused { .. }))
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// A request selector narrows a rootless bearer under its signed access
+    /// only: the family account's root becomes its exact scope, a foreign or
+    /// unknown root is refused identically, a signed root is unchanged by an
+    /// equal selector and never rebound by a different one, and no activity
+    /// is recorded.
+    ///
+    /// # Panics
+    /// Panics when a fixture write, issuance, or verification fails, or any
+    /// selection differs.
+    #[tokio::test]
+    async fn request_selector_narrows_only_rootless_bearers() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = RecordedAudit::new();
+        let tenant = fixture.data_tenant_id();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let creator = seed_user(&mut conn).await;
+        let family = service_family("checkout");
+        let account = insert_test_service_account(&mut conn, creator, Some(&family)).await;
+        let r1 = seed_root(&mut conn, &named_service_card_ref("checkout"), creator).await;
+        let foreign = seed_root(&mut conn, &named_service_card_ref("billing"), creator).await;
+        let rootless = verifier()
+            .verify(
+                &issuer(&audit)
+                    .issue(&mut conn, account, api_key(None), "req-rootless")
+                    .await
+                    .expect("rootless issuance succeeds")
+                    .access_token,
+                &tenant,
+            )
+            .expect("rootless token verifies");
+        let selected = super::select_request_root(&mut conn, &rootless, &r1)
+            .await
+            .expect("family root selects")
+            .expect("rootless bearer narrows");
+        assert_eq!(selected.principal.id, rootless.principal.id);
+        assert_eq!(
+            selected.principal.effective_permissions,
+            rootless.principal.effective_permissions
+        );
+        assert_eq!(
+            selected.principal.card_access,
+            CardAccess::Scoped {
+                cards: vec![r1.clone()]
+            }
+        );
+        assert_eq!(selected.principal.workload_uid, Some(r1.clone()));
+        for root in [foreign.clone(), unregistered_uid()] {
+            let refused = super::select_request_root(&mut conn, &rootless, &root).await;
+            assert!(
+                matches!(refused, Err(WyrdError::WorkloadUidRefused { .. })),
+                "{refused:?}"
+            );
+        }
+        assert!(
+            super::select_request_root(&mut conn, &selected, &r1)
+                .await
+                .expect("equal selector")
+                .is_none()
+        );
+        let rebound = super::select_request_root(&mut conn, &selected, &foreign).await;
+        assert!(
+            matches!(rebound, Err(WyrdError::SignedWorkloadMismatch { .. })),
+            "{rebound:?}"
+        );
+        assert_eq!(activity(&mut conn, account, &r1).await.0, None);
     }
 
     /// A human session carries the user's current grants and a refresh token.
@@ -1495,18 +1877,20 @@ mod pg_tests {
             id: PrincipalId::new(Uuid::now_v7()),
             kind: PrincipalKindTag::Service,
             tenant_id: tenant,
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         };
         let grants = [
             TenantGrant::ApiKey {
                 credential_id: Uuid::now_v7(),
+                workload_uid: None,
             },
-            TenantGrant::JwtBearer,
+            TenantGrant::JwtBearer { workload_uid: None },
             TenantGrant::Delegation {
                 subject: Box::new(subject),
                 subject_roles: Vec::new(),
                 subject_permissions: PermissionSet::from_iter([Permission::bifrost_record_write()]),
+                subject_card_access: CardAccess::AnyRegistered,
+                subject_workload_uid: None,
+                actor_workload_uid: unregistered_uid(),
                 prior_act: None,
                 audience: TokenAudience::Wyrd,
                 actor_credential_id: None,

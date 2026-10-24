@@ -7,12 +7,16 @@
 //! direct grants and revokes, `idp`/`direct` coexistence across a login,
 //! administration gates and their audited decisions, and the one
 //! non-enumerating refusal for every principal that is not assignable here.
+//! Stable Service accounts are created and restricted explicitly, and keep
+//! their identity, Roles, and credentials across releases.
 
 use axum::body::{Body, to_bytes};
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{Method, Request, StatusCode, header};
+use secrecy::SecretString;
 use serde_json::{Value, json};
 use uuid::Uuid;
 use wyrd_spec::auth::{Attribution, PrincipalId};
+use wyrd_spec::ids::CardUid;
 use wyrd_sql::queries::auth::{
     delete_service_account, insert_service_account, replace_idp_user_roles,
 };
@@ -30,13 +34,31 @@ async fn call(
     method: Method,
     uri: &str,
 ) -> (StatusCode, Value) {
+    send(server, jwt, method, uri, None).await
+}
+
+/// Send one request as `jwt`, with `body` as JSON when given, and split the
+/// answer into status and JSON body.
+///
+/// # Panics
+/// Panics when the request cannot be built, the route fails to respond, or
+/// the body is not JSON.
+async fn send(
+    server: &WyrdTestServer,
+    jwt: &str,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
     let response = server
         .oneshot_authenticated(
             jwt,
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::empty())
+            request
+                .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
                 .expect("request builds"),
         )
         .await
@@ -460,7 +482,7 @@ async fn discovery_filters_and_pages_by_id() {
                 "status": "active",
                 "email": "pr-person@test.wyrd",
                 "name": null,
-                "card_ref": null,
+                "workload_restriction": null,
             }],
             "next": null,
         })
@@ -507,4 +529,510 @@ async fn discovery_filters_and_pages_by_id() {
         assert!(seen.contains(id), "{id} is reached by paging");
     }
     assert!(!seen.contains(&admin.to_string()), "kind filters users out");
+}
+
+/// Register an empty Service `name` at `version` as `jwt` and return its UID.
+///
+/// # Panics
+/// Panics when the registration is refused or returns no UID.
+async fn register_service(
+    server: &WyrdTestServer,
+    jwt: &str,
+    name: &str,
+    version: &str,
+) -> CardUid {
+    register(
+        server,
+        jwt,
+        &format!("register-{name}-{version}"),
+        json!([{
+            "apiVersion": "wyrd/v1", "kind": "Service",
+            "metadata": { "name": name, "version": version },
+            "spec": {},
+            "artifacts": []
+        }]),
+    )
+    .await
+    .remove(0)
+}
+
+/// Register a Prompt, then an Agent `name` at 1.0.0 referencing it, as
+/// `jwt` and return the Agent's UID.
+///
+/// # Panics
+/// Panics when the registration is refused or returns no UID.
+async fn register_agent(server: &WyrdTestServer, jwt: &str, name: &str) -> CardUid {
+    let prompt = format!("{name}-prompt");
+    register(
+        server,
+        jwt,
+        &format!("register-{prompt}"),
+        json!([{
+            "apiVersion": "wyrd/v1", "kind": "Prompt",
+            "metadata": { "name": prompt, "version": "1.0.0" },
+            "spec": {
+                "provider": "openai", "model": "gpt-test",
+                "messages": [{ "role": "user", "content": "Answer." }]
+            },
+            "artifacts": []
+        }]),
+    )
+    .await;
+    register(
+        server,
+        jwt,
+        &format!("register-{name}"),
+        json!([{
+            "apiVersion": "wyrd/v1", "kind": "Agent",
+            "metadata": { "name": name, "version": "1.0.0" },
+            "spec": {
+                "prompt": { "kind": "Prompt", "name": prompt, "version": "1.0.0" },
+                "execution_route": { "kind": "native" }
+            },
+            "artifacts": []
+        }]),
+    )
+    .await
+    .remove(0)
+}
+
+/// Register `submissions` in one request as `jwt` and return each outcome's
+/// UID in submission order.
+///
+/// # Panics
+/// Panics when the registration is refused or an outcome carries no UID.
+async fn register(
+    server: &WyrdTestServer,
+    jwt: &str,
+    idempotency_key: &str,
+    submissions: Value,
+) -> Vec<CardUid> {
+    let response = server
+        .oneshot_authenticated(
+            jwt,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/cards")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", idempotency_key)
+                .body(Body::from(
+                    json!({ "submissions": submissions }).to_string(),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("registration responds");
+    let status = response.status();
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads"),
+    )
+    .expect("body is JSON");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["outcomes"]
+        .as_array()
+        .expect("outcomes is an array")
+        .iter()
+        .map(|outcome| {
+            serde_json::from_value(outcome["card_ref"]["uid"].clone())
+                .expect("registration returns each UID")
+        })
+        .collect()
+}
+
+/// Every assignable principal id the tenant lists.
+///
+/// # Panics
+/// Panics when the listing fails.
+async fn listed_ids(server: &WyrdTestServer, jwt: &str) -> Vec<String> {
+    let (status, page) = call(server, jwt, Method::GET, "/v1/principals?limit=200").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    page["principals"]
+        .as_array()
+        .expect("principals is an array")
+        .iter()
+        .map(|principal| principal["principal_id"].as_str().expect("id").to_owned())
+        .collect()
+}
+
+/// Explicit stable Service accounts outlive releases.
+///
+/// Registering two releases of one Service creates no principal. A principal
+/// administrator creates an unrestricted account; a family restriction needs
+/// tenant administration, makes the account its family's unique runtime
+/// account, and refuses a second claimant with a conflict on create and on
+/// replacement. Replacing a restriction with its current value is
+/// idempotent, and no replacement changes the account id, its Roles, or its
+/// credentials: the one key selects either release, and still authenticates
+/// rootless once the restriction is lifted. A User carries no restriction.
+///
+/// # Panics
+/// Panics when the server fails to start, a route answers unexpectedly, or a
+/// key stops exchanging.
+#[tokio::test(flavor = "current_thread")]
+async fn stable_account_restrictions_and_credentials() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let (user_id, admin_jwt) = user(&server, "sa-admin", &["admin"]).await;
+    server
+        .seed_role(
+            "sa_principal_admin",
+            &["service_accounts:write"
+                .parse::<wyrd_runtime::Permission>()
+                .expect("permission parses")],
+        )
+        .await
+        .expect("role seeds");
+    let (_, principal_admin_jwt) =
+        user(&server, "sa-principal-admin", &["sa_principal_admin"]).await;
+
+    let before = listed_ids(&server, &admin_jwt).await;
+    let v1 = register_service(&server, &admin_jwt, "sa-checkout", "1.0.0").await;
+    let v2 = register_service(&server, &admin_jwt, "sa-checkout", "2.0.0").await;
+    assert_eq!(
+        listed_ids(&server, &admin_jwt).await,
+        before,
+        "registering releases creates no principal"
+    );
+
+    let family = json!({ "mode": "family", "kind": "Service", "name": "sa-checkout" });
+    let create = |name: &str, restriction: Option<Value>| {
+        let mut body = json!({ "name": name, "roles": ["workload"] });
+        if let Some(restriction) = restriction {
+            body["workload_restriction"] = restriction;
+        }
+        body
+    };
+
+    let (status, unrestricted) = send(
+        &server,
+        &principal_admin_jwt,
+        Method::POST,
+        "/v1/principals",
+        Some(create("sa-automation", None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unrestricted}");
+    let automation = unrestricted["principal_id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let (status, page) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        "/v1/principals?name=sa-automation",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page["principals"][0]["workload_restriction"],
+        json!({ "mode": "unrestricted" }),
+        "an account is unrestricted by default"
+    );
+
+    let (status, problem) = send(
+        &server,
+        &principal_admin_jwt,
+        Method::POST,
+        "/v1/principals",
+        Some(create("sa-runtime-denied", Some(family.clone()))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], json!("WYRD_PERMISSION_403_DENIED_RBAC"));
+
+    let (status, created) = send(
+        &server,
+        &admin_jwt,
+        Method::POST,
+        "/v1/principals",
+        Some(create("checkout-runtime", Some(family.clone()))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let runtime = created["principal_id"].as_str().expect("id").to_owned();
+    let key = SecretString::from(
+        created["credential"]
+            .as_str()
+            .expect("first credential is returned once")
+            .to_owned(),
+    );
+
+    let (status, problem) = send(
+        &server,
+        &admin_jwt,
+        Method::POST,
+        "/v1/principals",
+        Some(create("checkout-runtime-2", Some(family.clone()))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+    assert_eq!(
+        problem["code"],
+        json!("WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT")
+    );
+    let restriction_uri = |id: &str| format!("/v1/principals/{id}/workload-restriction");
+    let (status, problem) = send(
+        &server,
+        &admin_jwt,
+        Method::PUT,
+        &restriction_uri(&automation),
+        Some(family.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{problem}");
+    assert_eq!(
+        problem["code"],
+        json!("WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT")
+    );
+
+    let (status, problem) = send(
+        &server,
+        &principal_admin_jwt,
+        Method::PUT,
+        &restriction_uri(&runtime),
+        Some(family.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    let (status, replayed) = send(
+        &server,
+        &admin_jwt,
+        Method::PUT,
+        &restriction_uri(&runtime),
+        Some(family.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed["principal_id"], json!(runtime));
+    assert_eq!(
+        replayed["workload_restriction"], family,
+        "replay is idempotent"
+    );
+
+    for root in [&v1, &v2] {
+        server
+            .exchange_api_key_for_workload(&key, root)
+            .await
+            .expect("rooted exchange succeeds");
+    }
+    let (status, roles) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        &format!("/v1/principals/{runtime}/roles"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{roles}");
+    assert_eq!(assignments(&roles), pairs(&[("workload", "direct")]));
+
+    let (status, lifted) = send(
+        &server,
+        &admin_jwt,
+        Method::PUT,
+        &restriction_uri(&runtime),
+        Some(json!({ "mode": "unrestricted" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{lifted}");
+    assert_eq!(
+        lifted["principal_id"],
+        json!(runtime),
+        "the id never changes"
+    );
+    assert_eq!(
+        lifted["workload_restriction"],
+        json!({ "mode": "unrestricted" })
+    );
+    let (_, roles_after) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        &format!("/v1/principals/{runtime}/roles"),
+    )
+    .await;
+    assert_eq!(assignments(&roles_after), assignments(&roles));
+    let (status, credentials) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        &format!("/v1/principals/{runtime}/credentials"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{credentials}");
+    assert_eq!(
+        credentials["credentials"].as_array().map(Vec::len),
+        Some(1),
+        "replacement neither issues nor retires credentials: {credentials}"
+    );
+    server
+        .exchange_api_key(&key)
+        .await
+        .expect("the same key authenticates rootless once unrestricted");
+
+    let (status, problem) = send(
+        &server,
+        &admin_jwt,
+        Method::PUT,
+        &restriction_uri(&user_id.to_string()),
+        Some(family),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+    assert_eq!(problem["code"], json!("WYRD_SPEC_400_VALIDATION"));
+}
+
+/// Workloads are Services only.
+///
+/// One family account selects both releases of its Service, but no other
+/// Service, no Agent, and no unknown UID, each refused identically at the
+/// token endpoint. A rootless bearer cannot select an Agent through the
+/// request header, while its rootless and Service-rooted calls still work.
+/// Neither account creation nor restriction replacement accepts an Agent
+/// family, and the refusal changes nothing.
+///
+/// # Panics
+/// Panics when the server fails to start or a route answers unexpectedly.
+#[tokio::test(flavor = "current_thread")]
+async fn workload_roots_and_families_are_services_only() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let (_, admin_jwt) = user(&server, "so-admin", &["admin"]).await;
+    let v1 = register_service(&server, &admin_jwt, "so-checkout", "1.0.0").await;
+    let v2 = register_service(&server, &admin_jwt, "so-checkout", "2.0.0").await;
+    let other = register_service(&server, &admin_jwt, "so-other", "1.0.0").await;
+    let agent = register_agent(&server, &admin_jwt, "so-agent").await;
+    let unknown = CardUid::new(Uuid::now_v7().to_string()).expect("v7 is a Card UID");
+
+    let (status, created) = send(
+        &server,
+        &admin_jwt,
+        Method::POST,
+        "/v1/principals",
+        Some(json!({
+            "name": "so-checkout-runtime",
+            "roles": ["workload"],
+            "workload_restriction": { "mode": "family", "kind": "Service", "name": "so-checkout" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let runtime = created["principal_id"].as_str().expect("id").to_owned();
+    let key = SecretString::from(
+        created["credential"]
+            .as_str()
+            .expect("first credential is returned once")
+            .to_owned(),
+    );
+    for root in [&v1, &v2] {
+        server
+            .exchange_api_key_for_workload(&key, root)
+            .await
+            .expect("the family account selects either release");
+    }
+    let mut refusals = Vec::new();
+    for root in [&other, &agent, &unknown] {
+        match server.exchange_api_key_for_workload(&key, root).await {
+            Err(wyrd_testing::WyrdTestServerError::Http { status, code, .. }) => {
+                refusals.push((status, code));
+            }
+            outcome => panic!("{root} must be refused, got {outcome:?}"),
+        }
+    }
+    assert!(
+        refusals
+            .iter()
+            .all(|refusal| refusal.1 == "WYRD_AUTH_401_WORKLOAD_UID_REFUSED"),
+        "another Service, an Agent, and an unknown UID refuse identically: {refusals:?}"
+    );
+    assert!(refusals.windows(2).all(|pair| pair[0] == pair[1]));
+
+    let (status, rootless) = call(&server, &admin_jwt, Method::GET, "/v1/principals").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rootless Card operations still work: {rootless}"
+    );
+    let selected = |root: &CardUid| {
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/principals")
+            .header("x-wyrd-workload-uid", root.as_str())
+            .body(Body::empty())
+            .expect("request builds")
+    };
+    let service_rooted = server
+        .oneshot_authenticated(&admin_jwt, selected(&v1))
+        .await
+        .expect("request responds");
+    assert_eq!(service_rooted.status(), StatusCode::OK);
+    let agent_rooted = server
+        .oneshot_authenticated(&admin_jwt, selected(&agent))
+        .await
+        .expect("request responds");
+    assert_eq!(agent_rooted.status(), StatusCode::UNAUTHORIZED);
+    let problem: Value = serde_json::from_slice(
+        &to_bytes(agent_rooted.into_body(), 1 << 20)
+            .await
+            .expect("body reads"),
+    )
+    .expect("body is JSON");
+    assert_eq!(problem["code"], json!("WYRD_AUTH_401_WORKLOAD_UID_REFUSED"));
+
+    let agent_family = json!({ "mode": "family", "kind": "Agent", "name": "so-agent" });
+    let (create_status, create_problem) = send(
+        &server,
+        &admin_jwt,
+        Method::POST,
+        "/v1/principals",
+        Some(json!({
+            "name": "so-agent-runtime",
+            "roles": ["workload"],
+            "workload_restriction": agent_family
+        })),
+    )
+    .await;
+    let (replace_status, replace_problem) = send(
+        &server,
+        &admin_jwt,
+        Method::PUT,
+        &format!("/v1/principals/{runtime}/workload-restriction"),
+        Some(agent_family),
+    )
+    .await;
+    for (status, problem) in [
+        (create_status, &create_problem),
+        (replace_status, &replace_problem),
+    ] {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+        assert_eq!(problem["code"], json!("WYRD_SPEC_400_VALIDATION"));
+    }
+    let (_, page) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        "/v1/principals?name=so-agent-runtime",
+    )
+    .await;
+    assert_eq!(
+        page["principals"],
+        json!([]),
+        "no Agent account was created"
+    );
+    let (_, page) = call(
+        &server,
+        &admin_jwt,
+        Method::GET,
+        "/v1/principals?name=so-checkout-runtime",
+    )
+    .await;
+    assert_eq!(
+        page["principals"][0]["workload_restriction"],
+        json!({ "mode": "family", "kind": "Service", "name": "so-checkout" }),
+        "a refused replacement changes nothing"
+    );
 }

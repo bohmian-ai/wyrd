@@ -30,7 +30,7 @@ use wyrd_runtime::{
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::CardRefScope;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuthMethod;
 use wyrd_spec::vala::error::BifrostError;
@@ -113,9 +113,7 @@ impl SystemReadAuthority {
         }
         let principal = Principal::new(
             principal,
-            PrincipalKind::System {
-                card_ref_scope: CardRefScope::default(),
-            },
+            PrincipalKind::System,
             tenant,
             Vec::new(),
             PermissionSet::from_iter(grants),
@@ -216,15 +214,16 @@ pub enum AuthorityRefusal {
 
 /// Resolves the authority a background Verifier run is accepted under.
 ///
-/// Scheduled runs serve their binding owner: at acceptance
-/// the owner's current authority is recovered through the tenant issuer's
-/// [`recover`](TenantTokenIssuer::recover), on the accepting transaction, and
-/// paired with the tenant SYSTEM principal as actor. An owner that is missing,
-/// inactive, or not admitted, or a tenant without SYSTEM, yields no authority
-/// and therefore no run; nothing falls back to another identity.
+/// Scheduled runs serve their binding owner: at acceptance the owner family's
+/// runtime account is freshly resolved under the binding's exact root through
+/// the tenant issuer's [`scheduled`](TenantTokenIssuer::scheduled), on the
+/// accepting transaction, and paired with the tenant SYSTEM principal as
+/// actor. An account that is missing, inactive, or not admitted, an unusable
+/// root, or a tenant without SYSTEM yields no authority and therefore no run;
+/// nothing falls back to another identity.
 #[derive(Clone)]
 pub struct BackgroundAuthority {
-    /// Tenant issuer that recovers the owner's current authority; `None`
+    /// Tenant issuer that resolves the owner's current authority; `None`
     /// when no signing key is configured, so no background run is accepted.
     issuer: Option<TenantTokenIssuer>,
 }
@@ -236,15 +235,15 @@ impl BackgroundAuthority {
         Self { issuer }
     }
 
-    /// The owner/SYSTEM authority a run serving `owner` is accepted under,
-    /// or why none was accepted in `conn`'s tenant.
+    /// The owner/SYSTEM authority a run serving `owner` under the exact
+    /// `root` is accepted under, or why none was accepted in `conn`'s tenant.
     ///
-    /// Reads SYSTEM and recovers the owner on `conn` without writing, so the
-    /// resolution commits or rolls back with the run it authorizes. Only an
-    /// inactive principal, tenant, or connection is
-    /// [`AuthorityRefusal::Rejected`]; missing configuration, a missing
-    /// SYSTEM principal, and corrupt or unsignable state are
-    /// [`AuthorityRefusal::Unavailable`] and logged.
+    /// Reads SYSTEM and resolves the owner on `conn` without writing, so the
+    /// resolution commits or rolls back with the run it authorizes. An
+    /// inactive principal, tenant, or connection, or a root the account can
+    /// no longer use, is [`AuthorityRefusal::Rejected`]; missing
+    /// configuration, a missing SYSTEM principal, and corrupt or unsignable
+    /// state are [`AuthorityRefusal::Unavailable`] and logged.
     ///
     /// # Errors
     /// Returns [`SqlError`] when a tenant read fails; the caller's
@@ -253,6 +252,7 @@ impl BackgroundAuthority {
         &self,
         conn: &mut TenantConn<'_>,
         owner: PrincipalId,
+        root: &CardUid,
     ) -> Result<Result<ExecutionAuthority, AuthorityRefusal>, SqlError> {
         let Some(issuer) = &self.issuer else {
             tracing::warn!(%owner, "no tenant issuer is configured; background run not accepted");
@@ -266,7 +266,7 @@ impl BackgroundAuthority {
             tracing::warn!(%owner, "the tenant has no SYSTEM principal; background run not accepted");
             return Ok(Err(AuthorityRefusal::Unavailable));
         };
-        match issuer.recover(conn, owner.as_uuid()).await {
+        match issuer.scheduled(conn, owner.as_uuid(), root).await {
             Ok(verified) => Ok(Ok(ExecutionAuthority::background(
                 AcceptedAuthority::new(&verified.principal, &verified.delegation_chain),
                 system,
@@ -276,7 +276,8 @@ impl BackgroundAuthority {
             Err(
                 error @ (IssuanceError::TenantNotAdmitting
                 | IssuanceError::PrincipalInactive
-                | IssuanceError::ConnectionInactive),
+                | IssuanceError::ConnectionInactive
+                | IssuanceError::Wyrd(WyrdError::WorkloadUidRefused { .. })),
             ) => {
                 tracing::info!(%owner, %error, "binding owner is refused; background run not accepted");
                 Ok(Err(AuthorityRefusal::Rejected(WyrdError::from(error))))
@@ -330,9 +331,7 @@ mod tests {
         };
         let system = Principal::new(
             PrincipalId::new(uuid::Uuid::now_v7()),
-            PrincipalKind::System {
-                card_ref_scope: CardRefScope::default(),
-            },
+            PrincipalKind::System,
             tenant,
             Vec::new(),
             PermissionSet::from_iter([grant]),

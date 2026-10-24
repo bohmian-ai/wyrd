@@ -53,21 +53,41 @@ process-wide membership poller reads the live set for every role. Internal
 Scribe writes route to a peer by its Scribe capability alone, so a pod without
 Oracle still reaches Scribe. At the entrance, Gate admits only a verified
 principal, OTLP authenticates its API key before decoding a body, and every
-Bifrost SQL path takes a `TenantConn` or an `OperatorPool`, never a bare pool.
+Bifrost SQL path uses the repository tenant capability, except the existing
+`OracleTableCuts` single-statement owner documented in the security posture.
+That exception retains verified tenant-local RLS and avoids extra transaction
+round trips; it permits no arbitrary bare-pool workflow.
 
 ## Table and row identity
 
-Every Bifrost table has one server-owned managed envelope with these required,
-non-null columns:
+Every Bifrost table has seven server-owned managed columns: nullable
+workload_card_uid (Service only), subject_card_uid and run_id; required
+sub_principal_id, act_principal_id, wyrd_request_id and wyrd_ingested_at.
+The request ID is the existing request/batch-fence correlator. The ingestion
+instant is taken once at admission from the PostgreSQL-anchored clock and
+retained across retry. Callers never supply managed identity as user fields.
 
-- `wyrd_request_id`: server-minted or validated request correlation, the
-  join key to audit and to the batch-commit fence;
-- `wyrd_ingested_at`: when Wyrd accepted the batch. Scribe takes it once per
-  batch at admission from a PostgreSQL-anchored clock: each node reads
-  `statement_timestamp()` once, carries it forward on its local monotonic
-  clock, and re-reads it every minute, never consulting its wall clock. Scribe
-  stamps the same value on every row and stores it on the batch's
-  `vala.scribe_batch_commits` fence. A caller can never supply it.
+The nine system tables (spans, logs, metrics, gateway calls, drift
+observations, verification results, execution inputs, drift result features
+and audit) additionally share six nullable Utf8 dimensions:
+service_name, service_version, deployment_environment, subject_kind,
+subject_name and subject_version. Registered UIDs determine identity labels;
+accepted workload context determines environment. Existing signal columns occur
+once. Dynamic tables keep the seven universal fields without these mandatory
+dimensions; audit targets remain separate from observation subjects.
+
+All eight use environment ASC NULLS FIRST, Service name ASC NULLS FIRST,
+Service version ASC NULLS FIRST and their existing time axis DESC NULLS LAST.
+Time-only partitions remain hourly for telemetry/gateway and daily for
+verification/drift. Creation defaults combine service_name, subject_name,
+workload_card_uid, subject_card_uid and run_id Blooms with signal-specific lookup
+keys; audit retains its accountability defaults. Ten result Blooms include
+result_id, execution_id, verifier_card_uid, binding_id and group_id. These are
+complete replaceable creation defaults, never a hidden validation floor.
+No environment/kind/version Bloom or identity partition is implied. The exact
+ledger is in the approved service-identity-and-telemetry storage supplement;
+normal describe exposes the resolved immutable definition. Preserve existing
+encoding/FPP, tenant overrides, table_version and retained-file semantics.
 
 The column names, types, stable ids, and order are declared once, in
 `vala_bifrost_redux::tables::managed_columns::MANAGED_COLUMNS`; every physical
@@ -83,7 +103,7 @@ but a naive `TIMESTAMP_NTZ` column names no instant, so registration refuses
 it as the time column rather than guess its zone. A registration declares
 it as `time_column` on its physical layout, and omitting it selects
 `wyrd_ingested_at`. The time column alone drives the hour or day partition
-transform, the default first sort key (descending), hot and published time
+transform, the descending time key (after shared context on attributable built-ins), hot and published time
 bounds, and `COUNT(*)`. Built-in tables declare their own: OTLP spans
 `start_time_unix_nano`, OTLP logs and metrics `time_unix_nano`, gateway and
 agent traces `started_at`, Drift observations and
@@ -312,9 +332,11 @@ typed columns:
   and exemplar filtered attributes), the log `body`, and the metric `metadata`
   as Variant. `resource_entity_refs` is a list of Structs with `type`,
   `id_keys`, `description_keys`, and `schema_url`. Well-known
-  semantic-convention values are copied into nullable promoted columns, each
-  null when its source is absent or has another type: `service_name`,
-  `service_version`, and `deployment_environment` on all three signals;
+  semantic-convention values are copied into nullable promoted columns. Owned
+  `service_name`/`service_version` agree with validated Service UID and environment
+  with accepted context; unowned telemetry promotes typed resource values. Raw
+  attributes remain unchanged. Subject kind/name/version derive from validated
+  subject UID. Other promotions remain null for absent/wrong-type sources;
   `gen_ai_*`, `http_request_method`, `http_route`,
   `http_response_status_code`, `url_full`, and the `exception_*` columns of the
   span's last `exception` event on spans; the record's own `exception_*`

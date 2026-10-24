@@ -829,14 +829,16 @@ impl<'a> GatewayInvocation<'a> {
     /// Authorizes the Card UID `subject` attributes a call to, when it names
     /// one; a Run alone needs no authorization.
     ///
-    /// A Card-bound caller attributes only to a UID its signed scope carries;
-    /// a caller bound to no Card may attribute to any registered
-    /// observation-target Card of its tenant, read from the registry. Runs
-    /// before routing, so a refusal reaches no provider.
+    /// A scoped caller attributes only to a UID its signed scope carries; a
+    /// rootless unrestricted caller may attribute to any registered
+    /// observation-target Card of its tenant, read from the registry; a
+    /// rootless family-restricted caller attributes to none. Runs before
+    /// routing, so a refusal reaches no provider.
     ///
     /// # Errors
     /// Returns `CardScopeDenied` for a UID outside the signed scope or, for an
-    /// unbound caller, one naming no registered observation-target Card, and
+    /// unbound caller, one naming no registered observation-target Card,
+    /// `WorkloadContextRequired` for a rootless restricted caller, and
     /// `ServiceUnavailable` when the registry cannot be read.
     async fn attribute(
         &self,
@@ -847,7 +849,12 @@ impl<'a> GatewayInvocation<'a> {
             return Ok(subject);
         };
         let authorized = match caller.principal.card_attribution() {
-            CardAttribution::Scoped(scope) => scope.uids().contains(card_uid),
+            CardAttribution::Scoped(scope) => scope.contains(card_uid),
+            CardAttribution::RootRequired(_) => {
+                return Err(WyrdError::workload_context_required(
+                    "the caller is restricted to one workload family and selected no root",
+                ));
+            }
             CardAttribution::AnyRegistered => {
                 self.is_observation_target(caller.data_tenant_id, card_uid)
                     .await?

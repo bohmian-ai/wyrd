@@ -10,6 +10,8 @@ use std::sync::{Arc, OnceLock};
 use crate::WyrdClient;
 use crate::bifrost::{Bifrost, BifrostOptions, QueueConfig, TableConfig};
 use crate::cards::{CardSelector, Cards};
+use crate::environment::Environment;
+use crate::error::WyrdClientError;
 use crate::observe::Run;
 use crate::observe::lifecycle::{BifrostLifecycle, StartedBifrost};
 use base64::Engine;
@@ -444,6 +446,30 @@ pub struct WyrdState {
     /// state was created with, else one resolved from the ambient
     /// configuration on first use and kept.
     client: Arc<OnceLock<WyrdClient>>,
+    /// The caller's client from [`WyrdState::from_path_with`], pinned to the
+    /// root and the configured environment only on first use.
+    supplied: Option<WyrdClient>,
+    /// The configured deployment environment, `None` inside when unknown;
+    /// fixed by [`WyrdState::configure`] or by the first implicit use.
+    deployment_environment: Arc<OnceLock<Option<String>>>,
+}
+
+/// The variable a [`WyrdState`] reads its default deployment environment from.
+pub const DEPLOYMENT_ENVIRONMENT_VAR: &str = "WYRD_DEPLOYMENT_ENVIRONMENT";
+
+/// The release and environment [`WyrdState::configure`] fixes for a state.
+///
+/// Omitted name and version default to the loaded Service; explicit ones must
+/// match it. An omitted environment defaults to a non-empty
+/// [`DEPLOYMENT_ENVIRONMENT_VAR`], else stays unknown.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigureOptions {
+    /// The loaded Service's `metadata.name`, or `None` for the bundle's.
+    pub service_name: Option<String>,
+    /// The loaded Service's exact version, or `None` for the bundle's.
+    pub service_version: Option<String>,
+    /// The workload's deployment environment, or `None` for the default.
+    pub deployment_environment: Option<String>,
 }
 
 /// How [`WyrdState::declare_with`] declares a Card file and prepares its state.
@@ -543,6 +569,8 @@ impl WyrdState {
             index: Arc::new(index),
             bifrost: Arc::new(BifrostLifecycle::default()),
             client: Arc::new(OnceLock::new()),
+            supplied: None,
+            deployment_environment: Arc::new(OnceLock::new()),
         })
     }
 
@@ -551,7 +579,9 @@ impl WyrdState {
     ///
     /// Identical to [`Self::from_path`], except that the state's identity is
     /// fixed now: Bifrost startup and every `observe.verify` call go through
-    /// `client`, and the ambient configuration is never read.
+    /// `client`, and the ambient configuration is never read. The client is
+    /// pinned to the bundle's root on first use, as [`Self::client`]
+    /// describes, so [`Self::configure`] still applies.
     ///
     /// # Arguments
     /// * `path` - The Card bundle directory.
@@ -561,9 +591,10 @@ impl WyrdState {
     /// # Errors
     /// As [`Self::from_path`].
     pub fn from_path_with(path: impl AsRef<Path>, client: WyrdClient) -> Result<Self, WyrdError> {
-        let state = Self::from_path(path)?;
-        let _ = state.client.set(client);
-        Ok(state)
+        Ok(Self {
+            supplied: Some(client),
+            ..Self::from_path(path)?
+        })
     }
 
     /// Declare the Card file at `path` and return the state of its graph,
@@ -720,6 +751,11 @@ impl WyrdState {
     /// every clone, as [`WyrdClient::from_global`] resolves it. Resolution
     /// performs no network IO.
     ///
+    /// Either way the client runs as the bundle's exact root
+    /// ([`WyrdClient::for_workload`]), so the state's evidence is attributed
+    /// to the Service it loaded; a component's [`Run`] view changes only the
+    /// subject, never this context.
+    ///
     /// # Errors
     /// Returns the client configuration error when the global config file
     /// cannot be read or parsed, or the credential resolution error.
@@ -727,8 +763,114 @@ impl WyrdState {
         if let Some(client) = self.client.get() {
             return Ok(client);
         }
-        let client = WyrdClient::from_global().map_err(WyrdError::from)?;
+        let client = match &self.supplied {
+            Some(client) => client.clone(),
+            None => WyrdClient::from_global().map_err(WyrdError::from)?,
+        };
+        let client = self.pinned(client);
         Ok(self.client.get_or_init(|| client))
+    }
+
+    /// `client` bound to this state's root UID and configured environment, or
+    /// unchanged when the bundle carries no root or the client already runs
+    /// in exactly that context.
+    fn pinned(&self, client: WyrdClient) -> WyrdClient {
+        let environment = self.deployment_environment();
+        match &self.root_ref().uid {
+            Some(uid)
+                if client.workload_uid() != Some(uid)
+                    || client.deployment_environment() != environment =>
+            {
+                client.for_service(uid.clone(), environment.map(str::to_owned))
+            }
+            _ => client,
+        }
+    }
+
+    /// Fix this state's Service release and deployment environment before
+    /// its first use.
+    ///
+    /// Local and synchronous: no registration, authentication, or other
+    /// network IO. Every clone shares the result, and a separately loaded
+    /// state keeps its own. Without a call, the first Run, client, Bifrost,
+    /// telemetry, or shutdown use applies the same defaults.
+    ///
+    /// # Arguments
+    /// * `options` - The explicit name, version, and environment.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_409_STATE_CONFIG_FROZEN` once configuration is fixed,
+    /// even after shutdown, and `WYRD_CLIENT_400_CONFIG_INVALID` for an empty
+    /// field or a name or version that does not match the loaded Service.
+    pub fn configure(&self, options: ConfigureOptions) -> Result<(), WyrdError> {
+        self.configure_in(options, &Environment::Process)
+    }
+
+    /// [`Self::configure`] reading its default environment from `environment`.
+    ///
+    /// # Errors
+    /// As [`Self::configure`].
+    fn configure_in(
+        &self,
+        options: ConfigureOptions,
+        environment: &Environment,
+    ) -> Result<(), WyrdError> {
+        let frozen = || WyrdError::SdkStateConfigFrozen {
+            message: "WyrdState configuration is already fixed by configure or first use"
+                .to_owned(),
+            details: json!({ "root": self.root_ref() }),
+        };
+        if self.deployment_environment.get().is_some() {
+            return Err(frozen());
+        }
+        let root = self.root_ref();
+        for (field, value, expected) in [
+            (
+                "service_name",
+                options.service_name.as_deref(),
+                Some(root.name.as_str()),
+            ),
+            (
+                "service_version",
+                options.service_version.as_deref(),
+                Some(root.version.as_str()),
+            ),
+            (
+                "deployment_environment",
+                options.deployment_environment.as_deref(),
+                None,
+            ),
+        ] {
+            let reason = match (value, expected) {
+                (Some(""), _) => "must not be empty".to_owned(),
+                (Some(value), Some(expected)) if value != expected => {
+                    format!("must match the loaded Service's {expected:?}")
+                }
+                _ => continue,
+            };
+            return Err(WyrdClientError::Config {
+                field: field.to_owned(),
+                reason,
+            }
+            .into());
+        }
+        let deployment_environment = options
+            .deployment_environment
+            .or_else(|| environment.var(DEPLOYMENT_ENVIRONMENT_VAR));
+        self.deployment_environment
+            .set(deployment_environment)
+            .map_err(|_| frozen())
+    }
+
+    /// The configured deployment environment, or `None` when unknown.
+    ///
+    /// Reading it is a use: an unconfigured state fixes its defaults here, as
+    /// [`Self::configure`] describes.
+    #[must_use]
+    pub fn deployment_environment(&self) -> Option<&str> {
+        self.deployment_environment
+            .get_or_init(|| Environment::Process.var(DEPLOYMENT_ENVIRONMENT_VAR))
+            .as_deref()
     }
 
     /// Resolve the Verifier named `name` bound in `verified_by` to `subject`.
@@ -807,6 +949,7 @@ impl WyrdState {
     /// execution. The run mints a UUIDv7 `run_id` that every view of it shares.
     #[must_use]
     pub fn run(&self) -> Run {
+        let _ = self.deployment_environment();
         Run::new(self.clone(), ROOT_ALIAS.to_owned(), self.root_ref().clone())
     }
 
@@ -825,6 +968,7 @@ impl WyrdState {
     /// this bundle; nothing is opened.
     pub fn run_for_card(&self, alias: &str) -> Result<Run, WyrdError> {
         let subject = self.card_ref(alias)?.clone();
+        let _ = self.deployment_environment();
         Ok(Run::new(self.clone(), alias.to_owned(), subject))
     }
 
@@ -853,6 +997,7 @@ impl WyrdState {
     /// # Errors
     /// Returns the first producer or sink failure from the drain.
     pub async fn shutdown(&self) -> Result<(), WyrdError> {
+        let _ = self.deployment_environment();
         self.bifrost.shutdown().await
     }
 
@@ -2205,6 +2350,9 @@ impl TelemetryFlushFailure {
 /// Exercises local Card bundle loading, typed Card projections, reference
 /// closure, alias identity, and artifact confinement without network access.
 pub(crate) mod tests {
+    use super::{ConfigureOptions, DEPLOYMENT_ENVIRONMENT_VAR};
+    use crate::WyrdClient;
+    use crate::environment::Environment;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs;
@@ -3031,6 +3179,100 @@ pub(crate) mod tests {
             state.card("model").expect("model alias resolves").kind,
             CardKind::Model
         );
+    }
+
+    /// Prove configure validates against the bundle, applies the environment
+    /// precedence, freezes on first use even after shutdown, and keeps two
+    /// states' contexts and pinned clients apart, all without network IO.
+    ///
+    /// # Panics
+    /// Panics if the fixture cannot load or a configure assertion fails.
+    #[tokio::test]
+    async fn configured_service_context_is_immutable() {
+        let bundle = TestBundle::complete_service();
+        let options = |name: Option<&str>, version: Option<&str>, environment: Option<&str>| {
+            ConfigureOptions {
+                service_name: name.map(str::to_owned),
+                service_version: version.map(str::to_owned),
+                deployment_environment: environment.map(str::to_owned),
+            }
+        };
+        let staging = Environment::from([(DEPLOYMENT_ENVIRONMENT_VAR, "staging")]);
+        let state = WyrdState::from_path(bundle.path()).expect("bundle loads");
+        for (refused, field) in [
+            (options(Some("other"), None, None), "service_name"),
+            (options(None, Some("9.9.9"), None), "service_version"),
+            (options(Some(""), None, None), "service_name"),
+            (options(None, None, Some("")), "deployment_environment"),
+        ] {
+            let error = state
+                .configure_in(refused, &staging)
+                .expect_err("invalid configure is refused");
+            assert_eq!(error.code(), "WYRD_CLIENT_400_CONFIG_INVALID");
+            assert_eq!(error.problem().details["field"], field);
+        }
+        state
+            .configure_in(options(Some("service"), Some("1.0.0"), None), &staging)
+            .expect("matching name and version configure");
+        assert_eq!(state.deployment_environment(), Some("staging"));
+        let frozen = state
+            .configure_in(options(None, None, Some("production")), &staging)
+            .expect_err("a second configure is refused");
+        assert_eq!(frozen.code(), "WYRD_SDK_409_STATE_CONFIG_FROZEN");
+
+        let explicit = WyrdState::from_path_with(bundle.path(), test_client()).expect("loads");
+        explicit
+            .configure_in(options(None, None, Some("production")), &staging)
+            .expect("explicit environment wins over the variable");
+        let unknown = WyrdState::from_path_with(bundle.path(), test_client()).expect("loads");
+        unknown
+            .configure_in(ConfigureOptions::default(), &Environment::from([]))
+            .expect("defaults configure");
+        assert_eq!(unknown.deployment_environment(), None);
+        let pinned = explicit.client().expect("pinned client");
+        assert_eq!(pinned.auth().deployment_environment(), Some("production"));
+        assert_eq!(pinned.workload_uid(), state.root_ref().uid.as_ref());
+        assert_eq!(
+            unknown
+                .client()
+                .expect("pinned")
+                .auth()
+                .deployment_environment(),
+            None
+        );
+
+        let used = WyrdState::from_path(bundle.path()).expect("loads");
+        let _ = used.run();
+        assert_eq!(
+            used.configure(ConfigureOptions::default())
+                .expect_err("a Run freezes defaults")
+                .code(),
+            "WYRD_SDK_409_STATE_CONFIG_FROZEN"
+        );
+        let closed = WyrdState::from_path(bundle.path()).expect("loads");
+        closed
+            .shutdown()
+            .await
+            .expect("an unstarted state shuts down");
+        assert_eq!(
+            closed
+                .configure(ConfigureOptions::default())
+                .expect_err("configure after shutdown is refused")
+                .code(),
+            "WYRD_SDK_409_STATE_CONFIG_FROZEN"
+        );
+    }
+
+    /// A client with a static credential that never contacts a server.
+    ///
+    /// # Panics
+    /// Panics if the static configuration cannot build a client.
+    fn test_client() -> WyrdClient {
+        WyrdClient::with_config(crate::config::ClientConfig {
+            credential: Some(secrecy::SecretString::from("test-key")),
+            ..crate::config::ClientConfig::default()
+        })
+        .expect("static config builds a client")
     }
 
     #[test]

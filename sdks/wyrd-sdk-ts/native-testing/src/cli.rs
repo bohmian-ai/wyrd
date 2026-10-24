@@ -60,21 +60,6 @@ impl From<NativeCardSelector> for SelectorArgs {
     }
 }
 
-/// Options for `issueKey`: the bound Card and the key's label and lifetime.
-#[napi(object)]
-pub struct NativeIssueKey {
-    /// Card kind, such as `Service` or `Agent`.
-    pub kind: String,
-    /// Card name.
-    pub name: String,
-    /// Exact Card version.
-    pub version: String,
-    /// Optional label stored with the key row.
-    pub label: Option<String>,
-    /// Optional lifetime override in seconds.
-    pub expires_in_seconds: Option<u32>,
-}
-
 /// Closed result of one command: its JSON value or its problem document.
 #[napi(object, object_from_js = false)]
 pub struct NativeCliOutcome {
@@ -212,36 +197,6 @@ pub async fn cli_pull(
                 &selector,
                 &output_dir,
                 metadata_only.unwrap_or(false),
-                client,
-            )
-            .await
-        }
-        Err(error) => Err(error),
-    };
-    NativeCliOutcome::from_result(result)
-}
-
-/// Issues an API key bound to one exact Card (`wyrd auth issue-key`).
-///
-/// The outcome holds the plaintext key exactly once.
-///
-/// # Errors
-///
-/// Returns a napi error only when the response cannot be serialized;
-/// coordinate, client, and server failures are returned in the outcome.
-#[napi]
-pub async fn cli_issue_key(
-    options: NativeIssueKey,
-    connection: Option<NativeCliConnection>,
-) -> napi::Result<NativeCliOutcome> {
-    let result = match client(connection) {
-        Ok(client) => {
-            commands::issue_key(
-                &options.kind,
-                &options.name,
-                &options.version,
-                options.label.as_deref(),
-                options.expires_in_seconds,
                 client,
             )
             .await

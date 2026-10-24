@@ -227,7 +227,6 @@ mod tests {
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::ids::CardUid;
-    use wyrd_spec::reference::CardRefScope;
     use wyrd_spec::verification::execution::VerificationRequest;
 
     use super::*;
@@ -242,10 +241,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let caller = Principal::new(
             PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref: None,
-                card_ref_scope: CardRefScope::default(),
-            },
+            PrincipalKind::Service,
             tenant,
             Vec::new(),
             PermissionSet::default(),
@@ -259,6 +255,7 @@ mod tests {
                     group_id: None,
                     inputs: BTreeMap::new(),
                     execution_route_overrides: BTreeMap::new(),
+                    deployment_environment: None,
                 };
                 let key = keys.map(|keys| format!("key-{}", position % keys));
                 Submission::new(

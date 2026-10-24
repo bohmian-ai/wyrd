@@ -6,8 +6,8 @@ use reqwest::Method;
 use uuid::Uuid;
 use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
-    IssuedCredential, PrincipalId, PrincipalPage, PrincipalQuery, PrincipalRoles,
-    RevokePrincipalRequest, RoleAssignmentChange,
+    IssuedCredential, PrincipalId, PrincipalPage, PrincipalQuery, PrincipalRoles, PrincipalSummary,
+    RevokePrincipalRequest, RoleAssignmentChange, WorkloadRestriction,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -145,6 +145,35 @@ impl Principals {
             .await
     }
 
+    /// Replace a Service account's workload restriction atomically.
+    ///
+    /// A family restriction makes the account that family's unique scheduled
+    /// runtime account. The account id, roles, and credentials are unchanged,
+    /// and replaying the current value is idempotent.
+    ///
+    /// # Arguments
+    /// * `principal_id` - The Service account to restrict.
+    /// * `restriction` - The complete replacement restriction.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks tenant-administrative
+    /// wildcard permission, the target is unknown or a User, or another live
+    /// account already holds the family.
+    pub async fn set_workload_restriction(
+        &self,
+        principal_id: &PrincipalId,
+        restriction: &WorkloadRestriction,
+    ) -> Result<PrincipalSummary, WyrdError> {
+        self.client
+            .http
+            .request_json(
+                Method::PUT,
+                &format!("/v1/principals/{principal_id}/workload-restriction"),
+                Some(restriction),
+            )
+            .await
+    }
+
     /// Revoke a principal outright, suspending it so it mints no new tokens.
     ///
     /// The blunt instrument next to [`Self::revoke_credential`]: rather than
@@ -209,8 +238,8 @@ impl Principals {
         Ok(())
     }
 
-    /// Discover the tenant's assignable principals: users and Service and
-    /// Agent principals that are not deleted, ordered by id.
+    /// Discover the tenant's assignable principals: users and Service
+    /// accounts that are not deleted, ordered by id.
     ///
     /// Filters are exact matches. Pass the returned page's `next` as
     /// `query.after` to read the following page; `next` is `None` on the last

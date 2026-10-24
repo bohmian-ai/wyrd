@@ -3,7 +3,7 @@ id: TASK-006
 kind: implementation
 status: proposed
 spec: SPEC-service-identity-and-telemetry
-spec_revision: 12
+spec_revision: 16
 requirements: [REQ-014, REQ-015, REQ-040, REQ-043, REQ-045, REQ-046, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, AC-014, AC-017, AC-019, AC-020]
 depends_on: [TASK-003]
 ---
@@ -237,6 +237,6 @@ private fixture/lifecycle/error plumbing remains implementation-owned.
 
 ## Authority Links
 
-- [Approved revision 12](../spec.md), [whole-trace/availability contract](../supplements/table-storage-and-correlation.md#whole-trace-verification-decision), [auth](../supplements/auth-system.md), [signal schemas](../supplements/telemetry-schemas.md).
+- [Approved revision 16](../spec.md), [whole-trace/availability contract](../supplements/table-storage-and-correlation.md#whole-trace-verification-decision), [auth](../supplements/auth-system.md), [signal schemas](../supplements/telemetry-schemas.md).
 - [Verifier](../../../../architecture/wyrd-design.md#verifier), [Bifrost](../../../../architecture/bifrost-design.md), [security](../../../../architecture/wyrd-security-posture.md), [SQL rules](../../../../crates/wyrd/wyrd-sql/AGENTS.md).
 - [Spec workflow](../../../spec-driven-development.md), [execution](../../../implementation-execution.md), [testing](../../../../TESTING.md), [Python rules](../../../../sdks/wyrd-sdk-python/AGENTS.md), [TypeScript rules](../../../../sdks/wyrd-sdk-ts/AGENTS.md).

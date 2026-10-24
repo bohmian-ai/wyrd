@@ -10,7 +10,10 @@ use std::process::ExitCode;
 use clap::{Args, Subcommand};
 use url::Url;
 use uuid::Uuid;
-use wyrd_spec::auth::{CreateServicePrincipalRequest, PrincipalId};
+use wyrd_spec::auth::{
+    CreateServicePrincipalRequest, PrincipalId, WorkloadFamily, WorkloadKind, WorkloadRestriction,
+};
+use wyrd_spec::ids::CardName;
 
 use crate::error::WyrdCliError;
 
@@ -25,6 +28,44 @@ pub enum CredentialCommand {
     List(PrincipalArgs),
     /// Retire one credential, leaving the principal and its roles untouched.
     Revoke(RevokeCredentialArgs),
+    /// Replace a Service account's workload restriction; omitting the family
+    /// makes the account unrestricted.
+    SetRestriction(SetRestrictionArgs),
+}
+
+/// An optional Service workload family, named by its Card name.
+#[derive(Debug, Args)]
+pub struct WorkloadFamilyArgs {
+    /// Card name of the Service family the account is restricted to.
+    #[arg(long, value_name = "NAME")]
+    pub workload_name: Option<CardName>,
+}
+
+impl WorkloadFamilyArgs {
+    /// The restriction these flags name: the Service family when a name is
+    /// given, otherwise unrestricted.
+    fn restriction(self) -> WorkloadRestriction {
+        self.workload_name
+            .map(|name| WorkloadFamily {
+                kind: WorkloadKind::Service,
+                name,
+            })
+            .into()
+    }
+}
+
+/// Replace one Service account's workload restriction.
+#[derive(Debug, Args)]
+pub struct SetRestrictionArgs {
+    /// Service account to restrict.
+    #[arg(long, value_name = "UUID")]
+    pub principal: String,
+    /// Family to restrict to; omitted means unrestricted.
+    #[command(flatten)]
+    pub family: WorkloadFamilyArgs,
+    /// Deployment; the credential comes from the ambient chain.
+    #[command(flatten)]
+    pub endpoint: TenantEndpoint,
 }
 
 /// How every tenant command reaches a deployment.
@@ -55,6 +96,10 @@ pub struct CreateArgs {
     /// Optional description recorded with the principal.
     #[arg(long, value_name = "TEXT")]
     pub description: Option<String>,
+    /// Optional family restriction; the account is that family's unique
+    /// scheduled runtime account and creating it needs tenant administration.
+    #[command(flatten)]
+    pub family: WorkloadFamilyArgs,
     /// Deployment; the credential comes from the ambient chain.
     #[command(flatten)]
     pub endpoint: TenantEndpoint,
@@ -90,13 +135,15 @@ pub struct RevokeCredentialArgs {
 /// # Errors
 /// Returns [`WyrdCliError::InvalidArgument`] when the principal is not a UUID,
 /// and the server's stable Wyrd error when the caller is unauthorized, a role
-/// does not exist in the tenant, or the principal or credential is unknown.
+/// does not exist in the tenant, the principal or credential is unknown, or
+/// another live account already holds the requested workload family.
 pub async fn dispatch(command: CredentialCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
         CredentialCommand::CreatePrincipal(args) => create(args).await,
         CredentialCommand::Issue(args) => issue(args).await,
         CredentialCommand::List(args) => list(args).await,
         CredentialCommand::Revoke(args) => revoke(args).await,
+        CredentialCommand::SetRestriction(args) => set_restriction(args).await,
     }
 }
 
@@ -123,6 +170,7 @@ async fn create(args: CreateArgs) -> Result<ExitCode, WyrdCliError> {
             name: args.name,
             roles: args.roles,
             description: args.description,
+            workload_restriction: Some(args.family.restriction()),
         })
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -193,6 +241,29 @@ async fn revoke(args: RevokeCredentialArgs) -> Result<ExitCode, WyrdCliError> {
         .map_err(|source| WyrdCliError::Server { source })?;
 
     println!("revoked: {}", args.credential_id);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Replace the account's restriction and print the one it now carries.
+///
+/// # Errors
+/// Returns the errors documented on [`dispatch`].
+async fn set_restriction(args: SetRestrictionArgs) -> Result<ExitCode, WyrdCliError> {
+    let principal = principal_id(&args.principal)?;
+    let summary = crate::client::principals(args.endpoint.server.as_str())
+        .await?
+        .set_workload_restriction(&principal, &args.family.restriction())
+        .await
+        .map_err(|source| WyrdCliError::Server { source })?;
+
+    match summary.workload_restriction {
+        Some(WorkloadRestriction::Family(family)) => println!(
+            "{principal}: restricted to {:?}/{}",
+            family.kind.card_kind(),
+            family.name
+        ),
+        _ => println!("{principal}: unrestricted"),
+    }
     Ok(ExitCode::SUCCESS)
 }
 

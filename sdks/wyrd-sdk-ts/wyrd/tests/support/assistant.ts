@@ -3,12 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Bifrost, Cards, Gateway, WyrdClient, WyrdState } from "wyrd-ai";
-import { cli } from "@wyrd/testing";
 import { z } from "zod";
 
 import type { ReceivedRequest, Reply } from "./http-receiver.js";
 import { configureGateway } from "./local-development.js";
-import { type DeclaredRef, fixture, declared, serverTest } from "./server.js";
+import { type DeclaredRef, fixture, declared, runtimeAccount, serverTest } from "./server.js";
 
 /** The Verdict the local judge returns for every answer: passed, citing the whole answer. */
 export const AGREES =
@@ -54,7 +53,7 @@ export const JudgeCall = z.object({
   card_uid: z.string().nullable(),
 });
 
-/** The declared assistant Service, its Card bundle, and its own key. */
+/** The declared assistant Service, its Card bundle, and its runtime account's key and principal. */
 export interface Assistant {
   readonly bundle: string;
   readonly key: string;
@@ -84,8 +83,7 @@ export async function judgeCalls(server: { flushBifrost(): void }): Promise<z.in
  * Deploy `gpt-4o` and capture call metadata on the gateway, register the
  * latency baseline, the latency Model, and the assistant Service, and hydrate
  * the assistant, all as `client` in its tenant. The returned key is the
- * assistant's own, minted by `issueKey` with no Role grant beyond its default
- * `workload`.
+ * assistant's runtime account's, holding only `workload`.
  */
 export async function registerAssistant(client: WyrdClient): Promise<Assistant> {
   await configureGateway(client);
@@ -96,11 +94,11 @@ export async function registerAssistant(client: WyrdClient): Promise<Assistant> 
   const receipt = await cards.declareFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
   const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-assistant-"));
   await cards.pull(receipt.root, bundle);
-  const issued = await cli.issueKey(receipt.root, { client });
+  const { principalId, key } = await runtimeAccount({ kind: "Service", name: receipt.root.name }, client);
   return {
     bundle,
-    key: issued.key,
-    principal: issued.principal_id,
+    key,
+    principal: principalId,
     service: declared(receipt),
     answerCheck: declared(receipt, "answer-check"),
     answerJudged: declared(receipt, "answer-judged"),

@@ -35,13 +35,14 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.util._once import Once
 from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
+from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.integrations.asgi import RUN_SCOPE_KEY, WyrdMiddleware
 from wyrd.otel import _EXPORTER_EXTRA, install_run_correlation, span_exporter
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer, cli
+from wyrd.testing import WyrdTestServer
 
-from .support import hydrated, timeline
+from .support import hydrated, stale_bundle, timeline
 
 pytestmark = pytest.mark.integration
 
@@ -189,9 +190,13 @@ def test_asgi_lifespan(
     observed_key: str,
     wyrd_server: WyrdTestServer,
     bifrost: Bifrost,
+    cards: Cards,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
 ) -> None:
+    stale = stale_bundle(observed_bundle, cards, tmp_path)
+
     def fresh() -> WyrdState:
         return hydrated(observed_bundle, WyrdClient(credential=observed_key))
 
@@ -252,8 +257,7 @@ def test_asgi_lifespan(
     assert events == ["startup"] and closed(state)
 
     # A failed drain is logged with its code and reported as shutdown failure.
-    agent_key = cli.issue_key(kind="Agent", name="observed-agent", version="1.0.0")
-    agent = hydrated(observed_bundle, WyrdClient(credential=agent_key.key))
+    agent = hydrated(stale, WyrdClient())
     events = []
     with caplog.at_level(logging.ERROR, logger="wyrd.integrations.asgi"):
         replies = cycle(app(agent, events, telemetry=False))
@@ -274,7 +278,7 @@ def test_asgi_lifespan(
 
     # A failed drain then is logged, and the application's error stays primary.
     caplog.clear()
-    agent, events = hydrated(observed_bundle, WyrdClient(credential=agent_key.key)), []
+    agent, events = hydrated(stale, WyrdClient()), []
     with caplog.at_level(logging.ERROR, logger="wyrd.integrations.asgi"):
         replies = cycle(raw(agent, events, RuntimeError("primary")))
     assert str(replies[1]["error"]) == "primary"
@@ -461,7 +465,7 @@ def test_asgi_telemetry_ownership(
 
     # telemetry=False: the application installs, exports, and flushes its own provider.
     reset_tracer_provider(monkeypatch)
-    client = WyrdClient(credential=observed_key)
+    client = WyrdClient(credential=observed_key).for_workload(root)
     owned, local = TracerProvider(), InMemorySpanExporter()
     owned.add_span_processor(SimpleSpanProcessor(local))
     owned.add_span_processor(SimpleSpanProcessor(span_exporter(client)))

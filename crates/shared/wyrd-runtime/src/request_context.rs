@@ -4,7 +4,8 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 use wyrd_spec::auth::Attribution;
-use wyrd_spec::ids::IdempotencyKey;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::{CardUid, IdempotencyKey};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::AuditDelegationStep;
 
@@ -23,20 +24,15 @@ impl DelegationStep {
     ///
     /// The conversion lives here rather than in `wyrd-spec` because the
     /// runtime owns [`PrincipalRef`]; the spec crate stays free of runtime
-    /// types. Only verified identity crosses: the principal's id, its
-    /// card-free kind tag, and the card authority it acted under. No
-    /// credential material is representable in the result.
+    /// types. Only verified identity crosses: the principal's id, its kind
+    /// tag, and the exact root it acted under. No credential material is
+    /// representable in the result.
     #[must_use]
     pub fn audit_projection(&self) -> AuditDelegationStep {
         AuditDelegationStep {
             principal_id: self.principal.id,
             principal_kind: self.principal.kind.tag(),
-            card_ref: self.principal.card_ref().cloned(),
-            card_ref_scope: self
-                .principal
-                .card_ref_scope()
-                .map(|scope| scope.as_slice().to_vec())
-                .unwrap_or_default(),
+            workload_uid: self.principal.workload_uid.clone(),
         }
     }
 }
@@ -64,15 +60,57 @@ pub fn delegated_attribution(principal: &Principal, chain: &[DelegationStep]) ->
     )
 }
 
+/// The exact root that owns work done by `principal` under `chain`.
+///
+/// The current (outermost) actor's root when delegated, otherwise the
+/// subject's own selected root; `None` for rootless work.
+#[must_use]
+pub fn owning_root<'a>(
+    principal: &'a Principal,
+    chain: &'a [DelegationStep],
+) -> Option<&'a CardUid> {
+    chain
+        .last()
+        .map_or(principal.workload_uid.as_ref(), |step| {
+            step.principal.workload_uid.as_ref()
+        })
+}
+
+/// Whether a request's `selected` workload root must still be resolved for a
+/// verified bearer.
+///
+/// A bearer whose owning root ([`owning_root`]) is already signed is
+/// immutable: an equal selector is an idempotent `Ok(false)` and a different
+/// one is refused, never unpinned. A rootless bearer answers `Ok(true)`, and
+/// the selector is resolved under its signed Card access. Every ingress
+/// routes a selector through here, so none silently drops or rebinds one.
+///
+/// # Errors
+/// Returns [`WyrdError::SignedWorkloadMismatch`] when `selected` differs from
+/// the signed root.
+pub fn needs_root_resolution(
+    principal: &Principal,
+    chain: &[DelegationStep],
+    selected: &CardUid,
+) -> Result<bool, WyrdError> {
+    match owning_root(principal, chain) {
+        Some(signed) if signed == selected => Ok(false),
+        Some(signed) => Err(WyrdError::signed_workload_mismatch(signed, selected)),
+        None => Ok(true),
+    }
+}
+
 /// The verified effective authority one accepted operation runs under.
 ///
 /// Captured once when the server accepts deferred work, such as a queued
 /// Verifier run, and stored with it so claim, retry, and restart reuse exactly
 /// what was accepted: the effective principal (for a delegated request, the
-/// subject/actor intersection authentication already produced) and the
-/// initiator-first delegation chain kept as audit history. It is never
-/// re-derived from a bare principal ID, holds no bearer token, API key, or
-/// credential ID, and is server-only state that no run view exposes.
+/// subject/actor intersection authentication already produced, with its
+/// signed Card limit and root) and the initiator-first delegation chain with
+/// each participant's root and non-secret credential provenance. It is never
+/// re-derived from a bare principal ID or the account's current roles, holds
+/// no bearer token or secret, and is server-only state that no run view
+/// exposes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedAuthority {
@@ -85,18 +123,20 @@ pub struct AcceptedAuthority {
 impl AcceptedAuthority {
     /// Capture `principal` and its verified `chain` as accepted authority.
     ///
-    /// Drops the credential ID: which credential authenticated the accepting
-    /// request is that request's audit fact, not part of the authority later
-    /// work runs under.
+    /// Keeps the non-secret credential ID as provenance; it never
+    /// authorizes later work.
     #[must_use]
     pub fn new(principal: &Principal, chain: &[DelegationStep]) -> Self {
         Self {
-            principal: Principal {
-                credential_id: None,
-                ..principal.clone()
-            },
+            principal: principal.clone(),
             delegation_chain: chain.to_vec(),
         }
+    }
+
+    /// The exact root that owns the accepted work.
+    #[must_use]
+    pub fn owning_root(&self) -> Option<&CardUid> {
+        owning_root(&self.principal, &self.delegation_chain)
     }
 
     /// The subject/actor pair the accepting request carried.
@@ -190,14 +230,14 @@ impl TraceParent {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcceptedAuthority, DelegationStep, RequestContext, TraceParent};
+    use super::{
+        AcceptedAuthority, DelegationStep, RequestContext, TraceParent, needs_root_resolution,
+    };
     use crate::permission::PermissionSet;
     use crate::principal::{Principal, PrincipalId, PrincipalKind, PrincipalRef};
     use chrono::Utc;
-    use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, IdempotencyKey};
-    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use wyrd_spec::auth::CardAccess;
+    use wyrd_spec::ids::{CardUid, IdempotencyKey};
     use wyrd_spec::request_id::RequestId;
 
     fn request_id() -> RequestId {
@@ -205,28 +245,57 @@ mod tests {
             .expect("generated UUIDv7 is a valid request id")
     }
 
-    fn card_ref(kind: CardKind, name: &str) -> CardRef {
-        CardRef {
-            kind,
-            name: CardName::new(name).expect("static card name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            uid: None,
-        }
+    fn service_principal(_name: &str) -> Principal {
+        let root = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 Card UID");
+        Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::Service,
+            wyrd_spec::DataTenantId::new_v7(),
+            Vec::new(),
+            PermissionSet::new(),
+        )
+        .with_card_access(
+            CardAccess::Scoped {
+                cards: vec![root.clone()],
+            },
+            Some(root),
+        )
     }
 
-    fn service_principal(name: &str) -> Principal {
-        let card_ref = card_ref(CardKind::Service, name);
-        Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::Service {
-                card_ref: Some(card_ref.clone()),
-                card_ref_scope: CardRefScope::own(&card_ref),
-            },
-            tenant_id: wyrd_spec::DataTenantId::new_v7(),
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
-        }
+    /// A signed root accepts only an equal selector; a rootless bearer
+    /// resolves any selector.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an equal selector needs resolution or errors, a differing
+    /// selector is not refused as `SignedWorkloadMismatch` for the signed root
+    /// or for a delegation chain carrying it, or a rootless bearer does not
+    /// need resolution.
+    #[test]
+    fn selector_never_rebinds_a_signed_root() {
+        let rooted = service_principal("rooted");
+        let signed = rooted.workload_uid.clone().expect("signed root");
+        let other = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 Card UID");
+        assert!(!needs_root_resolution(&rooted, &[], &signed).expect("equal selector"));
+        assert!(matches!(
+            needs_root_resolution(&rooted, &[], &other),
+            Err(wyrd_spec::error::WyrdError::SignedWorkloadMismatch { .. })
+        ));
+        let rootless = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            wyrd_spec::DataTenantId::new_v7(),
+            Vec::new(),
+            PermissionSet::new(),
+        );
+        assert!(needs_root_resolution(&rootless, &[], &other).expect("rootless"));
+        let delegated = [DelegationStep {
+            principal: PrincipalRef::from_principal(&rooted),
+        }];
+        assert!(matches!(
+            needs_root_resolution(&rootless, &delegated, &other),
+            Err(wyrd_spec::error::WyrdError::SignedWorkloadMismatch { .. })
+        ));
     }
 
     #[test]
@@ -246,7 +315,7 @@ mod tests {
 
         assert_eq!(step.principal.id, principal.id);
         assert_eq!(step.principal.kind, principal.kind);
-        assert!(step.principal.card_ref().is_some());
+        assert_eq!(step.principal.workload_uid, principal.workload_uid);
     }
 
     #[test]
@@ -309,16 +378,15 @@ mod tests {
         assert!(!debug.contains("third"));
     }
 
-    /// Accepted authority keeps the effective principal and chain, survives a
-    /// JSON round trip unchanged, never carries the accepting credential, and
-    /// projects the accepting request's subject/actor pair.
+    /// Accepted authority keeps the effective principal, Card limit, roots,
+    /// chain, and credential provenance across a JSON round trip, and
+    /// projects the accepting request's subject/actor pair and owning root.
     ///
     /// # Panics
     /// Panics when the authority does not serialize or deserialize, or when
-    /// the round trip changes it, keeps the credential, or projects another
-    /// pair.
+    /// the round trip changes it or projects another pair or owner.
     #[test]
-    fn accepted_authority_round_trips_without_credential() {
+    fn accepted_authority_round_trips_with_provenance() {
         let mut subject = service_principal("subject");
         subject.credential_id = Some(uuid::Uuid::now_v7());
         let actor = service_principal("actor");
@@ -332,8 +400,14 @@ mod tests {
             serde_json::from_value(json).expect("deserialize accepted authority");
 
         assert_eq!(parsed, accepted);
-        assert_eq!(parsed.principal.credential_id, None);
+        assert_eq!(parsed.principal.credential_id, subject.credential_id);
+        assert_eq!(parsed.principal.card_access, subject.card_access);
         assert_eq!(parsed.delegation_chain, chain);
+        assert_eq!(parsed.owning_root(), actor.workload_uid.as_ref());
+        assert_eq!(
+            AcceptedAuthority::new(&subject, &[]).owning_root(),
+            subject.workload_uid.as_ref()
+        );
         assert_eq!(parsed.attribution().sub_principal_id, subject.id);
         assert_eq!(parsed.attribution().act_principal_id, actor.id);
         assert_eq!(

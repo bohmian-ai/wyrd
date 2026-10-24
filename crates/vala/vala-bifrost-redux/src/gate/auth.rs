@@ -19,8 +19,9 @@ use std::sync::Arc;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_verify::{TokenAudience, TokenVerifier, VerifiedToken};
-use wyrd_runtime::{DelegationStep, Principal, delegated_attribution};
-use wyrd_spec::auth::Attribution;
+use wyrd_runtime::{DelegationStep, Principal, delegated_attribution, needs_root_resolution};
+use wyrd_spec::auth::{Attribution, WORKLOAD_UID_HEADER, workload_uid_selector};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::metadata::MetadataMap;
@@ -85,6 +86,18 @@ impl AuthContext {
     }
 }
 
+/// A caller the hosting server already verified and narrowed to its request's
+/// selected workload root, handed to Gate in the request extensions.
+///
+/// Gate verifies bearers store-free, so it cannot resolve a root for a
+/// rootless bearer and [`authenticate`] refuses such a selector. The hosting
+/// server owns the registry: it verifies the bearer, applies the selector
+/// through its one root-selection owner, and inserts the narrowed token here.
+/// Extensions never come from the wire, so only that server produces one; a
+/// request without it is verified by [`authenticate`] as usual.
+#[derive(Clone, Debug)]
+pub struct ResolvedCaller(pub VerifiedToken);
+
 /// Read the bearer token from the `x-wyrd-access-token` metadata, stripping an
 /// optional `Bearer ` prefix.
 ///
@@ -138,12 +151,16 @@ pub fn read_or_mint_request_id(metadata: &MetadataMap) -> RequestId {
 ///
 /// Synchronous and database-free: the tenant is read from the unverified
 /// payload only to select the expected tenant, and the verifier refuses a token
-/// whose signed tenant differs.
+/// whose signed tenant differs. An `x-wyrd-workload-uid` selector equal to the
+/// bearer's signed root is idempotent; resolving a root for a rootless bearer
+/// needs the registry, so this refuses it rather than dropping it, and a
+/// hosting server resolves it first and supplies a [`ResolvedCaller`].
 ///
 /// # Errors
 /// Returns [`IngestError::Unauthenticated`] when the bearer is missing, does not
 /// name a tenant, or fails signature, issuer, audience, expiry, or tenant
-/// verification.
+/// verification, and [`IngestError::WorkloadSelector`] for a malformed,
+/// mismatched, or unresolvable selector.
 pub fn authenticate(
     verifier: &TokenVerifier,
     metadata: &MetadataMap,
@@ -153,6 +170,31 @@ pub fn authenticate(
     let verified_token = verifier
         .verify_on(&token, &expected_tenant, TokenAudience::Bifrost)
         .map_err(|error| IngestError::Unauthenticated(error.to_string()))?;
+    let selector = workload_uid_selector(
+        metadata
+            .get_all(WORKLOAD_UID_HEADER)
+            .iter()
+            .map(wyrd_tonic::tonic::metadata::MetadataValue::as_bytes),
+    )
+    .map_err(IngestError::WorkloadSelector)?;
+    if let Some(root) = selector
+        && needs_root_resolution(
+            &verified_token.principal,
+            &verified_token.delegation_chain,
+            &root,
+        )
+        .map_err(IngestError::WorkloadSelector)?
+    {
+        return Err(IngestError::WorkloadSelector(
+            WyrdError::WorkloadUidRefused {
+                message: format!(
+                    "native Bifrost ingest selects workload root {root} only through a bearer \
+                 issued for it; exchange the credential with workload_uid"
+                ),
+                details: serde_json::json!({ "workload_uid": root }),
+            },
+        ));
+    }
     Ok(AuthContext::from_verified(verified_token, metadata))
 }
 

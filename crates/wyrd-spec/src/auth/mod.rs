@@ -3,10 +3,8 @@
 mod admin;
 mod attribution;
 mod browser;
-mod card_scope;
 mod device;
 mod human_connection;
-mod issue_key;
 mod oidc;
 mod permission_scope;
 mod platform_identity;
@@ -17,6 +15,7 @@ mod secret_bearer;
 mod tenant_admin;
 mod tenant_principals;
 mod token;
+mod workload;
 
 pub use admin::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
@@ -27,14 +26,12 @@ pub use browser::{
     BrowserApiKeyRequest, BrowserCredential, BrowserLoginRequest, BrowserLoginResponse,
     BrowserLogoutRequest, BrowserSessionQuery, BrowserSessionView, BrowserSessionsResponse,
 };
-pub use card_scope::CardScope;
 pub use device::{DeviceAuthorization, DeviceAuthorizationRequest, TokenRevocationRequest};
 pub use human_connection::{
     ConnectionActivate, ConnectionInput, ConnectionTestRequest, ConnectionTestResponse,
     HUMAN_SUBJECT_CLAIM, HumanClientAuth, HumanConnectionState, HumanConnectionView,
     HumanConnectionsResponse, refuse_human_trusted_issuer,
 };
-pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{
     AbsoluteUrl, CallbackQuery, ConnectionTester, IssuerUrl, LoginInitResponse, LoginInitiation,
     ProviderResponse, Sha256Hex, Sha256HexError, UrlParseError,
@@ -61,9 +58,13 @@ pub use tenant_principals::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
     CredentialMetadata, CredentialRevoked, IssuedCredential, ListCredentialsArgs, PrincipalPage,
     PrincipalQuery, PrincipalRoles, PrincipalStatus, PrincipalSummary, RevokeCredentialArgs,
-    RoleAssignment, RoleAssignmentChange, RoleSource,
+    RoleAssignment, RoleAssignmentChange, RoleSource, SetWorkloadRestrictionArgs,
 };
 pub use token::{
     AuthorizationServerMetadata, ExchangeTokenType, OAuthClientId, OAuthErrorCode,
     OAuthErrorResponse, TokenAudience, TokenRequest, TokenResponse, TokenType,
+};
+pub use workload::{
+    CardAccess, DEPLOYMENT_ENVIRONMENT_HEADER, FamilyRestriction, MAX_SCOPED_CARDS,
+    WORKLOAD_UID_HEADER, WorkloadFamily, WorkloadKind, WorkloadRestriction, workload_uid_selector,
 };

@@ -62,7 +62,7 @@ impl EvidenceInvestigation {
         let signals =
             canonical_signals::seed_canonical_signals(&server, "mcp-investigation").await?;
         let admin = server
-            .bootstrap_agent("mcp-evidence-admin", &["admin"])
+            .bootstrap_service("mcp-evidence-admin", &["admin"])
             .await?;
         let key = admin.api_key().ok_or("administrator has a machine key")?;
         let credential = ResolvedCredential::ApiKey(key.expose_secret().to_owned().into());
@@ -206,6 +206,7 @@ impl EvidenceInvestigation {
                 card_uid: subject_uid,
                 owner_card_uid: Some(subject_uid),
                 group_id: None,
+                deployment_environment: None,
                 binding_id: None,
                 trigger: None,
                 window,
@@ -367,6 +368,12 @@ impl EvidenceInvestigation {
     ///
     /// # Errors
     /// Returns principal, MCP, or unexpected-success failures.
+    ///
+    /// # Panics
+    /// Panics when a `max_rows` or `max_bytes` refusal does not carry
+    /// `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE`, when the restricted reader's
+    /// `vala.gateway.calls` read is not refused with status 403, or when any
+    /// refusal includes `rows`.
     pub(super) async fn refuse_unauthorized_or_oversized_reads(
         &self,
     ) -> Result<(), McpJourneyError> {
@@ -387,7 +394,7 @@ impl EvidenceInvestigation {
             .await?;
         let reader = self
             .server
-            .bootstrap_agent("evidence-reader", &["mcp_evidence_reader"])
+            .bootstrap_service("evidence-reader", &["mcp_evidence_reader"])
             .await?;
         let token = self
             .server

@@ -8,6 +8,7 @@ use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
 #[cfg(feature = "internal")]
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 
 /// The observation-kind discriminant that keys the producer pool.
 ///
@@ -25,9 +26,11 @@ pub enum SinkKind {
 /// `(server_url, credential fingerprint)`, computed **once** at handle
 /// construction. The fingerprint is a SHA-256 hex digest of the resolved
 /// credential's secret bytes — the credential is **never** JWT-decoded, so no
-/// server-derived identity is reachable from the client tier. Two configs with
-/// the same base URL and secret material produce the same scope; differing
-/// secrets never collide.
+/// server-derived identity is reachable from the client tier. The workload
+/// root the credential runs as is hashed beside it, so rootless, R1, and R2
+/// handles over one secret never share a pool. Two configs with the same base
+/// URL, secret material, and root produce the same scope; differing secrets or
+/// roots never collide.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClientScope {
     server_url: String,
@@ -53,9 +56,10 @@ impl ClientScope {
     #[cfg(feature = "internal")]
     pub fn from_config(config: &ClientConfig) -> Result<Self, WyrdError> {
         let credential = config.resolve_credential().map_err(WyrdError::from)?;
+        let workload_uid = config.environment.var("WYRD_WORKLOAD_UID");
         Ok(Self {
             server_url: config.http.base_url.trim_end_matches('/').to_owned(),
-            credential_fingerprint: fingerprint_credential(&credential),
+            credential_fingerprint: fingerprint_credential(&credential, workload_uid.as_deref()),
         })
     }
 
@@ -76,7 +80,10 @@ impl ClientScope {
         let auth = &client.auth;
         Self {
             server_url: auth.base_url().trim_end_matches('/').to_owned(),
-            credential_fingerprint: fingerprint_credential(auth.credential()),
+            credential_fingerprint: scoped_fingerprint(
+                fingerprint_credential(auth.credential(), auth.workload_uid().map(CardUid::as_str)),
+                auth.deployment_environment(),
+            ),
         }
     }
 
@@ -95,14 +102,32 @@ impl ClientScope {
     }
 }
 
-/// SHA-256 hex digest of the credential's secret bytes.
+/// `fingerprint` extended with the configured deployment environment, so two
+/// states over one credential and root in different environments never share
+/// a producer pool whose metadata carries the other's environment.
+fn scoped_fingerprint(fingerprint: String, deployment_environment: Option<&str>) -> String {
+    match deployment_environment {
+        Some(environment) => {
+            let mut hasher = Sha256::new();
+            hasher.update(fingerprint);
+            hasher.update([0]);
+            hasher.update(environment);
+            hex::encode(hasher.finalize())
+        }
+        None => fingerprint,
+    }
+}
+
+/// SHA-256 hex digest of the credential's secret bytes and the workload root
+/// it runs as.
 ///
 /// Reads `expose_secret()` on the variant's secret material — the only
 /// reachable identity material — and hashes the raw bytes. No JWT decode. A
 /// delegated credential hashes the subject token, the audience, and the
 /// actor's own fingerprint, so two subjects behind one actor never share a
-/// producer pool.
-fn fingerprint_credential(credential: &ResolvedCredential) -> String {
+/// producer pool. A root is hashed after a separator byte no secret or UID
+/// spelling contains, so rootless and rooted scopes never collide.
+fn fingerprint_credential(credential: &ResolvedCredential, workload_uid: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     match credential {
         ResolvedCredential::Renewable(source) => hasher.update(source.identity()),
@@ -116,8 +141,15 @@ fn fingerprint_credential(credential: &ResolvedCredential) -> String {
         } => {
             hasher.update(subject_token.expose_secret());
             hasher.update(audience.as_str());
-            hasher.update(fingerprint_credential(actor.credential()));
+            hasher.update(fingerprint_credential(
+                actor.credential(),
+                actor.workload_uid().map(CardUid::as_str),
+            ));
         }
+    }
+    if let Some(uid) = workload_uid {
+        hasher.update([0]);
+        hasher.update(uid);
     }
     hex::encode(hasher.finalize())
 }

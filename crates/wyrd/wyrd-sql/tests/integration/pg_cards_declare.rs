@@ -10,12 +10,13 @@ use wyrd_spec::envelope::Card;
 use wyrd_spec::ids::{CardName, CardUid};
 use wyrd_spec::reference::{CardRef, scope_child_card_refs};
 use wyrd_spec::registry::{ArtifactManifestEntry, DeclarationOperationId};
+use wyrd_sql::queries::auth::insert_service_account;
 use wyrd_sql::queries::cards::{
     NewCardRow, NewDeclarationOperation, RECONCILE_KIND_DECLARATION, claim_card_reconciliation,
     insert_artifact_manifest_rows, insert_card_row, insert_declaration_operation,
     lookup_existing_operation, manifest_completion_rows, persist_outbound_relationships,
     recheck_active_card_refs, record_card_reconciliation_failure, soft_delete_card_by_ref,
-    soft_delete_card_with_state, upsert_service_account_from_card,
+    soft_delete_card_with_state,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -322,21 +323,18 @@ async fn subject_actor_creation_and_replay() {
         .await
         .expect("card deletes");
 
-    let service: Card = serde_json::from_value(serde_json::json!({
-        "apiVersion": "wyrd/v1",
-        "kind": "Service",
-        "metadata": { "name": "pair-service", "version": "1.0.0" },
-        "spec": {},
-    }))
-    .expect("service fixture deserializes");
-    let service_uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
-    let principal = upsert_service_account_from_card(&mut conn, &service_uid, &service, pairs[0])
-        .await
-        .expect("principal projects");
-    let reprojected = upsert_service_account_from_card(&mut conn, &service_uid, &service, pairs[2])
-        .await
-        .expect("principal re-projects");
-    assert_eq!(principal, reprojected);
+    let principal = Uuid::now_v7();
+    insert_service_account(
+        &mut conn,
+        principal,
+        "service",
+        None,
+        "pair-service",
+        None,
+        pairs[0],
+    )
+    .await
+    .expect("account inserts");
 
     let card_pair: (Uuid, Uuid) = sqlx::query_as(
         "SELECT sub_principal_id, act_principal_id FROM wyrd.cards WHERE card_uid = $1",
@@ -349,7 +347,7 @@ async fn subject_actor_creation_and_replay() {
     let principal_pair: (Uuid, Uuid) = sqlx::query_as(
         "SELECT sub_principal_id, act_principal_id FROM wyrd.auth_service_accounts WHERE id = $1",
     )
-    .bind(principal.as_uuid())
+    .bind(principal)
     .fetch_one(&mut **conn.transaction())
     .await
     .expect("principal pair reads");

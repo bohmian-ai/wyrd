@@ -810,7 +810,7 @@ async fn tester_authorized(
             }
             _ => return Ok(false),
         },
-        PrincipalKindTag::TenantAdmin | PrincipalKindTag::Service | PrincipalKindTag::Agent => {
+        PrincipalKindTag::TenantAdmin | PrincipalKindTag::Service => {
             match service_account_by_id(conn, id).await.map_err(store_error)? {
                 Some(row) if principal_kind_tag(&row.principal_kind) == tester.principal_kind => {
                     list_service_account_roles(conn, id)
@@ -875,7 +875,7 @@ async fn recovery_key_authorizes(
     let required = Permission::identity_connections_write();
     let allowed = permissions.contains(&required);
     let recovery = AuditEvent {
-        card_ref: row.card_ref.map(|card_ref| card_ref.0),
+        card_ref: None,
         sub_principal_id: PrincipalId::new(row.principal_id),
         sub_principal_kind: principal_kind_tag(&row.principal_kind),
         act_principal_id: PrincipalId::new(row.principal_id),

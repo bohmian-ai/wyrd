@@ -23,6 +23,8 @@ from wyrd.client import WyrdClient
 from wyrd.observe import record
 from wyrd.testing import WyrdTestServer
 
+from tests.integration.support import rooted
+
 pytestmark = pytest.mark.integration
 
 
@@ -387,7 +389,7 @@ def test_delegated_client_reads_as_a_and_cannot_write_with_b_authority(
     b_key = wyrd_server.scoped_api_key(
         "delegated_writer", ["bifrost_query:read", "bifrost_record:write", "bifrost_table:read"]
     )
-    service_b = WyrdClient(credential=b_key)
+    service_b = rooted(b_key, "delegated_writer")
     as_a = Bifrost(client=service_b.on_behalf_of(WyrdClient(credential=a_key).access_token()))
     batch = pyarrow.RecordBatch.from_pylist(
         [{"id": 1, "value": "as-a"}],
@@ -427,7 +429,7 @@ def test_subject_actor_rows_and_reserved_columns(
         "bifrost_table:read",
     ]
     a = WyrdClient(credential=wyrd_server.scoped_api_key(f"subject_{column}", permissions))
-    b = WyrdClient(credential=wyrd_server.scoped_api_key(f"actor_{column}", permissions))
+    b = rooted(wyrd_server.scoped_api_key(f"actor_{column}", permissions), f"actor_{column}")
     config = TableConfig(Item, table)
     assert Bifrost(config).register() == "created"
 

@@ -12,7 +12,6 @@ from wyrd._wyrd.testing.cli import (
     CheckCard,
     CheckDiagnostic,
     CheckReport,
-    IssueKeyResponse,
     McpHostReport,
     McpInstallReport,
     declare,
@@ -23,20 +22,18 @@ from wyrd._wyrd.testing.cli import (
     revoke_provider_credential,
 )
 
-from ._commands import get, issue_key, pull
+from ._commands import get, pull
 
 __all__ = [
     "CheckCard",
     "CheckDiagnostic",
     "CheckReport",
-    "IssueKeyResponse",
     "McpHostReport",
     "McpInstallReport",
     "declare",
     "declare_check",
     "delete_provider_credential",
     "get",
-    "issue_key",
     "mcp_install",
     "pull",
     "put_provider_credential",

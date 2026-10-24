@@ -373,6 +373,13 @@ impl PyVerificationResult {
         CardRefPy(self.result.subject.clone())
     }
 
+    /// The deployment environment correlation tag the request supplied, or
+    /// `None` when it supplied none.
+    #[getter]
+    fn deployment_environment(&self) -> Option<&str> {
+        self.result.deployment_environment.as_deref()
+    }
+
     /// The overall verdict: `passed`, `failed`, or `inconclusive`.
     ///
     /// # Errors

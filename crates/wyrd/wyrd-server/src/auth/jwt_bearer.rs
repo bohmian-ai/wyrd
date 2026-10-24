@@ -6,7 +6,7 @@ use serde_json::json;
 use wyrd_auth::issuance::ExchangedToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::TenantSlug;
+use wyrd_spec::ids::{CardUid, TenantSlug};
 
 use crate::auth::{auth_not_configured, invalid_token, tenant_slug_from_host};
 use crate::http::error::WyrdErrorResponse;
@@ -15,7 +15,8 @@ use crate::state::AppState;
 /// Exchange a platform-attested workload assertion for a Wyrd access token.
 ///
 /// Resolves the tenant from the request host (or the caller's fallback slug),
-/// then hands the assertion to the workload exchange, which verifies it with
+/// then hands the assertion and optional `workload_uid` root selector to the
+/// workload exchange, which verifies it with
 /// the issuance-side external verifier and mints through the shared tenant
 /// issuer.
 ///
@@ -28,6 +29,7 @@ pub async fn exchange_jwt_bearer(
     headers: &HeaderMap,
     assertion: SecretString,
     tenant: Option<TenantSlug>,
+    workload_uid: Option<CardUid>,
     request_id: &str,
 ) -> Result<ExchangedToken, WyrdErrorResponse> {
     let tenant_id = resolve_workload_tenant(state, headers, tenant).await?;
@@ -48,7 +50,13 @@ pub async fn exchange_jwt_bearer(
             .ok_or_else(auth_not_configured)?,
     };
     service
-        .execute(state.postgres.wyrd(), tenant_id, assertion, request_id)
+        .execute(
+            state.postgres.wyrd(),
+            tenant_id,
+            assertion,
+            workload_uid,
+            request_id,
+        )
         .await
         .map_err(WyrdErrorResponse::from)
 }
@@ -125,11 +133,14 @@ mod pg_tests {
     use wyrd_runtime::{PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{Attribution, IssuerTokenPolicy, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
+    use wyrd_spec::auth::{
+        Attribution, CardAccess, FamilyRestriction, IssuerTokenPolicy, PLATFORM_AUDIT_PRINCIPAL,
+        PrincipalId, WorkloadFamily, WorkloadKind,
+    };
     use wyrd_spec::auth::{IssuerUrl, TokenType};
     use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::{CardName, TenantSlug};
+    use wyrd_spec::ids::{CardName, CardUid, TenantSlug};
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
@@ -156,19 +167,23 @@ mod pg_tests {
     const EXTERNAL_KID: &str = "ext-workload-key";
     const ED_X: &str = "WhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ-DZ8Vw";
 
+    /// A bound workload assertion exchanges for a Service access token whose
+    /// principal is the binding's stable account with its granted roles, no
+    /// refresh token, and one successful self-attributed audit row.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding or the exchange fails, or when the issued
+    /// token's principal, roles, token type, refresh token, or audit row differ
+    /// from the binding's Service account.
     #[tokio::test]
     async fn workload_jwt_bearer_mints_service_token() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let subject = "system:serviceaccount:default:svc";
         let role_name = builtin_role_name();
-        let binding = binding(
-            tenant,
-            subject,
-            CardKind::Service,
-            "svc",
-            Some(EXTERNAL_AUDIENCE),
-        );
+        let account = bootstrap_principal(&fixture, tenant, "svc", None, &[role_name])
+            .await
+            .expect("service account seeds");
         let (state, scribe) = RecordingScribe::attach(
             test_state_with_external(
                 &fixture,
@@ -177,13 +192,16 @@ mod pg_tests {
                     jwks_uri(&fixture).await,
                     EXTERNAL_AUDIENCE,
                 )],
-                vec![binding.clone()],
+                vec![binding(
+                    tenant,
+                    subject,
+                    account,
+                    None,
+                    Some(EXTERNAL_AUDIENCE),
+                )],
             )
             .await,
         );
-        bootstrap_principal(&fixture, tenant, CardKind::Service, "svc", &[role_name])
-            .await
-            .expect("service principal seeds");
 
         let assertion = encode_external_token(&external_claims(
             subject,
@@ -195,6 +213,7 @@ mod pg_tests {
             &tenant_headers(tenant_slug(&fixture)),
             SecretString::from(assertion),
             None,
+            None,
             "req-1",
         )
         .await
@@ -202,11 +221,10 @@ mod pg_tests {
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
             .expect("issued token verifies");
-        assert!(matches!(
-            &verified.principal.kind,
-            PrincipalKind::Service { card_ref, .. }
-                if card_ref.as_ref() == Some(&binding.card_ref)
-        ));
+        assert_eq!(verified.principal.kind, PrincipalKind::Service);
+        assert_eq!(verified.principal.id.as_uuid(), account);
+        assert_eq!(verified.principal.card_access, CardAccess::AnyRegistered);
+        assert_eq!(verified.principal.workload_uid, None);
         assert_eq!(role_names(&verified.principal.roles), set_of(&[role_name]));
         assert_eq!(exchanged.token_type, TokenType::Bearer);
         assert!(
@@ -220,13 +238,24 @@ mod pg_tests {
         assert_eq!(rows[0].error_tag, "");
     }
 
+    /// The tenant slug fallback resolves the workload tenant when the host
+    /// names none, and a binding's pinned default Service root becomes the
+    /// token's exact root.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding or the slug-fallback exchange fails, or when
+    /// the issued token does not carry the binding's account and pinned root.
     #[tokio::test]
-    async fn workload_jwt_bearer_falls_back_to_tenant_slug_for_agent() {
+    async fn workload_jwt_bearer_falls_back_to_tenant_slug_with_service_root() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let slug = tenant_slug(&fixture);
         let subject = "spiffe://cluster.local/ns/default/sa/agent";
         let role_name = builtin_role_name();
+        let account = bootstrap_principal(&fixture, tenant, "agent-runtime", None, &[role_name])
+            .await
+            .expect("service account seeds");
+        let agent = seed_root(&fixture, tenant, CardKind::Service, "agent", "1.0.0").await;
         let state = test_state_with_external(
             &fixture,
             vec![trusted_issuer(
@@ -237,15 +266,12 @@ mod pg_tests {
             vec![binding(
                 tenant,
                 subject,
-                CardKind::Agent,
-                "agent",
+                account,
+                Some(agent.clone()),
                 Some(EXTERNAL_AUDIENCE),
             )],
         )
         .await;
-        bootstrap_principal(&fixture, tenant, CardKind::Agent, "agent", &[role_name])
-            .await
-            .expect("agent principal seeds");
 
         let assertion = encode_external_token(&external_claims(
             subject,
@@ -257,6 +283,7 @@ mod pg_tests {
             &localhost_headers(),
             SecretString::from(assertion),
             Some(slug),
+            None,
             "req-2",
         )
         .await
@@ -264,17 +291,83 @@ mod pg_tests {
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
             .expect("issued token verifies");
-        assert!(matches!(
-            &verified.principal.kind,
-            PrincipalKind::Agent { card_ref, .. } if card_ref.name.as_str() == "agent"
-        ));
+        assert_eq!(verified.principal.id.as_uuid(), account);
+        assert_eq!(verified.principal.workload_uid, Some(agent.clone()));
+        assert!(verified.principal.authorizes_card_uid(&agent));
     }
 
+    /// A binding whose pinned default root is an Agent issues nothing:
+    /// workloads are Services only, and the refusal is the same one an
+    /// unknown root earns.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails or the exchange does not fail with
+    /// `WorkloadUidRefused`.
+    #[tokio::test]
+    async fn workload_jwt_bearer_refuses_an_agent_default_root() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let slug = tenant_slug(&fixture);
+        let subject = "spiffe://cluster.local/ns/default/sa/agent";
+        let role_name = builtin_role_name();
+        let account = bootstrap_principal(&fixture, tenant, "agent-runtime", None, &[role_name])
+            .await
+            .expect("service account seeds");
+        let agent = seed_root(&fixture, tenant, CardKind::Agent, "agent", "1.0.0").await;
+        let state = test_state_with_external(
+            &fixture,
+            vec![trusted_issuer(
+                tenant,
+                jwks_uri(&fixture).await,
+                EXTERNAL_AUDIENCE,
+            )],
+            vec![binding(
+                tenant,
+                subject,
+                account,
+                Some(agent),
+                Some(EXTERNAL_AUDIENCE),
+            )],
+        )
+        .await;
+
+        let assertion = encode_external_token(&external_claims(
+            subject,
+            EXTERNAL_AUDIENCE,
+            ChronoDuration::hours(1),
+        ));
+        let refused = exchange_jwt_bearer(
+            &state,
+            &localhost_headers(),
+            SecretString::from(assertion),
+            Some(slug),
+            None,
+            "req-agent-root",
+        )
+        .await
+        .expect_err("an Agent root is refused");
+        assert!(
+            matches!(refused.0, WyrdError::WorkloadUidRefused { .. }),
+            "{:?}",
+            refused.0
+        );
+    }
+
+    /// An assertion for an audience the trusted issuer does not expect is
+    /// refused as an invalid token and audited under the platform principal.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails, the exchange succeeds or fails with
+    /// anything but `InvalidToken`, or the single audit row is not a platform
+    /// `INVALID_TOKEN` denial.
     #[tokio::test]
     async fn wrong_audience_is_rejected_and_audited() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let role_name = builtin_role_name();
+        let account = bootstrap_principal(&fixture, tenant, "svc", None, &[role_name])
+            .await
+            .expect("service account seeds");
         let (state, scribe) = RecordingScribe::attach(
             test_state_with_external(
                 &fixture,
@@ -286,16 +379,13 @@ mod pg_tests {
                 vec![binding(
                     tenant,
                     "system:serviceaccount:default:svc",
-                    CardKind::Service,
-                    "svc",
+                    account,
+                    None,
                     Some(EXTERNAL_AUDIENCE),
                 )],
             )
             .await,
         );
-        bootstrap_principal(&fixture, tenant, CardKind::Service, "svc", &[role_name])
-            .await
-            .expect("service principal seeds");
 
         let assertion = encode_external_token(&external_claims(
             "system:serviceaccount:default:svc",
@@ -306,6 +396,7 @@ mod pg_tests {
             &state,
             &tenant_headers(tenant_slug(&fixture)),
             SecretString::from(assertion),
+            None,
             None,
             "req-3",
         )
@@ -326,10 +417,19 @@ mod pg_tests {
         assert_eq!(rows[0].error_tag, "INVALID_TOKEN");
     }
 
+    /// An assertion whose `exp` is two minutes in the past is refused as an
+    /// expired token.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails or the exchange does not fail with
+    /// `TokenExpired`.
     #[tokio::test]
     async fn expired_assertion_is_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
+        let account = bootstrap_principal(&fixture, tenant, "svc", None, &[])
+            .await
+            .expect("service account seeds");
         let state = test_state_with_external(
             &fixture,
             vec![trusted_issuer(
@@ -340,8 +440,8 @@ mod pg_tests {
             vec![binding(
                 tenant,
                 "system:serviceaccount:default:svc",
-                CardKind::Service,
-                "svc",
+                account,
+                None,
                 Some(EXTERNAL_AUDIENCE),
             )],
         )
@@ -357,6 +457,7 @@ mod pg_tests {
             &tenant_headers(tenant_slug(&fixture)),
             SecretString::from(assertion),
             None,
+            None,
             "req-4",
         )
         .await
@@ -364,6 +465,12 @@ mod pg_tests {
         assert!(matches!(error.0, WyrdError::TokenExpired { .. }));
     }
 
+    /// An assertion from an issuer the tenant does not trust is refused as an
+    /// invalid token.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails or the exchange does not fail with
+    /// `InvalidToken`.
     #[tokio::test]
     async fn untrusted_issuer_is_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -391,6 +498,7 @@ mod pg_tests {
             &tenant_headers(tenant_slug(&fixture)),
             SecretString::from(assertion),
             None,
+            None,
             "req-5",
         )
         .await
@@ -398,11 +506,20 @@ mod pg_tests {
         assert!(matches!(error.0, WyrdError::InvalidToken { .. }));
     }
 
+    /// A verified assertion whose subject has no server-owned workload binding
+    /// is refused as `PrincipalNotFound`, even when a Service account exists.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails or the exchange does not fail with
+    /// `PrincipalNotFound`.
     #[tokio::test]
     async fn server_owned_binding_denial_returns_principal_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let role_name = builtin_role_name();
+        bootstrap_principal(&fixture, tenant, "svc", None, &[role_name])
+            .await
+            .expect("service account seeds");
         let state = test_state_with_external(
             &fixture,
             vec![trusted_issuer(
@@ -413,9 +530,6 @@ mod pg_tests {
             vec![],
         )
         .await;
-        bootstrap_principal(&fixture, tenant, CardKind::Service, "svc", &[role_name])
-            .await
-            .expect("service principal seeds");
 
         let assertion = encode_external_token(&external_claims(
             "system:serviceaccount:default:svc",
@@ -427,6 +541,7 @@ mod pg_tests {
             &tenant_headers(tenant_slug(&fixture)),
             SecretString::from(assertion),
             None,
+            None,
             "req-6",
         )
         .await
@@ -434,19 +549,22 @@ mod pg_tests {
         assert!(matches!(error.0, WyrdError::PrincipalNotFound { .. }));
     }
 
+    /// A cloud workload-identity `principal://` subject resolves through its
+    /// server-owned binding to the bound Service account like any other
+    /// subject shape.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding or the exchange fails, or when the issued
+    /// token is not a Service token for the bound account.
     #[tokio::test]
     async fn cloud_workload_subject_shape_uses_server_owned_binding() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let subject = "principal://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/subject/deploy";
         let role_name = builtin_role_name();
-        let binding = binding(
-            tenant,
-            subject,
-            CardKind::Service,
-            "cloud-service",
-            Some(EXTERNAL_AUDIENCE),
-        );
+        let account = bootstrap_principal(&fixture, tenant, "cloud-service", None, &[role_name])
+            .await
+            .expect("cloud service account seeds");
         let state = test_state_with_external(
             &fixture,
             vec![trusted_issuer(
@@ -454,18 +572,15 @@ mod pg_tests {
                 jwks_uri(&fixture).await,
                 EXTERNAL_AUDIENCE,
             )],
-            vec![binding.clone()],
+            vec![binding(
+                tenant,
+                subject,
+                account,
+                None,
+                Some(EXTERNAL_AUDIENCE),
+            )],
         )
         .await;
-        bootstrap_principal(
-            &fixture,
-            tenant,
-            CardKind::Service,
-            "cloud-service",
-            &[role_name],
-        )
-        .await
-        .expect("cloud service principal seeds");
 
         let assertion = encode_external_token(&external_claims(
             subject,
@@ -477,6 +592,7 @@ mod pg_tests {
             &tenant_headers(tenant_slug(&fixture)),
             SecretString::from(assertion),
             None,
+            None,
             "req-cloud",
         )
         .await
@@ -484,13 +600,16 @@ mod pg_tests {
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
             .expect("issued token verifies");
-        assert!(matches!(
-            &verified.principal.kind,
-            PrincipalKind::Service { card_ref, .. }
-                if card_ref.as_ref() == Some(&binding.card_ref)
-        ));
+        assert_eq!(verified.principal.kind, PrincipalKind::Service);
+        assert_eq!(verified.principal.id.as_uuid(), account);
     }
 
+    /// The same issuer and subject bound in tenant A grant nothing when the
+    /// exchange targets tenant B, which trusts the issuer but holds no binding.
+    ///
+    /// # Panics
+    /// Panics when fixture or tenant B seeding fails, or the tenant B exchange
+    /// does not fail with `PrincipalNotFound`.
     #[tokio::test]
     async fn same_issuer_subject_is_tenant_scoped() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -499,6 +618,9 @@ mod pg_tests {
         let role_name = builtin_role_name();
         let subject = "system:serviceaccount:default:svc";
         let jwks = jwks_uri(&fixture).await;
+        let account = bootstrap_principal(&fixture, tenant_a, "svc", None, &[role_name])
+            .await
+            .expect("service account seeds");
         let state = test_state_with_external(
             &fixture,
             vec![
@@ -508,15 +630,12 @@ mod pg_tests {
             vec![binding(
                 tenant_a,
                 subject,
-                CardKind::Service,
-                "svc",
+                account,
+                None,
                 Some(EXTERNAL_AUDIENCE),
             )],
         )
         .await;
-        bootstrap_principal(&fixture, tenant_a, CardKind::Service, "svc", &[role_name])
-            .await
-            .expect("service principal seeds");
 
         let assertion = encode_external_token(&external_claims(
             subject,
@@ -528,6 +647,7 @@ mod pg_tests {
             &localhost_headers(),
             SecretString::from(assertion),
             Some(TenantSlug::new("workload-tenant-b").expect("slug is valid")),
+            None,
             "req-7",
         )
         .await
@@ -535,15 +655,185 @@ mod pg_tests {
         assert!(matches!(error.0, WyrdError::PrincipalNotFound { .. }));
     }
 
+    /// A binding maps a verified workload to one stable Service account and
+    /// its context: an explicit `workload_uid` wins, then the binding's
+    /// pinned default, then rootless family semantics, always inside the
+    /// account's restriction. Assertion claims naming another principal grant
+    /// nothing, a binding to anything but an active Service account never
+    /// lands, and foreign and unknown roots — explicit or pinned — refuse
+    /// identically.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding fails, the stray binding lands, an allowed
+    /// root is not selected with the binding's account and roles, the rootless
+    /// exchange does not carry the family restriction, or a foreign, unknown,
+    /// or misbound root is not refused with one identical `WorkloadUidRefused`
+    /// code.
+    #[tokio::test]
+    async fn stable_account_mapping_selects_only_allowed_context() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let role_name = builtin_role_name();
+        let family = WorkloadFamily {
+            kind: WorkloadKind::Service,
+            name: CardName::new("checkout").expect("static card name is valid"),
+        };
+        let account = bootstrap_principal(
+            &fixture,
+            tenant,
+            "checkout-runtime",
+            Some(&family),
+            &[role_name],
+        )
+        .await
+        .expect("family account seeds");
+        let other = bootstrap_principal(&fixture, tenant, "other", None, &[])
+            .await
+            .expect("other account seeds");
+        let release_1 = seed_root(&fixture, tenant, CardKind::Service, "checkout", "1.0.0").await;
+        let release_2 = seed_root(&fixture, tenant, CardKind::Service, "checkout", "2.0.0").await;
+        let foreign = seed_root(&fixture, tenant, CardKind::Service, "billing", "1.0.0").await;
+        let unknown = CardUid::from_uuid(Uuid::now_v7()).expect("v7 Card UID");
+
+        let pinned = "system:serviceaccount:shop:checkout";
+        let rootless = "system:serviceaccount:shop:checkout-batch";
+        let misbound = "system:serviceaccount:shop:checkout-misbound";
+        let state = test_state_with_external(
+            &fixture,
+            vec![trusted_issuer(
+                tenant,
+                jwks_uri(&fixture).await,
+                EXTERNAL_AUDIENCE,
+            )],
+            vec![
+                binding(
+                    tenant,
+                    pinned,
+                    account,
+                    Some(release_1.clone()),
+                    Some(EXTERNAL_AUDIENCE),
+                ),
+                binding(tenant, rootless, account, None, Some(EXTERNAL_AUDIENCE)),
+                binding(
+                    tenant,
+                    misbound,
+                    account,
+                    Some(foreign.clone()),
+                    Some(EXTERNAL_AUDIENCE),
+                ),
+            ],
+        )
+        .await;
+
+        // A binding to an unknown principal never lands.
+        let mut conn = fixture
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant conn opens");
+        let stray = binding(
+            tenant,
+            "system:serviceaccount:shop:stray",
+            Uuid::now_v7(),
+            None,
+            Some(EXTERNAL_AUDIENCE),
+        );
+        assert!(
+            !upsert_workload_binding(&mut conn, &binding_write_from_binding(&stray))
+                .await
+                .expect("binding upsert runs"),
+            "a binding to anything but an active Service account is refused"
+        );
+        conn.commit().await.expect("stray upsert commits");
+
+        let exchange = |subject: &'static str, workload_uid: Option<CardUid>| {
+            let state = state.clone();
+            let slug = tenant_slug(&fixture);
+            async move {
+                let mut claims =
+                    external_claims(subject, EXTERNAL_AUDIENCE, ChronoDuration::hours(1));
+                // Assertion claims naming another account or root grant nothing.
+                claims["principal_id"] = serde_json::json!(other.to_string());
+                claims["workload_uid"] = serde_json::json!(foreign_claim());
+                exchange_jwt_bearer(
+                    &state,
+                    &tenant_headers(slug),
+                    SecretString::from(encode_external_token(&claims)),
+                    None,
+                    workload_uid,
+                    "req-select",
+                )
+                .await
+                .map(|exchanged| {
+                    verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
+                        .expect("issued token verifies")
+                        .principal
+                })
+            }
+        };
+
+        for (subject, explicit, root) in [
+            (pinned, Some(release_2.clone()), &release_2),
+            (pinned, None, &release_1),
+            (rootless, Some(release_1.clone()), &release_1),
+        ] {
+            let principal = exchange(subject, explicit)
+                .await
+                .expect("an allowed root is selected");
+            assert_eq!(principal.id.as_uuid(), account, "identity is the binding's");
+            assert_eq!(principal.workload_uid.as_ref(), Some(root));
+            assert!(principal.authorizes_card_uid(root));
+            assert_eq!(role_names(&principal.roles), set_of(&[role_name]));
+        }
+
+        let principal = exchange(rootless, None)
+            .await
+            .expect("a rootless family exchange succeeds");
+        assert_eq!(principal.id.as_uuid(), account);
+        assert_eq!(principal.workload_uid, None);
+        assert_eq!(
+            principal.card_access,
+            CardAccess::RootRequired {
+                restriction: FamilyRestriction::Family(family.clone()),
+            }
+        );
+
+        let mut codes = Vec::new();
+        for (subject, explicit) in [
+            (pinned, Some(foreign.clone())),
+            (pinned, Some(unknown.clone())),
+            (misbound, None),
+        ] {
+            let error = exchange(subject, explicit)
+                .await
+                .expect_err("a root outside the restriction is refused");
+            assert!(
+                matches!(error.0, WyrdError::WorkloadUidRefused { .. }),
+                "{:?}",
+                error.0
+            );
+            codes.push(error.0.code());
+        }
+        assert!(
+            codes.windows(2).all(|pair| pair[0] == pair[1]),
+            "foreign and unknown roots refuse identically: {codes:?}"
+        );
+    }
+
+    /// The API-key exchange keeps issuing bearer tokens, without a refresh
+    /// token, alongside the workload jwt-bearer grant.
+    ///
+    /// # Panics
+    /// Panics when fixture seeding, key issuance, or the exchange fails, or
+    /// when the exchange returns a refresh token.
     #[tokio::test]
     async fn api_key_grant_still_mints() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let role_name = builtin_role_name();
         let state = test_state_with_external(&fixture, Vec::new(), Vec::new()).await;
-        bootstrap_principal(&fixture, tenant, CardKind::Service, "api-key", &[role_name])
+        bootstrap_principal(&fixture, tenant, "api-key", None, &[role_name])
             .await
-            .expect("service principal seeds");
+            .expect("service account seeds");
         let token = issue_api_key(&fixture, tenant, "api-key").await;
 
         let mut conn = fixture
@@ -556,7 +846,7 @@ mod pg_tests {
                 .tenant_issuer(state.bifrost.scribe_outbox())
                 .expect("issuing key configured"),
         }
-        .execute(&mut conn, SecretString::from(token), "req-api-key")
+        .execute(&mut conn, SecretString::from(token), None, "req-api-key")
         .await
         .expect("api-key exchange still succeeds");
         conn.commit().await.expect("api-key exchange commits");
@@ -584,6 +874,14 @@ mod pg_tests {
         )
     }
 
+    /// Build an [`AppState`] whose auth owner serves the given trusted issuers
+    /// and workload bindings from Postgres through the production Pg
+    /// resolvers, with a local Ed25519 issuing key and an external verifier.
+    ///
+    /// # Panics
+    /// Panics when an issuer or binding fails to seed or commit, a binding
+    /// does not target an active Service account, or the issuing key, kid, or
+    /// public key fails to parse.
     async fn test_state_with_external(
         fixture: &PgFixture,
         trusted: Vec<TrustedIssuer>,
@@ -605,14 +903,17 @@ mod pg_tests {
             conn.commit().await.expect("issuer seed commits");
         }
         for binding in &bindings {
-            let write = binding_write_from_binding(binding).expect("binding encodes");
+            let write = binding_write_from_binding(binding);
             let mut conn = fixture
                 .tenant_conn_for(binding.tenant_id)
                 .await
                 .expect("tenant conn opens");
-            upsert_workload_binding(&mut conn, &write)
-                .await
-                .expect("binding upsert");
+            assert!(
+                upsert_workload_binding(&mut conn, &write)
+                    .await
+                    .expect("binding upsert"),
+                "the binding targets an active Service account"
+            );
             conn.commit().await.expect("binding seed commits");
         }
 
@@ -657,16 +958,21 @@ mod pg_tests {
         })
     }
 
-    /// Insert a workload principal with the named roles and return its id, so
-    /// each test starts from a principal the grant path can actually resolve.
+    /// Insert a stable Service account named `name`, restricted to `family`
+    /// when given, with the named roles and return its id, so each test
+    /// starts from an account the grant path can actually resolve.
     ///
     /// # Errors
     /// Returns the [`sqlx::Error`] of the failing insert.
+    ///
+    /// # Panics
+    /// Panics when the tenant connection does not open, builtin roles fail to
+    /// seed, a named role is not a builtin role, or the seed fails to commit.
     async fn bootstrap_principal(
         fixture: &PgFixture,
         tenant: DataTenantId,
-        card_kind: CardKind,
         name: &str,
+        family: Option<&WorkloadFamily>,
         role_names: &[&str],
     ) -> Result<Uuid, sqlx::Error> {
         let mut conn = fixture
@@ -678,18 +984,11 @@ mod pg_tests {
             .expect("builtin roles seed");
         let creator_id = insert_creator_user(fixture, tenant).await?;
         let id = Uuid::now_v7();
-        let principal_kind = match &card_kind {
-            CardKind::Service => "service",
-            CardKind::Agent => "agent",
-            other => panic!("unexpected card kind in test: {other:?}"),
-        };
-        let card_ref = card_ref(card_kind, name);
-        insert_test_card(&mut conn, &card_ref, creator_id).await?;
         insert_service_account(
             &mut conn,
             id,
-            principal_kind,
-            Some(&card_ref),
+            "service",
+            family,
             name,
             None,
             Attribution::direct(PrincipalId::new(creator_id)),
@@ -703,6 +1002,42 @@ mod pg_tests {
         }
         conn.commit().await.expect("principal seed commits");
         Ok(id)
+    }
+
+    /// Register an active `kind`/`name`@`version` root Card in `tenant` and
+    /// return its registry uid.
+    ///
+    /// # Panics
+    /// Panics when seeding or the uid read-back fails.
+    async fn seed_root(
+        fixture: &PgFixture,
+        tenant: DataTenantId,
+        kind: CardKind,
+        name: &str,
+        version: &str,
+    ) -> CardUid {
+        let creator = insert_creator_user(fixture, tenant)
+            .await
+            .expect("creator user inserts");
+        let root = card_ref(kind, name, version);
+        let mut conn = fixture
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant conn opens");
+        insert_test_card(&mut conn, &root, creator)
+            .await
+            .expect("root card seeds");
+        let uid = wyrd_sql::queries::cards::get_card_by_ref(
+            &mut conn,
+            root.kind.clone(),
+            &root.name,
+            &root.version,
+        )
+        .await
+        .expect("root card registered")
+        .card_uid;
+        conn.commit().await.expect("root seed commits");
+        uid
     }
 
     /// Seeds a minimal Card of `target_ref`'s kind owned by `creator`; an
@@ -726,7 +1061,11 @@ mod pg_tests {
                     .expect("service fixture spec decodes")
             }
             CardKind::Agent => {
-                let prompt_ref = card_ref(CardKind::Prompt, &format!("{}-prompt", target_ref.name));
+                let prompt_ref = card_ref(
+                    CardKind::Prompt,
+                    &format!("{}-prompt", target_ref.name),
+                    "1.0.0",
+                );
                 let prompt_spec = Spec::from_kind_and_value(
                     &CardKind::Prompt,
                     serde_json::json!({
@@ -936,11 +1275,16 @@ mod pg_tests {
         tenant_b
     }
 
+    /// A binding of `subject` to the Service account `principal`, with an
+    /// optional pinned default root.
+    ///
+    /// # Panics
+    /// Panics when the static external issuer URL does not parse.
     fn binding(
         tenant: DataTenantId,
         subject: &str,
-        card_kind: CardKind,
-        name: &str,
+        principal: Uuid,
+        workload_uid: Option<CardUid>,
         audience: Option<&str>,
     ) -> WorkloadBinding {
         WorkloadBinding {
@@ -948,8 +1292,14 @@ mod pg_tests {
             issuer: IssuerUrl::new(EXTERNAL_ISSUER).expect("issuer URL is valid"),
             subject: subject.to_owned(),
             audience: audience.map(std::borrow::ToOwned::to_owned),
-            card_ref: card_ref(card_kind, name),
+            principal_id: PrincipalId::new(principal),
+            workload_uid,
         }
+    }
+
+    /// A root uid an assertion claims, which a binding never honors.
+    fn foreign_claim() -> String {
+        Uuid::now_v7().to_string()
     }
 
     fn trusted_issuer(tenant: DataTenantId, jwks_uri: url::Url, audience: &str) -> TrustedIssuer {
@@ -1003,11 +1353,15 @@ mod pg_tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
-    fn card_ref(kind: CardKind, name: &str) -> CardRef {
+    /// Unresolved [`CardRef`] for `kind`/`name`@`version` with no uid.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid Card name or `version` does not parse.
+    fn card_ref(kind: CardKind, name: &str, version: &str) -> CardRef {
         CardRef {
             kind,
             name: CardName::new(name).expect("static card name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            version: VersionBlock::parse(version).expect("static version is valid"),
             uid: None,
         }
     }

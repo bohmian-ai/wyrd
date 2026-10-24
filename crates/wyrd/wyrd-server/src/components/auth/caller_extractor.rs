@@ -139,7 +139,6 @@ mod pg_tests {
     use wyrd_runtime::PrincipalId;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_spec::reference::CardRefScope;
     use wyrd_spec::request_id::RequestId;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -225,8 +224,6 @@ mod pg_tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKindTag::User,
             tenant_id: tenant,
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         };
         state
             .auth
@@ -238,6 +235,8 @@ mod pg_tests {
                     principal,
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
+                    card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
+                    workload_uid: None,
                     credential_id: None,
                     act: None,
                     audience: wyrd_spec::auth::TokenAudience::Wyrd,

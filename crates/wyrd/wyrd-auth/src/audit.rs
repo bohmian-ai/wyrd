@@ -1,6 +1,6 @@
 //! Authentication audit events on the process audit stage.
 //!
-//! Token grants, API-key issuance, refresh-family revocation, and card-scope
+//! Token grants, refresh-family revocation, and card-scope
 //! mints are each recorded as one [`AuditEvent`] staged on the process
 //! [`wyrd_runtime::audit::AuditStage`], which the server backs with its one
 //! Scribe outbox into retained audit history. A grant never waits for, or
@@ -16,8 +16,6 @@ use wyrd_spec::vala::audit_detail::AuditErrorCode;
 /// Operation for every issued access token: authorization code, API key, JWT
 /// bearer, delegation, and refresh rotation.
 pub const TOKEN_EXCHANGE_OPERATION: &str = "auth.token.exchange";
-/// Operation for a minted API key; matches the issuing route's decision row.
-pub const API_KEY_ISSUE_OPERATION: &str = "auth.api_key.issue";
 /// Operation for a refresh-token family revoked after reuse was detected.
 pub const REFRESH_FAMILY_REVOKE_OPERATION: &str = "auth.refresh.revoke_family";
 /// Operation for a card-ref scope minted into (or refused from) a token.
@@ -102,7 +100,7 @@ pub fn principal_event(
 ///
 /// One owner for both planes: `platform.principals` stores `global_admin` or
 /// `user`, `wyrd.auth_service_accounts` stores `tenant_admin`, `service`,
-/// `agent`, or `system`, and `wyrd.auth_users` stores `user`. Unknown values are recorded as
+/// or `system`, and `wyrd.auth_users` stores `user`. Unknown values are recorded as
 /// `Service`, the non-human default; the grant paths reject unknown kinds
 /// before any event is built.
 #[must_use]
@@ -111,7 +109,6 @@ pub fn principal_kind_tag(value: &str) -> PrincipalKindTag {
         "global_admin" => PrincipalKindTag::GlobalAdmin,
         "tenant_admin" => PrincipalKindTag::TenantAdmin,
         "user" => PrincipalKindTag::User,
-        "agent" => PrincipalKindTag::Agent,
         "system" => PrincipalKindTag::System,
         _ => PrincipalKindTag::Service,
     }

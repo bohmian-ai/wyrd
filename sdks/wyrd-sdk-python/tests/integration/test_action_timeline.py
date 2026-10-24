@@ -58,8 +58,8 @@ def test_service_action_timeline_is_one_connected_tree(
     bifrost: Bifrost,
 ) -> None:
     Bifrost(TableConfig(Action, ACTIONS)).register()
-    service = WyrdClient(credential=assistant_key)
-    state = hydrated(assistant_bundle, service)
+    state = hydrated(assistant_bundle, WyrdClient(credential=assistant_key))
+    service = WyrdClient(credential=assistant_key, workload_uid=str(state.root_ref.uid))
     state.start_bifrost()
     state.start_telemetry()
     writer = Bifrost(client=service)

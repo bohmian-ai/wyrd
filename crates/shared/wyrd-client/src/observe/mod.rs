@@ -515,6 +515,7 @@ impl Observe<'_> {
             card_uid: bound.card_uid.clone(),
             run_id: self.run.run_id.clone(),
             group_id: self.group_id.clone(),
+            deployment_environment: self.run.state.deployment_environment().map(str::to_owned),
         }
     }
 }

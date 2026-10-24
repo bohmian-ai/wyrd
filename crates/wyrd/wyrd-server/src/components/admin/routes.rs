@@ -35,12 +35,13 @@ use wyrd_auth_oidc::{
 use wyrd_runtime::builtin_roles::DEFAULT_ISSUER_ROLE;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
-    IssuerTokenPolicy, IssuerUrl, TrustedIssuerView, WorkloadBindingView,
+    IssuerTokenPolicy, IssuerUrl, PrincipalId, TrustedIssuerView, WorkloadBindingView,
     refuse_human_trusted_issuer,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
+use wyrd_spec::ids::CardUid;
 use wyrd_sql::queries::auth::{
-    TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
+    TrustedIssuerWrite, delete_trusted_issuer, delete_workload_binding,
     delete_workload_bindings_for_issuer, insert_trusted_issuer, insert_workload_binding,
     trusted_issuers_for_tenant, workload_bindings_for_tenant,
 };
@@ -190,30 +191,25 @@ fn from_stored_json<T: DeserializeOwned>(stored: &JsonValue) -> Result<T, WyrdEr
     serde_json::from_value(stored.clone()).map_err(internal_error)
 }
 
-/// Workload-binding projection from a write row.
+/// Workload-binding projection from a stored row.
 ///
 /// # Errors
-/// Returns [`WyrdError::Internal`] when the stored card reference does not
-/// decode into a [`CardRef`](wyrd_spec::reference::CardRef).
-fn workload_binding_view_from_write(
-    write: &WorkloadBindingWrite,
+/// Returns [`WyrdError::Internal`] when the stored default root is not a
+/// Card UID.
+fn workload_binding_view_from_row(
+    row: WorkloadBindingRow,
 ) -> Result<WorkloadBindingView, WyrdErrorResponse> {
     Ok(WorkloadBindingView {
-        issuer: write.issuer_url.clone(),
-        subject: write.subject.clone(),
-        audience: write.audience.clone(),
-        card_ref: from_stored_json(&write.card_ref)?,
-    })
-}
-
-/// Workload-binding projection from a stored row.
-fn workload_binding_view_from_row(row: WorkloadBindingRow) -> WorkloadBindingView {
-    WorkloadBindingView {
         issuer: row.issuer_url,
         subject: row.subject,
         audience: row.audience,
-        card_ref: row.card_ref,
-    }
+        principal_id: PrincipalId::new(row.principal_id),
+        workload_uid: row
+            .workload_uid
+            .map(CardUid::from_uuid)
+            .transpose()
+            .map_err(internal_error)?,
+    })
 }
 
 /// Query for deleting one issuer, with the cascade flag.
@@ -498,16 +494,19 @@ async fn delete_trusted_issuer_route(
 // --------------------------------------------------------------------------
 
 /// `POST /v1/admin/workload-bindings` — bind a workload identity
-/// `(issuer, subject, audience)` to a server-owned `CardRef`.
+/// `(issuer, subject, audience)` to an active stable Service account and an
+/// optional pinned default root.
 ///
 /// Gated on `service_accounts:write`. The referenced issuer must already be
 /// registered in this tenant; an FK violation maps to a `404` (create the issuer
-/// first), a duplicate binding to a `409`. Writes through the RLS `TenantConn`.
+/// first), as does a principal that is not an active Service account, and a
+/// duplicate binding to a `409`. Writes through the RLS `TenantConn`.
 ///
 /// # Errors
 /// Returns a `401` without a usable token, a `403` without
 /// `service_accounts:write`, a `404` when the issuer is not registered in this
-/// tenant, a `409` for a duplicate binding, a `500` when the write fails, and a
+/// tenant or the principal is not an active Service account, a `409` for a
+/// duplicate binding, a `500` when the write fails, and a
 /// `503` when the store is unavailable or no token verifier is configured.
 #[utoipa::path(
     post,
@@ -558,20 +557,35 @@ async fn create_workload_binding(
 
     let binding = WorkloadBinding {
         tenant_id: caller.principal.tenant_id,
-        issuer: request.issuer.clone(),
-        subject: request.subject.clone(),
-        audience: request.audience.clone(),
-        card_ref: request.card_ref.clone(),
+        issuer: request.issuer,
+        subject: request.subject,
+        audience: request.audience,
+        principal_id: request.principal_id,
+        workload_uid: request.workload_uid,
     };
-    let write = binding_write_from_binding(&binding).map_err(internal_error)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
-    insert_workload_binding(&mut conn, &write)
+    let written = insert_workload_binding(&mut conn, &binding_write_from_binding(&binding))
         .await
         .map_err(|error| map_binding_write_error(error, &binding.issuer))?;
+    if !written {
+        return Err(WyrdErrorResponse::from(WyrdError::AdminNotFound {
+            message: format!(
+                "principal {} is not an active Service account in this tenant",
+                binding.principal_id
+            ),
+            details: serde_json::json!({ "principal_id": binding.principal_id }),
+        }));
+    }
     conn.commit().await.map_err(sql_unavailable)?;
 
-    Ok(Json(workload_binding_view_from_write(&write)?))
+    Ok(Json(WorkloadBindingView {
+        issuer: binding.issuer.as_str().to_owned(),
+        subject: binding.subject,
+        audience: binding.audience,
+        principal_id: binding.principal_id,
+        workload_uid: binding.workload_uid,
+    }))
 }
 
 /// `GET /v1/admin/workload-bindings?issuer=&subject=` — list the caller tenant's
@@ -637,7 +651,7 @@ async fn list_workload_bindings(
     let views = rows
         .into_iter()
         .map(workload_binding_view_from_row)
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(views))
 }
 
@@ -998,13 +1012,9 @@ mod pg_tests {
         Permission, PermissionCheck, PermissionDenyReason, PermissionSet, PermissionVerdict,
         Principal, PrincipalId, PrincipalKind, RoleRef,
     };
-    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::{IssuerUrl, SecretBearer};
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::CardName;
-    use wyrd_spec::reference::CardRef;
     use wyrd_storage::{LocalSigner, StorageHandle};
 
     use secrecy::ExposeSecret;
@@ -1124,13 +1134,29 @@ mod pg_tests {
         }
     }
 
-    fn sample_card_ref() -> CardRef {
-        CardRef {
-            kind: CardKind::Service,
-            name: CardName::new("my-model").expect("card name"),
-            version: VersionBlock::parse("1.0.0").expect("version"),
-            uid: None,
-        }
+    /// Seed one active unrestricted Service account a binding may target.
+    ///
+    /// # Panics
+    /// Panics when the insert or commit fails.
+    async fn seed_service_account(fixture: &PgFixture, tenant: DataTenantId) -> PrincipalId {
+        let id = uuid::Uuid::now_v7();
+        let mut conn = fixture
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant conn opens");
+        wyrd_sql::queries::auth::insert_service_account(
+            &mut conn,
+            id,
+            "service",
+            None,
+            "bound-service",
+            None,
+            wyrd_spec::auth::Attribution::unresolved(),
+        )
+        .await
+        .expect("service account inserts");
+        conn.commit().await.expect("service account commits");
+        PrincipalId::new(id)
     }
 
     /// Seed a no-secret issuer directly so binding tests can FK-reference it
@@ -1444,6 +1470,14 @@ mod pg_tests {
         settle_audit(&state).await;
     }
 
+    /// Deleting a trusted issuer that a live workload binding references
+    /// conflicts without leaking internals, and the cascade delete removes the
+    /// binding and then the issuer.
+    ///
+    /// # Panics
+    /// Panics when seeding or the binding create fails, the plain delete does
+    /// not return a safe conflict, or the cascade delete does not return
+    /// `204 No Content`.
     #[tokio::test]
     async fn delete_issuer_with_live_binding_conflicts_then_cascades() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1451,6 +1485,7 @@ mod pg_tests {
         let state = test_state(&fixture).await;
         seed_issuer(&fixture, tenant).await;
         let issuer = IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid");
+        let account = seed_service_account(&fixture, tenant).await;
 
         let _ = create_workload_binding(
             State(state.clone()),
@@ -1459,7 +1494,8 @@ mod pg_tests {
                 issuer: issuer.clone(),
                 subject: "system:serviceaccount:default/sa".to_owned(),
                 audience: None,
-                card_ref: sample_card_ref(),
+                principal_id: account,
+                workload_uid: None,
             }),
         )
         .await
@@ -1493,6 +1529,13 @@ mod pg_tests {
         settle_audit(&state).await;
     }
 
+    /// A workload binding round-trips through create, duplicate conflict,
+    /// issuer-filtered list, and delete, while a binding to an unknown
+    /// principal and a second delete are both not found.
+    ///
+    /// # Panics
+    /// Panics when seeding fails or any create, conflict, list, or delete step
+    /// returns a result other than the one the round trip pins.
     #[tokio::test]
     async fn workload_binding_crud_round_trip() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1501,13 +1544,28 @@ mod pg_tests {
         seed_issuer(&fixture, tenant).await;
         let issuer = IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid");
         let subject = "system:serviceaccount:default/sa";
+        let account = seed_service_account(&fixture, tenant).await;
 
         let make_request = || CreateWorkloadBindingRequest {
             issuer: issuer.clone(),
             subject: subject.to_owned(),
             audience: Some("wyrd-workload".to_owned()),
-            card_ref: sample_card_ref(),
+            principal_id: account,
+            workload_uid: None,
         };
+
+        // A binding to anything but an active Service account is not found.
+        let stray = create_workload_binding(
+            State(state.clone()),
+            writer(tenant),
+            Json(CreateWorkloadBindingRequest {
+                principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+                ..make_request()
+            }),
+        )
+        .await
+        .expect_err("a binding to an unknown principal must be not-found");
+        assert!(matches!(stray.0, WyrdError::AdminNotFound { .. }));
 
         let created =
             create_workload_binding(State(state.clone()), writer(tenant), Json(make_request()))
@@ -1515,6 +1573,8 @@ mod pg_tests {
                 .expect("binding create succeeds")
                 .0;
         assert_eq!(created.subject, subject);
+        assert_eq!(created.principal_id, account);
+        assert_eq!(created.workload_uid, None);
 
         // Duplicate (issuer, subject) conflicts.
         let conflict =
@@ -1565,6 +1625,14 @@ mod pg_tests {
         settle_audit(&state).await;
     }
 
+    /// Creating a binding whose issuer was never seeded is not found (the FK
+    /// has no target), and the permitted create still records its allowed
+    /// decision.
+    ///
+    /// # Panics
+    /// Panics when seeding fails, the create does not fail with
+    /// `AdminNotFound`, or the create decision is not audited exactly once as
+    /// allowed.
     #[tokio::test]
     async fn create_binding_for_unknown_issuer_is_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1573,6 +1641,7 @@ mod pg_tests {
         // Deliberately do NOT seed the issuer: the binding's composite FK to
         // auth_trusted_issuers has no target row.
         let issuer = IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid");
+        let account = seed_service_account(&fixture, tenant).await;
 
         let error = create_workload_binding(
             State(state.clone()),
@@ -1581,7 +1650,8 @@ mod pg_tests {
                 issuer,
                 subject: "system:serviceaccount:default/sa".to_owned(),
                 audience: None,
-                card_ref: sample_card_ref(),
+                principal_id: account,
+                workload_uid: None,
             }),
         )
         .await
@@ -1774,7 +1844,8 @@ mod pg_tests {
                 issuer: IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid"),
                 subject: "system:serviceaccount:default/sa".to_owned(),
                 audience: None,
-                card_ref: sample_card_ref(),
+                principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+                workload_uid: None,
             }),
         )
         .await
@@ -1886,7 +1957,8 @@ mod pg_tests {
                 issuer: IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid"),
                 subject: "system:serviceaccount:default/sa".to_owned(),
                 audience: None,
-                card_ref: sample_card_ref(),
+                principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+                workload_uid: None,
             }),
         )
         .await

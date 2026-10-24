@@ -105,12 +105,8 @@ mod pg_tests {
         let subject_jwt = server
             .exchange_api_key(subject.api_key().ok_or("a service carries a key")?)
             .await?;
-        let middle_jwt = server
-            .exchange_api_key(middle.api_key().ok_or("a service carries a key")?)
-            .await?;
-        let actor_jwt = server
-            .exchange_api_key(actor.api_key().ok_or("a service carries a key")?)
-            .await?;
+        let middle_jwt = server.exchange_rooted(&middle).await?;
+        let actor_jwt = server.exchange_rooted(&actor).await?;
         let one_hop = server
             .delegate(&subject_jwt, &middle_jwt, TokenAudience::Wyrd)
             .await?;
@@ -162,9 +158,7 @@ mod pg_tests {
         let underprivileged = server
             .bootstrap_service("mcp-delegation-reader", &[])
             .await?;
-        let reader_jwt = server
-            .exchange_api_key(underprivileged.api_key().ok_or("a service carries a key")?)
-            .await?;
+        let reader_jwt = server.exchange_rooted(&underprivileged).await?;
         let denied_token = server
             .delegate(&subject_jwt, &reader_jwt, TokenAudience::Wyrd)
             .await?;

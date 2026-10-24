@@ -1,7 +1,6 @@
 //! HTTP routes for the tenant auth surfaces: the OAuth authorization
 //! server (token, device authorization, revocation, and metadata
-//! endpoints), browser sign-in sessions, the OIDC provider callback, and
-//! Card-bound API key issuance.
+//! endpoints), browser sign-in sessions, and the OIDC provider callback.
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};
@@ -10,14 +9,14 @@ use axum::response::{Html, IntoResponse, Response};
 
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
-use uuid::Uuid;
 use wyrd_auth::callback::LoginCompletion;
 use wyrd_auth_verify::{AccessTokenClaims, VerifiedToken};
 use wyrd_spec::auth::{
-    CallbackQuery, ExchangeTokenType, IssueKeyRequest, OAuthClientId, OAuthErrorCode,
-    OAuthErrorResponse, SecretBearer, TokenAudience, TokenRequest, TokenResponse,
+    CallbackQuery, ExchangeTokenType, OAuthClientId, OAuthErrorCode, OAuthErrorResponse,
+    SecretBearer, TokenAudience, TokenRequest, TokenResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_sql::TenantConn;
 
@@ -30,11 +29,10 @@ use crate::auth::card_scope::{
 use crate::auth::exchange_api_key::{
     DelegateToken, ExchangeApiKey, api_key_invalid, map_exchange_error_to_wyrd,
 };
-use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
+use crate::auth::issue_api_key::WyrdApiKey;
 use crate::auth::jwt_bearer::exchange_jwt_bearer;
 use crate::auth::oauth::{ClientForm, GRANT_TYPES, OAuthError, OAuthForm, no_store};
 use crate::auth::refresh::{RefreshError, RefreshTokens, tenant_from_refresh_jwt};
-use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
@@ -47,11 +45,10 @@ use utoipa_axum::routes;
 /// (`POST /auth/device_authorization`) and its verification page
 /// (`GET`/`POST /auth/device`), the common OIDC provider callback
 /// (`GET /auth/callback`), the token endpoint (`POST /auth/token`), token
-/// revocation (`POST /auth/revoke`), authorization server metadata, the
-/// browser-session operations under `/auth/browser`, and API key issuance
-/// (`POST /auth/issue-key`). Device user-code attempts are
-/// limited per client address at the gateway (RFC 8628 §5.1), which sees the
-/// real client and one budget across replicas; the token endpoint enforces
+/// revocation (`POST /auth/revoke`), authorization server metadata, and the
+/// browser-session operations under `/auth/browser`. Device user-code
+/// attempts are limited per client address at the gateway (RFC 8628 §5.1),
+/// which sees the real client and one budget across replicas; the token endpoint enforces
 /// the device polling interval with `slow_down`.
 pub fn auth_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -68,7 +65,6 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         .routes(routes!(crate::auth::browser::logout))
         .routes(routes!(callback))
         .routes(routes!(token))
-        .routes(routes!(issue_key))
 }
 
 /// `POST /auth/token` — the OAuth token endpoint.
@@ -120,9 +116,9 @@ async fn token(
 ) -> Result<Response, OAuthError> {
     let client = crate::auth::oauth::identify_client(&headers, &form)?;
     match form.get("grant_type") {
-        None => return Err(OAuthError(OAuthErrorCode::InvalidRequest)),
+        None => return Err(OAuthError(OAuthErrorCode::InvalidRequest, None)),
         Some(grant) if !GRANT_TYPES.contains(&grant) => {
-            return Err(OAuthError(OAuthErrorCode::UnsupportedGrantType));
+            return Err(OAuthError(OAuthErrorCode::UnsupportedGrantType, None));
         }
         Some(_) => {}
     }
@@ -131,7 +127,7 @@ async fn token(
         state: &state,
         request_id: request_id.as_str(),
     };
-    let required = client.ok_or(OAuthError(OAuthErrorCode::InvalidClient));
+    let required = client.ok_or(OAuthError(OAuthErrorCode::InvalidClient, None));
     let response = match form.token_request()? {
         TokenRequest::RefreshToken { refresh_token } => grants
             .refresh(&refresh_token, required?)
@@ -139,7 +135,7 @@ async fn token(
             .map_err(OAuthError::from)?,
         TokenRequest::DeviceCode { device_code } => {
             if required? != OAuthClientId::WyrdCli {
-                return Err(OAuthError(OAuthErrorCode::UnauthorizedClient));
+                return Err(OAuthError(OAuthErrorCode::UnauthorizedClient, None));
             }
             crate::auth::cli_login::cli_logins(&state)?
                 .redeem(&device_code, request_id.as_str())
@@ -151,8 +147,9 @@ async fn token(
             actor_token: None,
             actor_token_type: None,
             audience: None,
+            workload_uid,
         } => grants
-            .api_key(&subject_token)
+            .api_key(&subject_token, workload_uid)
             .await
             .map_err(OAuthError::request)?,
         TokenRequest::TokenExchange {
@@ -161,18 +158,24 @@ async fn token(
             actor_token: Some(actor_token),
             actor_token_type: Some(ExchangeTokenType::AccessToken),
             audience: Some(audience),
+            workload_uid: None,
         } => grants
             .delegate(&subject_token, &actor_token, audience)
             .await
             .map_err(OAuthError::request)?,
         TokenRequest::TokenExchange { .. } => {
-            return Err(OAuthError(OAuthErrorCode::InvalidRequest));
+            return Err(OAuthError(OAuthErrorCode::InvalidRequest, None));
         }
-        TokenRequest::JwtBearer { assertion, tenant } => exchange_jwt_bearer(
+        TokenRequest::JwtBearer {
+            assertion,
+            tenant,
+            workload_uid,
+        } => exchange_jwt_bearer(
             &state,
             &headers,
             assertion.into_secret_string(),
             tenant,
+            workload_uid,
             request_id.as_str(),
         )
         .await
@@ -196,7 +199,8 @@ pub(crate) struct TokenGrants<'a> {
 }
 
 impl<'a> TokenGrants<'a> {
-    /// Exchange a Wyrd API key for an access token of its own principal.
+    /// Exchange a Wyrd API key for an access token of its own principal,
+    /// under the workload root `workload_uid` selects, if any.
     ///
     /// A key that does not parse names no tenant, so it is refused with the
     /// same error every invalid key earns.
@@ -205,11 +209,15 @@ impl<'a> TokenGrants<'a> {
     /// Returns [`WyrdError::ApiKeyInvalid`] for every unusable key, its
     /// refusal staged on the audit outbox when it names a tenant, and a store
     /// or issuance error.
-    pub(crate) async fn api_key(&self, api_key: &SecretBearer) -> Result<TokenResponse, WyrdError> {
+    pub(crate) async fn api_key(
+        &self,
+        api_key: &SecretBearer,
+        workload_uid: Option<CardUid>,
+    ) -> Result<TokenResponse, WyrdError> {
         let presented = SecretString::from(api_key.expose().to_owned());
         let (parsed, mut conn, exchange) = self.api_key_exchange(api_key.expose()).await?;
         let exchanged = match exchange
-            .execute(&mut conn, presented, self.request_id)
+            .execute(&mut conn, presented, workload_uid, self.request_id)
             .await
         {
             Ok(exchanged) => exchanged,
@@ -234,7 +242,7 @@ impl<'a> TokenGrants<'a> {
     ///
     /// The same key verification as [`Self::api_key`], committed with the
     /// key's use record, yielding the verified principal the exchanged token
-    /// would carry. Nothing is staged on the audit outbox: like a bearer
+    /// would carry under the root `workload_uid` selects, if any. Nothing is staged on the audit outbox: like a bearer
     /// request, the request's own authorization decisions are the audit.
     ///
     /// # Errors
@@ -243,9 +251,13 @@ impl<'a> TokenGrants<'a> {
     pub(crate) async fn api_key_principal(
         &self,
         api_key: &SecretString,
+        workload_uid: Option<CardUid>,
     ) -> Result<VerifiedToken, WyrdError> {
         let (parsed, mut conn, exchange) = self.api_key_exchange(api_key.expose_secret()).await?;
-        let verified = match exchange.authenticate(&mut conn, api_key).await {
+        let verified = match exchange
+            .authenticate(&mut conn, api_key, workload_uid)
+            .await
+        {
             Ok(verified) => verified,
             Err(error) => {
                 return Err(map_exchange_error_to_wyrd(&mut conn, &parsed.prefix, error).await);
@@ -502,95 +514,6 @@ async fn callback(
     }
 }
 
-/// `POST /auth/issue-key` — mint a Card-bound API key for an existing principal.
-///
-/// Gated on `service_accounts:write`. The principal must already exist — a
-/// credential is issued against an identity, never in place of one — and the
-/// plaintext is returned exactly once.
-///
-/// # Errors
-/// Returns a `401` without a usable token, a `403` without
-/// `service_accounts:write`, a `404` when the named principal does not exist in
-/// this tenant, a `500` when the write fails, and a `503` when the
-/// store is unavailable or no token verifier is configured.
-#[utoipa::path(
-    post,
-    path = "/auth/issue-key",
-    request_body = IssueKeyRequest,
-    responses(
-        (status = 200, description = "Key issued, plaintext returned once",
-         body = wyrd_spec::auth::IssueKeyResponse),
-        (status = 401, description = "An access token is required \
-          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
-        (status = 403, description = "Caller lacks service_accounts:write \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 404, description = "No principal is bound to the named Card \
-          (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The server's auth configuration is missing \
-          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "The store is unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
-    ),
-    tag = "Auth"
-)]
-async fn issue_key(
-    State(state): State<AppState>,
-    caller: AuthenticatedPrincipal,
-    request_id: Option<Extension<RequestId>>,
-    Json(request): Json<IssueKeyRequest>,
-) -> Result<Json<wyrd_spec::auth::IssueKeyResponse>, WyrdErrorResponse> {
-    let request_id_str: String;
-    let req_id = if let Some(Extension(id)) = request_id.as_ref() {
-        id.as_str()
-    } else {
-        request_id_str = Uuid::new_v4().to_string();
-        &request_id_str
-    };
-    let audited_caller = Caller::from_authenticated(
-        &caller,
-        RequestId::parse(req_id).unwrap_or_else(|_| RequestId::now_v7()),
-    );
-    let decision = crate::audit::authorize_service_accounts_write(
-        &state,
-        &audited_caller,
-        "issue API keys",
-        "auth.api_key.issue",
-        &format!("card:{}", request.card_ref.name),
-    )
-    .map_err(WyrdErrorResponse::from)?;
-
-    // The decision is staged as soon as it is made; the issued key is
-    // recorded separately once its transaction commits.
-    state
-        .bifrost
-        .scribe_outbox()
-        .stage(audited_caller.data_tenant_id, decision);
-    let tenant = caller.principal().tenant_id;
-    let mut conn = state
-        .postgres
-        .tenant_conn(tenant)
-        .await
-        .map_err(|error| WyrdErrorResponse::from(store_unavailable(error)))?;
-    let service = IssueApiKey::default();
-    let issued = service
-        .execute(&mut conn, request, audited_caller.attribution())
-        .await
-        .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
-    conn.commit()
-        .await
-        .map_err(|error| WyrdErrorResponse::from(store_unavailable(error)))?;
-    service.audit(
-        &**state.bifrost.scribe_outbox(),
-        tenant,
-        &issued,
-        &audited_caller.principal,
-        &audited_caller.delegation_chain,
-        req_id,
-    );
-
-    Ok(Json(issued.response))
-}
-
 /// The refusal of a grant the server lacks the auth configuration for.
 fn not_configured() -> WyrdError {
     crate::auth::auth_not_configured().0
@@ -598,7 +521,7 @@ fn not_configured() -> WyrdError {
 
 /// The refusal of a grant whose tenant store is unavailable; the cause is
 /// logged, never returned.
-fn store_unavailable(error: wyrd_sql::SqlError) -> WyrdError {
+pub(crate) fn store_unavailable(error: wyrd_sql::SqlError) -> WyrdError {
     tracing::warn!(error = %error, "auth db unavailable");
     WyrdError::AuthVerifyUnavailable {
         message: "auth backend unavailable".to_owned(),
@@ -634,42 +557,27 @@ fn bad_subject_token_format() -> WyrdError {
 }
 
 #[cfg(test)]
-mod pg_tests {
-    use std::sync::Arc;
-    use wyrd_spec::reference::CardRefScope;
-
-    use axum::Json;
-    use axum::extract::State;
+mod tests {
     use base64::Engine;
-    use sqlx::types::Json as SqlxJson;
-    use uuid::Uuid;
     use wyrd_auth_verify::{AccessTokenClaims, TokenPrincipalRef};
-    use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
-    use wyrd_semver::VersionBlock;
+    use wyrd_runtime::{PermissionSet, PrincipalId};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::IssueKeyRequest;
-    use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::error::WyrdError;
-    use wyrd_spec::ids::CardName;
-    use wyrd_spec::reference::CardRef;
-    use wyrd_storage::{LocalSigner, StorageHandle};
+    use wyrd_spec::auth::{CardAccess, PrincipalKindTag};
 
-    use crate::components::auth::AuthenticatedPrincipal;
-    use crate::components::gateway::recording::RecordingScribe;
-    use crate::state::AppState;
-    use axum::Extension;
-    use wyrd_spec::request_id::RequestId;
-    use wyrd_sql::TenantConn;
+    use super::{auth_router, tenant_from_unverified_access_token};
 
-    use super::{auth_router, issue_key, tenant_from_unverified_access_token};
-
+    /// The auth router builds with its token routes mounted without panicking.
     #[test]
-    fn mounts_token_and_issue_key_routes() {
+    fn mounts_token_routes() {
         let _router = auth_router();
     }
 
+    /// The tenant id is read from an access token's unverified payload segment,
+    /// ignoring the header and signature.
+    ///
+    /// # Panics
+    /// Panics when the static ids do not parse, the claims fail to serialize,
+    /// or the extracted tenant differs from the claims' tenant.
     #[test]
     fn extracts_tenant_from_unverified_access_token() {
         let tenant_id: DataTenantId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
@@ -684,11 +592,11 @@ mod pg_tests {
                 id: principal_id,
                 kind: PrincipalKindTag::User,
                 tenant_id,
-                card_ref: None,
-                card_ref_scope: CardRefScope::default(),
             },
             roles: vec![],
             permissions: PermissionSet::default(),
+            workload_uid: None,
+            card_access: CardAccess::AnyRegistered,
             act: None,
             aud: "wyrd".to_owned(),
             exp: 9_999_999_999,
@@ -727,294 +635,5 @@ mod pg_tests {
 
         let result = tenant_from_unverified_access_token(&fake_jwt);
         assert!(result.is_err());
-    }
-
-    fn service_card_ref() -> CardRef {
-        CardRef {
-            kind: CardKind::Service,
-            name: CardName::new("issue-key-target").expect("static name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            uid: None,
-        }
-    }
-
-    fn caller_with(
-        id: Uuid,
-        tenant: DataTenantId,
-        permissions: PermissionSet,
-    ) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal::from_verified(Arc::new(wyrd_auth_verify::VerifiedToken {
-            principal: Principal {
-                id: PrincipalId::new(id),
-                kind: PrincipalKind::User,
-                tenant_id: tenant,
-                roles: Vec::new(),
-                effective_permissions: permissions,
-                credential_id: None,
-            },
-            delegation_chain: Vec::new(),
-            exp: chrono::Utc::now() + chrono::Duration::minutes(5),
-        }))
-    }
-
-    async fn fixture_state(fixture: &PgFixture) -> AppState {
-        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
-            fixture.wyrd_postgres().clone(),
-            fixture.vala_postgres().clone(),
-        ));
-        let dir = tempfile::tempdir().expect("routes storage tempdir");
-        let storage_root = dir.keep().join("issue-key-storage");
-        std::fs::create_dir_all(&storage_root).expect("storage root creates");
-        let signer = LocalSigner::new(storage_root).expect("local signer creates");
-        crate::test_support::test_app_state(
-            postgres,
-            Arc::new(StorageHandle::new(signer)),
-            crate::test_support::test_catalog().await,
-        )
-    }
-
-    async fn insert_test_user(conn: &mut TenantConn<'_>, tenant: DataTenantId) -> Uuid {
-        let user_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status)
-             VALUES ($1, $2, $3, 'password', 'active')",
-        )
-        .bind(user_id)
-        .bind(tenant.as_uuid())
-        .bind(format!("test-{user_id}@example.com"))
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("test user inserts");
-        user_id
-    }
-
-    /// Insert an active Service principal bound to `card_ref` and return its id.
-    ///
-    /// The row stores the flat reference, its version, and a fresh Card UID,
-    /// created and acted by `creator`. It writes in the caller's tenant
-    /// transaction, which the caller commits.
-    ///
-    /// # Panics
-    /// Panics when the insert fails.
-    async fn insert_test_service_account(
-        conn: &mut TenantConn<'_>,
-        tenant: DataTenantId,
-        creator: Uuid,
-        card_ref: &CardRef,
-    ) -> Uuid {
-        let sa_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO wyrd.auth_service_accounts
-                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref, name, version, status, sub_principal_id, act_principal_id)
-             VALUES ($1, $2, 'service', 'Service', $3, $4, $5, $6, 'active', $7, $7)",
-        )
-        .bind(sa_id)
-        .bind(tenant.as_uuid())
-        .bind(Uuid::new_v4())
-        .bind(SqlxJson(card_ref.clone()))
-        .bind(format!("svc-{sa_id}"))
-        .bind(card_ref.version.as_str())
-        .bind(creator)
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("service account inserts");
-        sa_id
-    }
-
-    #[tokio::test]
-    /// A caller without `service_accounts:write` is refused with the RBAC
-    /// denial. The denial row commits to the real fixture database, so the
-    /// refusal is not masked by an unreachable audit store.
-    async fn issue_key_without_permission_is_rbac_denied() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let state = fixture_state(&fixture).await;
-        let caller = caller_with(Uuid::new_v4(), tenant, PermissionSet::new());
-        let request = IssueKeyRequest {
-            card_ref: service_card_ref(),
-            label: None,
-            expires_in_seconds: None,
-        };
-
-        let error = issue_key(State(state), caller, None, Json(request))
-            .await
-            .expect_err("missing permission is denied");
-
-        assert!(
-            matches!(error.0, WyrdError::PermissionDeniedRbac { .. }),
-            "expected an RBAC denial, got {:?}",
-            error.0
-        );
-    }
-
-    /// A caller holding `service_accounts:write` mints a key for a Card-bound
-    /// Service principal: the response names the stored credential, and one
-    /// issuance audit row records the issuing actor, target principal, tenant,
-    /// and request id.
-    ///
-    /// # Panics
-    /// Panics when seeding or issuance fails, the response names a different
-    /// Card or credential than the stored row, or the staged issuance audit row
-    /// is missing or records the wrong actor, target, tenant, or request id.
-    #[tokio::test]
-    async fn issue_key_with_permission_mints_response() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let card_ref = service_card_ref();
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let creator = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, tenant, creator, &card_ref).await;
-        conn.commit().await.expect("seed commits");
-
-        let (state, scribe) = RecordingScribe::attach(fixture_state(&fixture).await);
-        let caller = caller_with(
-            creator,
-            tenant,
-            PermissionSet::from_iter([Permission::service_accounts_write()]),
-        );
-        let request = IssueKeyRequest {
-            card_ref: card_ref.clone(),
-            label: None,
-            expires_in_seconds: None,
-        };
-
-        let request_id = RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff")
-            .expect("static request id is valid");
-        let expected_request_id = request_id.as_str().to_owned();
-
-        let response = issue_key(
-            State(state.clone()),
-            caller,
-            Some(Extension(request_id)),
-            Json(request),
-        )
-        .await
-        .expect("issue key succeeds");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        assert_eq!(
-            state.bifrost.scribe_outbox().settle(deadline).await,
-            0,
-            "audit settles"
-        );
-
-        assert_eq!(response.0.card_ref, card_ref);
-        assert!(!response.0.prefix.is_empty());
-
-        let mut verify_conn = fixture.tenant_conn().await.expect("verify conn opens");
-        let stored_key_id: Uuid =
-            sqlx::query_scalar("SELECT id FROM wyrd.auth_api_keys WHERE prefix = $1")
-                .bind(&response.0.prefix)
-                .fetch_one(&mut **verify_conn.transaction())
-                .await
-                .expect("issued key row reads");
-        assert_eq!(
-            response.0.key_id, stored_key_id,
-            "the response names the issued credential's UUID"
-        );
-        let issuances: Vec<_> = scribe
-            .audit_decisions()
-            .into_iter()
-            .filter(|decision| {
-                decision.operation == "auth.api_key.issue"
-                    && decision
-                        .detail
-                        .as_ref()
-                        .is_some_and(|detail| detail.to_string().contains("credential_issuance"))
-            })
-            .collect();
-        let [row] = issuances.as_slice() else {
-            panic!("one credential issuance audit event was recorded: {issuances:?}");
-        };
-        let detail = row.detail.as_ref().expect("issuance detail is recorded");
-        let audit_target: Uuid = detail["target_principal_id"]
-            .as_str()
-            .expect("target principal id is present")
-            .parse()
-            .expect("target principal id is a uuid");
-        assert_eq!(
-            row.sub_principal_id, creator,
-            "audit records the issuing actor"
-        );
-        assert_eq!(
-            audit_target, sa_id,
-            "audit records the target service account"
-        );
-        assert_eq!(row.tenant, tenant, "audit is tenant-scoped");
-        assert_eq!(
-            row.request_id, expected_request_id,
-            "audit records the request id"
-        );
-    }
-
-    /// A failure after authorization records its allowance and no key.
-    ///
-    /// The caller holds `service_accounts:write`, so the decision is an
-    /// allowance — but the named Card binds no principal, so issuance fails
-    /// after it. The audit row records the authorization decision, not the
-    /// operation's outcome: it is staged on the audit outbox before issuance
-    /// runs, so the allowance survives while no key exists.
-    ///
-    /// # Panics
-    /// Panics when the issue succeeds, the allowance is missing, or a key
-    /// exists.
-    #[tokio::test]
-    async fn a_failed_issue_records_its_allowance_and_no_key() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let creator = insert_test_user(&mut conn, tenant).await;
-        conn.commit().await.expect("seed commits");
-
-        let (state, scribe) = RecordingScribe::attach(fixture_state(&fixture).await);
-        let caller = caller_with(
-            creator,
-            tenant,
-            PermissionSet::from_iter([Permission::service_accounts_write()]),
-        );
-        let request = IssueKeyRequest {
-            card_ref: service_card_ref(),
-            label: None,
-            expires_in_seconds: None,
-        };
-
-        let error = issue_key(State(state.clone()), caller, None, Json(request))
-            .await
-            .expect_err("an unbound card cannot be issued a key");
-        assert!(
-            matches!(error.0, WyrdError::PrincipalNotFound { .. }),
-            "expected the unbound-card refusal, got {:?}",
-            error.0
-        );
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        assert_eq!(
-            state.bifrost.scribe_outbox().settle(deadline).await,
-            0,
-            "audit settles"
-        );
-        let allowed = scribe
-            .audit_decisions()
-            .into_iter()
-            .filter(|decision| {
-                decision.tenant == tenant
-                    && decision.operation == "auth.api_key.issue"
-                    && decision.outcome == "allowed"
-            })
-            .count();
-        let mut verify_conn = fixture.tenant_conn().await.expect("verify conn opens");
-        assert_eq!(
-            allowed, 1,
-            "the failed issue records the decision it evaluated"
-        );
-
-        let keys: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_api_keys WHERE data_tenant_id = $1")
-                .bind(tenant.as_uuid())
-                .fetch_one(&mut **verify_conn.transaction())
-                .await
-                .expect("key count reads");
-        assert_eq!(keys, 0, "a failed issue leaves no key");
     }
 }

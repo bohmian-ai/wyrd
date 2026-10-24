@@ -35,7 +35,7 @@ controls required to operate those boundaries.
 | Client or agent to gateway | TLS, verified Wyrd token, typed permission, request bounds |
 | Gateway to `wyrd-server` | Authenticated transport; original credentials preserved; gateway metadata is never tenant authority |
 | `wyrd-server` replica to replica | Mutual TLS from one dedicated cluster CA with the fixed `wyrd-peer` identity; the receiver checks every operation's context against its own state |
-| Application to Postgres | Tenant traffic always runs under RLS through `TenantConn`; the operator pool is excluded from handlers by construction. Operators supply the logins; boot refuses superuser and `BYPASSRLS` logins. Production uses a separate tenant login that does not own Wyrd's objects, so RLS confines it even if compromised. One ordinary login (local and small self-hosted) keeps RLS per pool, but a process compromise could set the operator flag and reach every tenant |
+| Application to Postgres | Tenant traffic runs under RLS through `TenantConn` or the named single-statement owners; the operator pool is excluded from handlers by construction. Operators supply the logins; boot refuses superuser and `BYPASSRLS` logins. Production uses a separate tenant login that does not own Wyrd's objects, so RLS confines it even if compromised. One ordinary login (local and small self-hosted) keeps RLS per pool, but a process compromise could set the operator flag and reach every tenant |
 | Application to object storage | Workload identity or short-lived credentials; tenant-qualified prefixes; encryption in transit and at rest |
 | Server to a Source endpoint | Credential indirection, DNS resolution and SSRF screening, address pinning, bounded IO |
 
@@ -51,21 +51,22 @@ principals live under `wyrd.*` behind RLS and can never reach the platform
 plane. Neither plane's credential or token is accepted by the other.
 
 `PrincipalKindTag` is the closed wire set shared by both planes:
-`global_admin`, `tenant_admin`, `user`, `service`, `agent`, and `system`. A
+`global_admin`, `tenant_admin`, `user`, `service`, and `system`. A
 platform principal is `global_admin` or `user`; a tenant principal is
-`tenant_admin`, `user`, `service`, `agent`, or the internal-only `system`. The
-runtime `Principal { id, kind, tenant_id, roles, effective_permissions,
-credential_id }` carries the tenant-plane
-`PrincipalKind`, and `PlatformPrincipal { id, kind, effective_permissions,
-credential_id }` the tenantless platform identity.
+`tenant_admin`, `user`, `service`, or the internal-only `system`. Agent is a
+Card kind, not a principal kind. The runtime `Principal { id, kind,
+tenant_id, roles, effective_permissions, credential_id, card_access,
+workload_uid }` carries the tenant-plane `PrincipalKind`, and
+`PlatformPrincipal { id, kind, effective_permissions, credential_id }` the
+tenantless platform identity.
 
-Card binding is a property of some machine principals, not a precondition for
-holding a credential. An `agent` principal always binds an Agent Card. A
-`service` principal binds a Service Card when it is a deployed workload and
-binds none when it is tenant automation created by a tenant administrator; a
-Card-free machine principal therefore carries no emit scope. `tenant_admin`,
-`global_admin`, and `user` never bind a Card — an administrative or human
-identity is not a registered AI-system component.
+No principal binds a Card. A `service` principal is a stable account an
+administrator creates explicitly; it serves Services, Agents, CI, and
+automation and outlives every release. A Card root is request execution
+context: the optional exchange or `x-wyrd-workload-uid` selection, signed as
+`workload_uid` with a `card_access` limit. `tenant_admin`, `global_admin`, and
+`user` hold no restriction; an administrative or human identity is not a
+registered AI-system component.
 
 Gateway capture is a server-internal write that holds no token, evaluates no
 permission, and writes no audit decision. Its rows carry the verified
@@ -87,16 +88,30 @@ and the three Verifier result tables. Only audit history may name the reserved
 system tenant; an audit row keeps its decision pair as content. A compromised cluster
 member, already out of scope, is the only caller that could misuse it.
 
-Card-bound identities are provisioned idempotently by tenant, principal kind,
-Card kind, and Card UID. Re-applying a Card preserves the principal identity.
-The first projection grants the built-in `workload` role in the registration
-transaction, so the workload can emit, query, and verify its evidence; its Card
-scope still bounds which Cards it may emit for and verify. A principal bound to no
-Card (User, tenant administrator, unbound Service) may attribute evidence to
-any registered observation-target Card in its own tenant; ingest resolves those
-references against the tenant registry, never across tenants.
-Re-applying a Card never grants the role again, so an administrator's
-revocation stands. Roles are assigned to principals, not Cards. A tenant
+Registering a Service or Agent Card creates Card versions only, never a
+principal, role grant, or credential. `POST /v1/principals` creates a Service
+account atomically with its roles, optional `workload_restriction`, and first
+credential, returned once; failure creates nothing. A restriction is
+`{"mode":"unrestricted"}` (the default) or
+`{"mode":"family","kind":"Service","name":...}`. A family restriction
+limits Card-attributed emission and verification to that family's roots and
+makes the account the family's unique scheduled runtime account; a second live
+account for the family conflicts with `WYRD_AUTH_409_WORKLOAD_BINDING_CONFLICT`.
+Creating or replacing a family restriction
+(`PUT /v1/principals/{id}/workload-restriction`) additionally requires the
+tenant-administrative wildcard permission, audited as
+`auth.principal.workload_restriction.set`; the replacement is idempotent,
+atomic, Service-only, and changes no id, role, or credential. A rootless
+User, tenant administrator, or unrestricted Service is `any_registered` and
+may attribute evidence to any registered observation-target Card in its own
+tenant; ingest resolves those references against the tenant registry, never
+across tenants. A rootless family-restricted Service is `root_required`: its
+generic authorized operations work, and Card-sensitive work is refused with
+`workload_context_required` even under wildcard grants. A selected root is
+required to be a Service and resolved under the account's restriction; an unknown and a foreign root are
+refused identically. Agent Cards remain valid graph subjects, never workload roots or account families.
+Configured Service/version/environment is retained as correlation on inputs/results;
+environment and derived identity labels grant no authority. Roles are assigned to principals, not Cards. A tenant
 administrator (`*`, not `service_accounts:write`) grants and revokes direct
 roles with `PUT` and `DELETE /v1/principals/{id}/roles/{role}`
 (`wyrd principal role grant|revoke`); each decision is staged on the Scribe
@@ -104,10 +119,11 @@ outbox as `auth.principal.role.grant` or `auth.principal.role.revoke`, and the
 change reaches the principal's next token. A user's assignments record their
 source: login replaces only `idp` assignments, so a direct grant survives the
 next login, and tokens carry the union of both sources.
-Credential issuance is a separate privileged operation and is policy-gated.
+Every credential has one account owner and no version; releases never
+require rotation.
 The verification runtime also provisions one UUIDv7 `system` principal per
 tenant, the server's own identity for continuous verification work that has no
-direct principal. It is not Card-bound or publicly manageable, has no
+direct principal. It is not publicly manageable, has no
 credential, role grant, refresh, workload, or delegation path, and never
 appears in a token: every issuer refuses it and every verifier rejects a
 `system` claim set. It is only ever an actor, never a subject: work it
@@ -354,8 +370,12 @@ credential.
 
 - Cross-service delegation uses RFC 8693 token exchange: the actor presents
   the subject's token as `subject_token` and its own as `actor_token`; the
-  actor must be a direct Card-bound Service or Agent token, and the signed
-  token names the subject as its principal and the actor as its outer `act`.
+  actor must be a direct Service token with a selected root, and the signed
+  token names the subject as its principal and the actor, with its
+  `workload_uid` and optional credential `cid`, as its outer `act`. The
+  effective `card_access` is the intersection of the subject's signed limit
+  and the actor's resolved root graph; it may be empty, and a `root_required`
+  subject cannot delegate Card authority it has not established.
   Both are verified from that token; no caller-supplied identity header is
   accepted, `act` confers no authority, and exchange consults no policy.
 - A delegated token is bound to the `wyrd` or `bifrost` audience; a `bifrost`
@@ -376,7 +396,12 @@ credential.
   the existing nonblocking audit outbox.
 - External federation accepts tokens only from an explicitly configured
   issuer, audience, algorithm, and claim mapping. OIDC discovery does not make
-  an issuer trusted.
+  an issuer trusted. A workload binding maps a verified issuer, subject, and
+  audience to an active Service account (`principal_id`) and an optional
+  default `workload_uid`; the write refuses any other target. At jwt-bearer
+  exchange an explicit `workload_uid` wins, then the binding's default, then
+  rootless semantics, all under the account's restriction. Assertion claims
+  never select a principal and the `tenant` selector only routes.
 - A connection is selected by the login entry point, never by a token, header,
   hostname, or post-login chooser. A tenant entry resolves only that tenant's
   connection; the deployment's single platform-scope connection resolves only
@@ -460,6 +485,20 @@ HTTP handlers receive identity through two extractors. `AuthenticatedPrincipal`
 verifies the signed Wyrd access token from `X-Wyrd-Access-Token`; `Caller`
 projects that verified principal with the request ID. `Caller.data_tenant_id`
 is copied from `principal.tenant_id`; no request header is tenant authority.
+
+An optional `x-wyrd-workload-uid` header (HTTP, MCP, gateway, and OTLP
+metadata) selects request context, never identity or tenant. On a token
+that already signs a root, an equal selector is idempotent and a different
+one is refused as `signed_workload_mismatch`. On a rootless bearer the
+server resolves the root under the token's signed `card_access` and the
+account restriction, with no broader live-grant lookup and no activity
+recorded; an unknown and a foreign root are refused identically. A
+repeated or malformed selector is refused. Native Bifrost and OTLP gRPC
+apply the same server-owned selection before Gate admission, so a User bearer
+driving a loaded state writes natively under its validated root; signature
+verification stays store-free, and Gate itself, without that server-resolved
+caller, accepts only a signed root and refuses a selector it would have to
+resolve.
 
 ### Permission model
 
@@ -639,8 +678,9 @@ is not an SSRF control.
 
 ## Tenant and data isolation
 
-- Tenant Postgres operations use `TenantConn` and transaction-local RLS state.
-  A tenant caller cannot select or widen that state.
+- Tenant Postgres operations use `TenantConn` and transaction-local RLS state,
+  except the exact single-statement owners documented below. Both paths derive
+  tenant context from verified authority; a caller cannot select or widen it.
 - `OperatorPool` is restricted to named platform operations whose owner checks
   tenant equality, lease generation, and fence before mutation. It is not a
   generic query escape hatch.
@@ -704,6 +744,17 @@ from the typed `DataTenantId`, whose UUID rendering cannot contain a quote.
 Elsewhere tenant identity is parameter-bound. A missing binding fails
 (`wyrd.current_tenant()` is strict) rather than returning an empty or
 cross-tenant result; dropping the wrapper rolls back and clears the binding.
+
+Three existing hot-path owners avoid separate transaction round trips:
+`OracleTableCuts`, `GatewayAdmissions` and `VerificationTargets`, enumerated by
+`STATEMENT_TENANT_OWNERS` in `scripts/check_tenant_isolation.py`. Each executes
+one request-role SQL statement whose function binds the verified tenant as
+transaction-local RLS state within the statement's implicit transaction. RLS and
+caller privileges still apply; an existing transaction bound to another tenant
+must be refused, never rebound. On a matching transaction, the caller retains
+commit/rollback ownership. The exception is confined to those owner methods,
+not arbitrary raw connections, extra statements or new bypasses. Other tenant
+work continues through TenantConn.
 
 Postgres enforces only tenant isolation and table-local invariants that hold
 for every login. Wyrd's RBAC is the single permission model: migrations add no

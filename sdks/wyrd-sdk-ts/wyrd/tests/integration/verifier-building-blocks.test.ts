@@ -35,12 +35,19 @@ import {
   WyrdState,
 } from "wyrd-ai";
 import { spanExporter } from "wyrd-ai/otel";
-import { cli } from "@wyrd/testing";
 
 import { judgeReply, toolCall, toolTurn } from "../support/assistant.js";
 import type { ReceivedRequest, Reply } from "../support/http-receiver.js";
 import { configureGateway } from "../support/local-development.js";
-import { type DeclaredRef, fixture, declared, serverTest, timeline } from "../support/server.js";
+import {
+  type DeclaredRef,
+  fixture,
+  declared,
+  rooted,
+  runtimeAccount,
+  serverTest,
+  timeline,
+} from "../support/server.js";
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -178,7 +185,7 @@ interface PolicyDesk {
 /**
  * `test` on a fresh verification-capable server per test whose gateway
  * deploys `gpt-4o` on the local upstream, with `policy-desk` declared and
- * hydrated and acting as its own Card-scoped key.
+ * hydrated and acting as its runtime account.
  */
 const test = serverTest({ provider: upstream, verificationRuntime: true, perTest: true }).extend<{
   desk: PolicyDesk;
@@ -190,9 +197,8 @@ const test = serverTest({ provider: upstream, verificationRuntime: true, perTest
     const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-policy-desk-"));
     await cards.pull(receipt.root, bundle);
     const root = declared(receipt);
-    const client = WyrdClient.connect({
-      credential: (await cli.issueKey(root)).key,
-    });
+    const { key } = await runtimeAccount({ kind: "Service", name: root.name });
+    const client = WyrdClient.connect({ credential: key, workloadUid: root.uid });
     const state = WyrdState.fromPath(bundle, { client });
     await state.startBifrost();
     await use({ bundle, root, client, state });
@@ -601,7 +607,7 @@ test("delegated tools keep the narrower authority", async ({ server, provider, d
   const subject = server.scopedApiKey("tool_subject", grants("all"));
   const actor = server.scopedApiKey("tool_delegate", grants({ tool: TOOLS[0] }));
   const token = await WyrdClient.connect({ credential: subject }).accessToken();
-  const delegated = await WyrdClient.connect({ credential: actor }).onBehalfOf(token, { audience: "wyrd" });
+  const delegated = await (await rooted(actor, "policy-desk")).onBehalfOf(token, { audience: "wyrd" });
   const principals = await Principals.connect();
   const [subjectId, actorId] = await Promise.all(
     ["tool_subject", "tool_delegate"].map(

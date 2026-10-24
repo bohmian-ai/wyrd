@@ -256,8 +256,9 @@ impl BifrostGrpcTransport {
         }
     }
 
-    /// Attaches the bearer token, `wyrd-request-id`, and the caller's W3C
-    /// trace context to one attempt.
+    /// Attaches the bearer token, the middleware's workload root when it has
+    /// one, `wyrd-request-id`, and the caller's W3C trace context to one
+    /// attempt.
     ///
     /// A supplied `request_id` is forwarded unchanged through the shared
     /// [`crate::auth::AuthMiddleware::request_id`]; otherwise one is minted.
@@ -288,6 +289,27 @@ impl BifrostGrpcTransport {
         request
             .metadata_mut()
             .insert("x-wyrd-access-token", access_token);
+        if let Some(uid) = self.connection.auth().workload_uid() {
+            let uid = MetadataValue::try_from(uid.as_str()).map_err(|_| WyrdError::Internal {
+                message: "bifrost workload UID cannot be represented as gRPC metadata".to_owned(),
+                details: serde_json::json!({}),
+            })?;
+            request
+                .metadata_mut()
+                .insert(wyrd_spec::auth::WORKLOAD_UID_HEADER, uid);
+        }
+        if let Some(environment) = self.connection.auth().deployment_environment() {
+            let environment =
+                MetadataValue::try_from(environment).map_err(|_| WyrdError::Internal {
+                    message:
+                        "bifrost deployment environment cannot be represented as gRPC metadata"
+                            .to_owned(),
+                    details: serde_json::json!({}),
+                })?;
+            request
+                .metadata_mut()
+                .insert(wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER, environment);
+        }
 
         let request_id = self
             .connection

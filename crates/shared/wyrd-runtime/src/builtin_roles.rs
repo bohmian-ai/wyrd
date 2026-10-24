@@ -93,7 +93,7 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
         permissions: EDITOR,
     },
     BuiltinRole {
-        name: DEFAULT_CARD_ROLE,
+        name: "workload",
         permissions: WORKLOAD,
     },
     BuiltinRole {
@@ -101,14 +101,6 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
         permissions: VIEWER,
     },
 ];
-
-/// Built-in Role a Card-bound Service or Agent principal receives at its first
-/// projection.
-///
-/// The grant is a direct assignment made once: an administrator who revokes
-/// it is not overridden by a later re-registration. The principal's Card
-/// scope still bounds which Cards it may attribute evidence to.
-pub const DEFAULT_CARD_ROLE: &str = "workload";
 
 /// Built-in Role a trusted issuer grants every principal it authenticates
 /// when its create request omits `default_roles`.
@@ -130,7 +122,7 @@ pub fn builtin_role_uuid(data_tenant_id: DataTenantId, role_name: &str) -> Uuid 
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{BUILTIN_ROLES, DEFAULT_CARD_ROLE, builtin_role_uuid};
+    use super::{BUILTIN_ROLES, builtin_role_uuid};
     use crate::Permission;
 
     /// Returns the named built-in Role's permissions.
@@ -183,7 +175,6 @@ mod tests {
             names,
             BTreeSet::from(["admin", "editor", "viewer", "workload"])
         );
-        assert_eq!(DEFAULT_CARD_ROLE, "workload");
     }
 
     /// Proves `viewer` ⊂ `workload` ⊂ `editor` ⊂ `admin`, each strictly.

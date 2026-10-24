@@ -107,7 +107,8 @@ const INSERT_SUBMISSIONS_SQL: &str = r"
         origin, run_id, inputs, route_overrides,
         sub_principal_id, act_principal_id, authority, cause_trace_id, cause_span_id,
         idempotency_key, request_sha256, status, error, max_attempts,
-        next_attempt_at, settled_at, created_at, updated_at, cause_sampled, group_id
+        next_attempt_at, settled_at, created_at, updated_at, cause_sampled, group_id,
+        deployment_environment
     )
     SELECT r.execution_id, wyrd.current_tenant(), v.card_uid, v.version, s.card_uid,
            'manual', r.run_id, r.inputs, r.route_overrides,
@@ -116,15 +117,16 @@ const INSERT_SUBMISSIONS_SQL: &str = r"
            CASE WHEN r.error IS NULL THEN 'pending' ELSE 'errored' END, r.error, $17,
            CASE WHEN r.error IS NULL THEN statement_timestamp() END,
            CASE WHEN r.error IS NOT NULL THEN statement_timestamp() END,
-           statement_timestamp(), statement_timestamp(), r.cause_sampled, r.group_id
+           statement_timestamp(), statement_timestamp(), r.cause_sampled, r.group_id,
+           r.deployment_environment
       FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::jsonb[],
                   $6::jsonb[], $7::uuid[], $8::uuid[], $9::jsonb[], $10::bytea[],
                   $11::bytea[], $12::text[], $13::bytea[], $14::jsonb[], $15::bool[],
-                  $16::text[])
+                  $16::text[], $18::text[])
            AS r(execution_id, verifier_card_uid, card_uid, run_id, inputs,
                 route_overrides, sub_principal_id, act_principal_id, authority,
                 cause_trace_id, cause_span_id, idempotency_key, request_sha256,
-                error, cause_sampled, group_id)
+                error, cause_sampled, group_id, deployment_environment)
       JOIN wyrd.cards v ON v.card_uid = r.verifier_card_uid
       JOIN wyrd.cards s ON s.card_uid = r.card_uid
     ON CONFLICT DO NOTHING
@@ -411,7 +413,7 @@ const CLAIM_SQL: &str = r"
               e.run_id, e.inputs, e.route_overrides,
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
               e.max_attempts, e.lease_expires_at, e.cause_trace_id, e.cause_span_id,
-              e.cause_sampled, e.group_id, e.group_sources,
+              e.cause_sampled, e.group_id, e.group_sources, e.deployment_environment,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
@@ -561,7 +563,7 @@ const RELEASE_SQL: &str = r"
 const STATUS_SQL: &str = r"
     SELECT execution_id, status, sub_principal_id, act_principal_id,
            verifier_card_uid, card_uid, result_id, error,
-           group_id, owner_card_uid, group_sources
+           group_id, owner_card_uid, group_sources, deployment_environment
       FROM wyrd.verifier_executions
      WHERE execution_id = $1
 ";
@@ -1080,7 +1082,7 @@ pub enum ScheduleSkip {
 
 /// What a claimed due occurrence calls for, decided before any authority is
 /// resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DueDecision {
     /// The stored schedule no longer parses; disarm the cursor.
     InvalidSchedule,
@@ -1095,8 +1097,10 @@ enum DueDecision {
     Run {
         /// The occurrence's fixed window.
         window: DriftWindow,
-        /// The owner's Card-bound principal the execution serves.
+        /// The owner family's runtime account the execution serves.
         owner: PrincipalId,
+        /// The binding's exact owner root the account runs under.
+        owner_root: CardUid,
         /// The next cursor.
         next_run_at: DateTime<Utc>,
     },
@@ -1107,10 +1111,10 @@ enum DueDecision {
 ///
 /// The occurrence, owner activity, and missed-boundary rule are already
 /// decided. When the occurrence needs an execution, [`Self::owner`] names the
-/// owner principal whose current authority the caller resolves, on the same
-/// transaction, before [`VerifierExecutionQueue::schedule_due`] settles the
-/// tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// family runtime account and exact root whose current authority the caller
+/// resolves, on the same transaction, before
+/// [`VerifierExecutionQueue::schedule_due`] settles the tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueBinding {
     /// The claimed binding.
     pub binding_id: BindingId,
@@ -1121,12 +1125,15 @@ pub struct DueBinding {
 }
 
 impl DueBinding {
-    /// The owner principal an execution would serve, or `None` when the
-    /// occurrence creates none and needs no authority.
+    /// The family runtime account and exact owner root an execution would
+    /// serve, or `None` when the occurrence creates none and needs no
+    /// authority.
     #[must_use]
-    pub const fn owner(&self) -> Option<PrincipalId> {
-        match self.decision {
-            DueDecision::Run { owner, .. } => Some(owner),
+    pub const fn owner(&self) -> Option<(PrincipalId, &CardUid)> {
+        match &self.decision {
+            DueDecision::Run {
+                owner, owner_root, ..
+            } => Some((*owner, owner_root)),
             DueDecision::InvalidSchedule | DueDecision::Skip { .. } => None,
         }
     }
@@ -1169,8 +1176,8 @@ pub struct DueGroup {
     pub owner_card_uid: CardUid,
     /// The pinned Trigger duration and source bindings.
     pub settings: GroupEndSettings,
-    /// The owner's stored Card-bound principal, whatever its status; `None`
-    /// when the owner has none, so nothing can be attributed to it.
+    /// The owner family's runtime account, whatever its status; `None` when
+    /// the family has none, so nothing can be attributed to it.
     pub owner: Option<PrincipalId>,
     /// Whether the owner is runtime-active, so its group may be admitted.
     pub active: bool,
@@ -1360,6 +1367,10 @@ pub struct ClaimedExecution {
     /// The Verifier's ready fitted Drift baselines keyed by requirement ID,
     /// read in the claim transaction; empty when it has none.
     pub fitted_baselines: BTreeMap<TaskId, Value>,
+    /// The deployment environment tag accepted with the execution, written
+    /// unchanged to its result rows; `None` when it carried none. Never an
+    /// execution input.
+    pub deployment_environment: Option<String>,
 }
 
 /// Outcome of a token-fenced settlement.
@@ -1421,6 +1432,9 @@ pub struct ExecutionStatus {
     pub card_uid: CardUid,
     /// Result pointer of a completed execution.
     pub result_id: Option<VerificationResultId>,
+    /// The deployment environment tag the execution was accepted with;
+    /// `None` when the invocation carried none.
+    pub deployment_environment: Option<String>,
 }
 
 /// Bounded retry of engine failures: attempts and exponential backoff.
@@ -1790,6 +1804,11 @@ impl VerifierExecutionQueue {
                     .collect::<Vec<_>>(),
             )
             .bind(self.retry.max_attempts)
+            .bind(
+                requests()
+                    .map(|request| request.deployment_environment.as_deref())
+                    .collect::<Vec<_>>(),
+            )
             .execute(&mut **conn.transaction())
             .await?;
         Ok(())
@@ -1920,12 +1939,13 @@ impl VerifierExecutionQueue {
                 Some(window) => match binding_activity(conn, binding_id, self.inactivity)
                     .await?
                     .filter(|activity| activity.active)
-                    .and_then(|activity| activity.principal_id)
+                    .and_then(|activity| Some((activity.principal_id?, activity.owner_card_uid)))
                 {
                     None => skip(ScheduleSkip::Inactive),
-                    Some(owner) => DueDecision::Run {
+                    Some((owner, owner_root)) => DueDecision::Run {
                         window,
                         owner,
+                        owner_root,
                         next_run_at,
                     },
                 },
@@ -2640,6 +2660,7 @@ impl VerifierExecutionQueue {
                     .result_id
                     .map(|id| stored(VerificationResultId::new(id)))
                     .transpose()?,
+                deployment_environment: row.deployment_environment,
             }))
         })
         .await
@@ -2967,6 +2988,8 @@ struct ClaimedRow {
     group_id: Option<String>,
     /// A group execution's pinned source selections.
     group_sources: Option<Json<BTreeMap<SlotName, GroupSourceSnapshot>>>,
+    /// Accepted deployment environment tag.
+    deployment_environment: Option<String>,
     /// Milliseconds the execution was claimable before this claim.
     queue_wait_ms: i64,
     /// Milliseconds since the execution was admitted.
@@ -3069,6 +3092,7 @@ impl ClaimedRow {
                 .fitted_baselines
                 .map(|Json(fitted)| fitted)
                 .unwrap_or_default(),
+            deployment_environment: self.deployment_environment,
         })
     }
 }
@@ -3117,6 +3141,8 @@ struct StatusRow {
     owner_card_uid: Option<Uuid>,
     /// A group execution's pinned source selections.
     group_sources: Option<Json<BTreeMap<SlotName, GroupSourceSnapshot>>>,
+    /// Deployment environment tag supplied at acceptance.
+    deployment_environment: Option<String>,
 }
 
 /// A dispatch row from [`DISPATCHES_SQL`].
@@ -3257,6 +3283,7 @@ mod tests {
             group_id: None,
             inputs: BTreeMap::new(),
             execution_route_overrides: BTreeMap::new(),
+            deployment_environment: None,
         }
     }
 

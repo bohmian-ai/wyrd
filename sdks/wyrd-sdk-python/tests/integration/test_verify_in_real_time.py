@@ -27,7 +27,7 @@ from wyrd.client import WyrdClient
 from wyrd.gateway import Gateway
 from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer, cli
+from wyrd.testing import WyrdTestServer
 
 from .conftest import registered_assistant, serving
 from .support import (
@@ -47,6 +47,7 @@ from .support import (
     group_execution,
     hydrated,
     pull,
+    runtime_account,
     service_key,
     timeline,
 )
@@ -70,7 +71,7 @@ def verifier_run(cards: Cards, verifier: str) -> dict[str, object]:
 
 def principal(service: str = "assistant") -> str:
     """The ``service`` principal id; ``assistant``'s is the one most judgments here are requested as."""
-    return cli.issue_key(kind="Service", name=service, version="1.0.0").principal_id
+    return runtime_account(service)[0]
 
 
 def result_with_its_judge_calls(
@@ -116,7 +117,9 @@ def verify_over_http(server: WyrdTestServer, cards: Cards, traceparent: str) -> 
     Returns the result's ``execution_id``.
     """
     registered = declare(cards, "cards/verify_in_real_time/assistant.yaml")
-    token = WyrdClient(credential=service_key("assistant")).access_token()
+    token = WyrdClient(
+        credential=service_key("assistant"), workload_uid=str(registered["assistant"].uid)
+    ).access_token()
     response = httpx.post(
         f"{server.base_url}/v1/verification/execute",
         headers={"x-wyrd-access-token": f"Bearer {token}", "traceparent": traceparent},
@@ -308,9 +311,8 @@ def test_submitted_answer_is_judged_in_the_background_and_resumes_by_id(
     execution = run.observe.submit("answer-check", "no")
     assert isinstance(execution, verify.Execution)
     waited = execution.wait(WAIT_SECONDS)
-    resumed = verify.Execution.connect(execution.id, WyrdClient(credential=assistant_key)).wait(
-        WAIT_SECONDS
-    )
+    service = WyrdClient(credential=assistant_key, workload_uid=str(assistant.root_ref.uid))
+    resumed = verify.Execution.connect(execution.id, service).wait(WAIT_SECONDS)
 
     assert waited.verdict == "failed"
     assert waited.execution_id == execution.id
@@ -406,7 +408,7 @@ def test_retired_verification_contracts_are_refused(
         state = hydrated(assistant_bundle, WyrdClient(credential=stale))
         with pytest.raises(WyrdError) as raised:
             state.run("agent").observe.verify("answer-check", "yes")
-        assert raised.value.code == "WYRD_SPEC_500_INTERNAL", action
+        assert raised.value.code == "WYRD_PERMISSION_500_ROLE_CORRUPT", action
 
     assert all(table["namespace"] != "vala.eval" for table in bifrost.list_tables())
 
@@ -446,15 +448,17 @@ def test_another_tenant_cannot_verify_the_assistant(
     for verifier in ["answer-check", "answer-judged"]:
         with pytest.raises(WyrdError) as raised:
             run.observe.verify(verifier, "yes")
-        assert raised.value.code == "WYRD_VERIFICATION_404_TARGET_NOT_FOUND"
+        assert raised.value.code == "WYRD_AUTH_401_WORKLOAD_UID_REFUSED"
 
 
-def enqueue_over_http(server: WyrdTestServer, key: str, idempotency_key: str, body: dict) -> str:
-    """Enqueue ``body`` over plain HTTP as ``key`` with ``idempotency_key``; return the execution."""
+def enqueue_over_http(
+    server: WyrdTestServer, client: WyrdClient, idempotency_key: str, body: dict
+) -> str:
+    """Enqueue ``body`` over plain HTTP as ``client`` with ``idempotency_key``; return the execution."""
     response = httpx.post(
         f"{server.base_url}/v1/verification/enqueue",
         headers={
-            "x-wyrd-access-token": f"Bearer {WyrdClient(credential=key).access_token()}",
+            "x-wyrd-access-token": f"Bearer {client.access_token()}",
             "idempotency-key": idempotency_key,
         },
         json=body,
@@ -492,13 +496,17 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
         }
 
     idempotency_key = f"support-turn-{group}"
-    replayed = enqueue_over_http(wyrd_server, key, idempotency_key, body(turns[5]))
-    assert enqueue_over_http(wyrd_server, key, idempotency_key, body(turns[5])) == replayed
+    service = WyrdClient(credential=key, workload_uid=str(registered["support"].uid))
+    replayed = enqueue_over_http(wyrd_server, service, idempotency_key, body(turns[5]))
+    assert enqueue_over_http(wyrd_server, service, idempotency_key, body(turns[5])) == replayed
     admin = client_of(wyrd_server)
     verify.Execution.connect(replayed, admin).wait(WAIT_SECONDS)
-    WyrdState.from_path(bundle, admin).run("agent").observe.verify(
-        "turn-check", {"answer": ""}, group_id=group
+    # A WyrdState would carry its Service root for the administrator too, so
+    # the ownerless turn is the administrator's rootless enqueue.
+    ownerless = enqueue_over_http(
+        wyrd_server, admin, f"support-ownerless-{group}", body({"answer": ""})
     )
+    verify.Execution.connect(ownerless, admin).wait(WAIT_SECONDS)
     other = wyrd_server.scoped_api_key("py_group_other", [verifier_run(cards, "answer-check")])
     with pytest.raises(WyrdError) as denied:
         WyrdState.from_path(bundle, WyrdClient(credential=other)).run("agent").observe.verify(
@@ -522,7 +530,7 @@ def test_grouped_support_resumes(wyrd_server: WyrdTestServer, cards: Cards, tmp_
     # A conflicting replay is refused by the queue after staging; it is sent
     # to its own group so the conversation above keeps its six turns.
     conflicting = {**body({"answer": ""}), "group_id": f"{group}-conflict"}
-    conflict = enqueue_over_http(wyrd_server, key, idempotency_key, conflicting)
+    conflict = enqueue_over_http(wyrd_server, service, idempotency_key, conflicting)
     with pytest.raises(WyrdError) as conflicted:
         verify.Execution.connect(conflict, admin).wait(WAIT_SECONDS)
     assert conflicted.value.code == "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT"
@@ -925,7 +933,7 @@ def test_grouped_conversations_coexist_with_drift(
     newer = declare(cards, "cards/verify_in_real_time/turn-check-newer.yaml")
     late = enqueue_over_http(
         wyrd_server,
-        key,
+        WyrdClient(credential=key, workload_uid=str(registered["support"].uid)),
         f"support-newer-{suffix}",
         {
             "verifier_card_uid": str(newer["turn-check"].uid),
@@ -942,7 +950,7 @@ def test_grouped_conversations_coexist_with_drift(
     )
     b_cards = Cards(tenant_b)
     declare(b_cards, "cards/verify_in_real_time/support.yaml")
-    b_key = cli.issue_key(kind="Service", name="support", version="1.0.0", client=tenant_b).key
+    b_key = service_key("support", tenant_b)
     b_state = WyrdState.from_path(
         pull(b_cards, "support", tmp_path / "b"), WyrdClient(credential=b_key)
     )

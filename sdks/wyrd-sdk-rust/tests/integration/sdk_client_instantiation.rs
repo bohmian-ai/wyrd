@@ -229,7 +229,11 @@ async fn credential_paths_preserve_exchange_and_bearer_behavior() {
             .map(WyrdError::from),
     ] {
         let refused = refused.expect("a refused exchange fails at connect");
-        assert_eq!(refused.code(), "WYRD_SPEC_400_VALIDATION", "{refused:?}");
+        assert_eq!(
+            refused.code(),
+            "WYRD_AUTH_401_API_KEY_INVALID",
+            "{refused:?}"
+        );
     }
 
     let issued = deployment
@@ -284,7 +288,8 @@ async fn delegated_connect_uses_the_subject_principal() {
         .await
         .expect("the subject's key exchanges");
     let admin = deployment.admin();
-    let delegated = admin
+    let delegated = deployment
+        .rooted_admin()
         .on_behalf_of(SecretString::from(reader.expose()), TokenAudience::Wyrd)
         .await
         .expect("the actor delegates");
@@ -309,7 +314,8 @@ async fn delegated_connect_uses_the_subject_principal() {
         .await
         .expect("the actor alone may read operators");
 
-    let to_bifrost = admin
+    let to_bifrost = deployment
+        .rooted_admin()
         .on_behalf_of(SecretString::from(reader.expose()), TokenAudience::Bifrost)
         .await
         .expect("the actor delegates to Bifrost");

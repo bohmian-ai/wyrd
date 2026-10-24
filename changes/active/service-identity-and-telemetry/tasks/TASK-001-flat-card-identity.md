@@ -10,6 +10,9 @@ parent_task:
 remediates: []
 ---
 
+> Historical baseline task. TASK-001 is treated as completed by the maintainer's revision-14 instruction; this does not claim new review or test evidence. Revision-14 authority is the current spec and supplements.
+
+
 # Flat Card identity
 
 ## Outcome and Value

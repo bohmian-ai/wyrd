@@ -20,7 +20,6 @@ use vala_sql::ValaPostgres;
 use iceberg::spec::Schema;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
-use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::TableVersion;
 
@@ -701,7 +700,7 @@ impl ScribeImpl {
                 AdmittedRowContext {
                     card_scope: frame
                         .attributed_cards
-                        .or_else(|| frame.principal.card_ref_scope().map(CardRefScope::uids)),
+                        .or_else(|| frame.principal.card_scope().map(<[_]>::to_vec)),
                     attribution: frame.attribution,
                     expected_schema_fingerprint,
                     request_id: frame.request_id,
@@ -1455,14 +1454,13 @@ mod tests {
     async fn decode_to_memtable_transfers_one_charge() {
         let scribe = ScribeImpl::new();
         let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("random tenant is valid");
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::User,
-            tenant_id: tenant,
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
-        };
+        let principal = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            PermissionSet::new(),
+        );
         let baseline = scribe.memory_snapshot().scribe_total_bytes;
         let decode_bytes = 4 * 1024 * 1024;
         let mut frame = decoded_size_frame(tenant, &principal, "v".repeat(1024));
@@ -1557,6 +1555,14 @@ mod tests {
 
     /// An oversized decoded request is refused at the pre-WAL size gate while
     /// the exact ceiling remains available to a subsequent bounded request.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the size gate admits a request one byte over or overflowing
+    /// the limit, refuses one at the exact ceiling, lets an oversized frame
+    /// through `ingest_frame` or change admission, memory, WAL bytes, or
+    /// memtable stats, or refuses the following small frame or leaves the WAL
+    /// unchanged after it.
     #[tokio::test]
     async fn oversized_decoded_request_is_rejected_before_wal_append() {
         let limit = 64 * 1024;
@@ -1582,14 +1588,13 @@ mod tests {
         let scribe = ScribeImpl::new();
         scribe.set_decoded_request_limit_for_test(limit);
         let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("random tenant is valid");
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::User,
-            tenant_id: tenant,
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
-        };
+        let principal = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            PermissionSet::new(),
+        );
         let make_frame = |value: String| decoded_size_frame(tenant, &principal, value);
         let admission_before = scribe.admission_snapshot();
         let memory_before = scribe.memory_snapshot();

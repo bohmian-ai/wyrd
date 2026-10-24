@@ -3,7 +3,7 @@ mod pg_tests {
     //!
     //! These tests drive real Postgres through [`PgFixture`], because every
     //! property under test is a property of the schema — tenancy constraints,
-    //! Card-binding agreement, credential ownership, and lifecycle — rather than
+    //! workload restrictions, credential ownership, and lifecycle — rather than
     //! of Rust code that could be asserted in isolation.
     //!
     //! Skipped automatically when the database environment is unset so the
@@ -12,20 +12,18 @@ mod pg_tests {
     use chrono::{DateTime, Duration, Utc};
     use sqlx::Row;
     use uuid::Uuid;
-    use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_semver::VersionBlock;
+    use wyrd_dev_fixtures::pg::{PgFixture, UnmigratedDatabase};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{Attribution, PrincipalKindTag};
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::auth::{Attribution, PrincipalKindTag, WorkloadFamily, WorkloadKind};
     use wyrd_spec::ids::CardName;
-    use wyrd_spec::reference::CardRef;
+    use wyrd_sql::SqlError;
     use wyrd_sql::queries::auth::{
         ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, credential_belongs_to,
-        delete_service_account, insert_api_key, insert_refresh_token, insert_role,
-        insert_service_account, insert_user, list_api_key_metadata, list_service_account_roles,
-        list_user_roles, provision_system_principal, replace_idp_user_roles,
-        service_account_by_card_ref, service_account_by_id, suspend_service_account_principal,
-        system_principal_id, tenant_admin_principal_id,
+        delete_service_account, family_account_id, insert_api_key, insert_refresh_token,
+        insert_role, insert_service_account, insert_user, list_api_key_metadata,
+        list_service_account_roles, list_user_roles, provision_system_principal,
+        replace_idp_user_roles, service_account_by_id, set_workload_restriction,
+        suspend_service_account_principal, system_principal_id, tenant_admin_principal_id,
     };
     use wyrd_sql::queries::platform::credentials::{
         insert_platform_credential_tx, list_platform_credentials, platform_credential_by_prefix,
@@ -37,7 +35,6 @@ mod pg_tests {
     use wyrd_sql::queries::platform::principals::{
         insert_platform_principal, platform_principal_by_id,
     };
-    use wyrd_sql::{MIGRATION_LEASE_WAIT, OperatorPool};
 
     /// Skip when no database is configured, matching the sibling Postgres suites.
     fn database_url() -> Option<String> {
@@ -574,6 +571,11 @@ mod pg_tests {
 
     /// A tenant administrative principal holds a credential without binding a
     /// Card, so an administrative identity needs no fabricated Card.
+    ///
+    /// # Panics
+    /// Panics when the fixture or tenant connection cannot start, the
+    /// card-free `tenant_admin` insert or its read-back fails, or the stored
+    /// row carries a restriction kind or name.
     #[tokio::test]
     async fn tenant_admin_principal_persists_without_a_card() {
         let Some(_) = database_url() else {
@@ -596,7 +598,7 @@ mod pg_tests {
         .expect("card-free administrative principal inserts");
 
         let row = sqlx::query(
-            "SELECT card_kind, card_uid, card_ref, version
+            "SELECT restriction_kind, restriction_name
                FROM wyrd.auth_service_accounts WHERE id = $1",
         )
         .bind(principal)
@@ -604,19 +606,18 @@ mod pg_tests {
         .await
         .expect("principal reads back");
 
-        assert!(row.get::<Option<String>, _>("card_kind").is_none());
-        assert!(row.get::<Option<Uuid>, _>("card_uid").is_none());
-        assert!(
-            row.get::<Option<serde_json::Value>, _>("card_ref")
-                .is_none()
-        );
-        assert!(row.get::<Option<String>, _>("version").is_none());
+        assert!(row.get::<Option<String>, _>("restriction_kind").is_none());
+        assert!(row.get::<Option<String>, _>("restriction_name").is_none());
     }
 
-    /// An administrative principal may not bind a Card, so the Card-free rule is
+    /// Only a Service account may carry a workload restriction, so the rule is
     /// enforced durably rather than only by the write path that observes it.
+    ///
+    /// # Panics
+    /// Panics when the fixture or tenant connection cannot start, or when
+    /// Postgres accepts a `tenant_admin` row restricted to a Service family.
     #[tokio::test]
-    async fn tenant_admin_principal_cannot_bind_a_card() {
+    async fn tenant_admin_principal_cannot_carry_a_workload_restriction() {
         let Some(_) = database_url() else {
             return;
         };
@@ -625,21 +626,120 @@ mod pg_tests {
 
         let result = sqlx::query(
             "INSERT INTO wyrd.auth_service_accounts
-                 (id, data_tenant_id, principal_kind, card_kind, card_uid, card_ref,
-                  name, version, status, sub_principal_id, act_principal_id)
-             VALUES ($1, $2, 'tenant_admin', 'Service', $3, '{}'::jsonb,
-                     'bogus', '1.0.0', 'active', $4, $4)",
+                 (id, data_tenant_id, principal_kind, restriction_kind, restriction_name,
+                  name, status, sub_principal_id, act_principal_id)
+             VALUES ($1, $2, 'tenant_admin', 'Service', 'bogus', 'bogus', 'active', $3, $3)",
         )
         .bind(Uuid::now_v7())
         .bind(fixture.data_tenant_id().as_uuid())
-        .bind(Uuid::now_v7())
         .bind(Uuid::now_v7())
         .execute(&mut **conn.transaction())
         .await;
 
         assert!(
             result.is_err(),
-            "an administrative principal cannot carry a Card binding"
+            "an administrative principal cannot carry a workload restriction"
+        );
+    }
+
+    /// One live account per family: a second restriction to the same family
+    /// conflicts on insert and on replacement, replacement is atomic and
+    /// idempotent, and releasing or deleting the holder frees the family.
+    ///
+    /// # Panics
+    /// Panics when a duplicate family is accepted, a replacement misreports
+    /// its row, or the family account lookup diverges.
+    #[tokio::test]
+    async fn family_restriction_is_unique_and_replaceable() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let family = WorkloadFamily {
+            kind: WorkloadKind::Service,
+            name: CardName::new("checkout").expect("static name is valid"),
+        };
+        let attribution = Attribution::direct(wyrd_spec::auth::PrincipalId::new(Uuid::now_v7()));
+        let (first, second) = (Uuid::now_v7(), Uuid::now_v7());
+        insert_service_account(
+            &mut conn,
+            first,
+            "service",
+            Some(&family),
+            "checkout-runtime",
+            None,
+            attribution,
+        )
+        .await
+        .expect("first account inserts");
+        insert_service_account(
+            &mut conn,
+            second,
+            "service",
+            None,
+            "checkout-next",
+            None,
+            attribution,
+        )
+        .await
+        .expect("second account inserts");
+        assert_eq!(
+            family_account_id(&mut conn, &family).await.expect("reads"),
+            Some(first)
+        );
+        assert!(
+            set_workload_restriction(&mut conn, first, Some(&family))
+                .await
+                .expect("unchanged value is idempotent")
+        );
+        conn.commit().await.expect("setup commits");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant reopens");
+        let duplicate = set_workload_restriction(&mut conn, second, Some(&family)).await;
+        assert!(
+            matches!(
+                duplicate.map_err(SqlError::from),
+                Err(SqlError::UniqueViolation { .. })
+            ),
+            "a second account cannot claim the family"
+        );
+        drop(conn);
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant reopens");
+        assert!(
+            set_workload_restriction(&mut conn, first, None)
+                .await
+                .expect("holder releases")
+        );
+        assert!(
+            set_workload_restriction(&mut conn, second, Some(&family))
+                .await
+                .expect("successor claims the freed family")
+        );
+        assert_eq!(
+            family_account_id(&mut conn, &family).await.expect("reads"),
+            Some(second)
+        );
+        assert!(
+            delete_service_account(&mut conn, second)
+                .await
+                .expect("successor deletes")
+        );
+        assert_eq!(
+            family_account_id(&mut conn, &family).await.expect("reads"),
+            None
+        );
+        assert!(
+            set_workload_restriction(&mut conn, first, Some(&family))
+                .await
+                .expect("a deleted holder frees the family")
+        );
+        assert!(
+            !set_workload_restriction(&mut conn, second, None)
+                .await
+                .expect("update runs"),
+            "a deleted account cannot be restricted"
         );
     }
 
@@ -807,7 +907,7 @@ mod pg_tests {
             Some(first)
         );
         let rows = sqlx::query(
-            "SELECT name, status, card_kind, card_uid, card_ref, version \
+            "SELECT name, status, restriction_kind, restriction_name \
                FROM wyrd.auth_service_accounts WHERE principal_kind = 'system'",
         )
         .fetch_all(&mut **conn.transaction())
@@ -817,11 +917,9 @@ mod pg_tests {
         let row = &rows[0];
         assert_eq!(row.get::<String, _>("name"), "verification-results-writer");
         assert_eq!(row.get::<String, _>("status"), "active");
-        for column in ["card_kind", "version"] {
+        for column in ["restriction_kind", "restriction_name"] {
             assert_eq!(row.get::<Option<String>, _>(column), None, "{column}");
         }
-        assert_eq!(row.get::<Option<Uuid>, _>("card_uid"), None);
-        assert_eq!(row.get::<Option<serde_json::Value>, _>("card_ref"), None);
         assert!(
             list_service_account_roles(&mut conn, first)
                 .await
@@ -853,7 +951,7 @@ mod pg_tests {
 
     /// Every public path that names a machine principal refuses the SYSTEM
     /// writer as though it did not exist, and the store itself refuses giving
-    /// it a lifecycle, a Card, a second row, or a refresh session.
+    /// it a lifecycle, a workload restriction, a second row, or a refresh session.
     ///
     /// # Panics
     /// Panics when any public lookup resolves the writer, a lifecycle write
@@ -888,19 +986,6 @@ mod pg_tests {
                 .expect("delete runs"),
             "public deletion cannot delete the writer"
         );
-        let verifier = CardRef {
-            kind: CardKind::Verifier,
-            name: CardName::new("verification-results-writer").expect("static name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            uid: None,
-        };
-        assert!(
-            service_account_by_card_ref(&mut conn, "system", &verifier)
-                .await
-                .expect("card lookup succeeds")
-                .is_none(),
-            "workload binding and jwt-bearer resolve no Card-free writer"
-        );
         assert_eq!(
             system_principal_id(&mut conn)
                 .await
@@ -917,10 +1002,9 @@ mod pg_tests {
                   WHERE principal_kind = 'system'",
             ),
             (
-                "a Card binding",
+                "a workload restriction",
                 "UPDATE wyrd.auth_service_accounts \
-                    SET card_kind = 'Verifier', card_uid = gen_random_uuid(), \
-                        card_ref = '{}'::jsonb, version = '1.0.0' \
+                    SET restriction_kind = 'Service', restriction_name = 'writer' \
                   WHERE principal_kind = 'system'",
             ),
             (
@@ -956,6 +1040,9 @@ mod pg_tests {
     /// one SYSTEM writer, and replaying it keeps that same row. The platform
     /// sentinel tenant is not a data tenant and never receives one.
     ///
+    /// The replay runs on a database stopped at that migration, because a
+    /// later migration may reshape the table it writes.
+    ///
     /// # Panics
     /// Panics when the replayed migration fails, leaves the tenant without a
     /// writer, replaces or duplicates it, or provisions the sentinel tenant.
@@ -964,12 +1051,38 @@ mod pg_tests {
         let Some(_) = database_url() else {
             return;
         };
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture
-            .seed_additional_tenant(&format!("system-upgrade-{}", Uuid::now_v7()))
+        let database = UnmigratedDatabase::create()
             .await
-            .expect("pre-existing tenant seeds");
-        let pool = fixture.superuser_pool().expect("migrator pool");
+            .expect("empty database creates");
+        let pool = database.migrator_pool().clone();
+        let run_to_system_migration = || async {
+            let mut conn = pool.acquire().await.expect("migrator connects");
+            for statement in [
+                "CREATE SCHEMA IF NOT EXISTS platform",
+                "CREATE SCHEMA IF NOT EXISTS wyrd",
+                "SET search_path TO wyrd, platform, public",
+            ] {
+                sqlx::query(statement)
+                    .execute(&mut *conn)
+                    .await
+                    .expect("migration bootstrap runs");
+            }
+            sqlx::migrate!("./migrations")
+                .run_to(SYSTEM_PRINCIPAL_MIGRATION_VERSION, &mut *conn)
+                .await
+                .expect("upgrade migration applies");
+            conn.close().await.expect("bootstrap connection closes");
+        };
+        run_to_system_migration().await;
+        let tenant = DataTenantId::new_v7();
+        sqlx::query(
+            "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
+             VALUES ($1, 'system-upgrade', 'system-upgrade', 'active')",
+        )
+        .bind(tenant.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("pre-existing tenant inserts");
         let read_writers = || async {
             sqlx::query_scalar::<_, Uuid>(
                 "SELECT id FROM wyrd.auth_service_accounts \
@@ -980,16 +1093,6 @@ mod pg_tests {
             .await
             .expect("writer rows read")
         };
-        // Seeding provisions a writer as production does; remove it so the
-        // tenant looks like one that predates the upgrade.
-        sqlx::query(
-            "DELETE FROM wyrd.auth_service_accounts \
-              WHERE data_tenant_id = $1 AND principal_kind = 'system'",
-        )
-        .bind(tenant.as_uuid())
-        .execute(&pool)
-        .await
-        .expect("seeded writer removes");
         assert!(
             read_writers().await.is_empty(),
             "the pre-upgrade tenant starts without a writer"
@@ -1002,14 +1105,7 @@ mod pg_tests {
                 .execute(&pool)
                 .await
                 .expect("migration ledger row removes");
-            let mut lease = OperatorPool::from(pool.clone())
-                .migration_lease(MIGRATION_LEASE_WAIT)
-                .await
-                .expect("migration lease acquires");
-            wyrd_sql::migrate(&mut lease)
-                .await
-                .expect("upgrade migration replays");
-            lease.release().await.expect("migration lease releases");
+            run_to_system_migration().await;
             backfilled.push(read_writers().await);
         }
 

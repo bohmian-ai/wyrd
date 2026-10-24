@@ -8,8 +8,8 @@ class WyrdTestServer:
     ``make_binding_due``. Keys that need Roles come from the credential
     fixtures, which stand in for the operator who grants Roles in a
     deployment: ``bootstrap_service``, ``bootstrap_service_in_tenant``, and
-    ``credential_registered_service``. A Card key without added Roles comes
-    from ``wyrd.testing.cli.issue_key``. The remaining members start or address the
+    ``credential_registered_service``. Accounts without added Roles come from
+    ``wyrd.auth.Principals``. The remaining members start or address the
     server.
 
     Starts a real Wyrd server bound to a loopback TCP socket backed by an
@@ -177,25 +177,26 @@ class WyrdTestServer:
         ...
 
     def credential_registered_service(self, card_ref: str, roles: list[str]) -> str:
-        """Issue an API key for the principal a registered Service Card projects.
+        """Issue an API key for a registered Service Card's family runtime account.
 
-        Nothing is minted: registering the Service already created its
-        principal, so the key carries that Service's real card-ref scope and a
-        run may observe the component Cards its spec references.
+        Registration creates no principal, so the account restricted to the
+        Card's family is reused or created here. A client of the key that runs
+        as the registered root may observe the component Cards its spec
+        references.
 
         Args:
             card_ref: the canonical ``Kind/name@version`` identity of a
                 Service already registered in the fixture tenant.
-            roles: built-in role names granted to that principal in addition
+            roles: built-in role names granted to that account in addition
                 to any it already holds.
 
         Returns:
-            An API key for the Service's principal.
+            An API key for the family's runtime account.
 
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` for an unparsable
                 ``card_ref``; ``WYRD_TESTING_500_HARNESS_BOOTSTRAP`` when the
-                Card has no projected principal.
+                Card is not a Service or Agent or a write fails.
 
         """
         ...

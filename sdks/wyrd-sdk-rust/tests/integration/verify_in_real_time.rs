@@ -24,7 +24,7 @@ use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{
     Bifrost, CallProvenance, Citation, ExecutionId, Gateway, GroupId, Locator, RequirementOutcome,
-    SpanRecord, VerificationVerdict, WyrdClient, WyrdError, cli,
+    SpanRecord, VerificationVerdict, WyrdClient, WyrdError,
 };
 use wyrd_spec::auth::{PrincipalKindTag, RevokePrincipalRequest};
 use wyrd_spec::ids::BindingId;
@@ -34,7 +34,7 @@ use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 use crate::action_timeline::service_telemetry;
 use crate::local_development::configure_gateway;
-use crate::support::{Deployment, ancestry, coordinates, declare, declared, fixture, pull};
+use crate::support::{Deployment, ancestry, declare, declared, fixture, pull, runtime_account};
 use crate::verifier_building_blocks::{completion, requirement, tool_call};
 
 /// How long a test waits for a queued execution or a scheduled result.
@@ -145,8 +145,8 @@ impl Assistant {
     /// The hydrated assistant, created with the Service's own client and
     /// started with Bifrost.
     ///
-    /// The Service's key comes from the `issue_key` CLI function with no Role
-    /// granted beyond its default `workload`, so Bifrost startup, every
+    /// The Service's family runtime account holds only `workload`, so
+    /// Bifrost startup, every
     /// verify, and every judge's gateway call run with exactly what a newly
     /// registered Service holds.
     ///
@@ -154,8 +154,7 @@ impl Assistant {
     /// Panics when the key is not issued, the bundle does not load, or
     /// Bifrost does not start.
     pub(crate) async fn state(&self) -> WyrdState {
-        let key = self.deployment.service_key(&self.service).await;
-        let state = self.state_as(self.deployment.client(&key));
+        let state = self.state_as(self.deployment.service_client(&self.service).await);
         state.start_bifrost().await.expect("Bifrost starts");
         state
     }
@@ -176,15 +175,10 @@ impl Assistant {
         declare(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
         let assistant = declare(&cards, "cards/verify_in_real_time/assistant.yaml").await;
         let bundle = pull(&cards, &assistant.root).await;
-        let [kind, name, version] = coordinates(&assistant.root);
-        let key = cli::issue_key(&kind, &name, &version, None, None, Some(admin))
-            .await
-            .expect("the CLI issues the Service key");
-        let state = WyrdState::from_path_with(
-            bundle.path().join("bundle"),
-            self.deployment.client(key.key.expose()),
-        )
-        .expect("bundle loads offline");
+        let (_, key) = runtime_account(&admin, &assistant.root).await;
+        let state =
+            WyrdState::from_path_with(bundle.path().join("bundle"), self.deployment.client(&key))
+                .expect("bundle loads offline");
         state.start_bifrost().await.expect("Bifrost starts");
         (state, bundle)
     }
@@ -227,21 +221,12 @@ impl Assistant {
     /// judgment is requested as.
     ///
     /// # Panics
-    /// Panics when the CLI refuses to issue the Service key.
+    /// Panics when the runtime account cannot be provisioned.
     async fn principal(&self, service: &CardRef) -> String {
-        let [kind, name, version] = coordinates(service);
-        cli::issue_key(
-            &kind,
-            &name,
-            &version,
-            None,
-            None,
-            Some(self.deployment.admin()),
-        )
-        .await
-        .expect("the CLI issues the Service key")
-        .principal_id
-        .to_string()
+        runtime_account(&self.deployment.admin(), service)
+            .await
+            .0
+            .to_string()
     }
 
     /// Publish every captured row, then read each `vala.gateway.calls` row's
@@ -299,10 +284,10 @@ impl Assistant {
     /// # Panics
     /// Panics when no token mints or the judgment is refused.
     async fn verify_over_http(&self, traceparent: &str) -> String {
-        let key = self.deployment.service_key(&self.service).await;
         let token = self
             .deployment
-            .client(&key)
+            .service_client(&self.service)
+            .await
             .access_token()
             .await
             .expect("access token mints");
@@ -843,8 +828,11 @@ async fn submitted_answer_is_judged_in_the_background_and_resumes_by_id() {
         panic!("Run evidence queues an execution");
     };
     let waited = execution.wait(WAIT).await.expect("the execution settles");
-    let key = assistant.deployment.service_key(&assistant.service).await;
-    let resumed = Execution::connect_with(*execution.id(), &assistant.deployment.client(&key))
+    let service = assistant
+        .deployment
+        .service_client(&assistant.service)
+        .await;
+    let resumed = Execution::connect_with(*execution.id(), &service)
         .await
         .expect("the handle rebuilds from its ID")
         .wait(WAIT)
@@ -938,10 +926,9 @@ async fn unfitted_baseline_is_skipped_on_schedule() {
     let cards = assistant.deployment.cards().await;
     let unfitted = declare(&cards, "cards/verify_in_real_time/unfitted-assistant.yaml").await;
     let bundle = pull(&cards, &unfitted.root).await;
-    let key = assistant.deployment.service_key(&unfitted.root).await;
     let state = WyrdState::from_path_with(
         bundle.path().join("bundle"),
-        assistant.deployment.client(&key),
+        assistant.deployment.service_client(&unfitted.root).await,
     )
     .expect("bundle loads");
     state.start_bifrost().await.expect("Bifrost starts");
@@ -1069,7 +1056,8 @@ async fn caller_without_the_verifier_grant_is_refused() {
 /// The retired verification contracts are unknown at the server: a principal
 /// whose stored role still grants `evals:run` or `evals:invoke` is refused by
 /// issuance before anything runs — the token endpoint's ordinary RFC 6749
-/// `server_error` for a role that no longer decodes — and the retired Eval
+/// `server_error` carrying `WYRD_PERMISSION_500_ROLE_CORRUPT` for a role that
+/// no longer decodes — and the retired Eval
 /// tables are listed nowhere and refused for describe, read, and write exactly
 /// as a never-existing namespace is, while the current verification table
 /// still answers.
@@ -1097,7 +1085,11 @@ async fn retired_verification_contracts_are_refused() {
             .verify("answer-check", json!("yes"))
             .await
             .expect_err("a stale evals grant is no grant");
-        assert_eq!(refused.code(), "WYRD_SPEC_500_INTERNAL", "{action}");
+        assert_eq!(
+            refused.code(),
+            "WYRD_PERMISSION_500_ROLE_CORRUPT",
+            "{action}"
+        );
     }
 
     let bifrost = Bifrost::connect_with(&assistant.deployment.admin(), BifrostOptions::default())
@@ -1164,11 +1156,14 @@ async fn exact_verifier_grant_verifies_only_that_verifier() {
     assistant.deployment.shutdown().await;
 }
 
-/// Another tenant's administrator cannot verify this tenant's assistant with
-/// either its assertion or its Agent-check Verifier.
+/// Another tenant's administrator cannot use this tenant's assistant: the
+/// state's root is foreign to that administrator's tenant, so it is refused
+/// exactly as an unknown root is, both when Bifrost starts and when either the
+/// assertion or the Agent-check Verifier is asked to judge.
 ///
 /// # Panics
-/// Panics when the verify succeeds or is refused with another code.
+/// Panics when Bifrost starts or a verify succeeds, or either is refused with
+/// another code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn another_tenant_cannot_verify_the_assistant() {
@@ -1178,7 +1173,11 @@ async fn another_tenant_cannot_verify_the_assistant() {
         .other_tenant_admin("other-tenant")
         .await;
     let state = assistant.state_as(assistant.deployment.client(&foreign));
-    state.start_bifrost().await.expect("Bifrost starts");
+    let refused = state
+        .start_bifrost()
+        .await
+        .expect_err("a foreign root starts no Bifrost");
+    assert_eq!(refused.code(), "WYRD_AUTH_401_WORKLOAD_UID_REFUSED");
     let run = state.run_for_card("agent").expect("agent run opens");
 
     for verifier in ["answer-check", "answer-judged"] {
@@ -1189,7 +1188,7 @@ async fn another_tenant_cannot_verify_the_assistant() {
             .expect_err("another tenant cannot verify");
         assert_eq!(
             refused.code(),
-            "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+            "WYRD_AUTH_401_WORKLOAD_UID_REFUSED",
             "{verifier}"
         );
     }
@@ -1203,8 +1202,8 @@ struct Grouped {
     receipt: DeclarationReceipt,
     /// The hydrated bundle the Service state and any other caller load.
     bundle: TempDir,
-    /// The Service's API key.
-    key: String,
+    /// The Service's family runtime account client, run as the Service.
+    client: WyrdClient,
     /// The Service's state, started with Bifrost.
     state: WyrdState,
     /// The Service's `group_end` binding.
@@ -1223,10 +1222,9 @@ impl Assistant {
         let cards = self.deployment.cards().await;
         let receipt = declare(&cards, relative).await;
         let bundle = pull(&cards, &receipt.root).await;
-        let key = self.deployment.service_key(&receipt.root).await;
-        let state =
-            WyrdState::from_path_with(bundle.path().join("bundle"), self.deployment.client(&key))
-                .expect("bundle loads");
+        let client = self.deployment.service_client(&receipt.root).await;
+        let state = WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
+            .expect("bundle loads");
         state.start_bifrost().await.expect("Bifrost starts");
         let ids = cards
             .get(CardSelector::exact(receipt.root.clone()))
@@ -1251,7 +1249,7 @@ impl Assistant {
         Grouped {
             receipt,
             bundle,
-            key,
+            client,
             state,
             binding: binding.expect("the Service binds a group_end Verifier"),
         }
@@ -1287,33 +1285,43 @@ impl Grouped {
         idempotency_key: &str,
         body: &serde_json::Value,
     ) -> ExecutionId {
-        let token = deployment
-            .client(&self.key)
-            .access_token()
-            .await
-            .expect("access token mints");
-        let response = reqwest::Client::new()
-            .post(format!(
-                "{}/v1/verification/enqueue",
-                deployment
-                    .server()
-                    .base_url()
-                    .expect("bound server has a URL")
-            ))
-            .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
-            .header("idempotency-key", idempotency_key)
-            .json(body)
-            .send()
-            .await
-            .expect("the server answers");
-        let status = response.status().as_u16();
-        let accepted: serde_json::Value = response.json().await.expect("the body is JSON");
-        assert_eq!(status, 202, "{accepted}");
-        accepted["execution_id"]
-            .as_str()
-            .and_then(|id| id.parse().ok())
-            .expect("the response names its execution")
+        enqueue_as(&self.client, deployment, idempotency_key, body).await
     }
+}
+
+/// Enqueue `body` over plain HTTP as `client`, with no root it did not sign,
+/// under `idempotency_key`, and return the accepted execution.
+///
+/// # Panics
+/// Panics when no token mints or the submission is not accepted.
+async fn enqueue_as(
+    client: &WyrdClient,
+    deployment: &Deployment,
+    idempotency_key: &str,
+    body: &serde_json::Value,
+) -> ExecutionId {
+    let token = client.access_token().await.expect("access token mints");
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/verification/enqueue",
+            deployment
+                .server()
+                .base_url()
+                .expect("bound server has a URL")
+        ))
+        .header("x-wyrd-access-token", format!("Bearer {}", token.expose()))
+        .header("idempotency-key", idempotency_key)
+        .json(body)
+        .send()
+        .await
+        .expect("the server answers");
+    let status = response.status().as_u16();
+    let accepted: serde_json::Value = response.json().await.expect("the body is JSON");
+    assert_eq!(status, 202, "{accepted}");
+    accepted["execution_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("the response names its execution")
 }
 
 /// A support conversation populated over three Runs of the Rust SDK, then
@@ -1321,7 +1329,7 @@ impl Grouped {
 /// HTTP enqueue, all as the Service under one `group_id`, is judged once its `after` period expires: the group execution
 /// reads back its group and owner and judges the Service's six turns in call
 /// order. The replay counts once; an ungrouped key conflict joins no group,
-/// and a same-group verify the administrator made with no owning Service and
+/// and a same-group enqueue the administrator made with no owning Service and
 /// a turn from a principal without `verifier:run` on the source Verifier are
 /// excluded, and the binding status names the execution.
 /// A standalone or inline `group_end` Trigger longer than one year is refused
@@ -1412,13 +1420,19 @@ async fn grouped_support_resumes() {
         .wait(WAIT)
         .await
         .expect("the enqueued turn is judged");
-    WyrdState::from_path_with(support.bundle.path().join("bundle"), deployment.admin())
-        .expect("bundle loads")
-        .run_for_card("agent")
-        .expect("agent run opens")
-        .observe()
-        .group_id(group.clone())
-        .verify("turn-check", json!({"answer": ""}))
+    // A WyrdState would carry its Service root for the administrator too, so
+    // the ownerless turn is the administrator's rootless enqueue.
+    let ownerless = enqueue_as(
+        &deployment.admin(),
+        deployment,
+        "support-turn-ownerless",
+        &body(&json!({"answer": ""})),
+    )
+    .await;
+    Execution::connect_with(ownerless, &deployment.admin())
+        .await
+        .expect("the execution handle connects")
+        .wait(WAIT)
         .await
         .expect("an ownerless turn is judged");
     let unauthorized = deployment
@@ -1552,18 +1566,15 @@ async fn grouped_support_resumes() {
     // latest execution is an errored group execution naming the group and
     // the reason, with no snapshot or result.
     let lapsed = GroupId::new("conv-2").expect("group id");
-    WyrdState::from_path_with(
-        support.bundle.path().join("bundle"),
-        deployment.client(&support.key),
-    )
-    .expect("bundle loads")
-    .run_for_card("agent")
-    .expect("agent run opens")
-    .observe()
-    .group_id(lapsed.clone())
-    .verify("turn-check", turns[0].clone())
-    .await
-    .expect("the turn is judged");
+    WyrdState::from_path_with(support.bundle.path().join("bundle"), support.client.clone())
+        .expect("bundle loads")
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .group_id(lapsed.clone())
+        .verify("turn-check", turns[0].clone())
+        .await
+        .expect("the turn is judged");
     let owner = assistant
         .principal(&support.receipt.root)
         .await
@@ -1954,7 +1965,7 @@ async fn grouped_coding_uses_declared_sources() {
         .await
         .expect("the Service may read spans live");
     let group = GroupId::new("session-1").expect("group id");
-    let (dispatch, provider) = service_telemetry(&deployment.client(&coding.key));
+    let (dispatch, provider) = service_telemetry(&coding.client);
     let session = tracing::dispatcher::with_default(&dispatch, || {
         let session = tracing::info_span!("session", otel.name = "coding-session");
         tracing::info_span!(parent: &session, "edit", otel.name = "edit-file").in_scope(|| ());
@@ -2407,7 +2418,7 @@ async fn grouped_sampled_frames_use_visible_outcomes() {
     let other_bundle = pull(&cards, &other.root).await;
     let other_state = WyrdState::from_path_with(
         other_bundle.path().join("bundle"),
-        deployment.client(&deployment.service_key(&other.root).await),
+        deployment.service_client(&other.root).await,
     )
     .expect("bundle loads");
     other_state.start_bifrost().await.expect("Bifrost starts");
@@ -2782,16 +2793,10 @@ async fn grouped_conversations_coexist_with_drift() {
         .expect("handle connects");
     let b_support = declare(&b_cards, "cards/verify_in_real_time/support.yaml").await;
     let b_bundle = pull(&b_cards, &b_support.root).await;
-    let [kind, name, version] = coordinates(&b_support.root);
-    let b_key = cli::issue_key(&kind, &name, &version, None, None, Some(tenant_b))
-        .await
-        .expect("the CLI issues tenant B's Service key")
-        .key;
-    let b_state = WyrdState::from_path_with(
-        b_bundle.path().join("bundle"),
-        deployment.client(b_key.expose()),
-    )
-    .expect("bundle loads");
+    let (_, b_key) = runtime_account(&tenant_b, &b_support.root).await;
+    let b_state =
+        WyrdState::from_path_with(b_bundle.path().join("bundle"), deployment.client(&b_key))
+            .expect("bundle loads");
     b_state.start_bifrost().await.expect("Bifrost starts");
     b_state
         .run_for_card("agent")

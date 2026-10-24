@@ -739,6 +739,7 @@ fn target(spec: &wyrd_spec::card::verifier::VerifierSpec) -> crate::verify::Targ
             .expect("subject UID"),
         run_id: wyrd_spec::vala::ids::RunId::new(),
         group_id: None,
+        deployment_environment: None,
     }
 }
 

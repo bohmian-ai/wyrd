@@ -1,12 +1,12 @@
 ---
 spec: SPEC-service-identity-and-telemetry
-spec_revision: 12
+spec_revision: 16
 status: approved
 ---
 
 # Supplemental telemetry schemas and column production
 
-This is a normative supplement to [specification revision 12](../spec.md), not
+This is a normative supplement to [specification revision 16](../spec.md), not
 an independently approved schema. It fixes the proposed persisted fields and
 their production semantics for `bifrost.traces.spans`, `bifrost.logs.records`, and
 `bifrost.metrics.points`. It does not define private builders or module layout.
@@ -63,9 +63,9 @@ on every descendant row. Native producers supply the same logical values.
 | `scope_attributes` | Existing | V | Canonical typed S attributes; empty object when absent. |
 | `scope_dropped_attributes_count` | Existing | i64 | S dropped count, or zero; checked widening. |
 | `scope_schema_url` | Existing | str | Enclosing scope wrapper's schema URL. |
-| `service_name` | Existing | str? | R attribute `service.name`, string promotion. |
-| `service_version` | Existing | str? | R attribute `service.version`, string promotion. |
-| `deployment_environment` | Existing | str? | First correctly typed string from `deployment.environment.name`, then `deployment.environment`. |
+| `service_name` | Existing | str? | Validated Service root name when owned; otherwise typed R `service.name`. |
+| `service_version` | Existing | str? | Validated Service root version when owned; otherwise typed R `service.version`. |
+| `deployment_environment` | Existing | str? | Accepted request environment when present; otherwise first typed string from `deployment.environment.name`, then `deployment.environment`. |
 | — | **New `service_namespace`** | str? | R attribute `service.namespace`, string promotion; never a Card identity field. |
 | — | **New `service_instance_id`** | str? | R attribute `service.instance.id`, string promotion. |
 | — | **New `process_pid`** | i64? | R attribute `process.pid`, signed-integer promotion. |
@@ -74,13 +74,16 @@ on every descendant row. Native producers supply the same logical values.
 | — | **New `telemetry_sdk_version`** | str? | R attribute `telemetry.sdk.version`, string promotion. |
 | `run_id` | Existing | str? | Final record-level `wyrd.run_id`; validate existing RunId text grammar. |
 | `card_uid` | **Renamed `subject_card_uid`** | str? | Final record-level `wyrd.card_uid`; validate grammar and authorize exact observation-target UID. The fresh baseline uses the subject name and unchanged value/type semantics. |
-| — | **New `workload_card_uid`** | str? | Server-stamped validated exact Service/Agent execution root; not an attribute promotion. |
+| — | **New `workload_card_uid`** | str? | Server-stamped validated exact Service execution root; not an attribute promotion. |
+| — | **New `subject_kind`** | str? | Server-derived canonical CardKind for the validated subject UID. |
+| — | **New `subject_name`** | str? | Same subject UID's registered name. |
+| — | **New `subject_version`** | str? | Same subject UID's registered version. |
 | `sub_principal_id` | Existing | str | Server-stamped authenticated account subject. |
 | `act_principal_id` | Existing | str | Server-stamped authenticated account actor; equals subject for a direct publisher. |
 | `wyrd_request_id` | Existing | str | Existing propagated/minted request correlator. |
 | `wyrd_ingested_at` | Existing | Tus | Existing PostgreSQL admission instant, once per admitted batch. |
 
-There are **20 current shared columns and 27 proposed shared columns**. These
+There are **20 current shared columns and 30 proposed shared columns**. The
 seven-field managed envelope is shared by all system and dynamic tables as
 specified in [table storage and correlation](table-storage-and-correlation.md).
 The additional resource/convenience fields remain specific to these signals;
@@ -131,13 +134,13 @@ primitive/presence values retain existing validation and absent-value behavior.
 | — | **New `is_exception`** | bool | True if P has any event named exactly `exception`, independent of status. |
 
 Current complete schema: **52 columns**. Proposed complete schema:
-**62 columns**. The shared Card field is renamed; no raw value, precision, or nested list is removed.
+**65 columns**. The shared Card field is renamed; no raw value, precision, or nested list is removed.
 
 ## `bifrost.logs.records`
 
 Add these fields to the shared schema. `L` means the OTLP LogRecord. Its trace
 and span IDs remain the original OTel correlation; do not manufacture an
-independent span ID or parent relationship to resemble Logfire's own logs.
+independent span ID or parent relationship to resemble another backend.
 
 | Current field | Proposed field | Type | Production |
 | --- | --- | --- | --- |
@@ -159,7 +162,7 @@ independent span ID or parent relationship to resemble Logfire's own logs.
 | — | **New `is_exception`** | bool | True if any of the three promoted exception strings is non-null, including empty strings. |
 
 Current complete schema: **35 columns**. Proposed complete schema:
-**43 columns**. Error severity alone does not imply an exception.
+**46 columns**. Error severity alone does not imply an exception.
 
 ## `bifrost.metrics.points`
 
@@ -200,7 +203,7 @@ column replaces integer counters.
 | `exemplars` | Existing | list<Exemplar> | Original point exemplars, empty when absent. |
 
 Current complete schema: **48 columns**. Proposed complete schema:
-**55 columns**. Existing metric-kind validation still controls which nullable
+**58 columns**. Existing metric-kind validation still controls which nullable
 fields may be present. Summary data, temporality, exemplars, and absent versus
 zero remain distinct.
 
@@ -268,8 +271,11 @@ partial structures are refused under the existing validation contract.
    string; integer promotion accepts only an integer. Missing or wrong type
    produces SQL null without discarding the original attribute. No numeric-text
    parsing, stringification, URL parsing fallback, or process/environment lookup
-   occurs in the server projection.
-3. Environment preserves the existing correctly typed stable-key-first,
+   occurs in ordinary attribute projection. Canonical owned Service/subject
+   descriptors and accepted environment use the validated context rules below,
+   rather than arbitrary raw resource labels.
+3. Without accepted request environment, owned and unowned telemetry preserve
+   correctly typed stable-key-first,
    older-key-second fallback. A wrongly typed stable value may fall back to a
    correctly typed older value; both remain in the source Variant. This
    accepts OTel semantic-convention evolution, not a Wyrd space alias.
@@ -294,7 +300,8 @@ retain their current record-level sources and grammar. In particular, the
 canonical OTLP correlation attribute remains `wyrd.card_uid`; this column
 rename does not introduce a second attribute spelling. Public native Arrow
 schemas and SQL use only `subject_card_uid` in the fresh baseline.
-Absent attributes yield null. A present wrong type or malformed value rejects
+For unconfigured generic telemetry, absent attributes yield null. Configured
+application records without a component subject use the Service UID. A present wrong type or malformed value rejects
 the record. A present Card UID must be an authorized observation-target UID.
 It never becomes the root merely because that is the only supplied Card.
 
@@ -320,11 +327,55 @@ root's graph even when a privileged User could separately write unowned
 evidence about that subject. This is truthful attribution, not a blanket
 restriction on the User's operation grants.
 
-Wyrd SDKs default service resource name/version from a loaded root and accept
-explicit OTel resource configuration. Preserve actual supplied resource values;
-do not silently rewrite them to make ownership appear consistent. Canonical
-Service membership is always decided by the verified owner UID. Optional
-`service_namespace` is not a replacement for removed Card space.
+`state.configure()` establishes Service name/version from the loaded bundle and
+environment from explicit configuration, then `WYRD_DEPLOYMENT_ENVIRONMENT`,
+then null. Explicit Service name/version must match the loaded Service; context
+freezes on first successful configure or implicit client/Run/writer/telemetry use;
+every later configure conflicts, even after shutdown. SDKs inject it on
+spans, logs, metrics and native observations, including records outside a Run.
+Within a component Run, inject the component subject; otherwise use the Service.
+Multiple states never share mutable context or buffered authority accidentally.
+
+The server derives canonical Service and subject descriptors from validated UIDs.
+Owned promoted Service columns cannot be overridden by resource values; retain
+all actual supplied values unchanged in `resource_attributes`. For unowned
+telemetry, existing typed Service/environment resource promotions still apply.
+Malformed correlation refuses; optional namespace remains descriptive and never
+participates in membership. Keep the six common descriptive columns once per
+signal as required by the storage supplement.
+
+Telemetry supports two setup paths:
+
+- **Wyrd-managed telemetry.** Configure the loaded state once, then call
+  `state.start_telemetry()` (or its language-native equivalent). Wyrd supplies
+  `service.name`, `service.version` and optional `deployment.environment.name`
+  from the frozen state context to its managed OpenTelemetry setup, and exports
+  with the state's validated workload context and existing authentication.
+- **Application-managed telemetry.** The application owns its OpenTelemetry
+  providers, resources and lifecycle. It supplies `service.name`,
+  `service.version` and optional `deployment.environment.name` on its resources,
+  and sends spans, logs and metrics through standard OTLP exporters to Wyrd's
+  supported endpoints with supported authentication. This path does not require
+  WyrdState, `state.start_telemetry()`, or an exporter accepting a state. Wyrd
+  does not copy private state configuration into an application-owned provider.
+
+Both paths use the same ingest validation and table projection. An application
+may supply the existing workload/subject/Run context where attribution is
+wanted; the server validates UIDs, permissions and graph membership. Resource
+names and versions never establish Card ownership, and owned promoted identity
+columns remain canonical for validated UIDs. When an accepted request supplies
+an environment, retain that value as before; without that context, promote the
+resource environment with the existing typed stable-key-first fallback, including
+on owned telemetry. Preserve raw resource attributes and leave absent environment
+null. Environment remains descriptive and grants no permission.
+
+Automatic startup must not silently reuse a provider bound to another state or
+replace an application-owned provider. Refuse incompatible startup with existing
+`WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`; its remediation is to keep the existing
+application-managed setup and use the second path. Wyrd never replaces or flushes
+that provider. Native state/Run contexts may coexist without multiple ambient
+defaults. No new exporter input, public state client accessor, exporter-specific
+identity setting or provider pipeline is required.
 
 ### Ingestion surfaces and trust
 
@@ -362,11 +413,12 @@ or accounts. Authorized tenant overrides follow the shared validation rules.
 Raw nested attributes remain queryable through existing Variant operators,
 shredding, and nested-field pruning.
 
-Service-family queries resolve registered root versions through Cards and
-bind their UIDs into SQL, for example `workload_card_uid IN ($1, $2)`. An exact
-release uses one UID. A general OTel query can independently filter
-`service_name`, `service_namespace`, `service_version`, and environment.
-Do not imply that Oracle joins directly to the Postgres account registry.
+Service-family queries directly filter `service_name` plus non-null validated
+`workload_card_uid`; exact releases add `service_version` or use the UID. Subject
+families use kind/name and optional version; exact subject uses its UID. Combine
+environment and Run/account predicates independently. Registered Service views
+exclude unowned resource-labelled rows. Resource namespace/raw attributes remain
+available for general OTel exploration; Oracle needs no Postgres registry join.
 
 ## Fresh baseline and acceptance detail
 
@@ -392,22 +444,20 @@ resolved tenant layout. No measured performance gain is claimed.
 
 ## External grounding and deliberate differences
 
-- [Logfire records columns](https://pydantic.dev/docs/logfire/reference/sql/#records-columns)
-  inform service/resource, URL, and exception conveniences. Wyrd keeps existing
-  field names except the explicit subject rename, and retains typed nested data;
-  it does not reproduce Logfire-specific
-  message/tags/level functions, pending spans, internal fields, or omission of
-  OTel SpanKind.
-- [Logfire metrics schema](https://pydantic.dev/docs/logfire/observe/explore/#metrics-schema)
-  informs queryable resource dimensions while Wyrd retains exact integers,
-  Summary, and Exemplar fields. Its scalar convenience is not a requirement
-  to convert integer counters to floating point.
 - [OTel service](https://opentelemetry.io/docs/specs/semconv/resource/service/),
   [environment](https://opentelemetry.io/docs/specs/semconv/resource/deployment-environment/),
   and [metric data model](https://opentelemetry.io/docs/specs/otel/metrics/data-model/)
   define signal meaning, not Wyrd's physical partitions or authorization.
 - [Iceberg partitioning](https://iceberg.apache.org/docs/latest/partitioning/)
   permits physical evolution independently of ordinary SQL predicates.
+
+## Stock gateway client closure
+
+The [approved SDK/gateway examples and header contract](auth-system.md#stock-provider-sdk-context-and-approved-examples)
+apply to both gateway credential modes. TASK-009 owns state-bound adapters;
+TASK-003 validates exact UIDs and projects the same shared context onto gateway
+calls, preserving it through buffering, streaming, retry and outbox delivery.
+No readable-name headers, new columns or layout changes accompany revision 15.
 
 ## Revision history
 
@@ -425,3 +475,6 @@ resolved tenant layout. No measured performance gain is claimed.
 | 10 | draft | Aligns packet revision with trace-readiness findings and agreed performance-validation approach; schemas and layouts are unchanged. |
 | 11 | draft | Aligns with agreed hourly signal defaults and absent-trace retry policy; stored signal schemas and Bloom sets are unchanged. |
 | 12 | approved | Aligns the packet revision with closed table/trace contracts; signal columns, extraction and layout defaults are unchanged. |
+| 14 | approved | Canonical owned Service/configured environment projections and three subject descriptors, yielding 30 shared and 65/46/58 full signal columns; shared defaults owned by storage supplement. |
+| 15 | approved | Links state-bound stock-client header/gateway closure; shared columns, counts and all physical defaults remain revision 14 values. |
+| 16 | approved | Specifies Wyrd-managed and application-managed standard OTLP setup; environment resource fallback applies without accepted request context. Existing schema counts and physical defaults remain unchanged. |

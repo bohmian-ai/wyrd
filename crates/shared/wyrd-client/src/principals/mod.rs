@@ -21,6 +21,7 @@ pub use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
     CredentialMetadata, IssuedCredential, PrincipalId, PrincipalKindTag, PrincipalPage,
     PrincipalQuery, PrincipalRoles, PrincipalStatus, PrincipalSummary, RevokePrincipalRequest,
-    RoleAssignment, RoleAssignmentChange, RoleSource,
+    RoleAssignment, RoleAssignmentChange, RoleSource, WorkloadFamily, WorkloadKind,
+    WorkloadRestriction,
 };
 pub use wyrd_spec::error::WyrdError;

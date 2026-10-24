@@ -243,7 +243,7 @@ impl Delivery {
             .await
             .expect("binding projects");
         self.seed
-            .activate(principal)
+            .activate(principal, &owner)
             .await
             .expect("owner activates");
         self.seed
@@ -312,7 +312,9 @@ impl Delivery {
             )
             .await
             .expect("binding projects");
-        seed.activate(principal).await.expect("owner activates");
+        seed.activate(principal, &owner)
+            .await
+            .expect("owner activates");
         seed.make_binding_due(binding)
             .await
             .expect("binding is due");

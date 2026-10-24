@@ -3359,14 +3359,13 @@ pub(crate) async fn ingest_unclaimed(
         .table_registration(&binding.table_ref, tenant)
         .await
         .expect("fixture table registration");
-    let principal = wyrd_runtime::principal::Principal {
-        id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: wyrd_runtime::principal::PrincipalKind::User,
-        tenant_id: tenant,
-        roles: Vec::new(),
-        effective_permissions: wyrd_runtime::PermissionSet::new(),
-        credential_id: None,
-    };
+    let principal = wyrd_runtime::principal::Principal::new(
+        wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+        wyrd_runtime::principal::PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        wyrd_runtime::PermissionSet::new(),
+    );
     scribe
         .ingest_native_for_test(NativeIngressTestFrame {
             principal,

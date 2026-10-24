@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
@@ -28,7 +29,7 @@ use wyrd_spec::registry::{
     DeclarationReceipt, ListCardsRequest, ListCardsResponse,
 };
 
-use wyrd_client::state::{DeclareOptions, TelemetryFlushFailure, WyrdState};
+use wyrd_client::state::{ConfigureOptions, DeclareOptions, TelemetryFlushFailure, WyrdState};
 
 use crate::bifrost::PyTableConfig;
 use crate::client::PyWyrdClient;
@@ -81,7 +82,13 @@ pub struct PyWyrdState {
     /// concurrent call on this state waits for the first instead of losing
     /// the global install to it. Traversal and readers use `telemetry` alone.
     telemetry_setup: Mutex<()>,
+    /// This state's process-unique identity, carried by its Runs so its
+    /// `http_auth` reads only its own innermost active Run.
+    token: u64,
 }
+
+/// The next [`PyWyrdState::token`]; never reused within a process.
+static NEXT_STATE_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 #[pymethods]
 impl PyWyrdState {
@@ -277,6 +284,64 @@ impl PyWyrdState {
         .map_err(WyrdPyError::from)
     }
 
+    /// Fix this state's Service release and deployment environment before
+    /// its first use; local, with no network IO.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WYRD_SDK_409_STATE_CONFIG_FROZEN` once configuration is fixed
+    /// by an earlier configure or first use, even after shutdown, and
+    /// `WYRD_CLIENT_400_CONFIG_INVALID` for an empty field or a name or
+    /// version that does not match the loaded Service.
+    #[pyo3(signature = (*, service_name=None, service_version=None, deployment_environment=None))]
+    fn configure(
+        &self,
+        service_name: Option<String>,
+        service_version: Option<String>,
+        deployment_environment: Option<String>,
+    ) -> CardPyResult<()> {
+        self.inner
+            .configure(ConfigureOptions {
+                service_name,
+                service_version,
+                deployment_environment,
+            })
+            .map_err(WyrdPyError::from)
+    }
+
+    /// The configured deployment environment correlation tag, or `None` when
+    /// none is set; reading it fixes an unconfigured state's defaults.
+    #[getter]
+    fn deployment_environment(&self) -> Option<&str> {
+        self.inner.deployment_environment()
+    }
+
+    /// Return an `httpx.Auth` / `httpx2.Auth` that authenticates every
+    /// request to Wyrd as this state's client, in this state's context.
+    ///
+    /// Each request carries the configured Service as its workload, the
+    /// configured deployment environment, and this state's innermost active
+    /// Run's subject and `run_id`, else the Service with no Run. Reading it
+    /// fixes an unconfigured state's defaults and resolves its client without
+    /// network IO. The flows live in `wyrd.client._http_auth.HttpAuth`.
+    ///
+    /// # Errors
+    /// Raises the credential error when the state's client cannot resolve,
+    /// and `ImportError` naming the `gateway` extra when `httpx` or `httpx2`
+    /// is not installed.
+    #[getter]
+    fn http_auth<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client =
+            PyWyrdClient::from_native(self.inner.client().map_err(WyrdPyError::from)?.clone());
+        let root = self.inner.root_ref().uid.as_ref().map(CardUid::as_str);
+        PyModule::import(py, "wyrd.client._http_auth")?
+            .getattr("HttpAuth")?
+            .call1((
+                client,
+                (self.token, root, self.inner.deployment_environment()),
+            ))
+    }
+
     /// Open one invocation over this state whose first view observes `alias`.
     ///
     /// Local only: no network IO, no server-side Run resource, and no Verifier
@@ -293,7 +358,7 @@ impl PyWyrdState {
             Some(alias) => self.inner.run_for_card(alias).map_err(WyrdPyError::from)?,
             None => self.inner.run(),
         };
-        Ok(PyRun::new(run))
+        Ok(PyRun::new(run, self.token))
     }
 
     /// Export completed spans from the provider `start_telemetry` installed,
@@ -543,6 +608,7 @@ impl PyWyrdState {
             data: hydrated.data,
             telemetry: OnceLock::new(),
             telemetry_setup: Mutex::new(()),
+            token: NEXT_STATE_TOKEN.fetch_add(1, Ordering::Relaxed),
         })
     }
 

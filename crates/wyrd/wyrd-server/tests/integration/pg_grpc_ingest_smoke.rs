@@ -39,7 +39,6 @@ use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, build_peer_grpc, serve
 use wyrd_server::verification::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
-use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::TenantTableBinding;
 use wyrd_testing::WyrdTestServer;
@@ -87,8 +86,6 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> Stri
         id: PrincipalId::new(uuid::Uuid::now_v7()),
         kind: PrincipalKindTag::User,
         tenant_id: tenant,
-        card_ref: None,
-        card_ref_scope: CardRefScope::default(),
     };
     state
         .auth
@@ -107,6 +104,8 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> Stri
                     .filter(|builtin| roles.contains(&builtin.name))
                     .flat_map(|builtin| builtin.permissions.iter().cloned())
                     .collect(),
+                card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
+                workload_uid: None,
                 credential_id: None,
                 act: None,
                 audience: wyrd_spec::auth::TokenAudience::Wyrd,
@@ -1126,6 +1125,8 @@ fn mint_record_writer_jwt(state: &AppState, principal: TokenPrincipalRef) -> Str
                 permissions: [wyrd_runtime::Permission::bifrost_record_write()]
                     .into_iter()
                     .collect(),
+                card_access: wyrd_spec::auth::CardAccess::AnyRegistered,
+                workload_uid: None,
                 credential_id: None,
                 act: None,
                 audience: wyrd_spec::auth::TokenAudience::Wyrd,
@@ -1158,8 +1159,6 @@ async fn public_result_writes_are_refused_over_grpc() {
             id: PrincipalId::new(Uuid::now_v7()),
             kind: PrincipalKindTag::Service,
             tenant_id: harness.tenant,
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
         },
     );
     let writers = [
@@ -1255,10 +1254,11 @@ async fn system_read_authority_reads_only_the_named_table() {
     .expect("observation table UID reads");
     let principal = &authority.context().principal;
     assert_eq!(principal.id.as_uuid(), harness.system);
-    assert!(matches!(
-        &principal.kind,
-        PrincipalKind::System { card_ref_scope } if card_ref_scope.is_empty()
-    ));
+    assert!(matches!(&principal.kind, PrincipalKind::System));
+    assert_eq!(
+        principal.card_access,
+        wyrd_spec::auth::CardAccess::Scoped { cards: Vec::new() }
+    );
     assert_eq!(
         principal.effective_permissions,
         PermissionSet::from_iter([wyrd_runtime::Permission {

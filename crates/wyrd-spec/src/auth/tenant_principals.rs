@@ -3,13 +3,13 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::{PrincipalId, PrincipalKindTag, SecretBearer};
-use crate::reference::CardRef;
+use crate::auth::{PrincipalId, PrincipalKindTag, SecretBearer, WorkloadRestriction};
 
-/// Request to create a tenant-scoped machine principal.
+/// Request to create a stable tenant Service account.
 ///
-/// The principal binds no Card: it is tenant automation — a CI runner, a
-/// deployment agent — rather than a deployed workload with an emit scope.
+/// The account outlives every release: it is never a Card version. The exact
+/// Service version a request runs as is selected per token or
+/// request as workload context, within `workload_restriction`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -22,6 +22,11 @@ pub struct CreateServicePrincipalRequest {
     /// Optional description.
     #[serde(default)]
     pub description: Option<String>,
+    /// Workload-family limit; omitted means unrestricted. A family restriction
+    /// is that family's unique scheduled runtime account and additionally
+    /// requires tenant-administrative wildcard permission.
+    #[serde(default)]
+    pub workload_restriction: Option<WorkloadRestriction>,
 }
 
 /// A created machine principal and its first credential.
@@ -94,6 +99,19 @@ pub struct ListCredentialsArgs {
     pub principal_id: PrincipalId,
 }
 
+/// Arguments replacing one Service account's workload restriction.
+///
+/// The MCP projection of `PUT /v1/principals/{principal_id}/workload-restriction`,
+/// whose HTTP body is the bare [`WorkloadRestriction`].
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetWorkloadRestrictionArgs {
+    /// Service account whose restriction to replace.
+    pub principal_id: PrincipalId,
+    /// The complete replacement restriction.
+    pub workload_restriction: WorkloadRestriction,
+}
+
 /// Arguments naming one credential and the principal that owns it.
 ///
 /// The principal is named as well as the credential so a credential id alone
@@ -125,7 +143,7 @@ pub struct CredentialRevoked {
 ///
 /// A user's assignments are owned per source: federated login replaces only
 /// `idp` rows on every sign-in, and a tenant administrator grants and revokes
-/// only `direct` rows. Service and Agent assignments are always `direct`.
+/// only `direct` rows. Service assignments are always `direct`.
 #[derive(
     Debug,
     Clone,
@@ -180,8 +198,7 @@ pub struct RoleAssignment {
 pub struct PrincipalRoles {
     /// Principal the assignments belong to.
     pub principal_id: PrincipalId,
-    /// Principal kind the server resolved from the id: `user`, `service`, or
-    /// `agent`.
+    /// Principal kind the server resolved from the id: `user` or `service`.
     pub kind: PrincipalKindTag,
     /// Assignments ordered by Role name, then source.
     pub roles: Vec<RoleAssignment>,
@@ -227,19 +244,20 @@ pub enum PrincipalStatus {
 pub struct PrincipalSummary {
     /// Durable principal id.
     pub principal_id: PrincipalId,
-    /// `user`, `service`, or `agent`.
+    /// `user` or `service`.
     pub kind: PrincipalKindTag,
     /// Lifecycle status.
     pub status: PrincipalStatus,
     /// Email, for users.
     #[serde(default)]
     pub email: Option<String>,
-    /// Principal name, for services and agents.
+    /// Account name, for services.
     #[serde(default)]
     pub name: Option<String>,
-    /// Bound Card, for Card-bound services and agents.
+    /// The account's workload restriction: explicit for a Service, null for a
+    /// User.
     #[serde(default)]
-    pub card_ref: Option<CardRef>,
+    pub workload_restriction: Option<WorkloadRestriction>,
 }
 
 /// Response of `GET /v1/principals`.
@@ -260,13 +278,13 @@ pub struct PrincipalPage {
 #[cfg_attr(feature = "server", into_params(parameter_in = Query))]
 #[serde(deny_unknown_fields)]
 pub struct PrincipalQuery {
-    /// `user`, `service`, or `agent`; omitted lists all three.
+    /// `user` or `service`; omitted lists both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<PrincipalKindTag>,
     /// Exact email; matches users only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    /// Exact principal name; matches services and agents only.
+    /// Exact account name; matches services only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Page size between 1 and 200; default 100.

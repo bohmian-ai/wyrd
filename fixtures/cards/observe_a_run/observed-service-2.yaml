@@ -1,0 +1,18 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: observed-service
+  version: 2.0.0
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./observed-agent.yaml
+    - alias: model
+      ref:
+        kind: Model
+        name: observed-model
+        version: 1.0.0
+      verified_by:
+        - verifier: ./observed-drift.yaml
+          runs_on: {kind: schedule, cron: "0 0 * * *"}

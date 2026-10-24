@@ -7,13 +7,13 @@
 //! misconfigured. Writes bind `data_tenant_id` from the [`TenantConn`].
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use serde_json::Value;
+use sqlx::types::Uuid;
 
 use crate::TenantConn;
 use crate::row_types::auth::WorkloadBindingRow;
 
 const WORKLOAD_BINDING_BY_SUBJECT_SQL: &str = r"
-    SELECT data_tenant_id, issuer_url, subject, audience, card_ref,
+    SELECT data_tenant_id, issuer_url, subject, audience, principal_id, workload_uid,
            created_at, updated_at
       FROM wyrd.auth_workload_bindings
      WHERE data_tenant_id = wyrd.current_tenant()
@@ -26,22 +26,29 @@ const WORKLOAD_BINDING_BY_SUBJECT_SQL: &str = r"
 
 const UPSERT_WORKLOAD_BINDING_SQL: &str = r"
     INSERT INTO wyrd.auth_workload_bindings (
-        data_tenant_id, issuer_url, subject, audience, card_ref
-    ) VALUES ($1, $2, $3, $4, $5)
+        data_tenant_id, issuer_url, subject, audience, principal_id, workload_uid
+    )
+    SELECT $1, $2, $3, $4, id, $6
+      FROM wyrd.auth_service_accounts
+     WHERE id = $5 AND principal_kind = 'service' AND status = 'active'
     ON CONFLICT (data_tenant_id, issuer_url, subject) DO UPDATE SET
         audience = EXCLUDED.audience,
-        card_ref = EXCLUDED.card_ref,
+        principal_id = EXCLUDED.principal_id,
+        workload_uid = EXCLUDED.workload_uid,
         updated_at = now()
 ";
 
 const INSERT_WORKLOAD_BINDING_SQL: &str = r"
     INSERT INTO wyrd.auth_workload_bindings (
-        data_tenant_id, issuer_url, subject, audience, card_ref
-    ) VALUES ($1, $2, $3, $4, $5)
+        data_tenant_id, issuer_url, subject, audience, principal_id, workload_uid
+    )
+    SELECT $1, $2, $3, $4, id, $6
+      FROM wyrd.auth_service_accounts
+     WHERE id = $5 AND principal_kind = 'service' AND status = 'active'
 ";
 
 const WORKLOAD_BINDING_BY_KEY_SQL: &str = r"
-    SELECT data_tenant_id, issuer_url, subject, audience, card_ref,
+    SELECT data_tenant_id, issuer_url, subject, audience, principal_id, workload_uid,
            created_at, updated_at
       FROM wyrd.auth_workload_bindings
      WHERE data_tenant_id = wyrd.current_tenant()
@@ -50,7 +57,7 @@ const WORKLOAD_BINDING_BY_KEY_SQL: &str = r"
 ";
 
 const WORKLOAD_BINDINGS_FOR_TENANT_SQL: &str = r"
-    SELECT data_tenant_id, issuer_url, subject, audience, card_ref,
+    SELECT data_tenant_id, issuer_url, subject, audience, principal_id, workload_uid,
            created_at, updated_at
       FROM wyrd.auth_workload_bindings
      WHERE data_tenant_id = wyrd.current_tenant()
@@ -75,7 +82,6 @@ const DELETE_WORKLOAD_BINDINGS_FOR_ISSUER_SQL: &str = r"
 /// Owned column values for an upsert into `wyrd.auth_workload_bindings`.
 ///
 /// `data_tenant_id` is bound from the [`TenantConn`], never from this struct.
-/// `card_ref` is a pre-encoded structured JSONB `serde_json::Value`.
 #[derive(Debug, Clone)]
 pub struct WorkloadBindingWrite {
     /// OIDC issuer URL (FK composite with `data_tenant_id`).
@@ -84,8 +90,11 @@ pub struct WorkloadBindingWrite {
     pub subject: String,
     /// Optional audience override; `None` acts as a wildcard fallback.
     pub audience: Option<String>,
-    /// Structured Card reference serialized to JSONB.
-    pub card_ref: Value,
+    /// Stable Service account the subject authenticates as.
+    pub principal_id: Uuid,
+    /// Optional pinned default root, used when a jwt-bearer request names
+    /// none.
+    pub workload_uid: Option<Uuid>,
 }
 
 /// Look up a workload binding for the given `(issuer, subject)` pair.
@@ -135,9 +144,11 @@ pub async fn workload_bindings_for_tenant(
 /// Insert or update a workload binding for the current tenant.
 ///
 /// `data_tenant_id` is taken from the bound [`TenantConn`]. On
-/// `(data_tenant_id, issuer_url, subject)` conflict the audience and card
-/// reference are overwritten so re-seeding from config is idempotent. The
+/// `(data_tenant_id, issuer_url, subject)` conflict the audience, account,
+/// and default root are overwritten so re-seeding from config is idempotent. The
 /// referenced trusted issuer row must already exist (FK `ON DELETE RESTRICT`).
+/// Returns `Ok(false)` and writes nothing when `principal_id` is not an active
+/// Service account, so federation never maps to an administrator or SYSTEM.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the upsert (including FK
@@ -145,16 +156,17 @@ pub async fn workload_bindings_for_tenant(
 pub async fn upsert_workload_binding(
     conn: &mut TenantConn<'_>,
     binding: &WorkloadBindingWrite,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     sqlx::query(UPSERT_WORKLOAD_BINDING_SQL)
         .bind(conn.data_tenant_id().as_uuid())
         .bind(&binding.issuer_url)
         .bind(&binding.subject)
         .bind(&binding.audience)
-        .bind(&binding.card_ref)
+        .bind(binding.principal_id)
+        .bind(binding.workload_uid)
         .execute(&mut **conn.transaction())
         .await
-        .map(|_| ())
+        .map(|result| result.rows_affected() > 0)
 }
 
 /// Insert a workload binding for the current tenant, failing on conflict.
@@ -163,7 +175,9 @@ pub async fn upsert_workload_binding(
 /// `(data_tenant_id, issuer_url, subject)` raises a unique-violation (`23505`)
 /// so the admin CRUD path can map it to a `409` conflict. The referenced
 /// trusted issuer must already exist or Postgres raises a foreign-key violation
-/// (`23503`). `data_tenant_id` is bound from the [`TenantConn`].
+/// (`23503`). `data_tenant_id` is bound from the [`TenantConn`]. Returns
+/// `Ok(false)` and writes nothing when `principal_id` is not an active Service
+/// account.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert (unique violation on a
@@ -171,16 +185,17 @@ pub async fn upsert_workload_binding(
 pub async fn insert_workload_binding(
     conn: &mut TenantConn<'_>,
     binding: &WorkloadBindingWrite,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     sqlx::query(INSERT_WORKLOAD_BINDING_SQL)
         .bind(conn.data_tenant_id().as_uuid())
         .bind(&binding.issuer_url)
         .bind(&binding.subject)
         .bind(&binding.audience)
-        .bind(&binding.card_ref)
+        .bind(binding.principal_id)
+        .bind(binding.workload_uid)
         .execute(&mut **conn.transaction())
         .await
-        .map(|_| ())
+        .map(|result| result.rows_affected() > 0)
 }
 
 /// Fetch one workload binding by its `(issuer, subject)` key for the tenant.
@@ -280,6 +295,13 @@ mod tests {
         assert!(!DELETE_WORKLOAD_BINDINGS_FOR_ISSUER_SQL.contains("subject"));
     }
 
+    /// The binding upsert conflicts on the tenant, issuer, and subject key and
+    /// overwrites the principal, workload UID, and audience of the stored row.
+    ///
+    /// # Panics
+    /// Panics when the upsert does not target `wyrd.auth_workload_bindings`,
+    /// does not conflict on `(data_tenant_id, issuer_url, subject)`, or does not
+    /// take `principal_id`, `workload_uid`, and `audience` from `EXCLUDED`.
     #[test]
     fn upsert_targets_composite_key_and_overwrites_columns() {
         assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("INSERT INTO wyrd.auth_workload_bindings"));
@@ -287,7 +309,8 @@ mod tests {
             UPSERT_WORKLOAD_BINDING_SQL
                 .contains("ON CONFLICT (data_tenant_id, issuer_url, subject)")
         );
-        assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("card_ref = EXCLUDED.card_ref"));
+        assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("principal_id = EXCLUDED.principal_id"));
+        assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("workload_uid = EXCLUDED.workload_uid"));
         assert!(UPSERT_WORKLOAD_BINDING_SQL.contains("audience = EXCLUDED.audience"));
     }
 

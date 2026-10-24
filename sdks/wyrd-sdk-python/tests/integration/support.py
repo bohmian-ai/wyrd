@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
 from collections.abc import Sequence
@@ -12,12 +13,13 @@ from typing import Any
 import httpx
 from pydantic import BaseModel
 from wyrd import verify
+from wyrd.auth import Principals
 from wyrd.bifrost import Bifrost, SpanRecord
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
 from wyrd.model import ModelInterface
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer, cli
+from wyrd.testing import WyrdTestServer
 
 FIXTURES = Path(__file__).resolve().parents[4] / "fixtures"
 """The repository-root fixture corpus shared by the Rust, Python, and TypeScript journeys."""
@@ -115,13 +117,22 @@ class StandInModel(ModelInterface):
         self.model = lambda value: value
 
 
-def client_of(server: WyrdTestServer, credential: str | None = None) -> WyrdClient:
-    """A client of ``server`` acting as ``credential``, by default its administrator."""
+def client_of(
+    server: WyrdTestServer, credential: str | None = None, workload_uid: str | None = None
+) -> WyrdClient:
+    """A client of ``server`` acting as ``credential``, by default its administrator, run as ``workload_uid`` when given."""
     return WyrdClient(
         server_url=server.base_url,
         credential=credential or server.api_key,
         grpc_url=server.grpc_url,
+        workload_uid=workload_uid,
     )
+
+
+def rooted(credential: str, service: str) -> WyrdClient:
+    """A client acting as ``credential``, run as the one registered ``service`` release."""
+    [root] = Cards().list(kind="Service", name=service).refs
+    return WyrdClient(credential=credential, workload_uid=str(root.uid))
 
 
 def timeline(server: WyrdTestServer, trace_id: str) -> list[SpanRecord]:
@@ -153,9 +164,32 @@ def pull(cards: Cards, service: str, destination: Path) -> Path:
     return cards.pull(ref, destination).destination
 
 
+def runtime_account(name: str, client: WyrdClient | None = None) -> tuple[str, str]:
+    """The ``name`` Service family's runtime account in ``client``'s tenant and one new key.
+
+    Registration creates no principal, so the account restricted to the family
+    is created holding only ``workload`` on first use and issued one more key
+    afterwards. Returns ``(principal_id, key)``.
+    """
+    principals = Principals(client)
+    account = f"{name}-runtime"
+    existing = principals.list(kind="service", name=account)["principals"]
+    if existing:
+        principal_id = existing[0]["principal_id"]
+        return principal_id, principals.issue_credential(principal_id)["credential"]
+    created = principals.create_service_principal(
+        {
+            "name": account,
+            "roles": ["workload"],
+            "workload_restriction": {"mode": "family", "kind": "Service", "name": name},
+        }
+    )
+    return created["principal_id"], created["credential"]
+
+
 def service_key(service: str, client: WyrdClient | None = None) -> str:
-    """Issue the registered ``service``'s own key as ``client``; it holds only the default Card Role."""
-    return cli.issue_key(kind="Service", name=service, version="1.0.0", client=client).key
+    """A key for the registered ``service``'s runtime account as ``client``; it holds only ``workload``."""
+    return runtime_account(service, client=client)[1]
 
 
 def hydrated(bundle: Path, client: WyrdClient | None = None) -> WyrdState:
@@ -268,3 +302,17 @@ class Watch:
     binding_id: str
     hooks: Receiver
     verifier: str
+
+
+def stale_bundle(bundle: Path, cards: Cards, tmp_path: Path) -> Path:
+    """A copy of ``bundle`` whose ``model`` names a registered Card outside the Service's graph."""
+    model = hydrated(bundle).card_ref("model").uid
+    foreign = declare(cards, "cards/observe_a_run/configured-service.yaml")[
+        "configured-service"
+    ].uid
+    assert model is not None and foreign is not None
+    stale = tmp_path / "stale"
+    shutil.copytree(bundle, stale)
+    for path in stale.rglob("*.yaml"):
+        path.write_text(path.read_text().replace(model, foreign))
+    return stale

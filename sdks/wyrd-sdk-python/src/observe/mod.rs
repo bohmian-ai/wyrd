@@ -195,12 +195,15 @@ fn inputs(
 pub struct PyRun {
     /// The native view; cloning it is cloning the view, not the writer.
     inner: Run,
+    /// The token of the state this view was opened on, so only that state's
+    /// `http_auth` adopts it.
+    state: u64,
 }
 
 impl PyRun {
-    /// Wrap one native view for Python.
-    pub(crate) fn new(inner: Run) -> Self {
-        Self { inner }
+    /// Wrap one native view of the state identified by `state` for Python.
+    pub(crate) fn new(inner: Run, state: u64) -> Self {
+        Self { inner, state }
     }
 }
 
@@ -227,6 +230,7 @@ impl PyRun {
     fn for_card(&self, alias: &str) -> WyrdPyResult<Self> {
         Ok(Self::new(
             self.inner.for_card(alias).map_err(WyrdPyError::from)?,
+            self.state,
         ))
     }
 
@@ -249,6 +253,7 @@ impl PyRun {
                 (
                     run.inner.subject_uid().as_str(),
                     run.inner.run_id().as_str(),
+                    run.state,
                 ),
             )
         });
@@ -280,6 +285,7 @@ impl PyRun {
                 (
                     run.inner.subject_uid().as_str(),
                     run.inner.run_id().as_str(),
+                    run.state,
                 ),
             )
         });

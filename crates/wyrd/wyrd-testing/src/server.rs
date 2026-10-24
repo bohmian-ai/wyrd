@@ -73,24 +73,25 @@ use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
-use wyrd_sql::queries::auth::service_account_by_card_ref;
 use wyrd_telemetry::TelemetryGuard;
 use wyrd_types::variant::variant_storage_type;
 
 use crate::bifrost::ForgeObjectStoreControl;
 use crate::bifrost::object_reads::ObjectReadProbe;
 
-use wyrd_spec::auth::{Attribution, RoleSource, TokenAudience, TokenResponse};
+use wyrd_spec::auth::{
+    Attribution, RoleSource, TokenAudience, TokenResponse, WorkloadFamily, WorkloadKind,
+};
 use wyrd_spec::card::verifier::{DriftBaselineState, DriftBaselineStatus};
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{BindingId, CardName, CardUid};
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    grant_role_to_service_account, grant_role_to_user, insert_api_key, insert_service_account,
-    insert_user, provision_system_principal, revoke_role_from_service_account,
-    revoke_role_from_user, role_by_name, tenant_admin_principal_id, trusted_issuer_by_url,
-    workload_binding_by_subject,
+    TrustedIssuerWrite, family_account_id, grant_role_to_service_account, grant_role_to_user,
+    insert_api_key, insert_service_account, insert_trusted_issuer, insert_user,
+    provision_system_principal, revoke_role_from_service_account, revoke_role_from_user,
+    role_by_name, tenant_admin_principal_id, trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -3035,8 +3036,7 @@ impl WyrdTestServer {
         name: &str,
         roles: &[&str],
     ) -> Result<Bootstrap, WyrdTestServerError> {
-        self.bootstrap_machine(name, roles, CardKind::Service, "service")
-            .await
+        self.bootstrap_machine(name, roles, CardKind::Service).await
     }
 
     /// Bootstrap a Service principal under an explicit tenant.
@@ -3055,55 +3055,41 @@ impl WyrdTestServer {
         name: &str,
         roles: &[&str],
     ) -> Result<Bootstrap, WyrdTestServerError> {
-        self.bootstrap_machine_in_tenant(tenant_id, name, roles, CardKind::Service, "service")
+        self.bootstrap_machine_in_tenant(tenant_id, name, roles, CardKind::Service)
             .await
     }
 
-    /// Issue an API key for the principal a registered Service Card already has.
+    /// Issue an API key for a registered Service Card's family runtime account.
     ///
-    /// [`Self::bootstrap_service`] invents a minimal fixture Card and a fresh
-    /// principal for it, so its minted card-ref scope is that bare root and
-    /// nothing else. An observation journey needs the opposite: the writer must
-    /// be the identity registration itself projected for the Service, because
-    /// the scope walk expands that registered spec into the component Cards the
-    /// run scopes its sibling views against. Registering a Service or Agent Card
-    /// already upserts that service account, so nothing is minted here — the row
-    /// is looked up by its card binding, granted the requested roles, and handed
-    /// one API key. The supplied `card_ref` must already be registered in the
-    /// fixture tenant.
+    /// [`Self::bootstrap_service`] mints an unrestricted account over a fresh
+    /// fixture Card. An observation or scheduling journey instead needs the
+    /// family's unique runtime account: registration creates no principal, so
+    /// the account restricted to the Card's family is reused or created here,
+    /// granted the requested roles, and handed one API key. The returned
+    /// [`Bootstrap::Machine`] carries `card_ref`, whose uid the caller selects
+    /// as the request root. The supplied `card_ref` must already be registered
+    /// in the fixture tenant.
     ///
     /// # Errors
-    /// Returns an error when the Card has no projected principal, or when SQL
+    /// Returns an error when the Card is not a Service, or when SQL
     /// writes or API-key hashing fail.
     pub async fn credential_registered_service(
         &self,
         card_ref: &CardRef,
         roles: &[&str],
     ) -> Result<Bootstrap, WyrdTestServerError> {
-        // The projection stores the binding with its uid; the lookup is JSONB
-        // containment, so a uid-less probe selects it either way.
-        let binding = CardRef {
-            uid: None,
-            ..card_ref.clone()
-        };
         let tenant_id = self.data_tenant_id();
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let api_key = WyrdApiKey::generate(tenant_id);
         let key_hash = wyrd_auth_issue::hash_secret(api_key.secret.expose_secret());
 
         let mut conn = self.tenant_conn_for(tenant_id).await?;
-        let principal = service_account_by_card_ref(&mut conn, "service", &binding)
-            .await
-            .map_err(sql)?
-            .ok_or_else(|| {
-                WyrdTestServerError::Auth(format!(
-                    "no service principal is projected for {binding}; register the Card first"
-                ))
-            })?;
+        let principal =
+            family_account(&mut conn, &card_ref.kind, &card_ref.name, creator_id).await?;
         insert_api_key(
             &mut conn,
             Uuid::now_v7(),
-            principal.id,
+            principal,
             &api_key.prefix,
             &key_hash,
             wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
@@ -3112,18 +3098,12 @@ impl WyrdTestServer {
         .await
         .map_err(sql)?;
         for role in roles {
-            grant_role(
-                &mut conn,
-                principal.id,
-                PrincipalTable::ServiceAccount,
-                role,
-            )
-            .await?;
+            grant_role(&mut conn, principal, PrincipalTable::ServiceAccount, role).await?;
         }
         conn.commit().await.map_err(sql)?;
 
         Ok(Bootstrap::Machine {
-            id: PrincipalId::new(principal.id),
+            id: PrincipalId::new(principal),
             api_key: api_key.secret,
             card_ref: card_ref.clone(),
         })
@@ -3226,6 +3206,38 @@ impl WyrdTestServer {
         Ok(row.and_then(|row| row.client_secret_enc))
     }
 
+    /// Trust `issuer_url` as a public workload issuer in the fixture tenant.
+    ///
+    /// Writes through the production trusted-issuer insert without OIDC
+    /// discovery, so a journey can administer workload bindings against an
+    /// issuer that need not be reachable. Its JWKS URI is `<issuer>/jwks`, its
+    /// audience `wyrd-api`, and it maps `sub` as the subject.
+    ///
+    /// # Errors
+    /// Returns an error when the issuer already exists or the write fails.
+    pub async fn seed_workload_issuer(&self, issuer_url: &str) -> Result<(), WyrdTestServerError> {
+        let mut conn = self.tenant_conn().await?;
+        insert_trusted_issuer(
+            &mut conn,
+            &TrustedIssuerWrite {
+                issuer_url: issuer_url.to_owned(),
+                jwks_uri: format!("{issuer_url}/jwks"),
+                expected_audience: "wyrd-api".to_owned(),
+                client_id: "wyrd-client".to_owned(),
+                client_auth: "Public".to_owned(),
+                claim_mapping: serde_json::json!({ "subject": "sub" }),
+                group_role_map: serde_json::json!({}),
+                default_roles: serde_json::json!([]),
+                principal_kind: "Workload".to_owned(),
+                jwks_ttl_secs: 3600,
+                client_secret_enc: None,
+            },
+        )
+        .await
+        .map_err(sql)?;
+        conn.commit().await.map_err(sql)
+    }
+
     /// Report whether a workload binding is visible under a tenant's RLS scope.
     ///
     /// Opens a [`TenantConn`] bound to `tenant_id` and runs the production
@@ -3300,19 +3312,6 @@ impl WyrdTestServer {
         .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
         Ok(api_key.secret)
-    }
-
-    /// Bootstrap an Agent principal through fixture SQL.
-    ///
-    /// # Errors
-    /// Returns an error when SQL writes or API-key hashing fail.
-    pub async fn bootstrap_agent(
-        &self,
-        name: &str,
-        roles: &[&str],
-    ) -> Result<Bootstrap, WyrdTestServerError> {
-        self.bootstrap_machine(name, roles, CardKind::Agent, "agent")
-            .await
     }
 
     /// Seed one non-builtin role carrying exactly the requested permissions.
@@ -3499,6 +3498,51 @@ impl WyrdTestServer {
         .await
     }
 
+    /// Exchange an API key through the real `/auth/token` route for a token
+    /// bound to the exact workload root `root`.
+    ///
+    /// # Errors
+    /// Returns an error when the route refuses the key or the root, or response
+    /// parsing fails.
+    pub async fn exchange_api_key_for_workload(
+        &self,
+        key: &SecretString,
+        root: &CardUid,
+    ) -> Result<String, WyrdTestServerError> {
+        self.token(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            ("subject_token", key.expose_secret()),
+            ("subject_token_type", "urn:wyrd:oauth:token-type:api_key"),
+            ("workload_uid", root.as_str()),
+        ])
+        .await
+    }
+
+    /// Exchange a bootstrapped machine's API key for a token rooted at its own
+    /// fixture Card, the context a delegating actor must carry.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Auth`] when `machine` is a User or its
+    /// Card carries no uid, and the errors of
+    /// [`Self::exchange_api_key_for_workload`].
+    pub async fn exchange_rooted(
+        &self,
+        machine: &Bootstrap,
+    ) -> Result<String, WyrdTestServerError> {
+        let (Some(key), Some(root)) = (
+            machine.api_key(),
+            machine.card_ref().and_then(|card| card.uid.as_ref()),
+        ) else {
+            return Err(WyrdTestServerError::Auth(
+                "a rooted exchange needs a machine with a registered fixture Card".to_owned(),
+            ));
+        };
+        self.exchange_api_key_for_workload(key, root).await
+    }
+
     /// Exchange `subject_jwt` and `actor_jwt` through `/auth/token` for a
     /// token letting the actor act on the subject's behalf at `audience`.
     ///
@@ -3553,20 +3597,16 @@ impl WyrdTestServer {
         Ok(token.access_token.expose().to_owned())
     }
 
-    /// Seed a Service/Agent principal under the client-expressible `card_ref`.
+    /// Register `card_ref` and seed its family's runtime Service account.
     ///
-    /// Workload bindings resolve to a server-owned `CardRef` with `uid = None`
-    /// (boot's `build_workload_bindings`), and the jwt-bearer exchange looks the
-    /// principal up by JSONB containment, so the stored ref must not carry a
-    /// `uid` the binding cannot express. The role-bearing `bootstrap_service`
-    /// helper mints a random `uid` onto the principal itself, so containment
-    /// against a uid-less binding can never select it. This registers the bound
-    /// Card under its own `uid` and seeds the principal under the binding's
-    /// uid-less ref, so a config-driven workload journey resolves to a real
-    /// account and its token mint can walk the registered card scope.
+    /// Registration creates no principal, so a scheduling or federation
+    /// journey needs the family's unique runtime account explicitly: the
+    /// account restricted to `card_ref`'s kind and name is reused or created
+    /// and granted `roles`. The Card is registered under `card_ref`'s uid, or a
+    /// fresh one when it has none.
     ///
     /// # Errors
-    /// Returns an error when the card kind is not Service/Agent, or SQL fails.
+    /// Returns an error when the card kind is not Service, or SQL fails.
     pub async fn seed_card_principal(
         &self,
         card_ref: &CardRef,
@@ -3576,15 +3616,14 @@ impl WyrdTestServer {
             .await
     }
 
-    /// Seed a Service/Agent principal under an explicit tenant.
+    /// Register `card_ref` and seed its family runtime account in `tenant_id`.
     ///
-    /// The tenant-scoped analogue of [`Self::seed_card_principal`]: the same
-    /// uid-less `card_ref` seed, written through the supplied tenant's
-    /// [`TenantConn`]. Multi-tenant isolation tests use this to seed a bound
-    /// workload only in tenant A.
+    /// The tenant-scoped analogue of [`Self::seed_card_principal`].
+    /// Multi-tenant isolation tests use this to seed a bound workload only in
+    /// tenant A.
     ///
     /// # Errors
-    /// Returns an error when the card kind is not Service/Agent, or SQL fails.
+    /// Returns an error when the card kind is not Service, or SQL fails.
     ///
     /// # Panics
     ///
@@ -3595,39 +3634,18 @@ impl WyrdTestServer {
         card_ref: &CardRef,
         roles: &[&str],
     ) -> Result<PrincipalId, WyrdTestServerError> {
-        let principal_kind = match &card_ref.kind {
-            CardKind::Service => "service",
-            CardKind::Agent => "agent",
-            other => {
-                return Err(WyrdTestServerError::Unsupported(format!(
-                    "seed_card_principal requires a Service or Agent card_ref, got {other:?}"
-                )));
-            }
-        };
-        let principal_id = Uuid::now_v7();
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let mut conn = self.tenant_conn_for(tenant_id).await?;
-        // The registry row needs its own uid, while the principal keeps the
-        // binding's uid-less `card_ref` so JSONB containment selects it.
         let registered = CardRef {
-            uid: Some(
+            uid: Some(card_ref.uid.clone().unwrap_or_else(|| {
                 CardUid::new(Uuid::now_v7().to_string())
-                    .expect("generated UUIDv7 is a valid CardUid"),
-            ),
+                    .expect("generated UUIDv7 is a valid CardUid")
+            })),
             ..card_ref.clone()
         };
         seed_machine_card(&mut conn, &registered, creator_id).await?;
-        insert_service_account(
-            &mut conn,
-            principal_id,
-            principal_kind,
-            Some(card_ref),
-            card_ref.name.as_str(),
-            None,
-            wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
-        )
-        .await
-        .map_err(sql)?;
+        let principal_id =
+            family_account(&mut conn, &card_ref.kind, &card_ref.name, creator_id).await?;
         for role in roles {
             grant_role(
                 &mut conn,
@@ -3641,26 +3659,29 @@ impl WyrdTestServer {
         Ok(PrincipalId::new(principal_id))
     }
 
+    /// Insert an unrestricted machine account, a fixture Card of `card_kind`
+    /// it may select as its root, its roles, and one API key in the server's
+    /// default tenant.
+    ///
+    /// The default-tenant analogue of [`Self::bootstrap_machine_in_tenant`].
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError`] when the tenant's fixture administrator
+    /// cannot be ensured, the Card reference is not valid for the kind, or any
+    /// of the inserts fail.
     async fn bootstrap_machine(
         &self,
         name: &str,
         roles: &[&str],
         card_kind: CardKind,
-        principal_kind: &'static str,
     ) -> Result<Bootstrap, WyrdTestServerError> {
-        self.bootstrap_machine_in_tenant(
-            self.data_tenant_id(),
-            name,
-            roles,
-            card_kind,
-            principal_kind,
-        )
-        .await
+        self.bootstrap_machine_in_tenant(self.data_tenant_id(), name, roles, card_kind)
+            .await
     }
 
-    /// Insert a machine principal with its Card binding, roles, and one API
-    /// key in the named tenant, returning the material a journey needs to act
-    /// as it.
+    /// Insert an unrestricted machine account, a fixture Card it may select as
+    /// its root, its roles, and one API key in the named tenant, returning the
+    /// material a journey needs to act as it.
     ///
     /// # Errors
     /// Returns [`WyrdTestServerError`] when the tenant's fixture administrator
@@ -3672,10 +3693,9 @@ impl WyrdTestServer {
         name: &str,
         roles: &[&str],
         card_kind: CardKind,
-        principal_kind: &'static str,
     ) -> Result<Bootstrap, WyrdTestServerError> {
         let card_ref = card_ref(card_kind, name)?;
-        self.mint_machine_principal(tenant_id, name, roles, card_ref, principal_kind)
+        self.mint_machine_principal(tenant_id, name, roles, card_ref)
             .await
     }
 
@@ -3694,7 +3714,6 @@ impl WyrdTestServer {
         name: &str,
         roles: &[&str],
         card_ref: CardRef,
-        principal_kind: &'static str,
     ) -> Result<Bootstrap, WyrdTestServerError> {
         let principal_id = Uuid::now_v7();
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
@@ -3706,8 +3725,8 @@ impl WyrdTestServer {
         insert_service_account(
             &mut conn,
             principal_id,
-            principal_kind,
-            Some(&card_ref),
+            "service",
+            None,
             name,
             None,
             wyrd_spec::auth::Attribution::direct(PrincipalId::new(creator_id)),
@@ -5504,6 +5523,47 @@ fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, WyrdTestServerError> 
             CardUid::new(Uuid::now_v7().to_string()).expect("generated UUIDv7 is a valid CardUid"),
         ),
     })
+}
+
+/// The active Service account restricted to the `kind`/`name` family,
+/// created with that restriction on first use.
+///
+/// Registration creates no principal, so this is how fixtures stand up the
+/// family's unique scheduled runtime account.
+///
+/// # Errors
+/// Returns an error when `kind` is not Service, or SQL fails.
+pub(crate) async fn family_account(
+    conn: &mut TenantConn<'_>,
+    kind: &CardKind,
+    name: &CardName,
+    creator_id: Uuid,
+) -> Result<Uuid, WyrdTestServerError> {
+    let workload_kind = WorkloadKind::from_card_kind(kind).ok_or_else(|| {
+        WyrdTestServerError::Unsupported(format!(
+            "a family account requires a Service card, got {kind:?}"
+        ))
+    })?;
+    let family = WorkloadFamily {
+        kind: workload_kind,
+        name: name.clone(),
+    };
+    if let Some(existing) = family_account_id(conn, &family).await.map_err(sql)? {
+        return Ok(existing);
+    }
+    let id = Uuid::now_v7();
+    insert_service_account(
+        conn,
+        id,
+        "service",
+        Some(&family),
+        &format!("{name}-runtime"),
+        None,
+        Attribution::direct(PrincipalId::new(creator_id)),
+    )
+    .await
+    .map_err(sql)?;
+    Ok(id)
 }
 
 /// Seed the backing Card row for a fixture-created Service or Agent principal.

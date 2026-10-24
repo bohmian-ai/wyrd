@@ -1703,3 +1703,210 @@ async fn block_clock_records_every_block_once() {
     assert_eq!(intervals.len(), 2, "one action and one check");
     assert!(intervals.iter().all(|(start, end)| start <= end));
 }
+
+/// A trace source counting fetches per trace: `landed` returns its spans,
+/// every other trace has not landed yet, and each fetch yields once so
+/// concurrent checks really overlap the read.
+#[derive(Default)]
+struct CountingTraces {
+    /// Spans of every landed trace.
+    landed: HashMap<TraceId, Arc<Vec<SpanRecord>>>,
+    /// Fetches made per trace.
+    fetches: Mutex<HashMap<TraceId, usize>>,
+}
+
+impl CountingTraces {
+    /// Fetches of `trace` so far.
+    ///
+    /// # Panics
+    /// Panics when a fetch panicked while holding the count lock.
+    fn fetches(&self, trace: TraceId) -> usize {
+        self.fetches
+            .lock()
+            .expect("fetches")
+            .get(&trace)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+#[async_trait]
+impl TraceSource for CountingTraces {
+    /// Count the fetch, yield, then return the landed spans.
+    ///
+    /// # Errors
+    /// Returns [`TraceUnavailable::NotYetLanded`] for a trace not landed.
+    ///
+    /// # Panics
+    /// Panics when another fetch panicked while holding the count lock.
+    async fn fetch(
+        &self,
+        trace_id: TraceId,
+        _deadline: Duration,
+    ) -> Result<Arc<Vec<SpanRecord>>, TraceUnavailable> {
+        *self
+            .fetches
+            .lock()
+            .expect("fetches")
+            .entry(trace_id)
+            .or_default() += 1;
+        tokio::task::yield_now().await;
+        self.landed
+            .get(&trace_id)
+            .cloned()
+            .ok_or(TraceUnavailable::NotYetLanded { trace_id })
+    }
+}
+
+/// A Verifier over trace slots `a`, `b` (naming the same trace as `a`), and
+/// `late`: two concurrent checks on `a`, one on `b`, and one on `late`.
+fn shared_trace_verifier() -> Arc<VerifierSpec> {
+    let check = |slot: &str, selector: &str, expected: Value| json!({"kind": "trace", "on": format!("inputs.{slot}"), "span_selector": selector, "operator": "equals", "expected": expected});
+    verifier(json!({
+        "inputs": {"a": {"type": "trace"}, "b": {"type": "trace"}, "late": {"type": "trace"}},
+        "requirements": [
+            {"id": "first", "statement": "Retrieves first", "check": check("a", "$.spans[0].name", json!("retrieve"))},
+            {"id": "second", "statement": "Ranks second", "check": check("a", "$.spans[1].name", json!("rank"))},
+            {"id": "same", "statement": "Same trace", "check": check("b", "$.spans[1].name", json!("rank"))},
+            {"id": "late", "statement": "Late trace", "check": check("late", "$.spans[0].name", json!("retrieve"))}
+        ]
+    }))
+}
+
+/// Trace evidence of `shared_trace_verifier` over `landed` and `late`.
+///
+/// # Panics
+/// Panics when a slot name is invalid.
+fn trace_evidence(landed: TraceId, late: TraceId) -> BTreeMap<SlotName, InputDeclaration> {
+    [("a", landed), ("b", landed), ("late", late)]
+        .into_iter()
+        .map(|(slot, trace_id)| {
+            (
+                SlotName::new(slot).expect("slot"),
+                InputDeclaration::Trace { trace_id },
+            )
+        })
+        .collect()
+}
+
+/// Concurrent checks and different slots naming one trace share one read
+/// per attempt and judge the same collection, a different trace is read
+/// separately, and a new run reads afresh.
+///
+/// # Panics
+/// Panics when a fetch count or outcome differs.
+#[tokio::test(start_paused = true)]
+async fn trace_checks_share_one_attempt_read() {
+    let landed = TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").expect("trace");
+    let late = TraceId::from_hex("1af7651916cd43dd8448eb211c80319c").expect("trace");
+    let spans = vec![
+        span(
+            landed,
+            SpanId::from_hex("b7ad6b7169203331").expect("span"),
+            "retrieve",
+        ),
+        span(
+            landed,
+            SpanId::from_hex("b7ad6b7169203332").expect("span"),
+            "rank",
+        ),
+    ];
+    let traces = Arc::new(CountingTraces {
+        landed: HashMap::from([(landed, Arc::new(spans))]),
+        ..CountingTraces::default()
+    });
+    let script = Arc::new(Script::default());
+    let engine = VerificationEngine::new(
+        Arc::clone(&script) as Arc<dyn ActionExecutor>,
+        Arc::clone(&script) as Arc<dyn CheckExecutor>,
+        Arc::clone(&traces) as Arc<dyn TraceSource>,
+        NonZeroUsize::new(4).expect("positive"),
+    );
+    for attempt in 1..=2 {
+        let outcome = engine
+            .run(
+                shared_trace_verifier(),
+                trace_evidence(landed, late),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await
+            .expect("outcome");
+        assert_eq!(
+            outcomes(&outcome),
+            BTreeMap::from([
+                ("first", RequirementOutcome::Passed),
+                ("second", RequirementOutcome::Passed),
+                ("same", RequirementOutcome::Passed),
+                ("late", RequirementOutcome::Inconclusive),
+            ])
+        );
+        assert_eq!(
+            traces.fetches(landed),
+            attempt,
+            "one read of the landed trace"
+        );
+        assert_eq!(traces.fetches(late), attempt, "one read of the late trace");
+    }
+}
+
+/// Only a deferring engine turns a not-yet-landed trace into
+/// [`EngineError::EvidenceUnavailable`]; otherwise it is an inconclusive
+/// requirement under the normal decision rule, and another read failure
+/// (here a trace the source knows is absent) is never deferred.
+///
+/// # Panics
+/// Panics when an engine result differs.
+#[tokio::test(start_paused = true)]
+async fn unlanded_traces_defer_only_a_deferring_engine() {
+    let landed = TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").expect("trace");
+    let late = TraceId::from_hex("1af7651916cd43dd8448eb211c80319c").expect("trace");
+    let script = Arc::new(Script::default());
+    let engine = |traces: Arc<dyn TraceSource>| {
+        VerificationEngine::new(
+            Arc::clone(&script) as Arc<dyn ActionExecutor>,
+            Arc::clone(&script) as Arc<dyn CheckExecutor>,
+            traces,
+            NonZeroUsize::new(4).expect("positive"),
+        )
+    };
+    let deadline = || Instant::now() + Duration::from_secs(60);
+    let deferred = engine(Arc::new(CountingTraces::default()))
+        .with_unlanded_traces_deferred()
+        .run(
+            shared_trace_verifier(),
+            trace_evidence(landed, late),
+            deadline(),
+        )
+        .await;
+    assert!(
+        matches!(deferred, Err(EngineError::EvidenceUnavailable(ref reason)) if reason.contains("not yet landed")),
+        "{deferred:?}"
+    );
+    let judged = engine(Arc::new(CountingTraces::default()))
+        .run(
+            shared_trace_verifier(),
+            trace_evidence(landed, late),
+            deadline(),
+        )
+        .await
+        .expect("outcome");
+    assert!(
+        judged
+            .requirements
+            .iter()
+            .all(|result| result.outcome == RequirementOutcome::Inconclusive
+                && result.reason.contains("not yet landed")),
+        "{judged:?}"
+    );
+    assert_eq!(judged.verdict, VerificationVerdict::Inconclusive);
+    let failed = engine(Arc::new(InMemoryTraceSource::new()))
+        .with_unlanded_traces_deferred()
+        .run(
+            shared_trace_verifier(),
+            trace_evidence(landed, late),
+            deadline(),
+        )
+        .await
+        .expect("another read failure is judged, never deferred");
+    assert_eq!(failed.verdict, VerificationVerdict::Inconclusive);
+}

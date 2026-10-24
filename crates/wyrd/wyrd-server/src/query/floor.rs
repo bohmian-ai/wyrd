@@ -333,12 +333,25 @@ impl Visitor for RelationCollector {
 mod tests {
     use super::*;
 
+    /// Proves the query floor admits a grouped `SELECT` that calls only
+    /// allowlisted aggregates such as `count` and `sum`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the floor refuses the allowlisted `SELECT`.
     #[test]
     fn query_floor_accepts_select_with_allowlisted_functions() {
         validate_query_sql("SELECT count(*), sum(n) FROM \"bifrost.bifrost.t\" GROUP BY model")
             .expect("select with count/sum passes the floor");
     }
 
+    /// Proves the read-only query floor refuses every mutating or DDL statement
+    /// before it can reach the engine.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the floor admits a `DELETE`, `INSERT`, `DROP`, or `UPDATE`, or
+    /// refuses one with anything but 400 `WYRD_VALA_400_QUERY_INVALID_SQL`.
     #[test]
     fn query_floor_rejects_non_select() {
         for sql in [
@@ -360,6 +373,13 @@ mod tests {
         assert_eq!(err.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
     }
 
+    /// Proves a function outside the allowlist, such as an unknown UDF, is
+    /// refused even inside an otherwise valid `SELECT`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the floor admits `evil_udf` or refuses it with anything but
+    /// 400 `WYRD_VALA_400_QUERY_INVALID_SQL`.
     #[test]
     fn query_floor_rejects_disallowed_function() {
         let err = validate_query_sql("SELECT evil_udf(payload) FROM \"bifrost.bifrost.t\"")
@@ -374,6 +394,12 @@ mod tests {
         assert_eq!(err.status(), 400);
     }
 
+    /// Proves table extraction returns the quoted Bifrost relation a query
+    /// reads, which authorization scopes are checked against.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `bifrost.bifrost.events` is missing from the extracted tables.
     #[test]
     fn query_referenced_tables_extracts_relation_names() {
         let tables = referenced_tables("SELECT payload FROM \"bifrost.bifrost.events\"");

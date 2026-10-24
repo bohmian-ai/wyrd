@@ -563,7 +563,11 @@ async fn configured_gateway_headers_are_authorized_and_captured() {
         .await
         .expect("a standalone Prompt registers")
         .root;
-    let warm = prompt.uid.clone().expect("the Prompt has a UID").to_string();
+    let warm = prompt
+        .uid
+        .clone()
+        .expect("the Prompt has a UID")
+        .to_string();
     let rootless = |card: &str, run: &str| {
         vec![
             ("authorization", format!("Bearer {}", journey.caller)),
@@ -688,9 +692,11 @@ async fn configured_gateway_headers_are_authorized_and_captured() {
 
     Mock::given(method("POST"))
         .and(path("/first/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(503).set_body_json(
-            json!({"error": {"message": "upstream busy", "type": "server_error"}}),
-        ))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_json(
+                json!({"error": {"message": "upstream busy", "type": "server_error"}}),
+            ),
+        )
         .up_to_n_times(2)
         .with_priority(1)
         .mount(&journey.upstream)
@@ -717,7 +723,8 @@ async fn configured_gateway_headers_are_authorized_and_captured() {
                               "candidates": [{"deployment": "acme-second", "model": "m"}]}]}),
         )
         .await;
-    let failover = json!({"model": "acme-first/m", "messages": [{"role": "user", "content": "hi"}]});
+    let failover =
+        json!({"model": "acme-first/m", "messages": [{"role": "user", "content": "hi"}]});
     let mut unowned = rootless(&service, "attempt-run-b");
     unowned.push(("x-wyrd-deployment-environment", "staging".to_owned()));
     for headers in [
@@ -740,8 +747,16 @@ async fn configured_gateway_headers_are_authorized_and_captured() {
                   CAST(sub_principal_id AS VARCHAR) AS sub, CAST(act_principal_id AS VARCHAR) AS act";
     let attempted = "run_id IN ('agent-run', 'attempt-run-a', 'attempt-run-b')";
     let origin_of = |row: &Value| {
-        ["request", "workload", "subject", "run_id", "deployment_environment", "sub", "act"]
-            .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
+        [
+            "request",
+            "workload",
+            "subject",
+            "run_id",
+            "deployment_environment",
+            "sub",
+            "act",
+        ]
+        .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
     };
     let calls: std::collections::BTreeMap<String, [Value; 7]> = journey
         .captured_json(
@@ -751,7 +766,12 @@ async fn configured_gateway_headers_are_authorized_and_captured() {
         )
         .await
         .iter()
-        .map(|call| (call["run_id"].as_str().expect("run").to_owned(), origin_of(call)))
+        .map(|call| {
+            (
+                call["run_id"].as_str().expect("run").to_owned(),
+                origin_of(call),
+            )
+        })
         .collect();
     assert_eq!(calls["attempt-run-a"][1], json!(service));
     assert_eq!(calls["attempt-run-b"][1], Value::Null);

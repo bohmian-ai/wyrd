@@ -782,6 +782,11 @@ mod sdk {
     }
 
     /// A server-owned column may not be declared as a user column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a schema declaring `subject_card_uid` builds a config, or
+    /// the refusal's code is not `WYRD_VALA_400_BIFROST_RESERVED_COLUMN`.
     #[test]
     fn table_config_rejects_a_reserved_column() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(

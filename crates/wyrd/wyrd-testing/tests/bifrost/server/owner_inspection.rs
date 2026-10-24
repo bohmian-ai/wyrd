@@ -143,6 +143,14 @@ fn combined_target(data_root: &std::path::Path) -> wyrd_testing::WyrdTestServerB
 /// # Errors
 ///
 /// Returns the first claim that broke.
+///
+/// # Panics
+///
+/// Panics when a write after the WAL fault is acknowledged, Scribe is not
+/// faulted and unready, `/readyz` is not 200 with Oracle and verification ok,
+/// published reads differ, the WAL directory is empty, Scribe is not ready
+/// after replay, the restart loses acknowledged rows or keeps the refused one,
+/// or the governor poison does not end the process.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn scribe_wal_fault_is_role_local() -> Result<(), super::query::ServerJourneyError> {
@@ -284,6 +292,13 @@ fn wal_segments(
 /// # Errors
 ///
 /// Returns the first claim that broke.
+///
+/// # Panics
+///
+/// Panics when the write after the WAL fault is acknowledged, no segment with
+/// records was corrupted, the restarted `/readyz` is not 200 with Scribe
+/// faulted and Oracle ok, published reads differ, a write is admitted, or the
+/// WAL bytes change.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJourneyError> {

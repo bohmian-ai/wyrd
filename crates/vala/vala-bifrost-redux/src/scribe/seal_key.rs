@@ -456,6 +456,11 @@ mod tests {
     }
 
     /// The seal-key text carries the typed partition, not a bare day segment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the key omits the namespace, table name, or typed
+    /// `hour:2026-07-14T09:00:00+00:00` partition, or still names a `day` segment.
     #[test]
     fn seal_key_canonical_key() {
         let tenant = crate::test_support::tenant();

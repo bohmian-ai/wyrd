@@ -840,6 +840,14 @@ mod batch_builder_tests {
 
     /// User columns come first, then the nullable correlation columns, and an
     /// explicit null on a nullable column is preserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either row set fails to prepare, the batch is not four
+    /// columns by two rows, the correlation columns are misnamed, non-nullable,
+    /// or carry the wrong Card uid or run id, the explicit null is lost, the
+    /// charge undercounts the batch memory, or uncorrelated rows get non-null
+    /// correlation cells.
     #[test]
     fn builds_user_columns_plus_correlation_columns() {
         let prepared = RowPreflight::new(&user_schema())
@@ -876,6 +884,11 @@ mod batch_builder_tests {
 
     /// Reserved keys, undeclared keys, type mismatches, missing required
     /// values, and invalid JSON are refused with their stable codes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any listed row prepares or refuses with a code other than
+    /// the one paired with it.
     #[test]
     fn invalid_rows_are_refused_with_stable_codes() {
         for (row, code) in [

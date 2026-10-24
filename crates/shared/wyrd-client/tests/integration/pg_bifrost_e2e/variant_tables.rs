@@ -230,6 +230,12 @@ mod pg_tests {
     }
 
     /// Query results keep the Variant extension and copy into another table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the archive table fails to register, the query or a
+    /// copied batch write fails, the queried `payload` column is not Variant,
+    /// or the archive does not read back exactly the inserted event.
     #[tokio::test]
     async fn query_results_copy_into_another_table() {
         let events = Events::start().await;
@@ -343,6 +349,12 @@ mod pg_tests {
 
     /// An unsigned column is refused by the SDK, and by the server when sent
     /// directly, and no table is created.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the SDK accepts the `UInt64` column, the server accepts
+    /// the raw register request, either refusal is not
+    /// `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, or describing the table finds it.
     #[tokio::test]
     async fn unsupported_type_is_refused_by_sdk_and_server() {
         let events = Events::start().await;
@@ -402,6 +414,11 @@ mod pg_tests {
 
     /// A model allowing extra keys is refused with the remediation to
     /// declare a Variant field instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the flattened model builds a config, the refusal is not
+    /// `WYRD_VALA_400_SCHEMA_PARSE`, or its message lacks the Variant remediation.
     #[tokio::test]
     async fn model_allowing_extra_keys_is_refused() {
         let refused = TableConfig::from_model::<Loose>("bifrost.datasets.loose")
@@ -418,6 +435,12 @@ mod pg_tests {
 
     /// Every type Iceberg cannot store is refused when the table is
     /// declared, naming the field and its type.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any listed type builds a config, refuses with a code other
+    /// than `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`, or omits the `moment`
+    /// field or the type from its message.
     #[tokio::test]
     async fn each_unsupported_type_is_refused_when_declared() {
         for data_type in [

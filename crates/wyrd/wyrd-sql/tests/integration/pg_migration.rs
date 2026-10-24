@@ -936,6 +936,13 @@ mod pg_tests {
     #[tokio::test]
     /// The full migration set applies to an empty database and applying it
     /// again is a no-op, so a redeploy cannot half-apply schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the owner pool cannot connect, either migration run fails, a
+    /// required relation is missing or a retired one exists, or the platform
+    /// resolver, `current_tenant` parallel safety, or `auth_%` and
+    /// `gateway_batch%` RLS metadata differ from the baseline.
     async fn migrations_apply_and_are_idempotent() {
         let Some(url) = database_url() else {
             return;

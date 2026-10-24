@@ -698,6 +698,12 @@ mod pg_tests {
         });
     }
 
+    /// Proves a caller holding table write cannot register into a built-in
+    /// namespace such as `bifrost.traces`, which only the server owns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the registration succeeds or fails with a status other than 400.
     #[test]
     fn bifrost_tables_register_reserved_namespace_is_rejected() {
         wyrd_runtime::runtime().block_on(async {
@@ -712,6 +718,14 @@ mod pg_tests {
         });
     }
 
+    /// Proves a registered table is listed and described with its user field,
+    /// and that list, register, and describe each audit one allowed verdict.
+    ///
+    /// # Panics
+    ///
+    /// Panics when register, list, or describe fails, the table or its `value`
+    /// field is missing, or the audit rows differ from one allowed list row and
+    /// one allowed register then describe row for the table.
     #[test]
     fn bifrost_tables_list_and_describe_reflect_registration() {
         wyrd_runtime::runtime().block_on(async {
@@ -787,6 +801,11 @@ mod pg_tests {
     }
 
     /// A denied list returns 403 and leaves one canonical deny row behind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the list succeeds or is not a 403, or the audit log does not
+    /// hold exactly one denied `bifrost.bifrost.list` row for this caller.
     #[test]
     fn bifrost_tables_list_requires_read_permission() {
         wyrd_runtime::runtime().block_on(async {
@@ -804,6 +823,11 @@ mod pg_tests {
     }
 
     /// A denied describe returns 403 and audits the requested table name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the describe succeeds or is not a 403, or the audit log does
+    /// not hold exactly one denied `bifrost.bifrost.describe` row for the table.
     #[test]
     fn bifrost_tables_describe_requires_read_permission() {
         wyrd_runtime::runtime().block_on(async {

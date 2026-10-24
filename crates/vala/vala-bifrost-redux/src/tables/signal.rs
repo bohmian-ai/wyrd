@@ -505,11 +505,18 @@ impl ResourcePromotions {
 /// server's validated subject context.
 #[derive(Debug, Default)]
 pub struct ResourcePromotionColumns {
+    /// Promoted `service.namespace`, one entry per accepted row.
     service_namespace: Vec<Option<String>>,
+    /// Promoted `service.instance.id`, one entry per accepted row.
     service_instance_id: Vec<Option<String>>,
+    /// Promoted `process.pid`, one entry per accepted row; its length is the
+    /// row count [`Self::finish`] sizes the null subject columns by.
     process_pid: Vec<Option<i64>>,
+    /// Promoted `telemetry.sdk.name`, one entry per accepted row.
     telemetry_sdk_name: Vec<Option<String>>,
+    /// Promoted `telemetry.sdk.language`, one entry per accepted row.
     telemetry_sdk_language: Vec<Option<String>>,
+    /// Promoted `telemetry.sdk.version`, one entry per accepted row.
     telemetry_sdk_version: Vec<Option<String>>,
 }
 

@@ -158,6 +158,10 @@ impl DomainTable for SpansTable {
         canonical_arrow_fields(SPAN_FIELDS)
     }
 
+    /// Declares the attributed hourly layout on `start_time_unix_nano`: rows sort by
+    /// environment, Service name, and Service version, then newest first, and
+    /// the Bloom set is the attribution columns plus
+    /// `trace_id` so a trace lookup prunes span files.
     fn physical_layout() -> PhysicalLayoutWire {
         attributed_layout(hourly_layout, "start_time_unix_nano", &["trace_id"])
     }

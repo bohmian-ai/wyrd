@@ -327,6 +327,10 @@ mod tests {
 
     /// Proves the persisted scope JSON is exactly the approved domain-tagged
     /// projection, so the wire form cannot drift from the spec.
+    ///
+    /// # Panics
+    /// Panics when a scope fails to serialize or the `all`, schema, or table
+    /// scope JSON differs from its approved projection.
     #[test]
     fn scope_json_matches_the_approved_projection() {
         let uid = Uuid::from_u128(0x1234);
@@ -353,6 +357,11 @@ mod tests {
 
     /// Proves object identities are validated, not merely parsed: an empty or
     /// over-long segment and a flattened namespace are all refused.
+    ///
+    /// # Panics
+    /// Panics when `all` or a valid schema scope fails validation, an empty
+    /// schema is not refused as an invalid `schema` identifier, or a flattened
+    /// catalog or 64-character schema segment validates.
     #[test]
     fn malformed_identities_are_rejected() {
         assert!(PermissionScope::All.validate().is_ok());
@@ -432,6 +441,10 @@ mod tests {
 
     /// Proves a non-UUID table identity fails at decode, so no unresolvable
     /// object identity can reach the synchronous checker.
+    ///
+    /// # Panics
+    /// Panics when the non-UUID table identity decodes or its decode error
+    /// does not name the UUID.
     #[test]
     fn malformed_table_identity_is_rejected_at_decode() {
         let error = serde_json::from_value::<PermissionScope>(serde_json::json!({

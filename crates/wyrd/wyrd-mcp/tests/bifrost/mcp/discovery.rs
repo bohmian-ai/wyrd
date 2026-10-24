@@ -263,6 +263,10 @@ mod pg_tests {
         ///
         /// # Errors
         /// Returns missing SQL or a query refusal.
+        ///
+        /// # Panics
+        /// Panics when the substituted guide example does not finish with a
+        /// `success` terminal outcome.
         async fn execute_sql_example(&self, example: &JsonValue) -> Result<(), McpJourneyError> {
             let mut arguments = example["arguments"].clone();
             let trace_id =

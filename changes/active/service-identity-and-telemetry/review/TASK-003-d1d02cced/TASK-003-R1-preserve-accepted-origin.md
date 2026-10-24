@@ -2,7 +2,7 @@
 id: TASK-003-R1
 spec: SPEC-service-identity-and-telemetry
 spec_revision: 16
-status: ready
+status: implemented
 kind: remediation
 original_task: changes/active/service-identity-and-telemetry/tasks/TASK-003-system-schemas-and-attribution.md
 reviewed_base: ca2ac4a37e229a8f95667c073db11c70ad7ecb8b
@@ -262,3 +262,61 @@ Record a short shared ownership flow from each affected Bifrost/gateway/verifica
   - Other per-call principal builders (`forge_harness.rs::scribe_append_and_seal`, `oracle/peer_cluster.rs`, `oracle/capacity.rs`) never retry under one batch id.
   - No production change.
 - Independent diagnostician report: it confirmed the same cause and fix site. It also noted that a changed origin under a reused batch id surfaces as `TableVersionConflict`. That refusal is the existing fence path and is out of scope here: the outcome is a refusal, as required.
+
+### Acceptance criteria
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-003-1: calls and every attempt span keep their own accepted workload/subject/Run/environment/request/pair; trusted Rows carry request/environment; public Frame forgery refuses | `wyrd-server/src/components/gateway/capture.rs::CallCapture::spans_batch` overwrites the projected `deployment_environment`/`subject_card_uid`/`run_id` per attempt from the call's `GatewayCallContext`, and appends `workload_card_uid` and `wyrd_request_id`. `vala-bifrost-redux/src/scribe/execution_lanes.rs::enforce_builtin_source_contract` (`carried` = `StampedAttribution::Rows`) admits a carried `wyrd_request_id` and judges a canonical signal against `resource_environment`. | `gateway::compatible::configured_gateway_headers_are_authorized_and_captured`: two failover origins with two attempts each, plus the streamed Anthropic call, give five attempt spans. Each has origin = its call's, one trace per call, distinct span ids and the exact GenAI name. Rows unit test `scribe::execution_lanes::tests::row_attributed_spans_carry_their_accepted_environment_and_request`. RED: projector without context, then 0 spans; `carried=false`, then `InvalidFrame`. | PASS |
+| FIND-TASK-003-2: a non-null shared dimension on a public native drift input refuses whole before ACK; null placeholders get the accepted context | `execution_lanes.rs::refuse_supplied_dimensions` is called from `decode_rows` for Frame attribution on non-signal built-ins | `verification_runtime::native_drift_dimensions_come_only_from_accepted_context`: six dimensions × (rootless, owned staging) all refuse; placeholders land with the accepted context. RED confirmed. | PASS |
+| FIND-TASK-003-3: one shared accepted-owner selection feeds hashing, descriptors and stamping | `gate/auth.rs::AuthContext::workload` (`owning_root`) feeds `frame_dimensions`, the OTLP batch id and `ScribeIngressFrame.workload`; Scribe's `AdmittedRowContext.workload = frame.workload` | `otlp::negative::pg_tests::delegated_exports_are_owned_by_the_current_actors_root` covers two actor releases, a rooted subject and a User delegation, each exported over gRPC twice and HTTP once (one set each); native delegated readback runs in the FIND-2 journey. RED: the subject root gives `service_name` `otlp-owner-subject`. | PASS |
+| FIND-TASK-003-4: replaying an explicit native batch id with a changed workload/pair/subject/Run refuses, warm and cold; request/time-only changes stay equal | `scribe/preprocess.rs`: `is_volatile_column`; `logical_data_identity` and `LogicalIdentity::for_rows` skip only volatile columns; `correlation_data_identity` is deleted and `otlp_batch_id` no longer folds it | `verification_runtime::native_batch_replay_is_bound_to_its_accepted_origin` covers warm and post-restart phases. Unit tests `logical_identity_ignores_server_receipt_columns_only` and `known_identity_is_reused_only_for_its_exact_inputs` pass. RED confirmed. | PASS |
+| FIND-TASK-003-5: cold and warm trusted delivery after subject deletion keep the UID/descriptors; peer path preserved; a new public action refuses | `gate/attribution.rs`: `Lookup::{Live, Retained}`. `row_dimensions` reads `get_card_for_reconciliation`; `frame_dimensions` and `observation_targets` stay live | Configured gateway journey: two Cards (one warmed by a delivered capture, one never described) are held at the provider and deleted mid-call. Both captures keep their UID, kind, name, version, Run, account and request, and a new call about either refuses 403 `WYRD_VALA_403_BIFROST_CARD_SCOPE`. `peer::oracle_only_gateway_captures_through_the_peer_scribe` passes. RED (`row_dimensions` Live): the cold row never lands. | PASS |
+| FIND-TASK-003-6: inventory items carry meaningful docs and accurate Errors/Panics sections; new remediation items follow the same rule | Doc-only edits to every inventory item; every remediation item carries rustdoc with `# Errors`/`# Panics` | Static inventory inspection; `mise run fmt`; `mise run lints` | PASS |
+
+### Shared ownership flow
+
+| Admission owner | Where the selection happens | Where accepted values are carried, and consumers |
+|---|---|---|
+| Bifrost Gate (HTTP/gRPC OTLP and native) | `AuthContext::workload` → `wyrd_runtime::owning_root(principal, chain)`, evaluated once per request | Read by `CardRegistry::frame_dimensions` (descriptors), by `otlp_batch_id` (identity) and by `ScribeIngressFrame.workload`. In Scribe ingress, `AdmittedRowContext.workload` stamps managed columns. No consumer reads `principal.workload_uid`. |
+| Gateway | `GatewayInvocation::admit_call` produces `GatewayCallContext` (existing shared selector) | `CallCapture.subject` feeds `calls_batch` and `spans_batch`, with each attempt repeating its call's context and request. The outbox `Chunk::attributed` adds the pair. Rows decode accepts the carried workload/subject/Run/request/environment, and `row_dimensions` describes the carried UIDs (live or retained) for local and peer delivery. |
+| Native replay | Scribe `logical_data_identity` over the stamped batch, excluding only volatile request/time | The same identity feeds the WAL, `committed_duplicate_rows` (warm) and `matches_logical` (durable). |
+| Verification | Unchanged: `AcceptedAuthority` / `ResultRun` keep the binding owner | Results reach Bifrost through the same Rows boundary; the gate behavior they rely on is unchanged. |
+
+### Commands
+
+```bash
+mise exec -- env WYRD_TEST_GATEWAY_PROVIDER_KEY=sk-native-upstream scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test gateway -P journey --run-ignored=all -E "test(=compatible::configured_gateway_headers_are_authorized_and_captured) | test(=peer::oracle_only_gateway_captures_through_the_peer_scribe) | test(=resilience::gateway_capacity_paces_streams_isolates_tenants_and_recovers) | test(=resilience::a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch) | test(=compatible::openai_compatible_streams_terminate_and_survive_a_capture_outage)"'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise run build:server && cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=verification_runtime::native_signal_values_and_attribution_are_validated_before_ack) | test(=verification_runtime::trusted_delivery_preserves_each_origin) | test(=verification_runtime::native_drift_dimensions_come_only_from_accepted_context) | test(=verification_runtime::native_batch_replay_is_bound_to_its_accepted_origin)'"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test otlp -P journey --run-ignored=all -E 'test(=negative::pg_tests::identical_exports_from_two_principals_each_keep_their_own_attribution) | test(=negative::pg_tests::delegated_exports_are_owned_by_the_current_actors_root)'"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --test scribe -p vala-bifrost-redux --test integration -P journey --run-ignored=all -E 'test(/replay|retry|duplicate|fence|recover|idempot|identity/)'"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p vala-bifrost-redux -p wyrd-server --lib"
+mise run fmt && mise run lints
+git diff --check
+```
+
+Results:
+- Gateway journeys: 5/5.
+- Server journeys: 4/4.
+- OTLP journeys: 2/2.
+- Replay/retry integration: 20/20.
+- `vala-bifrost-redux` + `wyrd-server` lib: 1431/1431.
+- fmt, lints and `git diff --check` are clean.
+- `codegen:check` is not needed: no contract, schema or generated source changed.
+
+**Diagnosis: gateway span frames refused while FIND-1 was implemented.**
+- Symptom: every `bifrost.traces.spans` frame was "rejected terminally", and the journey read 0 spans.
+- Cause: the canonical span projection already carries `subject_card_uid` and `run_id` correlation columns (`tables/signal.rs::correlation_fields`). Appending them again produced duplicate names, which `decode_rows` refuses with `InvalidFrame`.
+- Fix: in `spans_batch`, overwrite those projected columns and append only `workload_card_uid` and `wyrd_request_id`.
+
+### Non-goals and limits
+
+- No new writer, graph owner, context object, per-row SQL, cache, JWT descriptor, public header, API, alias, data conversion, registry join, check script, dependency, harness, timeout change, lint suppression or weakened assertion.
+- ServerSpans behavior is unchanged.
+- The public Frame still refuses carried `wyrd_request_id` and forged resource environments.
+- Tombstone lookup projects descriptors only; public admission (`frame_dimensions`, `observation_targets`, gateway `is_observation_target`) stays live.
+- FIND-6 is doc-only. Two existing test names promise more than their bodies check, and the docs describe the bodies:
+  - `audit_detail.rs::all_detail_variants_round_trip` round-trips only `Ingest`;
+  - `scribe/staging.rs::publication_manifest_recovers_rows_and_source_fence_fail_closed` checks no fence.
+  Renaming them was out of scope.
+- A changed origin under a reused native batch id refuses through the existing fence's `TableVersionConflict`. The refusal is correct, but its code describes the version path.

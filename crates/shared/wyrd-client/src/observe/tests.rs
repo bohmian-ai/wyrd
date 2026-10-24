@@ -1270,6 +1270,12 @@ fn row_value(bytes: &[u8]) -> Value {
 }
 
 /// Every feature becomes one tall row sharing the observation's identity.
+///
+/// # Panics
+/// Panics when the feature map or projection fails, the rows are not
+/// exactly `age`, `churned`, `plan`, `score`, or a row loses the record or
+/// session id, `created_at`, its 12 fixed columns, or carries a correlation
+/// field.
 #[test]
 fn drift_projects_one_tall_row_per_feature() {
     let record = drift::observation(
@@ -1363,6 +1369,10 @@ fn drift_refuses_unsupported_inputs() {
 // ── Scenario 5: the generic record path ────────────────────────────────────
 
 /// The first call describes the table once; later calls reuse its schema.
+///
+/// # Panics
+/// Panics when startup or either record fails, or the server sees more
+/// than one describe for the table across the run and its sibling Card view.
 #[tokio::test]
 async fn record_describes_a_dataset_table_once() {
     let server = DescribeServer::start(fixed_table_bodies());
@@ -1397,6 +1407,11 @@ async fn record_describes_a_dataset_table_once() {
 
 /// Racing first uses of one dynamic table converge on one describe and one
 /// producer, while two distinct tables keep their own destinations.
+///
+/// # Panics
+/// Panics when startup or any raced record fails, either table is
+/// described more than once, the pool holds other than two producers, or the
+/// two cached writer tables share a name.
 #[tokio::test]
 async fn concurrent_first_records_describe_each_table_once() {
     let server = DescribeServer::start(fixed_table_bodies());
@@ -1446,6 +1461,11 @@ async fn concurrent_first_records_describe_each_table_once() {
 }
 
 /// A reserved or system-managed table is refused before any describe.
+///
+/// # Panics
+/// Panics when startup fails, a record to a reserved, system, or
+/// malformed table succeeds or refuses with a code other than
+/// `WYRD_SDK_400_INVALID_OBSERVATION`, or the refusal reached a describe.
 #[tokio::test]
 async fn record_refuses_reserved_and_system_tables() {
     let server = DescribeServer::start(fixed_table_bodies());
@@ -1479,6 +1499,10 @@ async fn record_refuses_reserved_and_system_tables() {
 }
 
 /// An unknown dataset table fails at describe, before queue admission.
+///
+/// # Panics
+/// Panics when startup fails, or recording to the unregistered table
+/// succeeds or refuses with a status other than 404.
 #[tokio::test]
 async fn record_refuses_an_unknown_dataset_table() {
     let server = DescribeServer::start(fixed_table_bodies());

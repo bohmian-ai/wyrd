@@ -1472,6 +1472,10 @@ async fn remote_live_window_blocked_scribe_stops_cleanly() {
 /// # Errors
 ///
 /// Returns the first step whose stop, release, or terminal broke the contract.
+///
+/// # Panics
+///
+/// Panics when the ingest chunk size does not fit `usize`.
 async fn prove_window_blocked_scribe_stop() -> Result<(), PeerJourneyError> {
     let case = "window-blocked Scribe stopped";
     let mut cluster = PeerCluster::start(&[

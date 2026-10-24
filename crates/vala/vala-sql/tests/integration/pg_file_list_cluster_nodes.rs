@@ -161,6 +161,13 @@ mod pg_tests {
         );
     }
 
+    /// Proves `vala.file_list` admits each writer stream range once, so a
+    /// replayed promotion cannot register a second file for the same WAL span.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the first insert fails, the duplicate insert succeeds, or its
+    /// error is not SQLSTATE `23505` on `file_list_stream_range_ordinal_uniq`.
     #[tokio::test]
     async fn vala_file_list_rejects_duplicate_stream_range() {
         let (fixture, tenant_id) = setup().await;
@@ -302,6 +309,13 @@ mod pg_tests {
         );
     }
 
+    /// Proves row-level security hides one tenant's `vala.file_list` rows from a
+    /// `TenantConn` acquired for another tenant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when seeding tenant B, the tenant A insert, the tenant B connection,
+    /// count, or commit fails, or when tenant B sees tenant A's row.
     #[tokio::test]
     async fn vala_file_list_rls_blocks_cross_tenant_select() {
         let (fixture, tenant_a) = setup().await;
@@ -356,6 +370,13 @@ mod pg_tests {
         );
     }
 
+    /// Proves the operator session can write and read `vala.file_list` rows
+    /// through `operator_access`, which promotion and compaction depend on.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the operator insert or select fails, or the selected id
+    /// differs from the inserted one.
     #[tokio::test]
     async fn vala_operator_pool_can_insert_and_select_file_list() {
         let (fixture, tenant_id) = setup().await;

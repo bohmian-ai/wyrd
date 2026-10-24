@@ -3942,6 +3942,11 @@ impl FilteringFixture {
     /// Returns describe or decode errors, and an error naming the first file
     /// that is out of order, lacks a declared Bloom filter, carries an
     /// undeclared one, lacks pages, or yields no Bloom-negative probe.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a journey table's fully qualified name has no `.` separating
+    /// its namespace from its name.
     async fn expect_physical_layout(
         &self,
         custom: &[SealedObject],

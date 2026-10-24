@@ -628,6 +628,11 @@ mod tests {
     }
 
     /// Stable ingest saturation alone carries the exact gRPC retry marker.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `IngestBusy` is not `ResourceExhausted` with a `retry-after-ms`
+    /// of `1000`, or a permanent capacity refusal carries that marker.
     #[test]
     fn ingest_busy_grpc_retry_metadata() {
         let busy = IngestError::IngestBusy {
@@ -655,6 +660,11 @@ mod tests {
 
     /// Assert that Scribe remains domain-only while Gate supplies stable
     /// transport identity and preserves the Scribe-provided table where present.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Scribe error projects to a public code other than its
+    /// catalogued one, or the busy refusal loses the Scribe-provided table name.
     #[test]
     fn scribe_errors_project_through_gate_without_fallback_identity() {
         let cases = [

@@ -2766,6 +2766,14 @@ mod bifrost_wire_tests {
         assert!(minimal.metadata.is_empty());
     }
 
+    /// A field's `wyrd:column_class` metadata survives the wire round trip, so a
+    /// correlation column keeps its class between SDK and server.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the field spec fails to serialize, deserialize, or compare
+    /// equal after the round trip, or the decoded metadata no longer names the
+    /// column `correlation`.
     #[test]
     fn bifrost_wire_field_spec_carries_correlation_metadata() {
         let mut spec = FieldSpec {
@@ -2785,6 +2793,11 @@ mod bifrost_wire_tests {
 
     /// An omitted `physical_layout` stays `None` on the wire so the server can
     /// distinguish "no declaration" (defaults apply) from an explicit object.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request fails to deserialize or serialize, decodes a
+    /// `physical_layout`, or re-encodes with a `physical_layout` key.
     #[test]
     fn bifrost_wire_register_request_omits_physical_layout() {
         let req: RegisterTableRequest =
@@ -2801,6 +2814,12 @@ mod bifrost_wire_tests {
     /// The wire distinction between `None` and an explicit object survives; what
     /// the server no longer distinguishes is an empty `sort_keys` from an
     /// omitted one, which both resolve to the canonical event-time default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request fails to deserialize, decodes without a layout,
+    /// decodes a non-empty `partition_by`, `sort_keys`, or `bloom_columns`, or
+    /// differs from itself after a serialize/deserialize round trip.
     #[test]
     fn bifrost_wire_register_request_keeps_explicit_empty_layout_lists() {
         let req: RegisterTableRequest = serde_json::from_str(

@@ -271,6 +271,11 @@ mod tests {
     }
 
     /// Both canonical hierarchy and quoted dotted-FQN SQL resolve identically.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tenant, binding, or provider cannot be built, registration
+    /// fails, or either the hierarchical or the quoted dotted query fails to plan.
     #[tokio::test]
     async fn quoted_dotted_identifier_resolves_alongside_canonical_name() {
         let session = SessionContext::new();

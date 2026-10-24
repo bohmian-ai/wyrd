@@ -1422,6 +1422,13 @@ mod tests {
     /// run is unscorable, without it the complete population scores. A
     /// selected record whose configured values are all null is incomplete,
     /// agreeing with direct scoring of a preselected batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a baseline or statement fails to build, the PSI statement
+    /// does not read `bifrost.drift.observations` three times, the complete
+    /// population does not score (SPC as `NoDrift`), or a population with the
+    /// late partial or all-null record scores under PSI or SPC.
     #[tokio::test]
     async fn one_statement_decides_completeness_and_scores_from_one_cut() {
         let uid = subject().to_string();

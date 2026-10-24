@@ -4990,6 +4990,12 @@ mod tests {
     }
 
     /// The SQL parser accepts a complete query and extracts its canonical tables.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the CTE-and-join query is refused or its extracted tables are
+    /// not exactly `observations` and `spans` in sorted order, with the CTE alias
+    /// excluded.
     #[test]
     fn query_floor_extracts_joined_and_cte_tables() {
         let tables = parse_select_tables(

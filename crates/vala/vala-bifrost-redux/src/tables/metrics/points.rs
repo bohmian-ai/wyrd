@@ -192,6 +192,10 @@ impl DomainTable for PointsTable {
         canonical_arrow_fields(METRIC_FIELDS)
     }
 
+    /// Declares the attributed hourly layout on `time_unix_nano`: rows sort by
+    /// environment, Service name, and Service version, then newest first, and
+    /// the Bloom set is the attribution columns plus
+    /// `metric_name` so a per-metric lookup prunes point files.
     fn physical_layout() -> PhysicalLayoutWire {
         attributed_layout(hourly_layout, "time_unix_nano", &["metric_name"])
     }

@@ -103,6 +103,12 @@ impl std::fmt::Display for TableRef {
 mod tests {
     use super::*;
 
+    /// A constructed reference renders its fully qualified `bifrost.<schema>.<name>`
+    /// name and keeps the bare table name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rendered FQN or the stored name differs from the input.
     #[test]
     fn new_and_fqn_round_trip() {
         let t = TableRef::new(BifrostNamespace::Bifrost, "events");
@@ -110,6 +116,12 @@ mod tests {
         assert_eq!(t.name, "events");
     }
 
+    /// A known namespace FQN parses into its namespace and bare table name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `bifrost.bifrost.events` fails to parse or decodes to another
+    /// namespace or name.
     #[test]
     fn parse_fqn_accepts_known_namespace() {
         let t = TableRef::parse_fqn("bifrost.bifrost.events").expect("known ns");
@@ -125,6 +137,12 @@ mod tests {
 
     /// Every namespace renders, parses, and scopes under the one `bifrost`
     /// catalog, and the retired `vala` spelling resolves nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an FQN lacks the `bifrost.` prefix or does not round-trip, a
+    /// `vala.` spelling parses, or the permission scope is not a table scope under
+    /// the `bifrost` catalog and the namespace's schema.
     #[test]
     fn canonical_catalog_has_no_alias() {
         let uid = crate::catalog::TableUid::from_bytes([7; 16]);
@@ -151,6 +169,12 @@ mod tests {
         }
     }
 
+    /// Names carrying `..` or a leading `/` never parse, so a table reference cannot
+    /// escape its namespace's storage path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either traversal FQN parses.
     #[test]
     fn parse_fqn_rejects_path_traversal() {
         assert!(TableRef::parse_fqn("bifrost.bifrost.../etc/passwd").is_none());

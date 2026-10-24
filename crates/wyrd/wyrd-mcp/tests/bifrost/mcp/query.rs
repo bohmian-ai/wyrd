@@ -514,6 +514,15 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns setup, ingestion, MCP transport, query, or settlement failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the spans table or query tool is not discoverable, the
+    /// described table lacks `name` or `status_code`, the bounded read errors
+    /// or returns other columns, rows, query class, outcome, or row count, or
+    /// carries a freshness field, either ceiling does not refuse with
+    /// `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` and no rows, or the cancelled
+    /// query does not release every admission, byte, and peer slot.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn agent_debugs_otel_error_trace_through_mcp() -> Result<(), McpJourneyError> {
@@ -735,6 +744,13 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns fixture, transport, tool-call, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the span hierarchy, the GenAI token aggregate, the
+    /// log-to-span correlation, or the per-kind metric aggregate returns other
+    /// rows, the metric read is not a success, or the authorized reader does
+    /// not see the root span's structured GenAI attributes.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn agent_reads_canonical_trace_genai_logs_and_metrics_through_sql()

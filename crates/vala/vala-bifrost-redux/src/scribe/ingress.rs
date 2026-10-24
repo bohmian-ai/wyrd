@@ -1421,6 +1421,11 @@ mod tests {
     /// bound out of the proof. The fingerprint is computed from the same schema
     /// the batch carries, so the frame clears schema validation and reaches the
     /// size gate.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the two-column fixture batch fails to build against its own
+    /// schema.
     fn decoded_size_frame(
         tenant: DataTenantId,
         principal: &Principal,

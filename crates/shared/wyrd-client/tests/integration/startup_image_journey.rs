@@ -319,6 +319,11 @@ async fn insert_ids(client: &WyrdClient, fqn: &str, ids: std::ops::RangeInclusiv
 
 /// Before the scale-up, through the fixed `all` anchor: its Scribe
 /// acknowledges rows `1..=4`, and a fused read through it returns them.
+///
+/// # Panics
+/// Panics when the environment client or seed inserts fail, Bifrost does not
+/// connect or drain, rows `1..=4` never read back before the deadline, or the
+/// table name cannot be written to the state directory for the later phases.
 #[tokio::test]
 #[ignore = "run by scripts/server/test-kind-autoscale.sh against a kind cluster"]
 async fn kind_seed() {

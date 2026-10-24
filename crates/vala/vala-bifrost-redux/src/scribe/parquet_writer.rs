@@ -1997,6 +1997,14 @@ mod tests {
         assert_eq!((service_col.value(3), time_col.value(3)), ("a", 400));
     }
 
+    /// A sealed Scribe file Blooms exactly the layout's declared `service` column and
+    /// writes page-index metadata, so readers can prune by Bloom and by page.
+    ///
+    /// # Panics
+    ///
+    /// Panics when binding, layout resolution, encoding, or reading the file back
+    /// fails, `service` lacks a Bloom filter, `event_time` has one, or `event_time`
+    /// carries neither an offset nor a column index.
     #[test]
     fn parquet_writer_writes_bloom_and_page_index() {
         let tenant = DataTenantId::new_v7();

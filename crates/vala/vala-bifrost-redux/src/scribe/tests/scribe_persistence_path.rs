@@ -415,6 +415,12 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
 
 #[tokio::test]
 /// Production shards expose exact projections and WAL bounds to tail readers.
+///
+/// # Panics
+///
+/// Panics when the WAL writer or append fails, the admission names another
+/// batch or row count, shard tasks, channels, or memory accounting disagree,
+/// or the hot tail does not return one batch projected to `value` alone.
 async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_tail");
@@ -717,6 +723,11 @@ async fn assert_other_tenant_isolated(
 
 #[tokio::test]
 /// A shard WAL failure reaches the caller's durable completion boundary.
+///
+/// # Panics
+///
+/// Panics when the WAL writer cannot be built, the append succeeds despite the
+/// tripped sync failure, or it fails with anything but `ScribeError::Internal`.
 async fn shard_wal_failure_reaches_the_durable_completion() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_wal_failure");

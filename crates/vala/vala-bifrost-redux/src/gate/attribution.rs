@@ -180,7 +180,10 @@ impl CardRegistry {
             .await
             .map_err(|error| registry_unavailable(&error))?;
         for uid in unread {
-            if let Some(descriptor) = self.read_descriptor(&mut conn, tenant, &uid, lookup).await? {
+            if let Some(descriptor) = self
+                .read_descriptor(&mut conn, tenant, &uid, lookup)
+                .await?
+            {
                 described.push((uid, descriptor));
             }
         }

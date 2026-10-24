@@ -502,7 +502,11 @@ impl CallCapture {
             let index = schema.index_of(name).map_err(|_| CaptureDrop::Projection)?;
             columns[index] = column;
         }
-        fields.push(Arc::new(Field::new(WORKLOAD_CARD_UID, DataType::Utf8, true)));
+        fields.push(Arc::new(Field::new(
+            WORKLOAD_CARD_UID,
+            DataType::Utf8,
+            true,
+        )));
         columns.push(context(|context| {
             context.workload_card_uid.as_ref().map(CardUid::as_str)
         }));

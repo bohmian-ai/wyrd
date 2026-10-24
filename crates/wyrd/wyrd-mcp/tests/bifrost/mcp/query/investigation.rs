@@ -260,6 +260,10 @@ impl EvidenceInvestigation {
     ///
     /// # Errors
     /// Returns MCP or schema response failures.
+    ///
+    /// # Panics
+    /// Panics when the catalog omits any evidence table or its description
+    /// omits the field the investigation selects from it.
     pub(super) async fn describe_evidence(&self) -> Result<(), McpJourneyError> {
         let listed = structured(
             self.agent
@@ -304,6 +308,10 @@ impl EvidenceInvestigation {
     ///
     /// # Errors
     /// Returns MCP or SQL failures.
+    ///
+    /// # Panics
+    /// Panics when the query is not a successful terminal or the join returns
+    /// anything but the one error log on the failed tool span.
     pub(super) async fn correlate_trace(&self) -> Result<(), McpJourneyError> {
         let trace_id =
             wyrd_spec::vala::ids::TraceId::from_bytes(canonical_signals::TRACE_ID)?.to_hex();
@@ -319,6 +327,11 @@ impl EvidenceInvestigation {
     ///
     /// # Errors
     /// Returns MCP, SQL, or missing-identity failures.
+    ///
+    /// # Panics
+    /// Panics when a Verifier Card reads back another name or UID, a query is
+    /// not a successful terminal, the subject's results are not both failed
+    /// judgments, or the Drift result lacks its single drifted feature row.
     pub(super) async fn follow_subject_and_results(&self) -> Result<(), McpJourneyError> {
         for reference in [&self.drift_verifier, &self.assertion_verifier] {
             let response: GetCardResponse = serde_json::from_value(structured(
@@ -352,6 +365,10 @@ impl EvidenceInvestigation {
     ///
     /// # Errors
     /// Returns MCP or SQL failures.
+    ///
+    /// # Panics
+    /// Panics when a query is not a successful terminal, the declared table
+    /// returns other rows, or the absent result ID returns any row.
     pub(super) async fn read_custom_data(&self) -> Result<(), McpJourneyError> {
         assert_eq!(
             self.query(

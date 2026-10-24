@@ -24,6 +24,12 @@ mod pg_tests {
     }
 
     /// Proves Forge sees only active registrations in tenant/FQN order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture, tenant seeding, registration upsert, deprecation
+    /// update, or operator listing fails, or the listing is not exactly the two
+    /// active rows in strictly ascending tenant/FQN order.
     #[tokio::test]
     async fn active_table_inventory_is_operator_visible_ordered_and_status_filtered() {
         let fixture = PgFixture::start().await.expect("fixture");

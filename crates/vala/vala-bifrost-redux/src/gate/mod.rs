@@ -1683,6 +1683,14 @@ mod tests {
         ///
         /// This implementation returns no error after the frame invariants
         /// succeed; invariant violations panic in the test that owns it.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the frame's tenant differs from its principal's, its table
+        /// is not `bifrost.traces.spans`, it carries a schema fingerprint, its
+        /// payload is not an owner-backed canonical batch, or a `subject_card_uid`
+        /// column is missing, not Utf8, unparseable, or outside the signed scope,
+        /// and when a row or card log lock is poisoned.
         async fn ingest_frame(
             &self,
             frame: crate::contracts::ScribeIngressFrame,
@@ -1879,6 +1887,9 @@ mod tests {
         TableUid::from_bytes(*uuid::Uuid::now_v7().as_bytes())
     }
 
+    /// One user context in a fresh tenant, granted wildcard `bifrost_record_write`
+    /// only when `with_permission` is set, so a Gate test can drive both the allowed
+    /// and the RBAC-denied path.
     fn auth_context(with_permission: bool) -> AuthContext {
         let tenant = DataTenantId::new_v7();
         let permissions = if with_permission {
@@ -2101,6 +2112,12 @@ mod tests {
     /// The same grant is refused when the destination resolves to another
     /// registration, while the rest of `bifrost.gateway` stays unreserved for an
     /// ordinary wildcard writer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the foreign-UID write is admitted or refused with anything but
+    /// `RbacDenied`, reaches Scribe, the exact-UID or wildcard write is refused, or
+    /// Scribe does not ingest exactly those two frames.
     #[tokio::test]
     async fn gate_authorizes_record_writes_against_the_resolved_table_uid() {
         let granted = random_uid();

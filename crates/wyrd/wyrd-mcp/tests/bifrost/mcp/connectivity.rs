@@ -495,6 +495,22 @@ mod pg_tests {
     /// cancelled` and the process shutdown that has to wait for the work it
     /// cancelled. Splitting them would stand up four servers to observe one
     /// chain.
+    ///
+    /// # Errors
+    /// Returns an error when the bound server cannot start or exposes no base
+    /// URL, a raw `/mcp` POST fails or returns a non-JSON body, service
+    /// bootstrap fails or yields no API key, an MCP transport cannot be built,
+    /// a client cannot initialize, call the probe, send or cancel a request,
+    /// or shut down, audit retention or the retained-audit query fails, the
+    /// probe returns no structured content, or the cancel-and-join drain fails.
+    ///
+    /// # Panics
+    /// Panics when a missing or malformed credential is not refused with the
+    /// expected status and Wyrd problem code, the under-scoped call succeeds or
+    /// its refusal lacks the RBAC denial code, the denial is not audited exactly
+    /// once under the caller's request id, the probe reports a tenant or
+    /// principal other than the verified one, or the drain settles within
+    /// 500 ms while the parked call still holds its tracker token.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn mcp_rejects_credentials_and_joins_request_and_process_cancellation()

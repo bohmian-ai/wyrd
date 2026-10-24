@@ -624,6 +624,10 @@ mod tests {
     }
 
     /// Verify Gate's busy identity renders as retryable HTTP 429.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rendered response status is not 429 Too Many Requests.
     #[test]
     fn writer_busy_maps_to_429() {
         let response = ingest_error_to_response(
@@ -637,6 +641,11 @@ mod tests {
     }
 
     /// Verify endpoint-specific table context survives Gate's canonical projection.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a signal's closed-ingress error is not `WriterUnavailable` or
+    /// names a table other than that signal's physical table.
     #[test]
     fn writer_closed_table_name_is_per_signal() {
         for (signal, expected_table) in [
@@ -758,6 +767,10 @@ mod tests {
     }
 
     /// Verify table-not-found uses the catalog's 404 response.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rendered response status is not 404 Not Found.
     #[test]
     fn table_not_found_maps_to_404() {
         let response = ingest_error_to_response(
@@ -771,6 +784,12 @@ mod tests {
     }
 
     /// Verify malformed OTLP requests retain the dedicated code and table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a decode or request-validation error is not
+    /// `OtlpRequestMalformed` for `bifrost.traces.spans`, or its status or code
+    /// differs from 400 and `WYRD_VALA_400_OTLP_REQUEST_MALFORMED`.
     #[test]
     fn decode_error_maps_to_400_with_signal_table_context() {
         for (variant, label) in [
@@ -796,6 +815,11 @@ mod tests {
     }
 
     /// Verify malformed metrics requests use the metrics physical table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the error is not `OtlpRequestMalformed` naming
+    /// `bifrost.metrics.points`.
     #[test]
     fn metrics_decode_error_names_metrics_table() {
         let wyrd_err =
@@ -809,6 +833,11 @@ mod tests {
     }
 
     /// Verify malformed logs requests use the logs physical table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the error is not `OtlpRequestMalformed` naming
+    /// `bifrost.logs.records`.
     #[test]
     fn logs_decode_error_names_logs_table() {
         let wyrd_err =

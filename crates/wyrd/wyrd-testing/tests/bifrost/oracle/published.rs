@@ -240,6 +240,11 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
 ///
 /// Returns a client, ingest, or lifecycle error, and a descriptive error when
 /// the stalled read is not reached, does not terminate, or returns rows.
+///
+/// # Panics
+///
+/// Panics when the read cancelled under the stalled backend returns rows
+/// instead of an error.
 async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
     let mut server = WyrdTestServer::builder()
         .with_shutdown_drain_for_test(CANCELLED_READ_DRAIN)
@@ -850,6 +855,11 @@ async fn variant_sql_registry_covers_every_session() {
 /// # Errors
 ///
 /// Returns the first claim that broke.
+///
+/// # Panics
+///
+/// Panics when the remote-work snapshot holds fewer lease counts than the
+/// topology has followers.
 async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     let cluster = PeerCluster::start_with_slots(&[
         (BifrostTarget::Oracle, Some(2)),

@@ -99,6 +99,22 @@ impl ScribeCapturePeerService for ScribeCapturePeerGrpc {
     /// Scribe refusals cross through Gate's one ingest status mapping, so the
     /// caller sees saturation as `ResourceExhausted` and a closed writer as
     /// `Unavailable`, exactly as public ingest would report them.
+    ///
+    /// # Errors
+    ///
+    /// - A malformed frame is refused before any Scribe work: `InvalidArgument`
+    ///   for an unparseable tenant, batch, or request id, and `PermissionDenied`
+    ///   for a table outside the server-internal destinations or the reserved
+    ///   system tenant outside audit history.
+    /// - `Unavailable` when the tenant registry cannot describe the frame's
+    ///   Cards, so the peer retries rather than writing unstamped rows.
+    /// - A Scribe refusal carries Gate's ingest status with its Wyrd error code:
+    ///   `ResourceExhausted` for saturation (with `retry-after-ms`), payload
+    ///   limits, or a full WAL disk; `Unavailable` for a closed writer;
+    ///   `NotFound` for a missing table; `FailedPrecondition` for a schema
+    ///   fingerprint mismatch; `InvalidArgument` for an invalid frame or a
+    ///   row contract violation;
+    ///   `PermissionDenied` for a Card scope refusal; and `Internal` otherwise.
     async fn ingest_capture(
         &self,
         request: Request<IngestCaptureRequest>,

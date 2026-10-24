@@ -1582,6 +1582,12 @@ pub(crate) mod tests {
     /// [`OracleSessionShape`](crate::resources::OracleSessionShape) built from
     /// this node's own admission, never from a value the requesting peer
     /// supplied.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fragment with a Scribe cut is refused, a cut-less fragment or
+    /// an empty assignment set is accepted, or the admitted shape or session's
+    /// `target_partitions` differs from the admitted eight partitions.
     #[test]
     fn admitted_session_shape_contract() {
         let assignment = |cut: bool| FollowerScanAssignment {

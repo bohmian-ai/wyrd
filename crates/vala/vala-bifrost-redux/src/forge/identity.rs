@@ -42,6 +42,11 @@ mod tests {
     use super::*;
 
     /// Invalid durable identity is rejected by conversion before callers can load a catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an identity with a foreign catalog, an unknown namespace, a
+    /// traversal table name, or a task tenant other than the scheduler's converts.
     #[test]
     fn durable_identity_conversion_fails_closed() {
         let tenant = DataTenantId::new_v7();

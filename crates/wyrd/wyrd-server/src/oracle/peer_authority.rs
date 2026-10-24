@@ -1029,6 +1029,11 @@ mod tests {
     }
 
     /// Builds one fully bound v1 forwarding envelope for authority tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `AuthorizedQueryContext::try_new` refuses the tenant-bound
+    /// principal holding `bifrost_query_read`.
     fn forward_claims(
         worker: NodeId,
         worker_fence: u64,

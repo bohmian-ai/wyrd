@@ -173,6 +173,12 @@ mod tests {
         }
     }
 
+    /// The `Datasets` namespace renders as `bifrost.datasets` and resolves back from
+    /// both its wire spelling and its bare domain namespace.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rendered name or either lookup differs from `Datasets`.
     #[test]
     fn bifrost_namespace_datasets_variant_round_trips() {
         let datasets = BifrostNamespace::Datasets;

@@ -153,6 +153,13 @@ impl TenantTableBinding {
     ///
     /// Returns [`TenantTableBindingError::InvalidPhysicalNamespace`] if Iceberg
     /// rejects the already validated physical namespace components.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when `facts` were not produced by [`Self::facts`]:
+    /// `peak_bytes` must equal the 36-byte tenant string plus `binding_bytes` and
+    /// `file_prefix_bytes`, and `input_bytes` must cover at least the fixed
+    /// `4 + 7 + 36` namespace-component bytes that precede the segment.
     pub(crate) fn from_facts(
         facts: PhysicalBindingFacts<'_>,
     ) -> Result<Self, TenantTableBindingError> {
@@ -271,6 +278,12 @@ mod tests {
     }
 
     /// Proves the checked binding formulas and exact-capacity construction agree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the facts are refused, any total differs from its formula for
+    /// `bifrost.traces.spans`, materialization fails, or the object prefix's length
+    /// or capacity differs from `output_bytes`.
     #[test]
     fn physical_binding_facts_match_materialized_capacities() {
         let tenant = DataTenantId::new_v7();
@@ -303,6 +316,14 @@ mod tests {
         }
     }
 
+    /// Two organizations binding the same logical table get distinct Iceberg
+    /// namespaces and object prefixes, each qualified by its own tenant, while the
+    /// logical namespace stays tenant-free.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either binding is refused, the two physical identities collide,
+    /// or tenant A's namespace or prefix differs from its tenant-qualified form.
     #[test]
     fn tenant_table_binding_uses_authenticated_organization() {
         let table = table();
@@ -407,6 +428,13 @@ mod tests {
         );
     }
 
+    /// A tenant id spelled inside a logical table name stays an opaque local name:
+    /// it is kept verbatim and never reinterpreted as the physical tenant component.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the binding is refused or its table name or logical namespace
+    /// is rewritten.
     #[test]
     fn tenant_table_binding_rejects_tenant_in_logical_name() {
         let tenant = DataTenantId::new_v7();

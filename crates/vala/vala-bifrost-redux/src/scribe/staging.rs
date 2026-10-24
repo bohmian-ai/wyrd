@@ -1408,6 +1408,12 @@ pub(crate) mod tests {
     }
 
     /// Proves restart loads a typed publication transaction without Arrow replay.
+    ///
+    /// # Panics
+    ///
+    /// Panics when staging, election, or persisting or recovering the manifest
+    /// fails, or recovery does not return exactly the one publication with its
+    /// writer stream and the staged object key.
     #[tokio::test]
     async fn publication_manifest_recovers_rows_and_source_fence_fail_closed() {
         let directory = tempfile::tempdir().expect("stage root");

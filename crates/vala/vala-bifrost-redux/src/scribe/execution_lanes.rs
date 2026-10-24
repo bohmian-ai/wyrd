@@ -985,7 +985,8 @@ fn enforce_builtin_source_contract(
             .iter()
             .position(|field| field.name() == DEPLOYMENT_ENVIRONMENT)
     {
-        columns[environment] = resource_environment(rows).map_err(ScribeError::ContractViolation)?;
+        columns[environment] =
+            resource_environment(rows).map_err(ScribeError::ContractViolation)?;
     }
     let user = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|_| ScribeError::InvalidFrame)?;
@@ -1005,11 +1006,11 @@ fn enforce_builtin_source_contract(
 fn resource_environment(rows: &RecordBatch) -> Result<ArrayRef, BifrostError> {
     use crate::tables::signal::{ResourcePromotions, stored_attributes, utf8_opt_column};
 
-    let column = rows
-        .column_by_name("resource_attributes")
-        .ok_or_else(|| BifrostError::SchemaParse {
-            detail: "canonical batch is missing column resource_attributes".to_owned(),
-        })?;
+    let column =
+        rows.column_by_name("resource_attributes")
+            .ok_or_else(|| BifrostError::SchemaParse {
+                detail: "canonical batch is missing column resource_attributes".to_owned(),
+            })?;
     let environments = (0..rows.num_rows())
         .map(|row| {
             stored_attributes(column.as_ref(), row)
@@ -3337,13 +3338,19 @@ mod tests {
         assert!(
             matches!(
                 forged,
-                Err(ScribeError::ContractViolation(BifrostError::SchemaParse { .. }))
+                Err(ScribeError::ContractViolation(
+                    BifrostError::SchemaParse { .. }
+                ))
             ),
             "a public environment must derive from the resource: {forged:?}"
         );
         assert!(
             matches!(
-                decode_rows(&with(&[(WYRD_REQUEST_ID, request.as_str())]), &context, false),
+                decode_rows(
+                    &with(&[(WYRD_REQUEST_ID, request.as_str())]),
+                    &context,
+                    false
+                ),
                 Err(ScribeError::InvalidFrame)
             ),
             "a public frame never supplies its request"

@@ -1135,6 +1135,12 @@ mod tests {
 
     /// Stored scoped Bifrost grants decode to exactly their object scopes, and
     /// a scope-less row is surfaced as a corrupt role.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scoped rows fail to decode, the set is not exactly the
+    /// `logs` schema and `traces` table grants, it holds unscoped Bifrost query
+    /// read, or the scope-less row is not reported as role `unscoped`.
     #[test]
     fn decodes_scoped_bifrost_grants_and_rejects_unscoped_rows() {
         let uid = Uuid::now_v7();

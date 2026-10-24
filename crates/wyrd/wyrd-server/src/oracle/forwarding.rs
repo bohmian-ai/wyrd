@@ -880,6 +880,11 @@ mod tests {
     }
 
     /// Builds one valid authenticated query envelope input.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `AuthorizedQueryContext::try_new` refuses the tenant-bound
+    /// principal holding `bifrost_query_read`.
     fn query_input() -> (AuthorizedQueryContext, BifrostQueryRequest) {
         let tenant = wyrd_spec::DataTenantId::new_v7();
         let permission = Permission::bifrost_query_read();

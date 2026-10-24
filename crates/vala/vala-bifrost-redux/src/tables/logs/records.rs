@@ -105,6 +105,10 @@ impl DomainTable for RecordsTable {
         canonical_arrow_fields(LOG_FIELDS)
     }
 
+    /// Declares the attributed hourly layout on `time_unix_nano`: rows sort by
+    /// environment, Service name, and Service version, then newest first, and
+    /// the Bloom set is the attribution columns plus
+    /// `trace_id` so a trace lookup prunes log files.
     fn physical_layout() -> PhysicalLayoutWire {
         attributed_layout(hourly_layout, "time_unix_nano", &["trace_id"])
     }

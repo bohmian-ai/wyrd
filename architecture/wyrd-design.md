@@ -1457,6 +1457,21 @@ with none applicable the verdict is `inconclusive`. `all` returns failed on
 any failure, else inconclusive on any inconclusive, else passed. `pass_rate`
 divides passes by all applicable requirements, inconclusive included.
 
+A `trace` slot is judged over the whole trace: every retained span of that
+exact trace ID the accepted caller's ordinary `bifrost.traces.spans` query
+may read, whatever workload, Card, or time it carries, ordered by start time
+then span ID with each span's own identity. There is no acceptance-relative
+time window; the result stays owned by the execution's exact binding and
+subject. Each attempt reads one trace once and every check naming it shares
+that read. A trace over 10,000 spans, a refused query, or a timed-out read is
+inconclusive, never truncated. A trace with no visible span has not landed:
+`verify` judges it inconclusive at once, while a queued attempt before its
+last ends `retrying` with `evidence_unavailable` under the queue's ordinary
+three attempts and 30- then 60-second backoff, publishing nothing. The last
+attempt judges it inconclusive and completes under the Verifier's own
+`decide`. A completed result is final: spans landing later are judged only
+by a new execution.
+
 A check whose format declares `data` must return a matching non-null
 object; without a declaration it must not return `data`. The server validates
 the whole response against the exact declared schema and bounds `data` to

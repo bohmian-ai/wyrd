@@ -503,7 +503,10 @@ query, even before its first row. Published-source,
 security, tenant, schema, resource, cancellation, and deadline failures fail.
 
 All callers, including Verifiers, use this same query service and source
-behavior. The request has no visibility, freshness, or query-class selector.
+behavior. A `trace` check reads its evidence as the accepted caller's
+`SELECT … FROM bifrost.traces.spans WHERE trace_id = X'…' ORDER BY
+start_time_unix_nano, span_id LIMIT 10001`: exact trace ID, no time or
+attribution predicate, so retained history may cost more to scan. The request has no visibility, freshness, or query-class selector.
 Oracle alone classifies the one DataFusion plan as Interactive or Analytical
 from its physical root. A successful terminal means the published cut completed
 and each selected online Scribe supplied the rows required by the completed

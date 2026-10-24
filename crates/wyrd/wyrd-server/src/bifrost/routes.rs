@@ -213,6 +213,15 @@ pub(crate) async fn describe(
 /// is not JSON or does not match `AlterTableRequest`; otherwise the
 /// authorization, validation, not-found, version-conflict, or
 /// catalog-availability errors from the catalog service.
+///
+/// The `bifrost.table.alter` span records only the addressed namespace and
+/// table; state, the caller's credentials, and the body are skipped.
+#[tracing::instrument(
+    name = "bifrost.table.alter",
+    level = "debug",
+    skip_all,
+    fields(namespace = %namespace, table = %name)
+)]
 pub(crate) async fn alter(
     State(state): State<AppState>,
     caller: Caller,

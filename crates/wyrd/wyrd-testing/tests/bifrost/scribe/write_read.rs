@@ -162,9 +162,10 @@ async fn assert_canonical_genai_span_is_tenant_isolated(server: &wyrd_testing::W
         &format!(
             "SELECT name, CAST(gen_ai_usage_input_tokens AS BIGINT) AS input_tokens, \
              CAST(status_code AS BIGINT) AS status_code FROM {SPANS} \
-             WHERE scope_name = '{scope}' AND service_name = 'wyrd.fixture.service' \
+             WHERE scope_name = '{scope}' AND deployment_environment = '{environment}' \
              AND gen_ai_request_model = '{model}' AND resource_present AND scope_present \
              ORDER BY start_time_unix_nano",
+            environment = fixture::SPAN_ENVIRONMENT,
             model = fixture::MODEL
         ),
     )

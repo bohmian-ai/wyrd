@@ -373,13 +373,17 @@ fn default_cell(field: &Field) -> Cell {
     }
 }
 
+/// Typed resource environment both fixture spans report.
+pub const SPAN_ENVIRONMENT: &str = "fixture";
+
 /// Build the two-span parent/child trace batch over a described span schema.
 ///
 /// The parent is the GenAI chat operation carrying promoted operation,
 /// provider, model, conversation and token columns plus the structured
 /// input/output message payloads; the child is the tool call it made, which
-/// ends in error status. Both carry resource and scope metadata so a reader
-/// can attribute them to a service.
+/// ends in error status. Each promoted column is the value its own
+/// attributes derive. Both carry resource and scope metadata, including
+/// [`SPAN_ENVIRONMENT`], so a reader can attribute them to a service.
 ///
 /// # Panics
 ///
@@ -399,15 +403,24 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         ("status_message", Cell::Text("ok".to_owned())),
         (
             "attributes",
-            Cell::Variant(attributes(&[
-                ("gen_ai.input.messages", INPUT_MESSAGES),
-                ("gen_ai.output.messages", OUTPUT_MESSAGES),
-            ])),
+            Cell::Variant(serde_json::json!({
+                "gen_ai.input.messages": INPUT_MESSAGES,
+                "gen_ai.output.messages": OUTPUT_MESSAGES,
+                "gen_ai.operation.name": "chat",
+                "gen_ai.provider.name": "anthropic",
+                "gen_ai.request.model": MODEL,
+                "gen_ai.conversation.id": "conversation-fixture",
+                "gen_ai.usage.input_tokens": INPUT_TOKENS,
+                "gen_ai.usage.output_tokens": OUTPUT_TOKENS,
+            })),
         ),
         ("resource_present", Cell::Bool(true)),
         (
             "resource_attributes",
-            Cell::Variant(attributes(&[("service.name", "wyrd.fixture.service")])),
+            Cell::Variant(attributes(&[
+                ("service.name", "wyrd.fixture.service"),
+                ("deployment.environment.name", SPAN_ENVIRONMENT),
+            ])),
         ),
         ("scope_present", Cell::Bool(true)),
         ("scope_name", Cell::Text(scope.to_owned())),
@@ -415,6 +428,10 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         (
             "service_name",
             Cell::Text("wyrd.fixture.service".to_owned()),
+        ),
+        (
+            "deployment_environment",
+            Cell::Text(SPAN_ENVIRONMENT.to_owned()),
         ),
         ("gen_ai_operation_name", Cell::Text("chat".to_owned())),
         ("gen_ai_provider_name", Cell::Text("anthropic".to_owned())),
@@ -467,12 +484,23 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         ),
         (
             "attributes",
-            Cell::Variant(attributes(&[("gen_ai.tool.name", "search")])),
+            Cell::Variant(serde_json::json!({
+                "gen_ai.tool.name": "search",
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.provider.name": "anthropic",
+                "gen_ai.request.model": MODEL,
+                "gen_ai.conversation.id": "conversation-fixture",
+                "gen_ai.usage.input_tokens": 64,
+                "gen_ai.usage.output_tokens": 16,
+            })),
         ),
         ("resource_present", Cell::Bool(true)),
         (
             "resource_attributes",
-            Cell::Variant(attributes(&[("service.name", "wyrd.fixture.service")])),
+            Cell::Variant(attributes(&[
+                ("service.name", "wyrd.fixture.service"),
+                ("deployment.environment.name", SPAN_ENVIRONMENT),
+            ])),
         ),
         ("scope_present", Cell::Bool(true)),
         ("scope_name", Cell::Text(scope.to_owned())),
@@ -480,6 +508,10 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         (
             "service_name",
             Cell::Text("wyrd.fixture.service".to_owned()),
+        ),
+        (
+            "deployment_environment",
+            Cell::Text(SPAN_ENVIRONMENT.to_owned()),
         ),
         (
             "gen_ai_operation_name",
@@ -528,6 +560,11 @@ pub fn logs(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch {
         ("scope_present", Cell::Bool(true)),
         ("scope_name", Cell::Text(scope.to_owned())),
         ("scope_version", Cell::Text("1.0.0".to_owned())),
+        (
+            "service_name",
+            Cell::Text("wyrd.fixture.service".to_owned()),
+        ),
+        ("body_text", Cell::Text(LOG_BODY.to_owned())),
     ]);
     batch(schema, &[record])
 }
@@ -562,6 +599,10 @@ pub fn points(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch
             ("scope_present", Cell::Bool(true)),
             ("scope_name", Cell::Text(scope.to_owned())),
             ("scope_version", Cell::Text("1.0.0".to_owned())),
+            (
+                "service_name",
+                Cell::Text("wyrd.fixture.service".to_owned()),
+            ),
         ])
     };
     let mut counter = common("wyrd.fixture.requests", "sum");

@@ -1116,15 +1116,16 @@ pub fn validate_canonical_user_batch(
 /// of a value, so nested lists and objects come back empty and a Variant type
 /// OTLP cannot carry comes back unset; neither satisfies a string, integer, or
 /// boolean promotion, exactly as on the OTLP path. A stored object already
-/// holds only the final occurrence of each key.
+/// holds only the final occurrence of each key, and any other stored Variant
+/// carries no keys, so it derives no promotion.
 ///
 /// # Errors
 ///
 /// Returns [`BifrostError::SchemaParse`] when the column is not Variant
-/// storage or the row does not hold a Variant object.
+/// storage or the row does not decode.
 pub fn stored_attributes(column: &dyn Array, row: usize) -> Result<Vec<KeyValue>, BifrostError> {
     stored_variant(column, row, |variant| {
-        variant.as_object().map(|object| {
+        variant.as_object().map_or_else(Vec::new, |object| {
             object
                 .iter()
                 .map(|(key, value)| KeyValue {
@@ -1133,9 +1134,6 @@ pub fn stored_attributes(column: &dyn Array, row: usize) -> Result<Vec<KeyValue>
                 })
                 .collect()
         })
-    })?
-    .ok_or_else(|| BifrostError::SchemaParse {
-        detail: "a canonical attribute column does not hold a Variant object".to_owned(),
     })
 }
 

@@ -2256,7 +2256,8 @@ impl VariantAdmissionJourney {
     ///
     /// Every other column keeps the canonical fixture's valid value, so a
     /// refusal can come only from the two supplied fields or a deliberate
-    /// schema change.
+    /// schema change. No supplied body is a string, so the derived
+    /// `body_text` is null.
     ///
     /// # Errors
     ///
@@ -2280,10 +2281,11 @@ impl VariantAdmissionJourney {
             fields[index] = Arc::new(field);
             columns[index] = column;
         }
-        Ok(RecordBatch::try_new(
-            Arc::new(Schema::new(fields)),
-            columns,
-        )?)
+        with_text(
+            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?,
+            "body_text",
+            None,
+        )
     }
 
     /// The canonical two-span fixture under span scope `scope`.
@@ -4921,6 +4923,224 @@ async fn user_state_native_io_selects_validated_root() -> Result<(), ServerJourn
     )
     .await?;
     native_row(&editor, &fqn, &preflight, None).await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// `batch` with every row's `name` set to `value`, appending `name` as a
+/// nullable Utf8 column when the batch does not declare it.
+///
+/// # Errors
+/// Returns the Arrow error when the rebuilt batch does not assemble.
+fn with_text(
+    batch: &RecordBatch,
+    name: &str,
+    value: Option<&str>,
+) -> Result<RecordBatch, ServerJourneyError> {
+    let column: ArrayRef = Arc::new(StringArray::from(vec![value; batch.num_rows()]));
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    if let Ok(index) = batch.schema().index_of(name) {
+        columns[index] = column;
+    } else {
+        fields.push(Arc::new(Field::new(name, DataType::Utf8, true)));
+        columns.push(column);
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
+}
+
+/// Send `batch` to `bifrost.traces.spans` as one native frame under
+/// `batch_id` as `client`, and return the request id its rows carry.
+///
+/// # Errors
+/// Returns the server's stable refusal, or a harness error when the ingest
+/// channel cannot be dialled.
+///
+/// # Panics
+/// Panics when the batch does not encode as Arrow IPC.
+async fn native_spans(
+    client: &wyrd_client::WyrdClient,
+    batch_id: uuid::Uuid,
+    batch: &RecordBatch,
+) -> Result<RequestId, WyrdError> {
+    RawIngest::connect(client)
+        .await?
+        .insert(SPANS, batch_id, ipc(batch).expect("the frame encodes"))
+        .await
+}
+
+/// The distinct shared dimensions and workload of the spans one request
+/// wrote, as `admin` reads them back; a null column is omitted.
+///
+/// # Errors
+/// Returns the query error.
+async fn span_dimensions(
+    admin: &wyrd_client::WyrdClient,
+    request: &RequestId,
+) -> Result<Vec<Value>, ServerJourneyError> {
+    Ok(Bifrost::query_only(admin)
+        .sql_as(
+            &format!(
+                "SELECT DISTINCT service_name, service_version, deployment_environment, \
+                 subject_kind, subject_name, subject_version, \
+                 CAST(workload_card_uid AS VARCHAR) AS workload_card_uid \
+                 FROM bifrost.traces.spans \
+                 WHERE CAST(wyrd_request_id AS VARCHAR) = '{}'",
+                request.as_str()
+            ),
+            &[],
+        )
+        .await?)
+}
+
+/// Native canonical span frames carry only what their source fields derive,
+/// and their shared dimensions come from the accepted request context.
+///
+/// A frame whose promoted Service, environment, or subject label is forged is
+/// refused whole before any ACK. A frame run as a Service in an accepted
+/// environment lands with that Service's canonical name and version and that
+/// environment over the rows' labels, and with its Model subject's kind,
+/// name, and version. Without a request environment the typed resource
+/// environment survives, a rootless frame keeps its observed Service labels,
+/// and an empty environment header refuses the request. A batch id replayed
+/// under a changed owner is refused and its rows keep the original owner,
+/// while an exact replay is answered as a duplicate.
+///
+/// # Errors
+/// Returns server, fixture, client, ingest, flush, or query failures.
+///
+/// # Panics
+/// Panics when a forged or context-refused frame is acked, a valid frame is
+/// refused, or a row lands with other dimensions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn native_signal_values_and_attribution_are_validated_before_ack()
+-> Result<(), ServerJourneyError> {
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    server
+        .ensure_builtin_table_for_test(server.data_tenant_id(), "traces", "spans")
+        .await?;
+    let admin_key = server
+        .bootstrap_service("native-signal-admin", &["admin"])
+        .await?;
+    let admin = native_client(
+        &server,
+        admin_key
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let cards = wyrd_client::cards::Cards::connect_with(&admin).await?;
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    let model = Box::pin(cards.declare_from_path(&fixtures.join("observed-model.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Model has a UID")?;
+    let service_uid = Box::pin(cards.declare_from_path(&fixtures.join("observed-service.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Service has a UID")?;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("native-signal-editor", &["editor"])
+        .await?
+    else {
+        return Err("a user bootstraps as a user".into());
+    };
+    let editor = native_client(&server, &jwt)?;
+    let owned = editor.for_service(service_uid.clone(), Some("staging".to_owned()));
+    let schema = Arc::clone(
+        TableConfig::describe_with(&admin, SPANS)
+            .await?
+            .user_schema(),
+    );
+    let spans = canonical_signals::spans(
+        &schema,
+        "native-signal",
+        Utc::now().timestamp_nanos_opt().unwrap_or(0),
+    );
+    let attributed = with_text(&spans, SUBJECT_CARD_UID, Some(model.as_str()))?;
+
+    for column in ["service_name", "deployment_environment", "subject_name"] {
+        let forged = with_text(&attributed, column, Some("forged"))?;
+        let refused = native_spans(&owned, uuid::Uuid::now_v7(), &forged)
+            .await
+            .expect_err("a forged frame is refused before any ACK");
+        assert!(
+            matches!(
+                refused,
+                WyrdError::Vala {
+                    error: BifrostError::SchemaParse { .. }
+                }
+            ),
+            "forged {column}: {refused:?}"
+        );
+    }
+    let empty = native_spans(
+        &editor.for_service(service_uid.clone(), Some(String::new())),
+        uuid::Uuid::now_v7(),
+        &spans,
+    )
+    .await
+    .expect_err("an empty environment refuses the request");
+    assert!(
+        matches!(empty, WyrdError::Validation { .. }),
+        "empty environment: {empty:?}"
+    );
+
+    let replayed = uuid::Uuid::now_v7();
+    let landed = [
+        native_spans(&owned, uuid::Uuid::now_v7(), &attributed).await?,
+        native_spans(
+            &editor.for_workload(service_uid.clone()),
+            uuid::Uuid::now_v7(),
+            &spans,
+        )
+        .await?,
+        native_spans(&editor, replayed, &spans).await?,
+    ];
+    native_spans(&editor, replayed, &spans).await?;
+    native_spans(&owned, replayed, &spans)
+        .await
+        .expect_err("a batch id replayed under a changed owner is refused");
+    server.flush_bifrost().await?;
+
+    let service = service_uid.to_string();
+    let expected = [
+        json!({
+            "service_name": "observed-service",
+            "service_version": "1.0.0",
+            "deployment_environment": "staging",
+            "subject_kind": "Model",
+            "subject_name": "observed-model",
+            "subject_version": "1.0.0",
+            "workload_card_uid": service,
+        }),
+        json!({
+            "service_name": "observed-service",
+            "service_version": "1.0.0",
+            "deployment_environment": canonical_signals::SPAN_ENVIRONMENT,
+            "workload_card_uid": service,
+        }),
+        json!({
+            "service_name": "wyrd.fixture.service",
+            "deployment_environment": canonical_signals::SPAN_ENVIRONMENT,
+        }),
+    ];
+    for (request, expected) in landed.iter().zip(expected) {
+        assert_eq!(
+            span_dimensions(&admin, request).await?,
+            vec![expected],
+            "request {request}"
+        );
+    }
     server.shutdown().await?;
     Ok(())
 }

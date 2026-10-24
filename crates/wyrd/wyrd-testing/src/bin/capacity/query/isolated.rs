@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
@@ -32,12 +32,6 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Scribe's counter of Arrow bytes inserted into memtables.
 pub const INSERTED: &str = "bifrost_scribe_memtable_bytes_inserted_total";
 
-/// Oracle's counter of rows its executed plans scanned.
-pub const ROWS_SCANNED: &str = "oracle_query_rows_scanned_total";
-
-/// Oracle's counter of bytes its executed plans scanned.
-const BYTES_SCANNED: &str = "oracle_query_bytes_scanned_total";
-
 /// The outcome every judged Bifrost server timing has.
 pub const SUCCESS: &str = "success";
 
@@ -55,6 +49,9 @@ pub struct Isolated {
     senders: Vec<Lane>,
     /// The statement sequence every read window continues.
     sequence: Arc<AtomicU64>,
+    /// Each write path's published Parquet bytes per retained Arrow byte,
+    /// from its settled sample in [`Workload::prepare`].
+    storage: Vec<(WriteOp, Reading)>,
 }
 
 impl Isolated {
@@ -67,6 +64,7 @@ impl Isolated {
             bench: None,
             senders: Vec::new(),
             sequence: Arc::new(AtomicU64::new(0)),
+            storage: Vec::new(),
         }
     }
 
@@ -160,17 +158,9 @@ impl Isolated {
         );
         read_outcome(&mut repetition, &outcome, read_case(op));
         if read_case(op).is_some() {
-            let queries = outcome.latencies_us.len() as f64;
-            let per_query = |family: &str| {
-                let scanned = after.sum(family, &[]) - before.sum(family, &[]);
-                if queries > 0.0 {
-                    Reading::exact(scanned / queries)
-                } else {
-                    Reading::missing("no query was answered")
-                }
-            };
-            repetition.set("scanned_rows_per_query", per_query(ROWS_SCANNED));
-            repetition.set("scanned_bytes_per_query", per_query(BYTES_SCANNED));
+            let [rows, bytes] = population.scanned_per_query(SUCCESS);
+            repetition.set("scanned_rows_per_query", rows);
+            repetition.set("scanned_bytes_per_query", bytes);
         }
         if let Some(write) = write {
             let inserted = after.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
@@ -190,14 +180,27 @@ impl Isolated {
                     "L1 measures closed-loop acknowledgement; visibility is judged at L2",
                 ),
             );
-            repetition.set("storage_ratio", Reading::missing("publication continues past the window, so its Parquet bytes are not attributable to it"));
+            let ratio = self.storage.iter().find(|(op, _)| *op == write);
+            repetition.set(
+                "storage_ratio",
+                ratio.map_or_else(
+                    || Reading::missing("the path's storage sample was not taken"),
+                    |(_, ratio)| ratio.clone(),
+                ),
+            );
         }
         Ok(repetition)
     }
 }
 
+/// Rows each write path's storage sample writes in [`Workload::prepare`].
+const STORAGE_ROWS: i64 = 200_000;
+
+/// Committed Parquet bytes the server published.
+const PUBLISHED: &str = "bifrost_scribe_publication_bytes_total";
+
 /// Bytes per MiB.
-const MIB: f64 = 1_048_576.0;
+pub const MIB: f64 = 1_048_576.0;
 
 /// Sets the client readings every closed-loop step shares: requests,
 /// errors, diagnostic client round-trip percentiles, and, for a read
@@ -253,20 +256,50 @@ impl Workload for Isolated {
         proved.map_err(ExperimentError::Workload)
     }
 
-    /// Writes the standard fixture into the smoked server, waits until
-    /// every row is published as Parquet, and computes the exact answers.
+    /// Samples each write path's storage ratio, then writes the standard
+    /// fixture into the smoked server, waits until every row is published
+    /// as Parquet, and computes the exact answers.
+    ///
+    /// Each path writes [`STORAGE_ROWS`] fresh rows alone and settles; its
+    /// ratio is the settled `bifrost_scribe_publication_bytes_total` delta
+    /// over the `INSERTED` delta, both including server-internal rows written
+    /// meanwhile, and excluding WAL, staging, and catalog bytes.
     ///
     /// # Errors
     ///
-    /// Returns a workload error for an unsmoked workload, a fixture that
-    /// loaded short or with errors, or rows not published within the settle
-    /// timeout. Rows already written stay in the server; nothing is retried.
+    /// Returns a workload error for an unsmoked workload, a scrape failure,
+    /// a fixture that loaded short or with errors, or rows not published
+    /// within the settle timeout. Rows already written stay in the server;
+    /// nothing is retried.
     async fn prepare(&mut self) -> Result<(), ExperimentError> {
         let server = self
             .server
             .as_ref()
             .ok_or_else(|| ExperimentError::workload("the workload was not smoked"))?;
         let client = client(server).map_err(ExperimentError::workload)?;
+        for (op, sender, cursor) in &self.senders {
+            let before = server.metrics().await.map_err(ExperimentError::workload)?;
+            let end = cursor.load(Ordering::Relaxed) + STORAGE_ROWS;
+            let sample = sender
+                .closed_loop(cursor, end, LOADERS, &CancellationToken::new())
+                .await;
+            Residence::settle(server, SETTLE_TIMEOUT)
+                .await
+                .map_err(ExperimentError::workload)?;
+            let after = server.metrics().await.map_err(ExperimentError::workload)?;
+            let delta = |family: &str| after.sum(family, &[]) - before.sum(family, &[]);
+            let ratio = if sample.error_count() > 0 {
+                Reading::missing(format!(
+                    "the storage sample failed with {:?}",
+                    sample.errors
+                ))
+            } else if delta(INSERTED) > 0.0 {
+                Reading::exact(delta(PUBLISHED) / delta(INSERTED))
+            } else {
+                Reading::missing("the storage sample inserted no retained bytes")
+            };
+            self.storage.push((*op, ratio));
+        }
         let fixture = Fixture::standard();
         let loader = Sender::native(&client, TABLE, fixture)
             .await

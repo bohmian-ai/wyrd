@@ -677,6 +677,16 @@ async fn prove_query_stream_telemetry(
         oracle_stream.attributes.get("outcome").map(String::as_str),
         Some("success")
     );
+    for fact in ["rows_scanned", "bytes_scanned"] {
+        let scanned = oracle_stream
+            .attributes
+            .get(fact)
+            .and_then(|value| value.parse::<u64>().ok());
+        assert!(
+            scanned.is_some_and(|scanned| scanned > 0),
+            "the published scan reports its executed-plan {fact} on its trace, saw {scanned:?}"
+        );
+    }
     assert!(
         oracle_stream.duration_nanos <= gate_stream.duration_nanos,
         "Oracle stream work ends inside the Gate stream lifetime"

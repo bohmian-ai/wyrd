@@ -1392,6 +1392,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             instance: "server".to_owned(),
+            scan: None,
         }
     }
 

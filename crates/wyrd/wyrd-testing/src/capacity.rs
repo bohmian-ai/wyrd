@@ -21,7 +21,7 @@
 //! [`Usage`] at its close. A reading the OS cannot supply, a counter that went
 //! backwards, or a lost process is `None`, never zero use.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
@@ -526,6 +526,31 @@ pub struct Timing {
     pub span_id: String,
     /// The exporting server process's `service.instance.id`.
     pub instance: String,
+    /// For a `bifrost.query` observation, the executed-plan scan Oracle
+    /// recorded on the same trace, once a window joined it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<Scan>,
+}
+
+/// The public query's server timing boundary, whose observations carry
+/// their trace's [`Scan`].
+pub const QUERY_BOUNDARY: &str = "bifrost.query";
+
+/// Name of the Oracle span that records a query's executed-plan scan.
+pub const SCAN_SPAN: &str = "bifrost.oracle.stream";
+
+/// One query's executed-plan scan facts, decoded from a [`SCAN_SPAN`] the
+/// server exported on the query's trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Scan {
+    /// Hex trace id: the query's trace.
+    pub trace_id: String,
+    /// Rows the executed plan's file scans output, when they reported it.
+    pub rows: Option<u64>,
+    /// Bytes the executed plan scanned, when its scans reported it.
+    pub bytes: Option<u64>,
+    /// When the span ended, Unix nanoseconds: assigns it to a window only.
+    pub end_unix_ns: u64,
 }
 
 impl Timing {
@@ -551,11 +576,15 @@ impl Timing {
     }
 }
 
-/// Every [`TIMING_SPAN`] in one OTLP trace export, with a reason for each
-/// one that cannot be decoded, and the number of spans it carried.
+/// Every [`TIMING_SPAN`] and [`SCAN_SPAN`] in one OTLP trace export, with a
+/// reason for each one that cannot be decoded, and the number of spans it
+/// carried.
 #[must_use]
-pub fn decode_timings(request: &ExportTraceServiceRequest) -> (Vec<Timing>, Vec<String>, u64) {
-    let (mut timings, mut malformed, mut spans) = (Vec::new(), Vec::new(), 0_u64);
+pub fn decode_timings(
+    request: &ExportTraceServiceRequest,
+) -> (Vec<Timing>, Vec<Scan>, Vec<String>, u64) {
+    let (mut timings, mut scans, mut malformed, mut spans) =
+        (Vec::new(), Vec::new(), Vec::new(), 0_u64);
     for resource in &request.resource_spans {
         let instance = resource
             .resource
@@ -564,6 +593,23 @@ pub fn decode_timings(request: &ExportTraceServiceRequest) -> (Vec<Timing>, Vec<
             .unwrap_or_default();
         for span in resource.scope_spans.iter().flat_map(|scope| &scope.spans) {
             spans += 1;
+            if span.name == SCAN_SPAN {
+                match (
+                    nanos(&span.attributes, "rows_scanned"),
+                    nanos(&span.attributes, "bytes_scanned"),
+                ) {
+                    (Ok(rows), Ok(bytes)) => scans.push(Scan {
+                        trace_id: hex(&span.trace_id),
+                        rows,
+                        bytes,
+                        end_unix_ns: span.end_time_unix_nano,
+                    }),
+                    (Err(reason), _) | (_, Err(reason)) => {
+                        malformed.push(format!("a `{SCAN_SPAN}` span is malformed: {reason}"));
+                    }
+                }
+                continue;
+            }
             if span.name != TIMING_SPAN {
                 continue;
             }
@@ -580,6 +626,7 @@ pub fn decode_timings(request: &ExportTraceServiceRequest) -> (Vec<Timing>, Vec<
                     trace_id: hex(&span.trace_id),
                     span_id: hex(&span.span_id),
                     instance: instance.clone(),
+                    scan: None,
                 })
             })();
             match decoded {
@@ -590,7 +637,7 @@ pub fn decode_timings(request: &ExportTraceServiceRequest) -> (Vec<Timing>, Vec<
             }
         }
     }
-    (timings, malformed, spans)
+    (timings, scans, malformed, spans)
 }
 
 /// The string attribute `key`.
@@ -606,7 +653,8 @@ fn text(attributes: &[KeyValue], key: &str) -> Option<String> {
         )
 }
 
-/// The non-negative integer attribute `key`, `None` when absent.
+/// The non-negative integer attribute `key`, such as a duration or a scan
+/// count, `None` when absent.
 ///
 /// # Errors
 ///
@@ -664,7 +712,9 @@ enum Report {
     Export {
         /// Its timing observations.
         timings: Vec<Timing>,
-        /// Why each undecodable timing span was refused.
+        /// Its queries' scan facts.
+        scans: Vec<Scan>,
+        /// Why each undecodable timing or scan span was refused.
         malformed: Vec<String>,
         /// Spans of every name it carried.
         spans: u64,
@@ -677,6 +727,8 @@ enum Report {
 struct Received {
     /// Unassigned timing observations, in arrival order.
     timings: Vec<Timing>,
+    /// Unassigned scan facts, in arrival order, within the same retention.
+    scans: Vec<Scan>,
     /// Undecodable timing spans since the last window, at most
     /// [`KEPT_MALFORMED`].
     malformed: Vec<String>,
@@ -702,6 +754,7 @@ impl Default for Received {
     fn default() -> Self {
         Self {
             timings: Vec::new(),
+            scans: Vec::new(),
             malformed: Vec::new(),
             unkept: 0,
             dropped: BTreeMap::new(),
@@ -714,15 +767,25 @@ impl Default for Received {
 }
 
 impl Received {
-    /// Keeps one decoded export within the retention bounds.
-    fn keep(&mut self, timings: Vec<Timing>, malformed: Vec<String>, spans: u64) {
+    /// Keeps one decoded export within the retention bounds; scan facts
+    /// share the timings' bound and overflow under [`SCAN_SPAN`].
+    fn keep(&mut self, timings: Vec<Timing>, scans: Vec<Scan>, malformed: Vec<String>, spans: u64) {
         for timing in timings {
-            if self.timings.len() < self.retain {
+            if self.timings.len() + self.scans.len() < self.retain {
                 self.timings.push(timing);
             } else {
                 let (count, latest) = self.dropped.entry(timing.boundary).or_default();
                 *count += 1;
                 *latest = (*latest).max(timing.end_unix_ns);
+            }
+        }
+        for scan in scans {
+            if self.timings.len() + self.scans.len() < self.retain {
+                self.scans.push(scan);
+            } else {
+                let (count, latest) = self.dropped.entry(SCAN_SPAN.to_owned()).or_default();
+                *count += 1;
+                *latest = (*latest).max(scan.end_unix_ns);
             }
         }
         for reason in malformed {
@@ -752,11 +815,12 @@ impl TraceService for Intake {
         request: wyrd_tonic::tonic::Request<ExportTraceServiceRequest>,
     ) -> Result<wyrd_tonic::tonic::Response<ExportTraceServiceResponse>, wyrd_tonic::tonic::Status>
     {
-        let (timings, malformed, spans) = decode_timings(request.get_ref());
+        let (timings, scans, malformed, spans) = decode_timings(request.get_ref());
         report(
             &self.0,
             &Report::Export {
                 timings,
+                scans,
                 malformed,
                 spans,
             },
@@ -945,12 +1009,13 @@ impl Collector {
                     match serde_json::from_str(&line) {
                         Ok(Report::Export {
                             timings,
+                            scans,
                             malformed,
                             spans,
                         }) => shared
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
-                            .keep(timings, malformed, spans),
+                            .keep(timings, scans, malformed, spans),
                         other => return Err(format!("an unexpected report {other:?}")),
                     }
                 }
@@ -1147,8 +1212,16 @@ impl Collector {
             ));
         }
         invalid.extend(received.lost.clone());
-        for (boundary, _) in expected {
-            if let Some((count, latest)) = received.dropped.remove(*boundary)
+        let scanned = expected
+            .iter()
+            .any(|(boundary, _)| *boundary == QUERY_BOUNDARY)
+            .then_some(SCAN_SPAN);
+        for boundary in expected
+            .iter()
+            .map(|(boundary, _)| *boundary)
+            .chain(scanned)
+        {
+            if let Some((count, latest)) = received.dropped.remove(boundary)
                 && latest >= from
             {
                 invalid.push(format!(
@@ -1171,9 +1244,19 @@ impl Collector {
                 traces.len()
             ));
         }
-        let (timings, _): (Vec<Timing>, Vec<Timing>) = std::mem::take(&mut received.timings)
+        let (mut timings, _): (Vec<Timing>, Vec<Timing>) = std::mem::take(&mut received.timings)
             .into_iter()
             .partition(|timing| matching(timing));
+        let mut scans: HashMap<String, Scan> = std::mem::take(&mut received.scans)
+            .into_iter()
+            .filter(|scan| scan.end_unix_ns >= from)
+            .map(|scan| (scan.trace_id.clone(), scan))
+            .collect();
+        for timing in &mut timings {
+            if timing.boundary == QUERY_BOUNDARY {
+                timing.scan = scans.remove(&timing.trace_id);
+            }
+        }
         let (exports, spans) = (received.exports, received.spans);
         drop(received);
         if !traces.is_empty() {
@@ -1254,6 +1337,34 @@ pub fn unix_nanos(at: SystemTime) -> u64 {
         .map_or(0, |since| {
             u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
         })
+}
+
+/// The mean executed-plan scanned rows and bytes per query over `scans`,
+/// each query's own [`Scan`] on its trace. Each is missing, never zero,
+/// without a query or when one has no scan or its scan lacks the fact.
+#[must_use]
+pub fn scanned_per_query<'a>(scans: impl Iterator<Item = Option<&'a Scan>>) -> [Reading; 2] {
+    let scans: Vec<Option<&Scan>> = scans.collect();
+    let mean = |fact: &str, pick: fn(&Scan) -> Option<u64>| {
+        if scans.is_empty() {
+            return Reading::missing("no query was answered");
+        }
+        let mut total = 0_u64;
+        for scan in &scans {
+            let Some(value) = scan.and_then(pick) else {
+                return Reading::missing(format!(
+                    "an answered query has no executed-plan scanned {fact} on its trace"
+                ));
+            };
+            total = total.saturating_add(value);
+        }
+        let count = scans.len() as u64;
+        Reading::exact(total as f64 / count as f64).with_samples(count)
+    };
+    [
+        mean("rows", |scan| scan.rows),
+        mean("bytes", |scan| scan.bytes),
+    ]
 }
 
 /// One window's server timing observations.
@@ -1359,6 +1470,16 @@ impl Population {
         for (id, q) in ids {
             repetition.set(id, Reading::percentile(&samples, *q, NANOS_PER_MS));
         }
+    }
+
+    /// [`scanned_per_query`] over every [`QUERY_BOUNDARY`] observation with
+    /// `outcome`.
+    #[must_use]
+    pub fn scanned_per_query(&self, outcome: &str) -> [Reading; 2] {
+        scanned_per_query(
+            self.of(QUERY_BOUNDARY, outcome)
+                .map(|query| query.scan.as_ref()),
+        )
     }
 
     /// Observations of `boundary` with `outcome`.
@@ -1567,7 +1688,8 @@ pub fn install_tracing() {
 mod tests {
     use super::{
         Collector, ExportTraceServiceRequest, KEPT_MALFORMED, KeyValue, Percentiles, Population,
-        Readings, Selection, Smoke, TIMING_SPAN, Telemetry, Timing, Usage, deltas, elapsed,
+        QUERY_BOUNDARY, Readings, SCAN_SPAN, Selection, Smoke, TIMING_SPAN, Telemetry, Timing,
+        Usage, deltas, elapsed,
     };
     use crate::release_server::Metrics;
 
@@ -1707,8 +1829,9 @@ mod tests {
     /// stragglers; an in-limit window stays exact; offered traces match
     /// their own observations in any order, while a missing offered trace
     /// beside an unrelated same-boundary span or a repeated trace is
-    /// invalid; and malformed reasons and a stopped collector stay bounded,
-    /// specific invalidity.
+    /// invalid; each query's scan joins its own trace in any arrival order
+    /// and a query without one has no scan reading; and malformed reasons and
+    /// a stopped collector stay bounded, specific invalidity.
     ///
     /// # Panics
     ///
@@ -1736,13 +1859,28 @@ mod tests {
                         key: key.to_owned(),
                         value: Some(AnyValue { value: Some(value) }),
                     };
-                    let mut attributes = vec![
-                        attribute("boundary", Any::StringValue(boundary.to_owned())),
-                        attribute("outcome", Any::StringValue("success".to_owned())),
-                    ];
-                    attributes.extend(elapsed.map(|ns| attribute("elapsed_ns", Any::IntValue(ns))));
+                    // A `SCAN_SPAN` boundary exports a scan of `elapsed`
+                    // rows and twice as many bytes instead of a timing.
+                    let (name, attributes) = if boundary == SCAN_SPAN {
+                        let scanned = elapsed.unwrap_or_default();
+                        (
+                            SCAN_SPAN,
+                            vec![
+                                attribute("rows_scanned", Any::IntValue(scanned)),
+                                attribute("bytes_scanned", Any::IntValue(scanned * 2)),
+                            ],
+                        )
+                    } else {
+                        let mut attributes = vec![
+                            attribute("boundary", Any::StringValue(boundary.to_owned())),
+                            attribute("outcome", Any::StringValue("success".to_owned())),
+                        ];
+                        attributes
+                            .extend(elapsed.map(|ns| attribute("elapsed_ns", Any::IntValue(ns))));
+                        (TIMING_SPAN, attributes)
+                    };
                     Span {
-                        name: TIMING_SPAN.to_owned(),
+                        name: name.to_owned(),
                         trace_id: [trace.to_be_bytes(), trace.to_be_bytes()].concat(),
                         span_id: id.to_be_bytes().to_vec(),
                         end_time_unix_nano: super::unix_nanos(std::time::SystemTime::now()),
@@ -1813,6 +1951,40 @@ mod tests {
             ["1 of 1 traced requests have more than one server timing observation"]
         );
 
+        collector.received.lock().expect("received").retain = 16;
+        let opened = std::time::SystemTime::now();
+        export(SCAN_SPAN, &[12], Some(5)).await;
+        export(QUERY_BOUNDARY, &[11, 12], Some(10)).await;
+        export(SCAN_SPAN, &[11], Some(3)).await;
+        let scanned = collector
+            .window("scanned", opened, &[(QUERY_BOUNDARY, 2)])
+            .await;
+        assert!(scanned.invalid.is_empty(), "{:?}", scanned.invalid);
+        let rows = |id: u64| {
+            scanned
+                .timings
+                .iter()
+                .find(|timing| timing.trace_id == trace(id))
+                .and_then(|timing| timing.scan.as_ref()?.rows)
+        };
+        assert_eq!(
+            (rows(11), rows(12)),
+            (Some(3), Some(5)),
+            "each scan joins its own trace"
+        );
+        let [rows, bytes] = scanned.scanned_per_query("success");
+        assert_eq!((rows.value, bytes.value), (Some(4.0), Some(8.0)));
+        let opened = std::time::SystemTime::now();
+        export(QUERY_BOUNDARY, &[13], Some(10)).await;
+        let unscanned = collector
+            .window("unscanned", opened, &[(QUERY_BOUNDARY, 1)])
+            .await;
+        let [rows, _] = unscanned.scanned_per_query("success");
+        assert_eq!(
+            rows.value, None,
+            "a query without its scan is missing, never zero"
+        );
+
         let opened = std::time::SystemTime::now();
         export("a", &[0; KEPT_MALFORMED + 2], None).await;
         let malformed = collector.smoke("malformed", opened, &[("a", 0)], &[]).await;
@@ -1848,6 +2020,7 @@ mod tests {
             trace_id: "t".to_owned(),
             span_id: "s".to_owned(),
             instance: "i".to_owned(),
+            scan: None,
         };
         let usage = |server_cpu_seconds| Usage {
             seconds: 1.0,

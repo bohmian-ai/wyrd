@@ -317,12 +317,12 @@ fn isolated_metrics() -> Vec<Metric> {
         Metric::raw(
             "scanned_rows_per_query",
             "rows/query",
-            "rows the executed plans' file scans output (`oracle_query_rows_scanned_total`) per answered query; read steps only",
+            "mean rows each successful query's own executed-plan file scans output (`bifrost.oracle.stream` `rows_scanned` on its trace); read steps only",
         ),
         Metric::raw(
             "scanned_bytes_per_query",
             "B/query",
-            "bytes the executed plans scanned (`oracle_query_bytes_scanned_total`) per answered query; read steps only",
+            "mean bytes each successful query's own executed plan scanned (`bifrost.oracle.stream` `bytes_scanned` on its trace); read steps only",
         ),
         Metric::raw(
             "rows",
@@ -347,7 +347,7 @@ fn isolated_metrics() -> Vec<Metric> {
         Metric::raw(
             "storage_ratio",
             "ratio",
-            "published Parquet bytes per retained Arrow byte",
+            "published Parquet bytes per retained Arrow byte of one settled 200,000-row sample of the path taken before the windows; both include server-internal rows written meanwhile and exclude WAL, staging, and catalog bytes; write steps only",
         ),
         Metric::raw("scaling", "ratio", "Q_N/(N × Q_1) of `rate`"),
         Metric::raw("base_rate", "requests/s", "the one-client step's `rate`"),
@@ -913,6 +913,10 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
         Metric::raw("table_aggregates", "queries", "exactly answered whole-table aggregates in the window"),
         Metric::raw("ingest_rows", "rows", "durably acknowledged ingest rows in the window"),
         Metric::raw("queries_after_window", "queries", "exactly answered mixed queries in flight at the window end, answered after it and outside every work-per-CPU metric"),
+        Metric::raw("scanned_rows_per_query", "rows/query", "mean rows each in-window mixed query's own executed-plan file scans output (`bifrost.oracle.stream` `rows_scanned` on its trace)"),
+        Metric::raw("scanned_bytes_per_query", "B/query", "mean bytes each in-window mixed query's own executed plan scanned (`bifrost.oracle.stream` `bytes_scanned` on its trace)"),
+        Metric::raw("retained_mib", "MiB", "retained Arrow MiB the server inserted while the window was open (`bifrost_scribe_memtable_bytes_inserted_total`), including client-queue lanes and server-internal rows"),
+        Metric::raw("otlp_wire_mib", "MiB", "encoded OTLP protobuf MiB of ingest acknowledged before the window end, before framing and compression"),
         Metric::raw("ingest_rows_after_window", "rows", "ingest rows in flight at the window end, acknowledged during the drain and outside every work-per-CPU metric"),
         Metric::raw("p50_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (12 queries/s, at most 32 in flight, not the L1 64-client objective)"),
         Metric::raw("p95_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (12 queries/s, at most 32 in flight)"),
@@ -922,6 +926,10 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
         Metric::derived("table_aggregates_per_cpu_s", "queries/cpu-s", "whole-table aggregates per server CPU-second; the denominator also pays for everything else", Direction::Higher, Derive::PerCpu { work: "table_aggregates".to_owned(), scale: 1.0 }),
         Metric::derived("ingest_rows_per_cpu_s", "rows/cpu-s", "ingest rows per server CPU-second; the denominator also pays for queries", Direction::Higher, Derive::PerCpu { work: "ingest_rows".to_owned(), scale: 1.0 }),
         Metric::derived("queries_per_s_per_vcpu", "queries/s/vCPU", "mixed queries per wall second per provisioned logical CPU, (W/T)/P", Direction::Higher, Derive::PerVcpu { work: "queries".to_owned(), scale: 1.0 }),
+        Metric::derived("mib_per_s_per_vcpu", "MiB/s/vCPU", "(W/T)/P: retained Arrow MiB per wall second per provisioned logical CPU", Direction::Higher, Derive::PerVcpu { work: "retained_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("mib_per_cpu_s", "MiB/cpu-s", "W/C: retained Arrow MiB per server CPU-second; the denominator also pays for queries", Direction::Higher, Derive::PerCpu { work: "retained_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("wire_mib_per_s_per_vcpu", "MiB/s/vCPU", "(W/T)/P: encoded OTLP wire MiB per wall second per provisioned logical CPU", Direction::Higher, Derive::PerVcpu { work: "otlp_wire_mib".to_owned(), scale: 1.0 }),
+        Metric::derived("wire_mib_per_cpu_s", "MiB/cpu-s", "W/C: encoded OTLP wire MiB per server CPU-second; the denominator also pays for native ingest and queries", Direction::Higher, Derive::PerCpu { work: "otlp_wire_mib".to_owned(), scale: 1.0 }),
         Metric::derived("cpu_ms_per_query", "cpu-ms/query", "server CPU per mixed query, C/W; the numerator also pays for ingest", Direction::Lower, Derive::CpuPer { work: "queries".to_owned(), scale: 1e3 }),
         Metric::derived("ingest_rows_per_s_per_vcpu", "rows/s/vCPU", "ingest rows per wall second per provisioned logical CPU, (W/T)/P", Direction::Higher, Derive::PerVcpu { work: "ingest_rows".to_owned(), scale: 1.0 }),
         Metric::derived("cpu_us_per_ingest_row", "cpu-µs/row", "server CPU per ingest row, C/W; the numerator also pays for queries", Direction::Lower, Derive::CpuPer { work: "ingest_rows".to_owned(), scale: 1e6 }),
@@ -1077,8 +1085,9 @@ async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
 /// `count(*)` queries over the smoked native
 /// rows until one answers, all inside one window. Every request must reach
 /// `collector` as exactly one successful timing at its boundary, each write
-/// matched by the trace id it carried, with positive server CPU, inserted
-/// memtable bytes, and scanned rows.
+/// matched by the trace id it carried, with positive server CPU and inserted
+/// memtable bytes, and every answered query's own executed-plan scan on its
+/// trace, reporting positive rows and its bytes.
 ///
 /// # Errors
 ///
@@ -1148,7 +1157,6 @@ async fn smoke(
     smoke.usage(&usage);
     let delta = |family: &str| after.sum(family, &[]) - before.sum(family, &[]);
     smoke.positive(isolated::INSERTED, delta(isolated::INSERTED));
-    smoke.positive(isolated::ROWS_SCANNED, delta(isolated::ROWS_SCANNED));
     let traces: Vec<&str> = traces.iter().map(String::as_str).collect();
     let population = collector.smoke("smoke", from, &expected, &traces).await;
     let boundaries: Vec<(&str, &str, bool)> = expected
@@ -1156,6 +1164,17 @@ async fn smoke(
         .map(|(boundary, _)| (*boundary, isolated::SUCCESS, false))
         .collect();
     smoke.timings(&population, &boundaries);
+    // `count(*)` projects no column, so its scan reads no column bytes:
+    // rows must be positive, bytes only reported.
+    let [rows, bytes] = population.scanned_per_query(isolated::SUCCESS);
+    for reading in [&rows, &bytes] {
+        if reading.value.is_none() {
+            smoke.missing(reading.reason.clone().unwrap_or_default());
+        }
+    }
+    if let Some(rows) = rows.value {
+        smoke.positive("scanned rows per query", rows);
+    }
     smoke.finish()
 }
 

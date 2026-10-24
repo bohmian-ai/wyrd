@@ -32,7 +32,8 @@ use wyrd_client::transport::trace::with_caller_trace;
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 use wyrd_testing::capacity::{
-    Collector, NANOS_PER_MS, Percentiles, Population, Selection, Window, request_trace, unix_nanos,
+    Collector, NANOS_PER_MS, Percentiles, Population, QUERY_BOUNDARY, Scan, Selection, Timing,
+    Window, request_trace, scanned_per_query, unix_nanos,
 };
 use wyrd_testing::experiment::{
     Arrivals, ExperimentError, Phase, Reading, Repetition, Step, Workload,
@@ -40,7 +41,7 @@ use wyrd_testing::experiment::{
 use wyrd_testing::release_server::LocalServer;
 
 use crate::client_queue::{self, Emitted, LANES};
-use crate::query::isolated::SUCCESS;
+use crate::query::isolated::{INSERTED, MIB, SUCCESS};
 use crate::query::run::{Bench, Overload, QUEUE_FULL, Sender, WRONG_RESULT, ask, micros};
 use crate::query::workload::{Case, Fixture, INGEST_TABLE, TABLE};
 use crate::query::{Lane, Residence, SPLIT, WriteOp, client, lanes, smoke, start};
@@ -110,6 +111,8 @@ struct Asked {
     /// Its exact server time at `bifrost.query`, nanoseconds, once
     /// collected.
     server: Option<u64>,
+    /// Its executed-plan scan from the same trace, once collected.
+    scan: Option<Scan>,
 }
 
 /// One acknowledged or failed ingest request.
@@ -118,6 +121,8 @@ struct Acked {
     at: Instant,
     /// Rows it carried.
     rows: u64,
+    /// Encoded OTLP protobuf bytes it sent; zero for native writes.
+    wire: u64,
     /// Its diagnostic client latency in microseconds, or its error code.
     result: Result<u64, String>,
     /// The trace id its request carried, which its server timing shares.
@@ -298,7 +303,7 @@ impl Competing {
                 ))
             })?;
         let from = SystemTime::now();
-        let (opened, _) = Window::open(server, collector, Selection::RESOURCES)
+        let (opened, before) = Window::open(server, collector, Selection::RESOURCES)
             .await
             .map_err(ExperimentError::workload)?;
         let (start, start_unix) = (Instant::now(), unix_nanos(SystemTime::now()));
@@ -348,7 +353,7 @@ impl Competing {
         let asked = &mut queries.acked;
         let (backlog_capacity, overload, overloaded, backlog_overloaded) = overload;
         let overload = overload.map_err(ExperimentError::workload)?;
-        let (usage, _) = closed.map_err(ExperimentError::workload)?;
+        let (usage, after) = closed.map_err(ExperimentError::workload)?;
         let population = timings(collector, &step.id, from, &offered, asked).await;
         let phases = Phases {
             start,
@@ -376,6 +381,8 @@ impl Competing {
         population.validate(&mut repetition);
         read_queries(&mut repetition, asked, &phases);
         read_ingest(&mut repetition, &offered, &visibility, &population, &phases);
+        let inserted = after.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
+        repetition.set("retained_mib", Reading::exact(inserted / MIB));
         read_arrivals(&mut repetition, &offered, &queries);
         read_overload(&mut repetition, &overload, &queries.acked, &phases);
         for (lane, emitted) in LANES.iter().zip(lanes) {
@@ -404,7 +411,7 @@ async fn timings(
         .filter(|asked| asked.result.is_ok())
         .map(|asked| asked.trace.as_str())
         .collect();
-    let mut least = vec![("bifrost.query", traces.len() as u64)];
+    let mut least = vec![(QUERY_BOUNDARY, traces.len() as u64)];
     for ((op, _), offered) in SPLIT.iter().zip(offered) {
         let before = traces.len();
         traces.extend(
@@ -417,14 +424,16 @@ async fn timings(
         least.push((op.boundary(), (traces.len() - before) as u64));
     }
     let population = collector.traced(step, from, &least, &traces).await;
-    let queries: HashMap<&str, u64> = population
+    let queries: HashMap<&str, &Timing> = population
         .timings
         .iter()
-        .filter(|timing| timing.boundary == "bifrost.query" && timing.outcome == SUCCESS)
-        .map(|timing| (timing.trace_id.as_str(), timing.elapsed_ns))
+        .filter(|timing| timing.boundary == QUERY_BOUNDARY && timing.outcome == SUCCESS)
+        .map(|timing| (timing.trace_id.as_str(), timing))
         .collect();
     for asked in asked.iter_mut() {
-        asked.server = queries.get(asked.trace.as_str()).copied();
+        let timing = queries.get(asked.trace.as_str());
+        asked.server = timing.map(|timing| timing.elapsed_ns);
+        asked.scan = timing.and_then(|timing| timing.scan.clone());
     }
     population
 }
@@ -451,10 +460,9 @@ async fn offer(
         async move {
             let sent = std::time::Instant::now();
             let context = request_trace();
-            let result = sender
-                .send(first, first + chunk, &context)
-                .await
-                .map(|_| micros(sent));
+            let sent_bytes = sender.send(first, first + chunk, &context).await;
+            let wire = *sent_bytes.as_ref().unwrap_or(&0);
+            let result = sent_bytes.map(|_| micros(sent));
             outstanding.fetch_sub(chunk, Ordering::Relaxed);
             let at = Instant::now();
             if let (Ok(_), Some(probe)) = (&result, probe) {
@@ -463,6 +471,7 @@ async fn offer(
             Acked {
                 at,
                 rows: chunk.cast_unsigned(),
+                wire,
                 result,
                 trace: context.trace_id,
             }
@@ -527,6 +536,7 @@ async fn mixed(
                 trace: id,
                 result,
                 server: None,
+                scan: None,
             }
         }
     })
@@ -558,7 +568,8 @@ fn slowest(samples: &[u64], what: &str) -> Reading {
 /// capacity-phase point percentiles, totals, errors, and wrong answers; an
 /// answered query without its server timing invalidates the repetition.
 /// Totals credit only queries answered before the window end, the endpoint
-/// of the measured CPU; later answers are counted separately.
+/// of the measured CPU; later answers are counted separately. Scanned rows
+/// and bytes per query average those queries' own executed-plan scans.
 fn read_queries(repetition: &mut Repetition, asked: &[Asked], phases: &Phases) {
     let phase_readings: [(&str, &dyn Fn(Instant) -> bool); 2] = [
         ("capacity", &|at| phases.capacity(at)),
@@ -606,6 +617,9 @@ fn read_queries(repetition: &mut Repetition, asked: &[Asked], phases: &Phases) {
         "queries_after_window",
         Reading::count(late.len().to_u64().unwrap_or(0)),
     );
+    let [rows, bytes] = scanned_per_query(answered.iter().map(|asked| asked.scan.as_ref()));
+    repetition.set("scanned_rows_per_query", rows);
+    repetition.set("scanned_bytes_per_query", bytes);
     let tables = latencies(asked, Case::TableAggregate, |at| at < phases.end).len();
     repetition.set(
         "table_aggregates",
@@ -711,6 +725,15 @@ fn read_ingest(
             .sum()
     };
     repetition.set("ingest_rows", Reading::count(rows(false)));
+    let wire: u64 = acked
+        .iter()
+        .filter(|acked| acked.result.is_ok() && acked.at < phases.end)
+        .map(|acked| acked.wire)
+        .sum();
+    repetition.set(
+        "otlp_wire_mib",
+        Reading::exact(wire.to_f64().unwrap_or(f64::MAX) / MIB),
+    );
     repetition.set("ingest_rows_after_window", Reading::count(rows(true)));
     let drained = offered
         .iter()
@@ -1044,7 +1067,7 @@ mod tests {
 
     use tokio::time::Instant;
 
-    use wyrd_testing::capacity::Population;
+    use wyrd_testing::capacity::{Population, Scan};
     use wyrd_testing::experiment::Repetition;
 
     use num_traits::ToPrimitive;
@@ -1087,9 +1110,10 @@ mod tests {
         );
     }
 
-    /// Only queries and ingest rows answered before the window end, the
-    /// measured CPU's endpoint, are credited as work; later answers are
-    /// counted apart and a late failure stays an error.
+    /// Only queries, their scans, and ingest rows and wire bytes answered
+    /// before the window end, the measured CPU's endpoint, are credited as
+    /// work; later answers are counted apart and a late failure stays an
+    /// error.
     ///
     /// # Panics
     ///
@@ -1113,6 +1137,12 @@ mod tests {
             trace: String::new(),
             result,
             server: Some(1),
+            scan: Some(Scan {
+                trace_id: String::new(),
+                rows: Some(if at < end { 7 } else { 1000 }),
+                bytes: Some(9),
+                end_unix_ns: 0,
+            }),
         };
         let asked = [
             asked(early, Case::TableAggregate, Ok(1)),
@@ -1122,6 +1152,7 @@ mod tests {
         let acked = |at, rows, result| Acked {
             at,
             rows,
+            wire: rows * 1_048_576,
             result,
             trace: String::new(),
         };
@@ -1148,6 +1179,9 @@ mod tests {
         assert_eq!(value("queries_after_window"), Some(2.0));
         assert_eq!(value("ingest_rows"), Some(10.0));
         assert_eq!(value("ingest_rows_after_window"), Some(20.0));
+        assert_eq!(value("otlp_wire_mib"), Some(10.0));
+        assert_eq!(value("scanned_rows_per_query"), Some(7.0));
+        assert_eq!(value("scanned_bytes_per_query"), Some(9.0));
         assert_eq!(value("errors"), Some(1.0));
     }
 

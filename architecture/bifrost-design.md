@@ -1599,8 +1599,9 @@ across a restart; durable batch, file, and task rows answer that question.
 - **Traces.** A query is one trace: `bifrost.gate.query.stream` spans the
   client-facing stream through terminal or drop, with `bifrost.gate.query`
   dispatch as its child; `bifrost.oracle.stream` spans Oracle execution through
-  terminal cleanup, and `bifrost.oracle.peer.fragment{role,outcome}` spans each
-  remote fragment. Work `DataFusion` spawns inherits the query span, so remote
+  terminal cleanup and records the executed plan's final integer
+  `rows_scanned` and `bytes_scanned` when its scans report them, and
+  `bifrost.oracle.peer.fragment{role,outcome}` spans each remote fragment. Work `DataFusion` spawns inherits the query span, so remote
   fragments are child work of the query that dispatched them. Each operation
   span records exactly one `outcome`. A request that continues a sampled
   client trace keeps it: the Gate and Oracle spans join the caller's trace,

@@ -756,6 +756,7 @@ mod tests {
             trace_id: format!("{index:032x}"),
             span_id: format!("{index:016x}"),
             instance: "server".to_owned(),
+            scan: None,
         }
     }
 

@@ -376,13 +376,18 @@ impl OracleTelemetry {
     /// admitted, so it does not count as active work until
     /// [`QueryTelemetryGuard::admitted`] runs. The returned guard owns the
     /// `bifrost.oracle.stream` span, which the response stream polls inside
-    /// and which closes only after terminal cleanup drops the guard.
+    /// and which closes only after terminal cleanup drops the guard. At
+    /// finish the span also records the executed plan's final
+    /// `rows_scanned` and `bytes_scanned` when its scans reported them, as
+    /// integers in the query's trace.
     #[must_use]
     fn start_query(query_class: QueryClass) -> QueryTelemetryGuard {
         let span = tracing::info_span!(
             "bifrost.oracle.stream",
             query_class = query_class_label(query_class),
-            outcome = tracing::field::Empty
+            outcome = tracing::field::Empty,
+            rows_scanned = tracing::field::Empty,
+            bytes_scanned = tracing::field::Empty
         );
         let source_span = tracing::info_span!(
             parent: &span,
@@ -559,7 +564,8 @@ impl QueryTelemetryGuard {
         self.scan_stats = scan_stats;
     }
 
-    /// Emits the final query and stream outcome exactly once.
+    /// Emits the final query and stream outcome exactly once, with the
+    /// executed plan's scan rows and bytes on the query span when known.
     fn finish(&mut self, outcome: &'static str) {
         if self.finalization == QueryTelemetryFinalization::Closed {
             return;
@@ -599,6 +605,8 @@ impl QueryTelemetryGuard {
         )
         .increment(self.scan_stats.pruning.rows_pruned_page_index);
         if let Some(bytes) = self.scan_stats.physical_bytes_scanned {
+            self.span
+                .record("bytes_scanned", i64::try_from(bytes).unwrap_or(i64::MAX));
             metrics::counter!(
                 "oracle_query_bytes_scanned_total",
                 "class" => query_class_label(self.query_class)
@@ -606,6 +614,8 @@ impl QueryTelemetryGuard {
             .increment(bytes);
         }
         if let Some(rows) = self.scan_stats.physical_rows_scanned {
+            self.span
+                .record("rows_scanned", i64::try_from(rows).unwrap_or(i64::MAX));
             metrics::counter!(
                 "oracle_query_rows_scanned_total",
                 "class" => query_class_label(self.query_class)

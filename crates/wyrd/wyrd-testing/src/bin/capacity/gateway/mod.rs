@@ -224,7 +224,7 @@ fn overhead(mut base: Declaration) -> Declaration {
         ("case".to_owned(), json!(Case::ALL.map(Case::id))),
         ("clients".to_owned(), json!(CLIENTS)),
     ]);
-    base.controls = BTreeMap::from([
+    base.controls.extend([
         (
             "fixture".to_owned(),
             json!(
@@ -499,7 +499,7 @@ fn capacity_declaration(mut base: Declaration, rate: Option<f64>, slo: Slo) -> D
         "phase".to_owned(),
         json!(["capacity", "overload", "recovery"]),
     )]);
-    base.controls = BTreeMap::from([
+    base.controls.extend([
         (
             "fixture".to_owned(),
             json!({
@@ -850,7 +850,8 @@ mod tests {
             .collect()
     }
 
-    /// A base declaration at `level` that needs no release binary.
+    /// A base declaration at `level` that needs no release binary, with a
+    /// shared `timing` control as the runner assembles one.
     ///
     /// # Panics
     ///
@@ -865,7 +866,7 @@ mod tests {
             timing: level.timing(),
             validity: Validity::default(),
             variables: BTreeMap::new(),
-            controls: BTreeMap::new(),
+            controls: BTreeMap::from([("timing".to_owned(), json!({ "method": "shared" }))]),
             metrics: Vec::new(),
             criteria: Vec::new(),
             steps: Vec::new(),
@@ -880,7 +881,8 @@ mod tests {
 
     /// L1 declares all twelve case/client steps, the strict 0.5 ms overhead
     /// p99 only at 64 clients with p99 sample sufficiency, and every
-    /// correctness and capture criterion on every step; it is admissible.
+    /// correctness and capture criterion on every step, keeping the shared
+    /// timing control; it is admissible.
     ///
     /// # Panics
     ///
@@ -920,6 +922,7 @@ mod tests {
             assert_eq!(criterion.steps.len(), 12, "{id}");
         }
         assert!(declared.refusals().is_empty(), "{:?}", declared.refusals());
+        assert_eq!(declared.controls["timing"], json!({ "method": "shared" }));
         let shape = Case::ChatCapture.shape();
         assert_eq!(
             (shape.request_bytes, shape.expected, shape.stream),
@@ -929,7 +932,7 @@ mod tests {
     }
 
     /// L2 declares one contention step at the default rate with the SLO
-    /// defaults, fixes explicit overrides before execution in its controls,
+    /// defaults, keeps the shared timing control, fixes explicit overrides before execution in its controls,
     /// and refuses invalid values.
     ///
     /// # Panics
@@ -943,6 +946,7 @@ mod tests {
         assert_eq!(declared.steps.len(), 1);
         assert_eq!(declared.steps[0].id, CONTENTION);
         assert_eq!(declared.steps[0].params["rate"], json!(DEFAULT_RATE));
+        assert_eq!(declared.controls["timing"], json!({ "method": "shared" }));
         let limit = |declared: &super::Declaration, id: &str| {
             declared
                 .criteria

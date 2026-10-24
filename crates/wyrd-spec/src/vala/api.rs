@@ -562,6 +562,82 @@ pub struct RegisterTableResponse {
     pub table_version: TableVersion,
 }
 
+/// Deserializes a field that may be omitted but, when present, is never
+/// `null`: an explicit `null` fails as a type error instead of reading as
+/// omitted.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// Explicitly alter one table's definition (`PATCH /v1/bifrost/tables/{namespace}/{name}`).
+///
+/// The whole request applies atomically against `expected_table_version` and
+/// publishes exactly one new table version; a stale version changes nothing.
+/// At least one field besides the version must make an effective change.
+/// Unknown fields and explicit `null`s are refused, so a field is either
+/// omitted or carries a value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct AlterTableRequest {
+    /// The table version this edit was built from, as last described.
+    pub expected_table_version: TableVersion,
+    /// Layout lists to replace; an omitted list keeps the current one.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "PhysicalLayoutEdit")]
+    pub physical_layout: Option<PhysicalLayoutEdit>,
+    /// Nullable top-level custom columns to append, in the field-declaration
+    /// shape registration uses.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<FieldSpec>")]
+    pub add_columns: Option<Vec<FieldSpec>>,
+    /// Top-level custom columns to rename; each keeps its field id and values.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<ColumnRename>")]
+    pub rename_columns: Option<Vec<ColumnRename>>,
+}
+
+/// The layout lists one [`AlterTableRequest`] replaces.
+///
+/// Each supplied list replaces the table's complete current list and an
+/// omitted one is kept; `bloom_columns: []` removes every Bloom column. The
+/// time column is fixed at creation, so `time_column` is an unknown field
+/// here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalLayoutEdit {
+    /// The complete new partition list, holding exactly one `hour` or `day`
+    /// field over the time column.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<PartitionFieldWire>")]
+    pub partition_by: Option<Vec<PartitionFieldWire>>,
+    /// The complete new sort order; an empty list sorts by the time column
+    /// descending, nulls last.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<SortKeyWire>")]
+    pub sort_keys: Option<Vec<SortKeyWire>>,
+    /// The complete new Bloom column set, which may be empty.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Vec<String>")]
+    pub bloom_columns: Option<Vec<String>>,
+}
+
+/// One top-level custom column rename in an [`AlterTableRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ColumnRename {
+    /// The column's current name.
+    pub from: String,
+    /// The column's new name, unused by any other column.
+    pub to: String,
+}
+
 /// Maximum number of warnings carried by a terminal frame.
 pub const MAX_QUERY_TERMINAL_WARNINGS: usize = 16;
 /// Maximum number of closed source-completion entries.
@@ -2565,10 +2641,10 @@ mod bifrost_wire_tests {
     use std::collections::BTreeMap;
 
     use crate::vala::api::{
-        BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, DataTypeSpec, FieldSpec,
+        AlterTableRequest, BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, DataTypeSpec, FieldSpec,
         NullOrderWire, PARQUET_FIELD_ID_KEY, PartitionFieldWire, PartitionTransformWire,
-        PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
-        SortDirectionWire, SortKeyWire, TableStatus, TimeUnit,
+        PhysicalLayoutEdit, PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest,
+        RegisterTableResponse, SortDirectionWire, SortKeyWire, TableStatus, TimeUnit,
     };
     use schemars::schema_for;
 
@@ -2935,8 +3011,57 @@ mod bifrost_wire_tests {
         });
     }
 
+    /// A PATCH body decodes only with a canonical string version, no unknown
+    /// field (the time column included), and no explicit `null` at any depth;
+    /// omitted and empty lists stay distinct.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a refused body decodes or an accepted one decodes
+    /// differently.
+    #[test]
+    fn alter_table_request_decodes_strictly() {
+        let decode = |body: serde_json::Value| serde_json::from_value::<AlterTableRequest>(body);
+        let cleared = decode(serde_json::json!({
+            "expected_table_version": "12",
+            "physical_layout": {"bloom_columns": []}
+        }))
+        .expect("the supplement's Bloom-clearing body decodes");
+        assert_eq!(cleared.expected_table_version.get(), 12);
+        assert_eq!(
+            cleared.physical_layout,
+            Some(PhysicalLayoutEdit {
+                bloom_columns: Some(Vec::new()),
+                ..PhysicalLayoutEdit::default()
+            })
+        );
+        assert_eq!(cleared.add_columns, None);
+        bifrost_wire_round_trip(&cleared);
+        let max = decode(serde_json::json!({"expected_table_version": "9223372036854775807"}))
+            .expect("the maximum version decodes");
+        assert_eq!(max.expected_table_version.get(), i64::MAX);
+
+        for refused in [
+            serde_json::json!({"expected_table_version": 12}),
+            serde_json::json!({"expected_table_version": "0"}),
+            serde_json::json!({"expected_table_version": "012"}),
+            serde_json::json!({"expected_table_version": "9223372036854775808"}),
+            serde_json::json!({"physical_layout": {"bloom_columns": []}}),
+            serde_json::json!({"expected_table_version": "1", "table_version": "1"}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": null}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": null}),
+            serde_json::json!({"expected_table_version": "1", "rename_columns": null}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": {"bloom_columns": null}}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": {"time_column": "t"}}),
+            serde_json::json!({"expected_table_version": "1", "rename_columns": [{"from": "a", "to": "b", "x": 1}]}),
+        ] {
+            assert!(decode(refused.clone()).is_err(), "{refused} must be refused");
+        }
+    }
+
     #[test]
     fn bifrost_wire_schema_for_wire_types_does_not_panic() {
+        let _ = schema_for!(AlterTableRequest);
         let _ = schema_for!(BifrostTableEntry);
         let _ = schema_for!(BifrostTableDescription);
         let _ = schema_for!(DataTypeSpec);

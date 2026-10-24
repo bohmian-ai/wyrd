@@ -403,8 +403,11 @@ impl VerifierRunner {
     /// snapshot runs over its pinned source lists. The engine
     /// executes as the authority accepted with the execution, executed by
     /// `system`, with model calls attributed to the verified Card and the
-    /// submission's application Run. Under `test-support` a scripted outcome,
-    /// when queued, replaces the engine.
+    /// submission's application Run. Every attempt before the last defers a
+    /// not-yet-landed trace, so the queue retries the same execution under
+    /// its backoff; the last attempt judges it inconclusive and completes
+    /// under the Verifier's decision rule. Under `test-support` a scripted
+    /// outcome, when queued, replaces the engine.
     async fn dispatch(
         &self,
         tenant: DataTenantId,
@@ -450,8 +453,6 @@ impl VerifierRunner {
             ),
         };
         let caller = Caller::accepted(&run.authority, system);
-        let accepted_at = Utc::now()
-            - chrono::Duration::from_std(run.age).unwrap_or_else(|_| chrono::Duration::zero());
         let engine = match self.blocks.engine(
             &self.state,
             Execution {
@@ -468,7 +469,7 @@ impl VerifierRunner {
                     run_id,
                     deployment_environment: run.deployment_environment.clone(),
                 },
-                accepted_at,
+                defer_unlanded_traces: run.attempt < run.max_attempts,
                 drift,
                 clock: telemetry.clock(),
             },
@@ -909,7 +910,8 @@ fn result(
 ///
 /// An expired deadline times out, an unplannable Verifier, an uncapturable
 /// actual value, or nonconforming evidence terminates `errored`, a stopped
-/// block task or unreadable evidence metadata retries, and a block refused
+/// block task, unreadable evidence metadata, or a deferred not-yet-landed
+/// trace retries, and a block refused
 /// process capacity defers without spending an attempt.
 fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome {
     tracing::warn!(execution_id = %run.lease.execution_id, %error, "the verification engine failed");

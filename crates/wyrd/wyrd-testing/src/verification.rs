@@ -117,6 +117,15 @@ impl VerificationFixture {
         })
     }
 
+    /// This fixture with its registering actor holding exactly
+    /// `permissions`, so a submission's accepted authority can read
+    /// evidence such as traces.
+    #[must_use]
+    pub fn with_actor_permissions(mut self, permissions: PermissionSet) -> Self {
+        self.actor.effective_permissions = permissions;
+        self
+    }
+
     /// The tenant under test.
     #[must_use]
     pub const fn tenant(&self) -> DataTenantId {

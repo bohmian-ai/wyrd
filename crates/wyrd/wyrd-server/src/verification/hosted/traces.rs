@@ -3,14 +3,15 @@
 //! [`CallerTraces`] is the engine's [`TraceSource`] for `trace` inputs. Each
 //! fetch is one public query of `bifrost.traces.spans` under the accepted caller,
 //! so Oracle's table authorization, tenancy, and audit decide the read exactly
-//! as for any other query that caller makes.
+//! as for any other query that caller makes. The read selects every retained
+//! span of the exact trace ID, whatever workload, Card, or time it carries:
+//! a binding owns the result, never a narrower trace input.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 use vala_verify::{TraceSource, TraceUnavailable};
 use wyrd_client::bifrost::rows::{SPAN_COLUMNS, span_record};
@@ -28,12 +29,6 @@ use crate::state::AppState;
 // operator needs to tune it.
 pub const TRACE_SPAN_LIMIT: usize = 10_000;
 
-/// How far before its anchor a trace may have started. Spans are pruned on
-/// their time column, so the read never scans the whole table.
-// ponytail: fixed lookback; carry the trace's observed time on the input
-// declaration if week-old traces need verifying.
-const LOOKBACK: chrono::Duration = chrono::Duration::days(7);
-
 /// Stable query error of a tenant span table no export has created yet.
 const SPANS_NOT_CREATED: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
 
@@ -43,47 +38,31 @@ pub struct CallerTraces {
     state: AppState,
     /// The caller every span query is authorized and audited as; each
     /// statement runs under its own request ID ([`super::statement_caller`]),
-    /// since an execution's trace checks fetch concurrently.
+    /// since executions read traces concurrently.
     caller: Caller,
-    /// When the execution was accepted; spans are read from
-    /// [`LOOKBACK`] before it through one day after it, so retries read the
-    /// same pruned range.
-    anchor: DateTime<Utc>,
 }
 
 impl CallerTraces {
-    /// A trace reader for `caller` anchored at `anchor`.
+    /// A trace reader for `caller`.
     ///
     /// # Errors
     /// Returns the [`ScheduledQueryCaller::authenticated`] refusal when the
     /// caller cannot form an Oracle query context.
-    pub fn new(
-        state: AppState,
-        caller: Caller,
-        anchor: DateTime<Utc>,
-    ) -> Result<Self, wyrd_spec::error::WyrdError> {
+    pub fn new(state: AppState, caller: Caller) -> Result<Self, wyrd_spec::error::WyrdError> {
         crate::query::service::oracle_context(&caller)?;
-        Ok(Self {
-            state,
-            caller,
-            anchor,
-        })
+        Ok(Self { state, caller })
     }
 
-    /// The span statement of `trace_id`, start-time then span-ID ordered so
-    /// positional selectors are reproducible, asking for one span past
-    /// [`TRACE_SPAN_LIMIT`] so an oversized trace is detectable.
-    fn statement(&self, trace_id: TraceId) -> String {
-        let format = "%Y-%m-%d %H:%M:%S%.6f";
+    /// The span statement of `trace_id`: every retained span of that exact
+    /// trace, with no time or attribution predicate, start-time then span-ID
+    /// ordered so positional selectors are reproducible, asking for one span
+    /// past [`TRACE_SPAN_LIMIT`] so an oversized trace is detectable.
+    fn statement(trace_id: TraceId) -> String {
         format!(
             "SELECT {SPAN_COLUMNS} FROM bifrost.traces.spans \
              WHERE trace_id = X'{}' \
-               AND start_time_unix_nano >= TIMESTAMP '{}' \
-               AND start_time_unix_nano < TIMESTAMP '{}' \
              ORDER BY start_time_unix_nano, span_id LIMIT {}",
             trace_id.to_hex(),
-            (self.anchor - LOOKBACK).format(format),
-            (self.anchor + chrono::Duration::days(1)).format(format),
             TRACE_SPAN_LIMIT + 1,
         )
     }
@@ -108,7 +87,7 @@ impl TraceSource for CallerTraces {
         let mut batches: Vec<RecordBatch> = Vec::new();
         let request = BifrostQueryRequest {
             params: Vec::new(),
-            sql: self.statement(trace_id),
+            sql: Self::statement(trace_id),
             deadline_ms: i64::try_from(deadline.as_millis()).ok(),
         };
         let query = ScheduledQueryCaller::authenticated(

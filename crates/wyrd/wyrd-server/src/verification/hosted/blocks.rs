@@ -18,7 +18,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use monty_pool::PoolError;
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, AgentCardResolver, AgentExecutor, BlockCall, BlockClock,
@@ -69,8 +68,10 @@ pub struct Execution<'a> {
     pub routes: &'a BTreeMap<TaskId, ExecutionRoute>,
     /// The Card and application Run model calls are attributed to.
     pub subject: GatewayCallContext,
-    /// When the execution was accepted, anchoring trace reads.
-    pub accepted_at: DateTime<Utc>,
+    /// Whether a not-yet-landed trace stops the attempt so the queue can
+    /// retry it ([`VerificationEngine::with_unlanded_traces_deferred`]),
+    /// rather than judging the trace check inconclusive.
+    pub defer_unlanded_traces: bool,
     /// The resolved drift evidence of a scheduled window.
     pub drift: DriftChecks,
     /// The execution's block clock (`ExecutionTelemetry::clock`), on which
@@ -156,8 +157,8 @@ impl HostedBlocks {
             evidence: Arc::clone(&evidence),
             agent,
         });
-        let traces = CallerTraces::new(state.clone(), caller.clone(), execution.accepted_at)?;
-        Ok(VerificationEngine::new(
+        let traces = CallerTraces::new(state.clone(), caller.clone())?;
+        let engine = VerificationEngine::new(
             Arc::clone(&blocks) as Arc<dyn ActionExecutor>,
             blocks,
             Arc::new(traces),
@@ -165,7 +166,12 @@ impl HostedBlocks {
         )
         .with_drift(execution.drift)
         .with_evidence(evidence)
-        .with_clock(execution.clock))
+        .with_clock(execution.clock);
+        Ok(if execution.defer_unlanded_traces {
+            engine.with_unlanded_traces_deferred()
+        } else {
+            engine
+        })
     }
 }
 

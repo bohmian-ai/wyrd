@@ -1130,15 +1130,24 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
     use wyrd_testing::bifrost::cluster::{BifrostClusterSpec, WyrdTestCluster};
     use wyrd_testing::bifrost::revisions::{composite_batch, register_composite_table, shifted};
 
-    const CONFLICT: &str = "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT";
-    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
-        .await
-        .expect("the two-pod cluster starts");
     fn pod(cluster: &WyrdTestCluster, index: usize) -> &wyrd_testing::WyrdTestServer {
         cluster
             .server(index)
             .unwrap_or_else(|| panic!("the cluster owns pod {index}"))
     }
+    async fn flush(cluster: &WyrdTestCluster) {
+        for index in [0, 1] {
+            pod(cluster, index)
+                .flush_bifrost()
+                .await
+                .expect("the pod publishes");
+        }
+    }
+
+    const CONFLICT: &str = "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT";
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::two_mixed())
+        .await
+        .expect("the two-pod cluster starts");
     let tenant = cluster.data_tenant_id();
     let neighbour = cluster
         .add_tenant("layout-override-neighbour")
@@ -1163,14 +1172,6 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
     let clients = |cluster: &WyrdTestCluster| {
         [0, 1].map(|index| super::support::endpoint_client(pod(cluster, index), &api_key))
     };
-    async fn flush(cluster: &WyrdTestCluster) {
-        for index in [0, 1] {
-            pod(cluster, index)
-                .flush_bifrost()
-                .await
-                .expect("the pod publishes");
-        }
-    }
 
     let [a, b] = clients(&cluster);
     let base = composite_batch();

@@ -9962,6 +9962,7 @@ dependencies = [
  "wyrd-client",
  "wyrd-skald-spec",
  "wyrd-spec",
+ "wyrd-telemetry",
  "wyrd-testing",
 ]
 

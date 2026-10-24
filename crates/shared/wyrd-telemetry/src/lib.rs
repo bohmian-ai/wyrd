@@ -318,8 +318,10 @@ pub const TIMING_SPAN: &str = "wyrd.timing";
 /// closed `boundary` and `outcome` labels. The span reaches the operator's
 /// OTLP export like any other sampled span, so a collector reads every
 /// request's observation before any metrics histogram aggregates it; its own
-/// start and end times carry no measurement. A duration beyond `u64`
-/// nanoseconds saturates. Without an OpenTelemetry layer, or when the
+/// start and end times carry no measurement. The nanoseconds are recorded
+/// as `i64`, which the OpenTelemetry layer exports as an OTLP integer (it
+/// would export a `u64` field as its debug string); a duration beyond
+/// `i64::MAX` nanoseconds saturates. Without an OpenTelemetry layer, or when the
 /// filter disables the span, this does nothing.
 pub fn record_timing(
     parent: &tracing::Span,
@@ -329,7 +331,7 @@ pub fn record_timing(
     excluded: Option<std::time::Duration>,
 ) {
     let nanos =
-        |duration: std::time::Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        |duration: std::time::Duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX);
     let span = tracing::info_span!(
         parent: parent,
         "wyrd.timing",

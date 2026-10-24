@@ -1103,7 +1103,7 @@ pub fn install_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Percentiles, Readings, Selection, deltas, elapsed};
+    use super::{Collector, Percentiles, Readings, Selection, deltas, elapsed};
     use crate::release_server::Metrics;
 
     /// A two-point streaming selection over one family and a breakdown by
@@ -1234,5 +1234,64 @@ mod tests {
             (Some(50.0), Some(95.0), Some(99.0))
         );
         assert_eq!(Percentiles::raw(&[], 1.0).p50, None);
+    }
+
+    /// A timing span the server's own telemetry pipeline records and exports
+    /// over OTLP/gRPC reaches the collector as one well-formed observation
+    /// with its exact integer nanoseconds and residual, including a duration
+    /// above `u32::MAX`, while a `u64` field, which the layer exports as a
+    /// string, is refused as malformed rather than parsed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pipeline cannot start or the collected observation
+    /// is missing, malformed, or inexact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exported_timing_spans_parse_exactly() {
+        let directory = tempfile::tempdir().expect("artifacts");
+        let collector = Collector::start(directory.path()).await.expect("collector");
+        let guard = wyrd_telemetry::init(wyrd_telemetry::TelemetryConfig {
+            endpoint: Some(collector.endpoint.clone()),
+            sample_ratio: Some(1.0),
+            ..wyrd_telemetry::TelemetryConfig::default()
+        })
+        .expect("server telemetry pipeline");
+        let opened = std::time::SystemTime::now();
+        let elapsed = std::time::Duration::from_nanos(5_000_000_123);
+        let excluded = std::time::Duration::from_nanos(7);
+        tracing::info_span!("request").in_scope(|| {
+            wyrd_telemetry::record_timing(
+                &tracing::Span::current(),
+                "verification.direct",
+                "completed",
+                elapsed,
+                Some(excluded),
+            );
+            tracing::info_span!(
+                "wyrd.timing",
+                boundary = "verification.direct",
+                outcome = "completed",
+                elapsed_ns = 9_u64,
+            )
+            .in_scope(|| {});
+        });
+        tokio::task::spawn_blocking(move || guard.shutdown())
+            .await
+            .expect("telemetry shutdown");
+        let population = collector
+            .window("exported", opened, &[("verification.direct", 1)])
+            .await;
+        assert_eq!(
+            population.invalid,
+            ["a `wyrd.timing` span is malformed: a non-integer duration"]
+        );
+        assert_eq!(
+            (
+                population.elapsed("verification.direct", "completed"),
+                population.excluded("verification.direct", "completed"),
+                population.residuals("verification.direct", "completed"),
+            ),
+            (vec![5_000_000_123], vec![7], Ok(vec![5_000_000_116]))
+        );
     }
 }

@@ -39,7 +39,7 @@ def described_field_types_are_recursive_without_any() -> None:
             "registered_at": "2026-07-01T00:00:00Z",
             "updated_at": "2026-07-01T00:00:00Z",
         },
-        "table_version": "1",
+        "table_version": 1,
         "user_fields": [attributes],
         "correlation_fields": [],
         "canonical_physical_fingerprint": "canonical-fp",

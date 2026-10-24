@@ -310,7 +310,8 @@ impl ForgeManagedRewrite {
             &mut position_deletes,
             &mut equality_deletes,
         );
-        let result = match compaction.rewrite(planned.plan, table).await {
+        let output_view = forge_output_view(table, &policy.data_location)?;
+        let result = match compaction.rewrite(planned.plan, &output_view).await {
             Ok(result) => result,
             Err(error) => return Err(self.classify_core_failure(&error)),
         };
@@ -319,8 +320,9 @@ impl ForgeManagedRewrite {
         for file in result.output_data_files {
             let identity = ForgeOutputIdentity::validate(
                 file.file_path(),
-                &policy.data_location,
+                &crate::catalog::layout::forge_data_root(table.metadata().location()),
                 self.attempt_id,
+                policy.table_version,
             )
             .map_err(|error| self.attach_possible_outputs(error))?;
             if !writer_keys.insert(identity.writer_key()) {
@@ -397,6 +399,42 @@ impl ForgeManagedRewrite {
             possible_outputs,
         }
     }
+}
+
+/// Returns `table` as the rewrite core sees it: identical except that its
+/// `write.data.path` names the attempt's selected table-version directory.
+///
+/// The core derives output locations from that property alone. Bifrost never
+/// stores it, so the view exists only in memory for one rewrite and the
+/// published table keeps a single version-free Forge root.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Catalog`] when iceberg refuses the derived metadata
+/// or table.
+fn forge_output_view(table: &Table, data_location: &str) -> Result<Table, ForgeError> {
+    let metadata =
+        iceberg::spec::TableMetadataBuilder::new_from_metadata(table.metadata().clone(), None)
+            .set_properties(std::collections::HashMap::from([(
+                crate::catalog::layout::WRITE_DATA_PATH_PROPERTY.to_owned(),
+                data_location.to_owned(),
+            )]))
+            .and_then(iceberg::spec::TableMetadataBuilder::build)
+            .map_err(ForgeError::Catalog)?
+            .metadata;
+    let mut builder = Table::builder()
+        .file_io(table.file_io().clone())
+        .metadata(metadata)
+        .identifier(table.identifier().clone())
+        .runtime(iceberg::Runtime::current())
+        .disable_cache();
+    if let Some(location) = table.metadata_location() {
+        builder = builder.metadata_location(location);
+    }
+    Ok(builder
+        .build()
+        .map_err(ForgeError::Catalog)?
+        .with_object_cache(table.object_cache()))
 }
 
 /// Records the Variant residual-share metric for each Forge output.

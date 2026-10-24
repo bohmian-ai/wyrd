@@ -1142,6 +1142,7 @@ pub(crate) mod tests {
                 partition: &crate::catalog::PhysicalPartition::from(partition),
                 schema_fingerprint: "00".repeat(32),
                 sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
+                table_version: wyrd_spec::vala::ids::TableVersion::INITIAL,
             },
             crate::scribe::promotion::ScribeDataFileV1 {
                 record_count: 1,

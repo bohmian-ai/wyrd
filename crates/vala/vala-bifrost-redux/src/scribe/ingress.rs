@@ -106,8 +106,10 @@ struct AdmittedRowContext {
     attribution: StampedAttribution,
     /// Card UIDs every row's `card_uid` is authorized against.
     card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
-    /// Catalog fingerprint required of the projected source schema.
-    expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the projected source schema;
+    /// `None` leaves the selected definition's conformance as the only
+    /// schema authority.
+    expected_schema_fingerprint: Option<crate::schema::fingerprint::SchemaFingerprint>,
     /// Stable request identity moved into managed-column stamping.
     request_id: wyrd_spec::request_id::RequestId,
     /// Stable logical batch identity.
@@ -134,8 +136,10 @@ struct AdmittedRowContext {
 /// Both halves come from the same control row: the schema the caller must
 /// match, and the canonical layout that fixes how the rows are partitioned.
 struct LogicalFrameContract {
-    /// Catalog fingerprint required of the caller-owned source schema.
-    expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the caller-owned source
+    /// schema; `None` leaves the selected definition's conformance as the
+    /// only schema authority.
+    expected_schema_fingerprint: Option<crate::schema::fingerprint::SchemaFingerprint>,
     /// Registered time axis every slice of this frame is bucketed by.
     partition_scheme: crate::catalog::PartitionScheme,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
@@ -152,8 +156,10 @@ struct LogicalFrameContract {
 
 /// Root admission state established before any scalable materialization.
 struct RootAdmission {
-    /// Catalog fingerprint required of the caller-owned source schema.
-    expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Caller-supplied fingerprint required of the caller-owned source
+    /// schema; `None` leaves the selected definition's conformance as the
+    /// only schema authority.
+    expected_schema_fingerprint: Option<crate::schema::fingerprint::SchemaFingerprint>,
     /// Registered time axis applied to every prepared slice.
     partition_scheme: crate::catalog::PartitionScheme,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
@@ -179,10 +185,11 @@ struct RootAdmission {
 impl ScribeImpl {
     /// Resolves one authenticated logical frame under the Scribe catalog owner.
     ///
-    /// The catalog owner is authoritative for both halves of the contract: a
-    /// caller-supplied fingerprint is honored as an override, but the time
-    /// axis always comes from the registered canonical layout so no ingest path
-    /// can invent one. The embedded engine seam has no catalog owner: it takes
+    /// The catalog owner is authoritative for both halves of the contract: the
+    /// selected table version's native schema is the schema authority every
+    /// batch conforms to, a caller-supplied fingerprint is additionally
+    /// required when present, and the time axis always comes from the
+    /// registered canonical layout so no ingest path can invent one. The embedded engine seam has no catalog owner: it takes
     /// a built-in table's axis from the built-in layout, falls back to hourly
     /// `wyrd_ingested_at` for any other table, and must supply its own
     /// fingerprint.
@@ -202,12 +209,11 @@ impl ScribeImpl {
     ) -> Result<LogicalFrameContract, ScribeError> {
         let builtin = Self::builtin_definition(&frame.table);
         let Some(catalog) = self.catalog.as_ref() else {
-            let expected_schema_fingerprint =
-                frame
-                    .expected_schema_fingerprint
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "Scribe logical ingress requires its catalog owner".to_owned(),
-                    })?;
+            let expected_schema_fingerprint = Some(frame.expected_schema_fingerprint.ok_or_else(
+                || ScribeError::Internal {
+                    detail: "Scribe logical ingress requires its catalog owner".to_owned(),
+                },
+            )?);
             return Ok(LogicalFrameContract {
                 expected_schema_fingerprint,
                 partition_scheme: builtin.map_or_else(
@@ -230,10 +236,6 @@ impl ScribeImpl {
                 retry_only: None,
             });
         };
-        let (registered_fingerprint, _) = catalog
-            .table_registration(&frame.table, frame.authenticated_tenant)
-            .await
-            .map_err(scribe_catalog_error)?;
         let current = catalog
             .current_definition(&frame.table, frame.authenticated_tenant)
             .await
@@ -261,9 +263,7 @@ impl ScribeImpl {
             _ => (current, None),
         };
         Ok(LogicalFrameContract {
-            expected_schema_fingerprint: frame
-                .expected_schema_fingerprint
-                .unwrap_or(registered_fingerprint),
+            expected_schema_fingerprint: frame.expected_schema_fingerprint,
             partition_scheme: definition.partition_scheme.clone(),
             registered_schema: Some(Arc::clone(&definition.schema)),
             retry_only,
@@ -565,6 +565,107 @@ impl ScribeImpl {
         &self,
         mut frame: ScribeIngressFrame,
     ) -> Result<FrameAdmission, ScribeError> {
+        if frame.table_version.is_none() {
+            frame.table_version = self.shards.committed_version(
+                frame.principal.tenant_id,
+                frame.batch_id,
+                &frame.table.fqn(),
+            );
+        }
+        let mut retained = frame.table_version.is_none().then(|| RetainedSource {
+            frame: unclaimed_retry(&frame),
+            memory: None,
+        });
+        let table = frame.table.clone();
+        let dispatched = self
+            .prepare_and_dispatch_under(frame, false, retained.as_mut())
+            .await?;
+        // The retained input is either answered now or prepared again under
+        // its own admission charge, so its held charge ends here.
+        let retry = retained.map(RetainedSource::into_frame);
+        match dispatched {
+            Dispatched::Admitted(admission) => Ok(admission),
+            Dispatched::Refused(refusal) => {
+                let Some(mut retry) = retry else {
+                    return Err(refusal);
+                };
+                let Some(version) = self.accepted_version(&retry).await? else {
+                    return Err(refusal);
+                };
+                retry.table_version = Some(version);
+                settle_verification(
+                    self.prepare_and_dispatch_under(retry, true, None).await,
+                    refusal,
+                )
+            }
+            Dispatched::AcceptedUnder(accepted) => {
+                let conflict = table_version_conflict(&table, accepted.version);
+                let Some(mut retry) = retry else {
+                    let _ = accepted.verdict.send(false);
+                    return Err(conflict);
+                };
+                retry.table_version = Some(accepted.version);
+                let verified = self.prepare_and_dispatch_under(retry, true, None).await;
+                let _ = accepted
+                    .verdict
+                    .send(matches!(verified, Ok(Dispatched::Admitted(_))));
+                settle_verification(verified, conflict)
+            }
+        }
+    }
+
+    /// The table version whose durable fence accepted `frame`'s batch id.
+    ///
+    /// The exceptional recovery for a request stating no version that the
+    /// current definition refused: one tenant-scoped fence read, never on
+    /// fresh ingest. `None` means no fence names one, and the caller keeps its
+    /// refusal; so does a runtime with no control Postgres.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the tenant connection or the read fails.
+    async fn accepted_version(
+        &self,
+        frame: &ScribeIngressFrame,
+    ) -> Result<Option<TableVersion>, ScribeError> {
+        let Some(postgres) = self.control_postgres.as_ref() else {
+            return Ok(None);
+        };
+        let mut conn = postgres.tenant_conn(frame.principal.tenant_id).await?;
+        let version = vala_sql::queries::scribe_batch_commits::accepted_version(
+            &mut conn,
+            &frame.table.fqn(),
+            frame.batch_id,
+        )
+        .await?;
+        conn.commit().await?;
+        Ok(version)
+    }
+
+    /// Prepares one request under the version it claims, or the current one,
+    /// and dispatches it to its fixed shard.
+    ///
+    /// [`Dispatched::AcceptedUnder`] reports a batch id the durable fence
+    /// already spent under another version: its rows were suppressed, nothing
+    /// was acknowledged, and the shard holds its tenant group for the verdict.
+    /// [`Dispatched::Refused`] carries a contract refusal raised while
+    /// preparing admitted rows, which an accepted batch id may still answer.
+    ///
+    /// With `verify`, the frame is never dispatched: it is answered only as
+    /// an exact retry of the batch a fence accepted under its stated version,
+    /// as a stale-version retry is. A `retained` source shared with `frame`
+    /// is charged, before dispatch, for every allocation the prepared slices
+    /// do not alias, and holds that charge until its owner drops it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failures [`Self::prepare_and_dispatch`] documents.
+    async fn prepare_and_dispatch_under(
+        &self,
+        mut frame: ScribeIngressFrame,
+        verify: bool,
+        retained: Option<&mut RetainedSource>,
+    ) -> Result<Dispatched, ScribeError> {
         let append_started = Instant::now();
         let profile = Arc::new(WriteProfile::default());
         let admission = profile.admission.timer();
@@ -579,6 +680,11 @@ impl ScribeImpl {
             binding,
             reservation,
         } = self.admit_transport_frame(&mut frame).await?;
+        let retry_only = if verify {
+            retry_only.or(frame.table_version)
+        } else {
+            retry_only
+        };
         admission.done();
         let decode = profile.decode.timer();
         let tenant = frame.principal.tenant_id;
@@ -588,7 +694,7 @@ impl ScribeImpl {
                 detail: format!("Scribe request identity is not a UUID: {error}"),
             }
         })?;
-        let rows = self
+        let rows = match self
             .prepare_admitted_rows(
                 frame.payload,
                 AdmittedRowContext {
@@ -605,7 +711,11 @@ impl ScribeImpl {
                     registered_schema,
                 },
             )
-            .await?;
+            .await
+        {
+            Err(error) if is_contract_refusal(&error) => return Ok(Dispatched::Refused(error)),
+            rows => rows?,
+        };
         Self::mark_memory_prepared(&mut memory)?;
         decode.done();
 
@@ -626,7 +736,10 @@ impl ScribeImpl {
             profile: Arc::clone(&profile),
         };
         let preprocess = profile.preprocess.timer();
-        let mut prepared = self.preprocess(admitted).await?;
+        let mut prepared = match self.preprocess(admitted).await {
+            Err(error) if is_contract_refusal(&error) => return Ok(Dispatched::Refused(error)),
+            prepared => prepared?,
+        };
         let mut duplicate_rows = self.shards.committed_duplicate_rows(&prepared);
         if let (None, Some(current)) = (duplicate_rows, retry_only) {
             duplicate_rows = Some(
@@ -636,7 +749,15 @@ impl ScribeImpl {
             );
         }
         if duplicate_rows.is_none() {
-            self.charge_prepared(&mut prepared)?;
+            match retained {
+                Some(retained) => {
+                    let bytes = retained.unshared_bytes(&prepared);
+                    retained.memory = self.charge_prepared(&mut prepared, bytes)?;
+                }
+                None => {
+                    self.charge_prepared(&mut prepared, 0)?;
+                }
+            }
         }
         preprocess.done();
         if let Some(rows) = duplicate_rows {
@@ -645,12 +766,12 @@ impl ScribeImpl {
             drop(prepared);
             metrics::histogram!("bifrost_scribe_ack_seconds")
                 .record(append_started.elapsed().as_secs_f64());
-            return Ok(FrameAdmission {
+            return Ok(Dispatched::Admitted(FrameAdmission {
                 batch_id: frame.batch_id,
                 rows_accepted: rows,
                 receipt_micros,
                 first_commit: false,
-            });
+            }));
         }
         self.shards
             .try_send(prepared)
@@ -658,14 +779,17 @@ impl ScribeImpl {
         let completion = durable_rx.await.map_err(|_| ScribeError::Internal {
             detail: "shard owner dropped durable batch completion".to_owned(),
         })??;
+        if let Some(accepted) = completion.accepted_under {
+            return Ok(Dispatched::AcceptedUnder(accepted));
+        }
         metrics::histogram!("bifrost_scribe_ack_seconds")
             .record(append_started.elapsed().as_secs_f64());
-        Ok(FrameAdmission {
+        Ok(Dispatched::Admitted(FrameAdmission {
             batch_id: frame.batch_id,
             rows_accepted: completion.rows,
             receipt_micros,
             first_commit: completion.first_commit,
-        })
+        }))
     }
 
     /// Rows of `append` when its durable fence accepted exactly this batch
@@ -711,19 +835,33 @@ impl ScribeImpl {
         Ok(accepted.then_some(rows))
     }
 
-    /// Charges the bytes one prepared append actually holds before WAL/ACK.
+    /// Charges the bytes one prepared append actually holds before WAL/ACK,
+    /// plus `retained_bytes` a retained recovery source keeps alive beside it.
     ///
     /// Preprocessing materialized the memtable slices and their WAL records;
-    /// the admitted lease grows or shrinks to exactly that retained set. A
-    /// refusal drops the append and its owners before any WAL or ACK.
+    /// the admitted lease grows or shrinks to cover that set and the retained
+    /// source together before either charge moves, then the source's share is
+    /// split into its own decode-category owner. A refusal drops the append
+    /// and its owners before any WAL or ACK.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::IngestBusy`] when the shared cap cannot cover the
-    /// prepared bytes after one pressure seal, and an internal error when the
-    /// prepared append lost its lease or root accounting is poisoned.
-    fn charge_prepared(&self, prepared: &mut PreparedAppend) -> Result<(), ScribeError> {
-        let bytes = prepared.prepared_bytes;
+    /// charged bytes after one pressure seal, and an internal error when the
+    /// prepared append lost its lease, the sum overflows, or root accounting is
+    /// poisoned.
+    fn charge_prepared(
+        &self,
+        prepared: &mut PreparedAppend,
+        retained_bytes: usize,
+    ) -> Result<Option<crate::resources::ScribeMemoryLease>, ScribeError> {
+        let overflow = || ScribeError::Internal {
+            detail: "prepared and retained bytes overflow".to_owned(),
+        };
+        let bytes = prepared
+            .prepared_bytes
+            .checked_add(retained_bytes)
+            .ok_or_else(overflow)?;
         let table = prepared.table.name.clone();
         let memory = prepared
             .memory
@@ -731,7 +869,17 @@ impl ScribeImpl {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "prepared append lost its memory lease".to_owned(),
             })?;
-        self.resize_after_pressure_seal(memory, bytes, &table)
+        self.resize_after_pressure_seal(memory, bytes, &table)?;
+        if retained_bytes == 0 {
+            return Ok(None);
+        }
+        let mut source = memory
+            .split(retained_bytes)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("retained source split failed: {error}"),
+            })?;
+        source.transfer_category(MemoryCategory::Decode)?;
+        Ok(Some(source))
     }
 
     /// Returns the decoded-request ceiling for the current production or test owner.
@@ -869,6 +1017,119 @@ fn scheme_of(
             detail: format!("registered partition layout is invalid: {error}"),
         }
     })
+}
+
+/// Outcome of one preparation and dispatch under one table version.
+enum Dispatched {
+    /// The batch is durable and acknowledged.
+    Admitted(FrameAdmission),
+    /// The durable fence spent this batch id under another table version,
+    /// and the shard waits on the verdict.
+    AcceptedUnder(crate::scribe::preprocess::AcceptedUnder),
+    /// Preparing the admitted rows raised this contract refusal.
+    Refused(ScribeError),
+}
+
+/// Whether `error` refuses the rows under the selected definition, rather
+/// than the caller's identity, permission, size, or a resource.
+///
+/// Only such a refusal of a request stating no version may be answered by
+/// the definition that accepted its batch id; the retry still runs every
+/// admission check.
+fn is_contract_refusal(error: &ScribeError) -> bool {
+    matches!(
+        error,
+        ScribeError::InvalidFrame
+            | ScribeError::ContractViolation(_)
+            | ScribeError::FingerprintMismatch { .. }
+    )
+}
+
+/// Answers a verification retry: its acknowledgement when it proved the
+/// accepted batch, otherwise `refusal`, unless the retry itself failed for
+/// a reason other than the rows' contract.
+///
+/// # Errors
+///
+/// Returns `refusal` when the retry is not that batch, and the retry's own
+/// error when it could not be compared.
+fn settle_verification(
+    verified: Result<Dispatched, ScribeError>,
+    refusal: ScribeError,
+) -> Result<FrameAdmission, ScribeError> {
+    match verified {
+        Ok(Dispatched::Admitted(admission)) => Ok(admission),
+        Err(error) if !is_contract_refusal(&error) => Err(error),
+        Ok(_) | Err(_) => Err(refusal),
+    }
+}
+
+/// The input of a request stating no table version, retained so it can be
+/// prepared again under the version a durable fence names.
+///
+/// While the first attempt waits for its durable completion, `memory`
+/// charges the allocations the retained input keeps alive that the prepared
+/// slices do not share. Dropping the source or taking its frame releases that
+/// charge exactly once.
+struct RetainedSource {
+    /// Shared-buffer copy of the request.
+    frame: ScribeIngressFrame,
+    /// Charge for the allocations only this source keeps alive.
+    memory: Option<crate::resources::ScribeMemoryLease>,
+}
+
+impl RetainedSource {
+    /// Bytes this source keeps alive that `prepared`'s slices do not alias.
+    fn unshared_bytes(&self, prepared: &PreparedAppend) -> usize {
+        let crate::scribe::preprocess::PreparedSliceSet::Materialized(slices) = &prepared.slices;
+        let shared: Vec<&arrow::record_batch::RecordBatch> =
+            slices.iter().map(|slice| &slice.rows).collect();
+        match &self.frame.payload {
+            IngressPayload::ArrowIpc(bytes) => {
+                crate::scribe::memory::unshared_ipc_bytes(bytes, &shared)
+            }
+            IngressPayload::Canonical(canonical) => {
+                crate::scribe::memory::unshared_arrow_bytes(&canonical.batches, &shared)
+            }
+        }
+    }
+
+    /// Releases the held charge and returns the retained frame.
+    fn into_frame(self) -> ScribeIngressFrame {
+        let Self { frame, memory } = self;
+        drop(memory);
+        frame
+    }
+}
+
+/// Copies a frame that states no table version so it can be prepared again
+/// under the version a durable fence names.
+///
+/// Arrow IPC bytes and canonical batches are shared buffers, so this copies
+/// no payload; the retry is admitted and accounted like any frame.
+fn unclaimed_retry(frame: &ScribeIngressFrame) -> ScribeIngressFrame {
+    ScribeIngressFrame {
+        principal: frame.principal.clone(),
+        attribution: frame.attribution,
+        authenticated_tenant: frame.authenticated_tenant,
+        attributed_cards: frame.attributed_cards.clone(),
+        table: frame.table.clone(),
+        expected_schema_fingerprint: frame.expected_schema_fingerprint,
+        table_version: None,
+        request_id: frame.request_id.clone(),
+        batch_id: frame.batch_id,
+        measured_wire_bytes: frame.measured_wire_bytes,
+        payload: match &frame.payload {
+            IngressPayload::ArrowIpc(bytes) => IngressPayload::ArrowIpc(bytes.clone()),
+            IngressPayload::Canonical(canonical) => {
+                IngressPayload::Canonical(crate::contracts::CanonicalIngress {
+                    batches: canonical.batches.clone(),
+                    owner: None,
+                    logical_identity: canonical.logical_identity.clone(),
+                })
+            }
+        },
+    }
 }
 
 /// The typed refusal for a frame whose table version is not the table's

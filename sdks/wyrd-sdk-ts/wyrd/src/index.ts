@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
 import type {
-  BifrostTableDescription as TableDescription,
+  BifrostTableDescription as TableDescriptionWire,
   BifrostTableEntry as TableEntry,
   CancelRunningQueryResponse,
   CardRef,
@@ -198,7 +198,6 @@ export type {
   RoleAssignmentChange,
   RoleSource,
   SortKey,
-  TableDescription,
   TableEntry,
   TokenAudience,
   UpdateOperatorConnectionRequest,
@@ -413,6 +412,14 @@ function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
     details,
   );
 }
+
+/**
+ * Server projection of one registered table's stored physical schema.
+ *
+ * `table_version` is the exact version the schema and layout describe, as a
+ * `bigint`; its canonical decimal string is only the wire spelling.
+ */
+export type TableDescription = Omit<TableDescriptionWire, "table_version"> & { readonly table_version: bigint };
 
 function lifecycleValue<T>(result: NativeLifecycleResult): T {
   const error = projectedError(result);
@@ -746,7 +753,8 @@ export class TableConfig {
    *
    * `options.layout` requests the table's physical layout.
    * `options.compactionTargetFileSizeBytes` pins the table's Forge compaction
-   * file target; omitted, the table follows the server's deployment default.
+   * file target; omitted, the new table stores the server's deployment
+   * default, resolved once at creation.
    * Registration records it once, and a later registration naming a different
    * target is refused rather than silently changing it.
    *
@@ -1128,6 +1136,11 @@ export class Bifrost {
     this.#native = native;
   }
 
+  /** @internal Wrap one native handle; {@link Bifrost.connect} is the public constructor. */
+  static fromNative(native: NativeBifrost): Bifrost {
+    return new Bifrost(native);
+  }
+
   /**
    * Connect one client, optionally already bound to a write target.
    *
@@ -1461,7 +1474,9 @@ export class Bifrost {
    * for a transport failure.
    */
   async describeTable(namespace: string, name: string): Promise<TableDescription> {
-    return lifecycleValue<TableDescription>(await this.#native.describeTable(namespace, name));
+    const wire = lifecycleValue<TableDescriptionWire>(await this.#native.describeTable(namespace, name));
+    // The native client already refused any non-canonical or out-of-range spelling.
+    return { ...wire, table_version: BigInt(wire.table_version) };
   }
 }
 

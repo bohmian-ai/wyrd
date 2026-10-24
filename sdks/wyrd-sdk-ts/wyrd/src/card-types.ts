@@ -194,11 +194,13 @@ export interface BifrostTableDescription {
    */
   readonly canonical_physical_fingerprint?: string;
   /**
-   * The table's explicit Forge compaction file target, in bytes.
+   * The Forge compaction file target the table's definition stores, in
+   * bytes.
    *
-   * Present only when the table stores its own
-   * `write.target-file-size-bytes`; omitted means Forge compacts it toward
-   * the deployment default.
+   * The registered target, or the deployment default resolved when the
+   * table was created; a later deployment change does not alter it.
+   * Omitted only for a definition that stores no
+   * `write.target-file-size-bytes`.
    */
   readonly compaction_target_file_size_bytes?: number;
   /**

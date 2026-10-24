@@ -28,15 +28,39 @@ use wyrd_spec::ids::DataTenantId;
 
 /// The successful terminal a shard owner sends to one admitted append's waiter.
 ///
-/// Sent only after the append's rows are query-visible, or after the durable
-/// fence suppressed them as an already-committed replay of the same batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Sent only after the append's rows are query-visible, after the durable
+/// fence suppressed them as an already-committed replay of the same batch, or
+/// while the shard holds its group for [`AcceptedUnder`] verification.
+#[derive(Debug)]
 pub(crate) struct DurableCompletion {
     /// Rows the append carried, whether inserted now or already visible.
     pub rows: u64,
     /// Whether this append's group inserted the batch rather than suppressing
     /// a replay the fence or memtable identity showed was already committed.
     pub first_commit: bool,
+    /// The durable fence's claim that another table version already spent
+    /// this batch id.
+    ///
+    /// Such an append's rows were suppressed and nothing is acknowledged yet:
+    /// the caller decides whether it is that batch by preparing it under the
+    /// accepting version, and the shard holds the append's tenant group
+    /// uncommitted until it answers.
+    pub accepted_under: Option<AcceptedUnder>,
+}
+
+/// A batch id the durable fence accepted under another table version, held
+/// open until the caller proves or refuses its retained input as that batch.
+///
+/// The shard has rolled back its tenant group's fresh fences and waits on
+/// `verdict` outside any SQL transaction: `true` resumes fencing without this
+/// batch, while `false` or a dropped sender fails the group, so a
+/// contradiction commits none of its fresh peers.
+#[derive(Debug)]
+pub(crate) struct AcceptedUnder {
+    /// Table version whose fence accepted the batch id.
+    pub version: wyrd_spec::vala::ids::TableVersion,
+    /// Answered `true` only when the retained input is exactly that batch.
+    pub verdict: oneshot::Sender<bool>,
 }
 
 /// A complete request accepted by pod-global admission.
@@ -86,8 +110,9 @@ pub(crate) struct NativeAdmittedRows {
     /// Card UIDs every row's `card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
-    /// Catalog fingerprint validated independently for every source batch.
-    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
+    /// Caller-supplied fingerprint validated independently for every source
+    /// batch, when one was supplied.
+    pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
     /// Request identity stamped into every source batch.
     pub(crate) request_id: RequestId,
     /// Stable batch identity keying every produced slice.
@@ -1112,7 +1137,7 @@ mod tests {
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,
             attribution: Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())).into(),
-            expected_schema_fingerprint: fingerprint,
+            expected_schema_fingerprint: Some(fingerprint),
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
             receipt_micros: 0,

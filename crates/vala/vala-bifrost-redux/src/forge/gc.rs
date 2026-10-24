@@ -42,7 +42,7 @@ use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_hash, plan_tab
 use super::scribe_promotion::PROMOTION_BRANCH;
 use super::settings::ForgeTableSettings;
 use super::{Forge, ForgeWorker};
-use crate::catalog::layout::forge_data_location;
+use crate::catalog::layout::forge_data_root;
 use crate::catalog::{TableRef, TenantTableBinding};
 
 /// Cluster key every rewritten manifest shares, as in `RisingWave`.
@@ -576,7 +576,7 @@ impl Forge {
             &location,
             &binding,
             &self.core.warehouse,
-            &forge_data_location(&location),
+            &forge_data_root(&location),
         )?;
         let base_snapshot_id = table
             .metadata()

@@ -89,6 +89,37 @@ fn over_long_severity_text() -> String {
     "W".repeat(128)
 }
 
+/// Scope prefix of the partition-edit replay, one scope per span.
+const GROUPING_TRACE_SCOPE: &str = "wyrd.tests.otlp.negative.grouping";
+
+/// Builds one trace export of `scopes` spans in one hour, each under its own
+/// `GROUPING_TRACE_SCOPE.<salt>.<index>` scope.
+///
+/// A different `salt` is a different export with its own content and
+/// therefore its own derived batch id.
+fn scoped_resource_spans(anchor: i64, scopes: u8, salt: u8) -> Vec<ResourceSpans> {
+    let scope_spans = (0..scopes)
+        .map(|index| ScopeSpans {
+            scope: Some(support::signal_scope(&format!(
+                "{GROUPING_TRACE_SCOPE}.{salt}.{index}"
+            ))),
+            spans: vec![support::maximal_span(
+                anchor,
+                SpanIdentity {
+                    trace_id: NEGATIVE_TRACE_ID,
+                    span_id: [0xd0, salt, 0, 0, 0, 0, 0, index],
+                },
+            )],
+            schema_url: SCOPE_SCHEMA_URL.to_owned(),
+        })
+        .collect();
+    vec![ResourceSpans {
+        resource: Some(support::resource()),
+        scope_spans,
+        schema_url: RESOURCE_SCHEMA_URL.to_owned(),
+    }]
+}
+
 /// Builds one negative trace export whose spans are invalid at `invalid`.
 ///
 /// Every span is otherwise the maximal fixture span, so the only reason a
@@ -309,11 +340,12 @@ mod pg_tests {
         HttpEncoding, post_otlp, post_otlp_raw, post_otlp_with_headers,
     };
     use super::{
-        ATTRIBUTION_RUN, FAN_OUT_TRACE_SCOPE, LOG_MARKERS, LOG_REJECTION, METRIC_REJECTION,
-        NEGATIVE_LOG_SCOPE, NEGATIVE_METRIC_SCOPE, NEGATIVE_TRACE_SCOPE, SPAN_MARKERS,
-        SPAN_REJECTION, card_attributed_resource_logs, card_attributed_resource_metrics,
-        card_attributed_resource_spans, correlated_resource_spans, fan_out_resource_spans,
-        negative_resource_logs, negative_resource_metrics, negative_resource_spans, sorted_markers,
+        ATTRIBUTION_RUN, FAN_OUT_TRACE_SCOPE, GROUPING_TRACE_SCOPE, LOG_MARKERS, LOG_REJECTION,
+        METRIC_REJECTION, NEGATIVE_LOG_SCOPE, NEGATIVE_METRIC_SCOPE, NEGATIVE_TRACE_SCOPE,
+        SPAN_MARKERS, SPAN_REJECTION, card_attributed_resource_logs,
+        card_attributed_resource_metrics, card_attributed_resource_spans,
+        correlated_resource_spans, fan_out_resource_spans, negative_resource_logs,
+        negative_resource_metrics, negative_resource_spans, scoped_resource_spans, sorted_markers,
     };
     use wyrd_testing::Bootstrap;
 
@@ -441,6 +473,162 @@ mod pg_tests {
             "",
         );
 
+        journey.shutdown().await;
+    }
+
+    /// A replay across a definition edit is recovered under its accepting version.
+    ///
+    /// The Gate states no table version for canonical OTLP rows, so an
+    /// exporter replaying after a Bloom-only edit reaches Scribe under a newer
+    /// current version than the one that accepted it. Warm, the pod's committed
+    /// index names that version; after a restart only the durable fence does.
+    /// Both replays must acknowledge without storing a second row set.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an export or replay is refused, or the spans are not stored
+    /// exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn otlp_replay_across_a_definition_edit_is_acknowledged_once() {
+        let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+        let builder = || {
+            wyrd_testing::WyrdTestServer::builder()
+                .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+        };
+        let journey = OtlpJourney::start_on(builder()).await;
+        let spans = negative_resource_spans(support::anchor_nanos(), &[]);
+        let accepted = |partial: Option<_>| assert!(partial.is_none(), "every span is accepted");
+        accepted(export_traces_over_grpc(&journey, spans.clone()).await);
+        let tenant = journey.server().data_tenant_id();
+        journey
+            .server()
+            .commit_bloom_revision(
+                tenant,
+                &vala_bifrost_redux::catalog::TableRef::new(
+                    vala_bifrost_redux::namespaces::BifrostNamespace::Traces,
+                    "spans",
+                ),
+                &["scope_name", "trace_state"],
+            )
+            .await;
+        accepted(export_traces_over_grpc(&journey, spans.clone()).await);
+        let journey = journey.restart(builder()).await;
+        accepted(export_traces_over_grpc(&journey, spans).await);
+        journey.publish().await;
+
+        let stored = journey
+            .query(&format!(
+                "SELECT trace_state FROM {SPANS_TABLE} WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}'"
+            ))
+            .await;
+        assert_accepted_subset(&sorted_markers(&stored, "trace_state"), &SPAN_MARKERS, "");
+        journey.shutdown().await;
+    }
+
+    /// A replay the current partition layout would refuse is acknowledged
+    /// under the layout that accepted it.
+    ///
+    /// Thirty-three spans in one hour, each under its own scope, are accepted
+    /// and published while `spans` partitions hourly only. An identity
+    /// partition on `scope_name` then makes current planning see thirty-three
+    /// tuples, past the request-wide limit. The Gate states no version, so the
+    /// replay must still acknowledge under the original layout, leaving the
+    /// first acceptance's rows, receipt instant, and request exactly once. A
+    /// changed export no fence accepted keeps the current layout's refusal.
+    /// Built-in provisioning still pins the canonical partition spec at
+    /// startup, so the cold replay is proven by the Scribe tier-2
+    /// accepted-retry test rather than by a restart here.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an export or replay is refused, the stored rows differ
+    /// from the first acceptance, or the changed export is admitted.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn otlp_replay_across_a_partition_edit_is_acknowledged_once() {
+        let journey = OtlpJourney::start().await;
+        let anchor = support::anchor_nanos();
+        let spans = scoped_resource_spans(anchor, 33, 0);
+        let accepted = |partial: Option<_>| assert!(partial.is_none(), "every span is accepted");
+        let stored = async |journey: &OtlpJourney| {
+            journey.publish().await;
+            let batches = journey
+                .query(&format!(
+                    "SELECT scope_name, wyrd_ingested_at, wyrd_request_id FROM {SPANS_TABLE} \
+                     WHERE scope_name LIKE '{GROUPING_TRACE_SCOPE}.%'"
+                ))
+                .await;
+            let mut rows = Vec::new();
+            for batch in &batches {
+                let text = |name: &str| {
+                    let column = arrow::compute::cast(
+                        batch.column_by_name(name).expect("the column is selected"),
+                        &arrow::datatypes::DataType::Utf8,
+                    )
+                    .expect("the column renders as text");
+                    column
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("text is Utf8")
+                        .clone()
+                };
+                let (scopes, receipts, requests) = (
+                    text("scope_name"),
+                    text("wyrd_ingested_at"),
+                    text("wyrd_request_id"),
+                );
+                for index in 0..batch.num_rows() {
+                    rows.push([
+                        scopes.value(index).to_owned(),
+                        receipts.value(index).to_owned(),
+                        requests.value(index).to_owned(),
+                    ]);
+                }
+            }
+            rows.sort();
+            rows
+        };
+
+        accepted(export_traces_over_grpc(&journey, spans.clone()).await);
+        let original = stored(&journey).await;
+        assert_eq!(original.len(), 33, "the export is stored once");
+        journey
+            .server()
+            .commit_identity_partition_revision(
+                journey.server().data_tenant_id(),
+                &vala_bifrost_redux::catalog::TableRef::new(
+                    vala_bifrost_redux::namespaces::BifrostNamespace::Traces,
+                    "spans",
+                ),
+                "scope_name",
+            )
+            .await;
+        accepted(export_traces_over_grpc(&journey, spans).await);
+        assert_eq!(
+            stored(&journey).await,
+            original,
+            "the replay is the original"
+        );
+
+        let changed = ExportTraceServiceRequest {
+            resource_spans: scoped_resource_spans(anchor, 33, 1),
+        };
+        assert_refused(
+            &journey,
+            "/v1/traces",
+            HttpEncoding::Protobuf,
+            changed.encode_to_vec(),
+            Some(journey.token().to_owned()),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+        )
+        .await;
+        assert_eq!(
+            stored(&journey).await,
+            original,
+            "the refusal stores nothing"
+        );
         journey.shutdown().await;
     }
 

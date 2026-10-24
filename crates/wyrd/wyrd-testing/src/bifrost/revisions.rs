@@ -322,6 +322,56 @@ impl WyrdTestServer {
         .await;
     }
 
+    /// Commits a partition spec that keeps the current fields and adds an
+    /// identity partition on `column`, so rows the old spec grouped together
+    /// can fan out into one tuple per distinct `column` value.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `column` is not a column or the revision does not commit.
+    pub async fn commit_identity_partition_revision(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+        column: &str,
+    ) {
+        self.commit_table_revision(tenant, table, |metadata| {
+            let source = metadata
+                .current_schema()
+                .field_by_name(column)
+                .expect("the partition source is a column")
+                .id;
+            let spec = metadata
+                .default_partition_spec()
+                .fields()
+                .iter()
+                .try_fold(
+                    iceberg::spec::UnboundPartitionSpec::builder(),
+                    |builder, field| {
+                        builder.add_partition_field(
+                            field.source_id,
+                            field.name.clone(),
+                            field.transform,
+                        )
+                    },
+                )
+                .and_then(|builder| {
+                    builder.add_partition_field(
+                        source,
+                        column.to_owned(),
+                        iceberg::spec::Transform::Identity,
+                    )
+                })
+                .expect("spec builds")
+                .build();
+            vec![
+                iceberg::TableUpdate::AddSpec { spec },
+                iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
+            ]
+        })
+        .await;
+    }
+
     /// Commits a partition spec that keeps the current fields but buckets
     /// `shard` into `buckets`, so the new spec's tuples have the same shape
     /// and can hold the same values as the old spec's.

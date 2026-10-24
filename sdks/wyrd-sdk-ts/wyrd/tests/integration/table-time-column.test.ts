@@ -77,7 +77,7 @@ test("a user table's time column prunes a time range", async ({ server }) => {
   expect(inRange).toEqual([{ value: 1 }, { value: 2 }]);
   const described = await readingsTable.describeTable(NAMESPACE, READINGS);
   expect(described.physical_layout.time_column).toBe("event_time");
-  expect(described.table_version).toBe("1");
+  expect(described.table_version).toBe(1n);
   expect((await defaults.describeTable(NAMESPACE, DEFAULTS)).physical_layout.time_column).toBe("wyrd_ingested_at");
 }, 60_000);
 

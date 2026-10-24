@@ -256,6 +256,7 @@ pub fn build_claim_inserts(
             binding,
             partition: key.partition().clone(),
             sort_order_id,
+            table_version: key.table_version(),
             node_id: key.node_id().as_uuid(),
             writer_epoch: key.writer_epoch().as_i64(),
             wal_lsn_min,
@@ -277,6 +278,8 @@ struct PublishedArtifactFacts<'a> {
     partition: crate::catalog::PhysicalPartition,
     /// Iceberg sort order the objects were written under.
     sort_order_id: i32,
+    /// Table version whose definition accepted the rows.
+    table_version: wyrd_spec::vala::ids::TableVersion,
     /// Node whose writer produced the rows.
     node_id: Uuid,
     /// Fenced writer epoch that produced the rows.
@@ -370,6 +373,7 @@ fn build_inserts<'a>(
                         partition: &facts.partition,
                         schema_fingerprint: artifact.schema_fingerprint.clone(),
                         sort_order_id: facts.sort_order_id,
+                        table_version: facts.table_version,
                     },
                     artifact.data_file_metrics.clone(),
                 ),

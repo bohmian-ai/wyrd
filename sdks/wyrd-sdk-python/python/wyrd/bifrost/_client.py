@@ -147,6 +147,17 @@ def _batch_ipc(batch: pyarrow.RecordBatch) -> bytes:
     return bytes(sink.getvalue().to_pybytes())
 
 
+def _description(wire: Any) -> TableDescription:
+    """Project a described table's canonical decimal ``table_version`` to an exact ``int``.
+
+    The native client has already refused any non-canonical or out-of-range
+    spelling, so the conversion is exact for every version up to ``2**63 - 1``.
+    """
+
+    wire["table_version"] = int(wire["table_version"])
+    return cast("TableDescription", wire)
+
+
 def _row_json(row: Any) -> str:
     """Serialize one row the three ways a caller supplies it.
 
@@ -1033,7 +1044,7 @@ class Bifrost(_BifrostBase):
 
         """
 
-        return cast("TableDescription", self._native.describe_table(namespace, name))
+        return _description(self._native.describe_table(namespace, name))
 
 
 class AsyncBifrost(_BifrostBase):
@@ -1291,10 +1302,7 @@ class AsyncBifrost(_BifrostBase):
             WyrdError: As for ``Bifrost.describe_table()``.
         """
 
-        return cast(
-            "TableDescription",
-            await asyncio.to_thread(self._native.describe_table, namespace, name),
-        )
+        return _description(await asyncio.to_thread(self._native.describe_table, namespace, name))
 
 
 class DataTypeSpecVariants(TypedDict, total=False):
@@ -1394,8 +1402,10 @@ class _TableDescriptionOptional(TypedDict, total=False):
     """Description fields the server omits when they do not apply.
 
     ``canonical_physical_fingerprint`` is present only for built-in signal
-    tables. The compaction keys are present only when the table stores its
-    own value; absent means the server default.
+    tables. ``compaction_target_file_size_bytes`` is the target the table's
+    definition stores: the registered one, or the deployment default resolved
+    at creation. ``compaction_type`` is present only when the table stores
+    its own; absent means ``small-files``.
     """
 
     canonical_physical_fingerprint: str
@@ -1406,14 +1416,14 @@ class _TableDescriptionOptional(TypedDict, total=False):
 class TableDescription(_TableDescriptionOptional):
     """Server projection of one registered table's stored physical schema.
 
-    ``table_version`` is the decimal version the schema and layout describe;
+    ``table_version`` is the exact version the schema and layout describe;
     a writer sends it with every batch, and a batch naming any other version
     is refused. ``user_fields`` are the declared columns,
     ``correlation_fields`` the write-time ``card_uid``/``run_id`` inputs.
     """
 
     entry: TableEntry
-    table_version: str
+    table_version: int
     user_fields: list[FieldSpec]
     correlation_fields: list[FieldSpec]
     physical_layout: PhysicalLayout

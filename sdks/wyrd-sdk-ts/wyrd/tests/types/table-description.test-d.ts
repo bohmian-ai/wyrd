@@ -17,3 +17,5 @@ expectTypeOf<TableDescription["user_fields"][number]["metadata"]>().toEqualTypeO
 >();
 // An unskipped Option inside a variant is always present.
 expectTypeOf<Extract<DataType, { Timestamp: unknown }>["Timestamp"]["tz"]>().toEqualTypeOf<string | null>();
+// The version is an exact integer; only the wire spells it as a string.
+expectTypeOf<TableDescription["table_version"]>().toEqualTypeOf<bigint>();

@@ -13,7 +13,6 @@ use chrono::Duration as ChronoDuration;
 use iceberg::Catalog;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::forge::{
     ForgeObjectStore, ForgeUnsettledOutput, ForgeWorker, ForgeWorkerConfig,
 };
@@ -25,12 +24,9 @@ use super::support::{
     manual_clock,
 };
 
-/// Returns this fixture table's current Forge recipe root as an object key.
+/// Returns this fixture table's Forge data root, the orphan cleanup plan prefix.
 fn forge_root(fixture: &PromotionIntegrationFixture) -> String {
-    format!(
-        "{}/data/forge/{FORGE_WRITER_RECIPE}",
-        fixture.binding.object_prefix
-    )
+    format!("{}/data/forge", fixture.binding.object_prefix)
 }
 
 /// Writes one object directly into staging and returns its key.
@@ -81,7 +77,7 @@ async fn assert_no_durable_owner_names(
 ///
 /// Panics when the staging operator rejects a write.
 pub(super) async fn seed_lookalikes(fixture: &PromotionIntegrationFixture) -> Vec<String> {
-    let root = forge_root(fixture);
+    let root = format!("{}/1", forge_root(fixture));
     let prefix = &fixture.binding.object_prefix;
     let mut lookalikes = Vec::new();
     for path in [
@@ -139,7 +135,7 @@ async fn assert_eligibility(
 ///
 /// The lookalikes are the other half of the same claim. Listing discovers
 /// everything under the table prefix, so an object that merely resembles a
-/// rewrite output — a pre-recipe name, another recipe root, a Scribe pod object,
+/// rewrite output — a pre-version name, another version root, a Scribe pod object,
 /// catalog metadata — must survive a real collection pass untouched. Path
 /// grammar decides reach; it never decides safety.
 ///
@@ -233,7 +229,7 @@ async fn rowless_output_uses_canonical_identity_and_full_protection() {
         &promoted.fixture,
         &lookalikes,
         "InvalidPath",
-        "only the canonical recipe grammar is addressable by orphan collection",
+        "only the canonical output grammar is addressable by orphan collection",
     )
     .await;
 
@@ -281,7 +277,7 @@ async fn assert_collection_deletes_only_rowless(
 
 /// Seeds one ready orphan-cleanup task carrying the exact closed plan.
 ///
-/// The periodic planner writes this shape: one normalized Forge recipe root as
+/// The periodic planner writes this shape: one normalized Forge data root as
 /// the plan's only input and one immutable object-age cutoff as its only
 /// parameter. Seeding it directly keeps this scenario about the bounded scan
 /// rather than about planning.
@@ -371,7 +367,7 @@ pub(super) fn cursor_of(evidence: Option<&serde_json::Value>) -> String {
         .to_owned()
 }
 
-/// Returns every catalog-reachable object under the Forge recipe root.
+/// Returns every catalog-reachable object under the Forge data root.
 ///
 /// These are the leading, undeletable entries a bounded scan must walk past
 /// before it can ever reach an orphan behind them.
@@ -496,7 +492,7 @@ async fn bounded_retry_resumes_after_cursor_without_starvation() {
     let protected = protected_forge_outputs(&promoted.fixture).await;
     assert!(
         !protected.is_empty(),
-        "a published rewrite leaves catalog-reachable objects under the recipe root"
+        "a published rewrite leaves catalog-reachable objects under the Forge data root"
     );
     let leading = protected
         .last()
@@ -504,7 +500,7 @@ async fn bounded_retry_resumes_after_cursor_without_starvation() {
         .clone();
     let directory = leading
         .rsplit_once('/')
-        .expect("a recipe output has a parent directory")
+        .expect("a Forge output has a parent directory")
         .0
         .to_owned();
     let orphan = seed_object(
@@ -678,7 +674,7 @@ async fn assert_recovered_pass_exhausts_the_prefix(
 /// A sibling table's Forge root is refused before any catalog load or IO.
 ///
 /// The plan input is a delete authority. A prefix that is well shaped — same
-/// tenant, same warehouse, same current Forge recipe root — but names a
+/// tenant, same warehouse, same current Forge table-version root — but names a
 /// different table would still authorise deleting that table's objects, and the
 /// dispatch's catalog-derived comparison only catches it after the worker has
 /// already loaded metadata. The binding derived from the task row already names
@@ -715,7 +711,7 @@ async fn cross_table_plan_refuses_before_catalog_or_io() {
 
     let fixture = &promoted.fixture;
     let owned = forge_root(fixture);
-    // Same tenant, same warehouse, same recipe root: only the table segment
+    // Same tenant, same warehouse, same Forge data root: only the table segment
     // differs, which is exactly the prefix a confused or hostile planner emits.
     let sibling = owned.replace(
         &fixture.binding.table_name,
@@ -1227,7 +1223,7 @@ async fn one_eligible_orphan(name: &str) -> OrphanBatch {
     let orphan = seed_object(
         &promoted.fixture,
         format!(
-            "{}/{}-00000-{}.parquet",
+            "{}/1/{}-00000-{}.parquet",
             forge_root(&promoted.fixture),
             Uuid::now_v7(),
             Uuid::now_v7()

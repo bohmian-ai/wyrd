@@ -85,6 +85,20 @@ impl CommittedBatches {
         self.lock().batches.get(&(tenant, batch_id)) == Some(batch)
     }
 
+    /// Accepting table version recorded for `(tenant, batch_id)` in `table_fqn`.
+    pub(crate) fn version(
+        &self,
+        tenant: DataTenantId,
+        batch_id: Uuid,
+        table_fqn: &str,
+    ) -> Option<wyrd_spec::vala::ids::TableVersion> {
+        self.lock()
+            .batches
+            .get(&(tenant, batch_id))
+            .filter(|batch| batch.table_fqn == table_fqn)
+            .map(|batch| batch.table_version)
+    }
+
     /// Whether anything is recorded for `(tenant, batch_id)`, so a caller can
     /// skip computing the logical identity of a fresh batch.
     pub(crate) fn knows(&self, tenant: DataTenantId, batch_id: Uuid) -> bool {

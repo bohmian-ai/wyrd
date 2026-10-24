@@ -23,6 +23,7 @@ use iceberg::transaction::Transaction;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use uuid::Uuid;
+use wyrd_spec::vala::ids::TableVersion;
 
 use super::Forge;
 use super::error::ForgeError;
@@ -59,6 +60,7 @@ pub(super) const REWRITE_SNAPSHOT_PROPERTY_KEYS: &[&str] = &[
     "forge.rewrite.selection_fingerprint",
     "forge.rewrite.debt_fingerprint",
     "forge.rewrite.policy_fingerprint",
+    "forge.rewrite.table_version",
     "forge.rewrite.removed_data_files",
     "forge.rewrite.removed_delete_files",
     "forge.rewrite.retained_delete_files",
@@ -309,6 +311,8 @@ pub(super) struct RewriteCommitIdentity {
     pub(super) plan_hash: [u8; 32],
     /// Selection, debt, and policy fingerprints the attempt produced.
     pub(super) evidence: ForgeRewriteEvidence,
+    /// Table version the attempt selected and wrote every output under.
+    pub(super) table_version: TableVersion,
 }
 
 /// Everything the pure commit derivation reads, borrowed from its owner.
@@ -518,6 +522,10 @@ impl RewriteCommitRequest {
                 self.identity.evidence.policy_fingerprint.clone(),
             ),
             (
+                "forge.rewrite.table_version".to_owned(),
+                self.identity.table_version.to_string(),
+            ),
+            (
                 "forge.rewrite.removed_data_files".to_owned(),
                 self.removed_data_files.len().to_string(),
             ),
@@ -662,6 +670,8 @@ pub(super) struct RewriteSnapshotProperties {
     pub(super) debt_fingerprint: String,
     /// Policy fingerprint the publishing attempt produced.
     pub(super) policy_fingerprint: String,
+    /// Table version every added data file was written under.
+    pub(super) table_version: TableVersion,
     /// Number of live data files the commit removed.
     pub(super) removed_data_files: u64,
     /// Number of live delete files the commit removed.
@@ -684,7 +694,8 @@ impl RewriteSnapshotProperties {
     /// Returns [`ForgeError::Reconciliation`] when a required property is
     /// absent or empty, when the workflow or property version is not the one
     /// this owner writes, when an identity is not a UUID, when a count or
-    /// snapshot id is not a non-negative integer, when the plan hash is not 32
+    /// snapshot id is not a non-negative integer, when the table version is
+    /// not canonical, when the plan hash is not 32
     /// hex-encoded bytes, or when the commit claims to have added nothing.
     pub(super) fn validate(properties: &BTreeMap<String, String>) -> Result<Self, ForgeError> {
         let reconciliation = |detail: String| ForgeError::Reconciliation { detail };
@@ -755,6 +766,13 @@ impl RewriteSnapshotProperties {
             selection_fingerprint: read("forge.rewrite.selection_fingerprint")?.clone(),
             debt_fingerprint: read("forge.rewrite.debt_fingerprint")?.clone(),
             policy_fingerprint: read("forge.rewrite.policy_fingerprint")?.clone(),
+            table_version: read("forge.rewrite.table_version")?
+                .parse()
+                .map_err(|error| {
+                    reconciliation(format!(
+                        "rewrite snapshot table version is not canonical: {error}"
+                    ))
+                })?,
             removed_data_files: count("forge.rewrite.removed_data_files")?,
             removed_delete_files: count("forge.rewrite.removed_delete_files")?,
             retained_delete_files: count("forge.rewrite.retained_delete_files")?,
@@ -1511,6 +1529,7 @@ mod tests {
                 debt_fingerprint: "debt".to_owned(),
                 policy_fingerprint: "policy".to_owned(),
             },
+            table_version: TableVersion::INITIAL,
         }
     }
 

@@ -137,11 +137,13 @@ pub struct BifrostTableDescription {
     pub canonical_physical_fingerprint: Option<String>,
     /// The server-resolved canonical physical layout, fully populated.
     pub physical_layout: PhysicalLayoutWire,
-    /// The table's explicit Forge compaction file target, in bytes.
+    /// The Forge compaction file target the table's definition stores, in
+    /// bytes.
     ///
-    /// Present only when the table stores its own
-    /// `write.target-file-size-bytes`; omitted means Forge compacts it toward
-    /// the deployment default.
+    /// The registered target, or the deployment default resolved when the
+    /// table was created; a later deployment change does not alter it.
+    /// Omitted only for a definition that stores no
+    /// `write.target-file-size-bytes`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "crate::schema::skipped_option::<u64>")]
     pub compaction_target_file_size_bytes: Option<u64>,
@@ -517,8 +519,8 @@ pub struct RegisterTableRequest {
     pub physical_layout: Option<PhysicalLayoutWire>,
     /// Optional soft file target Forge compacts this table toward, in bytes.
     ///
-    /// Omitted, the table stores no explicit target and follows the Forge
-    /// deployment default (1 GiB unless the operator moved it). Supplied, it
+    /// Omitted, the new table stores the Forge deployment default resolved at
+    /// creation (1 GiB unless the operator moved it). Supplied, it
     /// must be at least 134217728 (the 128 MiB row-group target) and is stored
     /// as the table's `write.target-file-size-bytes` Iceberg property. A
     /// re-register may omit it or repeat the stored value; a different value

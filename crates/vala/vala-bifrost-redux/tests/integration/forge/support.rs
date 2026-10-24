@@ -1086,6 +1086,116 @@ impl PromotionIntegrationFixture {
         fixture
     }
 
+    /// The fixture's own real Scribe.
+    pub(crate) fn scribe(&self) -> &ScribeImpl {
+        &self.scribe
+    }
+
+    /// Starts a second real Scribe over the fixture's catalog, object store,
+    /// and database, with its own node, WAL, and empty committed index, as a
+    /// restarted pod meets the durable state.
+    ///
+    /// The returned directories hold its WAL and scratch and must outlive it.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions [`start_scribe`] documents.
+    pub(crate) async fn start_cold_scribe(
+        &self,
+    ) -> (Arc<ScribeImpl>, tempfile::TempDir, tempfile::TempDir) {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let scratch_root = tempfile::tempdir().expect("scratch directory");
+        let roles = fixture_roles(scratch_root.path(), wal_root.path());
+        let scribe = start_scribe(
+            &self.database,
+            Arc::clone(&self.catalog),
+            Arc::clone(self.storage.objects()),
+            wal_root.path(),
+            roles.scribe().expect("fixture Scribe capability"),
+        )
+        .await;
+        (scribe, wal_root, scratch_root)
+    }
+
+    /// Commits a partition spec that keeps the current fields and adds an
+    /// identity partition on `column`, advancing the table version by one,
+    /// then evicts the cached definition so the next admission reads it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table cannot be loaded, `column` is not a column, or
+    /// the revision does not commit.
+    pub(crate) async fn commit_identity_partition(&self, column: &str) {
+        let iceberg = self.catalog.iceberg_catalog();
+        let table = iceberg
+            .load_table(&self.binding.table_ident())
+            .await
+            .expect("fixture table load");
+        let metadata = table.metadata();
+        let version: i64 = metadata
+            .properties()
+            .get(vala_bifrost_redux::catalog::TABLE_VERSION_PROPERTY)
+            .expect("a Bifrost table carries its version")
+            .parse()
+            .expect("the version is canonical");
+        let source = metadata
+            .current_schema()
+            .field_by_name(column)
+            .expect("the partition source is a column")
+            .id;
+        let spec = metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .try_fold(
+                iceberg::spec::UnboundPartitionSpec::builder(),
+                |builder, field| {
+                    builder.add_partition_field(
+                        field.source_id,
+                        field.name.clone(),
+                        field.transform,
+                    )
+                },
+            )
+            .and_then(|builder| {
+                builder.add_partition_field(
+                    source,
+                    column.to_owned(),
+                    iceberg::spec::Transform::Identity,
+                )
+            })
+            .expect("spec builds")
+            .build();
+        let transaction = Transaction::new(&table);
+        let action = [
+            iceberg::TableUpdate::AddSpec { spec },
+            iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
+            iceberg::TableUpdate::SetProperties {
+                updates: [(
+                    vala_bifrost_redux::catalog::TABLE_VERSION_PROPERTY.to_owned(),
+                    (version + 1).to_string(),
+                )]
+                .into(),
+            },
+        ]
+        .into_iter()
+        .fold(
+            transaction.apply_updates().requirement(
+                iceberg::TableRequirement::DefaultSpecIdMatch {
+                    default_spec_id: metadata.default_partition_spec_id(),
+                },
+            ),
+            iceberg::transaction::ApplyUpdatesAction::update,
+        );
+        ApplyTransactionAction::apply(action, transaction)
+            .expect("revision applies")
+            .commit(iceberg.as_ref())
+            .await
+            .expect("revision commits");
+        self.catalog
+            .evict_current_definition(&self.binding.table_ref, self.tenant);
+    }
+
     /// Build one production Forge owner over explicit catalog and store seams.
     ///
     /// # Panics
@@ -2351,6 +2461,44 @@ impl SupervisedPromotion {
         .expect("the worker settled no attempt");
     }
 
+    /// Schedule one pass and await exactly one successful worker attempt while
+    /// `during` drives the seam the attempt is parked on.
+    ///
+    /// The success sibling of [`Self::run_one_failure_while`]: the control
+    /// runs while the attempt is parked, and the attempt must still succeed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a deterministic bound is missed or the attempt failed.
+    pub(crate) async fn run_one_success_while<F>(&mut self, during: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let expected = self.worker_observer.completed().saturating_add(1);
+        let expected_errors = self.worker_observer.returned_errors().len();
+        self.worker_observer.hold_after_next_attempt_for_test();
+        self.start_armed_worker();
+        let pass = self.request_pass();
+        tokio::time::timeout(FIXTURE_BOUND, during)
+            .await
+            .expect("parked production commit seam bound");
+        tokio::time::timeout(
+            FIXTURE_BOUND,
+            self.worker_observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .expect("production Forge worker attempt bound");
+        assert_eq!(
+            self.worker_observer.returned_errors().len(),
+            expected_errors,
+            "the attempt was expected to succeed: {:?}",
+            self.worker_observer.returned_errors()
+        );
+        self.stop_worker().await;
+        self.await_pass(pass).await;
+        assert_eq!(self.worker_observer.completed(), expected);
+    }
+
     /// Schedule one pass and await exactly one returned worker error while
     /// `during` drives the seam the attempt is parked on.
     ///
@@ -3000,7 +3148,7 @@ fn fixture_column(field: &Field, file_number: i64, noon: i64, offsets: &[i64]) -
 /// # Panics
 ///
 /// Panics when the batch cannot be written to an IPC stream.
-fn ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
+pub(crate) fn ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
     let mut ipc = Vec::new();
     {
         let mut writer =
@@ -3174,6 +3322,39 @@ async fn append_only(
     binding: &TenantTableBinding,
     batch: &RecordBatch,
 ) {
+    ingest_unclaimed(
+        scribe,
+        catalog,
+        tenant,
+        binding,
+        uuid::Uuid::now_v7(),
+        batch,
+    )
+    .await
+    .expect("fixture Scribe ingest");
+}
+
+/// Drives one real native Scribe append that states no table version.
+///
+/// The frame carries the table's registered fingerprint and `batch_id`, so a
+/// second call with the same batch is an honest retry of the first.
+///
+/// # Errors
+///
+/// Returns the Scribe refusal of the frame.
+///
+/// # Panics
+///
+/// Panics when the registration lookup fails.
+pub(crate) async fn ingest_unclaimed(
+    scribe: &ScribeImpl,
+    catalog: &BifrostCatalog,
+    tenant: DataTenantId,
+    binding: &TenantTableBinding,
+    batch_id: Uuid,
+    batch: &RecordBatch,
+) -> Result<vala_bifrost_redux::contracts::FrameAdmission, vala_bifrost_redux::contracts::ScribeError>
+{
     let (fingerprint, _) = catalog
         .table_registration(&binding.table_ref, tenant)
         .await
@@ -3191,11 +3372,10 @@ async fn append_only(
             table: binding.table_ref.clone(),
             expected_schema_fingerprint: fingerprint,
             request_id: wyrd_spec::request_id::RequestId::now_v7(),
-            batch_id: uuid::Uuid::now_v7(),
+            batch_id,
             payload: ingress_ipc(batch),
         })
         .await
-        .expect("fixture Scribe ingest");
 }
 
 /// Ages every `file_list` row the fixture just sealed.

@@ -15,7 +15,7 @@
 
 use bytes::Bytes;
 use iceberg::spec::DataFile;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use iceberg::table::Table;
 use serde_json::{Map, Value};
@@ -316,6 +316,9 @@ fn first_metric_disagreement(
 
 /// Proves one immutable object physically agrees with the evidence promoting it.
 ///
+/// `definition` is the retained definition of the version the evidence names;
+/// the object's spec, sort order, schema, and Bloom filters must be exactly
+/// that version's, because Bloom-only versions share every other id.
 /// The checks run cheapest-and-most-decisive first: table policy identity needs
 /// no IO at all, the footer decode needs one bounded parse, and the partition
 /// containment check needs the projection the decode already produced. Every
@@ -324,43 +327,48 @@ fn first_metric_disagreement(
 /// # Errors
 ///
 /// Returns [`ForgeError::Invariant`] when the record names a partition spec or
-/// sort order the table does not retain, the footer cannot be decoded under
-/// the writer's bounds, the footer's schema fingerprint differs from the
-/// record's, any persisted metric disagrees with the footer, or the object's own
+/// sort order its version does not declare, the footer cannot be decoded under
+/// the writer's bounds or onto that version's schema, the footer's schema
+/// fingerprint differs from the record's, its Bloom filters are not exactly
+/// that version's, any persisted metric disagrees with the footer, or the object's own
 /// time-column bounds are unusable or fall outside the partition the record claims.
 fn validate_promoted_object(
     record: &ScribePublishedHotFileV1,
     bytes: &Bytes,
     file_size: u64,
     table: &Table,
+    definition: &crate::catalog::TableDefinition,
 ) -> Result<(), ForgeError> {
-    let metadata = table.metadata();
     let spec_id = record.partition.spec_id;
-    let spec = metadata
+    if spec_id != definition.spec_id {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "promotion evidence names partition spec {spec_id}, which table version {} does not declare",
+                record.table_version
+            ),
+        });
+    }
+    let spec = table
+        .metadata()
         .partition_spec_by_id(spec_id)
         .ok_or_else(|| ForgeError::Invariant {
             detail: format!(
                 "promotion evidence names partition spec {spec_id}, which the table does not retain"
             ),
         })?;
-    if metadata
-        .sort_order_by_id(i64::from(record.sort_order_id))
-        .is_none()
-    {
+    if record.sort_order_id != definition.sort_order_id {
         return Err(ForgeError::Invariant {
             detail: format!(
-                "promotion evidence names sort order {}, which the table does not retain",
-                record.sort_order_id
+                "promotion evidence names sort order {}, which table version {} does not declare",
+                record.sort_order_id, record.table_version
             ),
         });
     }
 
-    let mut schemas = metadata.schemas_iter().cloned().collect::<Vec<_>>();
-    schemas.sort_by_key(|schema| std::cmp::Reverse(schema.schema_id()));
     let footer = crate::parquet::PromotedObjectFooter::decode(
         bytes,
         &record.object_key,
-        &schemas,
+        std::slice::from_ref(&definition.schema),
         file_size,
     )
     .map_err(|detail| ForgeError::Invariant { detail })?;
@@ -369,6 +377,19 @@ fn validate_promoted_object(
             detail: format!(
                 "promoted object {} was sealed against another schema than its evidence claims",
                 record.object_key
+            ),
+        });
+    }
+    if !footer.bloom_columns().iter().eq(definition
+        .layout
+        .bloom_columns()
+        .iter()
+        .collect::<BTreeSet<_>>())
+    {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "promoted object {} carries other Bloom filters than table version {} declares",
+                record.object_key, record.table_version
             ),
         });
     }
@@ -945,8 +966,9 @@ impl Forge {
     /// [`ForgeError::Reconciliation`] when the durable demand no longer matches
     /// the prepared plan, [`ForgeError::ObjectStore`] when an object cannot be
     /// read, and [`ForgeError::Invariant`] when an object contradicts its own
-    /// promotion evidence, disagrees with its own footer, names identity the
-    /// table no longer carries, or its `DataFile` cannot be rebuilt.
+    /// promotion evidence, disagrees with its own footer or with the retained
+    /// definition of the version it names, names a version the table does not
+    /// retain, or its `DataFile` cannot be rebuilt.
     pub(super) async fn revalidate_promotion(
         &self,
         binding: &TenantTableBinding,
@@ -972,8 +994,17 @@ impl Forge {
                     .to_owned(),
             });
         }
+        let fqn = binding.table_ref.fqn();
+        let mut definitions = BTreeMap::new();
         let mut data_files = Vec::with_capacity(demand.records.len());
         for record in &demand.records {
+            let definition = match definitions.entry(record.table_version) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                    self.retained_definition(&fqn, table, record.table_version)
+                        .await?,
+                ),
+            };
             let bytes = self
                 .core
                 .object_store
@@ -996,7 +1027,7 @@ impl Forge {
                 .map_err(|error| ForgeError::Invariant {
                     detail: format!("hot object failed promotion revalidation: {error}"),
                 })?;
-            validate_promoted_object(record, &bytes, file_size, table)?;
+            validate_promoted_object(record, &bytes, file_size, table, definition)?;
             data_files.push(record.data_file().map_err(|error| ForgeError::Invariant {
                 detail: format!("promotion evidence does not rebuild a data file: {error}"),
             })?);

@@ -11,7 +11,7 @@
 //! owns it, through Scribe promotion, and it is a different transaction with a
 //! different failure model. A rewrite that ends here leaves objects that are
 //! reclaimable by construction: they are named for their attempt, they are
-//! under the recipe path, and no snapshot references them.
+//! under the table-version path, and no snapshot references them.
 
 pub mod executor;
 pub(crate) mod fingerprint;

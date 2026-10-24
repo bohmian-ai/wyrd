@@ -23,7 +23,7 @@ use iceberg_compaction_core::file_selection::{FileSelector, PlanStrategy};
 use iceberg_compaction_core::managed::{SelectedFile, SelectionReport, SelectionStrategyKind};
 use wyrd_spec::DataTenantId;
 
-use crate::catalog::layout::{FORGE_WRITER_RECIPE, forge_data_location};
+use crate::catalog::layout::forge_data_location;
 use crate::forge::compact::ForgeConfig;
 use crate::forge::error::ForgeError;
 use crate::forge::settings::ForgeCompactionType;
@@ -98,8 +98,7 @@ pub(crate) fn registrable_target_file_size_bytes(bytes: u64) -> bool {
 /// Every field is derived, never defaulted at the point of use: the identity
 /// triple and both size targets come from the table, the small-file threshold
 /// is the operator's percentage of the table's resolved file target, and the
-/// data location
-/// and writer recipe come from the registered Forge path layout. Construction
+/// data location is the Forge path of the selected table version. Construction
 /// is the only place these can disagree, so construction is where they are
 /// checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,19 +116,24 @@ pub struct ForgeTablePolicy {
     pub(crate) partition_spec_id: i32,
     /// Current sort order a produced file must carry.
     pub(crate) sort_order_id: i32,
-    /// Writer recipe segment produced paths carry and selection resolves back.
-    pub(crate) writer_recipe: String,
-    /// Base location beneath which every rewrite output is written.
+    /// Table version whose definition the attempt selected for its outputs.
+    ///
+    /// Selected once, here, so execution, publication, lineage, and retry
+    /// revalidation all name the same complete definition.
+    pub(crate) table_version: wyrd_spec::vala::ids::TableVersion,
+    /// Base location beneath which every rewrite output is written: the
+    /// selected version's [`forge_data_location`].
     pub(crate) data_location: String,
 }
 
 impl ForgeTablePolicy {
     /// Derives one attempt's policy from a loaded table and validated limits.
     ///
-    /// The file target is the table's `write.target-file-size-bytes` property
-    /// when declared, otherwise the deployment default in
-    /// [`ForgeConfig::default_target_file_size_bytes`]. It is resolved here
-    /// once; execution, publication, and audit all read this policy's value.
+    /// The file target is the `write.target-file-size-bytes` property the
+    /// table's definition stores; creation resolved an omitted target to the
+    /// deployment default then, so a later deployment change never moves an
+    /// existing version's geometry. It is read here once; execution,
+    /// publication, and audit all read this policy's value.
     /// The small-file threshold is
     /// [`ForgeConfig::small_file_threshold_percent`] of that resolved target,
     /// so it moves with a declared target.
@@ -140,40 +144,27 @@ impl ForgeTablePolicy {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::InvalidConfig`] when a declared size is
-    /// unparseable or zero, when the small-file threshold is not strictly below
+    /// Returns [`ForgeError::InvalidConfig`] when the definition stores no
+    /// file target, when a declared size is unparseable or zero, when the small-file threshold is not strictly below
     /// the file target, when the row-group target exceeds the file target, when
     /// the file target cannot be represented on this platform or would overflow
-    /// the core's oversized ceiling, or when the table's declared data location
-    /// is not the registered Forge recipe location.
+    /// the core's oversized ceiling, or when the metadata declares no canonical
+    /// table version.
     pub(crate) fn extract(
         metadata: &TableMetadata,
         config: &ForgeConfig,
     ) -> Result<Self, ForgeError> {
         let properties = metadata.properties();
-        let target_file_size_bytes = declared_bytes(
-            properties,
-            FILE_TARGET_PROPERTY,
-            config.default_target_file_size_bytes,
-        )?;
+        let target_file_size_bytes = declared_bytes(properties, FILE_TARGET_PROPERTY, None)?;
         let row_group_target_bytes = declared_bytes(
             properties,
             ROW_GROUP_TARGET_PROPERTY,
-            ROW_GROUP_TARGET_DEFAULT,
+            Some(ROW_GROUP_TARGET_DEFAULT),
         )?;
-        let expected_location = forge_data_location(metadata.location());
-        let declared_location = properties
-            .get(crate::catalog::layout::WRITE_DATA_PATH_PROPERTY)
-            .map(String::as_str)
-            .unwrap_or_default();
-        if declared_location != expected_location {
-            return Err(ForgeError::InvalidConfig {
-                detail: format!(
-                    "table declares rewrite data location {declared_location:?}, \
-                     but the registered Forge recipe location is {expected_location:?}"
-                ),
-            });
-        }
+        let table_version = crate::catalog::layout::table_version(metadata.location(), metadata)
+            .map_err(|error| ForgeError::InvalidConfig {
+                detail: error.to_string(),
+            })?;
         let policy = Self {
             target_file_size_bytes,
             row_group_target_bytes,
@@ -191,8 +182,8 @@ impl ForgeTablePolicy {
                     ),
                 }
             })?,
-            writer_recipe: FORGE_WRITER_RECIPE.to_owned(),
-            data_location: expected_location,
+            table_version,
+            data_location: forge_data_location(metadata.location(), table_version),
         };
         policy.validate()?;
         Ok(policy)
@@ -563,16 +554,19 @@ fn percent_of(bytes: u64, percent: u8) -> u64 {
 ///
 /// # Errors
 ///
-/// Returns [`ForgeError::InvalidConfig`] when the property is present but is
-/// not a base-ten unsigned integer, because silently falling back to the
-/// default would execute under geometry the table did not declare.
+/// Returns [`ForgeError::InvalidConfig`] when the property is absent and has
+/// no default, or is present but is not a base-ten unsigned integer, because
+/// silently falling back would execute under geometry the table did not
+/// declare.
 fn declared_bytes(
     properties: &HashMap<String, String>,
     key: &str,
-    default: u64,
+    default: Option<u64>,
 ) -> Result<u64, ForgeError> {
     match properties.get(key) {
-        None => Ok(default),
+        None => default.ok_or_else(|| ForgeError::InvalidConfig {
+            detail: format!("table definition stores no {key}"),
+        }),
         Some(raw) => raw
             .parse::<u64>()
             .map_err(|error| ForgeError::InvalidConfig {
@@ -589,16 +583,34 @@ mod tests {
 
     /// Builds table metadata carrying an explicit Forge geometry.
     ///
-    /// Registration is reproduced rather than mocked: the location, the recipe
-    /// data path, and both size properties are the exact strings the catalog
-    /// writes, so a policy that reads them wrongly fails here rather than in a
+    /// Registration is reproduced rather than mocked: the location, the table
+    /// version, the file target creation resolves when none is declared, and
+    /// both size properties are the exact strings the catalog writes, so a policy that reads them wrongly fails here rather than in a
     /// tier-2 run.
     ///
     /// # Panics
     ///
     /// Panics when the fixture schema or metadata cannot be built, which is a
     /// construction invariant of the test rather than an input.
-    fn metadata_with(properties: Vec<(&str, &str)>) -> TableMetadata {
+    fn metadata_with(mut properties: Vec<(&str, &str)>) -> TableMetadata {
+        if !properties
+            .iter()
+            .any(|(key, _)| *key == FILE_TARGET_PROPERTY)
+        {
+            // Creation stores the 1 GiB compiled deployment default.
+            properties.push((FILE_TARGET_PROPERTY, "1073741824"));
+        }
+        metadata_declaring(properties)
+    }
+
+    /// Builds table metadata storing exactly `properties` plus table version
+    /// 1 unless one is given, so a definition missing a creation-resolved
+    /// property can be built.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture schema or metadata cannot be built.
+    fn metadata_declaring(properties: Vec<(&str, &str)>) -> TableMetadata {
         let schema = iceberg::spec::Schema::builder()
             .with_schema_id(0)
             .with_fields(vec![
@@ -617,8 +629,8 @@ mod tests {
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
         declared
-            .entry(crate::catalog::layout::WRITE_DATA_PATH_PROPERTY.to_owned())
-            .or_insert_with(|| forge_data_location(location));
+            .entry(crate::catalog::TABLE_VERSION_PROPERTY.to_owned())
+            .or_insert_with(|| "1".to_owned());
         iceberg::spec::TableMetadataBuilder::new(
             schema,
             iceberg::spec::PartitionSpec::unpartition_spec(),
@@ -645,16 +657,18 @@ mod tests {
     /// and the row-group target stays a separate, smaller term rather than
     /// being conflated with it. Clamping the target to the admitted memory, or
     /// reusing one term for both, would change the selection boundary and the
-    /// file geometry without any operator asking for it. An undeclared table
-    /// falls back to the deployment file target — 1 GiB unless the operator
-    /// moved it, never Iceberg's 512 MiB — and the Iceberg row-group default.
+    /// file geometry without any operator asking for it. The file target is
+    /// the one the definition stores — creation resolved an omitted one to
+    /// the deployment default, 1 GiB unless the operator moved it — so moving
+    /// the deployment default later changes nothing; a definition storing none
+    /// is refused. An undeclared row-group target is the Iceberg default.
     ///
     /// # Panics
     ///
     /// Panics when a declared geometry is refused, when either declared target
     /// is altered or conflated on its way to the selection policy or execution
-    /// configuration, or when an undeclared table misses the deployment and
-    /// Iceberg defaults.
+    /// configuration, when a moved deployment default changes a stored
+    /// target, or when a definition storing no target is not refused.
     #[test]
     fn forge_table_policy_preserves_declared_target_geometry() {
         let metadata = metadata_with(vec![
@@ -711,26 +725,30 @@ mod tests {
         );
 
         let unset = ForgeTablePolicy::extract(&metadata_with(Vec::new()), &limits())
-            .expect("undeclared geometry falls back to the deployment defaults");
+            .expect("a creation-resolved target is admissible");
         assert_eq!(unset.target_file_size_bytes, 1024 * 1024 * 1024);
         assert_eq!(unset.row_group_target_bytes, 128 * 1024 * 1024);
         let moved = ForgeConfig {
             default_target_file_size_bytes: 256 * 1024 * 1024,
             ..limits()
         };
-        assert_eq!(
-            ForgeTablePolicy::extract(&metadata_with(Vec::new()), &moved)
-                .expect("a moved deployment default is admissible")
-                .target_file_size_bytes,
-            256 * 1024 * 1024,
-            "an undeclared table follows the configured deployment default"
-        );
-        assert_eq!(
-            ForgeTablePolicy::extract(&metadata, &moved)
-                .expect("declared geometry is admissible")
-                .target_file_size_bytes,
-            268_435_456,
-            "a declared table property wins over the deployment default"
+        for table in [&metadata_with(Vec::new()), &metadata] {
+            assert_eq!(
+                ForgeTablePolicy::extract(table, &moved)
+                    .expect("a moved deployment default is admissible")
+                    .target_file_size_bytes,
+                ForgeTablePolicy::extract(table, &limits())
+                    .expect("stored geometry is admissible")
+                    .target_file_size_bytes,
+                "a moved deployment default never changes a stored definition's target"
+            );
+        }
+        assert!(
+            matches!(
+                ForgeTablePolicy::extract(&metadata_declaring(Vec::new()), &limits()),
+                Err(ForgeError::InvalidConfig { .. })
+            ),
+            "a definition storing no target is refused, not given today's default"
         );
     }
 
@@ -806,7 +824,7 @@ mod tests {
     /// One case per way the geometry can be impossible: a zero target, a
     /// non-numeric target, a target whose threshold share rounds to zero, a row-group
     /// target above the file target, a target whose oversized ceiling overflows,
-    /// and a data location that is not the registered recipe location. Each is
+    /// and a table version that is not canonical. Each is
     /// a condition under which an admitted attempt could only produce wrong or
     /// no work, so the refusal belongs at extraction rather than mid-rewrite.
     ///
@@ -866,15 +884,35 @@ mod tests {
         assert!(
             matches!(
                 ForgeTablePolicy::extract(
-                    &metadata_with(vec![(
-                        crate::catalog::layout::WRITE_DATA_PATH_PROPERTY,
-                        "file:///warehouse/tenant/table/data"
-                    )]),
+                    &metadata_with(vec![(crate::catalog::TABLE_VERSION_PROPERTY, "v1")]),
                     &limits(),
                 ),
                 Err(ForgeError::InvalidConfig { .. })
             ),
-            "outputs written outside the recipe location can never settle"
+            "outputs cannot name a definition the table does not declare canonically"
+        );
+    }
+
+    /// The policy selects the version the definition declares, and its outputs
+    /// land under that version's decimal path segment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the policy selects another version or another location.
+    #[test]
+    fn forge_table_policy_selects_the_declared_version_path() {
+        let policy = ForgeTablePolicy::extract(
+            &metadata_with(vec![(
+                crate::catalog::TABLE_VERSION_PROPERTY,
+                "9007199254740993",
+            )]),
+            &limits(),
+        )
+        .expect("a canonical version is admissible");
+        assert_eq!(policy.table_version.get(), 9_007_199_254_740_993);
+        assert_eq!(
+            policy.data_location,
+            "file:///warehouse/tenant/table/data/forge/9007199254740993"
         );
     }
 

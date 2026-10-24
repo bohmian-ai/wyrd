@@ -104,7 +104,9 @@ pub static EXEMPLAR_ELEMENT: F = F::sensitive(
 /// carrying a shape its declared kind cannot own. The trailing promoted
 /// resource columns copy well-known semantic-convention values out of
 /// `resource_attributes` so they can be filtered without decoding; each is
-/// null when its source is absent or is not a string.
+/// null when its source is absent or carries the wrong type, and the last
+/// duplicate key wins. The three subject columns are reserved for server
+/// attribution and stay null on projection.
 pub static METRIC_FIELDS: &[CanonicalField] = &[
     F::meta("metric_name", T::Utf8, false),
     F::meta("description", T::Utf8, false),
@@ -152,6 +154,12 @@ pub static METRIC_FIELDS: &[CanonicalField] = &[
     F::meta("service_name", T::Utf8, true),
     F::meta("service_version", T::Utf8, true),
     F::meta("deployment_environment", T::Utf8, true),
+    F::meta("service_namespace", T::Utf8, true),
+    F::meta("service_instance_id", T::Utf8, true),
+    F::meta("process_pid", T::Int64, true),
+    F::meta("telemetry_sdk_name", T::Utf8, true),
+    F::meta("telemetry_sdk_language", T::Utf8, true),
+    F::meta("telemetry_sdk_version", T::Utf8, true),
     F::meta("subject_kind", T::Utf8, true),
     F::meta("subject_name", T::Utf8, true),
     F::meta("subject_version", T::Utf8, true),

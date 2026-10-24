@@ -30,6 +30,10 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// semantic-convention values out of the Variant collections so they can be
 /// filtered without decoding; each is null when its source is absent or
 /// carries the wrong type, and `body_text` is set only for a string body.
+/// `is_exception` is non-null and true exactly when a promoted exception
+/// string is present, an empty one included; severity never sets it. The
+/// subject columns are reserved for server attribution and stay null on
+/// projection.
 pub static LOG_FIELDS: &[CanonicalField] = &[
     F::meta("time_unix_nano", signal::OTLP_INSTANT, false),
     F::meta("observed_time_unix_nano", signal::OTLP_INSTANT, false),
@@ -60,6 +64,12 @@ pub static LOG_FIELDS: &[CanonicalField] = &[
     F::meta("service_name", T::Utf8, true),
     F::meta("service_version", T::Utf8, true),
     F::meta("deployment_environment", T::Utf8, true),
+    F::meta("service_namespace", T::Utf8, true),
+    F::meta("service_instance_id", T::Utf8, true),
+    F::meta("process_pid", T::Int64, true),
+    F::meta("telemetry_sdk_name", T::Utf8, true),
+    F::meta("telemetry_sdk_language", T::Utf8, true),
+    F::meta("telemetry_sdk_version", T::Utf8, true),
     F::meta("subject_kind", T::Utf8, true),
     F::meta("subject_name", T::Utf8, true),
     F::meta("subject_version", T::Utf8, true),
@@ -67,6 +77,7 @@ pub static LOG_FIELDS: &[CanonicalField] = &[
     F::meta("exception_message", T::Utf8, true),
     F::meta("exception_stacktrace", T::Utf8, true),
     F::meta("body_text", T::Utf8, true),
+    F::meta("is_exception", T::Bool, false),
 ];
 
 /// The canonical durable table for the `OTLP` log signal.

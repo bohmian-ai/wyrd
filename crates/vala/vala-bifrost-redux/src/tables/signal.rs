@@ -335,6 +335,12 @@ impl ExceptionPromotions {
         }
     }
 
+    /// Whether any of the three values is present, an empty string included.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.exception_type.is_some() || self.message.is_some() || self.stacktrace.is_some()
+    }
+
     /// Returns the promoted text bytes these values add to one row.
     #[must_use]
     pub fn bytes(&self) -> usize {
@@ -396,6 +402,18 @@ pub struct ResourceEnvelope {
     pub service_version: Option<String>,
     /// Promoted `deployment.environment.name`, else `deployment.environment`.
     pub deployment_environment: Option<String>,
+    /// Promoted `service.namespace`; descriptive, never a Card identity.
+    pub service_namespace: Option<String>,
+    /// Promoted `service.instance.id`.
+    pub service_instance_id: Option<String>,
+    /// Promoted `process.pid`, as a signed integer.
+    pub process_pid: Option<i64>,
+    /// Promoted `telemetry.sdk.name`.
+    pub telemetry_sdk_name: Option<String>,
+    /// Promoted `telemetry.sdk.language`.
+    pub telemetry_sdk_language: Option<String>,
+    /// Promoted `telemetry.sdk.version`.
+    pub telemetry_sdk_version: Option<String>,
 }
 
 impl ResourceEnvelope {
@@ -418,6 +436,12 @@ impl ResourceEnvelope {
             service_version: promoted_string(attributes, "service.version"),
             deployment_environment: promoted_string(attributes, "deployment.environment.name")
                 .or_else(|| promoted_string(attributes, "deployment.environment")),
+            service_namespace: promoted_string(attributes, "service.namespace"),
+            service_instance_id: promoted_string(attributes, "service.instance.id"),
+            process_pid: promoted_int(attributes, "process.pid"),
+            telemetry_sdk_name: promoted_string(attributes, "telemetry.sdk.name"),
+            telemetry_sdk_language: promoted_string(attributes, "telemetry.sdk.language"),
+            telemetry_sdk_version: promoted_string(attributes, "telemetry.sdk.version"),
         })
     }
 
@@ -431,6 +455,11 @@ impl ResourceEnvelope {
                 &self.service_name,
                 &self.service_version,
                 &self.deployment_environment,
+                &self.service_namespace,
+                &self.service_instance_id,
+                &self.telemetry_sdk_name,
+                &self.telemetry_sdk_language,
+                &self.telemetry_sdk_version,
             ]
             .into_iter()
             .flatten()
@@ -441,6 +470,59 @@ impl ResourceEnvelope {
                 .iter()
                 .map(|entity| entity_ref_bytes(entity) + size_of::<i32>())
                 .sum::<usize>()
+    }
+}
+
+/// Column-wise storage of the context columns every signal ledger declares
+/// directly after `deployment_environment`.
+///
+/// Those are the six descriptive resource promotions followed by the three
+/// subject descriptors. The projection never derives a subject descriptor
+/// from telemetry, so those columns are null here; they belong to the
+/// server's validated subject context.
+#[derive(Debug, Default)]
+pub struct ResourcePromotionColumns {
+    service_namespace: Vec<Option<String>>,
+    service_instance_id: Vec<Option<String>>,
+    process_pid: Vec<Option<i64>>,
+    telemetry_sdk_name: Vec<Option<String>>,
+    telemetry_sdk_language: Vec<Option<String>>,
+    telemetry_sdk_version: Vec<Option<String>>,
+}
+
+impl ResourcePromotionColumns {
+    /// Append one accepted row's resource promotions.
+    pub fn push(&mut self, resource: &ResourceEnvelope) {
+        self.service_namespace
+            .push(resource.service_namespace.clone());
+        self.service_instance_id
+            .push(resource.service_instance_id.clone());
+        self.process_pid.push(resource.process_pid);
+        self.telemetry_sdk_name
+            .push(resource.telemetry_sdk_name.clone());
+        self.telemetry_sdk_language
+            .push(resource.telemetry_sdk_language.clone());
+        self.telemetry_sdk_version
+            .push(resource.telemetry_sdk_version.clone());
+    }
+
+    /// Build the nine columns in ledger order: the six promotions, then the
+    /// null `subject_kind`, `subject_name`, and `subject_version`.
+    #[must_use]
+    pub fn finish(self) -> [ArrayRef; 9] {
+        let rows = self.process_pid.len();
+        let subject = || arrow::array::new_null_array(&DataType::Utf8, rows);
+        [
+            utf8_opt_column(&self.service_namespace),
+            utf8_opt_column(&self.service_instance_id),
+            i64_opt_column(self.process_pid),
+            utf8_opt_column(&self.telemetry_sdk_name),
+            utf8_opt_column(&self.telemetry_sdk_language),
+            utf8_opt_column(&self.telemetry_sdk_version),
+            subject(),
+            subject(),
+            subject(),
+        ]
     }
 }
 

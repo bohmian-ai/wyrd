@@ -1272,7 +1272,8 @@ pub fn builtin_fqns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use arrow::array::{
-        ArrayRef, BinaryArray, Int64Array, StringArray, StructArray, make_array, new_null_array,
+        ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray, StructArray, make_array,
+        new_null_array,
     };
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, TimeUnit as ArrowTimeUnit};
@@ -1976,6 +1977,177 @@ mod tests {
             }],
             schema_url: String::new(),
         }]
+    }
+
+    /// The four resource shapes the promotion test repeats on every signal:
+    /// absent, present but empty, final-occurrence and wrong-type edges, and
+    /// correctly typed values with an older environment key.
+    fn promotion_resources() -> [Option<wyrd_tonic::otlp::resource::v1::Resource>; 4] {
+        let resource = |attributes| {
+            Some(wyrd_tonic::otlp::resource::v1::Resource {
+                attributes,
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            })
+        };
+        let text = |value: &str| Value::StringValue(value.to_owned());
+        [
+            None,
+            resource(Vec::new()),
+            resource(vec![
+                attribute("service.namespace", text("first")),
+                attribute("service.namespace", text("final")),
+                attribute("service.instance.id", text("pod-1")),
+                attribute("service.instance.id", Value::IntValue(9)),
+                attribute("process.pid", text("42")),
+                attribute("telemetry.sdk.name", text("")),
+                attribute("telemetry.sdk.language", Value::BoolValue(true)),
+            ]),
+            resource(vec![
+                attribute("service.instance.id", text("pod-2")),
+                attribute("process.pid", Value::IntValue(9_007_199_254_740_993)),
+                attribute("telemetry.sdk.name", text("opentelemetry")),
+                attribute("telemetry.sdk.language", text("python")),
+                attribute("telemetry.sdk.version", text("1.38.0")),
+                attribute("deployment.environment.name", Value::IntValue(1)),
+                attribute("deployment.environment", text("staging")),
+            ]),
+        ]
+    }
+
+    /// Assert one signal batch's promoted resource columns for the four
+    /// [`promotion_resources`] rows, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a presence bit, promoted value, or retained raw attribute
+    /// differs from the final typed occurrence.
+    fn assert_resource_promotions(batch: &RecordBatch, signal: &str) {
+        let text = |name: &str| -> Vec<Option<String>> {
+            let values = batch
+                .column_by_name(name)
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .unwrap_or_else(|| panic!("{signal} has text column {name}"));
+            (0..values.len())
+                .map(|row| values.is_valid(row).then(|| values.value(row).to_owned()))
+                .collect()
+        };
+        let owned = |values: [Option<&str>; 4]| values.map(|value| value.map(str::to_owned));
+        assert_eq!(batch.num_rows(), 4, "{signal} accepts every resource shape");
+        let present = batch
+            .column_by_name("resource_present")
+            .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+            .expect("resource presence");
+        assert_eq!(
+            (0..4).map(|row| present.value(row)).collect::<Vec<_>>(),
+            [false, true, true, true],
+            "{signal} keeps absent apart from present-empty"
+        );
+        for (name, expected) in [
+            ("service_namespace", [None, None, Some("final"), None]),
+            ("service_instance_id", [None, None, None, Some("pod-2")]),
+            (
+                "telemetry_sdk_name",
+                [None, None, Some(""), Some("opentelemetry")],
+            ),
+            ("telemetry_sdk_language", [None, None, None, Some("python")]),
+            ("telemetry_sdk_version", [None, None, None, Some("1.38.0")]),
+            (
+                "deployment_environment",
+                [None, None, None, Some("staging")],
+            ),
+            ("subject_kind", [None; 4]),
+            ("subject_name", [None; 4]),
+            ("subject_version", [None; 4]),
+        ] {
+            assert_eq!(text(name), owned(expected), "{signal} {name}");
+        }
+        let pid = batch
+            .column_by_name("process_pid")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .expect("process_pid is Int64");
+        assert_eq!(
+            (0..4)
+                .map(|row| pid.is_valid(row).then(|| pid.value(row)))
+                .collect::<Vec<_>>(),
+            [None, None, None, Some(9_007_199_254_740_993)],
+            "{signal} promotes only an integer pid, exactly"
+        );
+        let raw = batch
+            .column_by_name("resource_attributes")
+            .expect("resource attributes");
+        let raw = |row| {
+            wyrd_queue::variant::variant_cell_to_json(raw.as_ref(), row).expect("raw decodes")
+        };
+        assert_eq!(raw(1), serde_json::json!({}));
+        assert_eq!(raw(2)["service.instance.id"], serde_json::json!(9));
+        assert_eq!(raw(2)["process.pid"], serde_json::json!("42"));
+        assert_eq!(raw(3)["deployment.environment.name"], serde_json::json!(1));
+        assert_eq!(
+            raw(3)["deployment.environment"],
+            serde_json::json!("staging")
+        );
+    }
+
+    /// Every signal promotes the same final typed resource values and keeps
+    /// the raw attributes, and each ledger has its approved width.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a promotion parses, stringifies, or reads an earlier
+    /// occurrence, when absent and present-empty resources merge, when a raw
+    /// value is lost, or when a signal's complete column count differs.
+    #[test]
+    fn resource_promotions_preserve_final_typed_values() {
+        let resources = promotion_resources();
+        let template = span_fixture().remove(0);
+        let spans: Vec<_> = resources
+            .iter()
+            .cloned()
+            .map(|resource| wyrd_tonic::otlp::trace::v1::ResourceSpans {
+                resource,
+                ..template.clone()
+            })
+            .collect();
+        let template = log_fixture().remove(0);
+        let logs: Vec<_> = resources
+            .iter()
+            .cloned()
+            .map(|resource| wyrd_tonic::otlp::logs::v1::ResourceLogs {
+                resource,
+                ..template.clone()
+            })
+            .collect();
+        let template = metric_fixture().remove(0);
+        let metrics: Vec<_> = resources
+            .iter()
+            .cloned()
+            .map(|resource| wyrd_tonic::otlp::metrics::v1::ResourceMetrics {
+                resource,
+                ..template.clone()
+            })
+            .collect();
+
+        let (batch, _) =
+            traces::project_resource_spans(&spans, None, usize::MAX).expect("spans project");
+        assert_resource_promotions(&batch, "spans");
+        let (batch, _) =
+            logs::project_resource_logs(&logs, None, usize::MAX).expect("logs project");
+        assert_resource_promotions(&batch, "logs");
+        let (batch, _) =
+            metrics::project_resource_metrics(&metrics, None, usize::MAX).expect("metrics project");
+        assert_resource_promotions(&batch, "metrics");
+
+        for (fields, width) in [
+            (traces::spans::SPAN_FIELDS, 65),
+            (logs::records::LOG_FIELDS, 46),
+            (metrics::points::METRIC_FIELDS, 58),
+        ] {
+            assert_eq!(
+                managed_columns::canonical_physical_fields(fields).len(),
+                width
+            );
+        }
     }
 
     /// Assert two field lists have one exact Arrow layout.

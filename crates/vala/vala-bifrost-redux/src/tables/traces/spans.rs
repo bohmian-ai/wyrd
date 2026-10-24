@@ -64,7 +64,9 @@ pub static SPAN_LINK_ELEMENT: F = F::sensitive(
 /// values when the presence bit is false. The trailing promoted columns copy
 /// one well-known semantic-convention attribute each out of the Variant
 /// collections so it can be filtered without decoding; each is null when the
-/// attribute is absent or carries the wrong type.
+/// attribute is absent or carries the wrong type. `is_exception` is non-null
+/// and true exactly when any event is named `exception`. The subject columns
+/// are reserved for server attribution and stay null on projection.
 pub static SPAN_FIELDS: &[F] = &[
     F::meta("trace_id", T::FixedSizeBinary(16), false),
     F::meta("span_id", T::FixedSizeBinary(8), false),
@@ -109,6 +111,12 @@ pub static SPAN_FIELDS: &[F] = &[
     F::meta("gen_ai_usage_output_tokens", T::Int64, true),
     F::meta("service_version", T::Utf8, true),
     F::meta("deployment_environment", T::Utf8, true),
+    F::meta("service_namespace", T::Utf8, true),
+    F::meta("service_instance_id", T::Utf8, true),
+    F::meta("process_pid", T::Int64, true),
+    F::meta("telemetry_sdk_name", T::Utf8, true),
+    F::meta("telemetry_sdk_language", T::Utf8, true),
+    F::meta("telemetry_sdk_version", T::Utf8, true),
     F::meta("subject_kind", T::Utf8, true),
     F::meta("subject_name", T::Utf8, true),
     F::meta("subject_version", T::Utf8, true),
@@ -116,9 +124,12 @@ pub static SPAN_FIELDS: &[F] = &[
     F::meta("http_route", T::Utf8, true),
     F::meta("http_response_status_code", T::Int64, true),
     F::meta("url_full", T::Utf8, true),
+    F::meta("url_path", T::Utf8, true),
+    F::meta("url_query", T::Utf8, true),
     F::meta("exception_type", T::Utf8, true),
     F::meta("exception_message", T::Utf8, true),
     F::meta("exception_stacktrace", T::Utf8, true),
+    F::meta("is_exception", T::Bool, false),
 ];
 
 /// The canonical durable table for the OTLP trace signal.

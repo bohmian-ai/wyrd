@@ -331,6 +331,56 @@ mod tests {
         assert!(exception_type.is_null(correlated));
         assert!(typed::<StringArray>(batch, "exception_message").is_null(0));
         assert!(typed::<StringArray>(batch, "exception_stacktrace").is_null(0));
+        let is_exception = typed::<BooleanArray>(batch, "is_exception");
+        assert!(is_exception.value(0));
+        assert!(!is_exception.value(correlated));
+    }
+
+    /// A log is an exception exactly when a promoted exception string is
+    /// present, an empty string included; severity alone never is.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an empty exception string is not an exception, or when an
+    /// error severity or a wrongly typed exception attribute is.
+    #[test]
+    fn log_exception_flag_follows_promoted_strings_not_severity() {
+        let record = |severity_number, attributes| LogRecord {
+            severity_number,
+            attributes,
+            ..LogRecord::default()
+        };
+        let request = vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![
+                    record(
+                        9,
+                        vec![attribute(
+                            "exception.message",
+                            Value::StringValue(String::new()),
+                        )],
+                    ),
+                    record(17, Vec::new()),
+                    record(17, vec![attribute("exception.type", Value::IntValue(1))]),
+                ],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }];
+        let (batch, _) = project_resource_logs(&request, None, usize::MAX).expect("logs project");
+        let is_exception = typed::<BooleanArray>(&batch, "is_exception");
+        assert_eq!(
+            (0..3)
+                .map(|row| is_exception.value(row))
+                .collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        assert_eq!(
+            typed::<StringArray>(&batch, "exception_message").value(0),
+            ""
+        );
     }
 
     /// Assert resource and scope presence and context survive projection.

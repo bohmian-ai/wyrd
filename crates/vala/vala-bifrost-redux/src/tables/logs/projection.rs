@@ -24,11 +24,11 @@ use crate::otlp_contract::LogsOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope,
-    any_value_variant, attributes_variant, bool_column, checked_i64, entity_refs_column,
-    fixed_binary_opt_column, fixed_row_bytes, i32_column, otlp_instant_column,
-    projected_signal_schema, span_id_bytes, trace_id_bytes, u32_as_i64_column, utf8_column,
-    utf8_opt_column, variant_column,
+    ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope,
+    ResourcePromotionColumns, ScopeEnvelope, any_value_variant, attributes_variant, bool_column,
+    checked_i64, entity_refs_column, fixed_binary_opt_column, fixed_row_bytes, i32_column,
+    otlp_instant_column, projected_signal_schema, span_id_bytes, trace_id_bytes, u32_as_i64_column,
+    utf8_column, utf8_opt_column, variant_column,
 };
 use wyrd_spec::ids::CardUid;
 
@@ -167,6 +167,8 @@ struct LogColumns {
     service_version: Vec<Option<String>>,
     /// Promoted `deployment.environment.name`, else `deployment.environment`.
     deployment_environment: Vec<Option<String>>,
+    /// The descriptive resource promotions and subject descriptors that follow.
+    resource_promotions: ResourcePromotionColumns,
     /// Promoted `exception.type` attribute string.
     exception_type: Vec<Option<String>>,
     /// Promoted `exception.message` attribute string.
@@ -175,6 +177,8 @@ struct LogColumns {
     exception_stacktrace: Vec<Option<String>>,
     /// The body when it is a string, else null.
     body_text: Vec<Option<String>>,
+    /// Whether any promoted exception string is present.
+    is_exception: Vec<bool>,
     card_uid: Vec<Option<String>>,
     run_id: Vec<Option<String>>,
 }
@@ -294,6 +298,8 @@ impl LogColumns {
         self.service_version.push(resource.service_version.clone());
         self.deployment_environment
             .push(resource.deployment_environment.clone());
+        self.resource_promotions.push(resource);
+        self.is_exception.push(exception.any());
         self.exception_type.push(exception.exception_type);
         self.exception_message.push(exception.message);
         self.exception_stacktrace.push(exception.stacktrace);
@@ -316,7 +322,7 @@ impl LogColumns {
     /// Returns [`TableError::Internal`] when a column cannot be built or the
     /// assembled columns do not match the canonical schema.
     fn finish(self) -> Result<RecordBatch, TableError> {
-        let columns: Vec<ArrayRef> = vec![
+        let mut columns: Vec<ArrayRef> = vec![
             otlp_instant_column(self.time_unix_nano),
             otlp_instant_column(self.observed_time_unix_nano),
             i32_column(self.severity_number),
@@ -342,25 +348,17 @@ impl LogColumns {
             utf8_opt_column(&self.service_name),
             utf8_opt_column(&self.service_version),
             utf8_opt_column(&self.deployment_environment),
-            arrow::array::new_null_array(
-                &arrow::datatypes::DataType::Utf8,
-                self.service_name.len(),
-            ),
-            arrow::array::new_null_array(
-                &arrow::datatypes::DataType::Utf8,
-                self.service_name.len(),
-            ),
-            arrow::array::new_null_array(
-                &arrow::datatypes::DataType::Utf8,
-                self.service_name.len(),
-            ),
+        ];
+        columns.extend(self.resource_promotions.finish());
+        columns.extend([
             utf8_opt_column(&self.exception_type),
             utf8_opt_column(&self.exception_message),
             utf8_opt_column(&self.exception_stacktrace),
             utf8_opt_column(&self.body_text),
+            bool_column(self.is_exception),
             utf8_opt_column(&self.card_uid),
             utf8_opt_column(&self.run_id),
-        ];
+        ]);
         RecordBatch::try_new(Arc::clone(&LOG_SCHEMA), columns)
             .map_err(|error| TableError::Internal(format!("canonical log batch: {error}")))
     }

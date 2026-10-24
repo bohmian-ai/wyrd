@@ -25,12 +25,13 @@ use crate::otlp_contract::IngestOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope,
-    attributes_variant, bool_column, checked_i64, entity_refs_column, fixed_binary_column,
-    fixed_binary_opt_column, fixed_row_bytes, i32_column, i32_opt_column, i64_column,
-    i64_opt_column, internal, last_attribute, list_column, nested_fields, otlp_instant_column,
-    projected_signal_schema, promoted_int, promoted_string, span_id_bytes, struct_column,
-    trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, variant_column,
+    ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope,
+    ResourcePromotionColumns, ScopeEnvelope, attributes_variant, bool_column, checked_i64,
+    entity_refs_column, fixed_binary_column, fixed_binary_opt_column, fixed_row_bytes, i32_column,
+    i32_opt_column, i64_column, i64_opt_column, internal, last_attribute, list_column,
+    nested_fields, otlp_instant_column, projected_signal_schema, promoted_int, promoted_string,
+    span_id_bytes, struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
+    variant_column,
 };
 use wyrd_spec::ids::CardUid;
 
@@ -296,6 +297,8 @@ struct SpanColumns {
     service_version: Vec<Option<String>>,
     /// Promoted `deployment.environment.name`, else `deployment.environment`.
     deployment_environment: Vec<Option<String>>,
+    /// The descriptive resource promotions and subject descriptors that follow.
+    resource_promotions: ResourcePromotionColumns,
     /// Promoted `http.request.method` attribute string.
     http_request_method: Vec<Option<String>>,
     /// Promoted `http.route` attribute string.
@@ -304,12 +307,18 @@ struct SpanColumns {
     http_response_status_code: Vec<Option<i64>>,
     /// Promoted `url.full` attribute string.
     url_full: Vec<Option<String>>,
+    /// Promoted `url.path` attribute string.
+    url_path: Vec<Option<String>>,
+    /// Promoted `url.query` attribute string.
+    url_query: Vec<Option<String>>,
     /// Promoted `exception.type` attribute string.
     exception_type: Vec<Option<String>>,
     /// Promoted `exception.message` attribute string.
     exception_message: Vec<Option<String>>,
     /// Promoted `exception.stacktrace` attribute string.
     exception_stacktrace: Vec<Option<String>>,
+    /// Whether the span carries any event named `exception`.
+    is_exception: Vec<bool>,
     card_uid: Vec<Option<String>>,
     run_id: Vec<Option<String>>,
 }
@@ -437,9 +446,16 @@ impl SpanColumns {
         self.http_response_status_code
             .push(http.response_status_code);
         self.url_full.push(http.url_full);
+        self.url_path.push(http.url_path);
+        self.url_query.push(http.url_query);
         self.exception_type.push(exception.exception_type);
         self.exception_message.push(exception.message);
         self.exception_stacktrace.push(exception.stacktrace);
+        self.is_exception.push(
+            span.events
+                .iter()
+                .any(|event| event.name == EXCEPTION_EVENT_NAME),
+        );
         self.card_uid.push(correlation.card_uid);
         self.run_id.push(correlation.run_id);
 
@@ -462,6 +478,7 @@ impl SpanColumns {
         self.service_version.push(resource.service_version.clone());
         self.deployment_environment
             .push(resource.deployment_environment.clone());
+        self.resource_promotions.push(resource);
 
         self.scope_present.push(scope.present);
         self.scope_name.push(scope.name.clone());
@@ -636,7 +653,7 @@ impl SpanColumns {
 
         let mut gen_ai_strings = self.gen_ai_strings.into_iter();
         let mut gen_ai_ints = self.gen_ai_ints.into_iter();
-        let columns: Vec<ArrayRef> = vec![
+        let mut columns: Vec<ArrayRef> = vec![
             fixed_binary_column(16, &self.trace_id).map_err(internal)?,
             fixed_binary_column(8, &self.span_id).map_err(internal)?,
             fixed_binary_opt_column(8, &self.parent_span_id).map_err(internal)?,
@@ -678,28 +695,22 @@ impl SpanColumns {
             i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
             utf8_opt_column(&self.service_version),
             utf8_opt_column(&self.deployment_environment),
-            arrow::array::new_null_array(
-                &arrow::datatypes::DataType::Utf8,
-                self.service_name.len(),
-            ),
-            arrow::array::new_null_array(
-                &arrow::datatypes::DataType::Utf8,
-                self.service_name.len(),
-            ),
-            arrow::array::new_null_array(
-                &arrow::datatypes::DataType::Utf8,
-                self.service_name.len(),
-            ),
+        ];
+        columns.extend(self.resource_promotions.finish());
+        columns.extend([
             utf8_opt_column(&self.http_request_method),
             utf8_opt_column(&self.http_route),
             i64_opt_column(self.http_response_status_code),
             utf8_opt_column(&self.url_full),
+            utf8_opt_column(&self.url_path),
+            utf8_opt_column(&self.url_query),
             utf8_opt_column(&self.exception_type),
             utf8_opt_column(&self.exception_message),
             utf8_opt_column(&self.exception_stacktrace),
+            bool_column(self.is_exception),
             utf8_opt_column(&self.card_uid),
             utf8_opt_column(&self.run_id),
-        ];
+        ]);
 
         RecordBatch::try_new(Arc::clone(&SPAN_SCHEMA), columns)
             .map_err(|error| TableError::Internal(format!("canonical span batch: {error}")))
@@ -772,6 +783,10 @@ struct HttpPromotions {
     response_status_code: Option<i64>,
     /// `url.full`.
     url_full: Option<String>,
+    /// `url.path`.
+    url_path: Option<String>,
+    /// `url.query`.
+    url_query: Option<String>,
 }
 
 impl HttpPromotions {
@@ -782,15 +797,23 @@ impl HttpPromotions {
             route: promoted_string(attributes, "http.route"),
             response_status_code: promoted_int(attributes, "http.response.status_code"),
             url_full: promoted_string(attributes, "url.full"),
+            url_path: promoted_string(attributes, "url.path"),
+            url_query: promoted_string(attributes, "url.query"),
         }
     }
 
     /// Returns the promoted text bytes these values add to one row.
     fn bytes(&self) -> usize {
-        [&self.request_method, &self.route, &self.url_full]
-            .into_iter()
-            .flatten()
-            .map(String::len)
-            .sum()
+        [
+            &self.request_method,
+            &self.route,
+            &self.url_full,
+            &self.url_path,
+            &self.url_query,
+        ]
+        .into_iter()
+        .flatten()
+        .map(String::len)
+        .sum()
     }
 }

@@ -9,6 +9,7 @@
 /// of trusting a literal repeated at each call site.
 pub const BIFROST_CATALOG_NAME: &str = "wyrd-redux";
 
+mod alteration;
 mod bifrost_catalog;
 mod cut_cache;
 mod error;
@@ -23,14 +24,15 @@ pub mod table_ref;
 pub mod tenant_table;
 mod wire;
 
+pub use alteration::TableAlteration;
 pub use bifrost_catalog::{
     BifrostCatalog, CompactionRegistration, CreateTableRequest, MAX_PHYSICAL_LEAF_COLUMNS,
     PinnedIcebergFile, PinnedSealedTable, TableDefinition, TableUid,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use bifrost_catalog::{
-    inject_metadata_not_found_for_test, reset_cut_reads_for_test, reset_sealed_pin_count_for_test,
-    sealed_pin_count_for_test,
+    inject_metadata_not_found_for_test, pause_next_alter_after_publication_for_test,
+    reset_cut_reads_for_test, reset_sealed_pin_count_for_test, sealed_pin_count_for_test,
 };
 pub use error::BifrostCatalogError;
 pub use layout::{

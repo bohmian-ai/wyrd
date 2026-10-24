@@ -6,7 +6,7 @@
 import { z } from "zod";
 import { expect, vi } from "vitest";
 
-import { Bifrost, TableConfig } from "wyrd-ai";
+import { Bifrost, TableConfig, WyrdClient } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 
@@ -139,4 +139,76 @@ test("an open dict field is queried by key", async ({ apiRequests }) => {
 
 test("registering the same model again finds the existing table", async ({ apiRequests }) => {
   await expect(apiRequests.register()).resolves.toBe("already_exists");
+});
+
+const Scored = z.object({ request_id: z.string(), region: z.string() });
+const Labelled = z.object({ request_id: z.string(), area: z.string(), note: z.string().nullable() });
+
+test("table configuration preserves versions and values", async ({ server }) => {
+  const scored = await Bifrost.connect({ table: TableConfig.fromJsonSchema("vala.datasets.scored", Scored) });
+  await scored.register();
+  scored.insert({ request_id: "req-1", region: "us-east" });
+  await scored.flush();
+  server.flushBifrost();
+  const described = await scored.describeTable("vala.datasets", "scored");
+  expect(described.table_version).toBe(1n);
+
+  // Supplied layout lists name columns as they are after this edit's renames;
+  // an added column omitting `nullable` takes the server's nullable default.
+  const edited = await scored.alterTable("vala.datasets", "scored", {
+    expected_table_version: described.table_version,
+    physical_layout: { bloom_columns: ["area"] },
+    add_columns: [{ name: "note", data_type: "Utf8" }],
+    rename_columns: [{ from: "region", to: "area" }],
+  });
+
+  expect(edited.table_version).toBe(2n);
+  expect(edited.user_fields.map((field) => field.name)).toEqual(["request_id", "area", "note"]);
+  expect(edited.user_fields.find((field) => field.name === "note")?.nullable).toBe(true);
+  expect(edited.physical_layout.bloom_columns).toEqual(["area"]);
+  expect(edited.physical_layout.partition_by).toEqual(described.physical_layout.partition_by);
+  await expect(scored.describeTable("vala.datasets", "scored")).resolves.toEqual(edited);
+  await expect(scored.sql("SELECT request_id, area, note FROM vala.datasets.scored", [], Labelled)).resolves.toEqual([
+    { request_id: "req-1", area: "us-east", note: null },
+  ]);
+
+  const cleared = await scored.alterTable("vala.datasets", "scored", {
+    expected_table_version: edited.table_version,
+    physical_layout: { bloom_columns: [] },
+  });
+  expect(cleared.table_version).toBe(3n);
+  expect(cleared.physical_layout.bloom_columns).toEqual([]);
+  expect(cleared.user_fields).toEqual(edited.user_fields);
+
+  await expect(
+    scored.alterTable("vala.datasets", "scored", {
+      expected_table_version: 2n,
+      physical_layout: { bloom_columns: ["area"] },
+    }),
+  ).rejects.toMatchObject({ code: "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT" });
+
+  const viewer = await Bifrost.connect({
+    client: WyrdClient.connect({ credential: server.bootstrapService(["viewer"], "table-viewer") }),
+  });
+  await expect(viewer.describeTable("vala.datasets", "scored")).resolves.toEqual(cleared);
+  await expect(
+    viewer.alterTable("vala.datasets", "scored", {
+      expected_table_version: 3n,
+      physical_layout: { bloom_columns: ["area"] },
+    }),
+  ).rejects.toMatchObject({ code: "WYRD_PERMISSION_403_DENIED_RBAC" });
+
+  // A version is a positive signed 64-bit integer, sent exactly past 2^53.
+  const edit = (version: bigint) =>
+    scored.alterTable("vala.datasets", "scored", {
+      expected_table_version: version,
+      physical_layout: { bloom_columns: [] },
+    });
+  for (const version of [0n, -1n, 2n ** 63n]) {
+    await expect(edit(version)).rejects.toMatchObject({ code: "WYRD_SPEC_400_VALIDATION" });
+  }
+  for (const version of [2n ** 53n + 1n, 2n ** 63n - 1n]) {
+    await expect(edit(version)).rejects.toMatchObject({ code: "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT" });
+  }
+  await expect(scored.describeTable("vala.datasets", "scored")).resolves.toEqual(cleared);
 });

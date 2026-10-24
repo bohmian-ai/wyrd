@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Instant;
 
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::oracle_reader_authority::{CutTableRef, TableCut};
 use wyrd_spec::DataTenantId;
@@ -48,12 +47,26 @@ struct CachedCut {
     read_at: Instant,
 }
 
-/// The cache state guarded by one lock, so a fill and an invalidation are
-/// ordered by it.
+/// Entries whose fills are fenced by invalidations and by listener liveness.
+///
+/// One lock orders every fill against every invalidation: a reader captures
+/// [`Self::fill_generation`] before its awaited load and [`Self::fill`]s
+/// under it afterwards, and any [`Self::invalidate`] or [`Self::reset`] in
+/// between bumps the generation so the older result is discarded. Nothing is
+/// served or filled while the node is not listening, so a missed
+/// notification cannot leave an entry current; callers then read their
+/// authority uncached. A poisoned lock behaves as not listening.
 #[derive(Default)]
-struct CutEntries {
-    /// Cached cuts by table.
-    cuts: HashMap<CutKey, CachedCut>,
+pub(crate) struct ListenedCache<T> {
+    /// Entries, generation, and listening state.
+    state: RwLock<Listened<T>>,
+}
+
+/// The state [`ListenedCache`] guards with one lock.
+#[derive(Default)]
+struct Listened<T> {
+    /// Cached entries.
+    entries: T,
     /// Bumped by every invalidation; a fill that began under an older value
     /// is discarded.
     generation: u64,
@@ -61,11 +74,60 @@ struct CutEntries {
     live: bool,
 }
 
+impl<T: Default> ListenedCache<T> {
+    /// Answers `read` from the entries, or `None` when the node is not
+    /// listening.
+    pub(crate) fn get<R>(&self, read: impl FnOnce(&T) -> Option<R>) -> Option<R> {
+        let state = self.state.read().ok()?;
+        if !state.live {
+            return None;
+        }
+        read(&state.entries)
+    }
+
+    /// Returns the generation an awaited load must start under to be cached,
+    /// or `None` when the node is not listening.
+    pub(crate) fn fill_generation(&self) -> Option<u64> {
+        let state = self.state.read().ok()?;
+        state.live.then_some(state.generation)
+    }
+
+    /// Applies `fill` for a load that began under `generation`, unless the
+    /// load began while not listening or an invalidation or reset happened
+    /// since.
+    pub(crate) fn fill(&self, generation: Option<u64>, fill: impl FnOnce(&mut T)) {
+        let Ok(mut state) = self.state.write() else {
+            return;
+        };
+        if state.live && Some(state.generation) == generation {
+            fill(&mut state.entries);
+        }
+    }
+
+    /// Applies `invalidate` and bumps the generation, so a load that began
+    /// before it cannot refill what it dropped.
+    pub(crate) fn invalidate(&self, invalidate: impl FnOnce(&mut T)) {
+        if let Ok(mut state) = self.state.write() {
+            state.generation = state.generation.wrapping_add(1);
+            invalidate(&mut state.entries);
+        }
+    }
+
+    /// Clears every entry and records whether the node is now listening.
+    pub(crate) fn reset(&self, live: bool) {
+        if let Ok(mut state) = self.state.write() {
+            state.generation = state.generation.wrapping_add(1);
+            state.entries = T::default();
+            state.live = live;
+        }
+    }
+}
+
 /// Node-local cut cache; see the module docs for its consistency rule.
 #[derive(Default)]
 pub(crate) struct CutCache {
-    /// Entries, generation, and listening state.
-    entries: RwLock<CutEntries>,
+    /// Cached cuts by table, fenced by the listener lifecycle.
+    cuts: ListenedCache<HashMap<CutKey, CachedCut>>,
 }
 
 impl CutCache {
@@ -81,54 +143,48 @@ impl CutCache {
         tables: &[CutTableRef<'_>],
         not_before: Option<Instant>,
     ) -> Option<Vec<TableCut>> {
-        let entries = self.entries.read().ok()?;
-        if !entries.live {
-            return None;
-        }
-        let mut cuts = Vec::with_capacity(tables.len());
-        for (index, table) in tables.iter().enumerate() {
-            if tables[..index].contains(table) {
-                return None;
+        self.cuts.get(|cuts| {
+            let mut found = Vec::with_capacity(tables.len());
+            for (index, table) in tables.iter().enumerate() {
+                if tables[..index].contains(table) {
+                    return None;
+                }
+                let cached = cuts.get(&key(tenant, table))?;
+                if not_before.is_some_and(|bound| cached.read_at < bound) {
+                    return None;
+                }
+                found.push(cached.cut.clone());
             }
-            let cached = entries.cuts.get(&key(tenant, table))?;
-            if not_before.is_some_and(|bound| cached.read_at < bound) {
-                return None;
-            }
-            cuts.push(cached.cut.clone());
-        }
-        Some(cuts)
+            Some(found)
+        })
     }
 
     /// Returns the generation a database read must start under to be cached,
     /// or `None` when the node is not listening.
     pub(crate) fn fill_generation(&self) -> Option<u64> {
-        let entries = self.entries.read().ok()?;
-        entries.live.then_some(entries.generation)
+        self.cuts.fill_generation()
     }
 
     /// Caches `cuts`, read under `generation` and completed at `read_at`,
-    /// unless an invalidation or lost connection happened since.
-    pub(crate) fn insert(&self, generation: u64, read_at: Instant, cuts: &[TableCut]) {
-        let Ok(mut entries) = self.entries.write() else {
-            return;
-        };
-        if !entries.live || entries.generation != generation {
-            return;
-        }
-        for cut in cuts {
-            let identity = &cut.identity;
-            entries.cuts.insert(
-                (
-                    identity.tenant.as_uuid(),
-                    identity.namespace_name.clone(),
-                    identity.table_name.clone(),
-                ),
-                CachedCut {
-                    cut: cut.clone(),
-                    read_at,
-                },
-            );
-        }
+    /// unless the read began while not listening or an invalidation or lost
+    /// connection happened since.
+    pub(crate) fn insert(&self, generation: Option<u64>, read_at: Instant, cuts: &[TableCut]) {
+        self.cuts.fill(generation, |entries| {
+            for cut in cuts {
+                let identity = &cut.identity;
+                entries.insert(
+                    (
+                        identity.tenant.as_uuid(),
+                        identity.namespace_name.clone(),
+                        identity.table_name.clone(),
+                    ),
+                    CachedCut {
+                        cut: cut.clone(),
+                        read_at,
+                    },
+                );
+            }
+        });
     }
 
     /// Drops one table's cut, which Oracle found older than a Scribe's
@@ -137,62 +193,32 @@ impl CutCache {
     /// Bumps the generation exactly as a notification does, so a fill that
     /// began before the eviction cannot reinsert the stale cut.
     pub(crate) fn evict(&self, tenant: DataTenantId, table: &CutTableRef<'_>) {
-        let Ok(mut entries) = self.entries.write() else {
-            return;
-        };
-        entries.generation = entries.generation.wrapping_add(1);
-        entries.cuts.remove(&key(tenant, table));
+        self.cuts.invalidate(|cuts| {
+            cuts.remove(&key(tenant, table));
+        });
     }
 
     /// Drops the cut a notification names, or every cut when the payload is
     /// not `tenant|namespace|table`.
-    fn invalidate(&self, payload: &str) {
-        let Ok(mut entries) = self.entries.write() else {
-            return;
-        };
-        entries.generation = entries.generation.wrapping_add(1);
-        let mut parts = payload.splitn(3, '|');
-        match (
-            parts.next().and_then(|tenant| Uuid::parse_str(tenant).ok()),
-            parts.next(),
-            parts.next(),
-        ) {
-            (Some(tenant), Some(namespace), Some(table)) => {
-                entries
-                    .cuts
-                    .remove(&(tenant, namespace.to_owned(), table.to_owned()));
+    pub(crate) fn invalidate(&self, payload: &str) {
+        self.cuts.invalidate(|cuts| {
+            let mut parts = payload.splitn(3, '|');
+            match (
+                parts.next().and_then(|tenant| Uuid::parse_str(tenant).ok()),
+                parts.next(),
+                parts.next(),
+            ) {
+                (Some(tenant), Some(namespace), Some(table)) => {
+                    cuts.remove(&(tenant, namespace.to_owned(), table.to_owned()));
+                }
+                _ => cuts.clear(),
             }
-            _ => entries.cuts.clear(),
-        }
+        });
     }
 
     /// Clears every cut and records whether the node is now listening.
-    fn reset(&self, live: bool) {
-        if let Ok(mut entries) = self.entries.write() {
-            entries.generation = entries.generation.wrapping_add(1);
-            entries.cuts.clear();
-            entries.live = live;
-        }
-    }
-
-    /// Listens for cut invalidations through `listener` until `shutdown`.
-    ///
-    /// The cache serves only while the listener is subscribed and its
-    /// heartbeat answers: each loss or silent stall clears it and switches it
-    /// off before a replacement subscribes, and serving resumes from an
-    /// empty cache; see [`vala_sql::NotificationListener::watch`].
-    pub(crate) async fn watch(
-        &self,
-        listener: &vala_sql::NotificationListener,
-        shutdown: CancellationToken,
-    ) {
-        listener
-            .watch(
-                shutdown,
-                |live| self.reset(live),
-                |payload| self.invalidate(payload),
-            )
-            .await;
+    pub(crate) fn reset(&self, live: bool) {
+        self.cuts.reset(live);
     }
 }
 
@@ -229,8 +255,9 @@ mod tests {
     }
 
     /// Proves the cache serves only while listening, only cuts read at or
-    /// after the bound, drops a fill that raced an invalidation or eviction,
-    /// and drops exactly the table a notification or eviction names.
+    /// after the bound, drops a fill that raced an invalidation, eviction, or
+    /// reconnect or began while not listening, and drops exactly the table a
+    /// notification or eviction names.
     ///
     /// # Panics
     /// Panics when any serve, miss, or invalidation assertion fails.
@@ -250,7 +277,7 @@ mod tests {
 
         assert!(cache.fill_generation().is_none(), "not listening: no fill");
         cache.reset(true);
-        let generation = cache.fill_generation().expect("listening");
+        let generation = cache.fill_generation();
         cache.insert(
             generation,
             start,
@@ -283,7 +310,7 @@ mod tests {
             "other table kept"
         );
 
-        let stale = cache.fill_generation().expect("listening");
+        let stale = cache.fill_generation();
         cache.invalidate("malformed");
         cache.insert(stale, start, &[cut(tenant, "events")]);
         assert!(
@@ -295,9 +322,9 @@ mod tests {
             "malformed clears all"
         );
 
-        let generation = cache.fill_generation().expect("listening");
+        let generation = cache.fill_generation();
         cache.insert(generation, start, &[cut(tenant, "events")]);
-        let raced = cache.fill_generation().expect("listening");
+        let raced = cache.fill_generation();
         cache.evict(tenant, &events);
         assert!(
             cache.get(tenant, &[events], None).is_none(),
@@ -309,12 +336,28 @@ mod tests {
             "a fill that raced an eviction is dropped"
         );
 
-        let generation = cache.fill_generation().expect("listening");
+        let generation = cache.fill_generation();
         cache.insert(generation, start, &[cut(tenant, "events")]);
         cache.reset(false);
         assert!(
             cache.get(tenant, &[events], None).is_none(),
             "lost listener clears"
+        );
+
+        let disconnected = cache.fill_generation();
+        cache.insert(disconnected, start, &[cut(tenant, "events")]);
+        cache.reset(true);
+        cache.insert(disconnected, start, &[cut(tenant, "events")]);
+        assert!(
+            cache.get(tenant, &[events], None).is_none(),
+            "a read that began while not listening is never cached"
+        );
+        let raced = cache.fill_generation();
+        cache.reset(true);
+        cache.insert(raced, start, &[cut(tenant, "events")]);
+        assert!(
+            cache.get(tenant, &[events], None).is_none(),
+            "a fill that raced a reconnect is dropped"
         );
     }
 }

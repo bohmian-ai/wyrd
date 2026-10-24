@@ -1906,16 +1906,16 @@ impl Bifrost {
             .map(|runtime| Arc::clone(runtime.peer()))
     }
 
-    /// The Oracle cut-cache listener, when this process plans queries.
+    /// The catalog cache listener, when this process holds a catalog.
     ///
     /// Oracle's cut cache serves only while this listener hears every
-    /// `vala.file_list` change; the future runs until `shutdown` and is
+    /// `vala.file_list` change, and every node's cached table definitions
+    /// follow the edits it hears; the future runs until `shutdown` and is
     /// registered with the process supervisor at startup.
     pub(crate) fn refresh_worker(&self, shutdown: CancellationToken) -> Option<EngineWorker> {
-        self.oracle.as_ref()?;
         let catalog = Arc::clone(self.catalog()?);
         Some((
-            "oracle_cut_cache",
+            "bifrost_catalog_cache",
             Box::pin(async move { catalog.watch_cuts(shutdown).await }),
         ))
     }

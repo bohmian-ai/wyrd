@@ -5,12 +5,14 @@ import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
 import type {
+  AlterTableRequest as AlterTableRequestWire,
   BifrostTableDescription as TableDescriptionWire,
   BifrostTableEntry as TableEntry,
   CancelRunningQueryResponse,
   CardRef,
   CardDeclarationOutcome,
   CardSummary,
+  ColumnRename,
   CompactionTypeWire as CompactionType,
   CreateOperatorConnectionRequest,
   CreateServicePrincipalRequest,
@@ -45,6 +47,7 @@ import type {
   OperatorConnectionView,
   PartitionFieldWire as PartitionField,
   PhysicalLayoutWire as PhysicalLayout,
+  PhysicalLayoutEdit,
   PrincipalKindTag as PrincipalKind,
   PrincipalPage,
   PrincipalQuery,
@@ -146,6 +149,7 @@ export type { WyrdErrorCode } from "./error-codes.js";
 export type {
   CardDeclarationOutcome,
   CardSummary,
+  ColumnRename,
   CompactionType,
   CreateOperatorConnectionRequest,
   CreateServicePrincipalRequest,
@@ -180,6 +184,7 @@ export type {
   OperatorConnectionView,
   PartitionField,
   PhysicalLayout,
+  PhysicalLayoutEdit,
   PrincipalKind,
   PrincipalPage,
   PrincipalQuery,
@@ -420,6 +425,23 @@ function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
  * `bigint`; its canonical decimal string is only the wire spelling.
  */
 export type TableDescription = Omit<TableDescriptionWire, "table_version"> & { readonly table_version: bigint };
+
+/**
+ * One edit to a registered table, built from the version last described.
+ *
+ * `expected_table_version` is a `bigint`; the edit commits only while the
+ * table is still at that version. Supplied layout lists name columns after
+ * any rename in the same edit; an omitted list keeps the current one.
+ */
+export type TableAlteration = Omit<AlterTableRequestWire, "expected_table_version"> & {
+  readonly expected_table_version: bigint;
+};
+
+function tableDescription(result: NativeLifecycleResult): TableDescription {
+  const wire = lifecycleValue<TableDescriptionWire>(result);
+  // The native client already refused any non-canonical or out-of-range spelling.
+  return { ...wire, table_version: BigInt(wire.table_version) };
+}
 
 function lifecycleValue<T>(result: NativeLifecycleResult): T {
   const error = projectedError(result);
@@ -1469,9 +1491,26 @@ export class Bifrost {
    * for a transport failure.
    */
   async describeTable(namespace: string, name: string): Promise<TableDescription> {
-    const wire = lifecycleValue<TableDescriptionWire>(await this.#native.describeTable(namespace, name));
-    // The native client already refused any non-canonical or out-of-range spelling.
-    return { ...wire, table_version: BigInt(wire.table_version) };
+    return tableDescription(await this.#native.describeTable(namespace, name));
+  }
+
+  /**
+   * Edit one registered table's layout or custom columns.
+   *
+   * @param namespace - The table's namespace, such as `vala.datasets`.
+   * @param name - The table's name within `namespace`.
+   * @param alteration - The edit and the table version it was built from.
+   * @returns The server's projection of the committed table version.
+   * @throws {@link WyrdError} when the edit is invalid, the table moved past
+   * `expected_table_version`, the table is unknown or unauthorized, or for a
+   * transport failure.
+   */
+  async alterTable(namespace: string, name: string, alteration: TableAlteration): Promise<TableDescription> {
+    const request: AlterTableRequestWire = {
+      ...alteration,
+      expected_table_version: String(alteration.expected_table_version),
+    };
+    return tableDescription(await this.#native.alterTable(namespace, name, JSON.stringify(request)));
   }
 }
 

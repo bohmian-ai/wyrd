@@ -3355,6 +3355,29 @@ pub(crate) async fn ingest_unclaimed(
     batch: &RecordBatch,
 ) -> Result<vala_bifrost_redux::contracts::FrameAdmission, vala_bifrost_redux::contracts::ScribeError>
 {
+    ingest_at(scribe, catalog, tenant, binding, None, batch_id, batch).await
+}
+
+/// Drives one real native Scribe append claiming `table_version`, or the
+/// current version when `None`, as [`ingest_unclaimed`] does.
+///
+/// # Errors
+///
+/// Returns the Scribe refusal of the frame.
+///
+/// # Panics
+///
+/// Panics when the registration lookup fails.
+pub(crate) async fn ingest_at(
+    scribe: &ScribeImpl,
+    catalog: &BifrostCatalog,
+    tenant: DataTenantId,
+    binding: &TenantTableBinding,
+    table_version: Option<wyrd_spec::vala::ids::TableVersion>,
+    batch_id: Uuid,
+    batch: &RecordBatch,
+) -> Result<vala_bifrost_redux::contracts::FrameAdmission, vala_bifrost_redux::contracts::ScribeError>
+{
     let (fingerprint, _) = catalog
         .table_registration(&binding.table_ref, tenant)
         .await
@@ -3373,6 +3396,7 @@ pub(crate) async fn ingest_unclaimed(
             expected_schema_fingerprint: fingerprint,
             request_id: wyrd_spec::request_id::RequestId::now_v7(),
             batch_id,
+            table_version,
             payload: ingress_ipc(batch),
         })
         .await

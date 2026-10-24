@@ -236,10 +236,22 @@ impl ScribeImpl {
                 retry_only: None,
             });
         };
-        let current = catalog
+        let mut current = catalog
             .current_definition(&frame.table, frame.authenticated_tenant)
             .await
             .map_err(scribe_catalog_error)?;
+        if frame
+            .table_version
+            .is_some_and(|version| version > current.table_version)
+        {
+            // Another node committed an edit this node has not heard of yet;
+            // the writer described it, so reload once rather than refuse.
+            catalog.evict_current_definition(&frame.table, frame.authenticated_tenant);
+            current = catalog
+                .current_definition(&frame.table, frame.authenticated_tenant)
+                .await
+                .map_err(scribe_catalog_error)?;
+        }
         let (definition, retry_only) = match frame.table_version {
             Some(version) if version != current.table_version => {
                 let conflict = || table_version_conflict(&frame.table, current.table_version);

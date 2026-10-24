@@ -1,5 +1,6 @@
 //! A retry the current table definition refuses is answered by the version
-//! that accepted its batch id.
+//! that accepted its batch id, and a new batch binds the current version even
+//! when this node never heard the edit.
 
 mod pg_tests {
     use std::sync::Arc;
@@ -11,7 +12,8 @@ mod pg_tests {
     use vala_bifrost_redux::scribe::memory::MemoryCategory;
 
     use crate::forge::support::{
-        PromotionIntegrationFixture, fixture_day, fixture_time_field, ingest_unclaimed, ingress_ipc,
+        PromotionIntegrationFixture, fixture_day, fixture_time_field, ingest_at, ingest_unclaimed,
+        ingress_ipc,
     };
 
     /// Builds `scopes` rows in one fixture day, each with its own `scope`.
@@ -125,6 +127,119 @@ mod pg_tests {
             published,
             "no retry or refusal publishes rows"
         );
+    }
+
+    /// A node that is not listening admits new batches by the table's current
+    /// version even after another node commits an edit it never hears.
+    ///
+    /// The fixture's catalog runs no listener and accepts a batch at version
+    /// 1. A second catalog over the same database then commits version 2, so
+    /// the fixture's catalog neither hears nor evicts the edit. Its
+    /// registration serves the edited layout, a new batch at version 1 is
+    /// refused as a version conflict, a new batch at version 2
+    /// is accepted, and the version-1 batch still retries as acknowledged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture or edit cannot start or commit, the superseded
+    /// layout is served, a stale batch
+    /// is admitted or refused otherwise, the current batch is refused, or the
+    /// accepted retry is refused or reported as a first commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unheard_edit_still_governs_new_admission() {
+        use secrecy::ExposeSecret;
+        use wyrd_spec::vala::BifrostError;
+        use wyrd_spec::vala::ids::TableVersion;
+
+        let fixture = PromotionIntegrationFixture::start_with(
+            "unheard_edit",
+            vec![Field::new("scope", DataType::Utf8, false)],
+            &[],
+        )
+        .await;
+        let ingest = async |version, batch_id, batch: &RecordBatch| {
+            ingest_at(
+                fixture.scribe(),
+                &fixture.catalog,
+                fixture.tenant,
+                &fixture.binding,
+                Some(version),
+                batch_id,
+                batch,
+            )
+            .await
+        };
+        let accepted = uuid::Uuid::now_v7();
+        let original = scoped(1, "original");
+        assert!(
+            ingest(TableVersion::INITIAL, accepted, &original)
+                .await
+                .expect("version 1 admits")
+                .first_commit
+        );
+
+        let editor = vala_bifrost_redux::catalog::BifrostCatalog::new(
+            fixture.database.catalog_dsn().expose_secret(),
+            std::sync::Arc::clone(&fixture.storage),
+            fixture.vala.clone(),
+        )
+        .await
+        .expect("a second node's catalog builds");
+        let edited = editor
+            .alter_table(
+                fixture.tenant,
+                &fixture.binding.table_ref,
+                vala_bifrost_redux::catalog::TableAlteration {
+                    expected_table_version: TableVersion::INITIAL,
+                    physical_layout: wyrd_spec::vala::api::PhysicalLayoutEdit {
+                        bloom_columns: Some(vec!["scope".to_owned()]),
+                        ..Default::default()
+                    },
+                    add_columns: Vec::new(),
+                    rename_columns: Vec::new(),
+                },
+            )
+            .await
+            .expect("the second node commits version 2");
+        let (_, layout) = fixture
+            .catalog
+            .table_registration(&fixture.binding.table_ref, fixture.tenant)
+            .await
+            .expect("the registration resolves");
+        assert_eq!(
+            layout.bloom_columns,
+            ["scope"],
+            "the unheard edit's layout is served"
+        );
+
+        let stale = ingest(
+            TableVersion::INITIAL,
+            uuid::Uuid::now_v7(),
+            &scoped(1, "stale"),
+        )
+        .await
+        .expect_err("a new batch at the superseded version is refused");
+        assert!(
+            matches!(
+                stale,
+                ScribeError::ContractViolation(BifrostError::TableVersionConflict { .. })
+            ),
+            "{stale:?}"
+        );
+        assert!(
+            ingest(
+                edited.table_version,
+                uuid::Uuid::now_v7(),
+                &scoped(1, "current")
+            )
+            .await
+            .expect("a batch at the committed version admits")
+            .first_commit
+        );
+        let retried = ingest(TableVersion::INITIAL, accepted, &original)
+            .await
+            .expect("the accepted batch retries at its own version");
+        assert!(!retried.first_commit);
     }
 
     /// Builds one row per day in each of the two days before the fixture day

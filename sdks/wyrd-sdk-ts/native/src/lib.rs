@@ -38,7 +38,7 @@ use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, QueryParam};
+use wyrd_spec::vala::api::{AlterTableRequest, BifrostQueryRequest, QueryParam};
 use wyrd_spec::vala::api::{CompactionTypeWire, PhysicalLayoutWire};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{RunId, TraceId};
@@ -1224,6 +1224,48 @@ impl NativeBifrost {
         let client = self.client.clone();
         crate::trace::spawn(env, async move {
             match client.describe_table(&namespace, &name).await {
+                Ok(description) => NativeLifecycleResult::success(
+                    &serde_json::to_value(description).map_err(napi_error)?,
+                ),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+            }
+        })
+    }
+
+    /// Alters one registered table's definition at its observed table version
+    /// and resolves to the committed description.
+    ///
+    /// `request_json` is one serialized `AlterTableRequest`, decoded strictly
+    /// here; every edit decision belongs to the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// a malformed request and every Wyrd control failure are returned in
+    /// [`NativeLifecycleResult`].
+    ///
+    /// # Cancellation
+    ///
+    /// The edit runs to completion once started; a lost or abandoned result
+    /// may leave it committed, so describe the table before retrying.
+    #[napi]
+    pub fn alter_table<'env>(
+        &self,
+        env: &'env Env,
+        namespace: String,
+        name: String,
+        request_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            let altered = match serde_json::from_str::<AlterTableRequest>(&request_json) {
+                Ok(request) => client.alter_table(&namespace, &name, &request).await,
+                Err(error) => Err(validation_error(
+                    format!("invalid table edit request: {error}"),
+                    "request",
+                )),
+            };
+            match altered {
                 Ok(description) => NativeLifecycleResult::success(
                     &serde_json::to_value(description).map_err(napi_error)?,
                 ),

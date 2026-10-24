@@ -50,6 +50,7 @@ WIRE_ROOTS = [
     "ListCardsResponse",
     "DeclarationReceipt",
     # Bifrost.
+    "AlterTableRequest",
     "BifrostQueryRequest",
     "BifrostTableDescription",
     "CancelRunningQueryResponse",
@@ -98,6 +99,14 @@ REQUEST_ROOTS = {
     "RevokePrincipalRequest",
     "UpdateOperatorConnectionRequest",
 }
+
+# Request roots that reach definitions a response also returns, such as
+# `AlterTableRequest` reaching the `FieldSpec` a `BifrostTableDescription`
+# returns. A definition only these roots reach keeps input optionality. A shared
+# one whose modes differ keeps its output-mode node and gains an input-mode
+# `<Name>Input` copy that the request side references, so a defaulted request
+# field stays optional without loosening the response.
+SPLIT_REQUEST_ROOTS = {"AlterTableRequest"}
 
 # Property extension carrying the schema of the value an omitted-when-`None`
 # field holds whenever it is serialized (`wyrd_spec::schema::skipped_option`).
@@ -150,19 +159,32 @@ def pascal(text: str) -> str:
 class Lowering:
     """Lower JSON Schema definitions into named intermediate nodes."""
 
-    def __init__(self, definitions: dict, inputs: set[str]) -> None:
+    def __init__(
+        self, definitions: dict, inputs: set[str], copies: set[str] = frozenset()
+    ) -> None:
         self.definitions = definitions
         self.inputs = inputs
+        self.copies = copies
+        self.copy_of: dict[str, str] = {}
         self.output = False
         self.nodes: dict[str, tuple] = {}
         self.pending: list[str] = []
 
     def require(self, name: str) -> str:
-        """Queue a referenced definition for lowering and return its name."""
+        """Queue a referenced definition for lowering and return its name.
+
+        An input-mode reference to a definition in `copies` names its
+        input-mode `<Name>Input` copy instead.
+        """
         if name not in self.definitions:
             raise SystemExit(
                 f"{name}: referenced definition is missing from the contract bundle"
             )
+        if not self.output and name in self.copies:
+            copy = f"{name}Input"
+            if self.copy_of.setdefault(copy, name) != name or copy in self.definitions:
+                raise SystemExit(f"{copy}: input copy collides with another definition")
+            name = copy
         if name not in self.nodes and name not in self.pending:
             self.pending.append(name)
         return name
@@ -172,7 +194,7 @@ class Lowering:
         while self.pending:
             name = self.pending.pop()
             if name not in self.nodes:
-                self.define(name, self.definitions[name])
+                self.define(name, self.definitions[self.copy_of.get(name, name)])
 
     def fresh(self, name: str) -> str:
         """Return a hoisted-type name that collides with no definition."""
@@ -189,7 +211,7 @@ class Lowering:
         field is required in what the server returns, and a field serde skips
         when `None` lowers its `SERIALIZED` schema, the value it holds when present.
         """
-        self.output = name not in self.inputs
+        self.output = name not in self.inputs and name not in self.copy_of
         description = schema.get("description")
         if self.is_object(schema) and not self.variants(schema):
             self.nodes[name] = ("object", [], description)
@@ -438,6 +460,36 @@ def reachable(definitions: dict, names: list[str]) -> set[str]:
     return seen
 
 
+def mode_sensitive(definitions: dict, names: set[str]) -> set[str]:
+    """Return the `names` whose input- and output-mode lowerings differ.
+
+    A definition differs when one of its object properties carries a `default`
+    or a `SERIALIZED` schema, or when it references a definition that differs.
+    """
+
+    def direct(schema: object) -> bool:
+        if isinstance(schema, list):
+            return any(direct(item) for item in schema)
+        if not isinstance(schema, dict):
+            return False
+        if any(
+            isinstance(value, dict) and ("default" in value or SERIALIZED in value)
+            for value in schema.get("properties", {}).values()
+        ):
+            return True
+        return any(direct(value) for value in schema.values())
+
+    differs = {name for name in names if direct(definitions[name])}
+    grown = True
+    while grown:
+        grown = False
+        for name in names - differs:
+            if reachable(definitions, [name]) & differs:
+                differs.add(name)
+                grown = True
+    return differs
+
+
 def target(roots: dict, root: str) -> str:
     """Return the definition name a registered wire root refers to."""
     if root not in roots:
@@ -482,7 +534,25 @@ def lower(bundle: dict) -> dict[str, tuple]:
     definitions = bundle["$defs"]
     roots = bundle["roots"]
     requests = [target(roots, root) for root in sorted(REQUEST_ROOTS)]
-    lowering = Lowering(definitions, reachable(definitions, ["Card", *requests]))
+    inputs = reachable(definitions, ["Card", *requests])
+    split = reachable(
+        definitions, [target(roots, root) for root in sorted(SPLIT_REQUEST_ROOTS)]
+    )
+    responses = reachable(
+        definitions,
+        [
+            "Card",
+            *(
+                target(roots, root)
+                for root in WIRE_ROOTS
+                if root not in SPLIT_REQUEST_ROOTS
+            ),
+        ],
+    )
+    shared = (split & responses) - inputs
+    lowering = Lowering(
+        definitions, inputs | (split - responses), mode_sensitive(definitions, shared)
+    )
     schema = definitions["Card"]
     names = []
     for kind in SUPPORTED_KINDS:

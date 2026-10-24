@@ -1,23 +1,23 @@
 //! One composite-partition table and the catalog revisions journeys apply to it.
 //!
 //! The table is partitioned by event hour, nullable customer identity, and a
-//! four-way shard bucket. The revisions commit straight through the table's
-//! Iceberg catalog under the same current-id guards a public alteration uses,
-//! so a journey can write rows under one layout revision and read, promote, or
-//! compact them under the next.
+//! four-way shard bucket. The revisions commit through the catalog's public
+//! alteration owner from the described version, so a journey can write rows
+//! under one layout revision and read, promote, or compact them under the
+//! next.
 
 use std::sync::Arc;
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use iceberg::TableRequirement;
-use iceberg::spec::TableMetadata;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use vala_bifrost_redux::catalog::{TABLE_VERSION_PROPERTY, TableRef, TenantTableBinding};
+use vala_bifrost_redux::catalog::{TableAlteration, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire};
+use wyrd_spec::vala::api::{
+    BifrostTableDescription, ColumnRename, PartitionFieldWire, PartitionTransformWire,
+    PhysicalLayoutEdit, PhysicalLayoutWire,
+};
 
 use crate::WyrdTestServer;
 
@@ -154,65 +154,45 @@ pub fn shifted(batch: &RecordBatch, by: i64) -> RecordBatch {
 }
 
 impl WyrdTestServer {
-    /// Commits the updates `revise` derives from a table's current metadata
-    /// straight through its Iceberg catalog, guarded by the current schema,
-    /// spec, and sort-order ids, advancing the table version by one, then
-    /// evicts this node's cached definition so the next admission reads it.
+    /// Commits the edit `revise` derives from the table's current definition
+    /// through the catalog's public alteration owner, built from the
+    /// described version and current layout, and returns the committed
+    /// description.
+    ///
+    /// # Repetition, cancellation, and retry
+    ///
+    /// Every revision helper commits through this one. Each call describes
+    /// the table anew and edits from that version, so it is not idempotent:
+    /// repeating an effective call commits a further version, never a retry
+    /// of the first. The edit commits or rolls back as one, so dropping the
+    /// future before it returns either changes nothing or leaves the whole
+    /// edit committed; it is not retried, and a refused edit panics.
     ///
     /// # Panics
     ///
-    /// Panics when the table cannot be loaded or the revision does not commit.
-    pub async fn commit_table_revision(
+    /// Panics when the table cannot be described or the edit does not commit.
+    async fn alter_table_from_current(
         &self,
         tenant: DataTenantId,
         table: &TableRef,
-        revise: impl FnOnce(&TableMetadata) -> Vec<iceberg::TableUpdate>,
-    ) {
+        revise: impl FnOnce(&BifrostTableDescription) -> TableAlteration,
+    ) -> BifrostTableDescription {
         let catalog = self.bifrost_catalog();
-        let binding =
-            TenantTableBinding::resolve((tenant, table.clone())).expect("binding resolves");
-        let physical = catalog
-            .iceberg_catalog()
-            .load_table(&binding.table_ident())
+        let current = catalog
+            .describe_table(table, tenant)
             .await
-            .expect("physical table loads");
-        let metadata = physical.metadata();
-        let transaction = Transaction::new(&physical);
-        let version: i64 = metadata
-            .properties()
-            .get(TABLE_VERSION_PROPERTY)
-            .expect("a Bifrost table carries its version")
-            .parse()
-            .expect("the version is canonical");
-        let mut updates = revise(metadata);
-        updates.push(iceberg::TableUpdate::SetProperties {
-            updates: [(TABLE_VERSION_PROPERTY.to_owned(), (version + 1).to_string())].into(),
-        });
-        let action = updates.into_iter().fold(
-            transaction
-                .apply_updates()
-                .requirement(TableRequirement::CurrentSchemaIdMatch {
-                    current_schema_id: metadata.current_schema_id(),
-                })
-                .requirement(TableRequirement::DefaultSpecIdMatch {
-                    default_spec_id: metadata.default_partition_spec_id(),
-                })
-                .requirement(TableRequirement::DefaultSortOrderIdMatch {
-                    default_sort_order_id: metadata.default_sort_order_id(),
-                }),
-            iceberg::transaction::ApplyUpdatesAction::update,
-        );
-        ApplyTransactionAction::apply(action, transaction)
-            .expect("revision applies")
-            .commit(catalog.iceberg_catalog().as_ref())
+            .expect("the table describes");
+        catalog
+            .alter_table(tenant, table, revise(&current))
             .await
-            .expect("revision commits");
-        catalog.evict_current_definition(table, tenant);
+            .expect("the edit commits")
     }
 
     /// Commits `columns` as the table's complete ordered Bloom list: a
     /// Bloom-only definition edit that leaves every schema, spec, and sort
     /// order id unchanged and still advances the table version by one.
+    ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
     ///
     /// # Panics
     ///
@@ -223,101 +203,64 @@ impl WyrdTestServer {
         table: &TableRef,
         columns: &[&str],
     ) {
-        let value = serde_json::to_string(columns).expect("a string list serializes");
-        self.commit_table_revision(tenant, table, |_| {
-            vec![iceberg::TableUpdate::SetProperties {
-                updates: [(
-                    vala_bifrost_redux::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
-                    value,
-                )]
-                .into(),
-            }]
+        self.commit_layout_revision(tenant, table, |layout| PhysicalLayoutEdit {
+            bloom_columns: Some(columns.iter().map(|&column| column.to_owned()).collect()),
+            ..layout_edit(layout)
         })
         .await;
     }
 
     /// Commits a new default sort order — the current keys plus `value`
-    /// descending — and returns its id.
+    /// descending — and returns the id the committed order carries.
+    ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
     ///
     /// # Panics
     ///
-    /// Panics when the revision does not commit.
+    /// Panics when the revision does not commit or the table cannot be
+    /// loaded afterwards.
     pub async fn commit_sort_revision(&self, tenant: DataTenantId, table: &TableRef) -> i32 {
-        use iceberg::spec::{NullOrder, SortDirection, SortField, SortOrder, Transform};
-        let mut order_id = 0;
-        self.commit_table_revision(tenant, table, |metadata| {
-            order_id = metadata
-                .sort_orders_iter()
-                .map(|order| order.order_id)
-                .max()
-                .expect("a registered table has a sort order")
-                + 1;
-            let value_id = metadata
-                .current_schema()
-                .field_by_name("value")
-                .expect("value is a column")
-                .id;
-            let fields = metadata
-                .default_sort_order()
-                .fields
-                .iter()
-                .cloned()
-                .chain([SortField {
-                    source_id: value_id,
-                    transform: Transform::Identity,
-                    direction: SortDirection::Descending,
-                    null_order: NullOrder::Last,
-                }])
-                .collect();
-            vec![
-                iceberg::TableUpdate::AddSortOrder {
-                    sort_order: SortOrder::builder()
-                        .with_order_id(order_id)
-                        .with_fields(fields)
-                        .build_unbound()
-                        .expect("sort order builds"),
-                },
-                iceberg::TableUpdate::SetDefaultSortOrder { sort_order_id: -1 },
-            ]
+        use wyrd_spec::vala::api::{NullOrderWire, SortDirectionWire, SortKeyWire};
+        self.commit_layout_revision(tenant, table, |layout| PhysicalLayoutEdit {
+            sort_keys: Some(
+                layout
+                    .sort_keys
+                    .iter()
+                    .cloned()
+                    .chain([SortKeyWire {
+                        column: "value".to_owned(),
+                        direction: SortDirectionWire::Desc,
+                        null_order: NullOrderWire::Last,
+                    }])
+                    .collect(),
+            ),
+            ..layout_edit(layout)
         })
         .await;
+        let binding =
+            TenantTableBinding::resolve((tenant, table.clone())).expect("binding resolves");
+        let order_id = self
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .expect("physical table loads")
+            .metadata()
+            .default_sort_order_id();
         i32::try_from(order_id).expect("sort order id fits i32")
     }
 
     /// Commits a partition spec that keeps the current fields except the
     /// `shard` bucket.
     ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
+    ///
     /// # Panics
     ///
     /// Panics when the revision does not commit.
     pub async fn commit_spec_revision(&self, tenant: DataTenantId, table: &TableRef) {
-        self.commit_table_revision(tenant, table, |metadata| {
-            let shard = metadata
-                .current_schema()
-                .field_by_name("shard")
-                .expect("shard is a column")
-                .id;
-            let spec = metadata
-                .default_partition_spec()
-                .fields()
-                .iter()
-                .filter(|field| field.source_id != shard)
-                .try_fold(
-                    iceberg::spec::UnboundPartitionSpec::builder(),
-                    |builder, field| {
-                        builder.add_partition_field(
-                            field.source_id,
-                            field.name.clone(),
-                            field.transform,
-                        )
-                    },
-                )
-                .expect("spec builds")
-                .build();
-            vec![
-                iceberg::TableUpdate::AddSpec { spec },
-                iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
-            ]
+        self.commit_partition_revision(tenant, table, |fields| {
+            fields.retain(|field| field.column != "shard");
         })
         .await;
     }
@@ -326,48 +269,22 @@ impl WyrdTestServer {
     /// identity partition on `column`, so rows the old spec grouped together
     /// can fan out into one tuple per distinct `column` value.
     ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
+    ///
     /// # Panics
     ///
-    /// Panics when `column` is not a column or the revision does not commit.
+    /// Panics when the revision does not commit.
     pub async fn commit_identity_partition_revision(
         &self,
         tenant: DataTenantId,
         table: &TableRef,
         column: &str,
     ) {
-        self.commit_table_revision(tenant, table, |metadata| {
-            let source = metadata
-                .current_schema()
-                .field_by_name(column)
-                .expect("the partition source is a column")
-                .id;
-            let spec = metadata
-                .default_partition_spec()
-                .fields()
-                .iter()
-                .try_fold(
-                    iceberg::spec::UnboundPartitionSpec::builder(),
-                    |builder, field| {
-                        builder.add_partition_field(
-                            field.source_id,
-                            field.name.clone(),
-                            field.transform,
-                        )
-                    },
-                )
-                .and_then(|builder| {
-                    builder.add_partition_field(
-                        source,
-                        column.to_owned(),
-                        iceberg::spec::Transform::Identity,
-                    )
-                })
-                .expect("spec builds")
-                .build();
-            vec![
-                iceberg::TableUpdate::AddSpec { spec },
-                iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
-            ]
+        self.commit_partition_revision(tenant, table, |fields| {
+            fields.push(PartitionFieldWire::new(
+                column,
+                PartitionTransformWire::Identity,
+            ));
         })
         .await;
     }
@@ -375,6 +292,8 @@ impl WyrdTestServer {
     /// Commits a partition spec that keeps the current fields but buckets
     /// `shard` into `buckets`, so the new spec's tuples have the same shape
     /// and can hold the same values as the old spec's.
+    ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
     ///
     /// # Panics
     ///
@@ -385,40 +304,10 @@ impl WyrdTestServer {
         table: &TableRef,
         buckets: u32,
     ) {
-        self.commit_table_revision(tenant, table, |metadata| {
-            let shard = metadata
-                .current_schema()
-                .field_by_name("shard")
-                .expect("shard is a column")
-                .id;
-            let spec = metadata
-                .default_partition_spec()
-                .fields()
-                .iter()
-                .try_fold(
-                    iceberg::spec::UnboundPartitionSpec::builder(),
-                    |builder, field| {
-                        if field.source_id == shard {
-                            builder.add_partition_field(
-                                shard,
-                                format!("shard_bucket_{buckets}"),
-                                iceberg::spec::Transform::Bucket(buckets),
-                            )
-                        } else {
-                            builder.add_partition_field(
-                                field.source_id,
-                                field.name.clone(),
-                                field.transform,
-                            )
-                        }
-                    },
-                )
-                .expect("spec builds")
-                .build();
-            vec![
-                iceberg::TableUpdate::AddSpec { spec },
-                iceberg::TableUpdate::SetDefaultSpec { spec_id: -1 },
-            ]
+        self.commit_partition_revision(tenant, table, |fields| {
+            for field in fields.iter_mut().filter(|field| field.column == "shard") {
+                field.buckets = Some(buckets);
+            }
         })
         .await;
     }
@@ -426,43 +315,77 @@ impl WyrdTestServer {
     /// Commits a schema that renames `customer` to `client` under its field
     /// id and adds a nullable `note` string.
     ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
+    ///
     /// # Panics
     ///
     /// Panics when the revision does not commit.
     pub async fn commit_schema_revision(&self, tenant: DataTenantId, table: &TableRef) {
-        use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
-        self.commit_table_revision(tenant, table, |metadata| {
-            let current = metadata.current_schema();
-            let fields = current
-                .as_struct()
-                .fields()
-                .iter()
-                .map(|field| {
-                    if field.name == "customer" {
-                        let mut renamed = field.as_ref().clone();
-                        "client".clone_into(&mut renamed.name);
-                        Arc::new(renamed)
-                    } else {
-                        Arc::clone(field)
-                    }
-                })
-                .chain([Arc::new(NestedField::optional(
-                    metadata.last_column_id() + 1,
-                    "note",
-                    Type::Primitive(PrimitiveType::String),
-                ))])
-                .collect::<Vec<_>>();
-            let schema = IcebergSchema::builder()
-                .with_schema_id(current.schema_id() + 1)
-                .with_identifier_field_ids(current.identifier_field_ids())
-                .with_fields(fields)
-                .build()
-                .expect("schema builds");
-            vec![
-                iceberg::TableUpdate::AddSchema { schema },
-                iceberg::TableUpdate::SetCurrentSchema { schema_id: -1 },
-            ]
+        self.alter_table_from_current(tenant, table, |current| TableAlteration {
+            expected_table_version: current.table_version,
+            physical_layout: PhysicalLayoutEdit::default(),
+            add_columns: vec![Field::new("note", DataType::Utf8, true)],
+            rename_columns: vec![ColumnRename {
+                from: "customer".to_owned(),
+                to: "client".to_owned(),
+            }],
         })
         .await;
+    }
+
+    /// Commits the complete layout lists `edit` derives from the current
+    /// layout, with no schema change.
+    ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the revision does not commit.
+    async fn commit_layout_revision(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+        edit: impl FnOnce(&PhysicalLayoutWire) -> PhysicalLayoutEdit,
+    ) {
+        self.alter_table_from_current(tenant, table, |current| TableAlteration {
+            expected_table_version: current.table_version,
+            physical_layout: edit(&current.physical_layout),
+            add_columns: Vec::new(),
+            rename_columns: Vec::new(),
+        })
+        .await;
+    }
+
+    /// Commits the current partition fields as `revise` changes them.
+    ///
+    /// Repetition, cancellation, and retry follow `alter_table_from_current`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the revision does not commit.
+    async fn commit_partition_revision(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+        revise: impl FnOnce(&mut Vec<PartitionFieldWire>),
+    ) {
+        self.commit_layout_revision(tenant, table, |layout| {
+            let mut fields = layout.partition_by.clone();
+            revise(&mut fields);
+            PhysicalLayoutEdit {
+                partition_by: Some(fields),
+                ..layout_edit(layout)
+            }
+        })
+        .await;
+    }
+}
+
+/// The complete current lists of `layout` as an edit that changes nothing.
+fn layout_edit(layout: &PhysicalLayoutWire) -> PhysicalLayoutEdit {
+    PhysicalLayoutEdit {
+        partition_by: Some(layout.partition_by.clone()),
+        sort_keys: Some(layout.sort_keys.clone()),
+        bloom_columns: Some(layout.bloom_columns.clone()),
     }
 }

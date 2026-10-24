@@ -5,7 +5,8 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::{
-    BifrostTableDescription, BifrostTableEntry, RegisterTableRequest, RegisterTableResponse,
+    AlterTableRequest, BifrostTableDescription, BifrostTableEntry, RegisterTableRequest,
+    RegisterTableResponse,
 };
 
 use crate::bifrost::service;
@@ -19,7 +20,7 @@ use utoipa_axum::routes;
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(register, list))
-        .routes(routes!(describe))
+        .routes(routes!(describe, alter))
 }
 
 #[utoipa::path(
@@ -157,6 +158,81 @@ pub(crate) async fn describe(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<BifrostTableDescription>, WyrdErrorResponse> {
     service::describe_table(&state, caller, namespace, name)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+#[utoipa::path(
+    patch,
+    path = "/bifrost/tables/{namespace}/{name}",
+    params(
+        ("namespace" = String, Path, description = "Table namespace"),
+        ("name" = String, Path, description = "Table name")
+    ),
+    request_body = AlterTableRequest,
+    responses(
+        (status = 200, description = "The committed table description at its next table_version",
+         body = BifrostTableDescription),
+        (status = 400, description = "The body does not decode as the request contract (an \
+          unknown field such as time_column, an explicit null, or a non-canonical \
+          expected_table_version), the namespace is not one Bifrost serves, or the edit is \
+          outside the safe-edit contract or changes nothing (WYRD_SPEC_400_VALIDATION, \
+          WYRD_VALA_400_BIFROST_INVALID_TABLE_EDIT, \
+          WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT, WYRD_VALA_400_BIFROST_RESERVED_COLUMN, \
+          WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE, WYRD_VALA_400_SCHEMA_PARSE)",
+         body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "The principal may not administer Bifrost tables \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 404, description = "No table of that name is visible to this tenant \
+          (WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "The table is no longer at expected_table_version, or is at \
+          the maximum version (WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT, \
+          WYRD_VALA_409_BIFROST_TABLE_VERSION_EXHAUSTED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "This server carries no catalog, the catalog or its \
+          object store is unreachable, or no verifier is configured for the access \
+          token (WYRD_VALA_503_SCRIBE_ROLE_UNAVAILABLE, \
+          WYRD_VALA_503_BIFROST_CATALOG_UNREACHABLE, WYRD_VALA_503_BIFROST_STORAGE_UNREACHABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Any other catalog-backed refusal, each carrying \
+          its own stable code from the Bifrost catalog (WYRD_VALA_500_BIFROST_INTERNAL, \
+          WYRD_VALA_500_BIFROST_METADATA_MISMATCH)", body = WyrdProblem, content_type = "application/problem+json")
+    ),
+    tag = "Bifrost"
+)]
+/// Explicitly alters one visible table's partition, sort, or Bloom lists, or
+/// adds and renames its custom columns, against the version it was
+/// described at.
+///
+/// # Errors
+///
+/// Returns `WYRD_SPEC_400_VALIDATION` naming the decode failure when the body
+/// is not JSON or does not match `AlterTableRequest`; otherwise the
+/// authorization, validation, not-found, version-conflict, or
+/// catalog-availability errors from the catalog service.
+///
+/// The `bifrost.table.alter` span records only the addressed namespace and
+/// table; state, the caller's credentials, and the body are skipped.
+#[tracing::instrument(
+    name = "bifrost.table.alter",
+    level = "debug",
+    skip_all,
+    fields(namespace = %namespace, table = %name)
+)]
+pub(crate) async fn alter(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((namespace, name)): Path<(String, String)>,
+    body: Result<Json<AlterTableRequest>, JsonRejection>,
+) -> Result<Json<BifrostTableDescription>, WyrdErrorResponse> {
+    let Json(body) = body.map_err(|rejection| WyrdError::Validation {
+        message: "the body does not decode as an AlterTableRequest".to_owned(),
+        details: serde_json::json!({ "field": "body", "reason": rejection.body_text() }),
+    })?;
+    service::alter_table(&state, caller, namespace, name, body)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)

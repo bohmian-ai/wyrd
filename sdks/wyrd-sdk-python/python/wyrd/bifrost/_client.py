@@ -11,8 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, ca
 
 import pyarrow
 
-# The native ``_wyrd.bifrost`` submodule is private and has no stub.
-from .._wyrd import bifrost as _native  # ty: ignore[unresolved-import]
+from .._wyrd import bifrost as _native
 from ..client import WyrdClient
 from ..types import TIMESTAMP_TYPES, TimestampLTZ, TimestampNTZ, TimestampTZ
 

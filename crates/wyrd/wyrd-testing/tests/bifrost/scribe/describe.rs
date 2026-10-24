@@ -7,7 +7,7 @@ use wyrd_client::bifrost::BifrostOptions;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::ids::TableVersion;
 
-use super::support::{start_scribe_server, unique_table};
+use super::support::{start_scribe_server, tenant_client, unique_table};
 
 /// A writer never keeps its own copy of the physical contract.
 ///
@@ -536,6 +536,247 @@ async fn registered_layouts_are_bounded_and_resolved() {
                 .expect("the refused name registers under a valid layout"),
             RegisterOutcome::Created,
             "a refusal leaves no registration behind"
+        );
+    }
+    server.shutdown().await.expect("server shutdown");
+}
+
+/// The stable catalog code a refused client call carries.
+fn code(error: &wyrd_client::bifrost::BifrostClientError) -> String {
+    wyrd_spec::error::WyrdError::from(error).code().to_owned()
+}
+
+/// An edit at `version` that replaces only the listed layout lists.
+fn layout_edit(
+    version: TableVersion,
+    layout: wyrd_spec::vala::api::PhysicalLayoutEdit,
+) -> wyrd_spec::vala::api::AlterTableRequest {
+    wyrd_spec::vala::api::AlterTableRequest {
+        expected_table_version: version,
+        physical_layout: Some(layout),
+        add_columns: None,
+        rename_columns: None,
+    }
+}
+
+/// An edit at `version` that replaces only the Bloom list.
+fn bloom_edit(version: TableVersion, columns: &[&str]) -> wyrd_spec::vala::api::AlterTableRequest {
+    layout_edit(
+        version,
+        wyrd_spec::vala::api::PhysicalLayoutEdit {
+            bloom_columns: Some(columns.iter().map(|&column| column.to_owned()).collect()),
+            ..wyrd_spec::vala::api::PhysicalLayoutEdit::default()
+        },
+    )
+}
+
+/// An administrator's explicit layout edit replaces exactly the supplied
+/// lists at the next table version, and the version compares every edit.
+///
+/// For a built-in and a dynamic table alike, a Bloom-only edit at the
+/// described version commits once and returns the description describe then
+/// reads, and the same edit at the superseded version is refused as a version
+/// conflict. On the dynamic table a combined partition-and-sort edit keeps the
+/// omitted Bloom list; an explicit empty Bloom list clears it; two edits built
+/// from one version race to exactly one commit, so neither is lost silently;
+/// and an invalid post-edit layout, an edit that changes nothing, and an edit
+/// that supplies nothing are refused. Every refusal leaves the description,
+/// version included, unchanged.
+///
+/// # Panics
+///
+/// Panics when an edit commits other than once, a refusal carries another
+/// code, or a refused edit changes the described table.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn table_patch_preserves_omitted_lists_and_compares_versions() {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use wyrd_spec::vala::api::{
+        NullOrderWire, PartitionFieldWire, PartitionTransformWire, PhysicalLayoutEdit,
+        SortDirectionWire, SortKeyWire,
+    };
+
+    let server = start_scribe_server().await;
+    let client = tenant_client(&server, server.data_tenant_id()).await;
+    let bifrost = Bifrost::query_only(&client);
+    let table = unique_table("patched");
+    Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(
+                wyrd_client::bifrost::TableConfig::from_arrow(
+                    &format!("vala.datasets.{table}"),
+                    std::sync::Arc::new(Schema::new(vec![
+                        Field::new("customer", DataType::Utf8, true),
+                        Field::new("name", DataType::Utf8, false),
+                    ])),
+                )
+                .expect("declared table"),
+            ),
+            ..BifrostOptions::default()
+        },
+    )
+    .await
+    .expect("the writer connects")
+    .register()
+    .await
+    .expect("register the dynamic table");
+    let describe = |namespace: &'static str, name: String| {
+        let bifrost = &bifrost;
+        async move {
+            bifrost
+                .describe_table(namespace, &name)
+                .await
+                .expect("describe the table")
+        }
+    };
+
+    for (namespace, name, candidate) in [
+        ("vala.traces", "spans".to_owned(), "span_id"),
+        ("vala.datasets", table.clone(), "name"),
+    ] {
+        let before = describe(namespace, name.clone()).await;
+        let blooms: &[&str] = if before.physical_layout.bloom_columns.is_empty() {
+            &[candidate]
+        } else {
+            &[]
+        };
+        let committed = bifrost
+            .alter_table(namespace, &name, &bloom_edit(before.table_version, blooms))
+            .await
+            .unwrap_or_else(|error| panic!("{namespace}.{name} accepts a Bloom edit: {error}"));
+        assert_eq!(
+            Some(committed.table_version),
+            before.table_version.next(),
+            "{namespace}.{name}: a Bloom-only edit advances the version once"
+        );
+        assert_eq!(committed.physical_layout.bloom_columns, blooms);
+        assert_eq!(
+            committed.physical_layout.partition_by, before.physical_layout.partition_by,
+            "{namespace}.{name}: an omitted list is kept"
+        );
+        assert_eq!(committed.physical_layout.sort_keys, before.physical_layout.sort_keys);
+        assert_eq!(
+            describe(namespace, name.clone()).await,
+            committed,
+            "{namespace}.{name}: the edit returns the description describe reads"
+        );
+        let stale = bifrost
+            .alter_table(namespace, &name, &bloom_edit(before.table_version, &[]))
+            .await
+            .expect_err("an edit at a superseded version is refused");
+        assert_eq!(code(&stale), "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT");
+        assert_eq!(describe(namespace, name).await, committed);
+    }
+
+    let current = describe("vala.datasets", table.clone()).await;
+    let combined = bifrost
+        .alter_table(
+            "vala.datasets",
+            &table,
+            &layout_edit(
+                current.table_version,
+                PhysicalLayoutEdit {
+                    partition_by: Some(vec![
+                        PartitionFieldWire::new("wyrd_ingested_at", PartitionTransformWire::Day),
+                        PartitionFieldWire::new("customer", PartitionTransformWire::Identity),
+                    ]),
+                    sort_keys: Some(vec![SortKeyWire {
+                        column: "customer".to_owned(),
+                        direction: SortDirectionWire::Asc,
+                        null_order: NullOrderWire::First,
+                    }]),
+                    bloom_columns: None,
+                },
+            ),
+        )
+        .await
+        .expect("a combined partition and sort edit commits");
+    assert_eq!(combined.table_version, current.table_version.next().expect("next"));
+    assert_eq!(
+        combined.physical_layout.partition_by,
+        vec![
+            PartitionFieldWire::new("wyrd_ingested_at", PartitionTransformWire::Day),
+            PartitionFieldWire::new("customer", PartitionTransformWire::Identity),
+        ]
+    );
+    assert_eq!(combined.physical_layout.sort_keys[0].column, "customer");
+    assert_eq!(
+        combined.physical_layout.bloom_columns, current.physical_layout.bloom_columns,
+        "the omitted Bloom list is kept"
+    );
+    assert_eq!(combined.physical_layout.bloom_columns, ["name"]);
+    let cleared = bifrost
+        .alter_table("vala.datasets", &table, &bloom_edit(combined.table_version, &[]))
+        .await
+        .expect("an explicit empty Bloom list commits");
+    assert!(cleared.physical_layout.bloom_columns.is_empty());
+    assert_eq!(cleared.physical_layout.partition_by, combined.physical_layout.partition_by);
+
+    let (name_edit, customer_edit) = (
+        bloom_edit(cleared.table_version, &["name"]),
+        bloom_edit(cleared.table_version, &["customer"]),
+    );
+    let (first, second) = tokio::join!(
+        bifrost.alter_table("vala.datasets", &table, &name_edit),
+        bifrost.alter_table("vala.datasets", &table, &customer_edit),
+    );
+    let (winner, loser) = match (first, second) {
+        (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+        other => panic!("exactly one edit from one version commits: {other:?}"),
+    };
+    assert_eq!(code(&loser), "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT");
+    assert_eq!(winner.table_version, cleared.table_version.next().expect("next"));
+    let settled = describe("vala.datasets", table.clone()).await;
+    assert_eq!(settled, winner, "the losing edit changed nothing");
+
+    let refusals = [
+        (
+            bloom_edit(settled.table_version, &["absent"]),
+            "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT",
+            "BloomColumn/UnknownColumn",
+        ),
+        (
+            layout_edit(
+                settled.table_version,
+                PhysicalLayoutEdit {
+                    partition_by: Some(Vec::new()),
+                    ..PhysicalLayoutEdit::default()
+                },
+            ),
+            "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT",
+            "Partition/Missing",
+        ),
+        (
+            bloom_edit(
+                settled.table_version,
+                &settled
+                    .physical_layout
+                    .bloom_columns
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            ),
+            "WYRD_VALA_400_BIFROST_INVALID_TABLE_EDIT",
+            "NoEffectiveChange",
+        ),
+        (
+            layout_edit(settled.table_version, PhysicalLayoutEdit::default()),
+            "WYRD_VALA_400_BIFROST_INVALID_TABLE_EDIT",
+            "NoEffectiveChange",
+        ),
+    ];
+    for (edit, expected_code, expected) in refusals {
+        let refused = bifrost
+            .alter_table("vala.datasets", &table, &edit)
+            .await
+            .expect_err("the edit is refused");
+        assert_eq!(code(&refused), expected_code, "{refused}");
+        assert!(refused.to_string().contains(expected), "names {expected}: {refused}");
+        assert_eq!(
+            describe("vala.datasets", table.clone()).await,
+            settled,
+            "a refused edit changes nothing"
         );
     }
     server.shutdown().await.expect("server shutdown");

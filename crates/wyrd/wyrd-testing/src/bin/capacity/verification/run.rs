@@ -31,7 +31,7 @@ use wyrd_spec::verification::VerificationVerdict;
 use wyrd_testing::capacity::{
     Collector, Histogram, HistogramKey, NANOS_PER_MS, Population, Readings, ResourceWindow,
     SMOKE_WINDOW, Selection, Smoke, Telemetry, Timing, Window, driver_cpu_seconds, elapsed,
-    release_binary, unix_nanos,
+    release_binary, unix_nanos, usec_elapsed,
 };
 use wyrd_testing::experiment::{
     ExperimentError, Level, Phase, Reading, Repetition, Step, Workload,
@@ -295,7 +295,7 @@ impl Bench {
                 ))
             })?;
         let from = SystemTime::now();
-        let (opened, _) = Window::open(server, SELECTION)
+        let (opened, _) = Window::open(server, self.collector()?, SELECTION)
             .await
             .map_err(ExperimentError::workload)?;
         let measured = drive(&self.states[..clients], window).await;
@@ -310,6 +310,7 @@ impl Bench {
             peak_memory_bytes: usage.peak_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
+            collector_cpu_seconds: usage.collector_cpu_seconds,
             ..Repetition::default()
         };
         let telemetry = &usage.telemetry;
@@ -383,6 +384,7 @@ impl Bench {
         let first = scrape(server).await?;
         let (start, start_unix) = (Instant::now(), unix_nanos(SystemTime::now()));
         let driver_before = driver_cpu_seconds();
+        let collector_before = self.collector()?.cpu_usec();
         let resources = ResourceWindow::open([server]);
         let backlog_start = backlog(&first);
         let send = |op| {
@@ -404,6 +406,7 @@ impl Bench {
         let drain = drain(server, start + window).await?;
         let used = resources.finish([server], window.as_secs_f64());
         let driver = elapsed(driver_before, driver_cpu_seconds());
+        let collector = usec_elapsed(collector_before, self.collector()?.cpu_usec());
 
         let tallies: [[Measured; 2]; 3] = std::array::from_fn(|stage| {
             std::array::from_fn(|slot| lock(&tallies[stage][slot]).clone())
@@ -427,6 +430,7 @@ impl Bench {
             peak_memory_bytes: used.first().and_then(|used| used.peak_memory),
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: driver,
+            collector_cpu_seconds: collector,
             ..Repetition::default()
         };
         let mut lateness = direct.lateness_us.clone();
@@ -589,7 +593,7 @@ impl Workload for Bench {
             .ok_or_else(|| ExperimentError::workload("no application was provisioned"))?;
         let mut smoke = Smoke::new("verification");
         let from = SystemTime::now();
-        let (window, _) = Window::open(server, SELECTION)
+        let (window, _) = Window::open(server, self.collector()?, SELECTION)
             .await
             .map_err(ExperimentError::workload)?;
         let mut measured = Measured::default();

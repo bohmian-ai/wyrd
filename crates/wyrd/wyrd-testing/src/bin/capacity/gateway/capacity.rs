@@ -628,6 +628,7 @@ impl Observed {
             peak_memory_bytes: usage.peak_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
+            collector_cpu_seconds: usage.collector_cpu_seconds,
             arrivals: Some(Arrivals {
                 scheduled: self.driven.scheduled,
                 sent: self.driven.sent,
@@ -992,7 +993,7 @@ impl Capacity {
         let slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let stop = CancellationToken::new();
         let opened = SystemTime::now();
-        let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
+        let (traffic, baseline) = Window::open(server, collector, Selection::RESOURCES).await?;
         let start = Instant::now() + LEAD;
         let label = format!("{}-{phase:?}", step.id);
         let driving = driver.spawn(

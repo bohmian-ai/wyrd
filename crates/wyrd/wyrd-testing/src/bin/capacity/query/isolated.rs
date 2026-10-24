@@ -99,7 +99,7 @@ impl Isolated {
                 ExperimentError::workload(format!("step `{}` declares no clients", step.id))
             })?;
         let from = SystemTime::now();
-        let (opened, before) = Window::open(server, Selection::RESOURCES)
+        let (opened, before) = Window::open(server, collector, Selection::RESOURCES)
             .await
             .map_err(ExperimentError::workload)?;
         let (outcome, write) = if let Some(case) = read_case(op) {
@@ -138,6 +138,7 @@ impl Isolated {
             peak_memory_bytes: usage.peak_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
+            collector_cpu_seconds: usage.collector_cpu_seconds,
             ..Repetition::default()
         };
         let boundary = write.map_or("bifrost.query", WriteOp::boundary);

@@ -28,17 +28,40 @@ mod verification;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use wyrd_testing::capacity::{COLLECTOR_THREADS, serve_collector};
 use wyrd_testing::experiment::{Engine, Level, Verdict};
 
 use crate::levels::{Context, Plan};
 
-/// Dispatches the level command the arguments name.
-#[tokio::main]
-async fn main() -> ExitCode {
-    wyrd_testing::capacity::install_tracing();
+/// Dispatches the level command the arguments name, or, as `collect`, runs
+/// the timing collector helper process on its declared
+/// [`COLLECTOR_THREADS`] workers.
+fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().collect();
+    let collect = arguments.get(1).is_some_and(|command| command == "collect");
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    if collect {
+        runtime.worker_threads(COLLECTOR_THREADS);
+    }
+    let runtime = match runtime.enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("capacity: cannot start the Tokio runtime: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    wyrd_testing::capacity::install_tracing();
+    if collect {
+        return match runtime.block_on(serve_collector()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("capacity collect: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    ExitCode::from(Box::pin(dispatch(&arguments, &root)).await)
+    ExitCode::from(runtime.block_on(Box::pin(dispatch(&arguments, &root))))
 }
 
 /// Runs the command in `arguments` (program name first) against the
@@ -281,6 +304,7 @@ mod tests {
             peak_memory_bytes: Some(1 << 30),
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: Some(seconds / 10.0),
+            collector_cpu_seconds: Some(0.1),
             arrivals: (declaration.level == Level::Two).then_some(Arrivals {
                 scheduled: 10_000,
                 sent: 10_000,

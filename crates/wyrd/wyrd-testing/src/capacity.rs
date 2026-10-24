@@ -296,6 +296,9 @@ pub struct Usage {
     /// CPU seconds this benchmark process used, to show the driver was not
     /// the bottleneck; `None` when unreadable.
     pub driver_cpu_seconds: Option<f64>,
+    /// CPU seconds the [`Collector`] process used, to show collection was
+    /// not saturated; `None` when the process was lost or unreadable.
+    pub collector_cpu_seconds: Option<f64>,
     /// The workload's selected telemetry over the window.
     pub telemetry: Telemetry,
 }
@@ -315,17 +318,20 @@ pub struct Window {
     readings: Readings,
     /// This process's CPU seconds at start.
     driver_cpu_seconds: Option<f64>,
+    /// The collector process and its CPU microseconds at start.
+    collector: (u32, Option<u64>),
 }
 
 impl Window {
-    /// Opens a window over `server` reading `selection`, and returns the
-    /// opening scrape.
+    /// Opens a window over `server` and the `collector` process reading
+    /// `selection`, and returns the opening scrape.
     ///
     /// # Errors
     ///
     /// Returns scrape failures.
     pub async fn open(
         server: &LocalServer,
+        collector: &Collector,
         selection: Selection,
     ) -> Result<(Self, Metrics), Error> {
         let metrics = server.metrics().await?;
@@ -333,6 +339,7 @@ impl Window {
             resources: ResourceWindow::open([server]),
             readings: Readings::read(&metrics, selection),
             driver_cpu_seconds: driver_cpu_seconds(),
+            collector: (collector.pid(), collector.cpu_usec()),
             started: Instant::now(),
         };
         Ok((window, metrics))
@@ -356,6 +363,10 @@ impl Window {
             server_cpu_seconds,
             peak_memory_bytes,
             driver_cpu_seconds: elapsed(self.driver_cpu_seconds, driver_cpu_seconds()),
+            collector_cpu_seconds: usec_elapsed(
+                self.collector.1,
+                crate::release_server::os::process_cpu_usec(self.collector.0),
+            ),
             telemetry: self.readings.since(&metrics),
         };
         Ok((usage, metrics))
@@ -448,6 +459,16 @@ impl ResourceWindow {
 /// unreadable.
 pub fn driver_cpu_seconds() -> Option<f64> {
     crate::release_server::os::self_cpu_seconds()
+}
+
+/// The growth of a cumulative CPU-microsecond counter, in seconds, or
+/// `None` when either end is missing or the counter went backwards.
+#[must_use]
+pub fn usec_elapsed(before: Option<u64>, after: Option<u64>) -> Option<f64> {
+    match (before, after) {
+        (Some(before), Some(after)) if after >= before => Some((after - before) as f64 / 1e6),
+        _ => None,
+    }
 }
 
 /// The growth of a cumulative CPU reading, or `None` when either end is
@@ -614,51 +635,208 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// What the collector has received and not yet assigned to a window.
-#[derive(Debug, Default)]
+/// The largest OTLP export request the collector decodes; a larger one is
+/// refused with `RESOURCE_EXHAUSTED`, which the server's exporter counts as
+/// lost spans and the waiting window reports as missing observations.
+pub const MAX_EXPORT_BYTES: usize = 64 << 20;
+
+/// The most unassigned timing observations the collector retains; any
+/// beyond it are dropped and counted against their boundary.
+pub const RETAINED_TIMINGS: usize = 2_000_000;
+
+/// The most malformed-span reasons the collector keeps verbatim; any beyond
+/// it are only counted.
+pub const KEPT_MALFORMED: usize = 16;
+
+/// Worker threads of the collector process: its declared CPU budget.
+pub const COLLECTOR_THREADS: usize = 2;
+
+/// One line the collector process writes to its stdout.
+#[derive(Debug, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum Report {
+    /// The first line: where the collector listens.
+    Listening {
+        /// The `http://` endpoint.
+        endpoint: String,
+    },
+    /// One decoded export request.
+    Export {
+        /// Its timing observations.
+        timings: Vec<Timing>,
+        /// Why each undecodable timing span was refused.
+        malformed: Vec<String>,
+        /// Spans of every name it carried.
+        spans: u64,
+    },
+}
+
+/// What the collector has received and not yet assigned to a window, within
+/// [`RETAINED_TIMINGS`] and [`KEPT_MALFORMED`].
+#[derive(Debug)]
 struct Received {
     /// Unassigned timing observations, in arrival order.
     timings: Vec<Timing>,
-    /// Undecodable timing spans since the last window.
+    /// Undecodable timing spans since the last window, at most
+    /// [`KEPT_MALFORMED`].
     malformed: Vec<String>,
+    /// Undecodable timing spans beyond [`KEPT_MALFORMED`] since the last
+    /// window.
+    unkept: u64,
+    /// Per boundary, observations dropped beyond [`RETAINED_TIMINGS`] and
+    /// the latest end among them, Unix nanoseconds, until a window reading
+    /// that boundary reports them.
+    dropped: BTreeMap<String, (u64, u64)>,
+    /// Why the collector process stopped reporting, once it did.
+    lost: Option<String>,
     /// Export requests received in total.
     exports: u64,
     /// Spans received in total, of every name.
     spans: u64,
+    /// The most unassigned observations kept: [`RETAINED_TIMINGS`].
+    retain: usize,
 }
 
-/// The collector's OTLP trace service.
-#[derive(Clone)]
-struct Intake(Arc<Mutex<Received>>);
+impl Default for Received {
+    /// Nothing received, retaining at most [`RETAINED_TIMINGS`].
+    fn default() -> Self {
+        Self {
+            timings: Vec::new(),
+            malformed: Vec::new(),
+            unkept: 0,
+            dropped: BTreeMap::new(),
+            lost: None,
+            exports: 0,
+            spans: 0,
+            retain: RETAINED_TIMINGS,
+        }
+    }
+}
+
+impl Received {
+    /// Keeps one decoded export within the retention bounds.
+    fn keep(&mut self, timings: Vec<Timing>, malformed: Vec<String>, spans: u64) {
+        for timing in timings {
+            if self.timings.len() < self.retain {
+                self.timings.push(timing);
+            } else {
+                let (count, latest) = self.dropped.entry(timing.boundary).or_default();
+                *count += 1;
+                *latest = (*latest).max(timing.end_unix_ns);
+            }
+        }
+        for reason in malformed {
+            if self.malformed.len() < KEPT_MALFORMED {
+                self.malformed.push(reason);
+            } else {
+                self.unkept += 1;
+            }
+        }
+        self.exports += 1;
+        self.spans += spans;
+    }
+}
+
+/// Where the collector reports: its stdout, or a test's pipe.
+type Sink = Arc<Mutex<dyn std::io::Write + Send>>;
+
+/// The collector process's OTLP trace service.
+struct Intake(Sink);
 
 #[async_trait::async_trait]
 impl TraceService for Intake {
-    /// Keeps every timing span of one export and acknowledges it whole.
+    /// Decodes every timing span of one export, reports it as one line, and
+    /// acknowledges it whole once the line is written.
     async fn export(
         &self,
         request: wyrd_tonic::tonic::Request<ExportTraceServiceRequest>,
     ) -> Result<wyrd_tonic::tonic::Response<ExportTraceServiceResponse>, wyrd_tonic::tonic::Status>
     {
         let (timings, malformed, spans) = decode_timings(request.get_ref());
-        let mut received = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        received.timings.extend(timings);
-        received.malformed.extend(malformed);
-        received.exports += 1;
-        received.spans += spans;
+        report(
+            &self.0,
+            &Report::Export {
+                timings,
+                malformed,
+                spans,
+            },
+        )
+        .map_err(|error| wyrd_tonic::tonic::Status::unavailable(error.to_string()))?;
         Ok(wyrd_tonic::tonic::Response::new(
             ExportTraceServiceResponse::default(),
         ))
     }
 }
 
+/// Writes `line` to `sink` as one JSON line and flushes it.
+///
+/// # Errors
+///
+/// Returns the write failure, such as a driver that stopped reading.
+fn report(sink: &Sink, line: &Report) -> std::io::Result<()> {
+    let mut sink = sink.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut encoded = serde_json::to_vec(line)?;
+    encoded.push(b'\n');
+    sink.write_all(&encoded)?;
+    sink.flush()
+}
+
+/// Listens on a free loopback port, reports it as the first line to `sink`,
+/// then serves OTLP trace exports of at most [`MAX_EXPORT_BYTES`], reporting
+/// each as one line, until `stop` resolves.
+///
+/// # Errors
+///
+/// Returns the bind, report, or serve failure.
+async fn serve(sink: Sink, stop: impl Future<Output = ()> + Send) -> Result<(), Error> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    report(
+        &sink,
+        &Report::Listening {
+            endpoint: format!("http://{}", listener.local_addr()?),
+        },
+    )?;
+    wyrd_tonic::tonic::transport::Server::builder()
+        .add_service(
+            TraceServiceServer::new(Intake(sink)).max_decoding_message_size(MAX_EXPORT_BYTES),
+        )
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            stop,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Runs the collector process ([`serve`] reporting to stdout) until stdin
+/// closes. [`Collector::start`] runs this as `<program> collect` on a
+/// [`COLLECTOR_THREADS`]-worker runtime.
+///
+/// # Errors
+///
+/// Returns the bind, report, or serve failure.
+pub async fn serve_collector() -> Result<(), Error> {
+    let closed = tokio::task::spawn_blocking(|| {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+    });
+    let sink: Sink = Arc::new(Mutex::new(std::io::stdout()));
+    serve(sink, async {
+        let _ = closed.await;
+    })
+    .await
+}
+
 /// A local OTLP/gRPC trace collector the measured server exports to.
 ///
-/// It runs inside the benchmark driver, so its CPU is part of driver CPU and
-/// never server CPU; the server's tracing and export cost stays in server
-/// CPU. It keeps only [`TIMING_SPAN`]s, decodes them into [`Timing`]s, and
-/// hands each window the observations that ended inside it once every
-/// expected one arrived; every assigned observation is appended to
-/// `timings.jsonl` under the run's artifacts.
+/// It is a declared benchmark helper: a plain child process of the driver
+/// (`<program> collect`, [`serve_collector`]) that receives and decodes the
+/// server's export, so its CPU is neither driver nor server CPU and is
+/// reported on its own ([`Usage::collector_cpu_seconds`]). As a descendant
+/// of the driver, quiet-host checks exclude it. The server's tracing and
+/// export cost stays in server CPU. The driver keeps only [`TIMING_SPAN`]s,
+/// bounded by [`RETAINED_TIMINGS`], and hands each window the observations
+/// that ended inside it once every expected one arrived; every assigned
+/// observation is appended to `timings.jsonl` under the run's artifacts.
 pub struct Collector {
     /// The `http://` endpoint the server exports to.
     endpoint: String,
@@ -666,44 +844,141 @@ pub struct Collector {
     received: Arc<Mutex<Received>>,
     /// Raw observation file under the artifacts directory.
     log: PathBuf,
-    /// Stops the gRPC server on drop.
-    _stop: tokio_util::sync::DropGuard,
+    /// The collector process, or `None` for a test's in-process intake;
+    /// closing its stdin stops it, and dropping the collector kills it.
+    child: Option<std::process::Child>,
+    /// Stops a test's in-process intake on drop.
+    #[cfg(test)]
+    stop: Option<tokio_util::sync::DropGuard>,
 }
 
 impl Collector {
-    /// Listens on a free loopback port and keeps raw observations under
-    /// `artifacts`.
+    /// Starts the collector process from this program and keeps raw
+    /// observations under `artifacts`, with its stderr in
+    /// `collector.stderr` there.
     ///
     /// # Errors
     ///
-    /// Returns the bind or artifacts-directory failure.
+    /// Returns the artifacts-directory, spawn, or first-report failure.
+    #[cfg(not(test))]
+    pub async fn start(artifacts: &Path) -> Result<Self, Error> {
+        Self::spawn(&std::env::current_exe()?, artifacts).await
+    }
+
+    /// Runs the same intake inside this test process over a pipe, since a
+    /// test harness cannot be re-run as `collect`; its CPU is this process's.
+    ///
+    /// # Errors
+    ///
+    /// Returns the artifacts-directory, pipe, or first-report failure.
+    #[cfg(test)]
     pub async fn start(artifacts: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(artifacts)?;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let endpoint = format!("http://{}", listener.local_addr()?);
-        let received = Arc::new(Mutex::new(Received::default()));
+        let (reader, writer) = std::io::pipe()?;
         let stop = tokio_util::sync::CancellationToken::new();
-        let service = TraceServiceServer::new(Intake(Arc::clone(&received)))
-            .max_decoding_message_size(usize::MAX);
-        let stopped = stop.clone();
-        tokio::spawn(async move {
-            let served = wyrd_tonic::tonic::transport::Server::builder()
-                .add_service(service)
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    stopped.cancelled_owned(),
-                )
-                .await;
-            if let Err(error) = served {
-                tracing::error!(%error, "the timing collector stopped");
+        let sink: Sink = Arc::new(Mutex::new(writer));
+        tokio::spawn(serve(sink, stop.clone().cancelled_owned()));
+        let mut collector = Self::attach(reader, artifacts, None).await?;
+        collector.stop = Some(stop.drop_guard());
+        Ok(collector)
+    }
+
+    /// Starts `program collect` as the collector process.
+    ///
+    /// # Errors
+    ///
+    /// Returns the artifacts-directory, spawn, or first-report failure.
+    pub async fn spawn(program: &Path, artifacts: &Path) -> Result<Self, Error> {
+        std::fs::create_dir_all(artifacts)?;
+        let mut child = std::process::Command::new(program)
+            .arg("collect")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::fs::File::create(artifacts.join("collector.stderr"))?)
+            .spawn()?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("the collector process has no stdout".into());
+        };
+        Self::attach(stdout, artifacts, Some(child)).await
+    }
+
+    /// Reads the collector's first line, its endpoint, within 10 s, then
+    /// keeps every later line on a reader thread until `reports` closes or
+    /// fails, which marks the collector lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns the read failure or a first line that is not the endpoint;
+    /// `child` is then killed.
+    async fn attach(
+        reports: impl std::io::Read + Send + 'static,
+        artifacts: &Path,
+        child: Option<std::process::Child>,
+    ) -> Result<Self, Error> {
+        use std::io::BufRead as _;
+        let mut collector = Self {
+            endpoint: String::new(),
+            received: Arc::new(Mutex::new(Received::default())),
+            log: artifacts.join("timings.jsonl"),
+            child,
+            #[cfg(test)]
+            stop: None,
+        };
+        let mut lines = std::io::BufReader::new(reports).lines();
+        let first = tokio::task::spawn_blocking(move || (lines.next(), lines));
+        let (first, lines) = tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .map_err(|_| "the collector did not report its endpoint within 10 s")??;
+        match first.transpose()?.map(|line| serde_json::from_str(&line)) {
+            Some(Ok(Report::Listening { endpoint })) => collector.endpoint = endpoint,
+            other => {
+                return Err(format!("the collector did not report its endpoint: {other:?}").into());
+            }
+        }
+        let shared = Arc::clone(&collector.received);
+        std::thread::spawn(move || {
+            let lost = (|| -> Result<(), String> {
+                for line in lines {
+                    let line = line.map_err(|error| error.to_string())?;
+                    match serde_json::from_str(&line) {
+                        Ok(Report::Export {
+                            timings,
+                            malformed,
+                            spans,
+                        }) => shared
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .keep(timings, malformed, spans),
+                        other => return Err(format!("an unexpected report {other:?}")),
+                    }
+                }
+                Err("its output closed".to_owned())
+            })();
+            if let Err(reason) = lost {
+                shared.lock().unwrap_or_else(PoisonError::into_inner).lost =
+                    Some(format!("the timing collector stopped reporting: {reason}"));
             }
         });
-        Ok(Self {
-            endpoint,
-            received,
-            log: artifacts.join("timings.jsonl"),
-            _stop: stop.drop_guard(),
-        })
+        Ok(collector)
+    }
+
+    /// PID of the collector process; this process's for a test's
+    /// in-process intake.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child
+            .as_ref()
+            .map_or_else(std::process::id, std::process::Child::id)
+    }
+
+    /// Microseconds of user plus system CPU the collector process has used,
+    /// or `None` once it is gone or unreadable, so a lost collector never
+    /// reads as idle.
+    #[must_use]
+    pub fn cpu_usec(&self) -> Option<u64> {
+        crate::release_server::os::process_cpu_usec(self.pid())
     }
 
     /// The server environment that exports every span to this collector:
@@ -729,7 +1004,7 @@ impl Collector {
     #[must_use]
     pub fn declaration() -> Value {
         serde_json::json!({
-            "method": "server wyrd.timing spans: exact integer nanoseconds from the owning server boundary's std::time::Instant timers, exported through the operator OTLP/gRPC span exporter to a collector inside the benchmark driver",
+            "method": "server wyrd.timing spans: exact integer nanoseconds from the owning server boundary's std::time::Instant timers, exported through the operator OTLP/gRPC span exporter to a collector helper process the driver starts",
             "clock": "std::time::Instant on the server: the OS monotonic clock",
             "server_env": {
                 "WYRD_OTLP_SAMPLE_RATIO": "1.0",
@@ -737,7 +1012,14 @@ impl Collector {
                 "OTEL_BSP_MAX_EXPORT_BATCH_SIZE": "8192",
                 "OTEL_BSP_SCHEDULE_DELAY": EXPORT_DELAY.as_millis().to_string(),
             },
-            "cost": "the server's tracing and export CPU is in server CPU; the collector's CPU is in driver CPU",
+            "cost": "the server's tracing and export CPU is in server CPU; the collector helper's CPU is reported separately, in neither server nor driver CPU",
+            "collector": {
+                "worker_threads": COLLECTOR_THREADS,
+                "max_export_bytes": MAX_EXPORT_BYTES,
+                "retained_timings": RETAINED_TIMINGS,
+                "kept_malformed": KEPT_MALFORMED,
+                "host_checks": "excluded as a descendant of the driver",
+            },
             "assignment": "a window takes the observations that ended after it opened, once its expected count arrived (and, for traced requests, each request's own observation by trace id); a missing, extra, duplicate, or malformed observation makes it invalid",
         })
     }
@@ -856,6 +1138,23 @@ impl Collector {
         tokio::time::sleep(EXPORT_DELAY * 2).await;
         let mut received = self.received.lock().unwrap_or_else(PoisonError::into_inner);
         let mut invalid = std::mem::take(&mut received.malformed);
+        let unkept = std::mem::take(&mut received.unkept);
+        if unkept > 0 {
+            invalid.push(format!(
+                "{unkept} more `{TIMING_SPAN}` spans are malformed, beyond the {KEPT_MALFORMED} kept"
+            ));
+        }
+        invalid.extend(received.lost.clone());
+        for (boundary, _) in expected {
+            if let Some((count, latest)) = received.dropped.remove(*boundary)
+                && latest >= from
+            {
+                invalid.push(format!(
+                    "{count} `{boundary}` timing observations overflowed the collector's {}-observation retention and were dropped",
+                    received.retain
+                ));
+            }
+        }
         for (count, (boundary, want)) in counts(&received).iter().zip(expected) {
             if count < want || (exact && count != want) {
                 invalid.push(format!(
@@ -916,6 +1215,16 @@ impl Collector {
             writeln!(file, "{line}")?;
         }
         file.flush()
+    }
+}
+
+impl Drop for Collector {
+    /// Kills and reaps the collector process.
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -1066,7 +1375,7 @@ impl Smoke {
     }
 
     /// Requires `usage` to carry positive server CPU-seconds and readable
-    /// driver CPU, and this host to report its available logical CPUs.
+    /// driver and collector CPU, and this host to report its available logical CPUs.
     pub fn usage(&mut self, usage: &Usage) {
         match usage.server_cpu_seconds {
             Some(cpu) if cpu > 0.0 => self.proved.push(format!("server CPU {cpu:.3}s")),
@@ -1078,6 +1387,12 @@ impl Smoke {
         if usage.driver_cpu_seconds.is_none() {
             self.missing
                 .push("driver CPU-seconds are unavailable".to_owned());
+        }
+        match usage.collector_cpu_seconds {
+            Some(cpu) => self.proved.push(format!("collector CPU {cpu:.3}s")),
+            None => self
+                .missing
+                .push("collector CPU-seconds are unavailable".to_owned()),
         }
         match std::thread::available_parallelism() {
             Ok(cpus) => self.proved.push(format!("{cpus} logical CPUs")),
@@ -1233,8 +1548,8 @@ pub fn install_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Collector, Percentiles, Population, Readings, Selection, Smoke, Telemetry, Timing, Usage,
-        deltas, elapsed,
+        Collector, ExportTraceServiceRequest, KEPT_MALFORMED, KeyValue, Percentiles, Population,
+        Readings, Selection, Smoke, TIMING_SPAN, Telemetry, Timing, Usage, deltas, elapsed,
     };
     use crate::release_server::Metrics;
 
@@ -1368,6 +1683,104 @@ mod tests {
         assert_eq!(Percentiles::raw(&[], 1.0).p50, None);
     }
 
+    /// A real OTLP export past a small retention bound keeps only the bound,
+    /// and the overflow invalidates the window reading its boundary even
+    /// after a window over another boundary passed and dropped the kept
+    /// stragglers; an in-limit window stays exact, and malformed reasons and a stopped
+    /// collector stay bounded, specific invalidity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the collector cannot start or a window's evidence is
+    /// wrong.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collector_bounds_overflow_and_loss() {
+        use wyrd_tonic::otlp::common::v1::{AnyValue, any_value::Value as Any};
+        use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
+        use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
+
+        let directory = tempfile::tempdir().expect("artifacts");
+        let mut collector = Collector::start(directory.path()).await.expect("collector");
+        collector.received.lock().expect("received").retain = 3;
+        let mut client = TraceServiceClient::connect(collector.endpoint.clone())
+            .await
+            .expect("connect");
+        let mut id = 0_u64;
+        let mut export = async |boundary: &str, count: usize, elapsed: Option<i64>| {
+            let spans = (0..count)
+                .map(|_| {
+                    id += 1;
+                    let attribute = |key: &str, value| KeyValue {
+                        key: key.to_owned(),
+                        value: Some(AnyValue { value: Some(value) }),
+                    };
+                    let mut attributes = vec![
+                        attribute("boundary", Any::StringValue(boundary.to_owned())),
+                        attribute("outcome", Any::StringValue("success".to_owned())),
+                    ];
+                    attributes.extend(elapsed.map(|ns| attribute("elapsed_ns", Any::IntValue(ns))));
+                    Span {
+                        name: TIMING_SPAN.to_owned(),
+                        trace_id: [id.to_be_bytes(), id.to_be_bytes()].concat(),
+                        span_id: id.to_be_bytes().to_vec(),
+                        end_time_unix_nano: super::unix_nanos(std::time::SystemTime::now()),
+                        attributes,
+                        ..Span::default()
+                    }
+                })
+                .collect();
+            client
+                .export(ExportTraceServiceRequest {
+                    resource_spans: vec![ResourceSpans {
+                        scope_spans: vec![ScopeSpans {
+                            spans,
+                            ..ScopeSpans::default()
+                        }],
+                        ..ResourceSpans::default()
+                    }],
+                })
+                .await
+                .expect("export");
+        };
+
+        let opened = std::time::SystemTime::now();
+        export("a", 5, Some(10)).await;
+        let other = collector.smoke("other", opened, &[("b", 0)]).await;
+        assert!(other.invalid.is_empty(), "{:?}", other.invalid);
+        let over = collector.smoke("over", opened, &[("a", 5)]).await;
+        assert_eq!(
+            over.invalid,
+            [
+                "2 `a` timing observations overflowed the collector's 3-observation retention and were dropped",
+                "0 `a` timing observations arrived for 5 requests",
+            ],
+            "the overflow outlives a window over another boundary"
+        );
+
+        let opened = std::time::SystemTime::now();
+        export("a", 2, Some(10)).await;
+        let within = collector.window("within", opened, &[("a", 2)]).await;
+        assert!(within.invalid.is_empty(), "{:?}", within.invalid);
+        assert_eq!(within.elapsed("a", "success"), [10, 10]);
+
+        let opened = std::time::SystemTime::now();
+        export("a", KEPT_MALFORMED + 2, None).await;
+        let malformed = collector.smoke("malformed", opened, &[("a", 0)]).await;
+        assert_eq!(malformed.invalid.len(), KEPT_MALFORMED + 1);
+        assert_eq!(
+            malformed.invalid.last().map(String::as_str),
+            Some("2 more `wyrd.timing` spans are malformed, beyond the 16 kept")
+        );
+
+        drop(collector.stop.take());
+        let opened = std::time::SystemTime::now();
+        let lost = collector.smoke("lost", opened, &[("a", 0)]).await;
+        assert_eq!(
+            lost.invalid,
+            ["the timing collector stopped reporting: its output closed"]
+        );
+    }
+
     /// A smoke passes only on complete evidence and otherwise names its
     /// engine and every missing boundary, component, resource, and counter.
     ///
@@ -1391,6 +1804,7 @@ mod tests {
             server_cpu_seconds,
             peak_memory_bytes: None,
             driver_cpu_seconds: Some(0.1),
+            collector_cpu_seconds: Some(0.01),
             telemetry: Telemetry::default(),
         };
         let judged = [

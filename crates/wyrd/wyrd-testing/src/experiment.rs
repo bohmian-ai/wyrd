@@ -39,6 +39,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::capacity::COLLECTOR_THREADS;
 use crate::profile::{ProfileNote, Profiler};
 use crate::release_server::{Host, HostLoad};
 
@@ -1223,6 +1224,10 @@ pub struct Repetition {
     pub memory_interval_ms: u64,
     /// Driver CPU-seconds, or `None` when unreadable.
     pub driver_cpu_seconds: Option<f64>,
+    /// CPU-seconds of the timing collector helper process, in neither
+    /// server nor driver CPU, or `None` when it was lost or unreadable.
+    #[serde(default)]
+    pub collector_cpu_seconds: Option<f64>,
     /// P: the logical CPUs available to the server processes on this one
     /// shared host, counted once however many server processes share them;
     /// `None` when unavailable or changed during the window.
@@ -2094,7 +2099,8 @@ fn scaling(
 }
 
 /// Why one repetition is invalid: workload reasons, process loss and
-/// missing CPU, driver saturation, and open-loop misses or lateness.
+/// missing CPU, driver and collector saturation, and open-loop misses or
+/// lateness.
 fn repetition_reasons(repetition: &Repetition, validity: &Validity) -> Vec<Reason> {
     let mut reasons: Vec<Reason> = repetition
         .invalid
@@ -2119,6 +2125,23 @@ fn repetition_reasons(repetition: &Repetition, validity: &Validity) -> Vec<Reaso
                 reasons.push(Reason::new(
                     "driver.saturated",
                     format!("the driver used {cores:.2} cores, over {limit:.2} (80% of its {} core budget)", validity.driver_cores),
+                ));
+            }
+        }
+        Some(_) => {}
+    }
+    match repetition.collector_cpu_seconds {
+        None => reasons.push(Reason::new(
+            "reading.missing",
+            "collector CPU-seconds are unavailable: the timing collector was lost or unreadable",
+        )),
+        Some(collector) if repetition.seconds > 0.0 => {
+            let cores = collector / repetition.seconds;
+            let limit = COLLECTOR_THREADS as f64 * validity.driver_fraction;
+            if cores > limit {
+                reasons.push(Reason::new(
+                    "collector.saturated",
+                    format!("the timing collector used {cores:.2} cores, over {limit:.2} (80% of its {COLLECTOR_THREADS} worker threads)"),
                 ));
             }
         }
@@ -2761,9 +2784,16 @@ impl Record {
         let driver = mid.map_or_else(
             || "— not measured".to_owned(),
             |rep| {
-                rep.driver_cpu_seconds.map_or_else(
-                    || "— unavailable".to_owned(),
-                    |cpu| format!("{} s", number(cpu)),
+                let cpu = |seconds: Option<f64>| {
+                    seconds.map_or_else(
+                        || "— unavailable".to_owned(),
+                        |cpu| format!("{} s", number(cpu)),
+                    )
+                };
+                format!(
+                    "{} (collector {})",
+                    cpu(rep.driver_cpu_seconds),
+                    cpu(rep.collector_cpu_seconds)
                 )
             },
         );
@@ -3106,6 +3136,7 @@ mod tests {
             peak_memory_bytes: Some(512 << 20),
             memory_interval_ms: 10,
             driver_cpu_seconds: Some(1.0),
+            collector_cpu_seconds: Some(0.5),
             ..Repetition::default()
         };
         repetition.set("p99_ms", Reading::exact(0.3).with_samples(2_000));
@@ -3465,6 +3496,21 @@ mod tests {
             ),
             (
                 case(|r| r.driver_cpu_seconds = None),
+                "reading.missing",
+                Verdict::Invalid,
+            ),
+            (
+                case(|r| r.collector_cpu_seconds = Some(16.1)),
+                "collector.saturated",
+                Verdict::Invalid,
+            ),
+            (
+                case(|r| r.collector_cpu_seconds = Some(16.0)),
+                "",
+                Verdict::Pass,
+            ),
+            (
+                case(|r| r.collector_cpu_seconds = None),
                 "reading.missing",
                 Verdict::Invalid,
             ),

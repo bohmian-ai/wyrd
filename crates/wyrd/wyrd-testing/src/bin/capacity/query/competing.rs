@@ -235,7 +235,7 @@ impl Competing {
                 ))
             })?;
         let from = SystemTime::now();
-        let (opened, _) = Window::open(server, Selection::RESOURCES)
+        let (opened, _) = Window::open(server, collector, Selection::RESOURCES)
             .await
             .map_err(ExperimentError::workload)?;
         let (start, start_unix) = (Instant::now(), unix_nanos(SystemTime::now()));
@@ -300,6 +300,7 @@ impl Competing {
             peak_memory_bytes: usage.peak_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
+            collector_cpu_seconds: usage.collector_cpu_seconds,
             ..Repetition::default()
         };
         let backlog = |rows: i64| Reading::exact(rows.to_f64().unwrap_or(f64::MAX) / rate);

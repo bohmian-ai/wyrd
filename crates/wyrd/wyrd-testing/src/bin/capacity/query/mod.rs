@@ -1085,7 +1085,7 @@ async fn smoke(
 ) -> std::result::Result<String, String> {
     let mut smoke = Smoke::new("bifrost");
     let from = SystemTime::now();
-    let (window, before) = Window::open(server, Selection::RESOURCES)
+    let (window, before) = Window::open(server, collector, Selection::RESOURCES)
         .await
         .map_err(|error| error.to_string())?;
     let mut expected = Vec::new();

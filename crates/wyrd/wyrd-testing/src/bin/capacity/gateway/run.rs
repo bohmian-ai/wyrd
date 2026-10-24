@@ -297,6 +297,7 @@ impl Observed {
             peak_memory_bytes: usage.peak_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
+            collector_cpu_seconds: usage.collector_cpu_seconds,
             ..Repetition::default()
         };
         repetition.set(
@@ -434,7 +435,7 @@ pub async fn smoke(
         .ok_or("the tenant has no invoking key")?;
     let mut expected: BTreeMap<&str, u64> = BTreeMap::new();
     let from = SystemTime::now();
-    let (window, baseline) = Window::open(server, Selection::RESOURCES).await?;
+    let (window, baseline) = Window::open(server, collector, Selection::RESOURCES).await?;
     let mut samples = Samples::default();
     for (shape, policy) in shapes {
         tenant.capture(*policy).await?;
@@ -564,7 +565,7 @@ impl Overhead {
             return Ok(Repetition::default());
         }
         let from = SystemTime::now();
-        let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
+        let (traffic, baseline) = Window::open(server, collector, Selection::RESOURCES).await?;
         let samples = drive(tenant, &shape, clients, window).await?;
         let (usage, ended) = traffic.close(server).await?;
         let drain = settle(server).await?;
@@ -790,6 +791,7 @@ mod tests {
                 server_cpu_seconds: Some(5.0),
                 peak_memory_bytes: Some(1 << 30),
                 driver_cpu_seconds: Some(2.0),
+                collector_cpu_seconds: Some(0.1),
                 ..Usage::default()
             },
             population: Population {

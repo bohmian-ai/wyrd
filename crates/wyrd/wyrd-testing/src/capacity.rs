@@ -1,31 +1,40 @@
 //! Measurement owners shared by the opt-in capacity benchmark binaries.
 //!
 //! Every benchmark under `src/bin/` launches the release `wyrd-server` beside
-//! itself, reads `WYRD_LOG` for client-side tracing, windows replica cgroup
-//! CPU and peak memory, and reports nearest-rank or bucket-estimated
-//! percentiles. Those pieces live here once so each binary owns only its
-//! workload, verdicts, and report shape.
+//! itself as a plain child, reads `WYRD_LOG` for client-side tracing, windows
+//! the server process's CPU and sampled peak memory, and collects the server's
+//! exact per-request timings. Those pieces live here once so each workload
+//! owns only its production calls; [`crate::experiment`] owns judgment and
+//! history.
 //!
-//! Histogram percentiles are bucket estimates: the upper bound of the
-//! cumulative bucket covering the quantile, computed from a window's bucket
-//! deltas after summing every replica's buckets, never by averaging replica
-//! percentiles. Raw percentiles come from per-sample measurements.
+//! Judged latency is server-side only: the [`Collector`] receives the
+//! server's `wyrd.timing` spans over OTLP, each one request's exact integer
+//! nanoseconds from handler entry to its result, acknowledgement, or
+//! response handoff, plus the union of that request's own provider or
+//! Verifier waits; percentiles are nearest rank over those raw samples
+//! ([`nearest_rank`]), never bucket estimates. Server histograms remain only
+//! as diagnostic means and component breakdowns.
 //!
-//! A workload names the server histograms and runtime components it reads in
-//! one [`Selection`]; a [`Window`] reads them, the server's CPU and peak
+//! A workload names the diagnostic histograms and runtime components it reads
+//! in one [`Selection`]; a [`Window`] reads them, the server's CPU and peak
 //! memory, and this process's CPU at its open and differences them into a
-//! [`Usage`] at its close. Workload verdicts and reports stay with each
-//! workload.
+//! [`Usage`] at its close. A reading the OS cannot supply, a counter that went
+//! backwards, or a lost process is `None`, never zero use.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use serde_json::Value;
+use wyrd_tonic::otlp::common::v1::{KeyValue, any_value};
+use wyrd_tonic::otlp::trace_service::trace_service_server::{TraceService, TraceServiceServer};
+use wyrd_tonic::otlp::trace_service::{ExportTraceServiceRequest, ExportTraceServiceResponse};
 
-use crate::release_server::{LocalServer, MemoryPeak, Metrics};
+use crate::experiment::{Reading, Repetition};
+use crate::release_server::{LocalServer, Metrics, PeakSampler};
 
 /// Error type of the capacity helpers, matching the benchmark binaries.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -42,51 +51,29 @@ pub struct Percentiles {
 }
 
 impl Percentiles {
-    /// Nearest-rank percentiles of raw `samples`, each scaled by `scale`.
-    ///
-    /// The samples are copied and sorted; an empty slice yields no
-    /// percentiles.
-    pub fn raw(samples: &[u64], scale: f64) -> Self {
-        let mut sorted = samples.to_vec();
-        sorted.sort_unstable();
-        let rank = |q: f64| -> Option<f64> {
-            if sorted.is_empty() {
-                return None;
-            }
-            let rank = (q * sorted.len() as f64).ceil().to_usize().unwrap_or(0);
-            let index = rank.clamp(1, sorted.len()) - 1;
-            Some(sorted[index] as f64 * scale)
-        };
+    /// Nearest-rank percentiles of exact raw `samples`, each divided by
+    /// `per`, via [`nearest_rank`].
+    #[must_use]
+    pub fn raw(samples: &[u64], per: f64) -> Self {
         Self {
-            p50: rank(0.5),
-            p95: rank(0.95),
-            p99: rank(0.99),
-        }
-    }
-
-    /// Bucket-estimated percentiles of the observations between two
-    /// cumulative bucket readings of one histogram, via [`quantile`].
-    pub fn buckets(before: &[(f64, f64)], after: &[(f64, f64)]) -> Self {
-        Self {
-            p50: quantile(before, after, 0.5),
-            p95: quantile(before, after, 0.95),
-            p99: quantile(before, after, 0.99),
+            p50: nearest_rank(samples, 0.5, per),
+            p95: nearest_rank(samples, 0.95, per),
+            p99: nearest_rank(samples, 0.99, per),
         }
     }
 }
 
-/// The cumulative buckets of `family` matching `labels`, summed across every
-/// replica's scrape and sorted by bound.
-pub fn merged(scrapes: &[Metrics], family: &str, labels: &[&str]) -> Vec<(f64, f64)> {
-    let mut buckets: BTreeMap<u64, (f64, f64)> = BTreeMap::new();
-    for scrape in scrapes {
-        for (bound, count) in scrape.buckets(family, labels) {
-            buckets.entry(bound.to_bits()).or_insert((bound, 0.0)).1 += count;
-        }
-    }
-    let mut sorted: Vec<(f64, f64)> = buckets.into_values().collect();
-    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
-    sorted
+/// The nearest-rank percentile `q` of exact raw `samples`: the sample at
+/// rank `ceil(q * N)` in sorted order, divided by `per` (1e6 for nanoseconds
+/// to milliseconds; dividing keeps 500,000 ns exactly 0.5 ms). `None` without
+/// samples. The samples are copied, never interpolated or bucketed.
+#[must_use]
+pub fn nearest_rank(samples: &[u64], q: f64, per: f64) -> Option<f64> {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let rank = (q * sorted.len() as f64).ceil().to_usize().unwrap_or(0);
+    let index = rank.clamp(1, sorted.len().max(1)) - 1;
+    sorted.get(index).map(|sample| *sample as f64 / per)
 }
 
 /// Per-bound increase between two cumulative bucket readings; a bound absent
@@ -102,21 +89,6 @@ pub fn deltas(before: &[(f64, f64)], after: &[(f64, f64)]) -> Vec<(f64, f64)> {
         .iter()
         .map(|(bound, count)| (*bound, count - prior(*bound)))
         .collect()
-}
-
-/// The bound of the cumulative bucket holding quantile `q` of the
-/// observations between two readings of one histogram, or `None` when none
-/// were recorded.
-pub fn quantile(before: &[(f64, f64)], after: &[(f64, f64)], q: f64) -> Option<f64> {
-    let deltas = deltas(before, after);
-    let total = deltas.last().map_or(0.0, |(_, count)| *count);
-    if total <= 0.0 {
-        return None;
-    }
-    deltas
-        .iter()
-        .find(|(_, count)| *count >= q * total)
-        .map(|(bound, _)| *bound)
 }
 
 /// One server histogram's observations, cumulative in one scrape or over a
@@ -152,17 +124,6 @@ impl Histogram {
             sum: after.sum - self.sum,
             count: after.count - self.count,
         }
-    }
-
-    /// Bucket-bound p50/p95/p99, seconds, of these observations.
-    #[must_use]
-    pub fn percentiles(&self) -> Percentiles {
-        let zero: Vec<(f64, f64)> = self
-            .buckets
-            .iter()
-            .map(|(bound, _)| (*bound, 0.0))
-            .collect();
-        Percentiles::buckets(&zero, &self.buckets)
     }
 
     /// Exact mean, seconds, from `_sum` / `_count`, or `None` without
@@ -326,13 +287,15 @@ impl Telemetry {
 pub struct Usage {
     /// Wall-clock window length.
     pub seconds: f64,
-    /// Server CPU seconds.
-    pub server_cpu_seconds: f64,
-    /// Peak server memory over the window.
-    pub peak_memory_bytes: u64,
+    /// Server CPU seconds, or `None` when the process was lost or a reading
+    /// was unavailable or reset.
+    pub server_cpu_seconds: Option<f64>,
+    /// Sampled peak server resident memory over the window, or `None` when
+    /// it was never sampled.
+    pub peak_memory_bytes: Option<u64>,
     /// CPU seconds this benchmark process used, to show the driver was not
-    /// the bottleneck.
-    pub driver_cpu_seconds: f64,
+    /// the bottleneck; `None` when unreadable.
+    pub driver_cpu_seconds: Option<f64>,
     /// The workload's selected telemetry over the window.
     pub telemetry: Telemetry,
 }
@@ -351,7 +314,7 @@ pub struct Window {
     /// The selection at start.
     readings: Readings,
     /// This process's CPU seconds at start.
-    driver_cpu_seconds: f64,
+    driver_cpu_seconds: Option<f64>,
 }
 
 impl Window {
@@ -360,14 +323,14 @@ impl Window {
     ///
     /// # Errors
     ///
-    /// Returns scrape or memory-peak failures.
+    /// Returns scrape failures.
     pub async fn open(
         server: &LocalServer,
         selection: Selection,
     ) -> Result<(Self, Metrics), Error> {
         let metrics = server.metrics().await?;
         let window = Self {
-            resources: ResourceWindow::open([server])?,
+            resources: ResourceWindow::open([server]),
             readings: Readings::read(&metrics, selection),
             driver_cpu_seconds: driver_cpu_seconds(),
             started: Instant::now(),
@@ -380,114 +343,715 @@ impl Window {
     ///
     /// # Errors
     ///
-    /// Returns scrape or memory-peak failures.
+    /// Returns scrape failures.
     pub async fn close(self, server: &LocalServer) -> Result<(Usage, Metrics), Error> {
         let seconds = self.started.elapsed().as_secs_f64();
         let metrics = server.metrics().await?;
-        let resources = self.resources.finish([server], seconds)?;
+        let resources = self.resources.finish([server], seconds);
         let (server_cpu_seconds, peak_memory_bytes) = resources
             .first()
-            .map_or((0.0, 0), |used| (used.cpu_seconds, used.peak_memory));
+            .map_or((None, None), |used| (used.cpu_seconds, used.peak_memory));
         let usage = Usage {
             seconds,
             server_cpu_seconds,
             peak_memory_bytes,
-            driver_cpu_seconds: driver_cpu_seconds() - self.driver_cpu_seconds,
+            driver_cpu_seconds: elapsed(self.driver_cpu_seconds, driver_cpu_seconds()),
             telemetry: self.readings.since(&metrics),
         };
         Ok((usage, metrics))
     }
 }
 
-/// One replica's resource use over a measurement window.
+/// One server process's resource use over a measurement window.
 #[derive(Debug, Clone, Serialize)]
 pub struct Resources {
-    /// Replica ordinal.
-    pub replica: u16,
-    /// Cgroup CPU seconds consumed.
-    pub cpu_seconds: f64,
-    /// Mean cores: CPU seconds over window seconds.
-    pub cores: f64,
-    /// Peak cgroup memory, bytes.
-    pub peak_memory: u64,
+    /// CPU seconds consumed, or `None` when the process was lost or its
+    /// counter was unavailable or went backwards.
+    pub cpu_seconds: Option<f64>,
+    /// Mean cores: CPU seconds over window seconds, when CPU was read.
+    pub cores: Option<f64>,
+    /// Sampled peak resident memory, bytes, or `None` when never sampled.
+    pub peak_memory: Option<u64>,
 }
 
-/// Replica cgroup CPU and peak-memory readings at a window's start.
+/// Server process CPU and sampled peak-memory readings at a window's start.
 ///
 /// A benchmark opens the window before its workload, freezes CPU when the
 /// measured interval ends (before any drain), and finishes once it no longer
 /// needs peak memory, so CPU covers only the measured interval while peak
 /// memory covers everything after the open.
 pub struct ResourceWindow {
-    /// Each replica's ordinal, `cpu.stat usage_usec` at the open, and the
-    /// peak-memory descriptor reset at the open.
-    opened: Vec<(u16, u64, MemoryPeak)>,
-    /// Each replica's `usage_usec` once [`Self::freeze`] ran.
-    frozen: Option<Vec<u64>>,
+    /// Each process's CPU microseconds at the open and its memory sampler.
+    opened: Vec<(Option<u64>, Option<PeakSampler>)>,
+    /// Each process's CPU microseconds once [`Self::freeze`] ran.
+    frozen: Option<Vec<Option<u64>>>,
 }
 
 impl ResourceWindow {
-    /// Reads every replica's CPU counter and resets its peak memory.
-    ///
-    /// # Errors
-    ///
-    /// Returns a replica whose `memory.peak` cannot be opened or reset.
-    pub fn open<'a>(replicas: impl IntoIterator<Item = &'a LocalServer>) -> Result<Self, Error> {
-        let mut opened = Vec::new();
-        for replica in replicas {
-            opened.push((
-                replica.ordinal(),
-                replica.cpu_usec(),
-                replica.memory_peak()?,
-            ));
-        }
-        Ok(Self {
-            opened,
+    /// Reads every server process's CPU counter and starts sampling its
+    /// resident memory.
+    pub fn open<'a>(servers: impl IntoIterator<Item = &'a LocalServer>) -> Self {
+        Self {
+            opened: servers
+                .into_iter()
+                .map(|server| (server.cpu_usec(), server.memory_peak()))
+                .collect(),
             frozen: None,
-        })
+        }
     }
 
-    /// Reads every replica's CPU counter at the end of the measured interval.
+    /// Reads every server process's CPU counter at the end of the measured
+    /// interval.
     ///
-    /// `replicas` must be the same replicas, in the same order, as the open;
+    /// `servers` must be the same processes, in the same order, as the open;
     /// a later call replaces the earlier reading.
-    pub fn freeze<'a>(&mut self, replicas: impl IntoIterator<Item = &'a LocalServer>) {
-        self.frozen = Some(replicas.into_iter().map(LocalServer::cpu_usec).collect());
+    pub fn freeze<'a>(&mut self, servers: impl IntoIterator<Item = &'a LocalServer>) {
+        self.frozen = Some(servers.into_iter().map(LocalServer::cpu_usec).collect());
     }
 
-    /// Each replica's resources over `window_seconds`, using the frozen CPU
-    /// reading, or a fresh one from `replicas` when never frozen.
-    ///
-    /// # Errors
-    ///
-    /// Returns a peak-memory read failure.
+    /// Each process's resources over `window_seconds`, using the frozen CPU
+    /// reading, or a fresh one from `servers` when never frozen. A missing
+    /// reading at either end, or a counter that went backwards, leaves CPU
+    /// `None`.
     pub fn finish<'a>(
         mut self,
-        replicas: impl IntoIterator<Item = &'a LocalServer>,
+        servers: impl IntoIterator<Item = &'a LocalServer>,
         window_seconds: f64,
-    ) -> Result<Vec<Resources>, Error> {
+    ) -> Vec<Resources> {
         if self.frozen.is_none() {
-            self.freeze(replicas);
+            self.freeze(servers);
         }
         let frozen = self.frozen.unwrap_or_default();
-        let mut resources = Vec::new();
-        for ((replica, cpu_before, peak), cpu_after) in self.opened.into_iter().zip(frozen) {
-            let cpu_seconds = cpu_after.saturating_sub(cpu_before) as f64 / 1e6;
-            resources.push(Resources {
-                replica,
-                cpu_seconds,
-                cores: cpu_seconds / window_seconds.max(f64::EPSILON),
-                peak_memory: peak.read()?,
-            });
-        }
-        Ok(resources)
+        self.opened
+            .into_iter()
+            .zip(frozen)
+            .map(|((before, sampler), after)| {
+                let cpu_seconds = match (before, after) {
+                    (Some(before), Some(after)) if after >= before => {
+                        Some((after - before) as f64 / 1e6)
+                    }
+                    _ => None,
+                };
+                Resources {
+                    cpu_seconds,
+                    cores: cpu_seconds
+                        .filter(|_| window_seconds > 0.0)
+                        .map(|cpu| cpu / window_seconds),
+                    peak_memory: sampler.and_then(|sampler| sampler.finish().ok()),
+                }
+            })
+            .collect()
     }
 }
 
-/// CPU seconds this process has used (user plus system); zero when
+/// CPU seconds this process has used (user plus system), or `None` when
 /// unreadable.
-pub fn driver_cpu_seconds() -> f64 {
+pub fn driver_cpu_seconds() -> Option<f64> {
     crate::release_server::os::self_cpu_seconds()
+}
+
+/// The growth of a cumulative CPU reading, or `None` when either end is
+/// missing or the counter went backwards.
+#[must_use]
+pub fn elapsed(before: Option<f64>, after: Option<f64>) -> Option<f64> {
+    match (before, after) {
+        (Some(before), Some(after)) if after >= before => Some(after - before),
+        _ => None,
+    }
+}
+
+/// Nanoseconds per millisecond, the divisor from raw timings to report
+/// milliseconds.
+pub const NANOS_PER_MS: f64 = 1e6;
+
+/// The span the server records each request's exact timing on; see
+/// `wyrd_telemetry::record_timing`.
+pub const TIMING_SPAN: &str = "wyrd.timing";
+
+/// How long the server's batch export may wait before it sends, as the
+/// declared `OTEL_BSP_SCHEDULE_DELAY`.
+pub const EXPORT_DELAY: Duration = Duration::from_millis(100);
+
+/// How long a window's timing observations may take to reach the collector
+/// after its last request ended.
+const COLLECTION_WAIT: Duration = Duration::from_secs(30);
+
+/// One request's server timing at one boundary, decoded from a
+/// [`TIMING_SPAN`] the server exported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Timing {
+    /// The owning boundary, such as `gateway.buffered` or `bifrost.query`.
+    pub boundary: String,
+    /// The closed outcome the server recorded.
+    pub outcome: String,
+    /// Monotonic nanoseconds from handler entry to the boundary.
+    pub elapsed_ns: u64,
+    /// The union of excluded waits (provider exchanges, Verifier blocks),
+    /// nanoseconds, when the boundary has any.
+    pub excluded_ns: Option<u64>,
+    /// When the span ended, Unix nanoseconds: assigns it to a window only.
+    pub end_unix_ns: u64,
+    /// Hex trace id: the request's trace.
+    pub trace_id: String,
+    /// Hex span id, unique per observation.
+    pub span_id: String,
+    /// The exporting server process's `service.instance.id`.
+    pub instance: String,
+}
+
+impl Timing {
+    /// Elapsed less excluded nanoseconds, computed within this one request.
+    ///
+    /// # Errors
+    ///
+    /// Returns why there is no residual: no excluded component, or one
+    /// larger than the elapsed time. A negative residual is never clamped.
+    pub fn residual_ns(&self) -> Result<u64, String> {
+        let excluded = self.excluded_ns.ok_or_else(|| {
+            format!(
+                "a `{}` observation has no excluded component",
+                self.boundary
+            )
+        })?;
+        self.elapsed_ns.checked_sub(excluded).ok_or_else(|| {
+            format!(
+                "a `{}` observation's excluded {excluded} ns exceeds its elapsed {} ns",
+                self.boundary, self.elapsed_ns
+            )
+        })
+    }
+}
+
+/// Every [`TIMING_SPAN`] in one OTLP trace export, with a reason for each
+/// one that cannot be decoded, and the number of spans it carried.
+#[must_use]
+pub fn decode_timings(request: &ExportTraceServiceRequest) -> (Vec<Timing>, Vec<String>, u64) {
+    let (mut timings, mut malformed, mut spans) = (Vec::new(), Vec::new(), 0_u64);
+    for resource in &request.resource_spans {
+        let instance = resource
+            .resource
+            .as_ref()
+            .and_then(|resource| text(&resource.attributes, "service.instance.id"))
+            .unwrap_or_default();
+        for span in resource.scope_spans.iter().flat_map(|scope| &scope.spans) {
+            spans += 1;
+            if span.name != TIMING_SPAN {
+                continue;
+            }
+            let decoded = (|| {
+                let boundary = text(&span.attributes, "boundary").ok_or("no boundary")?;
+                let outcome = text(&span.attributes, "outcome").ok_or("no outcome")?;
+                let elapsed_ns = nanos(&span.attributes, "elapsed_ns")?.ok_or("no elapsed_ns")?;
+                Ok::<_, &str>(Timing {
+                    boundary,
+                    outcome,
+                    elapsed_ns,
+                    excluded_ns: nanos(&span.attributes, "excluded_ns")?,
+                    end_unix_ns: span.end_time_unix_nano,
+                    trace_id: hex(&span.trace_id),
+                    span_id: hex(&span.span_id),
+                    instance: instance.clone(),
+                })
+            })();
+            match decoded {
+                Ok(timing) => timings.push(timing),
+                Err(reason) => {
+                    malformed.push(format!("a `{TIMING_SPAN}` span is malformed: {reason}"));
+                }
+            }
+        }
+    }
+    (timings, malformed, spans)
+}
+
+/// The string attribute `key`.
+fn text(attributes: &[KeyValue], key: &str) -> Option<String> {
+    attributes
+        .iter()
+        .find(|attribute| attribute.key == key)
+        .and_then(
+            |attribute| match attribute.value.as_ref()?.value.as_ref()? {
+                any_value::Value::StringValue(value) => Some(value.clone()),
+                _ => None,
+            },
+        )
+}
+
+/// The non-negative integer attribute `key`, `None` when absent.
+///
+/// # Errors
+///
+/// Returns why a present value is not a non-negative integer.
+fn nanos(attributes: &[KeyValue], key: &str) -> Result<Option<u64>, &'static str> {
+    let Some(value) = attributes
+        .iter()
+        .find(|attribute| attribute.key == key)
+        .and_then(|attribute| attribute.value.as_ref()?.value.as_ref())
+    else {
+        return Ok(None);
+    };
+    match value {
+        any_value::Value::IntValue(value) => u64::try_from(*value)
+            .map(Some)
+            .map_err(|_| "a negative duration"),
+        _ => Err("a non-integer duration"),
+    }
+}
+
+/// Lower-case hex of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{byte:02x}"));
+        out
+    })
+}
+
+/// What the collector has received and not yet assigned to a window.
+#[derive(Debug, Default)]
+struct Received {
+    /// Unassigned timing observations, in arrival order.
+    timings: Vec<Timing>,
+    /// Undecodable timing spans since the last window.
+    malformed: Vec<String>,
+    /// Export requests received in total.
+    exports: u64,
+    /// Spans received in total, of every name.
+    spans: u64,
+}
+
+/// The collector's OTLP trace service.
+#[derive(Clone)]
+struct Intake(Arc<Mutex<Received>>);
+
+#[async_trait::async_trait]
+impl TraceService for Intake {
+    /// Keeps every timing span of one export and acknowledges it whole.
+    async fn export(
+        &self,
+        request: wyrd_tonic::tonic::Request<ExportTraceServiceRequest>,
+    ) -> Result<wyrd_tonic::tonic::Response<ExportTraceServiceResponse>, wyrd_tonic::tonic::Status>
+    {
+        let (timings, malformed, spans) = decode_timings(request.get_ref());
+        let mut received = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        received.timings.extend(timings);
+        received.malformed.extend(malformed);
+        received.exports += 1;
+        received.spans += spans;
+        Ok(wyrd_tonic::tonic::Response::new(
+            ExportTraceServiceResponse::default(),
+        ))
+    }
+}
+
+/// A local OTLP/gRPC trace collector the measured server exports to.
+///
+/// It runs inside the benchmark driver, so its CPU is part of driver CPU and
+/// never server CPU; the server's tracing and export cost stays in server
+/// CPU. It keeps only [`TIMING_SPAN`]s, decodes them into [`Timing`]s, and
+/// hands each window the observations that ended inside it once every
+/// expected one arrived; every assigned observation is appended to
+/// `timings.jsonl` under the run's artifacts.
+pub struct Collector {
+    /// The `http://` endpoint the server exports to.
+    endpoint: String,
+    /// What arrived and is unassigned.
+    received: Arc<Mutex<Received>>,
+    /// Raw observation file under the artifacts directory.
+    log: PathBuf,
+    /// Stops the gRPC server on drop.
+    _stop: tokio_util::sync::DropGuard,
+}
+
+impl Collector {
+    /// Listens on a free loopback port and keeps raw observations under
+    /// `artifacts`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bind or artifacts-directory failure.
+    pub async fn start(artifacts: &Path) -> Result<Self, Error> {
+        std::fs::create_dir_all(artifacts)?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let received = Arc::new(Mutex::new(Received::default()));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let service = TraceServiceServer::new(Intake(Arc::clone(&received)))
+            .max_decoding_message_size(usize::MAX);
+        let stopped = stop.clone();
+        tokio::spawn(async move {
+            let served = wyrd_tonic::tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    stopped.cancelled_owned(),
+                )
+                .await;
+            if let Err(error) = served {
+                tracing::error!(%error, "the timing collector stopped");
+            }
+        });
+        Ok(Self {
+            endpoint,
+            received,
+            log: artifacts.join("timings.jsonl"),
+            _stop: stop.drop_guard(),
+        })
+    }
+
+    /// The server environment that exports every span to this collector:
+    /// the operator OTLP endpoint, a sampling ratio of one, and a batch
+    /// queue large enough that a window's spans are never dropped. A
+    /// record declares these as its tracing configuration.
+    #[must_use]
+    pub fn server_env(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("WYRD_OTLP_ENDPOINT", self.endpoint.clone()),
+            ("WYRD_OTLP_SAMPLE_RATIO", "1.0".to_owned()),
+            ("OTEL_BSP_MAX_QUEUE_SIZE", "1048576".to_owned()),
+            ("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "8192".to_owned()),
+            (
+                "OTEL_BSP_SCHEDULE_DELAY",
+                EXPORT_DELAY.as_millis().to_string(),
+            ),
+        ]
+    }
+
+    /// The declared tracing configuration and collection method a record
+    /// keeps, without the collector's ephemeral port.
+    #[must_use]
+    pub fn declaration() -> Value {
+        serde_json::json!({
+            "method": "server wyrd.timing spans: exact integer nanoseconds from the owning server boundary's std::time::Instant timers, exported through the operator OTLP/gRPC span exporter to a collector inside the benchmark driver",
+            "clock": "std::time::Instant on the server: the OS monotonic clock",
+            "server_env": {
+                "WYRD_OTLP_SAMPLE_RATIO": "1.0",
+                "OTEL_BSP_MAX_QUEUE_SIZE": "1048576",
+                "OTEL_BSP_MAX_EXPORT_BATCH_SIZE": "8192",
+                "OTEL_BSP_SCHEDULE_DELAY": EXPORT_DELAY.as_millis().to_string(),
+            },
+            "cost": "the server's tracing and export CPU is in server CPU; the collector's CPU is in driver CPU",
+            "assignment": "a window takes the observations that ended after it opened, once its expected count arrived (and, for traced requests, each request's own observation by trace id); a missing, extra, duplicate, or malformed observation makes it invalid",
+        })
+    }
+
+    /// Waits until `expected` observations of each boundary ended at or
+    /// after `opened`, then takes every observation of those boundaries
+    /// that did and drops whatever else is unassigned: earlier windows'
+    /// stragglers and boundaries this window does not read.
+    ///
+    /// After the counts are reached the collector waits two more export
+    /// delays, so a late duplicate is counted rather than left for the next
+    /// window. The population is invalid when a count is short after
+    /// [`COLLECTION_WAIT`], over, or a span id repeats, or a timing span was
+    /// malformed. Taken observations are appended to the raw file.
+    pub async fn window(
+        &self,
+        label: &str,
+        opened: SystemTime,
+        expected: &[(&str, u64)],
+    ) -> Population {
+        self.collect(label, opened, expected, true, &[]).await
+    }
+
+    /// [`Self::window`] for a window whose boundaries also serve requests
+    /// the driver did not send itself: waits until at least `least`
+    /// observations of each boundary ended at or after `opened` and every
+    /// trace id of `traces` has one, then takes every observation of those
+    /// boundaries that did. The population is invalid when a count is short
+    /// or a trace has no observation after [`COLLECTION_WAIT`], a span id
+    /// repeats, or a timing span was malformed.
+    pub async fn traced(
+        &self,
+        label: &str,
+        opened: SystemTime,
+        least: &[(&str, u64)],
+        traces: &[&str],
+    ) -> Population {
+        self.collect(label, opened, least, false, traces).await
+    }
+
+    /// Waits for and takes a window's observations: `expected` counts per
+    /// boundary, exact when `exact` and lower bounds otherwise, and one
+    /// observation at least for each of `traces`.
+    async fn collect(
+        &self,
+        label: &str,
+        opened: SystemTime,
+        expected: &[(&str, u64)],
+        exact: bool,
+        traces: &[&str],
+    ) -> Population {
+        let from = unix_nanos(opened);
+        let matching = |timing: &Timing| {
+            timing.end_unix_ns >= from
+                && expected
+                    .iter()
+                    .any(|(boundary, _)| *boundary == timing.boundary)
+        };
+        let counts = |received: &Received| {
+            expected
+                .iter()
+                .map(|(boundary, _)| {
+                    received
+                        .timings
+                        .iter()
+                        .filter(|timing| matching(timing) && timing.boundary == *boundary)
+                        .count() as u64
+                })
+                .collect::<Vec<_>>()
+        };
+        let unseen = |received: &Received| {
+            if traces.is_empty() {
+                return 0;
+            }
+            let seen: std::collections::HashSet<&str> = received
+                .timings
+                .iter()
+                .filter(|timing| matching(timing))
+                .map(|timing| timing.trace_id.as_str())
+                .collect();
+            traces
+                .iter()
+                .filter(|trace| !seen.contains(**trace))
+                .count()
+        };
+        let waiting = tokio::time::Instant::now();
+        while waiting.elapsed() < COLLECTION_WAIT {
+            let reached = {
+                let received = self.received.lock().unwrap_or_else(PoisonError::into_inner);
+                counts(&received)
+                    .iter()
+                    .zip(expected)
+                    .all(|(count, (_, want))| count >= want)
+                    && unseen(&received) == 0
+            };
+            if reached {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(EXPORT_DELAY * 2).await;
+        let mut received = self.received.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut invalid = std::mem::take(&mut received.malformed);
+        for (count, (boundary, want)) in counts(&received).iter().zip(expected) {
+            if count < want || (exact && count != want) {
+                invalid.push(format!(
+                    "{count} `{boundary}` timing observations arrived for {want} requests"
+                ));
+            }
+        }
+        let missing = unseen(&received);
+        if missing > 0 {
+            invalid.push(format!(
+                "{missing} of {} traced requests have no server timing observation",
+                traces.len()
+            ));
+        }
+        let (timings, _): (Vec<Timing>, Vec<Timing>) = std::mem::take(&mut received.timings)
+            .into_iter()
+            .partition(|timing| matching(timing));
+        let (exports, spans) = (received.exports, received.spans);
+        drop(received);
+        let mut ids: Vec<&str> = timings
+            .iter()
+            .map(|timing| timing.span_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        let unique = ids.len();
+        ids.dedup();
+        if ids.len() != unique {
+            invalid.push(format!(
+                "{} timing observations repeat a span id",
+                unique - ids.len()
+            ));
+        }
+        if let Err(error) = self.append(label, &timings) {
+            invalid.push(format!("raw timings could not be kept: {error}"));
+        }
+        Population {
+            timings,
+            invalid,
+            exports,
+            spans,
+        }
+    }
+
+    /// Appends `timings`, each tagged with the window `label`, to the raw
+    /// file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the open or write failure.
+    fn append(&self, label: &str, timings: &[Timing]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)?;
+        for timing in timings {
+            let line = serde_json::json!({ "window": label, "timing": timing });
+            writeln!(file, "{line}")?;
+        }
+        file.flush()
+    }
+}
+
+/// `at` as Unix nanoseconds, the clock of [`Timing::end_unix_ns`]; zero
+/// before the epoch.
+#[must_use]
+pub fn unix_nanos(at: SystemTime) -> u64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        })
+}
+
+/// One window's server timing observations.
+#[derive(Debug, Clone, Default)]
+pub struct Population {
+    /// Every observation of the window's boundaries.
+    pub timings: Vec<Timing>,
+    /// Why the population is incomplete or untrustworthy; empty when it is
+    /// complete.
+    pub invalid: Vec<String>,
+    /// Export requests the collector had received so far.
+    pub exports: u64,
+    /// Spans of every name the collector had received so far.
+    pub spans: u64,
+}
+
+impl Population {
+    /// The elapsed nanoseconds of every `boundary` observation with
+    /// `outcome`.
+    #[must_use]
+    pub fn elapsed(&self, boundary: &str, outcome: &str) -> Vec<u64> {
+        self.of(boundary, outcome)
+            .map(|timing| timing.elapsed_ns)
+            .collect()
+    }
+
+    /// The excluded-wait nanoseconds of every `boundary` observation with
+    /// `outcome` that has one.
+    #[must_use]
+    pub fn excluded(&self, boundary: &str, outcome: &str) -> Vec<u64> {
+        self.of(boundary, outcome)
+            .filter_map(|timing| timing.excluded_ns)
+            .collect()
+    }
+
+    /// Each `boundary` observation with `outcome`'s residual, elapsed less
+    /// excluded within the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first observation's reason when any has no residual.
+    pub fn residuals(&self, boundary: &str, outcome: &str) -> Result<Vec<u64>, String> {
+        self.of(boundary, outcome)
+            .map(Timing::residual_ns)
+            .collect()
+    }
+
+    /// Observations of `boundary` whose outcome is not `outcome`.
+    #[must_use]
+    pub fn others(&self, boundary: &str, outcome: &str) -> u64 {
+        self.timings
+            .iter()
+            .filter(|timing| timing.boundary == boundary && timing.outcome != outcome)
+            .count() as u64
+    }
+
+    /// The collection-health line a repetition keeps as an observation.
+    #[must_use]
+    pub fn health(&self) -> String {
+        format!(
+            "server timing: {} observations assigned; the collector had received {} spans in {} exports",
+            self.timings.len(),
+            self.spans,
+            self.exports
+        )
+    }
+
+    /// Keeps this population's invalid reasons and collection health on
+    /// `repetition`; call once per window.
+    pub fn validate(&self, repetition: &mut Repetition) {
+        repetition.invalid.extend(self.invalid.iter().cloned());
+        repetition.observations.push(self.health());
+    }
+
+    /// Sets each `(id, q)` of `ids` on `repetition` to the nearest-rank
+    /// percentile q, in milliseconds, of the `boundary` observations with
+    /// the judged `outcome`: their residuals when `residual`, else their
+    /// elapsed times. Other outcomes stay in the raw file with their
+    /// durations and are counted by [`Self::others`], never judged. An empty
+    /// judged population or an observation without a residual makes the
+    /// repetition invalid.
+    pub fn percentiles(
+        &self,
+        repetition: &mut Repetition,
+        boundary: &str,
+        outcome: &str,
+        residual: bool,
+        ids: &[(&str, f64)],
+    ) {
+        let samples = if residual {
+            self.residuals(boundary, outcome).unwrap_or_else(|reason| {
+                repetition.invalid.push(reason);
+                Vec::new()
+            })
+        } else {
+            self.elapsed(boundary, outcome)
+        };
+        if samples.is_empty() {
+            repetition.invalid.push(format!(
+                "no `{boundary}` timing observation has outcome `{outcome}`"
+            ));
+        }
+        for (id, q) in ids {
+            repetition.set(id, Reading::percentile(&samples, *q, NANOS_PER_MS));
+        }
+    }
+
+    /// Observations of `boundary` with `outcome`.
+    fn of<'a>(&'a self, boundary: &'a str, outcome: &'a str) -> impl Iterator<Item = &'a Timing> {
+        self.timings
+            .iter()
+            .filter(move |timing| timing.boundary == boundary && timing.outcome == outcome)
+    }
+}
+
+/// A fresh W3C trace context for one benchmark request, so its server
+/// timing can be matched to it by trace id: the server's request span
+/// continues it. It is unsampled, so the server never stages a tenant copy
+/// of the request's spans, while the operator policy still records every
+/// span.
+#[must_use]
+pub fn request_trace() -> wyrd_spec::trace::TraceContext {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    wyrd_spec::trace::TraceContext {
+        span_id: id[..16].to_owned(),
+        trace_id: id,
+        trace_flags: 0,
+        trace_state: String::new(),
+    }
+}
+
+/// The smallest nonzero step this host's monotonic clock shows between two
+/// successive reads, nanoseconds: its effective timer resolution, which
+/// the server's timers share on this host.
+#[must_use]
+pub fn timer_resolution_ns() -> u64 {
+    (0..10_000)
+        .filter_map(|_| {
+            let start = Instant::now();
+            loop {
+                let step = start.elapsed();
+                if !step.is_zero() {
+                    break u64::try_from(step.as_nanos()).ok();
+                }
+            }
+        })
+        .min()
+        .unwrap_or(0)
 }
 
 /// The release `wyrd-server` built beside the running benchmark binary.
@@ -505,8 +1069,9 @@ pub fn release_binary() -> Result<PathBuf, Error> {
     }
 }
 
-/// The identity of the measured server `binary` a report records: its path,
-/// size, and modification time.
+/// The identity of the measured server `binary` a record keeps: its file
+/// name, size, and modification time. The directory stays out, since it names
+/// the contributor's checkout.
 ///
 /// # Errors
 ///
@@ -515,7 +1080,7 @@ pub fn binary_identity(binary: &Path) -> Result<Value, Error> {
     let metadata = std::fs::metadata(binary)?;
     let modified: chrono::DateTime<chrono::Utc> = metadata.modified()?.into();
     Ok(serde_json::json!({
-        "path": binary.display().to_string(),
+        "name": binary.file_name().map(|name| name.to_string_lossy().into_owned()),
         "bytes": metadata.len(),
         "modified": modified,
     }))
@@ -538,7 +1103,7 @@ pub fn install_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Percentiles, Readings, Selection, deltas, quantile};
+    use super::{Percentiles, Readings, Selection, deltas, elapsed};
     use crate::release_server::Metrics;
 
     /// A two-point streaming selection over one family and a breakdown by
@@ -575,13 +1140,12 @@ mod tests {
     }
 
     /// Shared readings keep each label selection independent, count a series
-    /// first exported mid-window from zero, give an idle selection no
-    /// percentiles, and keep only breakdown components that gained an
-    /// observation.
+    /// first exported mid-window from zero, give an idle selection no mean,
+    /// and keep only breakdown components that gained an observation.
     ///
     /// # Panics
     ///
-    /// Panics when a delta, percentile, or component is wrong.
+    /// Panics when a delta, mean, or component is wrong.
     #[test]
     fn shared_measurements_preserve_workload_deltas() {
         let before = Metrics::parse(&format!(
@@ -599,17 +1163,16 @@ mod tests {
 
         let answer = telemetry.histogram(STREAM.histograms[0]);
         assert_eq!((answer.count, answer.sum), (1000.0, 0.5));
-        assert_eq!(answer.percentiles().p50, Some(0.001));
-        assert_eq!(answer.percentiles().p99, Some(0.001));
+        assert_eq!(answer.buckets, [(0.001, 999.0), (f64::INFINITY, 1000.0)]);
         assert_eq!(answer.mean(), Some(0.0005));
 
         let end = telemetry.histogram(STREAM.histograms[1]);
         assert_eq!(end.count, 20.0);
-        assert_eq!(end.percentiles().p50, Some(f64::INFINITY));
+        assert_eq!(end.buckets, [(0.001, 0.0), (f64::INFINITY, 20.0)]);
+        assert_eq!(end.mean(), Some(0.02));
 
         let buffered = telemetry.histogram(STREAM.histograms[2]);
         assert_eq!(buffered.count, 0.0);
-        assert_eq!(buffered.percentiles().p99, None);
         assert_eq!(buffered.mean(), None);
 
         assert_eq!(
@@ -629,22 +1192,6 @@ mod tests {
         assert!((seconds - 0.5).abs() < 1e-9 && (count - 1000.0).abs() < f64::EPSILON);
     }
 
-    /// A quantile is the first cumulative bucket bound covering it among the
-    /// observations between two readings, and an empty interval has none.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a bound is wrong.
-    #[test]
-    fn quantile_reads_bucket_deltas() {
-        let before = [(0.1, 10.0), (1.0, 10.0), (f64::INFINITY, 10.0)];
-        let after = [(0.1, 15.0), (1.0, 105.0), (f64::INFINITY, 110.0)];
-        assert_eq!(quantile(&before, &after, 0.05), Some(0.1));
-        assert_eq!(quantile(&before, &after, 0.5), Some(1.0));
-        assert_eq!(quantile(&before, &after, 0.99), Some(f64::INFINITY));
-        assert_eq!(quantile(&after, &after, 0.5), None);
-    }
-
     /// A bound missing from the earlier reading counts from zero.
     ///
     /// # Panics
@@ -657,6 +1204,20 @@ mod tests {
             deltas(&[(0.1, 1.0)], &after),
             vec![(0.1, 3.0), (f64::INFINITY, 6.0)]
         );
+    }
+
+    /// A missing or reset cumulative reading has no growth, never zero use.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a missing or reset reading yields a value.
+    #[test]
+    fn missing_or_reset_readings_have_no_growth() {
+        assert_eq!(elapsed(Some(1.0), Some(3.5)), Some(2.5));
+        assert_eq!(elapsed(Some(2.0), Some(2.0)), Some(0.0));
+        assert_eq!(elapsed(None, Some(2.0)), None);
+        assert_eq!(elapsed(Some(2.0), None), None);
+        assert_eq!(elapsed(Some(3.0), Some(1.0)), None, "a reset counter");
     }
 
     /// Raw percentiles use the nearest rank and an empty sample has none.

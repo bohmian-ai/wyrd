@@ -272,6 +272,10 @@ impl RemoteScanMetrics {
 pub(crate) struct OracleQueryScanStats {
     /// Physical bytes reported by `DataFusion`'s Parquet scan metric.
     pub(crate) physical_bytes_scanned: Option<u64>,
+    /// Rows the executed local file scans produced, from their `output_rows`
+    /// metric; `None` when no local scan reported it or a remote scan, whose
+    /// participants report no rows, also ran.
+    pub(crate) physical_rows_scanned: Option<u64>,
     /// Number of distinct files executed file scan nodes were planned to read,
     /// less what `DataFusion`'s `FilePruner` skipped when opening them.
     pub(crate) files_scanned: u64,
@@ -308,7 +312,8 @@ impl OracleQueryScanStats {
         stats
     }
 
-    /// Reads the pinned `DataFusion` scan metric once after physical execution.
+    /// Reads the pinned `DataFusion` scan metrics, bytes and output rows, once
+    /// after physical execution.
     ///
     /// Files are counted from the plan before execution, and `DataFusion`
     /// skips files whose statistics exclude them only as it opens each one,
@@ -322,9 +327,13 @@ impl OracleQueryScanStats {
         self.finalized = true;
         let mut total = 0_u64;
         let mut available = false;
+        let mut rows: Option<u64> = None;
         for metrics in &self.physical_metrics {
             let metrics = metrics.clone_inner();
             self.pruning.add(parquet_pruning(&metrics));
+            if let Some(output) = metrics.output_rows() {
+                rows = Some(rows.unwrap_or(0).saturating_add(output as u64));
+            }
             let Some(MetricValue::Count { count, .. }) = metrics.sum_by_name("bytes_scanned")
             else {
                 continue;
@@ -335,6 +344,7 @@ impl OracleQueryScanStats {
         if available {
             self.physical_bytes_scanned = Some(total);
         }
+        self.physical_rows_scanned = rows.filter(|_| self.remote_handles.is_empty());
         for handle in &self.remote_handles {
             let (bytes, files, partitions) = handle.terminal_values();
             self.files_scanned = self.files_scanned.saturating_add(files);
@@ -2072,6 +2082,41 @@ pub(super) mod tests {
         stats.finalize();
         assert_eq!(stats.physical_bytes_scanned, Some(18));
         assert_eq!(stats.files_scanned, 2);
+    }
+
+    /// Local file scans' output rows sum across partitions and scans, and
+    /// are unavailable when no scan reported them or a remote scan also ran.
+    #[test]
+    fn scan_stats_sum_local_output_rows() {
+        use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
+        let scan = |rows: &[usize]| {
+            let set = ExecutionPlanMetricsSet::new();
+            for (partition, rows) in rows.iter().enumerate() {
+                MetricBuilder::new(&set).output_rows(partition).add(*rows);
+            }
+            set
+        };
+        let mut stats = OracleQueryScanStats {
+            physical_metrics: vec![scan(&[3, 4]), scan(&[5])],
+            ..OracleQueryScanStats::default()
+        };
+        stats.finalize();
+        assert_eq!(stats.physical_rows_scanned, Some(12));
+
+        let mut unreported = OracleQueryScanStats {
+            physical_metrics: vec![ExecutionPlanMetricsSet::new()],
+            ..OracleQueryScanStats::default()
+        };
+        unreported.finalize();
+        assert_eq!(unreported.physical_rows_scanned, None);
+
+        let mut mixed = OracleQueryScanStats {
+            physical_metrics: vec![scan(&[3])],
+            remote_handles: vec![Arc::new(RemoteScanMetrics::default())],
+            ..OracleQueryScanStats::default()
+        };
+        mixed.finalize();
+        assert_eq!(mixed.physical_rows_scanned, None);
     }
 
     /// Terminal aggregation is monotonic and emits exactly once after a drop.

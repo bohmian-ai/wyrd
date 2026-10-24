@@ -205,6 +205,11 @@ impl ExecutionTelemetry {
 
     /// Emit the outcome families of [`finish`](Self::finish): each phase,
     /// the whole execution, the Verifier's block time, and the overhead.
+    ///
+    /// The exact execution and block-union durations are also recorded,
+    /// unsubtracted, as one [`wyrd_telemetry::record_timing`] span under the
+    /// current span at boundary `verification.direct` or
+    /// `verification.queued`.
     fn emit(&self, outcome: &'static str, failed: bool) {
         let total = self.started.elapsed();
         let ledger = self.lock();
@@ -220,6 +225,16 @@ impl ExecutionTelemetry {
             }
         }
         let verifier = union(&self.clock.intervals());
+        wyrd_telemetry::record_timing(
+            &tracing::Span::current(),
+            match self.mode {
+                ExecutionMode::Direct => "verification.direct",
+                ExecutionMode::Queued => "verification.queued",
+            },
+            outcome,
+            total,
+            Some(verifier),
+        );
         metrics::histogram!(VERIFICATION_VERIFIER_SECONDS, "mode" => mode, "outcome" => outcome)
             .record(verifier.as_secs_f64());
         metrics::histogram!(VERIFICATION_OVERHEAD_SECONDS, "mode" => mode, "outcome" => outcome)

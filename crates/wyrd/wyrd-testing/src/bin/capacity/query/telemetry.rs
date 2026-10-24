@@ -1,5 +1,5 @@
 //! The `vala.traces.spans` telemetry fixture: deterministic GenAI/HTTP spans
-//! sent through OTLP ingest, and the exact answers they must read back as.
+//! sent through OTLP ingest.
 //!
 //! Like the events fixture, every value is a plain function of one span
 //! index, so any report row can be checked against its data by hand. Spans
@@ -8,9 +8,6 @@
 //! Bifrost's 10% Variant shredding threshold on purpose: core keys sit on
 //! 25-90% of spans, mid keys on 6-25%, and thousands of long-tail `custom.*`
 //! keys each on about 0.1%, so a published file shows which keys shredded.
-//!
-//! `start_time_unix_nano` is the table's time column, so a span-time window
-//! prunes by its hourly partitions before any file statistics.
 
 use std::collections::BTreeMap;
 
@@ -24,15 +21,7 @@ use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
-use crate::query::run::Usage;
-use crate::query::workload::{DAY_HOURS, DAY_START_MS, HOUR_MS, Rows, mix};
-
-/// The canonical span table OTLP trace ingest writes.
-pub const TABLE: &str = "vala.traces.spans";
-
-/// Spans in the standard telemetry fixture, as many as the events fixture's
-/// rows.
-pub const STANDARD_SPANS: i64 = 10_000_000;
+use crate::query::workload::{DAY_HOURS, DAY_START_MS, HOUR_MS, mix};
 
 /// Spans in every trace; the trace tree is [`Role::ALL`].
 pub const SPANS_PER_TRACE: i64 = 8;
@@ -81,24 +70,6 @@ const PLANS: [&str; 4] = ["free", "pro", "team", "enterprise"];
 /// The `exception.type` values of failed spans.
 const EXCEPTIONS: [&str; 3] = ["TimeoutError", "ConnectionResetError", "ValueError"];
 
-/// Span attribute keys present on at least 10% of spans, which every
-/// shredded published file must shred.
-pub const SHREDDED_KEYS: [&str; 13] = [
-    "customer.id",
-    "user",
-    "http.request.method",
-    "http.route",
-    "http.response.status_code",
-    "gen_ai.operation.name",
-    "gen_ai.provider.name",
-    "gen_ai.request.model",
-    "gen_ai.conversation.id",
-    "region",
-    "feature.flag",
-    "cache.hit",
-    "url.full",
-];
-
 /// The mid key deliberately under the threshold, which no file may shred.
 pub const UNSHREDDED_KEY: &str = "retry.count";
 
@@ -107,10 +78,6 @@ pub const TAIL_PREFIX: &str = "custom.";
 
 /// `start_time_unix_nano` of the first trace: the events fixture's day start.
 const DAY_START_NANOS: i64 = DAY_START_MS * 1_000_000;
-
-/// The one-hour span-time window the pruning question reads: the seventh
-/// hour of the fixture day, as an offset from its start.
-const WINDOW_START_HOUR: i64 = 6;
 
 /// Nanoseconds between consecutive spans' starts within one trace.
 const SPAN_STAGGER_NANOS: i64 = 50_000;
@@ -361,19 +328,11 @@ pub(crate) fn attribute(key: &str, value: Value) -> KeyValue {
 /// One telemetry fixture size and every span derived from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Telemetry {
-    /// Spans written to [`TABLE`]; a multiple of [`SPANS_PER_TRACE`].
+    /// Spans written to `vala.traces.spans`; a multiple of [`SPANS_PER_TRACE`].
     pub spans: i64,
 }
 
 impl Telemetry {
-    /// The standard 10-million-span fixture.
-    #[must_use]
-    pub const fn standard() -> Self {
-        Self {
-            spans: STANDARD_SPANS,
-        }
-    }
-
     /// Traces in the fixture.
     #[must_use]
     pub const fn traces(self) -> i64 {
@@ -592,244 +551,33 @@ impl Telemetry {
         }
         attributes
     }
-
-    /// Counts every span: the unbounded read the window is compared with.
-    #[must_use]
-    pub fn all_spans(self) -> (&'static str, String, Rows) {
-        (
-            "spans",
-            format!("SELECT COUNT(*) FROM {TABLE}"),
-            vec![vec![self.spans]],
-        )
-    }
-
-    /// Counts the spans starting in one hour of the fixture day, bounded on
-    /// the table's time column `start_time_unix_nano`.
-    ///
-    /// The bound is a nanosecond instant, so Oracle prunes by the hourly
-    /// partitions and file bounds before reading a row.
-    #[must_use]
-    pub fn span_window(self) -> (&'static str, String, Rows) {
-        let lower = DAY_START_NANOS + WINDOW_START_HOUR * HOUR_MS * 1_000_000;
-        let upper = lower + HOUR_MS * 1_000_000;
-        let inside = (0..self.spans)
-            .filter(|index| (lower..upper).contains(&self.start_nanos(*index)))
-            .count();
-        (
-            "span window",
-            format!(
-                "SELECT COUNT(*) FROM {TABLE} \
-                 WHERE start_time_unix_nano >= to_timestamp_nanos({lower}) \
-                 AND start_time_unix_nano < to_timestamp_nanos({upper})"
-            ),
-            vec![vec![inside.to_i64().unwrap_or(i64::MAX)]],
-        )
-    }
-
-    /// The exact-answer statements of the written spans, each with its name
-    /// and the answer computed from the span functions.
-    ///
-    /// Each answer loops over every span, so callers compute them once.
-    #[must_use]
-    pub fn questions(self) -> Vec<(&'static str, String, Rows)> {
-        let count =
-            |keep: &dyn Fn(i64) -> bool| (0..self.spans).filter(|index| keep(*index)).count();
-        let count =
-            |keep: &dyn Fn(i64) -> bool| vec![vec![count(keep).to_i64().unwrap_or(i64::MAX)]];
-        let lookup = self.traces() / 2;
-        let lookup_hex = hex::encode(trace_id(lookup));
-        let lookup_spans = lookup * SPANS_PER_TRACE..(lookup + 1) * SPANS_PER_TRACE;
-        let customer = customer(lookup * SPANS_PER_TRACE + 1).unwrap_or_default();
-        vec![
-            self.all_spans(),
-            self.span_window(),
-            (
-                "one service",
-                format!(
-                    "SELECT COUNT(*) FROM {TABLE} WHERE service_name = '{}'",
-                    service_name(3)
-                ),
-                count(&|index| service(index) == 3),
-            ),
-            (
-                "trace lookup",
-                format!(
-                    "SELECT COUNT(*), SUM(duration_nano) FROM {TABLE} \
-                     WHERE trace_id = X'{lookup_hex}'"
-                ),
-                vec![vec![
-                    SPANS_PER_TRACE,
-                    lookup_spans.map(duration_nanos).sum(),
-                ]],
-            ),
-            (
-                "errors",
-                format!("SELECT COUNT(*) FROM {TABLE} WHERE status_code = 2"),
-                count(&is_error),
-            ),
-            (
-                "server errors",
-                format!("SELECT COUNT(*) FROM {TABLE} WHERE http_response_status_code = 500"),
-                count(&|index| status_code(index) == Some(500)),
-            ),
-            (
-                "input tokens",
-                format!("SELECT SUM(gen_ai_usage_input_tokens) FROM {TABLE}"),
-                vec![vec![(0..self.spans).filter_map(input_tokens).sum()]],
-            ),
-            (
-                "customer",
-                format!(
-                    "SELECT COUNT(*) FROM {TABLE} WHERE attributes ->> 'customer.id' = '{customer}'"
-                ),
-                count(&|index| self::customer(index).as_deref() == Some(customer.as_str())),
-            ),
-            (
-                "region",
-                format!("SELECT COUNT(*) FROM {TABLE} WHERE attributes ->> 'region' = 'eu-west'"),
-                count(&|index| region(index) == Some("eu-west")),
-            ),
-        ]
-    }
-}
-
-/// Judges span-time pruning: the one-hour window must scan fewer files or
-/// fewer row groups than the unbounded count over the same published spans.
-///
-/// Returns the judged outcome with both reads' scan counts.
-pub fn judge_pruning(all: &Usage, window: &Usage) -> std::result::Result<String, String> {
-    let scanned = |usage: &Usage| {
-        (
-            usage.scanned("oracle_query_files_scanned_total"),
-            usage.scanned("oracle_query_row_groups_scanned_total"),
-        )
-    };
-    let (all_files, all_groups) = scanned(all);
-    let (window_files, window_groups) = scanned(window);
-    let summary = format!(
-        "window scanned {window_files:.0} files and {window_groups:.0} row groups, \
-         unbounded {all_files:.0} and {all_groups:.0}"
-    );
-    if window_files < all_files || window_groups < all_groups {
-        Ok(summary)
-    } else {
-        Err(format!("{summary}; the window pruned nothing"))
-    }
-}
-
-/// Judges the Variant layout of the published span files under `root`:
-/// every shredded file shreds each of [`SHREDDED_KEYS`] in `attributes` and
-/// neither [`UNSHREDDED_KEY`] nor any long-tail key.
-///
-/// Returns the judged outcome; no shredded file at all is a failure, since
-/// the fixture exists to put keys over the threshold.
-pub fn judge_shredding(files: &[std::path::PathBuf]) -> std::result::Result<String, String> {
-    let (mut shredded, mut flat, mut faults) = (0_usize, 0_usize, Vec::new());
-    for path in files {
-        match shredded_keys(path) {
-            Ok(None) => {}
-            Ok(Some(keys)) if keys.is_empty() => flat += 1,
-            Ok(Some(keys)) => {
-                shredded += 1;
-                let missing: Vec<_> = SHREDDED_KEYS
-                    .iter()
-                    .filter(|key| !keys.iter().any(|shredded| shredded == *key))
-                    .collect();
-                let extra: Vec<_> = keys
-                    .iter()
-                    .filter(|key| *key == UNSHREDDED_KEY || key.starts_with(TAIL_PREFIX))
-                    .collect();
-                if !missing.is_empty() || !extra.is_empty() {
-                    faults.push(format!(
-                        "{}: missing {missing:?}, unexpected {extra:?}",
-                        path.display()
-                    ));
-                }
-            }
-            Err(error) => faults.push(format!("{}: {error}", path.display())),
-        }
-    }
-    let summary = format!("{shredded} shredded and {flat} unshredded span files");
-    if shredded == 0 {
-        Err(format!("{summary}; none shredded"))
-    } else if let Some(first) = faults.first() {
-        Err(format!("{summary}; {} wrong, first {first}", faults.len()))
-    } else {
-        Ok(format!(
-            "{summary}; each shreds the {} core and mid keys, not {UNSHREDDED_KEY} or {TAIL_PREFIX}*",
-            SHREDDED_KEYS.len()
-        ))
-    }
-}
-
-/// The keys shredded under `attributes.typed_value` in the Parquet file at
-/// `path`; `None` when the file is not a span file (no `span_id`), empty when it is
-/// unshredded.
-///
-/// # Errors
-///
-/// Returns the open, footer, or schema-conversion failure.
-fn shredded_keys(path: &std::path::Path) -> std::result::Result<Option<Vec<String>>, String> {
-    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
-    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|error| error.to_string())?;
-    let schema = builder.schema();
-    let (Ok(_), Ok(attributes)) = (
-        schema.field_with_name("span_id"),
-        schema.field_with_name("attributes"),
-    ) else {
-        return Ok(None);
-    };
-    let arrow::datatypes::DataType::Struct(storage) = attributes.data_type() else {
-        return Ok(Some(Vec::new()));
-    };
-    Ok(Some(
-        match storage
-            .find("typed_value")
-            .map(|(_, field)| field.data_type())
-        {
-            Some(arrow::datatypes::DataType::Struct(keys)) => {
-                keys.iter().map(|key| key.name().clone()).collect()
-            }
-            _ => Vec::new(),
-        },
-    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Usage whose window scanned `files` files and `groups` row groups.
-    fn scanning(files: f64, groups: f64) -> Usage {
-        let mut usage = Usage::default();
-        for (counter, value) in [
-            ("oracle_query_files_scanned_total", files),
-            ("oracle_query_row_groups_scanned_total", groups),
-        ] {
-            let index = crate::query::run::SCAN_COUNTERS
-                .iter()
-                .position(|name| *name == counter)
-                .expect("the counter is a scan counter");
-            usage.scan_counts[index] = value;
-        }
-        usage
-    }
+    /// Spans in the shape test's fixture, as many as the events fixture's
+    /// rows.
+    const STANDARD_SPANS: i64 = 10_000_000;
 
-    /// The window passes when it scans fewer files or fewer row groups than
-    /// the unbounded read, and fails when it scans as much.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the judge passes an unpruned window or fails a pruned one.
-    #[test]
-    fn span_window_pruning_needs_fewer_files_or_row_groups() {
-        let all = scanning(24.0, 96.0);
-
-        assert!(judge_pruning(&all, &scanning(1.0, 4.0)).is_ok());
-        assert!(judge_pruning(&all, &scanning(24.0, 90.0)).is_ok());
-        assert!(judge_pruning(&all, &scanning(24.0, 96.0)).is_err());
-    }
+    /// Span attribute keys present on at least 10% of spans, which every
+    /// shredded published file must shred.
+    const SHREDDED_KEYS: [&str; 13] = [
+        "customer.id",
+        "user",
+        "http.request.method",
+        "http.route",
+        "http.response.status_code",
+        "gen_ai.operation.name",
+        "gen_ai.provider.name",
+        "gen_ai.request.model",
+        "gen_ai.conversation.id",
+        "region",
+        "feature.flag",
+        "cache.hit",
+        "url.full",
+    ];
 
     /// Share of the first `spans` spans for which `keep` holds.
     fn share(spans: i64, keep: impl Fn(i64) -> bool) -> f64 {
@@ -838,11 +586,13 @@ mod tests {
 
     /// Whether span `index`'s request carries attribute `key`.
     fn carries(index: i64, key: &str) -> bool {
-        Telemetry::standard()
-            .span(index)
-            .attributes
-            .iter()
-            .any(|attribute| attribute.key == key)
+        Telemetry {
+            spans: STANDARD_SPANS,
+        }
+        .span(index)
+        .attributes
+        .iter()
+        .any(|attribute| attribute.key == key)
     }
 
     /// The generator is deterministic, builds each trace as the fixed tree,
@@ -854,7 +604,9 @@ mod tests {
     /// fixture's stated shape.
     #[test]
     fn telemetry_spans_are_deterministic_trees_straddling_the_threshold() {
-        let fixture = Telemetry::standard();
+        let fixture = Telemetry {
+            spans: STANDARD_SPANS,
+        };
         let request = fixture.request(0, 16);
         let spans: Vec<&Span> = request
             .resource_spans
@@ -892,24 +644,6 @@ mod tests {
         assert!(
             (0..sample).map(duration_nanos).max() > Some(100_000_000),
             "the duration tail reaches past 100 ms"
-        );
-    }
-
-    /// The exact answers agree with the span functions on a small fixture.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an answer disagrees with a direct count over the spans.
-    #[test]
-    fn telemetry_answers_count_the_generated_spans() {
-        let fixture = Telemetry { spans: 8_000 };
-        let questions = fixture.questions();
-        assert_eq!(questions[0].2, vec![vec![8_000]]);
-        let errors = (0..8_000).filter(|index| is_error(*index)).count().to_i64();
-        assert_eq!(questions[4].2, vec![vec![errors.unwrap_or(i64::MAX)]]);
-        assert!(
-            questions[7].2[0][0] >= 1,
-            "the looked-up trace's customer is counted"
         );
     }
 }

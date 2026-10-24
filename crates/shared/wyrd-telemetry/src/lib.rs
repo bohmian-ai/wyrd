@@ -304,6 +304,45 @@ pub fn link_remote_span(
     ));
 }
 
+/// Name of the span [`record_timing`] emits.
+pub const TIMING_SPAN: &str = "wyrd.timing";
+
+/// Records one request's server timing at an owning boundary as a closed
+/// [`TIMING_SPAN`] child of `parent`.
+///
+/// `elapsed` is the owner's monotonic time from handler entry to `boundary`
+/// (result ready, write acknowledged, or response handoff), and `excluded`
+/// the union of the waits the owner does not count as its own work, such as
+/// provider exchanges or Verifier blocks, when the boundary has any. Both are
+/// exact integer nanoseconds, `elapsed_ns` and `excluded_ns`, with the
+/// closed `boundary` and `outcome` labels. The span reaches the operator's
+/// OTLP export like any other sampled span, so a collector reads every
+/// request's observation before any metrics histogram aggregates it; its own
+/// start and end times carry no measurement. A duration beyond `u64`
+/// nanoseconds saturates. Without an OpenTelemetry layer, or when the
+/// filter disables the span, this does nothing.
+pub fn record_timing(
+    parent: &tracing::Span,
+    boundary: &'static str,
+    outcome: &'static str,
+    elapsed: std::time::Duration,
+    excluded: Option<std::time::Duration>,
+) {
+    let nanos =
+        |duration: std::time::Duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+    let span = tracing::info_span!(
+        parent: parent,
+        "wyrd.timing",
+        boundary,
+        outcome,
+        elapsed_ns = nanos(elapsed),
+        excluded_ns = tracing::field::Empty,
+    );
+    if let Some(excluded) = excluded {
+        span.record("excluded_ns", nanos(excluded));
+    }
+}
+
 /// Resolve the effective tracing filter from multiple sources in priority order.
 ///
 /// Priority: `WYRD_LOG` env var → `RUST_LOG` env var → `config.filter` field → `"info"`.
@@ -513,6 +552,50 @@ mod tests {
             spans[0].attributes.get("component"),
             Some(&"wyrd".to_owned())
         );
+        guard.shutdown();
+    }
+
+    /// A timing span reaches the exporter under its request span with exact
+    /// nanosecond components, and omits the excluded component it lacks.
+    #[test]
+    fn timing_spans_carry_exact_nanoseconds() {
+        let (guard, capture) = super::init_test_capture(super::TelemetryConfig::default())
+            .expect("test telemetry pipeline initializes");
+        let checkpoint = capture.checkpoint();
+        let request = tracing::info_span!("request");
+        super::record_timing(
+            &request,
+            "gateway.answer",
+            "success",
+            std::time::Duration::from_nanos(500_001),
+            Some(std::time::Duration::from_nanos(1)),
+        );
+        super::record_timing(
+            &tracing::Span::none(),
+            "bifrost.query",
+            "success",
+            std::time::Duration::from_nanos(7),
+            None,
+        );
+        drop(request);
+        guard.force_flush();
+        let spans = capture.finished_since(checkpoint);
+        let timings: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == super::TIMING_SPAN)
+            .collect();
+        assert_eq!(timings.len(), 2);
+        let field = |index: usize, key: &str| timings[index].attributes.get(key).cloned();
+        assert_eq!(field(0, "boundary").as_deref(), Some("gateway.answer"));
+        assert_eq!(field(0, "elapsed_ns").as_deref(), Some("500001"));
+        assert_eq!(field(0, "excluded_ns").as_deref(), Some("1"));
+        assert_eq!(field(1, "elapsed_ns").as_deref(), Some("7"));
+        assert_eq!(field(1, "excluded_ns"), None);
+        let request = spans
+            .iter()
+            .find(|span| span.name == "request")
+            .expect("the request span was exported");
+        assert_eq!(timings[0].parent_span_id, request.span_id);
         guard.shutdown();
     }
 }

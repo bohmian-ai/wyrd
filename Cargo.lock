@@ -10082,7 +10082,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "toml",
  "workspace-hack",
 ]
 
@@ -10926,6 +10925,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml",
  "tower",
  "tracing",
  "tracing-subscriber",

@@ -9,27 +9,25 @@
 //! The benchmarks add only what the guide leaves to the operator:
 //! `WYRD_STORAGE_URL`, which has no default, pointing at a `file://`
 //! directory; a working directory so the server's `.wyrd/` state lands in a
-//! temporary root; a [`Placement`] that runs the process on the whole
-//! [`Host`] (Linux or macOS) or in a systemd scope enforcing an [`Envelope`]
-//! (Linux, for multi-replica benchmarks whose replicas each get their own
-//! resources); and any extra environment a benchmark names.
-//! A further replica joins the same Postgres and store on its own ports, as
-//! the configuration guide's peer mode describes.
+//! temporary root; and any extra environment a benchmark names. The server
+//! is a plain child process with the whole [`Host`]'s CPU and memory on every
+//! supported OS: no OS scope, quota, or limit bounds it, and its CPU and
+//! memory are read through `sysinfo` by PID.
 //! The wrapper's test-fixture `WYRD_DB_MAX_CONNECTIONS` and
 //! `WYRD_DB_MAX_CONNECTIONS_VALA` caps are removed, so
 //! the pools run at the server's defaults. Every other setting is the server's
 //! default.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Seek as _, Write as _};
+use std::fs::File;
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub(crate) mod os;
 
-pub use os::PeakSampler;
+pub use os::{HostLoad, PEAK_SAMPLE_INTERVAL_MS, PeakSampler};
 
 use secrecy::SecretString;
 use tempfile::TempDir;
@@ -38,46 +36,8 @@ use tempfile::TempDir;
 /// `WYRD_SERVER_URL`.
 pub const SERVER_URL: &str = "http://127.0.0.1:8080";
 
-/// The server's default public HTTP port, which replica 0 binds.
-const HTTP_PORT: u16 = 8080;
-
-/// The server's default Bifrost peer port, which replica 0 binds.
-const PEER_PORT: u16 = 50052;
-
-/// Port offset between consecutive replicas' listeners. The metrics
-/// listener follows the HTTP port by the server's default of one.
-const REPLICA_PORT_STRIDE: u16 = 10;
-
-/// Base of a joined replica's gRPC port. Replica 0 keeps the server defaults,
-/// 50051 for gRPC and [`PEER_PORT`] for peers. Those lie in
-/// Linux's ephemeral range (32768-60999); replica 0 binds them before any
-/// load, but a replica joining mid-run would race outbound connections that
-/// already took those local ports, so joined replicas listen below the range.
-const JOINED_GRPC_PORT: u16 = 30051;
-
-/// Base of a joined replica's Bifrost peer port; see [`JOINED_GRPC_PORT`].
-const JOINED_PEER_PORT: u16 = 30052;
-
-/// CPUs of quota in the pod envelope.
-pub const CPUS: u64 = 8;
-
-/// Memory limit of the pod envelope, with no swap.
-pub const MEMORY_BYTES: u64 = 16 << 30;
-
-/// Where one server process runs and what bounds it.
-///
-/// A single-server benchmark runs on [`Placement::Host`], so it measures
-/// whatever machine runs it, Linux or macOS, and labels its report with that
-/// [`Host`]. A multi-replica benchmark gives each process a
-/// [`Placement::Scoped`] envelope so replicas cannot borrow each other's CPU
-/// or memory; that needs a delegating systemd user manager, so Linux only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Placement {
-    /// A plain child process with the whole host's CPU and memory.
-    Host,
-    /// A systemd user scope enforcing this envelope.
-    Scoped(Envelope),
-}
+/// The server's default metrics listener address, one port above HTTP.
+const METRICS_PORT: u16 = 8081;
 
 /// The machine a benchmark ran on, which labels its report: results are
 /// comparable only between reports whose hosts match.
@@ -91,10 +51,15 @@ pub struct Host {
     pub memory_bytes: u64,
     /// Operating system, as [`std::env::consts::OS`] names it.
     pub os: &'static str,
+    /// Operating system version, or `unknown` when the OS reports none.
+    pub os_version: String,
+    /// CPU architecture, as [`std::env::consts::ARCH`] names it.
+    pub arch: &'static str,
 }
 
 impl Host {
-    /// Reads the running machine's CPU model, CPU count, and memory.
+    /// Reads the running machine's CPU model, CPU count, memory, OS, and
+    /// architecture.
     ///
     /// # Errors
     ///
@@ -105,6 +70,8 @@ impl Host {
             cpus: std::thread::available_parallelism()?.get(),
             memory_bytes: os::memory_bytes()?,
             os: std::env::consts::OS,
+            os_version: os::os_version(),
+            arch: std::env::consts::ARCH,
         })
     }
 
@@ -120,34 +87,6 @@ impl Host {
     }
 }
 
-/// The CPU quota and memory limit one process's systemd scope enforces.
-///
-/// The server sizes itself from its cgroup — the CPU quota rounded down to
-/// whole CPUs, at least one, and `memory.max` — so a benchmark that gives a
-/// process a smaller envelope measures it as a pod of that size would run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Envelope {
-    /// CPU quota in percent of one CPU, as systemd's `CPUQuota` takes it:
-    /// 150 is one and a half CPUs.
-    pub cpu_percent: u64,
-    /// Memory limit in bytes, with no swap.
-    pub memory_bytes: u64,
-}
-
-impl Envelope {
-    /// The pod envelope every benchmark runs in unless it names another:
-    /// [`CPUS`] CPUs and [`MEMORY_BYTES`].
-    pub const POD: Self = Self {
-        cpu_percent: CPUS * 100,
-        memory_bytes: MEMORY_BYTES,
-    };
-
-    /// The CPU quota in CPUs, possibly fractional.
-    pub fn cpus(self) -> f64 {
-        self.cpu_percent as f64 / 100.0
-    }
-}
-
 /// How long the server may take to report ready on `/readyz`.
 const READY_TIMEOUT: Duration = Duration::from_mins(2);
 
@@ -160,15 +99,12 @@ pub const STOP_GRACE: Duration = Duration::from_secs(45);
 /// Why starting, observing, or stopping the release server failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseServerError {
-    /// A process, file, cgroup, or OS probe operation failed.
+    /// A process, file, or OS probe operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// A `/readyz` or `/metrics` request failed.
     #[error(transparent)]
     Http(#[from] reqwest::Error),
-    /// A cgroup file held a non-integer value.
-    #[error(transparent)]
-    Parse(#[from] std::num::ParseIntError),
     /// The server or an operator subcommand misbehaved.
     #[error("{0}")]
     Server(String),
@@ -209,47 +145,17 @@ pub struct LocalServer {
     root: TempDir,
     /// The serving process until it is reaped.
     child: Option<Child>,
-    /// Where the process's CPU and memory are read from.
-    meter: Meter,
     /// The machine the process runs on.
     host: Host,
-    /// Tenants in the order `setup` provisioned them; empty on a joined
-    /// replica.
+    /// Tenants in the order `setup` provisioned them.
     tenants: Vec<SetupTenant>,
-    /// Replica ordinal: 0 for the server [`LocalServer::start`] set up,
-    /// which binds the default ports, and its listener offset otherwise.
-    ordinal: u16,
-    /// What the process runs, which decides its readiness probe.
-    role: Role,
-    /// Where the process runs and what bounds it.
-    placement: Placement,
-}
-
-/// Where a [`LocalServer`]'s CPU and memory are read from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Meter {
-    /// The scope's cgroup-v2 directory: the whole scope's usage.
-    Cgroup(PathBuf),
-    /// The server process itself, read from the OS by PID.
-    Process(u32),
-}
-
-/// What a [`LocalServer`] process runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Role {
-    /// The default target: the public API and every serving subsystem, ready
-    /// once `/readyz` answers.
-    Serving,
-    /// `WYRD_TARGET=forge-worker`: Forge work only, no API and no peer
-    /// listener, ready once its metrics listener answers.
-    ForgeWorker,
 }
 
 impl LocalServer {
     /// Migrates `binary` with the database URLs the Postgres wrapper exported
-    /// and serves it with `env` added at `placement`, then runs `setup` once
-    /// per slug in `tenants`, returning once `/readyz` answers 200, a scoped
-    /// cgroup enforces its envelope, and every tenant's credential was printed.
+    /// and serves it as a plain child with `env` added, then runs `setup` once
+    /// per slug in `tenants`, returning once `/readyz` answers 200 and every
+    /// tenant's credential was printed.
     ///
     /// The first `setup` initializes the platform root and discloses its
     /// credential; later runs present it as `WYRD_PLATFORM_CREDENTIAL`, as
@@ -259,8 +165,7 @@ impl LocalServer {
     ///
     /// Returns an error when `migrate` or a
     /// `setup` fails or prints no credential, the server exits or never
-    /// becomes ready, the host cannot be read, or a scoped cgroup does not
-    /// enforce its envelope.
+    /// becomes ready, or the host cannot be read.
     ///
     /// # Cancellation
     ///
@@ -271,28 +176,21 @@ impl LocalServer {
     /// and reaped with its working directory, `server.log`, and each
     /// `setup`'s stderr file kept. Rows `migrate` and the finished `setup`s
     /// wrote stay in the database; a retry starts from a fresh database.
-    pub async fn start(
-        binary: &Path,
-        tenants: &[&str],
-        env: &[(&str, &str)],
-        placement: Placement,
-    ) -> Result<Self> {
+    pub async fn start(binary: &Path, tenants: &[&str], env: &[(&str, &str)]) -> Result<Self> {
         let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
         let storage = root.path().join("storage");
         std::fs::create_dir_all(&storage)?;
         let storage_url = format!("file://{}", storage.display());
         let workdir = root.path().to_path_buf();
         OperatorRun::spawn(
-            operator(binary, &workdir, &storage_url, 0, Role::Serving, env).arg("migrate"),
+            operator(binary, &workdir, &storage_url, env).arg("migrate"),
             &workdir.join("migrate.stderr"),
         )?
         .finish()
         .await?;
-        let mut server =
-            Self::serve(binary, root, &storage_url, 0, Role::Serving, env, placement).await?;
+        let mut server = Self::serve(binary, root, &storage_url, env).await?;
 
-        let operator =
-            |program: &Path| operator(program, &workdir, &storage_url, 0, Role::Serving, env);
+        let operator = |program: &Path| operator(program, &workdir, &storage_url, env);
 
         let mut platform: Option<String> = None;
         for slug in tenants {
@@ -327,186 +225,45 @@ impl LocalServer {
         Ok(server)
     }
 
-    /// Starts replica `ordinal` of this deployment: `binary` serving the same
-    /// Postgres and store from its own working directory at this server's
-    /// placement, with every listener offset by `ordinal` strides from its
-    /// base: HTTP from the server default, gRPC and peer from
-    /// [`JOINED_GRPC_PORT`] and [`JOINED_PEER_PORT`]. Nothing is migrated or set
-    /// up; the replica serves the tenants this server provisioned.
+    /// Serves `binary` from `root` as a plain child and waits until it is
+    /// ready.
     ///
-    /// Several replicas need peer mode: give every replica, including this
-    /// one, `WYRD_PEER_TLS_DIR` in `env`; its peer address is derived here.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the process exits or never becomes ready, or a
-    /// scoped cgroup does not enforce its envelope.
-    pub async fn start_replica(
-        &self,
-        binary: &Path,
-        ordinal: u16,
-        env: &[(&str, &str)],
-    ) -> Result<Self> {
-        let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
-        let storage_url = format!("file://{}", self.storage_dir().display());
-        Self::serve(
-            binary,
-            root,
-            &storage_url,
-            ordinal,
-            Role::Serving,
-            env,
-            self.placement,
-        )
-        .await
-    }
-
-    /// Starts a dedicated Forge worker of this deployment as replica
-    /// `ordinal`: `binary` with `WYRD_TARGET=forge-worker`, the same Postgres
-    /// and store, its own working directory, a scope of `envelope`, and its
-    /// metrics listener offset by `ordinal` strides.
-    ///
-    /// A Forge worker serves no API and opens no peer listener, so it is
-    /// ready once `/metrics` answers. It pulls compaction from the elected
-    /// Forge leader over the peer route, which needs `WYRD_PEER_TLS_DIR` in
-    /// `env`; no peer address is derived for it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the process exits or never becomes ready, or its
-    /// cgroup does not enforce the envelope.
-    pub async fn start_forge_worker(
-        &self,
-        binary: &Path,
-        ordinal: u16,
-        env: &[(&str, &str)],
-        envelope: Envelope,
-    ) -> Result<Self> {
-        let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
-        let storage_url = format!("file://{}", self.storage_dir().display());
-        Self::serve(
-            binary,
-            root,
-            &storage_url,
-            ordinal,
-            Role::ForgeWorker,
-            env,
-            Placement::Scoped(envelope),
-        )
-        .await
-    }
-
-    /// Serves `binary` as replica `ordinal` in `role` from `root` at
-    /// `placement` and waits until it is ready.
-    ///
-    /// On the host, `binary` is spawned directly and metered by PID. Scoped,
-    /// it is spawned through `systemd-run --scope`, which execs it in place,
-    /// and metered by the scope's cgroup once that is confirmed to enforce
-    /// the envelope. The process-wide rustls provider is installed first,
-    /// because the readiness and metrics probes build reqwest clients, which
-    /// carry no provider of their own.
+    /// The process-wide rustls provider is installed first, because the
+    /// readiness and metrics probes build reqwest clients, which carry no
+    /// provider of their own.
     ///
     /// # Errors
     ///
     /// Returns an error when the rustls provider cannot be installed, the
-    /// host cannot be read, the process cannot spawn, exits, or never becomes
-    /// ready, or a scoped cgroup does not enforce its envelope.
+    /// host cannot be read, or the process cannot spawn, exits, or never
+    /// becomes ready.
     async fn serve(
         binary: &Path,
         root: TempDir,
         storage_url: &str,
-        ordinal: u16,
-        role: Role,
         env: &[(&str, &str)],
-        placement: Placement,
     ) -> Result<Self> {
         wyrd_tls::install_crypto_provider().map_err(|error| error.to_string())?;
         let host = Host::detect()?;
         let log = File::create(root.path().join("server.log"))?;
-        let mut command = match placement {
-            Placement::Host => operator(binary, root.path(), storage_url, ordinal, role, env),
-            Placement::Scoped(envelope) => {
-                let mut command = operator(
-                    Path::new("systemd-run"),
-                    root.path(),
-                    storage_url,
-                    ordinal,
-                    role,
-                    env,
-                );
-                command
-                    .args(["--user", "--scope", "--quiet", "--collect"])
-                    .arg(format!("--property=CPUQuota={}%", envelope.cpu_percent))
-                    .arg(format!("--property=MemoryMax={}", envelope.memory_bytes))
-                    .arg("--property=MemorySwapMax=0")
-                    .arg("--")
-                    .arg(binary);
-                command
-            }
-        };
-        let child = command
+        let child = operator(binary, root.path(), storage_url, env)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
             .spawn()?;
         let mut server = Self {
-            meter: Meter::Process(child.id()),
             host,
             child: Some(child),
             root,
             tenants: Vec::new(),
-            ordinal,
-            role,
-            placement,
         };
         server.await_ready().await?;
-        if let Placement::Scoped(envelope) = placement {
-            server.meter = Meter::Cgroup(server.find_cgroup()?);
-            server.confirm_envelope(envelope)?;
-        }
         Ok(server)
     }
 
-    /// This replica's public HTTP base URL; [`SERVER_URL`] for replica 0.
-    pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port(HTTP_PORT))
-    }
-
-    /// This replica's ordinal.
-    pub fn ordinal(&self) -> u16 {
-        self.ordinal
-    }
-
-    /// CPUs this process may use: its envelope's quota when scoped, else the
-    /// host's.
-    pub fn cpus(&self) -> f64 {
-        match self.placement {
-            Placement::Host => self.host.cpus as f64,
-            Placement::Scoped(envelope) => envelope.cpus(),
-        }
-    }
-
-    /// Memory this process may use: its envelope's limit when scoped, else
-    /// the host's physical memory.
-    pub fn memory_limit_bytes(&self) -> u64 {
-        match self.placement {
-            Placement::Host => self.host.memory_bytes,
-            Placement::Scoped(envelope) => envelope.memory_bytes,
-        }
-    }
-
-    /// One-line label for a report: the host fingerprint, prefixed by the
-    /// envelope when the process is scoped.
-    pub fn describe(&self) -> String {
-        match self.placement {
-            Placement::Host => self.host.describe(),
-            Placement::Scoped(envelope) => format!(
-                "{} CPU / {} GiB scope on {}",
-                envelope.cpus(),
-                envelope.memory_bytes >> 30,
-                self.host.describe()
-            ),
-        }
+    /// The machine the server runs on.
+    pub fn host(&self) -> &Host {
+        &self.host
     }
 
     /// The process's log, which [`LocalServer::stop`] later copies out; it
@@ -515,15 +272,9 @@ impl LocalServer {
         self.root.path().join("server.log")
     }
 
-    /// PID of the serving `wyrd-server` itself (`systemd-run --scope` execs
-    /// it in place); `None` once it was stopped.
+    /// PID of the serving `wyrd-server`; `None` once it was stopped.
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
-    }
-
-    /// `base` offset by this replica's ordinal.
-    fn port(&self, base: u16) -> u16 {
-        replica_port(base, self.ordinal)
     }
 
     /// The first tenant's admin credential, as the guide exports it in
@@ -556,51 +307,22 @@ impl LocalServer {
     ///
     /// Returns an error when the endpoint does not answer 200.
     pub async fn metrics(&self) -> Result<Metrics> {
-        let url = format!("http://127.0.0.1:{}/metrics", self.port(HTTP_PORT) + 1);
+        let url = format!("http://127.0.0.1:{METRICS_PORT}/metrics");
         let response = reqwest::get(url).await?.error_for_status()?;
         Ok(Metrics::parse(&response.text().await?))
     }
 
-    /// Microseconds of CPU the server has used so far: the scope's
-    /// `cpu.stat` `usage_usec` when scoped, else the process's user plus
-    /// system time; zero when unreadable.
-    pub fn cpu_usec(&self) -> u64 {
-        match &self.meter {
-            Meter::Cgroup(cgroup) => cgroup_stat(cgroup, "cpu.stat", "usage_usec"),
-            Meter::Process(pid) => os::process_cpu_usec(*pid),
-        }
+    /// Microseconds of user plus system CPU the server process has used so
+    /// far, or `None` once it is gone or unreadable, so a lost process never
+    /// reads as idle.
+    pub fn cpu_usec(&self) -> Option<u64> {
+        self.pid().and_then(os::process_cpu_usec)
     }
 
-    /// OOM kills the scope has seen so far. Always zero on the host, where an
-    /// OOM kill ends the server and so fails the benchmark directly.
-    pub fn oom_kills(&self) -> u64 {
-        match &self.meter {
-            Meter::Cgroup(cgroup) => cgroup_stat(cgroup, "memory.events", "oom_kill"),
-            Meter::Process(_) => 0,
-        }
-    }
-
-    /// Starts a fresh memory-peak measurement window.
-    ///
-    /// Scoped, writing to the cgroup's `memory.peak` resets the peak seen
-    /// through that descriptor. On the host, a [`PeakSampler`] samples
-    /// the process's resident memory until the window is read.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the peak cannot be reset.
-    pub fn memory_peak(&self) -> Result<MemoryPeak> {
-        match &self.meter {
-            Meter::Cgroup(cgroup) => {
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(cgroup.join("memory.peak"))?;
-                file.write_all(b"reset\n")?;
-                Ok(MemoryPeak::Cgroup(file))
-            }
-            Meter::Process(pid) => Ok(MemoryPeak::Process(os::PeakSampler::start(*pid))),
-        }
+    /// Starts sampling the server's resident memory for one window, or
+    /// `None` once it was stopped.
+    pub fn memory_peak(&self) -> Option<PeakSampler> {
+        self.pid().map(PeakSampler::start)
     }
 
     /// Sends `SIGTERM`, as `Ctrl-C` in the guide does, waits for a clean
@@ -646,9 +368,7 @@ impl LocalServer {
         Err(format!("wyrd-server did not exit within {}s", STOP_GRACE.as_secs()).into())
     }
 
-    /// Polls the role's readiness endpoint until it answers 200, failing if
-    /// the process exits: `/readyz` for a serving replica and `/metrics` for
-    /// a Forge worker, which serves nothing else.
+    /// Polls `/readyz` until it answers 200, failing if the process exits.
     ///
     /// # Errors
     ///
@@ -671,13 +391,7 @@ impl LocalServer {
                 )
                 .into());
             }
-            let probe = match self.role {
-                Role::Serving => format!("{}/readyz", self.url()),
-                Role::ForgeWorker => {
-                    format!("http://127.0.0.1:{}/metrics", self.port(HTTP_PORT) + 1)
-                }
-            };
-            if let Ok(response) = reqwest::get(probe).await {
+            if let Ok(response) = reqwest::get(format!("{SERVER_URL}/readyz")).await {
                 if response.status().is_success() {
                     return Ok(());
                 }
@@ -686,58 +400,6 @@ impl LocalServer {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Err(format!("wyrd-server never reported ready; last probe body: {last}").into())
-    }
-
-    /// Finds the process's cgroup-v2 directory from `/proc/<pid>/cgroup`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the process is gone or has no unified cgroup.
-    fn find_cgroup(&self) -> Result<PathBuf> {
-        let pid = self.child.as_ref().ok_or("wyrd-server exited")?.id();
-        let membership = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
-        let path = membership
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .ok_or("wyrd-server has no unified cgroup")?;
-        Ok(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
-    }
-
-    /// Confirms the scope's `cpu.max` allows exactly `envelope`'s CPU
-    /// percent and its `memory.max` equals its bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the server is not metered by its cgroup, or
-    /// either limit differs, which means the systemd user manager does not
-    /// delegate the `cpu` and `memory` controllers.
-    fn confirm_envelope(&self, envelope: Envelope) -> Result<()> {
-        let Meter::Cgroup(cgroup) = &self.meter else {
-            return Err("a scoped wyrd-server is not metered by its cgroup".into());
-        };
-        let read = |file: &str| std::fs::read_to_string(cgroup.join(file)).unwrap_or_default();
-        let (cpu, memory) = (read("cpu.max"), read("memory.max"));
-        let mut fields = cpu
-            .split_whitespace()
-            .map(|field| field.parse::<u64>().ok());
-        let cpu_percent = match (fields.next().flatten(), fields.next().flatten()) {
-            (Some(quota), Some(period)) if period > 0 => quota * 100 / period,
-            _ => 0,
-        };
-        let Envelope {
-            cpu_percent: expected_cpu,
-            memory_bytes,
-        } = envelope;
-        if cpu_percent == expected_cpu && memory.trim() == memory_bytes.to_string() {
-            return Ok(());
-        }
-        Err(format!(
-            "cgroup {} enforces cpu.max `{}` memory.max `{}`, not {expected_cpu}% CPU and {memory_bytes} bytes",
-            cgroup.display(),
-            cpu.trim(),
-            memory.trim()
-        )
-        .into())
     }
 }
 
@@ -751,51 +413,11 @@ impl Drop for LocalServer {
             let _ = child.wait();
             self.root.disable_cleanup(true);
             eprintln!(
-                "replica {} stopped abnormally; its log is kept at {}",
-                self.ordinal,
+                "wyrd-server stopped abnormally; its log is kept at {}",
                 self.root.path().join("server.log").display()
             );
         }
     }
-}
-
-/// One memory-peak window, reset when [`LocalServer::memory_peak`] opened it.
-pub enum MemoryPeak {
-    /// An open cgroup `memory.peak` descriptor.
-    Cgroup(File),
-    /// The server process's resident memory, sampled since the window opened.
-    Process(PeakSampler),
-}
-
-impl MemoryPeak {
-    /// Peak memory in bytes since the window opened: the scope's peak when
-    /// scoped, else the process's sampled peak resident set.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the peak cannot be read or parsed.
-    pub fn read(self) -> Result<u64> {
-        match self {
-            Self::Cgroup(mut file) => {
-                let mut contents = String::new();
-                file.rewind()?;
-                file.read_to_string(&mut contents)?;
-                Ok(contents.trim().parse()?)
-            }
-            Self::Process(sampler) => Ok(sampler.finish()?),
-        }
-    }
-}
-
-/// Reads one `key value` line of a flat-keyed cgroup file such as
-/// `cpu.stat` or `memory.events`; zero when absent.
-fn cgroup_stat(cgroup: &Path, file: &str, key: &str) -> u64 {
-    std::fs::read_to_string(cgroup.join(file))
-        .unwrap_or_default()
-        .lines()
-        .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(0)
 }
 
 /// One `/metrics` scrape: every series and its value.
@@ -884,24 +506,10 @@ impl Metrics {
     }
 }
 
-/// `base` offset by `ordinal` replica strides.
-fn replica_port(base: u16, ordinal: u16) -> u16 {
-    base + ordinal * REPLICA_PORT_STRIDE
-}
-
-/// A command running `program` as replica `ordinal` in `role` would: in
-/// `workdir`, publishing to `storage_url`, at the server's default pool size,
-/// on the replica's listeners, with `env` added. Peer mode derives a serving
-/// replica's peer listener and advertised address when `env` names
-/// `WYRD_PEER_TLS_DIR`; a Forge worker only dials, so it gets neither.
-fn operator(
-    program: &Path,
-    workdir: &Path,
-    storage_url: &str,
-    ordinal: u16,
-    role: Role,
-    env: &[(&str, &str)],
-) -> Command {
+/// A command running `program` as the operator would: in `workdir`,
+/// publishing to `storage_url`, at the server's default pool size, with `env`
+/// added.
+fn operator(program: &Path, workdir: &Path, storage_url: &str, env: &[(&str, &str)]) -> Command {
     let mut command = Command::new(program);
     command
         .current_dir(workdir)
@@ -909,30 +517,6 @@ fn operator(
         .env_remove("WYRD_DB_MAX_CONNECTIONS")
         .env_remove("WYRD_DB_MAX_CONNECTIONS_VALA")
         .envs(env.iter().copied());
-    if ordinal > 0 {
-        command
-            .env(
-                "WYRD_SERVER_BIND",
-                format!("127.0.0.1:{}", replica_port(HTTP_PORT, ordinal)),
-            )
-            .env(
-                "WYRD_GRPC_BIND",
-                format!("127.0.0.1:{}", replica_port(JOINED_GRPC_PORT, ordinal)),
-            );
-    }
-    if role == Role::ForgeWorker {
-        command.env("WYRD_TARGET", "forge-worker");
-    } else if env.iter().any(|(name, _)| *name == "WYRD_PEER_TLS_DIR") {
-        let base = if ordinal == 0 {
-            PEER_PORT
-        } else {
-            JOINED_PEER_PORT
-        };
-        let peer = format!("127.0.0.1:{}", replica_port(base, ordinal));
-        command
-            .env("WYRD_BIFROST_PEER_BIND_ADDR", &peer)
-            .env("WYRD_PEER_ADDRESS", &peer);
-    }
     command
 }
 
@@ -1036,54 +620,7 @@ impl Drop for OperatorRun {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
-    use std::path::Path;
-
-    use super::{Metrics, Role, operator};
-
-    /// A joined serving replica in peer mode derives its peer listener and
-    /// address from the joined-replica peer range; a Forge worker given the
-    /// same TLS directory only dials, so it gets its target and neither peer
-    /// setting.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a role's environment is wrong.
-    #[test]
-    fn forge_worker_dials_without_a_peer_listener() {
-        let env = [("WYRD_PEER_TLS_DIR", "/peer")];
-        let read = |role: Role| {
-            let command = operator(
-                Path::new("wyrd-server"),
-                Path::new("/"),
-                "file:///s",
-                2,
-                role,
-                &env,
-            );
-            let value = |name: &str| {
-                command
-                    .get_envs()
-                    .find(|(key, _)| *key == OsStr::new(name))
-                    .and_then(|(_, value)| value)
-                    .map(|value| value.to_string_lossy().into_owned())
-            };
-            (
-                value("WYRD_TARGET"),
-                value("WYRD_PEER_ADDRESS"),
-                value("WYRD_BIFROST_PEER_BIND_ADDR"),
-            )
-        };
-        let peer = Some(format!(
-            "127.0.0.1:{}",
-            super::replica_port(super::JOINED_PEER_PORT, 2)
-        ));
-        assert_eq!(read(Role::Serving), (None, peer.clone(), peer));
-        assert_eq!(
-            read(Role::ForgeWorker),
-            (Some("forge-worker".to_owned()), None, None)
-        );
-    }
+    use super::Metrics;
 
     /// Series of one family sum across label sets; other families and
     /// same-prefix families do not leak in.

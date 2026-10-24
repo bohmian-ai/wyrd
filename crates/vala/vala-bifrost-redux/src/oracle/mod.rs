@@ -605,6 +605,13 @@ impl QueryTelemetryGuard {
             )
             .increment(bytes);
         }
+        if let Some(rows) = self.scan_stats.physical_rows_scanned {
+            metrics::counter!(
+                "oracle_query_rows_scanned_total",
+                "class" => query_class_label(self.query_class)
+            )
+            .increment(rows);
+        }
         metrics::histogram!(
             "oracle_query_duration_seconds",
             "class" => query_class_label(self.query_class),

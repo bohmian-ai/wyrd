@@ -345,7 +345,7 @@ run = "bash scripts/run-bifrost-tests.sh"
 hide = true
 description = "Run Bifrost-facing unit tests in shared server, harness, SDK, and MCP owners."
 run = """
-cargo nextest run --locked -p wyrd-testing -p wyrd-server -p wyrd-client --lib --features wyrd-server/test-support -E '(package(wyrd-testing) & (test(/^bifrost::/) | test(/^interleaving::/) | test(/^load::/) | test(/^server::production_composition_tests::/))) | (package(wyrd-server) & (test(/^bifrost::/) | test(/^oracle::/) | test(/^query::/) | test(/^grpc::(query|scribe_tail)::/) | test(/bifrost|oracle|scribe|forge/))) | (package(wyrd-client) & (test(/^bifrost::query::/) | test(/^bifrost::sdk::/)))'
+cargo nextest run --locked -p wyrd-testing -p wyrd-server -p wyrd-client --lib --features wyrd-server/test-support -E '(package(wyrd-testing) & (test(/^bifrost::/) | test(/^interleaving::/) | test(/^server::production_composition_tests::/))) | (package(wyrd-server) & (test(/^bifrost::/) | test(/^oracle::/) | test(/^query::/) | test(/^grpc::(query|scribe_tail)::/) | test(/bifrost|oracle|scribe|forge/))) | (package(wyrd-client) & (test(/^bifrost::query::/) | test(/^bifrost::sdk::/)))'
 """
 
 [tasks."test:bifrost:unit:typescript:inner"]
@@ -533,90 +533,46 @@ hide = true
 description = "wyrd-testing `oracle` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all"
 
-[tasks."bench:bifrost:query-capacity"]
-description = "Opt-in benchmark (the capacity binary's query-capacity workload): one release wyrd-server started through the local-development journey (migrate, serve, setup) on the whole host, Linux or macOS (the report title carries the host fingerprint; compare only matching hosts), driven through the public Rust client, once with the rows held in the memtable (hot) and once, under a fresh Postgres, with them published as Parquet (WYRD_MAX_FILE_RETENTION_TIME=30, waiting until nothing is in a memtable or staged), each checked and reported under target/bifrost-query-capacity/<mode>/<tier>/: write 10M events, check every answer, selective and small-aggregate sweeps, medium, table, broad-window and full-scan reads, reads while writing, and a full query queue. `-- --fixture telemetry` instead exports 10M GenAI/HTTP spans over OTLP gRPC into vala.traces.spans, checks exact answers, and on Parquet judges which span attribute keys shred. `-- --heavy` writes 100M rows and runs the broad window and full scan on Parquet only. Always builds with frame pointers into target/profiling and records each query window of the server with perf under <tier>/profiles/, printing a per-query latency Pareto from the Oracle query profile and a CPU Pareto by crate. Fails on any FAIL row. Part of no gate or verify lane."
-run = '''
-bash -lc '
-set -uo pipefail
-target=target/profiling
-export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
-cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
-tiers=(hot parquet)
-[[ " $* " == *" --heavy "* ]] && tiers=(parquet)
-status=0
-for tier in "${tiers[@]}"; do
-  scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" query-capacity --tier "$tier" "$@" || status=1
-done
-exit "$status"' _
-'''
+[tasks."bench:build"]
+hide = true
+description = "Builds the release wyrd-server and the capacity benchmark driver with frame pointers into target/profiling for the bench:l1 and bench:l2 experiments."
+env = { CARGO_PROFILE_RELEASE_DEBUG = "line-tables-only", RUSTFLAGS = "-C force-frame-pointers=yes" }
+run = "cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir target/profiling"
 
-[tasks."bench:bifrost:write-capacity"]
-description = "Opt-in benchmark: the capacity binary's query-capacity workload in --writes mode. One release wyrd-server with production Scribe settings (one shard, Parquet rotation and publication on) on the whole host, driven through the public Rust client: 10M events written per step at 1, 4, 16 and 64 writers into one table, each step recorded with perf under target/bifrost-query-capacity/writes/parquet/profiles/ and reported in retained Arrow MB/s, MB/s per server core and rows/s, with each write-path stage's mean time per batch, fsyncs per batch and a CPU Pareto by crate. `-- --fixture telemetry` or `-- --fixture logs` sweeps OTLP gRPC exports instead (2M fresh spans into vala.traces.spans, or 2M ~1 KiB-body Kubernetes log records into vala.logs.records, per step, under target/bifrost-query-capacity/{telemetry,logs}-writes/parquet/), additionally reported in OTLP wire MiB/s and wire MiB/s and rows/s per server core, and judged on the fastest step: at least 200k rows/s and 30 MiB/s OTLP wire per server core. The native sweep fails on any step under 200k rows/s. Part of no gate or verify lane."
-run = '''
-bash -lc '
-set -uo pipefail
-target=target/profiling
-export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
-cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
-scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" query-capacity --tier parquet --writes "$@"' _
-'''
+[tasks."bench:l1"]
+description = "Level 1, every engine in order (Bifrost, Verification, Gateway), each under its own fresh Postgres and with its own record; forwards --profile and --allow-dirty, keeps going after a failed or invalid engine, and exits with the worst result (2 over 1 over 0); about 45 min. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Discards the run (exit 2) on a busy host, dirty source (unless --allow-dirty), overrun or unresolved evidence; fails (exit 1) on a declared criterion. Appends one v1 record under benchmarks/<engine>/<experiment>/ and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply captures, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build"]
+run = "target/profiling/release/capacity l1"
 
-[tasks."bench:verification:capacity"]
-description = "Opt-in benchmark (REQ-015/AC-009, the capacity binary's verification-capacity workload) of the verification runtime and engine overhead: one release wyrd-server started through the local-development journey on the whole host, Linux or macOS (the report title carries the host fingerprint; compare only matching hosts), with one tenant declaring one Service per closed-loop client, each client loading its own hydrated Service bundle under that Service's own Card-bound key, driven through the public Rust client at 1, 4, 16 and 64 closed-loop clients. Case 1: direct observe().verify of an assertion Verifier, judged on server wyrd_verification_overhead_seconds{mode=direct} p99 <= 500 µs from >=1,000 samples with zero refusals and correct verdicts; reports Verifier time, phases, and client-added time. Case 2: background observe().submit, reported only (submit time, queue wait, queued overhead and Verifier time, trigger to terminal, throughput, drain); fails only on refusals or a backlog not drained within 60 s. `-- --case 1` selects a case. Always builds with frame pointers into target/profiling and records each window with perf under target/verification-capacity/profiles/, printing the runtime's component Pareto, a CPU Pareto by crate and the off-CPU stacks. Fails on any FAIL row. Part of no gate or verify lane."
-run = '''
-bash -lc '
-set -uo pipefail
-target=target/profiling
-export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
-cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
-scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" verification-capacity "$@"' _
-'''
+[tasks."bench:l1:bifrost"]
+description = "Level 1 Bifrost `isolated` (5 s warmup, 3 x 10 s per step, 15 min budget): the standard 10M-row events fixture published as Parquet, exact-checked point lookups at 1/4/16/64 clients (p99 < 5 ms at 64), small aggregates and full scans at 1/64, and 2M-row native, OTLP spans and OTLP logs write sweeps at 1/4/16/64 with peak sanity floors (native >= 200k rows/s, OTLP >= 30 wire MiB per server CPU-second) and regression against benchmarks/bifrost/baselines.toml. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Discards the run (exit 2) on a busy host, dirty source (unless --allow-dirty), overrun or unresolved evidence; fails (exit 1) on a declared criterion. Appends one v1 record under benchmarks/<engine>/<experiment>/ and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply captures, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build"]
+run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 bifrost"
 
-[tasks."bench:gateway:overhead"]
-description = "Opt-in benchmark (the capacity binary's gateway-overhead workload) of the AI gateway's server overhead: one release wyrd-server started through the local-development journey on the whole host, Linux or macOS (the report title carries the host fingerprint and binary identity; compare only matching hosts), with one tenant's openai_compatible deployments against an instant local upstream and one wyrd_sk_ key per closed-loop client, driving raw HTTP/1.1 keep-alive POST /v1/chat/completions. Case 1 chat (about 1 KiB buffered) and case 2 chat-stream (32 data events then [DONE]) at 1, 4, 16 and 64 clients with metadata capture; case 3 chat-capture (64 KiB in and out, payload capture) at 16 and 64. 2 s warmup and 10 s windows. Each row is judged on server wyrd_gateway_overhead_seconds p99 < 1 ms from >=1,000 samples at every handoff point (TARGET at <=500 us), zero refusals or invalid answers, one staged capture per arrival with no drop or outbox loss, and memory headroom; each step's drain (within 60 s) and the shutdown have their own loss-free rows. Client roundtrip percentiles (completion; stream headers and first event) and client-added means are reported. `-- --case 1,2,3`, `--clients 1,4,16,64` (intersected with each case's matrix) and `--no-profile` select steps and skip profiling. Always builds with frame pointers into target/profiling and, unless --no-profile, records each window with perf under target/gateway-overhead/profiles/, printing the runtime's component Pareto, a CPU Pareto by crate and the off-CPU stacks. Writes target/gateway-overhead/. Fails on any FAIL row. Part of no gate or verify lane."
-run = '''
-bash -lc '
-set -uo pipefail
-target=target/profiling
-export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
-cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
-scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" gateway-overhead "$@"' _
-'''
+[tasks."bench:l1:verification"]
+description = "Level 1 Verification `direct-verify` (5 s warmup, 3 x 10 s per step, 15 min budget): direct observe().verify at 1/4/16/64 closed-loop clients, server overhead p99 < 500 us at 64 clients, server overhead components and verifications per server CPU-second, with correct verdicts and no refusal in every repetition. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Discards the run (exit 2) on a busy host, dirty source (unless --allow-dirty), overrun or unresolved evidence; fails (exit 1) on a declared criterion. Appends one v1 record under benchmarks/<engine>/<experiment>/ and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply captures, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build"]
+run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 verification"
 
-[tasks."bench:gateway:capacity"]
-description = "Opt-in benchmark (the capacity binary's gateway-capacity workload) of the AI gateway's sustainable open-loop rate: one release wyrd-server started through the local-development journey on the whole host, Linux or macOS (the report title carries the host fingerprint, binary identity, SLOs and pacing; compare only matching hosts), with four tenants of eight wyrd_sk_ keys each and metadata capture against a paced local upstream (100 ms buffered answers; streams with 250 ms headers then 32 chunks 20 ms apart). Case 1 buffered, case 2 paced-stream and case 3 tenant-contention (70/10/10/10 tenant split, half streams) each sweep --rates (default 50,100,250,500,1000 calls/s) with 2 s warmup and 15 s windows, stopping at the first unsustainable rate. A rate is SUSTAINABLE when every tenant and mode meets the SLOs from >=30 samples, the driver missed, capped and delayed no arrival, backlog did not grow, nothing was refused or invalid, captures equal admitted calls with no loss or misattribution, and memory has headroom. The highest sustainable rate then runs a 10 s overload at twice that rate, judged on configured admission refusals rather than timeouts or bad answers, followed by 20 s of recovery whose last 15 s are judged on the original SLOs. Requires `-- --max-answer-ms`, `--max-first-token-ms`, `--max-chunk-lag-ms` and `--max-stream-ms` for the selected cases; `--case 1,2,3`, `--rates` and `--no-profile` select steps and skip profiling. Always builds with frame pointers into target/profiling and, unless --no-profile, records each window with perf under target/gateway-capacity/profiles/. Writes target/gateway-capacity/. Fails on any FAIL or INVALID row. Part of no gate or verify lane."
-run = '''
-bash -lc '
-set -uo pipefail
-target=target/profiling
-export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
-cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
-scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" gateway-capacity "$@"' _
-'''
+[tasks."bench:l1:gateway"]
+description = "Level 1 Gateway `overhead` (5 s warmup, 3 x 10 s per step, 15 min budget): buffered chat, chat-stream and 64 KiB chat-capture against an instant local upstream at 1/4/16/64 closed-loop clients, added overhead p99 < 500 us at 64 clients at every handoff point, requests per server CPU-second, and one staged capture per call with nothing lost or shed. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Discards the run (exit 2) on a busy host, dirty source (unless --allow-dirty), overrun or unresolved evidence; fails (exit 1) on a declared criterion. Appends one v1 record under benchmarks/<engine>/<experiment>/ and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply captures, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build"]
+run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l1 gateway"
 
-[tasks."bench:bifrost:client-queue"]
-description = "Opt-in benchmark (AC-041, the capacity binary's client-queue workload): one release cloud wyrd-server over the storage emulators' RustFS service and its provisioned test bucket, on the whole host (report.json's envelope carries the host fingerprint), started through the local-development journey. One WyrdState emits open-loop Drift observations of 100 features: 500 obs/s for --seconds (default 60) with the default queue, judged on zero QUEUE_FULL, flat client bytes, drain within 1 s and exactly 100 durable rows per record_id; then a 1,000 obs/s step, a 50 ms acknowledgement-delay step and a --max-in-flight sweep (default 1,2,4,8), reported only. Writes target/bifrost-client-queue/. Part of no gate or verify lane."
-env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
-run = '''
-docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
-docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
-scripts/postgres/with-test-postgres.sh -- bash -lc '
-set -eu
-cargo build --locked --release -p wyrd-server --features wyrd-server/cloud
-cargo run --locked --release -p wyrd-testing --bin capacity -- client-queue "$@"' _
-'''
+[tasks."bench:l2:bifrost"]
+description = "Level 2 Bifrost `competing` (120 s warmup, 3 x 360 s, 20-30 min): every repetition runs capacity, overload and recovery over the 100M-row Parquet fixture with Forge compaction, open-loop 50/30/20 spans/logs/native ingest at 70% of the mixed capacity calibrated from the newest compatible bench:l1:bifrost record (INVALID without one) times --server-cores (default 8), 32 mixed query clients, a full query queue, and three client-queue lanes. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Discards the run (exit 2) on a busy host, dirty source (unless --allow-dirty), overrun or unresolved evidence; fails (exit 1) on a declared criterion. Appends one v1 record under benchmarks/<engine>/<experiment>/ and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply captures, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build"]
+run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l2 bifrost"
 
-[tasks."bench:bifrost:forge-capacity"]
-description = "Opt-in benchmark (forge-concurrent-planning Scenario 4, about 25 min): samples host load first and discards the run (exit 2) unless 8 host CPUs are free; drives the in-process Forge schedule (10,000 tracked / 1,000 due) open-loop with 32 compactors at the production pull rate (6.4 pulls/s), 10x and rising multiples to the p99 knee; starts one release cloud wyrd-server leader (WYRD_TARGET=server, 1 CPU / 4 GiB systemd scope) in peer mode over the storage emulators' RustFS bucket and test Postgres; per fleet size registers a fresh set of --tables (default 128) public tables with compaction on at the default type and target and a trigger equal to --backlog-snapshots (default 2), writes them through Scribe with no worker running until every table holds that many snapshots, probes the live leader's peer pull route open-loop at 1x and 10x under the first fill's writes, then stops the writes and drains the backlog with 1, 2, then 3 fresh dedicated WYRD_TARGET=forge-worker replicas (7/3 CPU / 4 GiB each; 8 CPU / 16 GiB in all). Gates p99 commit/pull/report decisions below 1 ms at 1x and 10x in-process and on the live leader's bifrost_forge_leader_decision_seconds, 2- and 3-worker drain rates at 1.7x and 2.5x one worker, no pull answered short while a table stayed due (leader debug log), and leader CPU below 70%; records rewrites/s, bytes/s, the bounding resource and Postgres and RustFS utilization. Builds with wyrd-server/cloud to commit table properties as an operator. Writes target/bifrost-forge-capacity/. Linux with a delegating systemd user manager; part of no gate or verify lane."
-env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
-run = '''
-docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
-docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
-scripts/postgres/with-test-postgres.sh -- bash -lc '
-set -eu
-cargo build --locked --release -p wyrd-server --features wyrd-server/cloud
-cargo run --locked --release -p wyrd-testing --features wyrd-server/cloud --bin bifrost_forge_capacity -- "$@"' _
-'''
+[tasks."bench:l2:verification"]
+description = "Level 2 Verification `competing` (120 s warmup, 3 x 360 s, 20-30 min): every repetition runs capacity, overload and recovery with open-loop direct and background verification and their evidence writes overlapping; direct overhead p99 < 500 us at capacity and recovery, backlog growth <= 1 s of offered work, drain <= 60 s and recovery <= 30 s. `--direct-rate`, `--submit-rate` and `--overload-factor` fix the declared rates. Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Discards the run (exit 2) on a busy host, dirty source (unless --allow-dirty), overrun or unresolved evidence; fails (exit 1) on a declared criterion. Appends one v1 record under benchmarks/<engine>/<experiment>/ and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply captures, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build"]
+run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l2 verification"
+
+[tasks."bench:l2:gateway"]
+description = "Level 2 Gateway `capacity` (120 s warmup, 3 x 360 s, 20-30 min): every repetition runs capacity, overload and recovery with four contending tenants open-loop against a paced local upstream and payload capture; server p99 completion <= 200 ms, first token <= 350 ms and full stream <= 1,100 ms (overridable with --max-completion-ms, --max-first-token-ms, --max-stream-ms; inter-chunk lag is diagnostic only), only the two declared 429 refusals and only under overload, and every capture accounted for. `--rate` fixes the offered rate (default 250 calls/s). Opt-in benchmark experiment; part of no gate, CI or verify lane. Builds the release wyrd-server and capacity driver with frame pointers into target/profiling before the experiment clock starts, then runs under a fresh repository Postgres on the whole host (macOS arm64, Linux x86_64, Linux arm64) with a file:// store. Discards the run (exit 2) on a busy host, dirty source (unless --allow-dirty), overrun or unresolved evidence; fails (exit 1) on a declared criterion. Appends one v1 record under benchmarks/<engine>/<experiment>/ and prints its report; raw artifacts stay under target/benchmarks/. `--profile` adds optional samply captures, `--steps a,b` runs a declared subset that records its omissions. See benchmarks/README.md."
+depends = ["bench:build"]
+run = "scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l2 gateway"
 
 [tasks."test:bifrost:journey:otlp"]
 description = "Tier-1 journeys: OTLP trace, log, metric, mixed-batch and negative protocol surfaces"

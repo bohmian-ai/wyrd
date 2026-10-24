@@ -23,6 +23,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayPayloadField};
 use wyrd_client::{Bifrost, Gateway, GlobalConfig, Principals, WyrdClient};
 use wyrd_spec::auth::CreateServicePrincipalRequest;
+use wyrd_testing::capacity::request_trace;
 use wyrd_testing::release_server::{SERVER_URL, SetupTenant};
 
 use crate::gateway::Result;
@@ -238,11 +239,15 @@ pub struct Timed {
     pub done: Instant,
     /// How it ended.
     pub outcome: Outcome,
+    /// The trace id the request's `traceparent` carried, which its server
+    /// timing spans share.
+    pub trace: String,
 }
 
-/// Sends one call of `shape` with `body` as `key` and times it to its
-/// validated end.
+/// Sends one call of `shape` with `body` as `key` under a fresh
+/// [`request_trace`] and times it to its validated end.
 pub async fn call(http: &Client, key: &SecretString, shape: &Shape, body: Bytes) -> Timed {
+    let trace = request_trace();
     let sent = Instant::now();
     let mut timed = Timed {
         sent,
@@ -250,10 +255,11 @@ pub async fn call(http: &Client, key: &SecretString, shape: &Shape, body: Bytes)
         events: Vec::new(),
         done: sent,
         outcome: Outcome::Answered,
+        trace: trace.trace_id.clone(),
     };
     timed.outcome = match tokio::time::timeout(
         CALL_TIMEOUT,
-        exchange(http, key, shape, body, &mut timed),
+        exchange(http, key, shape, body, &trace.to_traceparent(), &mut timed),
     )
     .await
     {
@@ -264,19 +270,21 @@ pub async fn call(http: &Client, key: &SecretString, shape: &Shape, body: Bytes)
     timed
 }
 
-/// Sends the request and reads its answer into `timed`, returning how it
-/// ended.
+/// Sends the request under `traceparent` and reads its answer into
+/// `timed`, returning how it ended.
 async fn exchange(
     http: &Client,
     key: &SecretString,
     shape: &Shape,
     body: Bytes,
+    traceparent: &str,
     timed: &mut Timed,
 ) -> Outcome {
     let response = match http
         .post(format!("{SERVER_URL}/v1/chat/completions"))
         .bearer_auth(key.expose_secret())
         .header("content-type", "application/json")
+        .header("traceparent", traceparent)
         .body(body)
         .send()
         .await

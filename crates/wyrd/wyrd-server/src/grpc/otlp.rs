@@ -194,7 +194,7 @@ where
         let gate = Arc::clone(&self.gate);
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Traces);
         let authentication = self.authentication.clone();
-        Box::pin(async move {
+        timed("bifrost.otlp.traces", async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
             let auth = match authentication.authenticate(&metadata).await {
                 Ok(auth) => auth,
@@ -212,6 +212,30 @@ where
             Ok(response)
         })
     }
+}
+
+/// Boxes one export's service future and records its server time, from the
+/// service call through the built response, as one
+/// [`wyrd_telemetry::record_timing`] span at `boundary`: `success` when the
+/// response carries no error `grpc-status`, else `failed`.
+fn timed(
+    boundary: &'static str,
+    export: impl Future<Output = Result<HttpResponse<TonicBody>, Infallible>> + Send + 'static,
+) -> Pin<Box<dyn Future<Output = Result<HttpResponse<TonicBody>, Infallible>> + Send>> {
+    let started = std::time::Instant::now();
+    let parent = tracing::Span::current();
+    Box::pin(async move {
+        let response = export.await;
+        let outcome = match &response {
+            Ok(response) => match response.headers().get("grpc-status") {
+                Some(status) if status != "0" => "failed",
+                _ => "success",
+            },
+            Err(never) => match *never {},
+        };
+        wyrd_telemetry::record_timing(&parent, boundary, outcome, started.elapsed(), None);
+        response
+    })
 }
 
 /// Unary trace handler that preserves Gate authentication and response semantics.
@@ -478,7 +502,7 @@ where
         let gate = Arc::clone(&self.gate);
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Metrics);
         let authentication = self.authentication.clone();
-        Box::pin(async move {
+        timed("bifrost.otlp.metrics", async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
             let auth = match authentication.authenticate(&metadata).await {
                 Ok(auth) => auth,
@@ -656,7 +680,7 @@ where
         let gate = Arc::clone(&self.gate);
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Logs);
         let authentication = self.authentication.clone();
-        Box::pin(async move {
+        timed("bifrost.otlp.logs", async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
             let auth = match authentication.authenticate(&metadata).await {
                 Ok(auth) => auth,

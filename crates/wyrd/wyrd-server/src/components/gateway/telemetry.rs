@@ -175,6 +175,12 @@ impl CallTelemetry {
     /// Records the server duration from arrival to `at`, the `upstream`
     /// time under `upstream_point`, and their difference at handoff `point`;
     /// nothing without an arrival.
+    ///
+    /// The same exact duration and provider wait are also recorded as one
+    /// [`wyrd_telemetry::record_timing`] span under the current span, at
+    /// boundary `gateway.buffered`, `gateway.stream.head`, or
+    /// `gateway.stream.end`, unsubtracted: the histograms keep bucketed
+    /// copies, and a reader of the span computes the overhead itself.
     fn point(
         &self,
         point: &'static str,
@@ -189,6 +195,17 @@ impl CallTelemetry {
         let duration = at.saturating_duration_since(arrival);
         let stream = if self.stream { "true" } else { "false" };
         let outcome = outcome_name(outcome);
+        wyrd_telemetry::record_timing(
+            &tracing::Span::current(),
+            match (self.stream, point) {
+                (false, _) => "gateway.buffered",
+                (true, "answer") => "gateway.stream.head",
+                (true, _) => "gateway.stream.end",
+            },
+            outcome,
+            duration,
+            Some(upstream),
+        );
         metrics::histogram!(
             GATEWAY_DURATION_SECONDS,
             "operation" => self.operation,

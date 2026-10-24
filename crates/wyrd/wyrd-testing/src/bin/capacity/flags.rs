@@ -57,20 +57,6 @@ pub fn list<T: PartialEq>(
     Ok(Some(selected))
 }
 
-/// The client counts `--clients` selects from `matrix`, or all of `matrix`.
-///
-/// # Errors
-///
-/// Returns a message for an invalid or duplicate count, or a count outside
-/// `matrix`.
-pub fn clients(arguments: &[String], matrix: &[usize]) -> Result<Vec<usize>, String> {
-    let expected = format!("client counts from {matrix:?}");
-    Ok(list(arguments, "--clients", &expected, |item| {
-        item.parse().ok().filter(|count| matrix.contains(count))
-    })?
-    .unwrap_or_else(|| matrix.to_vec()))
-}
-
 /// Refuses any argument after the program name that is neither one of
 /// `valued` flags (and its value) nor one of `switches`.
 ///
@@ -91,7 +77,7 @@ pub fn known(arguments: &[String], valued: &[&str], switches: &[&str]) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{clients, known, list, value};
+    use super::{known, list, value};
 
     /// A command line of `arguments` after the program name.
     fn line(arguments: &[&str]) -> Vec<String> {
@@ -121,9 +107,6 @@ mod tests {
         );
         assert!(list(&line(&["--case", "1,1"]), "--case", "cases", digit).is_err());
         assert!(list(&line(&["--case", "1,"]), "--case", "cases", digit).is_err());
-        assert_eq!(clients(&line(&[]), &[1, 4]), Ok(vec![1, 4]));
-        assert_eq!(clients(&line(&["--clients", "4"]), &[1, 4]), Ok(vec![4]));
-        assert!(clients(&line(&["--clients", "8"]), &[1, 4]).is_err());
         assert!(
             known(
                 &line(&["--case", "1", "--no-profile"]),

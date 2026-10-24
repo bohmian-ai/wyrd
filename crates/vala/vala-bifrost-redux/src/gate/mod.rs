@@ -67,8 +67,22 @@ fn projection_error(signal: &str, error: &TableError) -> IngestError {
         }
     }
 }
-/// Record the bounded-cardinality Gate request families used by D24.
+/// Record the bounded-cardinality Gate request families used by D24, and
+/// the request's exact server time as one
+/// [`wyrd_telemetry::record_timing`] span at boundary `bifrost.gate.write`
+/// or `bifrost.gate.query` under the current span.
 fn record_gate_request(operation: &'static str, outcome: &'static str, elapsed: Duration) {
+    wyrd_telemetry::record_timing(
+        &tracing::Span::current(),
+        if operation == "write" {
+            "bifrost.gate.write"
+        } else {
+            "bifrost.gate.query"
+        },
+        outcome,
+        elapsed,
+        None,
+    );
     metrics::counter!("bifrost_gate_requests_total", "operation" => operation, "outcome" => outcome)
         .increment(1);
     metrics::histogram!(

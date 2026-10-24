@@ -23,6 +23,7 @@ use wyrd_tonic::frame_codec::FrameEncoder;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::edge_timeout::EdgeTimer;
+use crate::http::middleware::metrics::RequestArrival;
 use crate::query::service;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
@@ -76,6 +77,67 @@ fn encode_query_frame(
     FrameEncoder::encode(&wyrd_tonic::wyrd::v1::QueryStreamFrame::from(frame))
         .map(Bytes::from)
         .map_err(|error| query_body_error(QueryBodyFailure::FrameEncoding, error))
+}
+
+/// One public query's server timing, recorded once as a
+/// [`wyrd_telemetry::record_timing`] span at boundary `bifrost.query` when
+/// dropped: from its HTTP arrival through the handoff of its terminal frame
+/// to the response body, or through its refusal.
+///
+/// The outcome is `success` or `failed` from the terminal frame, `failed`
+/// for a late stream error, `rejected` for a refusal before the stream, and
+/// `cancelled` for a body dropped before its terminal. A query without an
+/// arrival records nothing.
+struct QueryTiming {
+    /// The request span the timing span is recorded under.
+    parent: tracing::Span,
+    /// When the request reached the server.
+    arrival: Option<std::time::Instant>,
+    /// The outcome recorded on drop.
+    outcome: &'static str,
+}
+
+impl QueryTiming {
+    /// Starts the timing of a query that arrived at `arrival`, under the
+    /// current span.
+    fn new(arrival: Option<RequestArrival>) -> Self {
+        Self {
+            parent: tracing::Span::current(),
+            arrival: arrival.map(RequestArrival::instant),
+            outcome: "cancelled",
+        }
+    }
+
+    /// Notes the outcome `frame` settles, if it is a terminal or an error.
+    fn observe(&mut self, frame: &Result<wyrd_spec::vala::api::QueryStreamFrame, BifrostError>) {
+        use wyrd_spec::vala::api::{QueryStreamFrame, QueryTerminalOutcome};
+        match frame {
+            Ok(QueryStreamFrame::Terminal(terminal)) => {
+                self.outcome = if terminal.outcome == QueryTerminalOutcome::Success {
+                    "success"
+                } else {
+                    "failed"
+                };
+            }
+            Err(_) => self.outcome = "failed",
+            Ok(_) => {}
+        }
+    }
+}
+
+impl Drop for QueryTiming {
+    /// Records the timing with the outcome observed so far.
+    fn drop(&mut self) {
+        if let Some(arrival) = self.arrival {
+            wyrd_telemetry::record_timing(
+                &self.parent,
+                "bifrost.query",
+                self.outcome,
+                arrival.elapsed(),
+                None,
+            );
+        }
+    }
 }
 
 /// Standalone query router for the `/v1` group.
@@ -282,17 +344,24 @@ pub(crate) async fn cancel_running_query(
 ///
 /// Body collection, authentication, and admission are bounded by the server
 /// request timeout; once the query is dispatched, its own deadline governs.
+/// The query's server time, arrival through terminal handoff or refusal, is
+/// recorded once by [`QueryTiming`].
 pub(crate) async fn sync_query(
     State(state): State<AppState>,
     edge_timer: Option<Extension<EdgeTimer>>,
+    arrival: Option<Extension<RequestArrival>>,
     caller: Caller,
     Json(body): Json<BifrostQueryRequest>,
 ) -> Response {
+    let mut timing = QueryTiming::new(arrival.map(|Extension(arrival)| arrival));
     let edge_timer = edge_timer.map(|Extension(timer)| timer);
     let result = match service::stream_query(state.clone(), caller, body, edge_timer.as_ref()).await
     {
         Ok(result) => result,
-        Err(error) => return query_error_response(error),
+        Err(error) => {
+            timing.outcome = "rejected";
+            return query_error_response(error);
+        }
     };
     #[cfg(feature = "test-support")]
     let fault = state
@@ -325,7 +394,7 @@ pub(crate) async fn sync_query(
     let fault = None;
     #[cfg(not(feature = "test-support"))]
     let stall = None;
-    query_stream_response_with_fault(result, fault, stall)
+    query_stream_response_with_fault(result, fault, stall, timing)
 }
 
 /// Converts an admitted Oracle stream into the stable HTTP frame transport.
@@ -340,7 +409,7 @@ pub(crate) async fn sync_query(
 /// response construction failures return the stable internal problem response.
 #[cfg(test)]
 pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response {
-    query_stream_response_with_fault(result, None, None)
+    query_stream_response_with_fault(result, None, None, QueryTiming::new(None))
 }
 
 /// Drop guard notifying test waiters after the stalled body releases its stream.
@@ -371,6 +440,7 @@ fn query_stream_response_with_fault(
     result: OracleQueryStream,
     fault: Option<crate::state::QueryStreamFault>,
     stall: Option<std::sync::Arc<crate::state::QueryStreamStall>>,
+    mut timing: QueryTiming,
 ) -> Response {
     let schema_fingerprint = result.schema_fingerprint.clone();
     let deadline_ms = result.deadline_ms;
@@ -385,6 +455,7 @@ fn query_stream_response_with_fault(
             Some(query) => query.frames.next().await,
             None => None,
         } {
+            timing.observe(&frame);
             let frame = encode_query_frame(frame);
             yield frame;
             emitted = emitted.saturating_add(1);
@@ -433,12 +504,14 @@ fn query_stream_response_with_fault(
     result: OracleQueryStream,
     _fault: Option<()>,
     _stall: Option<()>,
+    mut timing: QueryTiming,
 ) -> Response {
     let schema_fingerprint = result.schema_fingerprint;
     let deadline_ms = result.deadline_ms;
     let mut frames = result.frames;
     let body = Body::from_stream(async_stream::stream! {
         while let Some(frame) = frames.next().await {
+            timing.observe(&frame);
             let frame = encode_query_frame(frame);
             yield frame;
         }
@@ -777,6 +850,7 @@ mod tests {
         wyrd_runtime::runtime().block_on(async {
             let response = sync_query(
                 State(state_without_oracle().await),
+                None,
                 None,
                 query_caller(),
                 Json(BifrostQueryRequest {

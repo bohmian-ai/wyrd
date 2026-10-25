@@ -507,7 +507,7 @@ pub fn timing_declaration() -> Value {
         "max_series": method.max_series,
         "max_scan_series": method.max_scan_series,
         "percentile": "nearest rank ceil(q * N) over the window's distribution",
-        "server_env": { "WYRD_METRICS_BENCHMARK_SNAPSHOT": "true" },
+        "server_env": { "WYRD_METRICS_BENCHMARK_SNAPSHOT": "1" },
         "tracing": "operator span export stays at its default (disabled); no span is required for timing",
         "assignment": "a window takes the observations recorded between its two snapshots once its expected count arrived; a short or extra count, a dropped or out-of-range observation, an unknown label, a missing or negative component, or a replaced process makes it invalid",
     })

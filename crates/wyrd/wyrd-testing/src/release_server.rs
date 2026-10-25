@@ -247,7 +247,7 @@ impl LocalServer {
         let host = Host::detect()?;
         let log = File::create(root.path().join("server.log"))?;
         let child = operator(binary, root.path(), storage_url, env)
-            .env("WYRD_METRICS_BENCHMARK_SNAPSHOT", "true")
+            .env("WYRD_METRICS_BENCHMARK_SNAPSHOT", "1")
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)

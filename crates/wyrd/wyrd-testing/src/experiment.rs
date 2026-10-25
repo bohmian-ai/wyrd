@@ -1044,6 +1044,9 @@ pub struct Reading {
     pub above: Option<f64>,
     /// Samples behind a percentile.
     pub samples: Option<u64>,
+    /// The nearest rank `ceil(q * N)` of a histogram percentile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<u64>,
     /// Why the value is missing or inapplicable.
     pub reason: Option<String>,
 }
@@ -1112,13 +1115,14 @@ impl Reading {
 
     /// Nearest-rank percentile `q` of a histogram `distribution`, each value
     /// divided by `per`, as the [`Self::bounded`] interval of its bucket,
-    /// with the sample count; missing without samples.
+    /// with the sample count and rank; missing without samples.
     #[must_use]
     pub fn quantile(distribution: &wyrd_telemetry::timing::Distribution, q: f64, per: f64) -> Self {
         distribution.quantile(q).map_or_else(
             || Self::missing("no successful sample"),
-            |bucket| {
-                Self::bounded(bucket.lowest as f64, bucket.highest as f64, per)
+            |bucket| Self {
+                rank: Some(bucket.rank),
+                ..Self::bounded(bucket.lowest as f64, bucket.highest as f64, per)
                     .with_samples(distribution.len())
             },
         )
@@ -1275,6 +1279,48 @@ pub struct Repetition {
     pub invalid: Vec<String>,
     /// Informative conditions, such as capture saturation; never verdicts.
     pub observations: Vec<String>,
+    /// Each judged server timing cohort's expected and recorded
+    /// observations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reconciliation: Vec<Reconciled>,
+    /// The full server timing snapshots each window was read from, which
+    /// the runner keeps under the run's target artifacts and never in the
+    /// record.
+    #[serde(skip)]
+    pub timings: Vec<TimingEvidence>,
+}
+
+/// One server timing cohort's reconciliation: the observations a window
+/// owed at one boundary, outcome, case, and phase, and those it recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reconciled {
+    /// The server timing boundary.
+    pub boundary: String,
+    /// The outcome the observations were owed with.
+    pub outcome: String,
+    /// The requests' case.
+    pub case: String,
+    /// The phase that admitted the requests.
+    pub phase: String,
+    /// Observations the requests the driver saw complete owe.
+    pub expected: u64,
+    /// Observations the server recorded.
+    pub recorded: u64,
+}
+
+/// The full server timing evidence of one window: the cumulative snapshots
+/// it differences, whose buckets rebuild every judged distribution, and
+/// its reconciliation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimingEvidence {
+    /// The window's name within its repetition, such as `measured`.
+    pub window: String,
+    /// The snapshot at the window's open.
+    pub before: wyrd_telemetry::timing::TimingSnapshot,
+    /// The snapshot once the window's cohort drained.
+    pub after: wyrd_telemetry::timing::TimingSnapshot,
+    /// The window's expected and recorded observations.
+    pub reconciliation: Vec<Reconciled>,
 }
 
 impl Repetition {
@@ -1368,6 +1414,42 @@ pub enum Phase {
     Warmup,
     /// Measured repetition `n`, from zero.
     Repetition(u8),
+}
+
+impl Phase {
+    /// The closed benchmark phase label a driver sends with every request
+    /// it admits in this phase; a repetition beyond the declared labels is
+    /// [`wyrd_telemetry::timing::INVALID`], which the server counts.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Warmup => "warmup",
+            Self::Repetition(0) => "repetition-1",
+            Self::Repetition(1) => "repetition-2",
+            Self::Repetition(2) => "repetition-3",
+            Self::Repetition(_) => wyrd_telemetry::timing::INVALID,
+        }
+    }
+}
+
+/// Writes `evidence`, one repetition's server timing snapshots, to
+/// `timings/<step>/<phase>.json` under the run's `artifacts`.
+///
+/// # Errors
+///
+/// Returns the directory, encoding, or write failure.
+fn keep_timings(
+    artifacts: &Path,
+    step: &str,
+    phase: Phase,
+    evidence: &[TimingEvidence],
+) -> std::io::Result<()> {
+    let directory = artifacts.join("timings").join(step);
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(
+        directory.join(format!("{}.json", phase.label())),
+        serde_json::to_vec(evidence)?,
+    )
 }
 
 /// One engine's production work under the shared lifecycle.
@@ -1717,6 +1799,13 @@ where
                 let available = provisioned_vcpus();
                 match bounded(deadline, &interrupt, workload.measure(step, phase, length)).await {
                     Ok(Ok(mut repetition)) => {
+                        if let Err(error) =
+                            keep_timings(&options.artifacts, &step.id, phase, &repetition.timings)
+                        {
+                            repetition.invalid.push(format!(
+                                "the server timing evidence could not be kept: {error}"
+                            ));
+                        }
                         let after = provisioned_vcpus();
                         repetition.provisioned_vcpus = available.filter(|_| available == after);
                         match (available, after) {
@@ -4090,9 +4179,15 @@ mod tests {
                 .since(&before)
                 .expect("one process");
             let mut population = Population::from_interval(interval);
-            population.expect(&[("verification.direct", UNLABELLED, expected)], true);
+            population.expect(&[crate::capacity::Expected {
+                boundary: "verification.direct",
+                outcome: "completed",
+                case: UNLABELLED,
+                phase: UNLABELLED,
+                count: expected,
+            }]);
             let mut repetition = Repetition::default();
-            population.validate(&mut repetition);
+            population.validate(&mut repetition, "measured");
             population.percentiles(
                 &mut repetition,
                 "verification.direct",
@@ -4747,9 +4842,16 @@ limitations = "excluded"
             Population::from_interval(after.since(&before).expect("one process"))
         };
         let (measured, mut cohort) = (window(&closed), window(&drained));
-        cohort.expect(&[("bifrost.query", UNLABELLED, 4)], true);
+        let owed = crate::capacity::Expected {
+            boundary: "bifrost.query",
+            outcome: "success",
+            case: UNLABELLED,
+            phase: UNLABELLED,
+            count: 4,
+        };
+        cohort.expect(&[owed]);
         assert!(cohort.invalid.is_empty(), "{:?}", cohort.invalid);
-        assert_eq!(measured.count("bifrost.query", UNLABELLED), 3, "work");
+        assert_eq!(measured.count("bifrost.query"), 3, "work");
         let latency = cohort.elapsed("bifrost.query", "success").expect("latency");
         let p99 = Reading::quantile(&latency, 0.99, crate::capacity::NANOS_PER_MS);
         assert!(
@@ -4758,7 +4860,7 @@ limitations = "excluded"
             "the drained completion is the cohort's p99, never the warmup: {p99:?}"
         );
         let mut short = window(&closed);
-        short.expect(&[("bifrost.query", UNLABELLED, 4)], true);
+        short.expect(&[owed]);
         assert_eq!(short.invalid.len(), 1, "the drain completion is owed");
         let mut replaced = drained.clone();
         replaced.process = "another".to_owned();

@@ -3,10 +3,12 @@
 //!
 //! Every repetition of a step is N closed-loop clients, each on its own
 //! keep-alive connection and key, sending the next call as soon as the last
-//! one is validated, for the window the lifecycle asks. The traffic window
-//! closes when the last client stops; a separate drain then waits for every
-//! in-flight call, capture, and outbox write before the final correctness
-//! scrape, so neither warmup work nor post-answer work is misattributed. The
+//! one is validated, for the window the lifecycle asks, each labelled with
+//! its case and phase. Work, seconds, and CPU stop at the window's end;
+//! calls then in flight drain into the cohort and count late, and a
+//! separate drain then waits for every capture and outbox write before the
+//! final correctness scrape, so neither warmup work nor post-answer work is
+//! misattributed. The
 //! server's per-call timings land in its benchmark histograms, read as a
 //! [`Population`] between two snapshots; overhead is each call's elapsed
 //! time less the union of its own provider waits, before any percentile. The warmup runs the same calls
@@ -22,8 +24,9 @@ use async_trait::async_trait;
 use tokio::task::JoinSet;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_testing::capacity::{
-    NANOS_PER_MS, Population, SMOKE_WINDOW, Selection, Smoke, UNLABELLED, Usage, Window,
+    Expected, NANOS_PER_MS, Population, SMOKE, SMOKE_WINDOW, Selection, Smoke, Usage, Window,
     release_binary,
 };
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
@@ -77,16 +80,20 @@ pub struct Samples {
     pub first_event_us: Vec<u64>,
     /// Calls that did not end validated, by outcome.
     pub errors: BTreeMap<String, u64>,
+    /// Validated answers that ended at or after the admission stop; still
+    /// in `completion_us`.
+    pub late: u64,
 }
 
 impl Samples {
-    /// Records one call.
-    pub fn record(&mut self, timed: &Timed) {
+    /// Records one call, late when it was validated at or after `stop`.
+    pub fn record(&mut self, timed: &Timed, stop: Option<Instant>) {
         self.arrivals += 1;
         let since = |at: Instant| micros(at.saturating_duration_since(timed.sent));
         match &timed.outcome {
             Outcome::Answered => {
                 self.completion_us.push(since(timed.done));
+                self.late += u64::from(stop.is_some_and(|stop| timed.done >= stop));
                 if let Some(first) = timed.events.first() {
                     self.first_event_us.push(since(*first));
                 }
@@ -98,6 +105,7 @@ impl Samples {
     /// Folds another client's samples into these.
     fn merge(&mut self, other: Self) {
         self.arrivals += other.arrivals;
+        self.late += other.late;
         self.completion_us.extend(other.completion_us);
         self.first_event_us.extend(other.first_event_us);
         for (key, count) in other.errors {
@@ -302,8 +310,10 @@ impl Observed {
         };
         repetition.set(
             "requests",
-            Reading::count(samples.completion_us.len() as u64),
+            Reading::count(samples.completion_us.len() as u64 - samples.late),
         );
+        repetition.set("late_requests", Reading::count(samples.late));
+        repetition.set("drain_seconds", Reading::exact(usage.drain_seconds));
         repetition.set("arrivals", Reading::count(samples.arrivals));
         repetition.set("errors", Reading::count(samples.error_count()));
         for (id, q) in [
@@ -314,7 +324,7 @@ impl Observed {
             repetition.set(id, Reading::percentile(&samples.completion_us, q, 1e3));
         }
         let population = &self.population;
-        population.validate(&mut repetition);
+        population.validate(&mut repetition, "measured");
         let answer = boundaries(self.stream)[0];
         population.percentiles(
             &mut repetition,
@@ -411,9 +421,10 @@ impl Observed {
 
 /// The Gateway release smoke: sequential calls of every `(shape, capture)`
 /// pair, for an equal share of [`SMOKE_WINDOW`] each, from `tenant`'s first key, each pair under its capture
-/// policy, inside one window that then settles. Every call must be
-/// validated and land in the server's histograms as one succeeded timing at
-/// each of its boundaries with its provider wait excluded, beside positive server CPU,
+/// policy and labelled with its case and the `smoke` phase, inside one
+/// window that then settles. Every call must be validated and land in the
+/// server's histograms as one succeeded timing in its cohort at each of its
+/// boundaries with its provider wait excluded, beside positive server CPU,
 /// staged captures, and Scribe outbox writes.
 ///
 /// # Errors
@@ -423,7 +434,7 @@ impl Observed {
 pub async fn smoke(
     server: &LocalServer,
     tenant: &Tenant,
-    shapes: &[(Shape, CapturePolicy)],
+    shapes: &[(Case, Shape, CapturePolicy)],
 ) -> Result<String> {
     let mut smoke = Smoke::new("gateway");
     let http = http()?;
@@ -431,21 +442,33 @@ pub async fn smoke(
         .keys
         .first()
         .ok_or("the tenant has no invoking key")?;
-    let mut expected: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut expected = Vec::new();
     let before = server.timings().await?;
     let (window, baseline) = Window::open(server, Selection::RESOURCES).await?;
     let mut samples = Samples::default();
-    for (shape, policy) in shapes {
+    for (case, shape, policy) in shapes {
         tenant.capture(*policy).await?;
         let share = SMOKE_WINDOW / u32::try_from(shapes.len()).unwrap_or(u32::MAX);
         let started = Instant::now();
         let mut calls = 0;
         while calls == 0 || started.elapsed() < share {
-            samples.record(&call(&http, key, shape, shape.body("smoke")).await);
+            let timed = with_benchmark_labels(
+                case.label(),
+                SMOKE,
+                call(&http, key, shape, shape.body("smoke")),
+            )
+            .await;
+            samples.record(&timed, None);
             calls += 1;
         }
         for boundary in boundaries(shape.stream) {
-            *expected.entry(boundary).or_default() += calls;
+            expected.push(Expected {
+                boundary,
+                outcome: SUCCEEDED,
+                case: case.label(),
+                phase: SMOKE,
+                count: calls,
+            });
         }
     }
     let (usage, _) = window.close(server).await?;
@@ -458,15 +481,16 @@ pub async fn smoke(
     }
     smoke.positive("staged captures", integrity.staged);
     smoke.positive("Scribe outbox writes", integrity.written);
-    let expected: Vec<(&str, &str, u64)> = expected
-        .into_iter()
-        .map(|(boundary, calls)| (boundary, UNLABELLED, calls))
-        .collect();
     let population = Population::smoke(server, &before, &expected).await;
-    let judged: Vec<(&str, &str, bool)> = expected
-        .iter()
-        .map(|(boundary, _, _)| (*boundary, SUCCEEDED, true))
-        .collect();
+    let mut judged: Vec<(&str, &str, bool)> = Vec::new();
+    for cohort in &expected {
+        if !judged
+            .iter()
+            .any(|(boundary, ..)| *boundary == cohort.boundary)
+        {
+            judged.push((cohort.boundary, SUCCEEDED, true));
+        }
+    }
     smoke.timings(&population, &judged);
     Ok(smoke.finish()?)
 }
@@ -545,22 +569,32 @@ impl Overhead {
             self.policy = Some(case.capture());
         }
         let shape = case.shape();
+        let labels = (case.label(), phase.label());
         if phase == Phase::Warmup {
-            drive(tenant, &shape, clients, window).await?;
+            drive(tenant, &shape, clients, Instant::now() + window, labels).await?;
             settle(server).await?;
             return Ok(Repetition::default());
         }
         let before = server.timings().await?;
         let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
-        let samples = drive(tenant, &shape, clients, window).await?;
-        let (usage, ended) = traffic.close(server).await?;
+        let stop = Instant::now() + window;
+        let (samples, usage, ended) = traffic
+            .measure(server, stop, drive(tenant, &shape, clients, stop, labels))
+            .await?;
+        let samples = samples?;
         let drain = settle(server).await?;
         let last = server.metrics().await?;
-        let expected: Vec<(&str, &str, u64)> = boundaries(shape.stream)
+        let expected: Vec<Expected<'_>> = boundaries(shape.stream)
             .iter()
-            .map(|boundary| (*boundary, UNLABELLED, samples.arrivals))
+            .map(|boundary| Expected {
+                boundary,
+                outcome: SUCCEEDED,
+                case: labels.0,
+                phase: labels.1,
+                count: samples.completion_us.len() as u64,
+            })
             .collect();
-        let population = Population::collect(server, &before, &expected, true).await;
+        let population = Population::collect(server, &before, &expected).await;
         let observed = Observed {
             stream: shape.stream,
             samples,
@@ -588,11 +622,11 @@ impl Workload for Overhead {
         let (Some(server), Some(tenant)) = (&self.server, &self.tenant) else {
             return Err(ExperimentError::workload("the workload did not start"));
         };
-        let shapes: Vec<(Shape, CapturePolicy)> = Case::ALL
+        let shapes: Vec<(Case, Shape, CapturePolicy)> = Case::ALL
             .iter()
-            .map(|case| (case.shape(), case.capture()))
+            .map(|case| (*case, case.shape(), case.capture()))
             .collect();
-        self.policy = shapes.last().map(|(_, policy)| *policy);
+        self.policy = shapes.last().map(|(.., policy)| *policy);
         smoke(server, tenant, &shapes)
             .await
             .map_err(ExperimentError::workload)
@@ -648,7 +682,8 @@ impl Workload for Overhead {
 }
 
 /// Runs `clients` closed-loop clients of `tenant`, each with its own
-/// connection and key, making `shape` calls for `duration`.
+/// connection and key, making `shape` calls labelled `(case, phase)`
+/// admitted until `stop`; a call validated at or after `stop` is late.
 ///
 /// # Errors
 ///
@@ -657,17 +692,20 @@ async fn drive(
     tenant: &Tenant,
     shape: &Shape,
     clients: usize,
-    duration: Duration,
+    stop: Instant,
+    (case, phase): (&'static str, &'static str),
 ) -> Result<Samples> {
-    let deadline = Instant::now() + duration;
     let body = shape.body("overhead");
     let mut tasks = JoinSet::new();
     for key in tenant.keys.iter().take(clients) {
         let (http, key, shape, body) = (http()?, key.clone(), shape.clone(), body.clone());
         tasks.spawn(async move {
             let mut samples = Samples::default();
-            while Instant::now() < deadline {
-                samples.record(&call(&http, &key, &shape, body.clone()).await);
+            while Instant::now() < stop {
+                let timed =
+                    with_benchmark_labels(case, phase, call(&http, &key, &shape, body.clone()))
+                        .await;
+                samples.record(&timed, Some(stop));
             }
             samples
         });
@@ -782,6 +820,7 @@ mod tests {
                 completion_us: vec![400; calls],
                 first_event_us: if stream { vec![200; calls] } else { Vec::new() },
                 errors: BTreeMap::new(),
+                late: 0,
             },
             usage: Usage {
                 seconds: 10.0,

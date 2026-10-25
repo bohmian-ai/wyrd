@@ -11,9 +11,11 @@
 //!
 //! Judged times are the server's `verification.direct` benchmark
 //! histograms: each execution's elapsed time and its residual after the
-//! union of its own Verifier blocks, assigned to a phase by the timing
-//! snapshots taken at its boundaries, so by when it ended. Client round
-//! trips and the remaining histograms are diagnostic.
+//! union of its own Verifier blocks, in the cohort of the phase that
+//! admitted it, read once every request drained. Recovery's judged cohort
+//! is admitted after its grace; the grace's arrivals join overload's. The
+//! per-second recovery curve and the client round trips and remaining
+//! histograms are diagnostic.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -26,12 +28,13 @@ use async_trait::async_trait;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use wyrd_client::state::WyrdState;
+use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_telemetry::timing::{Distribution, TimingSnapshot};
 use wyrd_testing::capacity::{
-    Histogram, HistogramKey, NANOS_PER_MS, Population, Readings, ResourceWindow, SMOKE_WINDOW,
-    Selection, Smoke, Telemetry, UNLABELLED, Window, driver_cpu_seconds, elapsed, release_binary,
+    Expected, Histogram, HistogramKey, NANOS_PER_MS, Population, Readings, ResourceWindow, SMOKE,
+    SMOKE_WINDOW, Selection, Smoke, Telemetry, Window, driver_cpu_seconds, elapsed, release_binary,
 };
 use wyrd_testing::experiment::{
     ExperimentError, Level, Phase, Reading, Repetition, Step, Workload,
@@ -70,6 +73,12 @@ const DIRECT_TIMING: &str = "verification.direct";
 
 /// The outcome of a completed execution, whatever its verdict.
 const COMPLETED: &str = "completed";
+
+/// The benchmark case of a direct `verify`.
+const DIRECT_CASE: &str = "direct-verify";
+
+/// The benchmark case of a queued `submit`.
+const QUEUED_CASE: &str = "queued-verify";
 
 /// A `submit` request's arrival until it was staged.
 const SUBMIT: &str = "wyrd_verification_submit_seconds";
@@ -126,6 +135,16 @@ enum Op {
     Verify,
     /// `observe.submit`: staged for one queued execution.
     Submit,
+}
+
+impl Op {
+    /// The benchmark case the call declares.
+    const fn case(self) -> &'static str {
+        match self {
+            Self::Verify => DIRECT_CASE,
+            Self::Submit => QUEUED_CASE,
+        }
+    }
 }
 
 /// What a set of calls answered.
@@ -256,14 +275,21 @@ impl Bench {
     }
 
     /// One L1 repetition: `step`'s clients each run closed-loop direct
-    /// `verify` for `window`, judged by each acknowledged call's exact
-    /// server timing.
+    /// `verify` for `window`, labelled with `phase`, judged by each
+    /// acknowledged call's exact server timing. Work, seconds, and CPU stop
+    /// at the window's end; calls then in flight drain into the cohort and
+    /// count late.
     ///
     /// # Errors
     ///
     /// Returns a workload error for an undeclared client count or a failed
     /// scrape.
-    async fn closed(&self, step: &Step, window: Duration) -> Result<Repetition, ExperimentError> {
+    async fn closed(
+        &self,
+        step: &Step,
+        phase: Phase,
+        window: Duration,
+    ) -> Result<Repetition, ExperimentError> {
         let server = self.server()?;
         let clients = step
             .number("clients")
@@ -280,9 +306,13 @@ impl Bench {
         let (opened, _) = Window::open(server, SELECTION)
             .await
             .map_err(ExperimentError::workload)?;
-        let measured = drive(&self.states[..clients], window).await;
-        let (usage, _) = opened
-            .close(server)
+        let stop = Instant::now() + window;
+        let (measured, usage, _) = opened
+            .measure(
+                server,
+                stop.into_std(),
+                drive(&self.states[..clients], stop, phase.label()),
+            )
             .await
             .map_err(ExperimentError::workload)?;
         let mut repetition = Repetition {
@@ -299,11 +329,16 @@ impl Bench {
         let population = Population::collect(
             server,
             &before,
-            &[(DIRECT_TIMING, UNLABELLED, acknowledged)],
-            true,
+            &[Expected {
+                boundary: DIRECT_TIMING,
+                outcome: COMPLETED,
+                case: DIRECT_CASE,
+                phase: phase.label(),
+                count: acknowledged,
+            }],
         )
         .await;
-        population.validate(&mut repetition);
+        population.validate(&mut repetition, "measured");
         population.percentiles(
             &mut repetition,
             DIRECT_TIMING,
@@ -337,7 +372,12 @@ impl Bench {
             Reading::count(population.others(DIRECT_TIMING, COMPLETED)),
         );
         set_client(&mut repetition, &measured);
-        repetition.set("verifications", Reading::count(acknowledged));
+        repetition.set(
+            "verifications",
+            Reading::count(acknowledged - measured.late),
+        );
+        repetition.set("verifications_after_window", Reading::count(measured.late));
+        repetition.set("drain_seconds", Reading::exact(usage.drain_seconds));
         repetition.set("errors", Reading::count(measured.unexpected(None)));
         repetition.set("wrong", Reading::count(measured.wrong));
         repetition
@@ -367,6 +407,7 @@ impl Bench {
         let schedule = Schedule::of(step, window).map_err(ExperimentError::workload)?;
         let states = Arc::new(self.states.clone());
         let tallies: Arc<[[Mutex<Measured>; 2]; 3]> = Arc::default();
+        let admitted: Arc<[AtomicU64; 3]> = Arc::default();
         let sequence = Arc::new(AtomicU64::new(0));
         let before = timings(server).await?;
         let first = scrape(server).await?;
@@ -381,33 +422,40 @@ impl Bench {
                 start,
                 Arc::clone(&states),
                 Arc::clone(&tallies),
+                Arc::clone(&admitted),
                 Arc::clone(&sequence),
             )
         };
         let (sent, observed) = tokio::join!(
             async { tokio::join!(send(Op::Verify), send(Op::Submit)) },
-            observe(server, &schedule, start, (&first, &before), resources),
+            observe(
+                server,
+                &schedule,
+                start,
+                (&first, &before),
+                (resources, driver_before)
+            ),
         );
         let (direct, background) = sent;
-        let (observed, resources) = observed?;
+        let (observed, resources, driver) = observed?;
         let drain = drain(server, start + window).await?;
         let used = resources.finish([server], window.as_secs_f64());
-        let driver = elapsed(driver_before, driver_cpu_seconds());
 
         let tallies: [[Measured; 2]; 3] = std::array::from_fn(|stage| {
             std::array::from_fn(|slot| lock(&tallies[stage][slot]).clone())
         });
-        let verified: u64 = tallies
+        let owed: Vec<Expected<'_>> = STAGES
             .iter()
-            .map(|[verify, _]| verify.latencies_us.len() as u64)
-            .sum();
-        let population = Population::collect(
-            server,
-            &before,
-            &[(DIRECT_TIMING, UNLABELLED, verified)],
-            false,
-        )
-        .await;
+            .zip(admitted.iter())
+            .map(|(phase, count)| Expected {
+                boundary: DIRECT_TIMING,
+                outcome: COMPLETED,
+                case: DIRECT_CASE,
+                phase,
+                count: count.load(Ordering::Relaxed),
+            })
+            .collect();
+        let population = Population::collect(server, &before, &owed).await;
         let ended = Ended {
             snapshots: &observed.timings,
         };
@@ -430,7 +478,7 @@ impl Bench {
             missed: direct.missed + background.missed,
             lateness_p99_us: Reading::percentile(&lateness, 0.99, 1.0).value,
         });
-        population.validate(&mut repetition);
+        population.validate(&mut repetition, "measured");
         let panicked = direct.panicked + background.panicked;
         if panicked > 0 {
             repetition
@@ -468,26 +516,12 @@ impl Bench {
                 }
             }
         }
-        let [capacity_stage, overload_stage, recovery_stage] = schedule.stages();
-        let settled = recovery_stage.start + RECOVERY_LIMIT;
-        let recovery_end = recovery_stage.start + recovery_stage.length;
-        let overhead = [
-            ended.overhead_p99(
-                capacity_stage.start,
-                capacity_stage.start + capacity_stage.length,
-            ),
-            ended.overhead_p99(
-                overload_stage.start,
-                overload_stage.start + overload_stage.length,
-            ),
-            if settled < recovery_end {
-                ended.overhead_p99(settled, recovery_end)
-            } else {
-                Reading::missing("the recovery phase is shorter than its 30 s grace")
-            },
-        ];
-        for (name, overhead) in STAGES.iter().zip(overhead) {
-            repetition.set(&format!("{name}.direct_overhead_p99_ms"), overhead);
+        let [_, _, recovery_stage] = schedule.stages();
+        for name in STAGES {
+            repetition.set(
+                &format!("{name}.direct_overhead_p99_ms"),
+                overhead_p99(&population.only(DIRECT_CASE, name)),
+            );
         }
         let mut low = Duration::ZERO;
         let mut recovered = None;
@@ -507,19 +541,13 @@ impl Bench {
                 Reading::exact,
             ),
         );
-        match ended.between(
-            capacity_stage.start,
-            capacity_stage.start + capacity_stage.length,
-        ) {
-            Ok(capacity) => capacity.percentiles(
-                &mut repetition,
-                DIRECT_TIMING,
-                COMPLETED,
-                false,
-                &[("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)],
-            ),
-            Err(reason) => repetition.invalid.push(reason),
-        }
+        population.only(DIRECT_CASE, STAGES[0]).percentiles(
+            &mut repetition,
+            DIRECT_TIMING,
+            COMPLETED,
+            false,
+            &[("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)],
+        );
         for (name, items) in STAGES.iter().zip(observed.backlog) {
             repetition.set(
                 &format!("{name}.backlog_seconds"),
@@ -598,7 +626,8 @@ impl Workload for Bench {
                 break;
             }
             let sent = Instant::now();
-            let outcome = call(state, Op::Verify, sequence).await;
+            let outcome =
+                with_benchmark_labels(DIRECT_CASE, SMOKE, call(state, Op::Verify, sequence)).await;
             measured.record(micros(sent), outcome, false);
         }
         let (usage, _) = window
@@ -626,7 +655,13 @@ impl Workload for Bench {
         let population = Population::smoke(
             server,
             &before,
-            &[(DIRECT_TIMING, UNLABELLED, measured.answered())],
+            &[Expected {
+                boundary: DIRECT_TIMING,
+                outcome: COMPLETED,
+                case: DIRECT_CASE,
+                phase: SMOKE,
+                count: measured.latencies_us.len() as u64,
+            }],
         )
         .await;
         smoke.timings(&population, &[(DIRECT_TIMING, COMPLETED, true)]);
@@ -663,11 +698,11 @@ impl Workload for Bench {
     async fn measure(
         &mut self,
         step: &Step,
-        _phase: Phase,
+        phase: Phase,
         window: Duration,
     ) -> Result<Repetition, ExperimentError> {
         match self.level {
-            Level::One => self.closed(step, window).await,
+            Level::One => self.closed(step, phase, window).await,
             Level::Two => Box::pin(self.competing(step, window)).await,
         }
     }
@@ -743,25 +778,32 @@ impl Ended<'_> {
     /// between `low` and `high`; missing when one has no residual or the
     /// interval is invalid.
     fn overhead_p99(&self, low: Duration, high: Duration) -> Reading {
-        let population = match self.between(low, high) {
-            Ok(population) => population,
-            Err(reason) => return Reading::missing(reason),
-        };
-        if let Some(reason) = population.invalid.first() {
-            return Reading::missing(reason.clone());
+        match self.between(low, high) {
+            Ok(population) => overhead_p99(&population),
+            Err(reason) => Reading::missing(reason),
         }
-        population
-            .residuals(DIRECT_TIMING, COMPLETED)
-            .map_or_else(Reading::missing, |residual| {
-                Reading::quantile(&residual, 0.99, NANOS_PER_MS)
-            })
     }
+}
+
+/// The p99, milliseconds, of `population`'s completed direct residuals;
+/// missing when one has no residual, none completed, or the population is
+/// invalid.
+fn overhead_p99(population: &Population) -> Reading {
+    if let Some(reason) = population.invalid.first() {
+        return Reading::missing(reason.clone());
+    }
+    population
+        .residuals(DIRECT_TIMING, COMPLETED)
+        .map_or_else(Reading::missing, |residual| {
+            Reading::quantile(&residual, 0.99, NANOS_PER_MS)
+        })
 }
 
 /// Reads `/metrics` and the timing snapshot at each phase boundary of
 /// `schedule` from `start`, and every [`POLL`] through recovery, keeping
 /// each recovery read's backlog for the recovery judgment; `first` is the
-/// pair read at the start. Freezes server CPU at the window's end.
+/// pair read at the start. Freezes server CPU and returns the driver CPU
+/// since `driver_before` at the window's end, before its closing scrape.
 ///
 /// # Errors
 ///
@@ -771,8 +813,8 @@ async fn observe(
     schedule: &Schedule,
     start: Instant,
     (first, opened_timings): (&Metrics, &TimingSnapshot),
-    mut resources: ResourceWindow,
-) -> Result<(Observed, ResourceWindow), ExperimentError> {
+    (mut resources, driver_before): (ResourceWindow, Option<f64>),
+) -> Result<(Observed, ResourceWindow, Option<f64>), ExperimentError> {
     let [_, overload, recovery] = schedule.stages();
     let mut snapshots = vec![(Duration::ZERO, opened_timings.clone())];
     let whole = Readings::read(first, SELECTION);
@@ -791,9 +833,14 @@ async fn observe(
     let opened = Readings::read(&at_recovery, SELECTION);
     let mut ticks = Vec::new();
     let mut offset = recovery.start;
+    let mut driver = None;
     let last_metrics = loop {
         offset = (offset + POLL).min(schedule.window);
         tokio::time::sleep_until(start + offset).await;
+        if offset >= schedule.window {
+            resources.freeze([server]);
+            driver = elapsed(driver_before, driver_cpu_seconds());
+        }
         let metrics = scrape(server).await?;
         snapshots.push((offset, timings(server).await?));
         ticks.push((offset.saturating_sub(recovery.start), backlog(&metrics)));
@@ -801,7 +848,6 @@ async fn observe(
             break metrics;
         }
     };
-    resources.freeze([server]);
     let recovering = opened.since(&last_metrics);
     let observed = Observed {
         backlog: [
@@ -815,7 +861,7 @@ async fn observe(
         whole: whole.since(&last_metrics),
         timings: snapshots,
     };
-    Ok((observed, resources))
+    Ok((observed, resources, driver))
 }
 
 /// What one open-loop sender scheduled and sent.
@@ -834,21 +880,25 @@ struct Offered {
 }
 
 /// Sends `op` arrivals at each phase's rate of `schedule` from `start`,
-/// rotating across `states`, recording each answer into its phase's tally
-/// and marking one after the window end late, and waits for every sent
-/// arrival to answer.
+/// rotating across `states`, each labelled with its admission phase,
+/// recording each answer into its schedule phase's tally and marking one
+/// after the window end late, counting each acknowledged direct call in
+/// `admitted` by its admission phase, and waits for every sent arrival to
+/// answer.
 async fn arrivals(
     op: Op,
     schedule: Schedule,
     start: Instant,
     states: Arc<Vec<WyrdState>>,
     tallies: Arc<[[Mutex<Measured>; 2]; 3]>,
+    admitted: Arc<[AtomicU64; 3]>,
     sequence: Arc<AtomicU64>,
 ) -> Offered {
     let mut offered = Offered::default();
     let mut tasks = JoinSet::new();
     let slot = usize::from(op == Op::Submit);
     let end = start + schedule.window;
+    let recovery = schedule.stages()[2].start;
     for (index, stage) in schedule.stages().into_iter().enumerate() {
         let rate = match op {
             Op::Verify => stage.direct_rate,
@@ -860,6 +910,7 @@ async fn arrivals(
                 break;
             }
             let at = start + stage.start + offset;
+            let phase = admission(recovery, index, stage.start + offset);
             tokio::time::sleep_until(at).await;
             offered.scheduled += 1;
             while let Some(joined) = tasks.try_join_next() {
@@ -872,11 +923,15 @@ async fn arrivals(
             offered.lateness_us.push(micros(at));
             let next = sequence.fetch_add(1, Ordering::Relaxed);
             let state = states[usize::try_from(next).unwrap_or(0) % states.len()].clone();
-            let tallies = Arc::clone(&tallies);
+            let (tallies, admitted) = (Arc::clone(&tallies), Arc::clone(&admitted));
             tasks.spawn(async move {
                 let called = Instant::now();
-                let outcome = call(&state, op, next).await;
+                let outcome =
+                    with_benchmark_labels(op.case(), STAGES[phase], call(&state, op, next)).await;
                 let late = Instant::now() >= end;
+                if op == Op::Verify && outcome.is_ok() {
+                    admitted[phase].fetch_add(1, Ordering::Relaxed);
+                }
                 lock(&tallies[index][slot]).record(micros(called), outcome, late);
             });
             offered.sent += 1;
@@ -886,6 +941,17 @@ async fn arrivals(
         offered.panicked += u64::from(joined.is_err());
     }
     offered
+}
+
+/// The [`STAGES`] index of the admission phase of an arrival due `offset`
+/// after the start in schedule phase `index`: recovery's arrivals within
+/// [`RECOVERY_LIMIT`] of its start at `recovery` join overload's cohort.
+fn admission(recovery: Duration, index: usize, offset: Duration) -> usize {
+    if index == 2 && offset < recovery + RECOVERY_LIMIT {
+        1
+    } else {
+        index
+    }
 }
 
 /// Waits from `stopped`, when load stopped, until no queued execution is
@@ -937,21 +1003,22 @@ async fn scrape(server: &LocalServer) -> Result<Metrics, ExperimentError> {
     server.metrics().await.map_err(ExperimentError::workload)
 }
 
-/// Runs one closed-loop client per state making direct `verify` calls for
-/// `window`, client `i` presenting application `i`'s key.
-async fn drive(states: &[WyrdState], window: Duration) -> Measured {
-    let deadline = Instant::now() + window;
+/// Runs one closed-loop client per state making direct `verify` calls,
+/// labelled `phase`, admitted until `stop`, client `i` presenting
+/// application `i`'s key; a call answering at or after `stop` is late.
+async fn drive(states: &[WyrdState], stop: Instant, phase: &'static str) -> Measured {
     let sequence = Arc::new(AtomicU64::new(0));
     let mut tasks = JoinSet::new();
     for state in states {
         let (state, sequence) = (state.clone(), Arc::clone(&sequence));
         tasks.spawn(async move {
             let mut measured = Measured::default();
-            while Instant::now() < deadline {
+            while Instant::now() < stop {
                 let next = sequence.fetch_add(1, Ordering::Relaxed);
                 let sent = Instant::now();
-                let outcome = call(&state, Op::Verify, next).await;
-                measured.record(micros(sent), outcome, false);
+                let outcome =
+                    with_benchmark_labels(DIRECT_CASE, phase, call(&state, Op::Verify, next)).await;
+                measured.record(micros(sent), outcome, Instant::now() >= stop);
             }
             measured
         });
@@ -1067,7 +1134,26 @@ fn micros(since: Instant) -> u64 {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{ADMISSION_REFUSAL, Measured};
+    use std::time::Duration;
+
+    use super::{ADMISSION_REFUSAL, Measured, admission};
+
+    /// Arrivals keep their schedule phase's cohort except recovery's first
+    /// 30 s, which join overload's, so recovery is judged after its grace
+    /// however late each call completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an arrival lands in the wrong cohort.
+    #[test]
+    fn recovery_grace_arrivals_join_overload() {
+        let recovery = Duration::from_secs(100);
+        let second = Duration::from_secs(1);
+        assert_eq!(admission(recovery, 0, second), 0);
+        assert_eq!(admission(recovery, 1, second * 99), 1);
+        assert_eq!(admission(recovery, 2, recovery + second * 29), 1);
+        assert_eq!(admission(recovery, 2, recovery + second * 30), 2);
+    }
 
     /// Answers count acknowledged and refused calls, only undeclared
     /// refusals are unexpected, and an acknowledgement after the window end

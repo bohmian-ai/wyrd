@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use wyrd_client::bifrost::BifrostOptions;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayPayloadField};
+use wyrd_client::transport::trace::benchmark_headers;
 use wyrd_client::{Bifrost, Gateway, GlobalConfig, Principals, WyrdClient};
 use wyrd_spec::auth::CreateServicePrincipalRequest;
 use wyrd_testing::release_server::{SERVER_URL, SetupTenant};
@@ -264,8 +265,8 @@ pub async fn call(http: &Client, key: &SecretString, shape: &Shape, body: Bytes)
     timed
 }
 
-/// Sends the request and reads its answer into
-/// `timed`, returning how it ended.
+/// Sends the request, with the benchmark labels scoped on this task, and
+/// reads its answer into `timed`, returning how it ended.
 async fn exchange(
     http: &Client,
     key: &SecretString,
@@ -273,8 +274,11 @@ async fn exchange(
     body: Bytes,
     timed: &mut Timed,
 ) -> Outcome {
-    let response = match http
-        .post(format!("{SERVER_URL}/v1/chat/completions"))
+    let request = benchmark_headers().into_iter().fold(
+        http.post(format!("{SERVER_URL}/v1/chat/completions")),
+        |request, (name, value)| request.header(name, value),
+    );
+    let response = match request
         .bearer_auth(key.expose_secret())
         .header("content-type", "application/json")
         .body(body)

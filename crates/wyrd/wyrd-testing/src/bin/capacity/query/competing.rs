@@ -12,8 +12,8 @@
 //! grace ends.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
@@ -24,15 +24,14 @@ use secrecy::ExposeSecret as _;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use wyrd_client::transport::trace::with_benchmark_case;
+use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
-use wyrd_telemetry::timing::{Distribution, TimingSnapshot};
+use wyrd_telemetry::timing::Distribution;
 use wyrd_testing::capacity::{
-    NANOS_PER_MS, Percentiles, Population, QUERY_BOUNDARY, Selection, UNLABELLED, Window,
+    Expected, NANOS_PER_MS, Percentiles, Population, QUERY_BOUNDARY, Selection, Window,
 };
 use wyrd_testing::experiment::{
     Arrivals, ExperimentError, Phase, Reading, Repetition, Step, Workload,
@@ -41,7 +40,9 @@ use wyrd_testing::release_server::LocalServer;
 
 use crate::client_queue::{self, Emitted, LANES};
 use crate::query::isolated::{INSERTED, MIB, SUCCESS};
-use crate::query::run::{Bench, Overload, QUEUE_FULL, Sender, WRONG_RESULT, ask, micros};
+use crate::query::run::{
+    Admission, Bench, Overload, QUEUE_FULL, Sender, WRONG_RESULT, ask, micros,
+};
 use crate::query::workload::{Case, Fixture, INGEST_TABLE, TABLE};
 use crate::query::{Lane, PARQUET_ENV, Residence, SPLIT, WriteOp, client, lanes, smoke, start};
 
@@ -101,6 +102,8 @@ const fn mixed_case(sequence: u64) -> Case {
 struct Asked {
     /// When it answered.
     at: Instant,
+    /// The admission phase it was sent in.
+    phase: &'static str,
     /// What it asked.
     case: Case,
     /// Its diagnostic client latency in microseconds, or its error code.
@@ -111,6 +114,8 @@ struct Asked {
 struct Acked {
     /// When it answered.
     at: Instant,
+    /// The admission phase it was sent in.
+    phase: &'static str,
     /// Rows it carried.
     rows: u64,
     /// Encoded OTLP protobuf bytes it sent; zero for native writes.
@@ -191,30 +196,45 @@ where
     offered
 }
 
+/// The admission phases a repetition labels its offered requests with:
+/// capacity until overload starts, overload until its recovery grace ends,
+/// and recovery after; only capacity and recovery are judged.
+const ADMISSIONS: [&str; 3] = ["capacity", "overload", "recovery"];
+
+/// Which admission phase a request sent now belongs to. Recovery's start is
+/// known only once overload ends.
+struct Admitting {
+    /// Capacity end and overload start.
+    overload: Instant,
+    /// Recovery-grace end, once overload ended.
+    recovery: OnceLock<Instant>,
+}
+
+impl Admitting {
+    /// The [`ADMISSIONS`] label of a request sent at `at`.
+    fn label(&self, at: Instant) -> &'static str {
+        if at < self.overload {
+            ADMISSIONS[0]
+        } else if self.recovery.get().is_some_and(|recovery| at >= *recovery) {
+            ADMISSIONS[2]
+        } else {
+            ADMISSIONS[1]
+        }
+    }
+}
+
 /// The repetition's phase boundaries.
 #[derive(Clone, Copy)]
 struct Phases {
-    /// Window start.
-    start: Instant,
     /// Capacity end and overload start.
     overload: Instant,
     /// Overload end.
     overloaded: Instant,
-    /// Window end.
+    /// Window end: the admission stop.
     end: Instant,
 }
 
 impl Phases {
-    /// Whether `at` falls in the capacity phase.
-    fn capacity(&self, at: Instant) -> bool {
-        at >= self.start && at < self.overload
-    }
-
-    /// Whether `at` falls in recovery after its grace.
-    fn recovered(&self, at: Instant) -> bool {
-        at >= self.overloaded + RECOVERY_GRACE && at < self.end
-    }
-
     /// Whether a queue-full refusal at `at` is the declared one: from
     /// overload's start until the recovery grace ends.
     fn refusal_allowed(&self, at: Instant) -> bool {
@@ -252,8 +272,9 @@ impl Competing {
     }
 
     /// Runs one whole capacity → overload → recovery sequence of `step` over
-    /// `window`, drains, collects its server timings, and reads every phase's
-    /// evidence.
+    /// `window`, labelling every offered request with its admission phase,
+    /// freezes work, seconds, and CPU at the window end, drains, collects the
+    /// drained server timings, and reads every phase's cohort from them.
     ///
     /// # Errors
     ///
@@ -285,90 +306,57 @@ impl Competing {
             .map_err(ExperimentError::workload)?;
         let start = Instant::now();
         let end = start + window;
-        let overload_at = start + window * 5 / 12;
+        let admitting = Admitting {
+            overload: start + window * 5 / 12,
+            recovery: OnceLock::new(),
+        };
         let outstanding = Arc::new(AtomicI64::new(0));
         let (visible, probes) = mpsc::unbounded_channel();
         let ingest = futures_util::future::join_all(SPLIT.iter().zip(&self.senders).map(
             |((_, share), (op, sender, cursor))| {
                 let probe = (*op == WriteOp::Native).then(|| visible.clone());
                 offer(
-                    sender,
-                    cursor,
+                    (*op, sender, cursor),
                     rate * share,
-                    start,
-                    end,
+                    (start, end),
+                    &admitting,
                     &outstanding,
                     probe,
                 )
             },
         ));
         drop(visible);
-        let prober = probe(bench.queries(), probes);
-        let queries = mixed(bench, start, end, &self.sequence);
+        let prober = probe(bench.queries(), probes, &admitting);
+        let queries = mixed(bench, start, end, &self.sequence, &admitting);
         let lanes = futures_util::future::join_all(LANES.iter().map(|lane| {
             let tenant = Arc::clone(tenant);
             async move { lane.run(&tenant, end).await }
         }));
         let overload = async {
-            tokio::time::sleep_until(overload_at).await;
-            let capacity = server.timings().await;
+            tokio::time::sleep_until(admitting.overload).await;
             let before = outstanding.load(Ordering::Relaxed);
             let overload = bench.overload_queue(server).await;
             let overloaded = Instant::now();
+            let _ = admitting.recovery.set(overloaded + RECOVERY_GRACE);
             let backlog = outstanding.load(Ordering::Relaxed);
-            let recovered = overloaded + RECOVERY_GRACE;
-            let recovery = if recovered < end {
-                tokio::time::sleep_until(recovered).await;
-                Some(server.timings().await)
-            } else {
-                None
-            };
-            (before, overload, overloaded, backlog, capacity, recovery)
+            (before, overload, overloaded, backlog)
         };
-        let closer = async {
+        let stopped = async {
             tokio::time::sleep_until(end).await;
-            let backlog = outstanding.load(Ordering::Relaxed);
-            let timings = server.timings().await;
-            (opened.close(server).await, backlog, timings)
+            outstanding.load(Ordering::Relaxed)
         };
-        let (offered, visibility, queries, lanes, overload, (closed, backlog_end, ended)) =
-            tokio::join!(ingest, prober, queries, lanes, overload, closer);
+        let work = async { tokio::join!(ingest, prober, queries, lanes, overload, stopped) };
+        let (driven, usage, after) = opened
+            .measure(server, end.into_std(), work)
+            .await
+            .map_err(ExperimentError::workload)?;
+        let (offered, visibility, queries, lanes, overload, backlog_end) = driven;
         let asked = &queries.acked;
-        let (backlog_capacity, overload, overloaded, backlog_overloaded, capacity, recovery) =
-            overload;
+        let (backlog_capacity, overload, overloaded, backlog_overloaded) = overload;
         let overload = overload.map_err(ExperimentError::workload)?;
-        let (usage, after) = closed.map_err(ExperimentError::workload)?;
-        let population =
-            Population::collect(server, &timings, &expected(asked, &offered), false).await;
-        let mut refused = Vec::new();
-        let mut between = |low: &TimingSnapshot, high: &Result<TimingSnapshot, _>| match high {
-            Ok(high) => high.since(low).map_or_else(
-                |reason| {
-                    refused.push(reason);
-                    Population::default()
-                },
-                Population::from_interval,
-            ),
-            Err(error) => {
-                refused.push(format!("the timing snapshot is unreadable: {error}"));
-                Population::default()
-            }
-        };
-        let windows = Windows {
-            whole: between(&timings, &ended),
-            capacity: between(&timings, &capacity),
-            recovery: match (&recovery, &ended) {
-                (Some(Ok(low)), high) => between(low, high),
-                (Some(Err(error)), _) => {
-                    refused.push(format!("the timing snapshot is unreadable: {error}"));
-                    Population::default()
-                }
-                (None, _) => Population::default(),
-            },
-        };
+        let population = Population::collect(server, &timings, &expected(asked, &offered)).await;
         let phases = Phases {
-            start,
-            overload: overload_at,
+            overload: admitting.overload,
             overloaded,
             end,
         };
@@ -379,7 +367,6 @@ impl Competing {
             peak_memory_bytes: usage.peak_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
-            invalid: refused,
             ..Repetition::default()
         };
         let backlog = |rows: i64| Reading::exact(rows.to_f64().unwrap_or(f64::MAX) / rate);
@@ -388,9 +375,9 @@ impl Competing {
             "recovery.backlog_growth_s",
             backlog(backlog_end - backlog_overloaded),
         );
-        population.validate(&mut repetition);
-        read_queries(&mut repetition, asked, &windows, &phases);
-        read_ingest(&mut repetition, &offered, &visibility, &windows, &phases);
+        population.validate(&mut repetition, "measured");
+        read_queries(&mut repetition, asked, &population, &phases);
+        read_ingest(&mut repetition, &offered, &visibility, &population, &phases);
         let inserted = after.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
         repetition.set("retained_mib", Reading::exact(inserted / MIB));
         read_arrivals(&mut repetition, &offered, &queries);
@@ -403,63 +390,69 @@ impl Competing {
     }
 }
 
-/// One judged phase: its name, its server timing population, and whether
-/// a client answer at an instant falls in it.
-type PhaseWindow<'a> = (&'a str, &'a Population, &'a dyn Fn(Instant) -> bool);
-
-/// Server timing populations between the repetition's phase snapshots.
-#[derive(Default)]
-struct Windows {
-    /// Window start to window end.
-    whole: Population,
-    /// Window start to overload start.
-    capacity: Population,
-    /// Recovery-grace end to window end; empty when the grace outlasts the
-    /// window.
-    recovery: Population,
-}
-
-/// The least server observations the window's answers prove, from the
-/// window start until every answer drained: each answered query at
-/// `bifrost.query` under its class's case, and each acknowledged ingest
-/// request at its path's boundary. Visibility probes and the client-queue
-/// lanes reach the same boundaries, and native writes and OTLP exports carry
-/// no case, so every count is a lower bound.
-fn expected(asked: &[Asked], offered: &[Offered<Acked>]) -> Vec<(&'static str, &'static str, u64)> {
-    let cases = [
-        Case::Selective,
-        Case::SmallAggregate,
-        Case::MillionAggregate,
-        Case::TableAggregate,
-        Case::FullScan,
-    ];
-    let mut expected: Vec<_> = cases
-        .iter()
-        .map(|case| {
+/// The exact server observations the drained window owes, by case and
+/// admission phase: each answered query, a wrong answer included, at
+/// `bifrost.query`, and each acknowledged ingest request at its path's
+/// boundary. Visibility probes, the overload's held queries, and the
+/// client-queue lanes carry other labels, so none can cover an offered one.
+fn expected(asked: &[Asked], offered: &[Offered<Acked>]) -> Vec<Expected<'static>> {
+    let mut expected = Vec::new();
+    for phase in ADMISSIONS {
+        for case in MIXED {
             let answered = asked
                 .iter()
-                .filter(|asked| asked.case == *case && asked.result.is_ok())
+                .filter(|asked| asked.case == case && asked.phase == phase)
+                .filter(|asked| {
+                    asked
+                        .result
+                        .as_ref()
+                        .map_or_else(|code| code == WRONG_RESULT, |_| true)
+                })
                 .count();
-            (QUERY_BOUNDARY, case.label(), answered as u64)
-        })
-        .collect();
-    for ((op, _), offered) in SPLIT.iter().zip(offered) {
-        let acked = offered.acked.iter().filter(|acked| acked.result.is_ok());
-        expected.push((op.boundary(), UNLABELLED, acked.count() as u64));
+            expected.push(Expected {
+                boundary: QUERY_BOUNDARY,
+                outcome: SUCCESS,
+                case: case.label(),
+                phase,
+                count: answered.to_u64().unwrap_or(u64::MAX),
+            });
+        }
+        for ((op, _), offered) in SPLIT.iter().zip(offered) {
+            let acked = offered
+                .acked
+                .iter()
+                .filter(|acked| acked.phase == phase && acked.result.is_ok())
+                .count();
+            expected.push(Expected {
+                boundary: op.boundary(),
+                outcome: SUCCESS,
+                case: op.name(),
+                phase,
+                count: acked.to_u64().unwrap_or(u64::MAX),
+            });
+        }
     }
     expected
 }
 
-/// Sends `sender`'s path open loop at `rows_per_s` from `start` until `end`,
-/// counting pending rows in `outstanding`, sending each native
-/// acknowledgement's last id and time to `probe`, then waits for every
-/// pending arrival.
+/// The mixed query classes.
+const MIXED: [Case; 5] = [
+    Case::Selective,
+    Case::SmallAggregate,
+    Case::MillionAggregate,
+    Case::TableAggregate,
+    Case::FullScan,
+];
+
+/// Sends path `op`'s `sender` open loop at `rows_per_s` from `start` until
+/// `end`, each request labelled with `op` and its admission phase, counting
+/// pending rows in `outstanding`, sending each native acknowledgement's last
+/// id and time to `probe`, then waits for every pending arrival.
 async fn offer(
-    sender: &Sender,
-    cursor: &Arc<AtomicI64>,
+    (op, sender, cursor): (WriteOp, &Sender, &Arc<AtomicI64>),
     rows_per_s: f64,
-    start: Instant,
-    end: Instant,
+    (start, end): (Instant, Instant),
+    admitting: &Admitting,
     outstanding: &Arc<AtomicI64>,
     probe: Option<mpsc::UnboundedSender<(Instant, i64)>>,
 ) -> Offered<Acked> {
@@ -467,11 +460,13 @@ async fn offer(
     let interval = Duration::from_secs_f64(chunk.to_f64().unwrap_or(f64::MAX) / rows_per_s);
     open_loop(start, end, interval, MAX_PENDING, || {
         let first = cursor.fetch_add(chunk, Ordering::Relaxed);
+        let phase = admitting.label(Instant::now());
         let (sender, outstanding, probe) = (sender.clone(), Arc::clone(outstanding), probe.clone());
         outstanding.fetch_add(chunk, Ordering::Relaxed);
         async move {
             let sent = std::time::Instant::now();
-            let sent_bytes = sender.send(first, first + chunk).await;
+            let sent_bytes =
+                with_benchmark_labels(op.name(), phase, sender.send(first, first + chunk)).await;
             let wire = *sent_bytes.as_ref().unwrap_or(&0);
             let result = sent_bytes.map(|_| micros(sent));
             outstanding.fetch_sub(chunk, Ordering::Relaxed);
@@ -481,6 +476,7 @@ async fn offer(
             }
             Acked {
                 at,
+                phase,
                 rows: chunk.cast_unsigned(),
                 wire,
                 result,
@@ -491,26 +487,29 @@ async fn offer(
 }
 
 /// Asks, for every acknowledged native write on `acks`, until its last row
-/// is queryable, and returns each acknowledgement's time with its
-/// visibility delay in microseconds, or `None` past [`VISIBILITY_WAIT`].
+/// is queryable, and returns each acknowledgement's admission phase with
+/// its visibility delay in microseconds, or `None` past
+/// [`VISIBILITY_WAIT`]. Probes are incidental work, labelled `probe`.
 async fn probe(
     queries: Arc<wyrd_client::Bifrost>,
     mut acks: mpsc::UnboundedReceiver<(Instant, i64)>,
-) -> Vec<(Instant, Option<u64>)> {
+    admitting: &Admitting,
+) -> Vec<(&'static str, Option<u64>)> {
     let mut probes = JoinSet::new();
     while let Some((acked, id)) = acks.recv().await {
         let queries = Arc::clone(&queries);
+        let phase = admitting.label(acked);
         probes.spawn(async move {
             let sql = format!("SELECT COUNT(*) AS n FROM {INGEST_TABLE} WHERE event_id = {id}");
             let one = vec![vec![1]];
             while acked.elapsed() < VISIBILITY_WAIT {
                 let asked = ask(&queries, sql.clone(), &one);
-                if with_benchmark_case("probe", asked).await.is_ok() {
-                    return (acked, Some(micros(acked.into_std())));
+                if with_benchmark_labels("probe", phase, asked).await.is_ok() {
+                    return (phase, Some(micros(acked.into_std())));
                 }
                 tokio::time::sleep(VISIBILITY_POLL).await;
             }
-            (acked, None)
+            (phase, None)
         });
     }
     let mut seen = Vec::new();
@@ -521,27 +520,31 @@ async fn probe(
 }
 
 /// Sends mixed queries open loop at [`QUERY_RATE`] from `start` until
-/// `end`, independent of answers, with at most [`QUERY_CLIENTS`] in flight.
+/// `end`, independent of answers, with at most [`QUERY_CLIENTS`] in flight,
+/// each labelled with its class and admission phase.
 async fn mixed(
     bench: &Arc<Bench>,
     start: Instant,
     end: Instant,
     sequence: &Arc<AtomicU64>,
+    admitting: &Admitting,
 ) -> Offered<Asked> {
     let queries = bench.queries();
     let interval = Duration::from_secs_f64(1.0 / QUERY_RATE);
     open_loop(start, end, interval, QUERY_CLIENTS, || {
         let next = sequence.fetch_add(1, Ordering::Relaxed);
         let case = mixed_case(next);
+        let phase = admitting.label(Instant::now());
         let (sql, expected) = bench.question(case, next);
         let queries = Arc::clone(&queries);
         async move {
             let sent = std::time::Instant::now();
-            let result = with_benchmark_case(case.label(), ask(&queries, sql, &expected))
+            let result = with_benchmark_labels(case.label(), phase, ask(&queries, sql, &expected))
                 .await
                 .map(|()| micros(sent));
             Asked {
                 at: Instant::now(),
+                phase,
                 case,
                 result,
             }
@@ -551,10 +554,15 @@ async fn mixed(
 }
 
 /// Nearest-rank percentile `q`, milliseconds, of the successful `boundary`
-/// observations of `case` in `population`; missing without one.
-fn server_percentile(population: &Population, boundary: &str, case: &str, q: f64) -> Reading {
+/// observations of `case` admitted in `phase`; missing without one.
+fn server_percentile(
+    population: &Population,
+    boundary: &str,
+    (case, phase): (&str, &str),
+    q: f64,
+) -> Reading {
     population
-        .only(case, UNLABELLED)
+        .only(case, phase)
         .elapsed(boundary, SUCCESS)
         .map_or_else(
             || Reading::missing(format!("no `{boundary}` {case} answered in the phase")),
@@ -573,21 +581,23 @@ fn slowest(samples: &[u64], what: &str) -> Reading {
     )
 }
 
-/// Sets every query reading: per-phase server latencies from each phase's
-/// snapshots and client-answered counts, the capacity-phase point
-/// percentiles, totals, errors, and wrong answers. Totals credit only
-/// queries answered before the window end, the endpoint of the measured
-/// CPU; later answers are counted separately. Scanned rows and bytes per
-/// query average the executed-plan scans of the mixed queries the server
-/// answered in the window.
-fn read_queries(repetition: &mut Repetition, asked: &[Asked], windows: &Windows, phases: &Phases) {
-    let phase_readings: [PhaseWindow<'_>; 2] = [
-        ("capacity", &windows.capacity, &|at| phases.capacity(at)),
-        ("recovery", &windows.recovery, &|at| phases.recovered(at)),
-    ];
-    for (phase, population, within) in phase_readings {
+/// Sets every query reading: per-phase server latencies and answered
+/// counts of the queries admitted in the phase, however late they
+/// completed; the capacity-phase point percentiles; totals, errors, and
+/// wrong answers. Totals credit only queries answered before the window
+/// end, the endpoint of the measured CPU; later answers are counted
+/// separately. Scanned rows and bytes per query average the executed-plan
+/// scans of the mixed queries the server answered, never a probe's.
+fn read_queries(
+    repetition: &mut Repetition,
+    asked: &[Asked],
+    population: &Population,
+    phases: &Phases,
+) {
+    for phase in [ADMISSIONS[0], ADMISSIONS[2]] {
         let id = |name: &str| format!("{phase}.{name}");
-        let read = |case: Case, q| server_percentile(population, QUERY_BOUNDARY, case.label(), q);
+        let read =
+            |case: Case, q| server_percentile(population, QUERY_BOUNDARY, (case.label(), phase), q);
         repetition.set(&id("point_p99_ms"), read(Case::Selective, 0.99));
         repetition.set(&id("small_p95_ms"), read(Case::SmallAggregate, 0.95));
         repetition.set(&id("million_p95_ms"), read(Case::MillionAggregate, 0.95));
@@ -595,7 +605,7 @@ fn read_queries(repetition: &mut Repetition, asked: &[Asked], windows: &Windows,
         repetition.set(&id("scan_p95_ms"), read(Case::FullScan, 0.95));
         let answered = asked
             .iter()
-            .filter(|asked| within(asked.at) && asked.result.is_ok())
+            .filter(|asked| asked.phase == phase && asked.result.is_ok())
             .count();
         repetition.set(
             &id("queries"),
@@ -606,7 +616,7 @@ fn read_queries(repetition: &mut Repetition, asked: &[Asked], windows: &Windows,
         let point = Case::Selective.label();
         repetition.set(
             id,
-            server_percentile(&windows.capacity, QUERY_BOUNDARY, point, q),
+            server_percentile(population, QUERY_BOUNDARY, (point, ADMISSIONS[0]), q),
         );
     }
     let answered = |late: bool, case: Option<Case>| {
@@ -621,16 +631,12 @@ fn read_queries(repetition: &mut Repetition, asked: &[Asked], windows: &Windows,
     repetition.set("queries", Reading::count(answered(false, None)));
     repetition.set("queries_after_window", Reading::count(answered(true, None)));
     let mut mixed = Population::default();
-    for case in [
-        Case::Selective,
-        Case::SmallAggregate,
-        Case::MillionAggregate,
-        Case::TableAggregate,
-        Case::FullScan,
-    ] {
-        mixed
-            .scans
-            .extend(windows.whole.only(case.label(), UNLABELLED).scans);
+    for phase in ADMISSIONS {
+        for case in MIXED {
+            let cohort = population.only(case.label(), phase);
+            mixed.series.extend(cohort.series);
+            mixed.scans.extend(cohort.scans);
+        }
     }
     let [rows, bytes] = mixed.scanned_per_query(SUCCESS);
     repetition.set("scanned_rows_per_query", rows);
@@ -653,9 +659,8 @@ fn read_queries(repetition: &mut Repetition, asked: &[Asked], windows: &Windows,
 }
 
 /// Sets every ingest reading: per-phase server acknowledgement p99 over
-/// every successful write-boundary observation between the phase's
-/// snapshots (the client-queue lanes' writes included, since native writes
-/// carry no case), the diagnostic visibility, and rows; totals; the drain; and adds
+/// every successful offered write admitted in the phase, the diagnostic
+/// visibility, and rows; totals; the drain; and adds
 /// ingest failures and undeclared query refusals to `errors`. The row total
 /// credits only acknowledgements before the window end, the endpoint of the
 /// measured CPU; drain acknowledgements are counted separately and every
@@ -663,22 +668,17 @@ fn read_queries(repetition: &mut Repetition, asked: &[Asked], windows: &Windows,
 fn read_ingest(
     repetition: &mut Repetition,
     offered: &[Offered<Acked>],
-    visibility: &[(Instant, Option<u64>)],
-    windows: &Windows,
+    visibility: &[(&'static str, Option<u64>)],
+    population: &Population,
     phases: &Phases,
 ) {
-    let writes = SPLIT.map(|(op, _)| op.boundary());
     let acked: Vec<&Acked> = offered.iter().flat_map(|offered| &offered.acked).collect();
-    let phase_readings: [PhaseWindow<'_>; 2] = [
-        ("capacity", &windows.capacity, &|at| phases.capacity(at)),
-        ("recovery", &windows.recovery, &|at| phases.recovered(at)),
-    ];
-    for (phase, population, within) in phase_readings {
+    for phase in [ADMISSIONS[0], ADMISSIONS[2]] {
         let id = |name: &str| format!("{phase}.{name}");
-        let unlabelled = population.only(UNLABELLED, UNLABELLED);
         let mut acks: Option<Distribution> = None;
-        for boundary in writes {
-            let Some(part) = unlabelled.elapsed(boundary, SUCCESS) else {
+        for (op, _) in SPLIT {
+            let cohort = population.only(op.name(), phase);
+            let Some(part) = cohort.elapsed(op.boundary(), SUCCESS) else {
                 continue;
             };
             match &mut acks {
@@ -699,13 +699,13 @@ fn read_ingest(
         );
         let rows: u64 = acked
             .iter()
-            .filter(|acked| within(acked.at) && acked.result.is_ok())
+            .filter(|acked| acked.phase == phase && acked.result.is_ok())
             .map(|acked| acked.rows)
             .sum();
         repetition.set(&id("ingest_rows"), Reading::count(rows));
         let seen: Vec<Option<u64>> = visibility
             .iter()
-            .filter(|(at, _)| within(*at))
+            .filter(|(admitted, _)| *admitted == phase)
             .map(|(_, delay)| *delay)
             .collect();
         let reading = if seen.iter().any(Option::is_none) {
@@ -952,7 +952,7 @@ impl Competing {
                 &Arc::new(AtomicI64::new(0)),
                 fixture.rows,
                 LOADERS,
-                &CancellationToken::new(),
+                Admission::default(),
             )
             .await;
         if loaded.error_count() > 0 || loaded.rows != fixture.rows.cast_unsigned() {
@@ -963,17 +963,7 @@ impl Competing {
             .into());
         }
         Residence::settle(server, SETTLE_TIMEOUT).await?;
-        self.bench = Some(Arc::new(Bench::new(
-            &client,
-            fixture,
-            &[
-                Case::Selective,
-                Case::SmallAggregate,
-                Case::MillionAggregate,
-                Case::TableAggregate,
-                Case::FullScan,
-            ],
-        )));
+        self.bench = Some(Arc::new(Bench::new(&client, fixture, &MIXED)));
         let [setup] = server.tenants() else {
             return Err("setup provisioned one tenant".into());
         };
@@ -1066,16 +1056,90 @@ mod tests {
 
     use tokio::time::Instant;
 
-    use wyrd_telemetry::timing::{Distribution, IntervalScan};
+    use wyrd_telemetry::timing::{Distribution, IntervalScan, IntervalSeries};
     use wyrd_testing::capacity::Population;
     use wyrd_testing::experiment::Repetition;
 
     use num_traits::ToPrimitive;
 
     use super::{
-        Acked, Asked, Case, Offered, Phases, QUERY_CLIENTS, QUERY_RATE, Windows, mixed_case,
-        open_loop, read_ingest, read_queries,
+        Acked, Asked, Case, Offered, Phases, QUERY_CLIENTS, QUERY_RATE, WRONG_RESULT, expected,
+        mixed_case, open_loop, read_ingest, read_queries,
     };
+
+    /// A successful `bifrost.query` series of `case` in `phase` with one
+    /// observation of `nanos`.
+    fn timed(case: &str, phase: &str, nanos: u64) -> IntervalSeries {
+        IntervalSeries {
+            boundary: "bifrost.query".to_owned(),
+            outcome: "success".to_owned(),
+            case: case.to_owned(),
+            phase: phase.to_owned(),
+            count: 1,
+            elapsed: Distribution::of_durations(&[nanos]).expect("an in-range duration"),
+            excluded: None,
+            residual: None,
+            missing_excluded: 0,
+            out_of_range: 0,
+            negative_residual: 0,
+        }
+    }
+
+    /// A slow capacity query that completes during overload stays in the
+    /// capacity cohort and its percentiles; a wrong answer is owed as a
+    /// success; and a probe or another phase never covers a missing offered
+    /// observation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a cohort is moved, covered, or miscounted.
+    #[test]
+    fn cohorts_follow_admission_not_completion() {
+        let start = Instant::now();
+        let phases = Phases {
+            overload: start + Duration::from_secs(5),
+            overloaded: start + Duration::from_secs(7),
+            end: start + Duration::from_secs(12),
+        };
+        let asked = |phase, result| Asked {
+            at: start + Duration::from_secs(6),
+            phase,
+            case: Case::Selective,
+            result,
+        };
+        let asked = [
+            asked("capacity", Ok(1)),
+            asked("capacity", Err(WRONG_RESULT.to_owned())),
+            asked("capacity", Err("WYRD_X".to_owned())),
+        ];
+        let owed = expected(&asked, &[]);
+        let point = owed
+            .iter()
+            .find(|cohort| cohort.case == "point-lookup" && cohort.phase == "capacity")
+            .expect("the capacity point cohort");
+        assert_eq!(point.count, 2);
+        let mut covered = Population {
+            series: vec![
+                timed("point-lookup", "capacity", 9_000_000),
+                timed("probe", "capacity", 1_000_000),
+                timed("point-lookup", "overload", 1_000_000),
+            ],
+            ..Population::default()
+        };
+        covered.expect(&owed);
+        assert_eq!(
+            covered.invalid,
+            [
+                "1 `bifrost.query` timing observations of case point-lookup in phase capacity have outcome `success` for 2 completed requests",
+                "1 `bifrost.query` timing observations of case point-lookup in phase overload have outcome `success` for 0 completed requests",
+            ]
+        );
+        let mut repetition = Repetition::default();
+        read_queries(&mut repetition, &asked, &covered, &phases);
+        let p99 = repetition.reading("capacity.point_p99_ms");
+        assert!(p99.value.is_some_and(|ms| ms >= 9.0), "{p99:?}");
+        assert_eq!(repetition.reading("capacity.queries").value, Some(1.0));
+    }
 
     /// A slow answer never postpones a due query: the open loop sends every
     /// arrival on schedule and keeps every answer, misses arrivals once its
@@ -1124,14 +1188,18 @@ mod tests {
         let start = Instant::now();
         let end = start + Duration::from_secs(12);
         let phases = Phases {
-            start,
             overload: start + Duration::from_secs(5),
             overloaded: start + Duration::from_secs(7),
             end,
         };
         let early = end - Duration::from_secs(1);
         let late = end + Duration::from_secs(1);
-        let asked = |at, case, result| Asked { at, case, result };
+        let asked = |at, case, result| Asked {
+            at,
+            phase: "recovery",
+            case,
+            result,
+        };
         let asked = [
             asked(early, Case::TableAggregate, Ok(1)),
             asked(end, Case::TableAggregate, Ok(1)),
@@ -1139,6 +1207,7 @@ mod tests {
         ];
         let acked = |at, rows, result| Acked {
             at,
+            phase: "recovery",
             rows,
             wire: rows * 1_048_576,
             result,
@@ -1156,7 +1225,7 @@ mod tests {
             IntervalScan {
                 outcome: "success".to_owned(),
                 case: case.to_owned(),
-                phase: "none".to_owned(),
+                phase: "recovery".to_owned(),
                 count: 1,
                 rows: facts(rows),
                 bytes: facts(9),
@@ -1165,16 +1234,17 @@ mod tests {
                 out_of_range: 0,
             }
         };
-        let windows = Windows {
-            whole: Population {
-                scans: vec![scan("table-aggregate", 7), scan("probe", 1000)],
-                ..Population::default()
-            },
-            ..Windows::default()
+        let population = Population {
+            series: vec![
+                timed("table-aggregate", "recovery", 1),
+                timed("probe", "recovery", 1),
+            ],
+            scans: vec![scan("table-aggregate", 7), scan("probe", 1000)],
+            ..Population::default()
         };
         let mut repetition = Repetition::default();
-        read_queries(&mut repetition, &asked, &windows, &phases);
-        read_ingest(&mut repetition, &offered, &[], &windows, &phases);
+        read_queries(&mut repetition, &asked, &population, &phases);
+        read_ingest(&mut repetition, &offered, &[], &population, &phases);
         let value = |id: &str| repetition.reading(id).value;
         assert_eq!(value("queries"), Some(1.0));
         assert_eq!(value("table_aggregates"), Some(1.0));

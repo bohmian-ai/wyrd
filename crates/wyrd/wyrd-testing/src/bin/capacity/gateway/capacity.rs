@@ -8,10 +8,13 @@
 //! places every arrival in advance and [`open_loop`] launches each at its
 //! instant whatever the responses do: an arrival more than [`MISS_AFTER`]
 //! late is missed and one beyond [`MAX_IN_FLIGHT`] open calls is capped,
-//! //! never replayed or queued. The SLOs judge the server's own timing
-//! histograms (from handler entry to the buffered answer, stream head, or
-//! final frame handoff) between snapshots at each phase boundary, every
-//! tenant together: tenants are never a snapshot label. Client chunk lag, each data event's receipt behind its
+//! //! never replayed or queued. Every call declares its mode's case and the
+//! phase that admitted it. Work, seconds, and CPU stop at the schedule's
+//! end; calls then in flight drain into their cohort and count late. The
+//! SLOs judge the server's own timing histograms (from handler entry to the
+//! buffered answer, stream head, or final frame handoff) of each admitted
+//! phase's cohort once every call drained, every tenant together: tenants
+//! are never a snapshot label. Client chunk lag, each data event's receipt behind its
 //! [`PacedUpstream`] send, is diagnostic. A sampler reads in-flight calls, active server calls, and
 //! outbox backlog every second, and scrapes at each phase boundary attribute
 //! shedding to the phase that caused it.
@@ -30,8 +33,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_testing::capacity::{
-    NANOS_PER_MS, Percentiles, Population, Selection, UNLABELLED, Usage, Window, release_binary,
+    Expected, NANOS_PER_MS, Percentiles, Population, Selection, Usage, Window, release_binary,
 };
 use wyrd_testing::experiment::{
     Arrivals, ExperimentError, Phase, Reading, Repetition, Step, Workload,
@@ -44,7 +48,7 @@ use crate::gateway::run::{
     smoke,
 };
 use crate::gateway::workload::{CapturePolicy, Shape, Tenant, Timed, call, http};
-use crate::gateway::{PROCESS, Result, param, shutdown};
+use crate::gateway::{Case, PROCESS, Result, param, shutdown};
 
 /// The overload phase's rate over the declared rate.
 pub const OVERLOAD_FACTOR: f64 = 2.0;
@@ -239,6 +243,36 @@ pub enum Period {
     Overload,
     /// Judged recovery.
     Recovery,
+}
+
+impl Period {
+    /// Every period, in schedule order.
+    pub const ALL: [Self; 3] = [Self::Capacity, Self::Overload, Self::Recovery];
+
+    /// The closed benchmark phase its calls declare.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Capacity => "capacity",
+            Self::Overload => "overload",
+            Self::Recovery => "recovery",
+        }
+    }
+}
+
+/// The closed benchmark case of a call of `stream` mode.
+#[must_use]
+pub const fn mode(stream: bool) -> Case {
+    if stream { Case::ChatStream } else { Case::Chat }
+}
+
+/// The server timings of the calls `phase` admitted, both modes.
+#[must_use]
+pub fn cohort(population: &Population, phase: Period) -> Population {
+    let mut cohort = population.only(mode(false).label(), phase.label());
+    let streamed = population.only(mode(true).label(), phase.label());
+    cohort.series.extend(streamed.series);
+    cohort
 }
 
 /// Every arrival of a run of fixed-rate segments, placed in advance.
@@ -584,6 +618,8 @@ pub struct Observed {
     pub durable_bytes: f64,
     /// The drain after arrivals stopped.
     pub drain: Drain,
+    /// Answered calls that completed after the schedule's end.
+    pub late: u64,
 }
 
 impl Observed {
@@ -638,15 +674,14 @@ impl Observed {
         repetition.set("recovery.errors", Reading::count(recovery));
         repetition.set("overload.refused", Reading::count(refused));
         repetition.set("errors", Reading::count(capacity + overload + recovery));
-        repetition.set(
-            "requests",
-            Reading::count(
-                self.calls
-                    .iter()
-                    .filter(|call| call.timed.outcome.answered())
-                    .count() as u64,
-            ),
-        );
+        let answered = self
+            .calls
+            .iter()
+            .filter(|call| call.timed.outcome.answered())
+            .count() as u64;
+        repetition.set("requests", Reading::count(answered - self.late));
+        repetition.set("late_requests", Reading::count(self.late));
+        repetition.set("drain_seconds", Reading::exact(usage.drain_seconds));
         self.capacity.percentiles(
             &mut repetition,
             BUFFERED,
@@ -704,7 +739,7 @@ impl Observed {
                 "{unmatched} streams whose data events did not pair with upstream sends"
             ));
         }
-        self.population.validate(&mut repetition);
+        self.population.validate(&mut repetition, "measured");
         if self.ownership.len() != TENANTS.len() {
             repetition
                 .invalid
@@ -765,14 +800,16 @@ impl Driver {
         }
     }
 
-    /// Launches the [`contention`] arrivals of `schedule` from `start` into
-    /// `calls`, each marked `<label>-<index>` so its upstream send times
-    /// match, holding at most [`MAX_IN_FLIGHT`] of `slots`. Resolves with the
-    /// driver's counts and every sent call once all have completed; the
-    /// caller's future owns the schedule, so cancelling it stops launching.
+    /// Launches the [`contention`] arrivals of `phases`' schedule at `rate`
+    /// from `start` into `calls`, each marked `<label>-<index>` so its
+    /// upstream send times match and labelled with its mode and admitting
+    /// [`Period`], holding at most [`MAX_IN_FLIGHT`] of `slots`. Resolves
+    /// with the driver's counts and every sent call once all have
+    /// completed; the caller's future owns the schedule, so cancelling it
+    /// stops launching.
     pub async fn drive(
         &self,
-        schedule: Schedule,
+        (phases, rate): (&Phases, f64),
         start: Instant,
         label: &str,
         slots: Arc<Semaphore>,
@@ -786,13 +823,16 @@ impl Driver {
             let marker = format!("{label}-{}", planned.index);
             let shape = self.shapes[usize::from(stream)].clone();
             let body = shape.body(&marker);
+            let labels = (mode(stream).label(), phases.phase(planned.offset).label());
             let (http, upstream, arrived) = (
                 self.http.clone(),
                 Arc::clone(&self.upstream),
                 Arc::clone(&arrived),
             );
             async move {
-                let timed = call(&http, &key, &shape, body).await;
+                let timed =
+                    with_benchmark_labels(labels.0, labels.1, call(&http, &key, &shape, body))
+                        .await;
                 let sends = upstream.take(&marker);
                 arrived
                     .lock()
@@ -806,6 +846,7 @@ impl Driver {
                     });
             }
         };
+        let schedule = phases.schedule(rate);
         let driven = open_loop(&schedule, start, slots, MAX_IN_FLIGHT, calls, launch).await;
         let arrived = std::mem::take(&mut *arrived.lock().unwrap_or_else(PoisonError::into_inner));
         (driven, arrived)
@@ -923,8 +964,9 @@ impl Capacity {
     }
 
     /// Runs `phase` of `step` over `window`: the whole capacity, overload,
-    /// recovery schedule, then the drain, capture reads, and the server
-    /// timings between snapshots at each phase boundary.
+    /// recovery schedule, measured until its end while admitted calls
+    /// drain, then the capture drain and reads, and each admitted phase's
+    /// cohort of the drained server timings.
     ///
     /// # Errors
     ///
@@ -951,7 +993,7 @@ impl Capacity {
         let driving = async {
             let driven = driver
                 .drive(
-                    phases.schedule(rate),
+                    (&phases, rate),
                     start,
                     &label,
                     Arc::clone(&slots),
@@ -963,35 +1005,45 @@ impl Capacity {
         };
         let boundaries = async {
             let overload = scrape_at(server, start, phases.capacity).await?;
-            let capacity = server.timings().await?;
             let recovery = scrape_at(server, start, phases.judged()).await?;
-            let judged = server.timings().await?;
-            Result::Ok((overload, recovery, capacity, judged))
+            Result::Ok((overload, recovery))
         };
-        let (driven, backlog, boundaries) =
-            tokio::join!(driving, sample(server, &slots, start, &stop), boundaries);
-        let completed = server.timings().await?;
+        let end = (start + window).into_std();
+        let work =
+            async { tokio::join!(driving, sample(server, &slots, start, &stop), boundaries) };
+        let ((driven, backlog, boundaries), usage, ended) =
+            traffic.measure(server, end, work).await?;
         let (driven, calls) = driven;
-        let (usage, ended) = traffic.close(server).await?;
         let drain = settle(server).await?;
         let last = server.metrics().await?;
         if phase == Phase::Warmup {
             return Ok(Repetition::default());
         }
-        let (at_overload, at_recovery, capacity, judged) = boundaries?;
-        let count =
-            |pick: fn(&Arrived) -> bool| calls.iter().filter(|call| pick(call)).count() as u64;
-        let streams = count(|call| call.stream);
-        let expected = [
-            (BUFFERED, UNLABELLED, calls.len() as u64 - streams),
-            (STREAM_HEAD, UNLABELLED, streams),
-            (
-                STREAM_END,
-                UNLABELLED,
-                count(|call| call.stream && call.timed.outcome.answered()),
-            ),
-        ];
-        let population = Population::collect(server, &timings, &expected, true).await;
+        let (at_overload, at_recovery) = boundaries?;
+        let mut expected = Vec::new();
+        for period in Period::ALL {
+            for stream in [false, true] {
+                let answered = calls
+                    .iter()
+                    .filter(|call| call.stream == stream && call.timed.outcome.answered())
+                    .filter(|call| phases.phase(call.offset) == period)
+                    .count() as u64;
+                for boundary in crate::gateway::run::boundaries(stream) {
+                    expected.push(Expected {
+                        boundary,
+                        outcome: SUCCEEDED,
+                        case: mode(stream).label(),
+                        phase: period.label(),
+                        count: answered,
+                    });
+                }
+            }
+        }
+        let population = Population::collect(server, &timings, &expected).await;
+        let late = calls
+            .iter()
+            .filter(|call| call.timed.outcome.answered() && call.timed.done >= end)
+            .count() as u64;
         let after = self.captured().await?;
         let ownership = (0..TENANTS.len())
             .map(|tenant| {
@@ -1026,11 +1078,12 @@ impl Capacity {
             overload_shed: Integrity::between(&at_overload, &at_recovery).shed,
             admitted,
             ownership,
+            capacity: cohort(&population, Period::Capacity),
+            recovery: cohort(&population, Period::Recovery),
             population,
-            capacity: Population::from_interval(capacity.since(&timings)?),
-            recovery: Population::from_interval(completed.since(&judged)?),
             durable_bytes: Durable::between(&baseline, &ended).bytes,
             drain,
+            late,
         };
         Ok(observed.repetition())
     }
@@ -1053,10 +1106,10 @@ impl Workload for Capacity {
         else {
             return Err(ExperimentError::workload("the workload did not start"));
         };
-        let shapes: Vec<(Shape, CapturePolicy)> = driver
+        let shapes: Vec<(Case, Shape, CapturePolicy)> = driver
             .shapes
             .iter()
-            .map(|shape| (shape.clone(), CapturePolicy::Metadata))
+            .map(|shape| (mode(shape.stream), shape.clone(), CapturePolicy::Metadata))
             .collect();
         smoke(server, tenant, &shapes)
             .await
@@ -1457,6 +1510,7 @@ mod tests {
                 seconds: 0.5,
                 remaining: 0.0,
             },
+            late: 0,
         }
     }
 

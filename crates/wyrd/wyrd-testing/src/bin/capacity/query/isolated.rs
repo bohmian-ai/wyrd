@@ -16,12 +16,11 @@ use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
-use tokio_util::sync::CancellationToken;
-use wyrd_testing::capacity::{Population, Selection, UNLABELLED, Window};
+use wyrd_testing::capacity::{Expected, Population, Selection, Window};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
 use wyrd_testing::release_server::LocalServer;
 
-use crate::query::run::{Bench, Outcome, Sender, WRONG_RESULT, ask};
+use crate::query::run::{Admission, Bench, Outcome, Sender, WRONG_RESULT, ask};
 use crate::query::telemetry::{self, Telemetry};
 use crate::query::workload::{Case, Fixture, Rows, TABLE};
 use crate::query::{
@@ -84,8 +83,11 @@ impl Isolated {
     /// Runs one closed-loop window of `step` for `window` and reads its
     /// server timings, client diagnostics, and server and driver usage.
     ///
-    /// Every request the window sent must have exactly one server timing at
-    /// its boundary; the judged percentiles are the successful ones'. Each write
+    /// Every request carries its case and `phase`; the window admits until
+    /// its stop, and its work, seconds, and CPU stop there while requests
+    /// then in flight drain, counted late. Every request the server answered
+    /// must have exactly one successful server timing in its cohort; the
+    /// judged percentiles are that whole cohort's, late ones included. Each write
     /// path after the first waits, before its first warmup, for every
     /// earlier row to publish, so no path's server CPU pays for another
     /// path's backlog; a path's 64-client step still carries its own
@@ -120,65 +122,75 @@ impl Isolated {
                 .await
                 .map_err(ExperimentError::workload)?;
         }
+        let read = read_op(op);
+        let write = WriteOp::parse(op)
+            .and_then(|op| self.senders.iter().find(|(declared, ..)| *declared == op));
+        let case = match (read, write) {
+            (Some(read), _) => read.case(),
+            (None, Some((write, ..))) => write.name(),
+            (None, None) => {
+                return Err(ExperimentError::workload(format!(
+                    "step `{}` names no known op `{op}`",
+                    step.id
+                )));
+            }
+        };
         let timings = server.timings().await.map_err(ExperimentError::workload)?;
         let (opened, before) = Window::open(server, Selection::RESOURCES)
             .await
             .map_err(ExperimentError::workload)?;
-        let read = read_op(op);
-        let (outcome, write) = if let Some(read) = read {
-            let bench = self
-                .bench
-                .as_ref()
-                .ok_or_else(|| ExperimentError::workload("the read fixture was not loaded"))?;
-            let deadline = Instant::now() + window;
-            let outcome = match read {
-                Read::Events(case) => bench.drive(case, clients, deadline, &self.sequence).await,
-                Read::Trace => {
-                    let spans = self.spans;
-                    bench
-                        .drive_with(clients, deadline, &self.sequence, move |sequence| {
-                            Telemetry::trace_lookup(spans, sequence)
-                        })
-                        .await
+        let stop = Instant::now() + window;
+        let admission = Admission::measured(stop, (case, phase.label()));
+        let work = async {
+            match (read, write) {
+                (Some(read), _) => {
+                    let bench = self.bench.as_ref().ok_or_else(|| {
+                        ExperimentError::workload("the read fixture was not loaded")
+                    })?;
+                    let outcome = match read {
+                        Read::Events(case) => {
+                            bench.drive(case, clients, admission, &self.sequence).await
+                        }
+                        Read::Trace => {
+                            let spans = self.spans;
+                            bench
+                                .drive_with(clients, admission, &self.sequence, move |sequence| {
+                                    Telemetry::trace_lookup(spans, sequence)
+                                })
+                                .await
+                        }
+                        Read::Shredded | Read::LongTail => {
+                            let (_, question) = self
+                                .filters
+                                .iter()
+                                .find(|(filter, _)| *filter == read)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    ExperimentError::workload("the span fixture was not loaded")
+                                })?;
+                            bench
+                                .drive_with(clients, admission, &self.sequence, move |_| {
+                                    question.clone()
+                                })
+                                .await
+                        }
+                    };
+                    Ok((outcome, None))
                 }
-                Read::Shredded | Read::LongTail => {
-                    let (_, question) = self
-                        .filters
-                        .iter()
-                        .find(|(filter, _)| *filter == read)
-                        .cloned()
-                        .ok_or_else(|| {
-                            ExperimentError::workload("the span fixture was not loaded")
-                        })?;
-                    bench
-                        .drive_with(clients, deadline, &self.sequence, move |_| question.clone())
-                        .await
-                }
-            };
-            (outcome, None)
-        } else if let Some((write, sender, cursor)) = WriteOp::parse(op)
-            .and_then(|op| self.senders.iter().find(|(declared, ..)| *declared == op))
-        {
-            let stop = CancellationToken::new();
-            let timer = stop.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(window).await;
-                timer.cancel();
-            });
-            (
-                sender.closed_loop(cursor, i64::MAX, clients, &stop).await,
-                Some(*write),
-            )
-        } else {
-            return Err(ExperimentError::workload(format!(
-                "step `{}` names no known op `{op}`",
-                step.id
-            )));
+                (None, Some((write, sender, cursor))) => Ok((
+                    sender
+                        .closed_loop(cursor, i64::MAX, clients, admission)
+                        .await,
+                    Some(*write),
+                )),
+                (None, None) => Err(ExperimentError::workload("unreachable op")),
+            }
         };
-        let (usage, after) = opened
-            .close(server)
+        let (driven, usage, after) = opened
+            .measure(server, stop, work)
             .await
             .map_err(ExperimentError::workload)?;
+        let (outcome, write) = driven?;
         if self.experiment == Experiment::Hot {
             hot(server).await?;
         }
@@ -192,10 +204,15 @@ impl Isolated {
             ..Repetition::default()
         };
         let boundary = write.map_or("bifrost.query", WriteOp::boundary);
-        let sent = outcome.latencies_us.len() as u64 + outcome.error_count();
-        let population =
-            Population::collect(server, &timings, &[(boundary, UNLABELLED, sent)], true).await;
-        population.validate(&mut repetition);
+        let cohort = Expected {
+            boundary,
+            outcome: SUCCESS,
+            case,
+            phase: phase.label(),
+            count: outcome.answered(),
+        };
+        let population = Population::collect(server, &timings, &[cohort]).await;
+        population.validate(&mut repetition, "measured");
         population.percentiles(
             &mut repetition,
             boundary,
@@ -208,6 +225,7 @@ impl Isolated {
             Reading::count(population.others(boundary, SUCCESS)),
         );
         read_outcome(&mut repetition, &outcome, read);
+        repetition.set("drain_seconds", Reading::exact(usage.drain_seconds));
         if read.is_some() {
             let [rows, bytes] = population.scanned_per_query(SUCCESS);
             repetition.set("scanned_rows_per_query", rows);
@@ -218,14 +236,15 @@ impl Isolated {
         }
         if let Some(write) = write {
             let inserted = after.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
-            repetition.set("rows", Reading::count(outcome.rows));
+            repetition.set("rows", Reading::count(outcome.rows - outcome.late_rows));
+            repetition.set("late_rows", Reading::count(outcome.late_rows));
             repetition.set("retained_mib", Reading::exact(inserted / MIB));
             repetition.set(
                 "wire_bytes",
                 if write == WriteOp::Native {
                     Reading::missing("native writes send Arrow IPC, not OTLP")
                 } else {
-                    Reading::count(outcome.wire_bytes)
+                    Reading::count(outcome.wire_bytes - outcome.late_wire_bytes)
                 },
             );
             repetition.set(
@@ -290,13 +309,14 @@ async fn scanned(
     Ok(SCANNED.map(|family| after.sum(family, &[]) - before.sum(family, &[])))
 }
 
-/// Sets the client readings every closed-loop step shares: requests,
-/// errors, diagnostic client round-trip percentiles, and, for a `read`,
-/// answered and wrong queries.
+/// Sets the client readings every closed-loop step shares: requests
+/// completed by the stop and late, errors, diagnostic client round-trip
+/// percentiles, and, for a `read`, measured and wrong queries.
 fn read_outcome(repetition: &mut Repetition, outcome: &Outcome, read: Option<Read>) {
     let wrong = outcome.errors.get(WRONG_RESULT).copied().unwrap_or(0);
-    let requests = outcome.latencies_us.len().to_u64().unwrap_or(u64::MAX);
+    let requests = outcome.measured();
     repetition.set("requests", Reading::count(requests));
+    repetition.set("late_requests", Reading::count(outcome.late));
     repetition.set("errors", Reading::count(outcome.error_count()));
     for (id, q) in [
         ("client_p50_ms", 0.5),
@@ -453,7 +473,7 @@ impl Workload for Isolated {
             let before = server.metrics().await.map_err(ExperimentError::workload)?;
             let end = cursor.load(Ordering::Relaxed) + rows;
             let sample = sender
-                .closed_loop(cursor, end, LOADERS, &CancellationToken::new())
+                .closed_loop(cursor, end, LOADERS, Admission::default())
                 .await;
             cursor.store(end, Ordering::Relaxed);
             let after = server.metrics().await.map_err(ExperimentError::workload)?;
@@ -478,7 +498,7 @@ impl Workload for Isolated {
                 &Arc::new(AtomicI64::new(0)),
                 fixture.rows,
                 LOADERS,
-                &CancellationToken::new(),
+                Admission::default(),
             )
             .await;
         if loaded.error_count() > 0 || loaded.rows != fixture.rows.cast_unsigned() {

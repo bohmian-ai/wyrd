@@ -57,10 +57,10 @@ pub const HIGHEST_NS: u64 = 1 << 37;
 pub const HIGHEST_SCAN: u64 = 1 << 50;
 
 /// The most timing series one process keeps.
-pub const MAX_SERIES: usize = 128;
+pub const MAX_SERIES: usize = 256;
 
 /// The most scan series one process keeps.
-pub const MAX_SCAN_SERIES: usize = 32;
+pub const MAX_SCAN_SERIES: usize = 64;
 
 /// The request metadata carrying a benchmark request's case.
 pub const CASE_HEADER: &str = "x-wyrd-benchmark-case";

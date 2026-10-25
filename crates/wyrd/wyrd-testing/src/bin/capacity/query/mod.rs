@@ -35,8 +35,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
-use wyrd_testing::capacity::{Population, Selection, Smoke, UNLABELLED, Window};
+use wyrd_testing::capacity::{Expected, Population, SMOKE, Selection, Smoke, Window};
 use wyrd_testing::experiment::{
     Baselines, Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reason,
     Record, Status, Step, Verdict,
@@ -175,6 +176,19 @@ pub enum Read {
     Shredded,
     /// A span filter on a long-tail key below the shredding threshold.
     LongTail,
+}
+
+impl Read {
+    /// The closed benchmark case its queries carry.
+    #[must_use]
+    pub const fn case(self) -> &'static str {
+        match self {
+            Self::Events(case) => case.label(),
+            Self::Trace => "trace-lookup",
+            Self::Shredded => "shredded-filter",
+            Self::LongTail => "long-tail-filter",
+        }
+    }
 }
 
 /// The `hot` read steps.
@@ -1355,8 +1369,9 @@ async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
 /// requests through every lane, advancing its cursor so later windows write
 /// fresh identities, then exact `count(*)` queries over the smoked native
 /// rows until one answers, all inside one window and without waiting for
-/// publication. Every request must land in the server's histograms as
-/// exactly one successful timing at its boundary, with positive server CPU
+/// publication. Every request carries its case and the `smoke` phase and
+/// must land in the server's histograms as exactly one successful timing
+/// in that cohort at its boundary, with positive server CPU
 /// and inserted memtable bytes.
 ///
 /// # Errors
@@ -1379,7 +1394,7 @@ async fn smoke(
         let chunk = sender.request_rows();
         for _ in 0..SMOKE_WRITES {
             let first = cursor.fetch_add(chunk, Ordering::Relaxed);
-            match sender.send(first, first + chunk).await {
+            match with_benchmark_labels(op.name(), SMOKE, sender.send(first, first + chunk)).await {
                 Ok(wire) if *op != WriteOp::Native => {
                     smoke.positive(&format!("{} wire bytes", op.name()), wire as f64);
                 }
@@ -1389,7 +1404,13 @@ async fn smoke(
                 }
             }
         }
-        expected.push((op.boundary(), UNLABELLED, SMOKE_WRITES.cast_unsigned()));
+        expected.push(Expected {
+            boundary: op.boundary(),
+            outcome: isolated::SUCCESS,
+            case: op.name(),
+            phase: SMOKE,
+            count: SMOKE_WRITES.cast_unsigned(),
+        });
     }
     let queries = Bifrost::query_only(client);
     let sql = format!("SELECT count(*) FROM {}", workload::INGEST_TABLE);
@@ -1397,9 +1418,13 @@ async fn smoke(
     let mut answered = false;
     while !answered && asked < SMOKE_QUERIES {
         asked += 1;
-        answered = run::ask(&queries, sql.clone(), &vec![vec![native_rows]])
-            .await
-            .is_ok();
+        answered = with_benchmark_labels(
+            "probe",
+            SMOKE,
+            run::ask(&queries, sql.clone(), &vec![vec![native_rows]]),
+        )
+        .await
+        .is_ok();
         if !answered {
             tokio::time::sleep(SMOKE_POLL).await;
         }
@@ -1409,7 +1434,13 @@ async fn smoke(
             "none of {asked} `count(*)` queries answered the {native_rows} acknowledged native rows exactly"
         ));
     }
-    expected.push(("bifrost.query", UNLABELLED, asked));
+    expected.push(Expected {
+        boundary: "bifrost.query",
+        outcome: isolated::SUCCESS,
+        case: "probe",
+        phase: SMOKE,
+        count: asked,
+    });
     let (usage, after) = window
         .close(server)
         .await
@@ -1420,7 +1451,7 @@ async fn smoke(
     let population = Population::smoke(server, &timings, &expected).await;
     let boundaries: Vec<(&str, &str, bool)> = expected
         .iter()
-        .map(|(boundary, _, _)| (*boundary, isolated::SUCCESS, false))
+        .map(|cohort| (cohort.boundary, cohort.outcome, false))
         .collect();
     smoke.timings(&population, &boundaries);
     smoke.finish()

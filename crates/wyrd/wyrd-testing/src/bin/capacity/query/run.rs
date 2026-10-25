@@ -17,6 +17,7 @@ use num_traits::ToPrimitive;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use wyrd_client::bifrost::{BifrostClientError, BifrostOptions, TableConfig};
+use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
 use wyrd_testing::release_server::LocalServer;
@@ -47,19 +48,69 @@ const QUEUE_SETTLE: Duration = Duration::from_secs(60);
 /// How long the query sent into the full queue may take to be refused.
 const OVERFLOW_WAIT: Duration = Duration::from_secs(30);
 
+/// A closed benchmark case and the phase that admitted a request.
+pub type Labels = (&'static str, &'static str);
+
+/// What a closed loop admits under: the stop after which it admits nothing
+/// and counts completions as late, and the benchmark labels its requests
+/// carry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Admission {
+    /// The admission stop; `None` admits until the loop's own end.
+    pub stop: Option<Instant>,
+    /// The labels of every request, or `None` for unclassified work such
+    /// as a fixture load.
+    pub labels: Option<Labels>,
+}
+
+impl Admission {
+    /// A measured loop's admission: until `stop`, labelled `labels`.
+    pub const fn measured(stop: Instant, labels: Labels) -> Self {
+        Self {
+            stop: Some(stop),
+            labels: Some(labels),
+        }
+    }
+
+    /// Whether a request may still be admitted.
+    fn open(&self) -> bool {
+        self.stop.is_none_or(|stop| Instant::now() < stop)
+    }
+
+    /// Whether a completion now is after the stop.
+    fn late(&self) -> bool {
+        self.stop.is_some_and(|stop| Instant::now() >= stop)
+    }
+
+    /// Runs `future` with this admission's labels on its requests.
+    pub async fn labelled<F: Future>(self, future: F) -> F::Output {
+        match self.labels {
+            Some((case, phase)) => with_benchmark_labels(case, phase, future).await,
+            None => future.await,
+        }
+    }
+}
+
 /// What one closed loop observed.
 #[derive(Debug, Default)]
 pub struct Outcome {
-    /// Latency of every successful request, microseconds.
+    /// Latency of every successful request, microseconds, late ones
+    /// included.
     pub latencies_us: Vec<u64>,
     /// Failed requests by stable error code, `wrong-result`, or terminal.
     pub errors: BTreeMap<String, u64>,
-    /// Rows durably acknowledged by a write loop.
+    /// Rows durably acknowledged by a write loop, late ones included.
     pub rows: u64,
     /// Encoded OTLP protobuf bytes of the acknowledged export requests,
     /// before transport framing and without compression; zero for native
-    /// writes.
+    /// writes. Late ones included.
     pub wire_bytes: u64,
+    /// Successful requests that completed after the admission stop.
+    pub late: u64,
+    /// Rows of the late requests.
+    pub late_rows: u64,
+    /// Encoded bytes of the late requests.
+    pub late_wire_bytes: u64,
 }
 
 impl Outcome {
@@ -68,11 +119,39 @@ impl Outcome {
         self.errors.values().sum()
     }
 
+    /// Successful requests that completed by the admission stop: the
+    /// measured work.
+    pub fn measured(&self) -> u64 {
+        self.latencies_us.len() as u64 - self.late
+    }
+
+    /// Requests the server answered successfully, late ones included: every
+    /// success and every query whose rows were wrong.
+    pub fn answered(&self) -> u64 {
+        self.latencies_us.len() as u64 + self.errors.get(WRONG_RESULT).copied().unwrap_or(0)
+    }
+
+    /// Records one success of `rows` rows and `wire` bytes, sent at `sent`,
+    /// late when it completed after `admission`'s stop.
+    fn succeeded(&mut self, admission: &Admission, sent: Instant, rows: u64, wire: u64) {
+        self.latencies_us.push(micros(sent));
+        self.rows += rows;
+        self.wire_bytes += wire;
+        if admission.late() {
+            self.late += 1;
+            self.late_rows += rows;
+            self.late_wire_bytes += wire;
+        }
+    }
+
     /// Folds another client's results into this one.
     fn merge(&mut self, other: Self) {
         self.latencies_us.extend(other.latencies_us);
         self.rows += other.rows;
         self.wire_bytes += other.wire_bytes;
+        self.late += other.late;
+        self.late_rows += other.late_rows;
+        self.late_wire_bytes += other.late_wire_bytes;
         for (code, count) in other.errors {
             *self.errors.entry(code).or_default() += count;
         }
@@ -237,7 +316,9 @@ impl Sender {
 
     /// Sends from `writers` concurrent closed-loop senders, each taking the
     /// next [`Self::request_rows`] rows from the shared `cursor`, until the
-    /// cursor reaches `end` or `stop` is cancelled.
+    /// cursor reaches `end` or `admission` stops; each request carries
+    /// `admission`'s labels on every attempt, and one completing after its
+    /// stop is late.
     ///
     /// The cursor only grows, so every request carries fresh identities and
     /// a later loop never repeats an earlier one's rows as a retry.
@@ -246,27 +327,28 @@ impl Sender {
         cursor: &Arc<AtomicI64>,
         end: i64,
         writers: usize,
-        stop: &CancellationToken,
+        admission: Admission,
     ) -> Outcome {
         let chunk = self.request_rows();
         let mut tasks = JoinSet::new();
         for _ in 0..writers {
-            let (sender, cursor, stop) = (self.clone(), Arc::clone(cursor), stop.clone());
+            let (sender, cursor) = (self.clone(), Arc::clone(cursor));
             tasks.spawn(async move {
                 let mut outcome = Outcome::default();
-                while !stop.is_cancelled() {
+                while admission.open() {
                     let first = cursor.fetch_add(chunk, Ordering::Relaxed);
                     if first >= end {
                         break;
                     }
                     let last = (first + chunk).min(end);
                     let sent = Instant::now();
-                    match sender.send(first, last).await {
-                        Ok(wire) => {
-                            outcome.latencies_us.push(micros(sent));
-                            outcome.rows += (last - first).cast_unsigned();
-                            outcome.wire_bytes += wire;
-                        }
+                    match admission.labelled(sender.send(first, last)).await {
+                        Ok(wire) => outcome.succeeded(
+                            &admission,
+                            sent,
+                            (last - first).cast_unsigned(),
+                            wire,
+                        ),
                         Err(code) => *outcome.errors.entry(code).or_default() += 1,
                     }
                 }
@@ -351,29 +433,30 @@ impl Bench {
         (case.sql(self.fixture, sequence), expected)
     }
 
-    /// Runs `clients` closed-loop clients of `case` until `deadline`, each
+    /// Runs `clients` closed-loop clients of `case` under `admission`, each
     /// taking the next statement from the shared `sequence`.
     pub async fn drive(
         self: &Arc<Self>,
         case: Case,
         clients: usize,
-        deadline: Instant,
+        admission: Admission,
         sequence: &Arc<AtomicU64>,
     ) -> Outcome {
         let bench = Arc::clone(self);
-        self.drive_with(clients, deadline, sequence, move |next| {
+        self.drive_with(clients, admission, sequence, move |next| {
             bench.question(case, next)
         })
         .await
     }
 
-    /// Runs `clients` closed-loop clients until `deadline`, each asking the
-    /// statement and exact answer `question` gives the next value of the
-    /// shared `sequence`.
+    /// Runs `clients` closed-loop clients until `admission` stops, each
+    /// asking, under its labels, the statement and exact answer `question`
+    /// gives the next value of the shared `sequence`; an answer after the
+    /// stop is late.
     pub async fn drive_with(
         &self,
         clients: usize,
-        deadline: Instant,
+        admission: Admission,
         sequence: &Arc<AtomicU64>,
         question: impl Fn(u64) -> (String, Rows) + Send + Sync + 'static,
     ) -> Outcome {
@@ -387,12 +470,12 @@ impl Bench {
             );
             tasks.spawn(async move {
                 let mut outcome = Outcome::default();
-                while Instant::now() < deadline {
+                while admission.open() {
                     let next = sequence.fetch_add(1, Ordering::Relaxed);
                     let (sql, expected) = question(next);
                     let sent = Instant::now();
-                    match ask(&queries, sql, &expected).await {
-                        Ok(()) => outcome.latencies_us.push(micros(sent)),
+                    match admission.labelled(ask(&queries, sql, &expected)).await {
+                        Ok(()) => outcome.succeeded(&admission, sent, 0, 0),
                         Err(error) => *outcome.errors.entry(error).or_default() += 1,
                     }
                 }
@@ -603,7 +686,35 @@ fn authorized<T>(body: T, token: &str) -> std::result::Result<Request<T>, String
 
 #[cfg(test)]
 mod tests {
-    use super::{Outcome, accepted};
+    use std::time::Instant;
+
+    use super::{Admission, Outcome, accepted};
+
+    /// A request completing after the admission stop is late: its work
+    /// leaves the measured counts while its latency stays in the cohort.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a late completion is measured or dropped.
+    #[test]
+    fn completions_after_the_stop_are_late_and_kept() {
+        let stopped = Admission::measured(Instant::now(), ("native-write", "repetition-1"));
+        assert!(!stopped.open());
+        let mut outcome = Outcome::default();
+        outcome.succeeded(&Admission::default(), Instant::now(), 2, 20);
+        outcome.succeeded(&stopped, Instant::now(), 3, 30);
+        assert_eq!(
+            (outcome.measured(), outcome.late, outcome.answered()),
+            (1, 1, 2)
+        );
+        assert_eq!(
+            (
+                outcome.rows - outcome.late_rows,
+                outcome.wire_bytes - outcome.late_wire_bytes
+            ),
+            (2, 20)
+        );
+    }
 
     /// Merged client outcomes keep every sample, row, wire byte, and error
     /// code, and an export that dropped rows is a `partial-success` failure.
@@ -618,6 +729,7 @@ mod tests {
             errors: [("wrong-result".to_owned(), 1)].into(),
             rows: 10,
             wire_bytes: 100,
+            ..Outcome::default()
         };
         total.merge(Outcome {
             latencies_us: vec![3],
@@ -628,6 +740,7 @@ mod tests {
             .into(),
             rows: 5,
             wire_bytes: 50,
+            ..Outcome::default()
         });
         assert_eq!(total.latencies_us, [1, 2, 3]);
         assert_eq!(

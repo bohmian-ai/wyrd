@@ -126,6 +126,16 @@ impl Case {
         }
     }
 
+    /// The closed benchmark case its calls declare.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "buffered-metadata",
+            Self::ChatStream => "streamed-metadata",
+            Self::ChatCapture => "buffered-payload",
+        }
+    }
+
     /// What its tenant captures.
     #[must_use]
     pub const fn capture(self) -> CapturePolicy {

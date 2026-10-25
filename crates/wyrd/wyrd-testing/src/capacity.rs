@@ -34,8 +34,11 @@ use wyrd_telemetry::timing::{
     Distribution, IntervalScan, IntervalSeries, TimingInterval, TimingSnapshot,
 };
 
-use crate::experiment::{Reading, Repetition};
+use crate::experiment::{Reading, Reconciled, Repetition, TimingEvidence};
 use crate::release_server::{LocalServer, Metrics, PeakSampler};
+
+/// The benchmark phase every release smoke's requests declare.
+pub const SMOKE: &str = "smoke";
 
 /// Error type of the capacity helpers, matching the benchmark binaries.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -297,7 +300,10 @@ pub struct Usage {
     /// CPU seconds this benchmark process used, to show the driver was not
     /// the bottleneck; `None` when unreadable.
     pub driver_cpu_seconds: Option<f64>,
-    /// The workload's selected telemetry over the window.
+    /// Seconds the requests in flight at the window's stop took to drain
+    /// after it, outside `seconds` and both CPU readings.
+    pub drain_seconds: f64,
+    /// The workload's selected telemetry over the window and its drain.
     pub telemetry: Telemetry,
 }
 
@@ -306,7 +312,9 @@ pub struct Usage {
 ///
 /// Opening and closing each scrape `/metrics` once and hand that scrape back,
 /// so a workload reading further series takes them from the same scrape. The
-/// window's seconds end before the closing scrape; its CPU readings follow it.
+/// window's seconds and both CPU readings freeze together, before the
+/// closing scrape and, through [`Self::measure`], before the requests in
+/// flight at the window's stop drain.
 pub struct Window {
     /// Window start, taken once the opening readings are done.
     started: Instant,
@@ -346,9 +354,48 @@ impl Window {
     ///
     /// Returns scrape failures.
     pub async fn close(self, server: &LocalServer) -> Result<(Usage, Metrics), Error> {
-        let seconds = self.started.elapsed().as_secs_f64();
+        let ((), usage, metrics) = self.measure(server, Instant::now(), async {}).await?;
+        Ok((usage, metrics))
+    }
+
+    /// Runs `work` in the window and stops measuring at `stop`, or when
+    /// `work` ends first: the window's seconds, server CPU, and driver CPU
+    /// freeze there, and only then do the requests `work` still has in
+    /// flight drain, outside them, before the closing scrape. `work` must
+    /// admit nothing after `stop` and counts what completes after it as
+    /// late. Returns `work`'s output, the usage, and the closing scrape.
+    ///
+    /// # Errors
+    ///
+    /// Returns the closing scrape's failure.
+    pub async fn measure<T>(
+        self,
+        server: &LocalServer,
+        stop: Instant,
+        work: impl Future<Output = T>,
+    ) -> Result<(T, Usage, Metrics), Error> {
+        let Self {
+            started,
+            mut resources,
+            readings,
+            driver_cpu_seconds: driver_opened,
+        } = self;
+        let mut work = std::pin::pin!(work);
+        let early = tokio::select! {
+            output = &mut work => Some(output),
+            () = tokio::time::sleep_until(stop.into()) => None,
+        };
+        resources.freeze([server]);
+        let driver = elapsed(driver_opened, driver_cpu_seconds());
+        let stopped = Instant::now();
+        let output = match early {
+            Some(output) => output,
+            None => work.await,
+        };
+        let drain_seconds = stopped.elapsed().as_secs_f64();
+        let seconds = stopped.duration_since(started).as_secs_f64();
         let metrics = server.metrics().await?;
-        let resources = self.resources.finish([server], seconds);
+        let resources = resources.finish([server], seconds);
         let (server_cpu_seconds, peak_memory_bytes) = resources
             .first()
             .map_or((None, None), |used| (used.cpu_seconds, used.peak_memory));
@@ -356,10 +403,11 @@ impl Window {
             seconds,
             server_cpu_seconds,
             peak_memory_bytes,
-            driver_cpu_seconds: elapsed(self.driver_cpu_seconds, driver_cpu_seconds()),
-            telemetry: self.readings.since(&metrics),
+            driver_cpu_seconds: driver,
+            drain_seconds,
+            telemetry: readings.since(&metrics),
         };
-        Ok((usage, metrics))
+        Ok((output, usage, metrics))
     }
 }
 
@@ -509,12 +557,33 @@ pub fn timing_declaration() -> Value {
         "percentile": "nearest rank ceil(q * N) over the window's distribution",
         "server_env": { "WYRD_METRICS_BENCHMARK_SNAPSHOT": "1" },
         "tracing": "operator span export stays at its default (disabled); no span is required for timing",
-        "assignment": "a window takes the observations recorded between its two snapshots once its expected count arrived; a short or extra count, a dropped or out-of-range observation, an unknown label, a missing or negative component, or a replaced process makes it invalid",
+        "assignment": "every request carries its closed case and the repetition or admission phase that admitted it, activated once its caller authenticated; a window takes the observations recorded between its opening snapshot and one taken after its admitted cohort drained, so a late completion stays in its admitted cohort; each cohort's judged-outcome count must equal the completions the driver saw, other outcomes (retried or refused attempts) are counted beside it; a short or extra count, a dropped or out-of-range observation, an unknown label, a missing or negative component, scans that are not the answered cohort's, or a replaced process makes it invalid",
+        "measurement": "work, wall seconds, and server and driver CPU stop at the admission stop, before the requests then in flight drain; their completions count as late work beside the measured work, and their latency stays in the final cohort",
+        "evidence": "each window's full opening and drained snapshots are kept under the run's target artifacts as timings/<step>/<phase>.json; the record keeps each cohort's reconciliation and each percentile's rank and bucket bounds",
     })
 }
 
+/// One cohort a window owes server timings for: the requests of `case`
+/// admitted in `phase` that the driver saw complete with `outcome` at
+/// `boundary`, `count` of them. Attempts with any other outcome, such as a
+/// retried failure or a refusal, are counted beside it, never owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expected<'a> {
+    /// The server timing boundary.
+    pub boundary: &'a str,
+    /// The judged outcome the completions record.
+    pub outcome: &'a str,
+    /// The requests' closed case, or [`UNLABELLED`].
+    pub case: &'a str,
+    /// The closed phase that admitted them, or [`UNLABELLED`].
+    pub phase: &'a str,
+    /// Completions the driver saw.
+    pub count: u64,
+}
+
 /// One window's server timing observations: the series and scan facts
-/// recorded between two snapshots of one server process.
+/// recorded between two snapshots of one server process, and the
+/// snapshots and reconciliation they were read from.
 #[derive(Debug, Clone, Default)]
 pub struct Population {
     /// Every timing series with an observation in the window.
@@ -524,20 +593,22 @@ pub struct Population {
     /// Why the population is incomplete or untrustworthy; empty when it is
     /// complete.
     pub invalid: Vec<String>,
+    /// The snapshots the window differences, once read.
+    pub snapshots: Option<(TimingSnapshot, TimingSnapshot)>,
+    /// Each owed cohort's expected and recorded observations.
+    pub reconciliation: Vec<Reconciled>,
 }
 
 impl Population {
-    /// Waits up to [`COLLECTION_WAIT`] until `server` recorded `expected`
-    /// observations of each `(boundary, case)` since `before` (any outcome
-    /// and phase; [`UNLABELLED`] for requests without a case), exactly when
-    /// `exact` and at least otherwise, then takes the window.
+    /// Waits up to [`COLLECTION_WAIT`] until `server` recorded every
+    /// `expected` cohort since `before`, then takes the window; a cohort
+    /// recorded short or over is invalid.
     pub async fn collect(
         server: &LocalServer,
         before: &TimingSnapshot,
-        expected: &[(&str, &str, u64)],
-        exact: bool,
+        expected: &[Expected<'_>],
     ) -> Self {
-        Self::wait(server, before, expected, exact, COLLECTION_WAIT).await
+        Self::wait(server, before, expected, COLLECTION_WAIT).await
     }
 
     /// [`Self::collect`] for a smoke's exact requests, waiting at most
@@ -545,9 +616,9 @@ impl Population {
     pub async fn smoke(
         server: &LocalServer,
         before: &TimingSnapshot,
-        expected: &[(&str, &str, u64)],
+        expected: &[Expected<'_>],
     ) -> Self {
-        Self::wait(server, before, expected, true, SMOKE_WAIT).await
+        Self::wait(server, before, expected, SMOKE_WAIT).await
     }
 
     /// Polls `server`'s snapshot until the counts are reached or `wait`
@@ -555,15 +626,14 @@ impl Population {
     async fn wait(
         server: &LocalServer,
         before: &TimingSnapshot,
-        expected: &[(&str, &str, u64)],
-        exact: bool,
+        expected: &[Expected<'_>],
         wait: Duration,
     ) -> Self {
         let waiting = Instant::now();
         loop {
             let mut population = match server.timings().await {
-                Ok(after) => match after.since(before) {
-                    Ok(interval) => Self::from_interval(interval),
+                Ok(after) => match Self::between(before, after) {
+                    Ok(population) => population,
                     Err(reason) => return Self::refused(reason),
                 },
                 Err(error) => {
@@ -572,26 +642,63 @@ impl Population {
             };
             let reached = expected
                 .iter()
-                .all(|(boundary, case, want)| population.count(boundary, case) >= *want);
+                .all(|cohort| population.recorded(cohort) >= cohort.count);
             if reached || waiting.elapsed() >= wait {
-                population.expect(expected, exact);
+                population.expect(expected);
                 return population;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
-    /// Marks the population invalid for each `(boundary, case)` of
-    /// `expected` whose count is short, or, when `exact`, over.
-    pub fn expect(&mut self, expected: &[(&str, &str, u64)], exact: bool) {
-        for (boundary, case, want) in expected {
-            let count = self.count(boundary, case);
-            if count < *want || (exact && count != *want) {
+    /// The population of `after` since `before`, keeping both snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the snapshots do not difference: a replaced process or a
+    /// reset.
+    pub fn between(before: &TimingSnapshot, after: TimingSnapshot) -> Result<Self, String> {
+        let mut population = Self::from_interval(after.since(before)?);
+        population.snapshots = Some((before.clone(), after));
+        Ok(population)
+    }
+
+    /// Reconciles each `expected` cohort: one recorded short or over makes
+    /// the population invalid.
+    pub fn expect(&mut self, expected: &[Expected<'_>]) {
+        for cohort in expected {
+            let recorded = self.recorded(cohort);
+            if recorded != cohort.count {
                 self.invalid.push(format!(
-                    "{count} `{boundary}` timing observations of case {case} were recorded for {want} requests"
+                    "{recorded} `{}` timing observations of case {} in phase {} have outcome `{}` for {} completed requests",
+                    cohort.boundary, cohort.case, cohort.phase, cohort.outcome, cohort.count
                 ));
             }
+            self.reconciliation.push(Reconciled {
+                boundary: cohort.boundary.to_owned(),
+                outcome: cohort.outcome.to_owned(),
+                case: cohort.case.to_owned(),
+                phase: cohort.phase.to_owned(),
+                expected: cohort.count,
+                recorded,
+            });
         }
+    }
+
+    /// Observations recorded for `cohort`'s boundary, outcome, case, and
+    /// phase.
+    #[must_use]
+    pub fn recorded(&self, cohort: &Expected<'_>) -> u64 {
+        self.series
+            .iter()
+            .filter(|series| {
+                series.boundary == cohort.boundary
+                    && series.outcome == cohort.outcome
+                    && series.case == cohort.case
+                    && series.phase == cohort.phase
+            })
+            .map(|series| series.count)
+            .sum()
     }
 
     /// The population of `interval`, invalid for every dropped,
@@ -626,6 +733,7 @@ impl Population {
             series: interval.series,
             scans: interval.scans,
             invalid,
+            ..Self::default()
         }
     }
 
@@ -637,8 +745,9 @@ impl Population {
         }
     }
 
-    /// The observations of `case` in `phase` alone, keeping every invalid
-    /// reason; an L2 window judges each query class and phase this way.
+    /// The observations of `case` admitted in `phase` alone, keeping every
+    /// invalid reason but not the window's snapshots; an L2 window judges
+    /// each class's admitted cohort this way.
     #[must_use]
     pub fn only(&self, case: &str, phase: &str) -> Self {
         Self {
@@ -655,15 +764,16 @@ impl Population {
                 .cloned()
                 .collect(),
             invalid: self.invalid.clone(),
+            ..Self::default()
         }
     }
 
-    /// Observations of `boundary` and `case` of any outcome and phase.
+    /// Observations of `boundary` of any outcome, case, and phase.
     #[must_use]
-    pub fn count(&self, boundary: &str, case: &str) -> u64 {
+    pub fn count(&self, boundary: &str) -> u64 {
         self.series
             .iter()
-            .filter(|series| series.boundary == boundary && series.case == case)
+            .filter(|series| series.boundary == boundary)
             .map(|series| series.count)
             .sum()
     }
@@ -731,19 +841,33 @@ impl Population {
         )
     }
 
-    /// Keeps this population's invalid reasons and collection health on
-    /// `repetition`; call once per window.
-    pub fn validate(&self, repetition: &mut Repetition) {
+    /// Keeps this population's invalid reasons, collection health, and
+    /// reconciliation on `repetition`, and its snapshots as the evidence of
+    /// the repetition's `window`; call once per window.
+    pub fn validate(&self, repetition: &mut Repetition, window: &str) {
         repetition.invalid.extend(self.invalid.iter().cloned());
         repetition.observations.push(self.health());
+        repetition
+            .reconciliation
+            .extend(self.reconciliation.iter().cloned());
+        if let Some((before, after)) = &self.snapshots {
+            repetition.timings.push(TimingEvidence {
+                window: window.to_owned(),
+                before: before.clone(),
+                after: after.clone(),
+                reconciliation: self.reconciliation.clone(),
+            });
+        }
     }
 
     /// Sets each `(id, q)` of `ids` on `repetition` to the nearest-rank
     /// percentile q, in milliseconds, of the `boundary` observations with
     /// the judged `outcome`: their residuals when `residual`, else their
-    /// elapsed times. Other outcomes are counted by [`Self::others`], never
-    /// judged. An empty judged population or an observation without a
-    /// residual makes the repetition invalid.
+    /// elapsed times, each with its rank and bucket bounds. The last id with
+    /// its `pNN` segment read `max` also gets the largest observation's
+    /// bucket. Other outcomes are counted by [`Self::others`], never judged.
+    /// An empty judged population or an observation without a residual
+    /// makes the repetition invalid.
     pub fn percentiles(
         &self,
         repetition: &mut Repetition,
@@ -761,12 +885,17 @@ impl Population {
         }
         .map_err(|reason| repetition.invalid.push(reason))
         .ok();
-        for (id, q) in ids {
+        let maximum = ids.last().map(|(id, _)| (maximum_id(id), 1.0));
+        for (id, q) in ids
+            .iter()
+            .map(|(id, q)| ((*id).to_owned(), *q))
+            .chain(maximum)
+        {
             repetition.set(
-                id,
+                &id,
                 distribution.as_ref().map_or_else(
                     || Reading::missing("no successful sample"),
-                    |distribution| Reading::quantile(distribution, *q, NANOS_PER_MS),
+                    |distribution| Reading::quantile(distribution, q, NANOS_PER_MS),
                 ),
             );
         }
@@ -774,8 +903,9 @@ impl Population {
 
     /// The mean executed-plan scanned rows and bytes per query over the
     /// scan series with `outcome`, as bounds of each bucketed total; each is
-    /// missing, never zero, without a query or when any query lacks the
-    /// fact.
+    /// missing, never zero, without a query, when any query lacks the fact,
+    /// or when the scanned queries are not exactly the population's
+    /// [`QUERY_BOUNDARY`] timings with `outcome`, the same cohort.
     #[must_use]
     pub fn scanned_per_query(&self, outcome: &str) -> [Reading; 2] {
         let scans: Vec<&IntervalScan> = self
@@ -784,11 +914,20 @@ impl Population {
             .filter(|scan| scan.outcome == outcome)
             .collect();
         let queries: u64 = scans.iter().map(|scan| scan.count).sum();
+        let timed: u64 = self
+            .of(QUERY_BOUNDARY, outcome)
+            .map(|series| series.count)
+            .sum();
         let mean = |fact: &str,
                     missing: fn(&IntervalScan) -> u64,
                     pick: fn(&IntervalScan) -> &Distribution| {
             if queries == 0 {
                 return Reading::missing("no query was answered");
+            }
+            if queries != timed {
+                return Reading::missing(format!(
+                    "{queries} queries reported scans for {timed} `{QUERY_BOUNDARY}` timings"
+                ));
             }
             if scans.iter().any(|scan| missing(scan) > 0) {
                 return Reading::missing(format!(
@@ -817,6 +956,22 @@ impl Population {
             .iter()
             .filter(move |series| series.boundary == boundary && series.outcome == outcome)
     }
+}
+
+/// `id` with its percentile segment, such as `p99`, read `max`:
+/// `overhead_p99_ms` names `overhead_max_ms`.
+fn maximum_id(id: &str) -> String {
+    id.split('_')
+        .map(|part| {
+            let digits = part.strip_prefix('p').unwrap_or_default();
+            if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                "max"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 /// The merge of `parts`; `None` when there is none or any part is `None`.
@@ -1002,8 +1157,8 @@ pub fn install_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Distribution, IntervalScan, IntervalSeries, Percentiles, Population, Readings, Selection,
-        Smoke, Telemetry, TimingInterval, UNLABELLED, Usage, deltas, elapsed,
+        Distribution, Expected, IntervalScan, IntervalSeries, Percentiles, Population, Readings,
+        Selection, Smoke, Telemetry, TimingInterval, UNLABELLED, Usage, deltas, elapsed,
     };
     use crate::release_server::Metrics;
 
@@ -1194,27 +1349,32 @@ mod tests {
         ));
         assert!(mixed.invalid.is_empty(), "{:?}", mixed.invalid);
         let point = mixed.only("point-lookup", "steady");
-        assert_eq!(point.count("bifrost.query", "point-lookup"), 2);
-        assert_eq!(point.count("bifrost.query", "full-scan"), 0);
+        let cohort = |case, phase, count| Expected {
+            boundary: "bifrost.query",
+            outcome: "success",
+            case,
+            phase,
+            count,
+        };
+        assert_eq!(point.count("bifrost.query"), 2);
+        assert_eq!(point.recorded(&cohort("full-scan", "steady", 0)), 0);
         let [rows, bytes] = point.scanned_per_query("success");
         assert_eq!(
             (rows.value, rows.above, bytes.value),
             (Some(4.0), None, Some(8.0))
         );
-        mixed.expect(
-            &[
-                ("bifrost.query", "point-lookup", 3),
-                ("bifrost.query", "full-scan", 2),
-            ],
-            true,
-        );
+        mixed.expect(&[
+            cohort("point-lookup", "steady", 2),
+            cohort("full-scan", "steady", 2),
+        ]);
         assert_eq!(
             mixed.invalid,
             [
-                "1 `bifrost.query` timing observations of case full-scan were recorded for 2 requests"
+                "1 `bifrost.query` timing observations of case full-scan in phase steady have outcome `success` for 2 completed requests"
             ],
-            "a query class never satisfies another's count"
+            "neither another class nor another phase satisfies a cohort's count"
         );
+        assert_eq!(mixed.reconciliation[1].recorded, 1);
 
         let broken = Population::from_interval(interval(
             vec![series(UNLABELLED, UNLABELLED, &[1], 1)],
@@ -1268,6 +1428,7 @@ mod tests {
             server_cpu_seconds,
             peak_memory_bytes: None,
             driver_cpu_seconds: Some(0.1),
+            drain_seconds: 0.0,
             telemetry: Telemetry::default(),
         };
         let judged = [

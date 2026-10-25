@@ -162,11 +162,30 @@ pub(super) async fn tenant_client(
     server: &WyrdTestServer,
     tenant: DataTenantId,
 ) -> wyrd_client::WyrdClient {
-    let bootstrap = server
+    endpoint_client(server, &tenant_key(server, tenant).await)
+}
+
+/// Mints one new service principal in `tenant` and returns its API key.
+///
+/// The principal pair is part of a batch's identity, so a case that resends
+/// an acknowledged batch, after a restart or through another pod, builds every
+/// client from one key with [`endpoint_client`]; a new principal's resend is a
+/// different batch.
+///
+/// # Panics
+///
+/// Panics when the service cannot be bootstrapped or returns no API key.
+pub(super) async fn tenant_key(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+) -> secrecy::SecretString {
+    server
         .bootstrap_service_in_tenant(tenant, &unique_table("scribe_client"), &["admin"])
         .await
-        .expect("tenant service bootstrap");
-    endpoint_client(server, bootstrap.api_key().expect("service API key"))
+        .expect("tenant service bootstrap")
+        .api_key()
+        .expect("service API key")
+        .clone()
 }
 
 /// Builds one public SDK client that reaches `server`'s endpoints with

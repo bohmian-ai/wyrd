@@ -9,17 +9,17 @@
 //! boundary and every second of recovery, then the queue drains before the
 //! next repetition, so each starts from the same empty backlog.
 //!
-//! Judged times are the server's exact `verification.direct` timings from
-//! the run's [`Collector`]: each execution's elapsed time and its residual
-//! after the union of its own Verifier blocks, assigned to a phase by when
-//! it ended. Client round trips and the remaining histograms are
-//! diagnostic.
+//! Judged times are the server's `verification.direct` benchmark
+//! histograms: each execution's elapsed time and its residual after the
+//! union of its own Verifier blocks, assigned to a phase by the timing
+//! snapshots taken at its boundaries, so by when it ended. Client round
+//! trips and the remaining histograms are diagnostic.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
@@ -28,10 +28,10 @@ use tokio::time::Instant;
 use wyrd_client::state::WyrdState;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::VerificationVerdict;
+use wyrd_telemetry::timing::{Distribution, TimingSnapshot};
 use wyrd_testing::capacity::{
-    Collector, Histogram, HistogramKey, NANOS_PER_MS, Population, Readings, ResourceWindow,
-    SMOKE_WINDOW, Selection, Smoke, Telemetry, Timing, Window, driver_cpu_seconds, elapsed,
-    release_binary, unix_nanos, usec_elapsed,
+    Histogram, HistogramKey, NANOS_PER_MS, Population, Readings, ResourceWindow, SMOKE_WINDOW,
+    Selection, Smoke, Telemetry, UNLABELLED, Window, driver_cpu_seconds, elapsed, release_binary,
 };
 use wyrd_testing::experiment::{
     ExperimentError, Level, Phase, Reading, Repetition, Step, Workload,
@@ -198,8 +198,6 @@ pub struct Bench {
     server: Option<LocalServer>,
     /// One application per client or rotation slot.
     states: Vec<WyrdState>,
-    /// The server timing collector, from `prepare`.
-    collector: Option<Collector>,
 }
 
 impl Bench {
@@ -211,7 +209,6 @@ impl Bench {
             logs,
             server: None,
             states: Vec::new(),
-            collector: None,
         }
     }
 
@@ -226,39 +223,18 @@ impl Bench {
             .ok_or_else(|| ExperimentError::workload("the server is not running"))
     }
 
-    /// The timing collector.
+    /// Starts the release server through the guide and provisions the
+    /// tenant's applications for the level.
     ///
     /// # Errors
     ///
-    /// Returns a workload error before `prepare`.
-    fn collector(&self) -> Result<&Collector, ExperimentError> {
-        self.collector
-            .as_ref()
-            .ok_or_else(|| ExperimentError::workload("the timing collector is not running"))
-    }
-
-    /// Starts the collector and the release server through the guide and
-    /// provisions the tenant's applications for the level.
-    ///
-    /// # Errors
-    ///
-    /// Returns a workload error for a collector, server, or provisioning
-    /// failure.
+    /// Returns a workload error for a server or provisioning failure.
     async fn start(&mut self) -> Result<(), ExperimentError> {
         std::fs::create_dir_all(&self.logs).map_err(ExperimentError::workload)?;
         let binary = release_binary().map_err(ExperimentError::workload)?;
-        let collector = Collector::start(&self.logs)
+        let server = LocalServer::start(&binary, &["bench"], &[])
             .await
             .map_err(ExperimentError::workload)?;
-        let tracing = collector.server_env();
-        let variables: Vec<(&str, &str)> = tracing
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect();
-        let server = LocalServer::start(&binary, &["bench"], &variables)
-            .await
-            .map_err(ExperimentError::workload)?;
-        self.collector = Some(collector);
         let [setup] = server.tenants() else {
             return Err(ExperimentError::workload("setup provisioned one tenant"));
         };
@@ -300,8 +276,8 @@ impl Bench {
                     self.states.len()
                 ))
             })?;
-        let from = SystemTime::now();
-        let (opened, _) = Window::open(server, self.collector()?, SELECTION)
+        let before = timings(server).await?;
+        let (opened, _) = Window::open(server, SELECTION)
             .await
             .map_err(ExperimentError::workload)?;
         let measured = drive(&self.states[..clients], window).await;
@@ -316,15 +292,17 @@ impl Bench {
             peak_memory_bytes: usage.peak_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
-            collector_cpu_seconds: usage.collector_cpu_seconds,
             ..Repetition::default()
         };
         let telemetry = &usage.telemetry;
         let acknowledged = measured.latencies_us.len() as u64;
-        let population = self
-            .collector()?
-            .window(&step.id, from, &[(DIRECT_TIMING, acknowledged)])
-            .await;
+        let population = Population::collect(
+            server,
+            &before,
+            &[(DIRECT_TIMING, UNLABELLED, acknowledged)],
+            true,
+        )
+        .await;
         population.validate(&mut repetition);
         population.percentiles(
             &mut repetition,
@@ -340,16 +318,20 @@ impl Bench {
             true,
             &[("overhead_p99_ms", 0.99)],
         );
-        let verifier = population.excluded(DIRECT_TIMING, COMPLETED);
+        let verifier = population
+            .excluded(DIRECT_TIMING, COMPLETED)
+            .ok_or_else(|| "no completed direct execution has a Verifier component".to_owned());
         repetition.set(
             "overhead_mean_ms",
             mean_ms(population.residuals(DIRECT_TIMING, COMPLETED)),
         );
         repetition.set(
             "verifier_p99_ms",
-            Reading::percentile(&verifier, 0.99, NANOS_PER_MS),
+            verifier.as_ref().map_or_else(Reading::missing, |verifier| {
+                Reading::quantile(verifier, 0.99, NANOS_PER_MS)
+            }),
         );
-        repetition.set("verifier_mean_ms", mean_ms(Ok(verifier)));
+        repetition.set("verifier_mean_ms", mean_ms(verifier));
         repetition.set(
             "server_failures",
             Reading::count(population.others(DIRECT_TIMING, COMPLETED)),
@@ -386,11 +368,10 @@ impl Bench {
         let states = Arc::new(self.states.clone());
         let tallies: Arc<[[Mutex<Measured>; 2]; 3]> = Arc::default();
         let sequence = Arc::new(AtomicU64::new(0));
-        let from = SystemTime::now();
+        let before = timings(server).await?;
         let first = scrape(server).await?;
-        let (start, start_unix) = (Instant::now(), unix_nanos(SystemTime::now()));
+        let start = Instant::now();
         let driver_before = driver_cpu_seconds();
-        let collector_before = self.collector()?.cpu_usec();
         let resources = ResourceWindow::open([server]);
         let backlog_start = backlog(&first);
         let send = |op| {
@@ -405,14 +386,13 @@ impl Bench {
         };
         let (sent, observed) = tokio::join!(
             async { tokio::join!(send(Op::Verify), send(Op::Submit)) },
-            observe(server, &schedule, start, &first, resources),
+            observe(server, &schedule, start, (&first, &before), resources),
         );
         let (direct, background) = sent;
         let (observed, resources) = observed?;
         let drain = drain(server, start + window).await?;
         let used = resources.finish([server], window.as_secs_f64());
         let driver = elapsed(driver_before, driver_cpu_seconds());
-        let collector = usec_elapsed(collector_before, self.collector()?.cpu_usec());
 
         let tallies: [[Measured; 2]; 3] = std::array::from_fn(|stage| {
             std::array::from_fn(|slot| lock(&tallies[stage][slot]).clone())
@@ -421,13 +401,15 @@ impl Bench {
             .iter()
             .map(|[verify, _]| verify.latencies_us.len() as u64)
             .sum();
-        let population = self
-            .collector()?
-            .traced(&step.id, from, &[(DIRECT_TIMING, verified)], &[])
-            .await;
+        let population = Population::collect(
+            server,
+            &before,
+            &[(DIRECT_TIMING, UNLABELLED, verified)],
+            false,
+        )
+        .await;
         let ended = Ended {
-            population: &population,
-            start_unix,
+            snapshots: &observed.timings,
         };
         let mut repetition = Repetition {
             seconds: window.as_secs_f64(),
@@ -436,7 +418,6 @@ impl Bench {
             peak_memory_bytes: used.first().and_then(|used| used.peak_memory),
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: driver,
-            collector_cpu_seconds: collector,
             ..Repetition::default()
         };
         let mut lateness = direct.lateness_us.clone();
@@ -526,15 +507,18 @@ impl Bench {
                 Reading::exact,
             ),
         );
-        let capacity_elapsed: Vec<u64> = ended
-            .between(
-                capacity_stage.start,
-                capacity_stage.start + capacity_stage.length,
-            )
-            .map(|timing| timing.elapsed_ns)
-            .collect();
-        for (id, q) in [("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)] {
-            repetition.set(id, Reading::percentile(&capacity_elapsed, q, NANOS_PER_MS));
+        match ended.between(
+            capacity_stage.start,
+            capacity_stage.start + capacity_stage.length,
+        ) {
+            Ok(capacity) => capacity.percentiles(
+                &mut repetition,
+                DIRECT_TIMING,
+                COMPLETED,
+                false,
+                &[("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)],
+            ),
+            Err(reason) => repetition.invalid.push(reason),
         }
         for (name, items) in STAGES.iter().zip(observed.backlog) {
             repetition.set(
@@ -580,14 +564,14 @@ impl Bench {
 
 #[async_trait]
 impl Workload for Bench {
-    /// Starts the collector and the release server through the guide,
+    /// Starts the release server through the guide,
     /// provisions the tenant's applications (one per L1 client at the
     /// largest declared count, or [`APPLICATIONS`] for the L2 rotation),
     /// then sends sequential direct `verify` calls from one application
-    /// for [`SMOKE_WINDOW`]. Each must answer with the expected verdict and reach
-    /// the collector as one completed `verification.direct` timing with its
-    /// Verifier component, beside positive server CPU and component
-    /// observations.
+    /// for [`SMOKE_WINDOW`]. Each must answer with the expected verdict and
+    /// land in the server's histograms as one completed `verification.direct`
+    /// timing with its Verifier component and residual, beside positive
+    /// server CPU and component observations.
     ///
     /// # Errors
     ///
@@ -597,14 +581,14 @@ impl Workload for Bench {
     /// nothing is retried.
     async fn smoke(&mut self) -> Result<String, ExperimentError> {
         self.start().await?;
-        let (server, collector) = (self.server()?, self.collector()?);
+        let server = self.server()?;
         let state = self
             .states
             .first()
             .ok_or_else(|| ExperimentError::workload("no application was provisioned"))?;
         let mut smoke = Smoke::new("verification");
-        let from = SystemTime::now();
-        let (window, _) = Window::open(server, self.collector()?, SELECTION)
+        let before = timings(server).await?;
+        let (window, _) = Window::open(server, SELECTION)
             .await
             .map_err(ExperimentError::workload)?;
         let mut measured = Measured::default();
@@ -639,9 +623,12 @@ impl Workload for Bench {
                 .map(|(_, count)| count)
                 .sum(),
         );
-        let population = collector
-            .smoke("smoke", from, &[(DIRECT_TIMING, measured.answered())], &[])
-            .await;
+        let population = Population::smoke(
+            server,
+            &before,
+            &[(DIRECT_TIMING, UNLABELLED, measured.answered())],
+        )
+        .await;
         smoke.timings(&population, &[(DIRECT_TIMING, COMPLETED, true)]);
         smoke.finish().map_err(ExperimentError::Workload)
     }
@@ -721,47 +708,60 @@ struct Observed {
     bound: f64,
     /// The whole window's telemetry.
     whole: Telemetry,
+    /// The server's timing snapshot at each read, by its planned offset
+    /// from the schedule's start, the start itself first.
+    timings: Vec<(Duration, TimingSnapshot)>,
 }
 
-/// A window's completed direct executions, placed by when they ended.
+/// A window's completed direct executions, placed by when they ended: by
+/// the timing snapshots taken at its phase boundaries and recovery reads.
 struct Ended<'a> {
-    /// The window's server timings.
-    population: &'a Population,
-    /// The schedule's start in Unix nanoseconds.
-    start_unix: u64,
+    /// Each snapshot by its offset from the schedule's start.
+    snapshots: &'a [(Duration, TimingSnapshot)],
 }
 
 impl Ended<'_> {
-    /// The completed direct executions that ended from `low` until before
-    /// `high` after the schedule's start.
-    fn between(&self, low: Duration, high: Duration) -> impl Iterator<Item = &Timing> {
-        let nanos = |offset: Duration| u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX);
-        let (low, high) = (nanos(low), nanos(high));
-        self.population.timings.iter().filter(move |timing| {
-            let at = timing.end_unix_ns.checked_sub(self.start_unix);
-            timing.boundary == DIRECT_TIMING
-                && timing.outcome == COMPLETED
-                && at.is_some_and(|at| at >= low && at < high)
-        })
+    /// The executions recorded between the snapshots at `low` and `high`
+    /// after the schedule's start.
+    ///
+    /// # Errors
+    ///
+    /// Returns why there is no such interval: no snapshot was taken at
+    /// either offset, or the two cannot be differenced.
+    fn between(&self, low: Duration, high: Duration) -> Result<Population, String> {
+        let at = |offset: Duration| {
+            self.snapshots
+                .iter()
+                .find(|(taken, _)| *taken == offset)
+                .map(|(_, snapshot)| snapshot)
+                .ok_or_else(|| format!("no timing snapshot was taken at {offset:?}"))
+        };
+        Ok(Population::from_interval(at(high)?.since(at(low)?)?))
     }
 
     /// The p99, milliseconds, of the residuals of the executions that ended
-    /// from `low` until before `high`; missing when one has no residual.
+    /// between `low` and `high`; missing when one has no residual or the
+    /// interval is invalid.
     fn overhead_p99(&self, low: Duration, high: Duration) -> Reading {
-        match self
-            .between(low, high)
-            .map(Timing::residual_ns)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(residuals) => Reading::percentile(&residuals, 0.99, NANOS_PER_MS),
-            Err(reason) => Reading::missing(reason),
+        let population = match self.between(low, high) {
+            Ok(population) => population,
+            Err(reason) => return Reading::missing(reason),
+        };
+        if let Some(reason) = population.invalid.first() {
+            return Reading::missing(reason.clone());
         }
+        population
+            .residuals(DIRECT_TIMING, COMPLETED)
+            .map_or_else(Reading::missing, |residual| {
+                Reading::quantile(&residual, 0.99, NANOS_PER_MS)
+            })
     }
 }
 
-/// Reads `/metrics` at each phase boundary of `schedule` from `start`, and
-/// every [`POLL`] through recovery, keeping each recovery read's backlog for
-/// the recovery judgment. Freezes server CPU at the window's end.
+/// Reads `/metrics` and the timing snapshot at each phase boundary of
+/// `schedule` from `start`, and every [`POLL`] through recovery, keeping
+/// each recovery read's backlog for the recovery judgment; `first` is the
+/// pair read at the start. Freezes server CPU at the window's end.
 ///
 /// # Errors
 ///
@@ -770,31 +770,34 @@ async fn observe(
     server: &LocalServer,
     schedule: &Schedule,
     start: Instant,
-    first: &Metrics,
+    (first, opened_timings): (&Metrics, &TimingSnapshot),
     mut resources: ResourceWindow,
 ) -> Result<(Observed, ResourceWindow), ExperimentError> {
     let [_, overload, recovery] = schedule.stages();
+    let mut snapshots = vec![(Duration::ZERO, opened_timings.clone())];
     let whole = Readings::read(first, SELECTION);
     let opened = Readings::read(first, SELECTION);
     tokio::time::sleep_until(start + overload.start).await;
     let at_overload = scrape(server).await?;
+    snapshots.push((overload.start, timings(server).await?));
     let capacity = opened.since(&at_overload);
     let opened = Readings::read(&at_overload, SELECTION);
     tokio::time::sleep_until(start + recovery.start).await;
     let at_recovery = scrape(server).await?;
+    snapshots.push((recovery.start, timings(server).await?));
     let overloaded = opened.since(&at_recovery);
     let backlog_capacity = backlog(&at_overload);
     let bound = backlog_capacity + BACKLOG_LIMIT_SECONDS * schedule.offered();
     let opened = Readings::read(&at_recovery, SELECTION);
-    let end = start + schedule.window;
     let mut ticks = Vec::new();
-    let mut tick = start + recovery.start;
+    let mut offset = recovery.start;
     let last_metrics = loop {
-        tick = (tick + POLL).min(end);
-        tokio::time::sleep_until(tick).await;
+        offset = (offset + POLL).min(schedule.window);
+        tokio::time::sleep_until(start + offset).await;
         let metrics = scrape(server).await?;
-        ticks.push((tick - (start + recovery.start), backlog(&metrics)));
-        if tick >= end {
+        snapshots.push((offset, timings(server).await?));
+        ticks.push((offset - recovery.start, backlog(&metrics)));
+        if offset >= schedule.window {
             break metrics;
         }
     };
@@ -810,6 +813,7 @@ async fn observe(
         bound,
         stages: [capacity, overloaded, recovering],
         whole: whole.since(&last_metrics),
+        timings: snapshots,
     };
     Ok((observed, resources))
 }
@@ -915,6 +919,15 @@ fn backlog(metrics: &Metrics) -> f64 {
             .sum::<f64>()
 }
 
+/// Reads the server's cumulative benchmark timing snapshot.
+///
+/// # Errors
+///
+/// Returns the read failure as a workload error.
+async fn timings(server: &LocalServer) -> Result<TimingSnapshot, ExperimentError> {
+    server.timings().await.map_err(ExperimentError::workload)
+}
+
 /// Scrapes the server's `/metrics`.
 ///
 /// # Errors
@@ -991,18 +1004,23 @@ fn set_client(repetition: &mut Repetition, measured: &Measured) {
     }
 }
 
-/// The exact mean, milliseconds, of `samples` nanoseconds, or why there is
-/// none.
-fn mean_ms(samples: Result<Vec<u64>, String>) -> Reading {
-    match samples {
+/// The mean, milliseconds, of a nanosecond `distribution` as the bounds of
+/// its bucketed total, or why there is none.
+fn mean_ms(distribution: Result<Distribution, String>) -> Reading {
+    match distribution {
         Err(reason) => Reading::missing(reason),
-        Ok(samples) if samples.is_empty() => Reading::missing("no observation in the window"),
-        Ok(samples) => Reading::exact(
-            samples.iter().map(|sample| *sample as f64).sum::<f64>()
-                / samples.len() as f64
-                / NANOS_PER_MS,
-        )
-        .with_samples(samples.len() as u64),
+        Ok(distribution) if distribution.is_empty() => {
+            Reading::missing("no observation in the window")
+        }
+        Ok(distribution) => {
+            let (low, high) = distribution.total_bounds();
+            Reading::bounded(
+                low as f64,
+                high as f64,
+                distribution.len() as f64 * NANOS_PER_MS,
+            )
+            .with_samples(distribution.len())
+        }
     }
 }
 

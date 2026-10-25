@@ -11,13 +11,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
 use tokio_util::sync::CancellationToken;
-use wyrd_testing::capacity::{Collector, Selection, Window};
+use wyrd_testing::capacity::{Population, Selection, UNLABELLED, Window};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
 use wyrd_testing::release_server::LocalServer;
 
@@ -43,12 +43,10 @@ pub const SUCCESS: &str = "success";
 
 /// The L1 server, its fixture, and the shared cursors of every closed loop.
 pub struct Isolated {
-    /// Where the server log and raw timings are kept.
+    /// Where the server log is kept.
     logs: PathBuf,
     /// The experiment this workload runs.
     experiment: Experiment,
-    /// The collector the server exports its timings to, once prepared.
-    collector: Option<Collector>,
     /// The running server, once prepared.
     server: Option<LocalServer>,
     /// The query handle and exact answers, once prepared.
@@ -73,7 +71,6 @@ impl Isolated {
         Self {
             logs,
             experiment,
-            collector: None,
             server: None,
             bench: None,
             senders: Vec::new(),
@@ -105,7 +102,7 @@ impl Isolated {
         phase: Phase,
         window: Duration,
     ) -> Result<Repetition, ExperimentError> {
-        let (Some(server), Some(collector)) = (&self.server, &self.collector) else {
+        let Some(server) = &self.server else {
             return Err(ExperimentError::workload("the workload was not prepared"));
         };
         let op = step.text("op").unwrap_or_default();
@@ -123,8 +120,8 @@ impl Isolated {
                 .await
                 .map_err(ExperimentError::workload)?;
         }
-        let from = SystemTime::now();
-        let (opened, before) = Window::open(server, collector, Selection::RESOURCES)
+        let timings = server.timings().await.map_err(ExperimentError::workload)?;
+        let (opened, before) = Window::open(server, Selection::RESOURCES)
             .await
             .map_err(ExperimentError::workload)?;
         let read = read_op(op);
@@ -192,14 +189,12 @@ impl Isolated {
             peak_memory_bytes: usage.peak_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
-            collector_cpu_seconds: usage.collector_cpu_seconds,
             ..Repetition::default()
         };
         let boundary = write.map_or("bifrost.query", WriteOp::boundary);
         let sent = outcome.latencies_us.len() as u64 + outcome.error_count();
-        let population = collector
-            .window(&format!("{}/{phase:?}", step.id), from, &[(boundary, sent)])
-            .await;
+        let population =
+            Population::collect(server, &timings, &[(boundary, UNLABELLED, sent)], true).await;
         population.validate(&mut repetition);
         population.percentiles(
             &mut repetition,
@@ -395,29 +390,25 @@ async fn settled(
 
 #[async_trait]
 impl Workload for Isolated {
-    /// Starts the collector and server, registers each write path, and
+    /// Starts the server, registers each write path, and
     /// smokes every write path and the query boundary
     /// ([`crate::query::smoke`]) before any fixture loads.
     ///
     /// # Errors
     ///
-    /// Returns a workload error for a collector, server, or registration
+    /// Returns a workload error for a server or registration
     /// failure, or the smoke's missing evidence. A started server is kept
     /// even when the smoke fails, so [`Workload::finish`] stops it; nothing
     /// is retried.
     async fn smoke(&mut self) -> Result<String, ExperimentError> {
-        let collector = Collector::start(&self.logs)
-            .await
-            .map_err(ExperimentError::workload)?;
-        let server = start(&collector, self.experiment.env())
+        let server = start(self.experiment.env())
             .await
             .map_err(ExperimentError::workload)?;
         let client = client(&server).map_err(ExperimentError::workload)?;
         self.senders = lanes(&client, &WriteOp::ALL)
             .await
             .map_err(ExperimentError::workload)?;
-        let proved = smoke(&server, &collector, &client, &self.senders).await;
-        self.collector = Some(collector);
+        let proved = smoke(&server, &client, &self.senders).await;
         self.server = Some(server);
         proved.map_err(ExperimentError::Workload)
     }

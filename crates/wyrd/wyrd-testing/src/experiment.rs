@@ -39,7 +39,6 @@ use sha2::{Digest as _, Sha256};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::capacity::COLLECTOR_THREADS;
 use crate::profile::{ProfileNote, Profiler};
 use crate::release_server::{Host, HostLoad};
 
@@ -1090,6 +1089,36 @@ impl Reading {
         self
     }
 
+    /// A value known to lie in the integer interval `[low, high]`, divided
+    /// by `per`: exact when the bounds meet, else the interval
+    /// `((low - 1) / per, high / per]`, so a threshold passes or fails only
+    /// when the whole interval is on one side of it.
+    #[must_use]
+    pub fn bounded(low: f64, high: f64, per: f64) -> Self {
+        if low >= high {
+            return Self::exact(low / per);
+        }
+        Self {
+            value: Some(high / per),
+            above: Some((low - 1.0) / per),
+            ..Self::default()
+        }
+    }
+
+    /// Nearest-rank percentile `q` of a histogram `distribution`, each value
+    /// divided by `per`, as the [`Self::bounded`] interval of its bucket,
+    /// with the sample count; missing without samples.
+    #[must_use]
+    pub fn quantile(distribution: &wyrd_telemetry::timing::Distribution, q: f64, per: f64) -> Self {
+        distribution.quantile(q).map_or_else(
+            || Self::missing("no successful sample"),
+            |bucket| {
+                Self::bounded(bucket.lowest as f64, bucket.highest as f64, per)
+                    .with_samples(distribution.len())
+            },
+        )
+    }
+
     /// Nearest-rank percentile `q` of exact raw `samples`, each divided by
     /// `per` (1e6 for nanoseconds to milliseconds), with the sample count;
     /// missing without samples. Dividing keeps a boundary exact: 500,000 ns
@@ -1224,9 +1253,10 @@ pub struct Repetition {
     pub memory_interval_ms: u64,
     /// Driver CPU-seconds, or `None` when unreadable.
     pub driver_cpu_seconds: Option<f64>,
-    /// CPU-seconds of the timing collector helper process, in neither
-    /// server nor driver CPU, or `None` when it was lost or unreadable.
-    #[serde(default)]
+    /// CPU-seconds of the timing collector helper process a schema-1
+    /// record kept, in neither server nor driver CPU; never measured since
+    /// server timing moved into the server's own histograms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collector_cpu_seconds: Option<f64>,
     /// P: the logical CPUs available to the server processes on this one
     /// shared host, counted once however many server processes share them;
@@ -2155,23 +2185,6 @@ fn repetition_reasons(repetition: &Repetition, validity: &Validity) -> Vec<Reaso
         }
         Some(_) => {}
     }
-    match repetition.collector_cpu_seconds {
-        None => reasons.push(Reason::new(
-            "reading.missing",
-            "collector CPU-seconds are unavailable: the timing collector was lost or unreadable",
-        )),
-        Some(collector) if repetition.seconds > 0.0 => {
-            let cores = collector / repetition.seconds;
-            let limit = COLLECTOR_THREADS as f64 * validity.driver_fraction;
-            if cores > limit {
-                reasons.push(Reason::new(
-                    "collector.saturated",
-                    format!("the timing collector used {cores:.2} cores, over {limit:.2} (80% of its {COLLECTOR_THREADS} worker threads)"),
-                ));
-            }
-        }
-        Some(_) => {}
-    }
     if let Some(arrivals) = repetition.arrivals {
         if arrivals.missed > 0 {
             reasons.push(Reason::new(
@@ -2815,11 +2828,14 @@ impl Record {
                         |cpu| format!("{} s", number(cpu)),
                     )
                 };
-                format!(
-                    "{} (collector {})",
-                    cpu(rep.driver_cpu_seconds),
-                    cpu(rep.collector_cpu_seconds)
-                )
+                match rep.collector_cpu_seconds {
+                    Some(collector) => format!(
+                        "{} (collector {} s)",
+                        cpu(rep.driver_cpu_seconds),
+                        number(collector)
+                    ),
+                    None => cpu(rep.driver_cpu_seconds),
+                }
             },
         );
         format!(
@@ -3059,14 +3075,7 @@ mod tests {
         Reading, Record, Repetition, Rule, Source, Status, Step, Validity, Verdict, Workload,
         convert, regression, run,
     };
-    use wyrd_tonic::otlp::common::v1::any_value::Value;
-    use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
-    use wyrd_tonic::otlp::resource::v1::Resource;
-    use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
-    use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
-    use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
-
-    use crate::capacity::{Collector, Histogram, TIMING_SPAN, unix_nanos};
+    use crate::capacity::{Histogram, Population, UNLABELLED};
     use crate::release_server::HostLoad;
 
     /// A quiet host sample.
@@ -3532,21 +3541,6 @@ mod tests {
                 Verdict::Invalid,
             ),
             (
-                case(|r| r.collector_cpu_seconds = Some(16.1)),
-                "collector.saturated",
-                Verdict::Invalid,
-            ),
-            (
-                case(|r| r.collector_cpu_seconds = Some(16.0)),
-                "",
-                Verdict::Pass,
-            ),
-            (
-                case(|r| r.collector_cpu_seconds = None),
-                "reading.missing",
-                Verdict::Invalid,
-            ),
-            (
                 case(|r| r.server_cpu_seconds = None),
                 "reading.missing",
                 Verdict::Invalid,
@@ -3871,11 +3865,12 @@ mod tests {
     /// or reset CPU, unavailable P, and zero denominators are missing with
     /// reasons, never zero; host core metadata is never a denominator; units
     /// convert MB to MiB and time prefixes but never across kinds. Server
-    /// timings collected and decoded through the OTLP collector give exact
-    /// nearest-rank residuals, so p99s of 499,999, 500,000, and 500,001 ns
-    /// judge PASS, FAIL, FAIL under a strict 0.5 ms limit whatever the
-    /// client saw; extra, duplicate, or malformed observations and missing
-    /// or negative residuals are invalid, never clamped.
+    /// timings recorded into the benchmark histograms and differenced
+    /// between two snapshots give nearest-rank residual buckets, so p99s of
+    /// 499,000, 500,000, and 501,000 ns judge PASS, ambiguous, FAIL under a
+    /// strict 0.5 ms limit whatever the client saw; a zero residual counts;
+    /// extra, out-of-range, unexcluded, or negative observations are
+    /// invalid, never clamped.
     ///
     /// # Panics
     ///
@@ -4061,73 +4056,25 @@ mod tests {
                 .contains("provisioned vCPUs")
         );
 
-        let directory = tempfile::tempdir().expect("artifacts");
-        let collector = Collector::start(directory.path()).await.expect("collector");
-        let mut client = TraceServiceClient::connect(collector.server_env()[0].1.clone())
-            .await
-            .expect("connect");
-        let mut sent = 0_u64;
-        let export = |spans: Vec<(u64, Option<u64>, u64)>| {
-            let spans = spans
-                .into_iter()
-                .map(|(elapsed, excluded, id)| {
-                    let integer = |key: &str, value: u64| KeyValue {
-                        key: key.to_owned(),
-                        value: Some(AnyValue {
-                            value: Some(Value::IntValue(i64::try_from(value).expect("ns"))),
-                        }),
-                    };
-                    let text = |key: &str, value: &str| KeyValue {
-                        key: key.to_owned(),
-                        value: Some(AnyValue {
-                            value: Some(Value::StringValue(value.to_owned())),
-                        }),
-                    };
-                    let mut attributes = vec![
-                        text("boundary", "verification.direct"),
-                        text("outcome", "completed"),
-                    ];
-                    if elapsed > 0 {
-                        attributes.push(integer("elapsed_ns", elapsed));
-                    }
-                    attributes.extend(excluded.map(|excluded| integer("excluded_ns", excluded)));
-                    Span {
-                        name: TIMING_SPAN.to_owned(),
-                        trace_id: [id.to_be_bytes(), id.to_be_bytes()].concat(),
-                        span_id: id.to_be_bytes().to_vec(),
-                        end_time_unix_nano: unix_nanos(std::time::SystemTime::now()),
-                        attributes,
-                        ..Span::default()
-                    }
-                })
-                .collect();
-            ExportTraceServiceRequest {
-                resource_spans: vec![ResourceSpans {
-                    resource: Some(Resource::default()),
-                    scope_spans: vec![ScopeSpans {
-                        spans,
-                        ..ScopeSpans::default()
-                    }],
-                    ..ResourceSpans::default()
-                }],
-            }
-        };
+        wyrd_telemetry::timing::enable();
         let verifier = 2_000_000;
-        let mut window = async |spans: Vec<(u64, Option<u64>, u64)>, expected: u64| {
-            let opened = std::time::SystemTime::now();
-            // Out of order across two exports, as a batch exporter may send them.
-            let (late, early) = spans.split_at(spans.len() / 2);
-            for half in [early.to_vec(), late.to_vec()] {
-                client.export(export(half)).await.expect("export");
+        let window = |requests: &[(u64, Option<u64>)], expected: u64| {
+            let before = wyrd_telemetry::timing::snapshot();
+            let request = tracing::Span::none();
+            for (elapsed, excluded) in requests {
+                wyrd_telemetry::record_timing(
+                    &request,
+                    "verification.direct",
+                    "completed",
+                    std::time::Duration::from_nanos(*elapsed),
+                    excluded.map(std::time::Duration::from_nanos),
+                );
             }
-            sent += 1;
-            let population = collector
-                .window(
-                    &format!("v4-{sent}"),
-                    opened,
-                    &[("verification.direct", expected)],
-                )
-                .await;
+            let interval = wyrd_telemetry::timing::snapshot()
+                .since(&before)
+                .expect("one process");
+            let mut population = Population::from_interval(interval);
+            population.expect(&[("verification.direct", UNLABELLED, expected)], true);
             let mut repetition = Repetition::default();
             population.validate(&mut repetition);
             population.percentiles(
@@ -4139,7 +4086,7 @@ mod tests {
             );
             repetition
         };
-        let samples = |p99: u64| -> Vec<(u64, Option<u64>, u64)> {
+        let samples = |p99: u64| -> Vec<(u64, Option<u64>)> {
             (0..100_u64)
                 .map(|index| {
                     let residual = match index {
@@ -4147,22 +4094,30 @@ mod tests {
                         99 => 10_000_000,
                         _ => 1_000,
                     };
-                    (residual + verifier, Some(verifier), index + 1)
+                    (residual + verifier, Some(verifier))
                 })
                 .collect()
         };
-        for (p99, verdict) in [(499_999, true), (500_000, false), (500_001, false)] {
-            let judged = window(samples(p99), 100).await;
+        for (p99, verdict) in [
+            (499_000, Some(true)),
+            (500_000, None),
+            (501_000, Some(false)),
+        ] {
+            let judged = window(&samples(p99), 100);
             assert!(judged.invalid.is_empty(), "{:?}", judged.invalid);
             let reading = judged.reading("overhead_p99_ms");
-            assert_eq!(
-                (reading.value, reading.above, reading.samples),
-                (Some(p99 as f64 / 1e6), None, Some(100)),
-                "the 99th of 100 sorted residuals, exact"
-            );
+            assert_eq!(reading.samples, Some(100));
             let (lo, open, hi) = reading.interval().expect("interval");
-            assert_eq!(Op::Lt.judge(lo, open, hi, 0.5), Some(verdict), "{p99} ns");
-            let mut delayed = window(samples(p99), 100).await;
+            assert!(
+                lo < p99 as f64 / 1e6 && hi >= Some(p99 as f64 / 1e6),
+                "the 99th of 100 residuals lies in its bucket's bounds"
+            );
+            assert_eq!(
+                Op::Lt.judge(lo, open, hi, 0.5),
+                verdict,
+                "{p99} ns passes or fails only when its whole bucket does"
+            );
+            let mut delayed = window(&samples(p99), 100);
             delayed.set("client_p99_ms", Reading::exact(p99 as f64 / 1e6 + 50.0));
             assert_eq!(
                 delayed.reading("overhead_p99_ms"),
@@ -4170,53 +4125,79 @@ mod tests {
                 "client delay never moves server latency"
             );
         }
+        let exact = window(&[(verifier + 1_000, Some(verifier)), (5, Some(5))], 2);
+        let reading = exact.reading("overhead_p99_ms");
+        assert_eq!(
+            (reading.value, reading.above),
+            (Some(0.001), None),
+            "a value in a unit-wide bucket is exact"
+        );
+        let mut zero = Repetition::default();
+        Population::from_interval({
+            let before = wyrd_telemetry::timing::snapshot();
+            wyrd_telemetry::record_timing(
+                &tracing::Span::none(),
+                "verification.direct",
+                "completed",
+                std::time::Duration::ZERO,
+                Some(std::time::Duration::ZERO),
+            );
+            wyrd_telemetry::timing::snapshot()
+                .since(&before)
+                .expect("one process")
+        })
+        .percentiles(
+            &mut zero,
+            "verification.direct",
+            "completed",
+            true,
+            &[("overhead_p99_ms", 0.99)],
+        );
+        assert_eq!(
+            zero.reading("overhead_p99_ms").value,
+            Some(0.0),
+            "a zero residual is counted, never missing"
+        );
         let mut extra = samples(1_000);
-        extra.push((1_000 + verifier, Some(verifier), 101));
-        let extra = window(extra, 100).await;
+        extra.push((1_000 + verifier, Some(verifier)));
+        let extra = window(&extra, 100);
         assert!(
             extra.invalid[0].contains("101 `verification.direct`"),
             "{:?}",
             extra.invalid
         );
-        let mut repeated = samples(1_000);
-        repeated[1].2 = 1;
-        let repeated = window(repeated, 100).await;
+        let mut overflowed = samples(1_000);
+        overflowed[0].0 = wyrd_telemetry::timing::HIGHEST_NS * 2;
+        let overflowed = window(&overflowed, 100);
         assert!(
-            repeated
+            overflowed
                 .invalid
                 .iter()
-                .any(|reason| reason.contains("repeat a span id"))
-        );
-        let mut malformed = samples(1_000);
-        malformed[0].0 = 0;
-        let malformed = window(malformed, 99).await;
-        assert!(
-            malformed
-                .invalid
-                .iter()
-                .any(|reason| reason.contains("malformed"))
+                .any(|reason| reason.contains("outside the trackable range")),
+            "{:?}",
+            overflowed.invalid
         );
         let mut negative = samples(1_000);
         negative[0].1 = Some(negative[0].0 + 1);
-        let negative = window(negative, 100).await;
-        assert!(!negative.reading("overhead_p99_ms").is_present());
+        let negative = window(&negative, 100);
         assert!(
             negative
                 .invalid
                 .iter()
-                .any(|reason| reason.contains("exceeds its elapsed"))
+                .any(|reason| reason.contains("excluded waits exceeding elapsed time")),
+            "never clamped: {:?}",
+            negative.invalid
         );
         let mut unexcluded = samples(1_000);
         unexcluded[0].1 = None;
-        let unexcluded = window(unexcluded, 100).await;
+        let unexcluded = window(&unexcluded, 100);
         assert!(
-            !unexcluded.reading("overhead_p99_ms").is_present(),
-            "never clamped or substituted"
-        );
-        let raw = std::fs::read_to_string(directory.path().join("timings.jsonl")).expect("raw");
-        assert!(
-            raw.lines().count() >= 100 * 6,
-            "every taken observation is kept raw"
+            unexcluded
+                .invalid
+                .iter()
+                .any(|reason| reason.contains("inconsistent excluded components")),
+            "never substituted: {:?}",
+            unexcluded.invalid
         );
 
         let layout = |buckets: Vec<(f64, f64)>| Histogram {

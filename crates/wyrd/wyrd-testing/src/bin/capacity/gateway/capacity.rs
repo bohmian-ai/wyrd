@@ -8,18 +8,17 @@
 //! places every arrival in advance and [`open_loop`] launches each at its
 //! instant whatever the responses do: an arrival more than [`MISS_AFTER`]
 //! late is missed and one beyond [`MAX_IN_FLIGHT`] open calls is capped,
-//! never replayed or queued. //! Every call carries its own trace, so its exact server timings (from handler
-//! entry to the buffered answer, stream head, or final frame handoff) are
-//! joined to it by trace id from the run's [`Collector`]; the SLOs judge only
-//! those. Client chunk lag, each data event's receipt behind its
+//! //! never replayed or queued. The SLOs judge the server's own timing
+//! histograms (from handler entry to the buffered answer, stream head, or
+//! final frame handoff) between snapshots at each phase boundary, every
+//! tenant together: tenants are never a snapshot label. Client chunk lag, each data event's receipt behind its
 //! [`PacedUpstream`] send, is diagnostic. A sampler reads in-flight calls, active server calls, and
 //! outbox backlog every second, and scrapes at each phase boundary attribute
 //! shedding to the phase that caused it.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
@@ -32,8 +31,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_testing::capacity::{
-    Collector, NANOS_PER_MS, Percentiles, Population, Selection, Timing, Usage, Window,
-    release_binary,
+    NANOS_PER_MS, Percentiles, Population, Selection, UNLABELLED, Usage, Window, release_binary,
 };
 use wyrd_testing::experiment::{
     Arrivals, ExperimentError, Phase, Reading, Repetition, Step, Workload,
@@ -108,7 +106,7 @@ pub const fn contention(index: u64) -> (usize, bool) {
     (tenant, (index / 10 + slot) % 2 == 1)
 }
 
-/// The p99 SLOs every capacity and recovery call is judged by,
+/// The p99 SLOs every capacity and recovery phase is judged by,
 /// milliseconds of exact server time from handler entry, and which of them
 /// the invocation overrode.
 #[derive(Debug, Clone, PartialEq)]
@@ -367,8 +365,6 @@ pub struct Arrived {
     pub timed: Timed,
     /// The upstream's send time of each data event, or of the buffered body.
     pub sends: Vec<std::time::Instant>,
-    /// The server timing observations sharing its trace, once collected.
-    pub server: Vec<Timing>,
 }
 
 /// One backlog reading.
@@ -443,54 +439,23 @@ pub fn misattributed(ownership: &[Ownership], staged: f64, shed: f64) -> u64 {
     misses
 }
 
-/// A tenant's, or every tenant's, answered calls of one mode: exact server
-/// nanoseconds from handler entry, and diagnostic client chunk lag.
+/// A tenant's, or every tenant's, answered calls of one mode: diagnostic
+/// client chunk lag.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Distribution {
-    /// Until the buffered answer's handoff (`gateway.buffered`), or a
-    /// stream's final frame handoff (`gateway.stream.end`).
-    pub completion_ns: Vec<u64>,
-    /// Streams: until the head handoff (`gateway.stream.head`).
-    pub first_ns: Vec<u64>,
-    /// Buffered: completion less the union of the call's own provider waits.
-    pub overhead_ns: Vec<u64>,
-    /// Diagnostic only: each stream data event's client receipt behind its
-    /// upstream send, microseconds.
+    /// Each stream data event's client receipt behind its upstream send,
+    /// microseconds.
     pub lag_us: Vec<u64>,
     /// Streams whose data events and upstream sends did not pair one to one.
     pub unmatched: u64,
-    /// Answered calls without a successful server timing at a boundary, or
-    /// whose provider wait exceeds that timing.
-    pub untimed: u64,
 }
 
 impl Distribution {
     /// Adds one answered call.
     pub fn add(&mut self, call: &Arrived) {
-        let mut server = |boundary: &str| {
-            let timing = call
-                .server
-                .iter()
-                .find(|timing| timing.boundary == boundary && timing.outcome == SUCCEEDED);
-            if timing.is_none() {
-                self.untimed += 1;
-            }
-            timing
-        };
         if !call.stream {
-            if let Some(timing) = server(BUFFERED) {
-                self.completion_ns.push(timing.elapsed_ns);
-                match timing.residual_ns() {
-                    Ok(residual) => self.overhead_ns.push(residual),
-                    Err(_) => self.untimed += 1,
-                }
-            }
             return;
         }
-        let (head, end) = (server(STREAM_HEAD), server(STREAM_END));
-        self.first_ns.extend(head.map(|timing| timing.elapsed_ns));
-        self.completion_ns
-            .extend(end.map(|timing| timing.elapsed_ns));
         if call.sends.len() != call.timed.events.len() {
             self.unmatched += 1;
         }
@@ -548,43 +513,39 @@ pub fn worst(readings: &[Reading]) -> Reading {
     worst.unwrap_or_else(|| Reading::missing("no distribution"))
 }
 
-/// The three p99 SLO readings of `phase` and its diagnostic chunk lag, by
-/// declared metric name: the worst tenant's in capacity, every tenant
-/// together in recovery.
-fn slo_readings(calls: &[Arrived], phases: &Phases, phase: Period) -> [(&'static str, Reading); 4] {
+/// The three p99 SLO readings of `phase` from its server timing
+/// `population`, every tenant together, and its diagnostic chunk lag, the
+/// worst tenant's in capacity, by declared metric name.
+fn slo_readings(
+    calls: &[Arrived],
+    phases: &Phases,
+    phase: Period,
+    population: &Population,
+) -> [(&'static str, Reading); 4] {
     let tenants: Vec<Option<usize>> = match phase {
         Period::Recovery => vec![None],
         _ => (0..TENANTS.len()).map(Some).collect(),
     };
-    let of = |stream: bool| -> Vec<Distribution> {
-        tenants
+    let lag = worst(
+        &tenants
             .iter()
-            .map(|tenant| Distribution::of(calls, phases, phase, *tenant, stream))
-            .collect()
-    };
-    let (buffered, streamed) = (of(false), of(true));
-    let read = |distributions: &[Distribution], samples: fn(&Distribution) -> &[u64], per| {
-        worst(
-            &distributions
-                .iter()
-                .map(|distribution| Reading::percentile(samples(distribution), 0.99, per))
-                .collect::<Vec<_>>(),
+            .map(|tenant| {
+                let streamed = Distribution::of(calls, phases, phase, *tenant, true);
+                Reading::percentile(&streamed.lag_us, 0.99, 1e3)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let p99 = |boundary| {
+        population.elapsed(boundary, SUCCEEDED).map_or_else(
+            || Reading::missing(format!("no `{boundary}` call succeeded in the phase")),
+            |elapsed| Reading::quantile(&elapsed, 0.99, NANOS_PER_MS),
         )
     };
     [
-        (
-            "completion",
-            read(&buffered, |d| &d.completion_ns, NANOS_PER_MS),
-        ),
-        (
-            "first_token",
-            read(&streamed, |d| &d.first_ns, NANOS_PER_MS),
-        ),
-        ("chunk_lag", read(&streamed, |d| &d.lag_us, 1e3)),
-        (
-            "stream",
-            read(&streamed, |d| &d.completion_ns, NANOS_PER_MS),
-        ),
+        ("completion", p99(BUFFERED)),
+        ("first_token", p99(STREAM_HEAD)),
+        ("chunk_lag", lag),
+        ("stream", p99(STREAM_END)),
     ]
 }
 
@@ -611,9 +572,14 @@ pub struct Observed {
     pub admitted: f64,
     /// Per tenant, its durable capture rows.
     pub ownership: Vec<Ownership>,
-    /// The schedule's server timings: their collection's invalid reasons
-    /// and health; each call holds its own observations.
+    /// The schedule's server timings, from its start until every call
+    /// completed: their reconciliation's invalid reasons and health.
     pub population: Population,
+    /// Server timings from the schedule's start to overload's start.
+    pub capacity: Population,
+    /// Server timings from judged recovery's start until every call
+    /// completed.
+    pub recovery: Population,
     /// Accounted bytes the Scribe outbox wrote while arrivals ran.
     pub durable_bytes: f64,
     /// The drain after arrivals stopped.
@@ -633,7 +599,6 @@ impl Observed {
             peak_memory_bytes: usage.peak_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
-            collector_cpu_seconds: usage.collector_cpu_seconds,
             arrivals: Some(Arrivals {
                 scheduled: self.driven.scheduled,
                 sent: self.driven.sent,
@@ -643,13 +608,11 @@ impl Observed {
             }),
             ..Repetition::default()
         };
-        for phase in [Period::Capacity, Period::Recovery] {
-            let name = if phase == Period::Capacity {
-                "capacity"
-            } else {
-                "recovery"
-            };
-            for (metric, reading) in slo_readings(&self.calls, &self.phases, phase) {
+        for (phase, name, population) in [
+            (Period::Capacity, "capacity", &self.capacity),
+            (Period::Recovery, "recovery", &self.recovery),
+        ] {
+            for (metric, reading) in slo_readings(&self.calls, &self.phases, phase, population) {
                 repetition.set(&format!("{name}.{metric}_p99_ms"), reading);
             }
         }
@@ -684,16 +647,19 @@ impl Observed {
                     .count() as u64,
             ),
         );
-        let buffered = Distribution::of(&self.calls, &self.phases, Period::Capacity, None, false);
-        for (id, q) in [("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)] {
-            repetition.set(
-                id,
-                Reading::percentile(&buffered.completion_ns, q, NANOS_PER_MS),
-            );
-        }
-        repetition.set(
-            "capacity.overhead_p99_ms",
-            Reading::percentile(&buffered.overhead_ns, 0.99, NANOS_PER_MS),
+        self.capacity.percentiles(
+            &mut repetition,
+            BUFFERED,
+            SUCCEEDED,
+            false,
+            &[("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)],
+        );
+        self.capacity.percentiles(
+            &mut repetition,
+            BUFFERED,
+            SUCCEEDED,
+            true,
+            &[("capacity.overhead_p99_ms", 0.99)],
         );
         repetition.set(
             "capacity.backlog_growth",
@@ -729,22 +695,13 @@ impl Observed {
         repetition.set("capture_bytes", capture(self.durable_bytes));
         repetition.set("drain_s", Reading::exact(self.drain.seconds));
         repetition.set("undrained", Reading::exact(self.drain.remaining));
-        let (mut unmatched, mut untimed) = (0, 0);
-        for phase in [Period::Capacity, Period::Overload, Period::Recovery] {
-            for stream in [false, true] {
-                let all = Distribution::of(&self.calls, &self.phases, phase, None, stream);
-                unmatched += all.unmatched;
-                untimed += all.untimed;
-            }
-        }
+        let unmatched: u64 = [Period::Capacity, Period::Overload, Period::Recovery]
+            .into_iter()
+            .map(|phase| Distribution::of(&self.calls, &self.phases, phase, None, true).unmatched)
+            .sum();
         if unmatched > 0 {
             repetition.invalid.push(format!(
                 "{unmatched} streams whose data events did not pair with upstream sends"
-            ));
-        }
-        if untimed > 0 {
-            repetition.invalid.push(format!(
-                "{untimed} answered-call boundaries have no successful server timing, or a provider wait beyond it"
             ));
         }
         self.population.validate(&mut repetition);
@@ -846,7 +803,6 @@ impl Driver {
                         offset: planned.offset,
                         timed,
                         sends,
-                        server: Vec::new(),
                     });
             }
         };
@@ -907,8 +863,6 @@ pub struct Capacity {
     tenants: Vec<Tenant>,
     /// The arrivals' driver, once prepared.
     driver: Option<Driver>,
-    /// The server timing collector, once prepared.
-    collector: Option<Collector>,
     /// Where the server log is copied when it stops.
     log: PathBuf,
     /// Every call the measurement launched; a cancelled measurement leaves
@@ -926,30 +880,20 @@ impl Capacity {
             upstream: None,
             tenants: Vec::new(),
             driver: None,
-            collector: None,
             log,
             calls: Mutex::new(JoinSet::new()),
         }
     }
 
-    /// Starts the timing collector, the release server exporting every span
-    /// to it with [`TENANTS`], the paced upstream, and [`KEYS_PER_TENANT`]
+    /// Starts the release server with [`TENANTS`], the paced upstream, and [`KEYS_PER_TENANT`]
     /// keys per tenant with metadata capture.
     ///
     /// # Errors
     ///
-    /// Returns a collector, server, upstream, or provisioning failure.
+    /// Returns a server, upstream, or provisioning failure.
     async fn start(&mut self) -> Result<()> {
         let binary = release_binary()?;
-        let artifacts = self.log.parent().unwrap_or(&self.log).to_path_buf();
-        let collector = Collector::start(&artifacts).await?;
-        let tracing = collector.server_env();
-        let variables: Vec<(&str, &str)> = tracing
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect();
-        let server = LocalServer::start(&binary, &TENANTS, &variables).await?;
-        self.collector = Some(collector);
+        let server = LocalServer::start(&binary, &TENANTS, &[]).await?;
         let upstream = Arc::new(PacedUpstream::start(PACING, MAX_IN_FLIGHT).await?);
         for setup in server.tenants() {
             let tenant = Tenant::provision(setup, &upstream.uri(), KEYS_PER_TENANT).await?;
@@ -979,8 +923,8 @@ impl Capacity {
     }
 
     /// Runs `phase` of `step` over `window`: the whole capacity, overload,
-    /// recovery schedule, then the drain, capture reads, and each call's
-    /// server timings by trace id.
+    /// recovery schedule, then the drain, capture reads, and the server
+    /// timings between snapshots at each phase boundary.
     ///
     /// # Errors
     ///
@@ -990,8 +934,8 @@ impl Capacity {
         let rate = param(step, "rate")
             .filter(|rate| *rate > 0.0)
             .ok_or_else(|| format!("step `{}` declares no rate", step.id))?;
-        let (Some(server), Some(upstream), Some(driver), Some(collector)) =
-            (&self.server, &self.upstream, &self.driver, &self.collector)
+        let (Some(server), Some(upstream), Some(driver)) =
+            (&self.server, &self.upstream, &self.driver)
         else {
             return Err("the workload was not prepared".into());
         };
@@ -1000,8 +944,8 @@ impl Capacity {
         let before = self.captured().await?;
         let slots = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let stop = CancellationToken::new();
-        let opened = SystemTime::now();
-        let (traffic, baseline) = Window::open(server, collector, Selection::RESOURCES).await?;
+        let timings = server.timings().await?;
+        let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
         let start = Instant::now() + LEAD;
         let label = format!("{}-{phase:?}", step.id);
         let driving = async {
@@ -1019,41 +963,35 @@ impl Capacity {
         };
         let boundaries = async {
             let overload = scrape_at(server, start, phases.capacity).await?;
+            let capacity = server.timings().await?;
             let recovery = scrape_at(server, start, phases.judged()).await?;
-            Result::Ok((overload, recovery))
+            let judged = server.timings().await?;
+            Result::Ok((overload, recovery, capacity, judged))
         };
         let (driven, backlog, boundaries) =
             tokio::join!(driving, sample(server, &slots, start, &stop), boundaries);
-        let (driven, mut calls) = driven;
+        let completed = server.timings().await?;
+        let (driven, calls) = driven;
         let (usage, ended) = traffic.close(server).await?;
         let drain = settle(server).await?;
         let last = server.metrics().await?;
         if phase == Phase::Warmup {
             return Ok(Repetition::default());
         }
-        let (at_overload, at_recovery) = boundaries?;
+        let (at_overload, at_recovery, capacity, judged) = boundaries?;
         let count =
             |pick: fn(&Arrived) -> bool| calls.iter().filter(|call| pick(call)).count() as u64;
         let streams = count(|call| call.stream);
         let expected = [
-            (BUFFERED, calls.len() as u64 - streams),
-            (STREAM_HEAD, streams),
+            (BUFFERED, UNLABELLED, calls.len() as u64 - streams),
+            (STREAM_HEAD, UNLABELLED, streams),
             (
                 STREAM_END,
+                UNLABELLED,
                 count(|call| call.stream && call.timed.outcome.answered()),
             ),
         ];
-        let population = collector.window(&label, opened, &expected).await;
-        let mut traces: HashMap<&str, Vec<Timing>> = HashMap::new();
-        for timing in &population.timings {
-            traces
-                .entry(timing.trace_id.as_str())
-                .or_default()
-                .push(timing.clone());
-        }
-        for call in &mut calls {
-            call.server = traces.remove(call.timed.trace.as_str()).unwrap_or_default();
-        }
+        let population = Population::collect(server, &timings, &expected, true).await;
         let after = self.captured().await?;
         let ownership = (0..TENANTS.len())
             .map(|tenant| {
@@ -1089,6 +1027,8 @@ impl Capacity {
             admitted,
             ownership,
             population,
+            capacity: Population::from_interval(capacity.since(&timings)?),
+            recovery: Population::from_interval(completed.since(&judged)?),
             durable_bytes: Durable::between(&baseline, &ended).bytes,
             drain,
         };
@@ -1108,12 +1048,9 @@ impl Workload for Capacity {
     /// missing evidence.
     async fn smoke(&mut self) -> std::result::Result<String, ExperimentError> {
         self.start().await.map_err(ExperimentError::workload)?;
-        let (Some(server), Some(tenant), Some(driver), Some(collector)) = (
-            &self.server,
-            self.tenants.first(),
-            &self.driver,
-            &self.collector,
-        ) else {
+        let (Some(server), Some(tenant), Some(driver)) =
+            (&self.server, self.tenants.first(), &self.driver)
+        else {
             return Err(ExperimentError::workload("the workload did not start"));
         };
         let shapes: Vec<(Shape, CapturePolicy)> = driver
@@ -1121,7 +1058,7 @@ impl Workload for Capacity {
             .iter()
             .map(|shape| (shape.clone(), CapturePolicy::Metadata))
             .collect();
-        smoke(server, collector, tenant, &shapes)
+        smoke(server, tenant, &shapes)
             .await
             .map_err(ExperimentError::workload)
     }
@@ -1191,7 +1128,8 @@ mod tests {
     use tokio::sync::Semaphore;
     use tokio::task::JoinSet;
     use tokio::time::Instant;
-    use wyrd_testing::capacity::{Population, Timing, Usage};
+    use wyrd_telemetry::timing::{Distribution, IntervalSeries};
+    use wyrd_testing::capacity::{Population, UNLABELLED, Usage};
     use wyrd_testing::experiment::Reading;
 
     use super::{
@@ -1379,28 +1317,51 @@ mod tests {
         );
     }
 
-    /// One server observation at `boundary` with `outcome`, `elapsed_ms`
-    /// long, 0.1 ms of it outside its provider waits.
-    fn timing(boundary: &str, outcome: &str, elapsed_ms: u64) -> Timing {
-        let elapsed_ns = elapsed_ms * 1_000_000;
-        Timing {
+    /// One series of successful `boundary` observations, each `elapsed_ms`
+    /// long, 0.1 ms of each outside its provider waits.
+    fn timing(boundary: &str, elapsed_ms: &[u64]) -> IntervalSeries {
+        let durations = |samples: Vec<u64>| Distribution::of_durations(&samples).expect("in range");
+        let elapsed: Vec<u64> = elapsed_ms.iter().map(|ms| ms * 1_000_000).collect();
+        IntervalSeries {
             boundary: boundary.to_owned(),
-            outcome: outcome.to_owned(),
-            elapsed_ns,
-            excluded_ns: Some(elapsed_ns - 100_000),
-            end_unix_ns: 1,
-            trace_id: String::new(),
-            span_id: String::new(),
-            instance: "server".to_owned(),
-            scan: None,
+            outcome: SUCCEEDED.to_owned(),
+            case: UNLABELLED.to_owned(),
+            phase: UNLABELLED.to_owned(),
+            count: elapsed.len() as u64,
+            excluded: Some(durations(elapsed.iter().map(|ns| ns - 100_000).collect())),
+            residual: Some(durations(vec![100_000; elapsed.len()])),
+            elapsed: durations(elapsed),
+            missing_excluded: 0,
+            out_of_range: 0,
+            negative_residual: 0,
+        }
+    }
+
+    /// One phase's server timings: every tenant's buffered and streamed
+    /// calls, the last tenant's slower, each stream's head at 10 ms.
+    fn phase() -> Population {
+        Population {
+            series: vec![
+                timing(BUFFERED, &[50, 50, 50, 90]),
+                timing(STREAM_HEAD, &[10; 4]),
+                timing(STREAM_END, &[50, 50, 50, 90]),
+            ],
+            ..Population::default()
+        }
+    }
+
+    /// Whether `reading` holds `value`: exactly, or inside its bucket.
+    fn holds(reading: &Reading, value: f64) -> bool {
+        match (reading.above, reading.value) {
+            (Some(above), Some(upper)) => above < value && value <= upper,
+            (None, Some(exact)) => (exact - value).abs() < 1e-9,
+            _ => false,
         }
     }
 
     /// One call of `tenant` in `stream` mode scheduled at `offset` seconds
-    /// that ended `outcome` with a server answer handoff `done_ms` after
-    /// handler entry (a stream's head 10 ms after it), its events each 2 ms
-    /// behind its upstream send. An unanswered call's server timing is a
-    /// refusal; a timed-out call has none.
+    /// that ended `outcome` `done_ms` after its send, its events each 2 ms
+    /// behind its upstream send.
     fn arrived(
         tenant: usize,
         stream: bool,
@@ -1410,16 +1371,6 @@ mod tests {
     ) -> Arrived {
         let scheduled = std::time::Instant::now();
         let at = |ms: u64| scheduled + Duration::from_millis(ms);
-        let server = match (&outcome, stream) {
-            (Outcome::TimedOut, _) => Vec::new(),
-            (Outcome::Answered, false) => vec![timing(BUFFERED, SUCCEEDED, done_ms)],
-            (Outcome::Answered, true) => vec![
-                timing(STREAM_HEAD, SUCCEEDED, 10),
-                timing(STREAM_END, SUCCEEDED, done_ms),
-            ],
-            (_, false) => vec![timing(BUFFERED, "refused", done_ms)],
-            (_, true) => vec![timing(STREAM_HEAD, "refused", done_ms)],
-        };
         let events: Vec<_> = if stream {
             (1..=4).map(|n| at(n * 10)).collect()
         } else {
@@ -1440,10 +1391,8 @@ mod tests {
                 events,
                 done: at(done_ms),
                 outcome,
-                trace: String::new(),
             },
             sends,
-            server,
         }
     }
 
@@ -1501,6 +1450,8 @@ mod tests {
             overload_shed: 0.0,
             admitted: 24.0,
             population: Population::default(),
+            capacity: phase(),
+            recovery: phase(),
             durable_bytes: 4_096.0,
             drain: Drain {
                 seconds: 0.5,
@@ -1515,11 +1466,11 @@ mod tests {
         reading.above.is_none().then_some(reading.value).flatten()
     }
 
-    /// A clean repetition judges capacity by the worst tenant and recovery
-    /// over every tenant, by each call's exact server time from handler
-    /// entry, with the buffered overhead its residual after provider waits
-    /// and chunk lag a client diagnostic; an answered call without its
-    /// server timing invalidates the evidence; declared
+    /// A clean repetition judges each phase over every tenant by its server
+    /// timing histograms from handler entry, with the buffered overhead its
+    /// residual after provider waits and chunk lag a client diagnostic of
+    /// the worst tenant; an invalid timing window invalidates the evidence;
+    /// declared
     /// admission refusals count only in overload, every other unanswered
     /// call is an error of its phase, shed items are attributed to overload
     /// or outside it, and unpaired stream events invalidate the evidence.
@@ -1530,14 +1481,22 @@ mod tests {
     #[test]
     fn capacity_repetition_classifies_phases_and_capture() {
         let clean = observed(Vec::new()).repetition();
-        assert_eq!(exact(&clean, "capacity.completion_p99_ms"), Some(90.0));
+        for (id, value) in [
+            ("capacity.completion_p99_ms", 90.0),
+            ("recovery.stream_p99_ms", 90.0),
+            ("capacity.first_token_p99_ms", 10.0),
+            ("capacity.overhead_p99_ms", 0.1),
+            ("p99_ms", 90.0),
+            ("p50_ms", 50.0),
+        ] {
+            assert!(
+                holds(&clean.reading(id), value),
+                "{id}: {:?}",
+                clean.reading(id)
+            );
+        }
         assert_eq!(exact(&clean, "capacity.chunk_lag_p99_ms"), Some(2.0));
-        assert_eq!(exact(&clean, "recovery.stream_p99_ms"), Some(90.0));
-        assert_eq!(exact(&clean, "capacity.first_token_p99_ms"), Some(10.0));
-        assert_eq!(exact(&clean, "capacity.overhead_p99_ms"), Some(0.1));
-        assert_eq!(exact(&clean, "p99_ms"), Some(90.0));
-        assert_eq!(clean.reading("capacity.completion_p99_ms").samples, Some(1));
-        assert_eq!(clean.reading("recovery.completion_p99_ms").samples, Some(4));
+        assert_eq!(clean.reading("capacity.completion_p99_ms").samples, Some(4));
         for id in [
             "capacity.errors",
             "overload.unexpected",
@@ -1556,11 +1515,11 @@ mod tests {
         assert_eq!(clean.observations.len(), 2, "{:?}", clean.observations);
 
         let mut untimed = observed(Vec::new());
-        untimed.calls[0].server.clear();
         untimed.population.invalid.push("a short window".to_owned());
+        untimed.recovery = Population::default();
         let untimed = untimed.repetition();
-        assert_eq!(untimed.invalid.len(), 2, "{:?}", untimed.invalid);
-        assert!(untimed.invalid[0].contains("no successful server timing"));
+        assert_eq!(untimed.invalid, ["a short window"]);
+        assert!(!untimed.reading("recovery.completion_p99_ms").is_present());
 
         let refused = |offset| {
             arrived(

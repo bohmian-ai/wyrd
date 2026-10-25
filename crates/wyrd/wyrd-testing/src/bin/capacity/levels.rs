@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
-use wyrd_testing::capacity::{Collector, binary_identity, release_binary, timer_resolution_ns};
+use wyrd_testing::capacity::{
+    binary_identity, release_binary, timer_resolution_ns, timing_declaration,
+};
 use wyrd_testing::experiment::{
     Declaration, Engine, HostRecord, Invocation, Level, Options, Record, Source, Validity, Verdict,
     Workload, run,
@@ -135,7 +137,7 @@ pub fn assemble(
         engine.name().to_owned(),
     ];
     command.extend(context.arguments.iter().skip(1).cloned());
-    let mut timing = Collector::declaration();
+    let mut timing = timing_declaration();
     timing["timer_resolution_ns"] = json!(timer_resolution_ns());
     Declaration {
         engine,

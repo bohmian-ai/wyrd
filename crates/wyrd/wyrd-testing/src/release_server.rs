@@ -247,6 +247,7 @@ impl LocalServer {
         let host = Host::detect()?;
         let log = File::create(root.path().join("server.log"))?;
         let child = operator(binary, root.path(), storage_url, env)
+            .env("WYRD_METRICS_BENCHMARK_SNAPSHOT", "true")
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -310,6 +311,18 @@ impl LocalServer {
         let url = format!("http://127.0.0.1:{METRICS_PORT}/metrics");
         let response = reqwest::get(url).await?.error_for_status()?;
         Ok(Metrics::parse(&response.text().await?))
+    }
+
+    /// Reads the server's cumulative benchmark timing snapshot from the
+    /// loopback metrics listener, which [`Self::serve`] enables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the endpoint does not answer 200 with a
+    /// snapshot.
+    pub async fn timings(&self) -> Result<wyrd_telemetry::timing::TimingSnapshot> {
+        let url = format!("http://127.0.0.1:{METRICS_PORT}/benchmark/timings");
+        Ok(reqwest::get(url).await?.error_for_status()?.json().await?)
     }
 
     /// Microseconds of user plus system CPU the server process has used so

@@ -204,6 +204,19 @@ impl Case {
         }
     }
 
+    /// The benchmark case label its requests carry, so a benchmark-mode
+    /// server keeps each class's timings apart.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Selective => "point-lookup",
+            Self::SmallAggregate => "small-aggregate",
+            Self::MillionAggregate => "million-aggregate",
+            Self::TableAggregate => "table-aggregate",
+            Self::FullScan => "full-scan",
+        }
+    }
+
     /// Distinct statements the case rotates through by `sequence % variants`.
     ///
     /// The selective case derives each ID from the sequence instead, so its

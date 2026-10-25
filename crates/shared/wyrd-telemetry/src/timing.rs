@@ -72,7 +72,7 @@ pub const PHASE_HEADER: &str = "x-wyrd-benchmark-phase";
 pub const CASES: &[&str] = &[
     "point-lookup",
     "small-aggregate",
-    "minute-aggregate",
+    "million-aggregate",
     "table-aggregate",
     "full-scan",
     "trace-lookup",
@@ -637,6 +637,34 @@ impl Distribution {
             .subtract(&earlier.0)
             .map_err(|_| "a bucket count went backwards: the histogram was reset".to_owned())?;
         Ok(Self(interval))
+    }
+
+    /// A duration distribution of exact `samples` nanoseconds, as a client
+    /// test builds one.
+    ///
+    /// # Errors
+    ///
+    /// Returns which sample is outside the duration range.
+    pub fn of_durations(samples: &[u64]) -> Result<Self, String> {
+        let mut histogram = durations();
+        for sample in samples {
+            histogram
+                .record(*sample)
+                .map_err(|_| format!("{sample} ns is outside the duration range"))?;
+        }
+        Ok(Self(histogram))
+    }
+
+    /// Adds `other`'s observations, merging two series of one population.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `other` holds a value outside this
+    /// distribution's range: a duration merged with a scan fact.
+    pub fn add(&mut self, other: &Self) -> Result<(), String> {
+        self.0
+            .add(&other.0)
+            .map_err(|_| "two distributions of different ranges cannot merge".to_owned())
     }
 
     /// Observations.

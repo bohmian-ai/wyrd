@@ -31,12 +31,12 @@ mod workload;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
-use wyrd_testing::capacity::{Collector, Selection, Smoke, Window, request_trace};
+use wyrd_testing::capacity::{Population, Selection, Smoke, UNLABELLED, Window};
 use wyrd_testing::experiment::{
     Baselines, Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reason,
     Record, Status, Step, Verdict,
@@ -1288,21 +1288,14 @@ fn client(server: &LocalServer) -> Result<WyrdClient> {
     })?)
 }
 
-/// Starts the release server with Scribe settings `settings` and every
-/// span exported to `collector`.
+/// Starts the release server with Scribe settings `settings`.
 ///
 /// # Errors
 ///
 /// Returns the binary lookup or start failure.
-async fn start(collector: &Collector, settings: &[(&str, &str)]) -> Result<LocalServer> {
+async fn start(settings: &[(&str, &str)]) -> Result<LocalServer> {
     let binary = wyrd_testing::capacity::release_binary()?;
-    let tracing = collector.server_env();
-    let variables: Vec<(&str, &str)> = settings
-        .iter()
-        .copied()
-        .chain(tracing.iter().map(|(name, value)| (*name, value.as_str())))
-        .collect();
-    Ok(LocalServer::start(&binary, &["bench"], &variables).await?)
+    Ok(LocalServer::start(&binary, &["bench"], settings).await?)
 }
 
 /// One write path's sender and the cursor every later window continues.
@@ -1362,9 +1355,9 @@ async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
 /// requests through every lane, advancing its cursor so later windows write
 /// fresh identities, then exact `count(*)` queries over the smoked native
 /// rows until one answers, all inside one window and without waiting for
-/// publication. Every request must reach `collector` as exactly one
-/// successful timing at its boundary, each write matched by the trace id it
-/// carried, with positive server CPU and inserted memtable bytes.
+/// publication. Every request must land in the server's histograms as
+/// exactly one successful timing at its boundary, with positive server CPU
+/// and inserted memtable bytes.
 ///
 /// # Errors
 ///
@@ -1372,26 +1365,21 @@ async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
 /// piece of evidence.
 async fn smoke(
     server: &LocalServer,
-    collector: &Collector,
     client: &WyrdClient,
     lanes: &[Lane],
 ) -> std::result::Result<String, String> {
     let mut smoke = Smoke::new("bifrost");
-    let from = SystemTime::now();
-    let (window, before) = Window::open(server, collector, Selection::RESOURCES)
+    let timings = server.timings().await.map_err(|error| error.to_string())?;
+    let (window, before) = Window::open(server, Selection::RESOURCES)
         .await
         .map_err(|error| error.to_string())?;
     let mut expected = Vec::new();
-    let mut traces = Vec::new();
     let mut native_rows = 0;
     for (op, sender, cursor) in lanes {
         let chunk = sender.request_rows();
         for _ in 0..SMOKE_WRITES {
             let first = cursor.fetch_add(chunk, Ordering::Relaxed);
-            let trace = request_trace();
-            let sent = sender.send(first, first + chunk, &trace).await;
-            traces.push(trace.trace_id);
-            match sent {
+            match sender.send(first, first + chunk).await {
                 Ok(wire) if *op != WriteOp::Native => {
                     smoke.positive(&format!("{} wire bytes", op.name()), wire as f64);
                 }
@@ -1401,7 +1389,7 @@ async fn smoke(
                 }
             }
         }
-        expected.push((op.boundary(), SMOKE_WRITES.cast_unsigned()));
+        expected.push((op.boundary(), UNLABELLED, SMOKE_WRITES.cast_unsigned()));
     }
     let queries = Bifrost::query_only(client);
     let sql = format!("SELECT count(*) FROM {}", workload::INGEST_TABLE);
@@ -1421,7 +1409,7 @@ async fn smoke(
             "none of {asked} `count(*)` queries answered the {native_rows} acknowledged native rows exactly"
         ));
     }
-    expected.push(("bifrost.query", asked));
+    expected.push(("bifrost.query", UNLABELLED, asked));
     let (usage, after) = window
         .close(server)
         .await
@@ -1429,11 +1417,10 @@ async fn smoke(
     smoke.usage(&usage);
     let delta = |family: &str| after.sum(family, &[]) - before.sum(family, &[]);
     smoke.positive(isolated::INSERTED, delta(isolated::INSERTED));
-    let traces: Vec<&str> = traces.iter().map(String::as_str).collect();
-    let population = collector.smoke("smoke", from, &expected, &traces).await;
+    let population = Population::smoke(server, &timings, &expected).await;
     let boundaries: Vec<(&str, &str, bool)> = expected
         .iter()
-        .map(|(boundary, _)| (*boundary, isolated::SUCCESS, false))
+        .map(|(boundary, _, _)| (*boundary, isolated::SUCCESS, false))
         .collect();
     smoke.timings(&population, &boundaries);
     smoke.finish()

@@ -7,13 +7,14 @@
 //! owns only its production calls; [`crate::experiment`] owns judgment and
 //! history.
 //!
-//! Judged latency is server-side only: the [`Collector`] receives the
-//! server's `wyrd.timing` spans over OTLP, each one request's exact integer
-//! nanoseconds from handler entry to its result, acknowledgement, or
-//! response handoff, plus the union of that request's own provider or
-//! Verifier waits; percentiles are nearest rank over those raw samples
-//! ([`nearest_rank`]), never bucket estimates. Server histograms remain only
-//! as diagnostic means and component breakdowns.
+//! Judged latency is server-side only: each [`Population`] is the
+//! difference of two cumulative snapshots of the server's bounded benchmark
+//! histograms, which record each request's integer nanoseconds from handler
+//! entry to its result, acknowledgement, or response handoff, plus the union
+//! of that request's own provider or Verifier waits and the residual between
+//! them. Each percentile is the nearest-rank bucket's bounds, judged whole.
+//! The coarse Prometheus histograms remain only as diagnostic means and
+//! component breakdowns.
 //!
 //! A workload names the diagnostic histograms and runtime components it reads
 //! in one [`Selection`]; a [`Window`] reads them, the server's CPU and peak
@@ -21,17 +22,17 @@
 //! [`Usage`] at its close. A reading the OS cannot supply, a counter that went
 //! backwards, or a lost process is `None`, never zero use.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use serde_json::Value;
-use wyrd_tonic::otlp::common::v1::{KeyValue, any_value};
-use wyrd_tonic::otlp::trace_service::trace_service_server::{TraceService, TraceServiceServer};
-use wyrd_tonic::otlp::trace_service::{ExportTraceServiceRequest, ExportTraceServiceResponse};
+pub use wyrd_telemetry::timing::UNLABELLED;
+use wyrd_telemetry::timing::{
+    Distribution, IntervalScan, IntervalSeries, TimingInterval, TimingSnapshot,
+};
 
 use crate::experiment::{Reading, Repetition};
 use crate::release_server::{LocalServer, Metrics, PeakSampler};
@@ -296,9 +297,6 @@ pub struct Usage {
     /// CPU seconds this benchmark process used, to show the driver was not
     /// the bottleneck; `None` when unreadable.
     pub driver_cpu_seconds: Option<f64>,
-    /// CPU seconds the [`Collector`] process used, to show collection was
-    /// not saturated; `None` when the process was lost or unreadable.
-    pub collector_cpu_seconds: Option<f64>,
     /// The workload's selected telemetry over the window.
     pub telemetry: Telemetry,
 }
@@ -318,20 +316,17 @@ pub struct Window {
     readings: Readings,
     /// This process's CPU seconds at start.
     driver_cpu_seconds: Option<f64>,
-    /// The collector process and its CPU microseconds at start.
-    collector: (u32, Option<u64>),
 }
 
 impl Window {
-    /// Opens a window over `server` and the `collector` process reading
-    /// `selection`, and returns the opening scrape.
+    /// Opens a window over `server` reading `selection`, and returns the
+    /// opening scrape.
     ///
     /// # Errors
     ///
     /// Returns scrape failures.
     pub async fn open(
         server: &LocalServer,
-        collector: &Collector,
         selection: Selection,
     ) -> Result<(Self, Metrics), Error> {
         let metrics = server.metrics().await?;
@@ -339,7 +334,6 @@ impl Window {
             resources: ResourceWindow::open([server]),
             readings: Readings::read(&metrics, selection),
             driver_cpu_seconds: driver_cpu_seconds(),
-            collector: (collector.pid(), collector.cpu_usec()),
             started: Instant::now(),
         };
         Ok((window, metrics))
@@ -363,10 +357,6 @@ impl Window {
             server_cpu_seconds,
             peak_memory_bytes,
             driver_cpu_seconds: elapsed(self.driver_cpu_seconds, driver_cpu_seconds()),
-            collector_cpu_seconds: usec_elapsed(
-                self.collector.1,
-                crate::release_server::os::process_cpu_usec(self.collector.0),
-            ),
             telemetry: self.readings.since(&metrics),
         };
         Ok((usage, metrics))
@@ -485,950 +475,259 @@ pub fn elapsed(before: Option<f64>, after: Option<f64>) -> Option<f64> {
 /// milliseconds.
 pub const NANOS_PER_MS: f64 = 1e6;
 
-/// The span the server records each request's exact timing on; see
-/// `wyrd_telemetry::record_timing`.
-pub const TIMING_SPAN: &str = "wyrd.timing";
+/// The public query's server timing boundary, whose queries also record
+/// executed-plan scan facts.
+pub const QUERY_BOUNDARY: &str = "bifrost.query";
 
-/// How long the server's batch export may wait before it sends, as the
-/// declared `OTEL_BSP_SCHEDULE_DELAY`.
-pub const EXPORT_DELAY: Duration = Duration::from_millis(100);
-
-/// How long a window's timing observations may take to reach the collector
-/// after its last request ended.
+/// How long a window's timing observations may take to land in the server's
+/// histograms after its last request ended: each records at its boundary,
+/// around the response handoff, so the wait covers only that race.
 const COLLECTION_WAIT: Duration = Duration::from_secs(30);
 
-/// How long a smoke's handful of timing observations may take to reach the
-/// collector: a few export delays, so missing evidence fails promptly.
+/// How long a smoke's handful of timing observations may take to land, so
+/// missing evidence fails promptly.
 const SMOKE_WAIT: Duration = Duration::from_secs(3);
 
 /// The least time a smoke keeps sending, so its server CPU outgrows the
 /// process counters' tick resolution.
 pub const SMOKE_WINDOW: Duration = Duration::from_secs(1);
 
-/// One request's server timing at one boundary, decoded from a
-/// [`TIMING_SPAN`] the server exported.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
-pub struct Timing {
-    /// The owning boundary, such as `gateway.buffered` or `bifrost.query`.
-    pub boundary: String,
-    /// The closed outcome the server recorded.
-    pub outcome: String,
-    /// Monotonic nanoseconds from handler entry to the boundary.
-    pub elapsed_ns: u64,
-    /// The union of excluded waits (provider exchanges, Verifier blocks),
-    /// nanoseconds, when the boundary has any.
-    pub excluded_ns: Option<u64>,
-    /// When the span ended, Unix nanoseconds: assigns it to a window only.
-    pub end_unix_ns: u64,
-    /// Hex trace id: the request's trace.
-    pub trace_id: String,
-    /// Hex span id, unique per observation.
-    pub span_id: String,
-    /// The exporting server process's `service.instance.id`.
-    pub instance: String,
-    /// For a `bifrost.query` observation, the executed-plan scan Oracle
-    /// recorded on the same trace, once a window joined it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scan: Option<Scan>,
-}
-
-/// The public query's server timing boundary, whose observations carry
-/// their trace's [`Scan`].
-pub const QUERY_BOUNDARY: &str = "bifrost.query";
-
-/// Name of the Oracle span that records a query's executed-plan scan.
-pub const SCAN_SPAN: &str = "bifrost.oracle.stream";
-
-/// One query's executed-plan scan facts, decoded from a [`SCAN_SPAN`] the
-/// server exported on the query's trace.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
-pub struct Scan {
-    /// Hex trace id: the query's trace.
-    pub trace_id: String,
-    /// Rows the executed plan's file scans output, when they reported it.
-    pub rows: Option<u64>,
-    /// Bytes the executed plan scanned, when its scans reported it.
-    pub bytes: Option<u64>,
-    /// When the span ended, Unix nanoseconds: assigns it to a window only.
-    pub end_unix_ns: u64,
-}
-
-impl Timing {
-    /// Elapsed less excluded nanoseconds, computed within this one request.
-    ///
-    /// # Errors
-    ///
-    /// Returns why there is no residual: no excluded component, or one
-    /// larger than the elapsed time. A negative residual is never clamped.
-    pub fn residual_ns(&self) -> Result<u64, String> {
-        let excluded = self.excluded_ns.ok_or_else(|| {
-            format!(
-                "a `{}` observation has no excluded component",
-                self.boundary
-            )
-        })?;
-        self.elapsed_ns.checked_sub(excluded).ok_or_else(|| {
-            format!(
-                "a `{}` observation's excluded {excluded} ns exceeds its elapsed {} ns",
-                self.boundary, self.elapsed_ns
-            )
-        })
-    }
-}
-
-/// Every [`TIMING_SPAN`] and [`SCAN_SPAN`] in one OTLP trace export, with a
-/// reason for each one that cannot be decoded, and the number of spans it
-/// carried.
+/// The timing method a record declares: the server's bounded histograms,
+/// read as cumulative snapshots from the loopback metrics listener and
+/// differenced per window.
 #[must_use]
-pub fn decode_timings(
-    request: &ExportTraceServiceRequest,
-) -> (Vec<Timing>, Vec<Scan>, Vec<String>, u64) {
-    let (mut timings, mut scans, mut malformed, mut spans) =
-        (Vec::new(), Vec::new(), Vec::new(), 0_u64);
-    for resource in &request.resource_spans {
-        let instance = resource
-            .resource
-            .as_ref()
-            .and_then(|resource| text(&resource.attributes, "service.instance.id"))
-            .unwrap_or_default();
-        for span in resource.scope_spans.iter().flat_map(|scope| &scope.spans) {
-            spans += 1;
-            if span.name == SCAN_SPAN {
-                match (
-                    nanos(&span.attributes, "rows_scanned"),
-                    nanos(&span.attributes, "bytes_scanned"),
-                ) {
-                    (Ok(rows), Ok(bytes)) => scans.push(Scan {
-                        trace_id: hex(&span.trace_id),
-                        rows,
-                        bytes,
-                        end_unix_ns: span.end_time_unix_nano,
-                    }),
-                    (Err(reason), _) | (_, Err(reason)) => {
-                        malformed.push(format!("a `{SCAN_SPAN}` span is malformed: {reason}"));
-                    }
-                }
-                continue;
-            }
-            if span.name != TIMING_SPAN {
-                continue;
-            }
-            let decoded = (|| {
-                let boundary = text(&span.attributes, "boundary").ok_or("no boundary")?;
-                let outcome = text(&span.attributes, "outcome").ok_or("no outcome")?;
-                let elapsed_ns = nanos(&span.attributes, "elapsed_ns")?.ok_or("no elapsed_ns")?;
-                Ok::<_, &str>(Timing {
-                    boundary,
-                    outcome,
-                    elapsed_ns,
-                    excluded_ns: nanos(&span.attributes, "excluded_ns")?,
-                    end_unix_ns: span.end_time_unix_nano,
-                    trace_id: hex(&span.trace_id),
-                    span_id: hex(&span.span_id),
-                    instance: instance.clone(),
-                    scan: None,
-                })
-            })();
-            match decoded {
-                Ok(timing) => timings.push(timing),
-                Err(reason) => {
-                    malformed.push(format!("a `{TIMING_SPAN}` span is malformed: {reason}"));
-                }
-            }
-        }
-    }
-    (timings, scans, malformed, spans)
-}
-
-/// The string attribute `key`.
-fn text(attributes: &[KeyValue], key: &str) -> Option<String> {
-    attributes
-        .iter()
-        .find(|attribute| attribute.key == key)
-        .and_then(
-            |attribute| match attribute.value.as_ref()?.value.as_ref()? {
-                any_value::Value::StringValue(value) => Some(value.clone()),
-                _ => None,
-            },
-        )
-}
-
-/// The non-negative integer attribute `key`, such as a duration or a scan
-/// count, `None` when absent.
-///
-/// # Errors
-///
-/// Returns why a present value is not a non-negative integer.
-fn nanos(attributes: &[KeyValue], key: &str) -> Result<Option<u64>, &'static str> {
-    let Some(value) = attributes
-        .iter()
-        .find(|attribute| attribute.key == key)
-        .and_then(|attribute| attribute.value.as_ref()?.value.as_ref())
-    else {
-        return Ok(None);
-    };
-    match value {
-        any_value::Value::IntValue(value) => u64::try_from(*value)
-            .map(Some)
-            .map_err(|_| "a negative duration"),
-        _ => Err("a non-integer duration"),
-    }
-}
-
-/// Lower-case hex of `bytes`.
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut out, byte| {
-        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{byte:02x}"));
-        out
+pub fn timing_declaration() -> Value {
+    let method = wyrd_telemetry::timing::Method::current();
+    serde_json::json!({
+        "method": "server benchmark histograms: integer nanoseconds from the owning server boundary's std::time::Instant timers, recorded into bounded HDR histograms and read as cumulative snapshots from the loopback metrics listener; each window is the bucket-count difference of two snapshots of one process",
+        "clock": method.clock,
+        "precision": format!("{} significant digits; each percentile is judged on its whole bucket's bounds", method.significant_digits),
+        "range_ns": [method.lowest_ns, method.highest_ns],
+        "scan_range": [1, method.highest_scan],
+        "max_series": method.max_series,
+        "max_scan_series": method.max_scan_series,
+        "percentile": "nearest rank ceil(q * N) over the window's distribution",
+        "server_env": { "WYRD_METRICS_BENCHMARK_SNAPSHOT": "true" },
+        "tracing": "operator span export stays at its default (disabled); no span is required for timing",
+        "assignment": "a window takes the observations recorded between its two snapshots once its expected count arrived; a short or extra count, a dropped or out-of-range observation, an unknown label, a missing or negative component, or a replaced process makes it invalid",
     })
 }
 
-/// The largest OTLP export request the collector decodes; a larger one is
-/// refused with `RESOURCE_EXHAUSTED`, which the server's exporter counts as
-/// lost spans and the waiting window reports as missing observations.
-pub const MAX_EXPORT_BYTES: usize = 64 << 20;
-
-/// The most unassigned timing observations the collector retains; any
-/// beyond it are dropped and counted against their boundary.
-pub const RETAINED_TIMINGS: usize = 2_000_000;
-
-/// The most malformed-span reasons the collector keeps verbatim; any beyond
-/// it are only counted.
-pub const KEPT_MALFORMED: usize = 16;
-
-/// Worker threads of the collector process: its declared CPU budget.
-pub const COLLECTOR_THREADS: usize = 2;
-
-/// One line the collector process writes to its stdout.
-#[derive(Debug, Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-enum Report {
-    /// The first line: where the collector listens.
-    Listening {
-        /// The `http://` endpoint.
-        endpoint: String,
-    },
-    /// One decoded export request.
-    Export {
-        /// Its timing observations.
-        timings: Vec<Timing>,
-        /// Its queries' scan facts.
-        scans: Vec<Scan>,
-        /// Why each undecodable timing or scan span was refused.
-        malformed: Vec<String>,
-        /// Spans of every name it carried.
-        spans: u64,
-    },
-}
-
-/// What the collector has received and not yet assigned to a window, within
-/// [`RETAINED_TIMINGS`] and [`KEPT_MALFORMED`].
-#[derive(Debug)]
-struct Received {
-    /// Unassigned timing observations, in arrival order.
-    timings: Vec<Timing>,
-    /// Unassigned scan facts, in arrival order, within the same retention.
-    scans: Vec<Scan>,
-    /// Undecodable timing spans since the last window, at most
-    /// [`KEPT_MALFORMED`].
-    malformed: Vec<String>,
-    /// Undecodable timing spans beyond [`KEPT_MALFORMED`] since the last
-    /// window.
-    unkept: u64,
-    /// Per boundary, observations dropped beyond [`RETAINED_TIMINGS`] and
-    /// the latest end among them, Unix nanoseconds, until a window reading
-    /// that boundary reports them.
-    dropped: BTreeMap<String, (u64, u64)>,
-    /// Why the collector process stopped reporting, once it did.
-    lost: Option<String>,
-    /// Export requests received in total.
-    exports: u64,
-    /// Spans received in total, of every name.
-    spans: u64,
-    /// The most unassigned observations kept: [`RETAINED_TIMINGS`].
-    retain: usize,
-}
-
-impl Default for Received {
-    /// Nothing received, retaining at most [`RETAINED_TIMINGS`].
-    fn default() -> Self {
-        Self {
-            timings: Vec::new(),
-            scans: Vec::new(),
-            malformed: Vec::new(),
-            unkept: 0,
-            dropped: BTreeMap::new(),
-            lost: None,
-            exports: 0,
-            spans: 0,
-            retain: RETAINED_TIMINGS,
-        }
-    }
-}
-
-impl Received {
-    /// Keeps one decoded export within the retention bounds; scan facts
-    /// share the timings' bound and overflow under [`SCAN_SPAN`].
-    fn keep(&mut self, timings: Vec<Timing>, scans: Vec<Scan>, malformed: Vec<String>, spans: u64) {
-        for timing in timings {
-            if self.timings.len() + self.scans.len() < self.retain {
-                self.timings.push(timing);
-            } else {
-                let (count, latest) = self.dropped.entry(timing.boundary).or_default();
-                *count += 1;
-                *latest = (*latest).max(timing.end_unix_ns);
-            }
-        }
-        for scan in scans {
-            if self.timings.len() + self.scans.len() < self.retain {
-                self.scans.push(scan);
-            } else {
-                let (count, latest) = self.dropped.entry(SCAN_SPAN.to_owned()).or_default();
-                *count += 1;
-                *latest = (*latest).max(scan.end_unix_ns);
-            }
-        }
-        for reason in malformed {
-            if self.malformed.len() < KEPT_MALFORMED {
-                self.malformed.push(reason);
-            } else {
-                self.unkept += 1;
-            }
-        }
-        self.exports += 1;
-        self.spans += spans;
-    }
-}
-
-/// Where the collector reports: its stdout, or a test's pipe.
-type Sink = Arc<Mutex<dyn std::io::Write + Send>>;
-
-/// The collector process's OTLP trace service.
-struct Intake(Sink);
-
-#[async_trait::async_trait]
-impl TraceService for Intake {
-    /// Decodes every timing span of one export, reports it as one line, and
-    /// acknowledges it whole once the line is written.
-    async fn export(
-        &self,
-        request: wyrd_tonic::tonic::Request<ExportTraceServiceRequest>,
-    ) -> Result<wyrd_tonic::tonic::Response<ExportTraceServiceResponse>, wyrd_tonic::tonic::Status>
-    {
-        let (timings, scans, malformed, spans) = decode_timings(request.get_ref());
-        report(
-            &self.0,
-            &Report::Export {
-                timings,
-                scans,
-                malformed,
-                spans,
-            },
-        )
-        .map_err(|error| wyrd_tonic::tonic::Status::unavailable(error.to_string()))?;
-        Ok(wyrd_tonic::tonic::Response::new(
-            ExportTraceServiceResponse::default(),
-        ))
-    }
-}
-
-/// Writes `line` to `sink` as one JSON line and flushes it.
-///
-/// # Errors
-///
-/// Returns the write failure, such as a driver that stopped reading.
-fn report(sink: &Sink, line: &Report) -> std::io::Result<()> {
-    let mut sink = sink.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut encoded = serde_json::to_vec(line)?;
-    encoded.push(b'\n');
-    sink.write_all(&encoded)?;
-    sink.flush()
-}
-
-/// Listens on a free loopback port, reports it as the first line to `sink`,
-/// then serves OTLP trace exports of at most [`MAX_EXPORT_BYTES`], reporting
-/// each as one line, until `stop` resolves.
-///
-/// # Errors
-///
-/// Returns the bind, report, or serve failure.
-async fn serve(sink: Sink, stop: impl Future<Output = ()> + Send) -> Result<(), Error> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    report(
-        &sink,
-        &Report::Listening {
-            endpoint: format!("http://{}", listener.local_addr()?),
-        },
-    )?;
-    wyrd_tonic::tonic::transport::Server::builder()
-        .add_service(
-            TraceServiceServer::new(Intake(sink)).max_decoding_message_size(MAX_EXPORT_BYTES),
-        )
-        .serve_with_incoming_shutdown(
-            tokio_stream::wrappers::TcpListenerStream::new(listener),
-            stop,
-        )
-        .await?;
-    Ok(())
-}
-
-/// Runs the collector process ([`serve`] reporting to stdout) until stdin
-/// closes. [`Collector::start`] runs this as `<program> collect` on a
-/// [`COLLECTOR_THREADS`]-worker runtime.
-///
-/// # Errors
-///
-/// Returns the bind, report, or serve failure.
-pub async fn serve_collector() -> Result<(), Error> {
-    let closed = tokio::task::spawn_blocking(|| {
-        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
-    });
-    let sink: Sink = Arc::new(Mutex::new(std::io::stdout()));
-    serve(sink, async {
-        let _ = closed.await;
-    })
-    .await
-}
-
-/// A local OTLP/gRPC trace collector the measured server exports to.
-///
-/// It is a declared benchmark helper: a plain child process of the driver
-/// (`<program> collect`, [`serve_collector`]) that receives and decodes the
-/// server's export, so its CPU is neither driver nor server CPU and is
-/// reported on its own ([`Usage::collector_cpu_seconds`]). As a descendant
-/// of the driver, quiet-host checks exclude it. The server's tracing and
-/// export cost stays in server CPU. The driver keeps only [`TIMING_SPAN`]s,
-/// bounded by [`RETAINED_TIMINGS`], and hands each window the observations
-/// that ended inside it once every expected one arrived; every assigned
-/// observation is appended to `timings.jsonl` under the run's artifacts.
-pub struct Collector {
-    /// The `http://` endpoint the server exports to.
-    endpoint: String,
-    /// What arrived and is unassigned.
-    received: Arc<Mutex<Received>>,
-    /// Raw observation file under the artifacts directory.
-    log: PathBuf,
-    /// The collector process, or `None` for a test's in-process intake;
-    /// closing its stdin stops it, and dropping the collector kills it.
-    child: Option<std::process::Child>,
-    /// Stops a test's in-process intake on drop.
-    #[cfg(test)]
-    stop: Option<tokio_util::sync::DropGuard>,
-}
-
-impl Collector {
-    /// Starts the collector process from this program and keeps raw
-    /// observations under `artifacts`, with its stderr in
-    /// `collector.stderr` there.
-    ///
-    /// # Errors
-    ///
-    /// Returns the artifacts-directory, spawn, or first-report failure.
-    #[cfg(not(test))]
-    pub async fn start(artifacts: &Path) -> Result<Self, Error> {
-        Self::spawn(&std::env::current_exe()?, artifacts).await
-    }
-
-    /// Runs the same intake inside this test process over a pipe, since a
-    /// test harness cannot be re-run as `collect`; its CPU is this process's.
-    ///
-    /// # Errors
-    ///
-    /// Returns the artifacts-directory, pipe, or first-report failure.
-    #[cfg(test)]
-    pub async fn start(artifacts: &Path) -> Result<Self, Error> {
-        std::fs::create_dir_all(artifacts)?;
-        let (reader, writer) = std::io::pipe()?;
-        let stop = tokio_util::sync::CancellationToken::new();
-        let sink: Sink = Arc::new(Mutex::new(writer));
-        tokio::spawn(serve(sink, stop.clone().cancelled_owned()));
-        let mut collector = Self::attach(reader, artifacts, None).await?;
-        collector.stop = Some(stop.drop_guard());
-        Ok(collector)
-    }
-
-    /// Starts `program collect` as the collector process.
-    ///
-    /// # Errors
-    ///
-    /// Returns the artifacts-directory, spawn, or first-report failure.
-    pub async fn spawn(program: &Path, artifacts: &Path) -> Result<Self, Error> {
-        std::fs::create_dir_all(artifacts)?;
-        let mut child = std::process::Command::new(program)
-            .arg("collect")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::fs::File::create(artifacts.join("collector.stderr"))?)
-            .spawn()?;
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("the collector process has no stdout".into());
-        };
-        Self::attach(stdout, artifacts, Some(child)).await
-    }
-
-    /// Reads the collector's first line, its endpoint, within 10 s, then
-    /// keeps every later line on a reader thread until `reports` closes or
-    /// fails, which marks the collector lost.
-    ///
-    /// # Errors
-    ///
-    /// Returns the read failure or a first line that is not the endpoint;
-    /// `child` is then killed.
-    async fn attach(
-        reports: impl std::io::Read + Send + 'static,
-        artifacts: &Path,
-        child: Option<std::process::Child>,
-    ) -> Result<Self, Error> {
-        use std::io::BufRead as _;
-        let mut collector = Self {
-            endpoint: String::new(),
-            received: Arc::new(Mutex::new(Received::default())),
-            log: artifacts.join("timings.jsonl"),
-            child,
-            #[cfg(test)]
-            stop: None,
-        };
-        let mut lines = std::io::BufReader::new(reports).lines();
-        let first = tokio::task::spawn_blocking(move || (lines.next(), lines));
-        let (first, lines) = tokio::time::timeout(Duration::from_secs(10), first)
-            .await
-            .map_err(|_| "the collector did not report its endpoint within 10 s")??;
-        match first.transpose()?.map(|line| serde_json::from_str(&line)) {
-            Some(Ok(Report::Listening { endpoint })) => collector.endpoint = endpoint,
-            other => {
-                return Err(format!("the collector did not report its endpoint: {other:?}").into());
-            }
-        }
-        let shared = Arc::clone(&collector.received);
-        std::thread::spawn(move || {
-            let lost = (|| -> Result<(), String> {
-                for line in lines {
-                    let line = line.map_err(|error| error.to_string())?;
-                    match serde_json::from_str(&line) {
-                        Ok(Report::Export {
-                            timings,
-                            scans,
-                            malformed,
-                            spans,
-                        }) => shared
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .keep(timings, scans, malformed, spans),
-                        other => return Err(format!("an unexpected report {other:?}")),
-                    }
-                }
-                Err("its output closed".to_owned())
-            })();
-            if let Err(reason) = lost {
-                shared.lock().unwrap_or_else(PoisonError::into_inner).lost =
-                    Some(format!("the timing collector stopped reporting: {reason}"));
-            }
-        });
-        Ok(collector)
-    }
-
-    /// PID of the collector process; this process's for a test's
-    /// in-process intake.
-    #[must_use]
-    pub fn pid(&self) -> u32 {
-        self.child
-            .as_ref()
-            .map_or_else(std::process::id, std::process::Child::id)
-    }
-
-    /// Microseconds of user plus system CPU the collector process has used,
-    /// or `None` once it is gone or unreadable, so a lost collector never
-    /// reads as idle.
-    #[must_use]
-    pub fn cpu_usec(&self) -> Option<u64> {
-        crate::release_server::os::process_cpu_usec(self.pid())
-    }
-
-    /// The server environment that exports every span to this collector:
-    /// the operator OTLP endpoint, a sampling ratio of one, and a batch
-    /// queue large enough that a window's spans are never dropped. A
-    /// record declares these as its tracing configuration.
-    #[must_use]
-    pub fn server_env(&self) -> Vec<(&'static str, String)> {
-        vec![
-            ("WYRD_OTLP_ENDPOINT", self.endpoint.clone()),
-            ("WYRD_OTLP_SAMPLE_RATIO", "1.0".to_owned()),
-            ("OTEL_BSP_MAX_QUEUE_SIZE", "1048576".to_owned()),
-            ("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "8192".to_owned()),
-            (
-                "OTEL_BSP_SCHEDULE_DELAY",
-                EXPORT_DELAY.as_millis().to_string(),
-            ),
-        ]
-    }
-
-    /// The declared tracing configuration and collection method a record
-    /// keeps, without the collector's ephemeral port.
-    #[must_use]
-    pub fn declaration() -> Value {
-        serde_json::json!({
-            "method": "server wyrd.timing spans: exact integer nanoseconds from the owning server boundary's std::time::Instant timers, exported through the operator OTLP/gRPC span exporter to a collector helper process the driver starts",
-            "clock": "std::time::Instant on the server: the OS monotonic clock",
-            "server_env": {
-                "WYRD_OTLP_SAMPLE_RATIO": "1.0",
-                "OTEL_BSP_MAX_QUEUE_SIZE": "1048576",
-                "OTEL_BSP_MAX_EXPORT_BATCH_SIZE": "8192",
-                "OTEL_BSP_SCHEDULE_DELAY": EXPORT_DELAY.as_millis().to_string(),
-            },
-            "cost": "the server's tracing and export CPU is in server CPU; the collector helper's CPU is reported separately, in neither server nor driver CPU",
-            "collector": {
-                "worker_threads": COLLECTOR_THREADS,
-                "max_export_bytes": MAX_EXPORT_BYTES,
-                "retained_timings": RETAINED_TIMINGS,
-                "kept_malformed": KEPT_MALFORMED,
-                "host_checks": "excluded as a descendant of the driver",
-            },
-            "assignment": "a window takes the observations that ended after it opened, once its expected count arrived (and, for traced requests, each request's own observation by trace id); a missing, extra, duplicate, or malformed observation makes it invalid",
-        })
-    }
-
-    /// Waits until `expected` observations of each boundary ended at or
-    /// after `opened`, then takes every observation of those boundaries
-    /// that did and drops whatever else is unassigned: earlier windows'
-    /// stragglers and boundaries this window does not read.
-    ///
-    /// After the counts are reached the collector waits two more export
-    /// delays, so a late duplicate is counted rather than left for the next
-    /// window. The population is invalid when a count is short after
-    /// [`COLLECTION_WAIT`], over, or a span id repeats, or a timing span was
-    /// malformed. Taken observations are appended to the raw file.
-    pub async fn window(
-        &self,
-        label: &str,
-        opened: SystemTime,
-        expected: &[(&str, u64)],
-    ) -> Population {
-        self.collect(label, opened, expected, true, &[], COLLECTION_WAIT)
-            .await
-    }
-
-    /// [`Self::window`] for a smoke's requests, waiting at most
-    /// [`SMOKE_WAIT`] for a short count, and requiring each of `traces` to
-    /// have exactly one observation.
-    pub async fn smoke(
-        &self,
-        label: &str,
-        opened: SystemTime,
-        expected: &[(&str, u64)],
-        traces: &[&str],
-    ) -> Population {
-        self.collect(label, opened, expected, true, traces, SMOKE_WAIT)
-            .await
-    }
-
-    /// [`Self::window`] for a window whose boundaries also serve requests
-    /// the driver did not send itself: waits until at least `least`
-    /// observations of each boundary ended at or after `opened` and every
-    /// trace id of `traces` has one, then takes every observation of those
-    /// boundaries that did. The population is invalid when a count is short
-    /// or a trace has no observation after [`COLLECTION_WAIT`], a trace has
-    /// more than one, a span id repeats, or a timing span was malformed.
-    pub async fn traced(
-        &self,
-        label: &str,
-        opened: SystemTime,
-        least: &[(&str, u64)],
-        traces: &[&str],
-    ) -> Population {
-        self.collect(label, opened, least, false, traces, COLLECTION_WAIT)
-            .await
-    }
-
-    /// Waits up to `wait` for and takes a window's observations: `expected`
-    /// counts per boundary, exact when `exact` and lower bounds otherwise,
-    /// and one observation at least for each of `traces`.
-    async fn collect(
-        &self,
-        label: &str,
-        opened: SystemTime,
-        expected: &[(&str, u64)],
-        exact: bool,
-        traces: &[&str],
-        wait: Duration,
-    ) -> Population {
-        let from = unix_nanos(opened);
-        let matching = |timing: &Timing| {
-            timing.end_unix_ns >= from
-                && expected
-                    .iter()
-                    .any(|(boundary, _)| *boundary == timing.boundary)
-        };
-        let counts = |received: &Received| {
-            expected
-                .iter()
-                .map(|(boundary, _)| {
-                    received
-                        .timings
-                        .iter()
-                        .filter(|timing| matching(timing) && timing.boundary == *boundary)
-                        .count() as u64
-                })
-                .collect::<Vec<_>>()
-        };
-        let unseen = |received: &Received| {
-            if traces.is_empty() {
-                return 0;
-            }
-            let seen: std::collections::HashSet<&str> = received
-                .timings
-                .iter()
-                .filter(|timing| matching(timing))
-                .map(|timing| timing.trace_id.as_str())
-                .collect();
-            traces
-                .iter()
-                .filter(|trace| !seen.contains(**trace))
-                .count()
-        };
-        let waiting = tokio::time::Instant::now();
-        while waiting.elapsed() < wait {
-            let reached = {
-                let received = self.received.lock().unwrap_or_else(PoisonError::into_inner);
-                counts(&received)
-                    .iter()
-                    .zip(expected)
-                    .all(|(count, (_, want))| count >= want)
-                    && unseen(&received) == 0
-            };
-            if reached {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        tokio::time::sleep(EXPORT_DELAY * 2).await;
-        let mut received = self.received.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut invalid = std::mem::take(&mut received.malformed);
-        let unkept = std::mem::take(&mut received.unkept);
-        if unkept > 0 {
-            invalid.push(format!(
-                "{unkept} more `{TIMING_SPAN}` spans are malformed, beyond the {KEPT_MALFORMED} kept"
-            ));
-        }
-        invalid.extend(received.lost.clone());
-        let scanned = expected
-            .iter()
-            .any(|(boundary, _)| *boundary == QUERY_BOUNDARY)
-            .then_some(SCAN_SPAN);
-        for boundary in expected
-            .iter()
-            .map(|(boundary, _)| *boundary)
-            .chain(scanned)
-        {
-            if let Some((count, latest)) = received.dropped.remove(boundary)
-                && latest >= from
-            {
-                invalid.push(format!(
-                    "{count} `{boundary}` timing observations overflowed the collector's {}-observation retention and were dropped",
-                    received.retain
-                ));
-            }
-        }
-        for (count, (boundary, want)) in counts(&received).iter().zip(expected) {
-            if count < want || (exact && count != want) {
-                invalid.push(format!(
-                    "{count} `{boundary}` timing observations arrived for {want} requests"
-                ));
-            }
-        }
-        let missing = unseen(&received);
-        if missing > 0 {
-            invalid.push(format!(
-                "{missing} of {} traced requests have no server timing observation",
-                traces.len()
-            ));
-        }
-        let (mut timings, _): (Vec<Timing>, Vec<Timing>) = std::mem::take(&mut received.timings)
-            .into_iter()
-            .partition(|timing| matching(timing));
-        let mut scans: HashMap<String, Scan> = std::mem::take(&mut received.scans)
-            .into_iter()
-            .filter(|scan| scan.end_unix_ns >= from)
-            .map(|scan| (scan.trace_id.clone(), scan))
-            .collect();
-        for timing in &mut timings {
-            if timing.boundary == QUERY_BOUNDARY {
-                timing.scan = scans.remove(&timing.trace_id);
-            }
-        }
-        let (exports, spans) = (received.exports, received.spans);
-        drop(received);
-        if !traces.is_empty() {
-            let wanted: std::collections::HashSet<&str> = traces.iter().copied().collect();
-            let mut seen: BTreeMap<&str, u64> = BTreeMap::new();
-            for timing in &timings {
-                if wanted.contains(timing.trace_id.as_str()) {
-                    *seen.entry(timing.trace_id.as_str()).or_default() += 1;
-                }
-            }
-            let repeated = seen.values().filter(|count| **count > 1).count();
-            if repeated > 0 {
-                invalid.push(format!(
-                    "{repeated} of {} traced requests have more than one server timing observation",
-                    traces.len()
-                ));
-            }
-        }
-        let mut ids: Vec<&str> = timings
-            .iter()
-            .map(|timing| timing.span_id.as_str())
-            .collect();
-        ids.sort_unstable();
-        let unique = ids.len();
-        ids.dedup();
-        if ids.len() != unique {
-            invalid.push(format!(
-                "{} timing observations repeat a span id",
-                unique - ids.len()
-            ));
-        }
-        if let Err(error) = self.append(label, &timings) {
-            invalid.push(format!("raw timings could not be kept: {error}"));
-        }
-        Population {
-            timings,
-            invalid,
-            exports,
-            spans,
-        }
-    }
-
-    /// Appends `timings`, each tagged with the window `label`, to the raw
-    /// file.
-    ///
-    /// # Errors
-    ///
-    /// Returns the open or write failure.
-    fn append(&self, label: &str, timings: &[Timing]) -> std::io::Result<()> {
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log)?;
-        for timing in timings {
-            let line = serde_json::json!({ "window": label, "timing": timing });
-            writeln!(file, "{line}")?;
-        }
-        file.flush()
-    }
-}
-
-impl Drop for Collector {
-    /// Kills and reaps the collector process.
-    fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// `at` as Unix nanoseconds, the clock of [`Timing::end_unix_ns`]; zero
-/// before the epoch.
-#[must_use]
-pub fn unix_nanos(at: SystemTime) -> u64 {
-    at.duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| {
-            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
-        })
-}
-
-/// The mean executed-plan scanned rows and bytes per query over `scans`,
-/// each query's own [`Scan`] on its trace. Each is missing, never zero,
-/// without a query or when one has no scan or its scan lacks the fact.
-#[must_use]
-pub fn scanned_per_query<'a>(scans: impl Iterator<Item = Option<&'a Scan>>) -> [Reading; 2] {
-    let scans: Vec<Option<&Scan>> = scans.collect();
-    let mean = |fact: &str, pick: fn(&Scan) -> Option<u64>| {
-        if scans.is_empty() {
-            return Reading::missing("no query was answered");
-        }
-        let mut total = 0_u64;
-        for scan in &scans {
-            let Some(value) = scan.and_then(pick) else {
-                return Reading::missing(format!(
-                    "an answered query has no executed-plan scanned {fact} on its trace"
-                ));
-            };
-            total = total.saturating_add(value);
-        }
-        let count = scans.len() as u64;
-        Reading::exact(total as f64 / count as f64).with_samples(count)
-    };
-    [
-        mean("rows", |scan| scan.rows),
-        mean("bytes", |scan| scan.bytes),
-    ]
-}
-
-/// One window's server timing observations.
+/// One window's server timing observations: the series and scan facts
+/// recorded between two snapshots of one server process.
 #[derive(Debug, Clone, Default)]
 pub struct Population {
-    /// Every observation of the window's boundaries.
-    pub timings: Vec<Timing>,
+    /// Every timing series with an observation in the window.
+    pub series: Vec<IntervalSeries>,
+    /// Every scan series with a query in the window.
+    pub scans: Vec<IntervalScan>,
     /// Why the population is incomplete or untrustworthy; empty when it is
     /// complete.
     pub invalid: Vec<String>,
-    /// Export requests the collector had received so far.
-    pub exports: u64,
-    /// Spans of every name the collector had received so far.
-    pub spans: u64,
 }
 
 impl Population {
-    /// The elapsed nanoseconds of every `boundary` observation with
-    /// `outcome`.
-    #[must_use]
-    pub fn elapsed(&self, boundary: &str, outcome: &str) -> Vec<u64> {
-        self.of(boundary, outcome)
-            .map(|timing| timing.elapsed_ns)
-            .collect()
+    /// Waits up to [`COLLECTION_WAIT`] until `server` recorded `expected`
+    /// observations of each `(boundary, case)` since `before` (any outcome
+    /// and phase; [`UNLABELLED`] for requests without a case), exactly when
+    /// `exact` and at least otherwise, then takes the window.
+    pub async fn collect(
+        server: &LocalServer,
+        before: &TimingSnapshot,
+        expected: &[(&str, &str, u64)],
+        exact: bool,
+    ) -> Self {
+        Self::wait(server, before, expected, exact, COLLECTION_WAIT).await
     }
 
-    /// The excluded-wait nanoseconds of every `boundary` observation with
-    /// `outcome` that has one.
-    #[must_use]
-    pub fn excluded(&self, boundary: &str, outcome: &str) -> Vec<u64> {
-        self.of(boundary, outcome)
-            .filter_map(|timing| timing.excluded_ns)
-            .collect()
+    /// [`Self::collect`] for a smoke's exact requests, waiting at most
+    /// [`SMOKE_WAIT`].
+    pub async fn smoke(
+        server: &LocalServer,
+        before: &TimingSnapshot,
+        expected: &[(&str, &str, u64)],
+    ) -> Self {
+        Self::wait(server, before, expected, true, SMOKE_WAIT).await
     }
 
-    /// Each `boundary` observation with `outcome`'s residual, elapsed less
-    /// excluded within the request.
+    /// Polls `server`'s snapshot until the counts are reached or `wait`
+    /// expires, then validates the last interval.
+    async fn wait(
+        server: &LocalServer,
+        before: &TimingSnapshot,
+        expected: &[(&str, &str, u64)],
+        exact: bool,
+        wait: Duration,
+    ) -> Self {
+        let waiting = Instant::now();
+        loop {
+            let mut population = match server.timings().await {
+                Ok(after) => match after.since(before) {
+                    Ok(interval) => Self::from_interval(interval),
+                    Err(reason) => return Self::refused(reason),
+                },
+                Err(error) => {
+                    return Self::refused(format!("the timing snapshot is unreadable: {error}"));
+                }
+            };
+            let reached = expected
+                .iter()
+                .all(|(boundary, case, want)| population.count(boundary, case) >= *want);
+            if reached || waiting.elapsed() >= wait {
+                population.expect(expected, exact);
+                return population;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Marks the population invalid for each `(boundary, case)` of
+    /// `expected` whose count is short, or, when `exact`, over.
+    pub fn expect(&mut self, expected: &[(&str, &str, u64)], exact: bool) {
+        for (boundary, case, want) in expected {
+            let count = self.count(boundary, case);
+            if count < *want || (exact && count != *want) {
+                self.invalid.push(format!(
+                    "{count} `{boundary}` timing observations of case {case} were recorded for {want} requests"
+                ));
+            }
+        }
+    }
+
+    /// The population of `interval`, invalid for every dropped,
+    /// unlabelled-by-mistake, or inconsistent observation in it.
+    #[must_use]
+    pub fn from_interval(interval: TimingInterval) -> Self {
+        let mut invalid = Vec::new();
+        if interval.dropped > 0 {
+            invalid.push(format!(
+                "{} timing observations overflowed the server's series bound and were dropped",
+                interval.dropped
+            ));
+        }
+        if interval.invalid_labels > 0 {
+            invalid.push(format!(
+                "{} requests declared an unknown benchmark case or phase",
+                interval.invalid_labels
+            ));
+        }
+        for series in &interval.series {
+            invalid.extend(series.problems());
+        }
+        for scan in &interval.scans {
+            if scan.out_of_range > 0 {
+                invalid.push(format!(
+                    "{} scan facts of case {} are outside the trackable range",
+                    scan.out_of_range, scan.case
+                ));
+            }
+        }
+        Self {
+            series: interval.series,
+            scans: interval.scans,
+            invalid,
+        }
+    }
+
+    /// A population with no observation, invalid for `reason`.
+    fn refused(reason: String) -> Self {
+        Self {
+            invalid: vec![reason],
+            ..Self::default()
+        }
+    }
+
+    /// The observations of `case` in `phase` alone, keeping every invalid
+    /// reason; an L2 window judges each query class and phase this way.
+    #[must_use]
+    pub fn only(&self, case: &str, phase: &str) -> Self {
+        Self {
+            series: self
+                .series
+                .iter()
+                .filter(|series| series.case == case && series.phase == phase)
+                .cloned()
+                .collect(),
+            scans: self
+                .scans
+                .iter()
+                .filter(|scan| scan.case == case && scan.phase == phase)
+                .cloned()
+                .collect(),
+            invalid: self.invalid.clone(),
+        }
+    }
+
+    /// Observations of `boundary` and `case` of any outcome and phase.
+    #[must_use]
+    pub fn count(&self, boundary: &str, case: &str) -> u64 {
+        self.series
+            .iter()
+            .filter(|series| series.boundary == boundary && series.case == case)
+            .map(|series| series.count)
+            .sum()
+    }
+
+    /// The elapsed distribution of every `boundary` observation with
+    /// `outcome`; `None` without one.
+    #[must_use]
+    pub fn elapsed(&self, boundary: &str, outcome: &str) -> Option<Distribution> {
+        merged(
+            self.of(boundary, outcome)
+                .map(|series| Some(&series.elapsed)),
+        )
+    }
+
+    /// The excluded-wait distribution of every `boundary` observation with
+    /// `outcome`; `None` without one, or when any series has none.
+    #[must_use]
+    pub fn excluded(&self, boundary: &str, outcome: &str) -> Option<Distribution> {
+        merged(
+            self.of(boundary, outcome)
+                .map(|series| series.excluded.as_ref()),
+        )
+    }
+
+    /// The residual distribution, elapsed less excluded within each
+    /// request, of every `boundary` observation with `outcome`.
     ///
     /// # Errors
     ///
-    /// Returns the first observation's reason when any has no residual.
-    pub fn residuals(&self, boundary: &str, outcome: &str) -> Result<Vec<u64>, String> {
-        self.of(boundary, outcome)
-            .map(Timing::residual_ns)
-            .collect()
+    /// Returns why there is no residual: no observation, or a series
+    /// without an excluded component.
+    pub fn residuals(&self, boundary: &str, outcome: &str) -> Result<Distribution, String> {
+        if self.of(boundary, outcome).next().is_none() {
+            return Err(format!(
+                "no `{boundary}` timing observation has outcome `{outcome}`"
+            ));
+        }
+        merged(
+            self.of(boundary, outcome)
+                .map(|series| series.residual.as_ref()),
+        )
+        .ok_or_else(|| {
+            format!("no `{boundary}` timing observation with outcome `{outcome}` has a residual")
+        })
     }
 
     /// Observations of `boundary` whose outcome is not `outcome`.
     #[must_use]
     pub fn others(&self, boundary: &str, outcome: &str) -> u64 {
-        self.timings
+        self.series
             .iter()
-            .filter(|timing| timing.boundary == boundary && timing.outcome != outcome)
-            .count() as u64
+            .filter(|series| series.boundary == boundary && series.outcome != outcome)
+            .map(|series| series.count)
+            .sum()
     }
 
     /// The collection-health line a repetition keeps as an observation.
     #[must_use]
     pub fn health(&self) -> String {
         format!(
-            "server timing: {} observations assigned; the collector had received {} spans in {} exports",
-            self.timings.len(),
-            self.spans,
-            self.exports
+            "server timing: {} observations in {} series, {} scanned queries",
+            self.series.iter().map(|series| series.count).sum::<u64>(),
+            self.series.len(),
+            self.scans.iter().map(|scan| scan.count).sum::<u64>(),
         )
     }
 
@@ -1442,10 +741,9 @@ impl Population {
     /// Sets each `(id, q)` of `ids` on `repetition` to the nearest-rank
     /// percentile q, in milliseconds, of the `boundary` observations with
     /// the judged `outcome`: their residuals when `residual`, else their
-    /// elapsed times. Other outcomes stay in the raw file with their
-    /// durations and are counted by [`Self::others`], never judged. An empty
-    /// judged population or an observation without a residual makes the
-    /// repetition invalid.
+    /// elapsed times. Other outcomes are counted by [`Self::others`], never
+    /// judged. An empty judged population or an observation without a
+    /// residual makes the repetition invalid.
     pub fn percentiles(
         &self,
         repetition: &mut Repetition,
@@ -1454,44 +752,84 @@ impl Population {
         residual: bool,
         ids: &[(&str, f64)],
     ) {
-        let samples = if residual {
-            self.residuals(boundary, outcome).unwrap_or_else(|reason| {
-                repetition.invalid.push(reason);
-                Vec::new()
-            })
+        let distribution = if residual {
+            self.residuals(boundary, outcome)
         } else {
-            self.elapsed(boundary, outcome)
-        };
-        if samples.is_empty() {
-            repetition.invalid.push(format!(
-                "no `{boundary}` timing observation has outcome `{outcome}`"
-            ));
+            self.elapsed(boundary, outcome).ok_or_else(|| {
+                format!("no `{boundary}` timing observation has outcome `{outcome}`")
+            })
         }
+        .map_err(|reason| repetition.invalid.push(reason))
+        .ok();
         for (id, q) in ids {
-            repetition.set(id, Reading::percentile(&samples, *q, NANOS_PER_MS));
+            repetition.set(
+                id,
+                distribution.as_ref().map_or_else(
+                    || Reading::missing("no successful sample"),
+                    |distribution| Reading::quantile(distribution, *q, NANOS_PER_MS),
+                ),
+            );
         }
     }
 
-    /// [`scanned_per_query`] over every [`QUERY_BOUNDARY`] observation with
-    /// `outcome`.
+    /// The mean executed-plan scanned rows and bytes per query over the
+    /// scan series with `outcome`, as bounds of each bucketed total; each is
+    /// missing, never zero, without a query or when any query lacks the
+    /// fact.
     #[must_use]
     pub fn scanned_per_query(&self, outcome: &str) -> [Reading; 2] {
-        scanned_per_query(
-            self.of(QUERY_BOUNDARY, outcome)
-                .map(|query| query.scan.as_ref()),
-        )
+        let scans: Vec<&IntervalScan> = self
+            .scans
+            .iter()
+            .filter(|scan| scan.outcome == outcome)
+            .collect();
+        let queries: u64 = scans.iter().map(|scan| scan.count).sum();
+        let mean = |fact: &str,
+                    missing: fn(&IntervalScan) -> u64,
+                    pick: fn(&IntervalScan) -> &Distribution| {
+            if queries == 0 {
+                return Reading::missing("no query was answered");
+            }
+            if scans.iter().any(|scan| missing(scan) > 0) {
+                return Reading::missing(format!(
+                    "an answered query has no executed-plan scanned {fact}"
+                ));
+            }
+            let (low, high) = scans.iter().fold((0_u64, 0_u64), |(low, high), scan| {
+                let (lo, hi) = pick(scan).total_bounds();
+                (low.saturating_add(lo), high.saturating_add(hi))
+            });
+            Reading::bounded(low as f64, high as f64, queries as f64).with_samples(queries)
+        };
+        [
+            mean("rows", |scan| scan.missing_rows, |scan| &scan.rows),
+            mean("bytes", |scan| scan.missing_bytes, |scan| &scan.bytes),
+        ]
     }
 
-    /// Observations of `boundary` with `outcome`.
-    fn of<'a>(&'a self, boundary: &'a str, outcome: &'a str) -> impl Iterator<Item = &'a Timing> {
-        self.timings
+    /// Series of `boundary` with `outcome`.
+    fn of<'a>(
+        &'a self,
+        boundary: &'a str,
+        outcome: &'a str,
+    ) -> impl Iterator<Item = &'a IntervalSeries> {
+        self.series
             .iter()
-            .filter(move |timing| timing.boundary == boundary && timing.outcome == outcome)
+            .filter(move |series| series.boundary == boundary && series.outcome == outcome)
     }
 }
 
+/// The merge of `parts`; `None` when there is none or any part is `None`.
+fn merged<'a>(mut parts: impl Iterator<Item = Option<&'a Distribution>>) -> Option<Distribution> {
+    let mut total = parts.next()??.clone();
+    for part in parts {
+        total.add(part?).ok()?;
+    }
+    Some(total)
+}
+
 /// What one engine's release smoke proved and found missing, judged from
-/// the same windows, collector, and counters the experiment reads.
+/// the same windows, snapshots, and counters the experiment reads.
 #[derive(Debug)]
 pub struct Smoke {
     /// The engine smoked.
@@ -1514,7 +852,7 @@ impl Smoke {
     }
 
     /// Requires `usage` to carry positive server CPU-seconds and readable
-    /// driver and collector CPU, and this host to report its available logical CPUs.
+    /// driver CPU, and this host to report its available logical CPUs.
     pub fn usage(&mut self, usage: &Usage) {
         match usage.server_cpu_seconds {
             Some(cpu) if cpu > 0.0 => self.proved.push(format!("server CPU {cpu:.3}s")),
@@ -1527,12 +865,6 @@ impl Smoke {
             self.missing
                 .push("driver CPU-seconds are unavailable".to_owned());
         }
-        match usage.collector_cpu_seconds {
-            Some(cpu) => self.proved.push(format!("collector CPU {cpu:.3}s")),
-            None => self
-                .missing
-                .push("collector CPU-seconds are unavailable".to_owned()),
-        }
         match std::thread::available_parallelism() {
             Ok(cpus) => self.proved.push(format!("{cpus} logical CPUs")),
             Err(_) => self
@@ -1542,25 +874,24 @@ impl Smoke {
     }
 
     /// Requires `population` to be complete and each `(boundary, outcome,
-    /// component)` to have an observation with `outcome`, and, when
-    /// `component`, an excluded component no larger than its elapsed time.
+    /// component)` to have a histogram observation with `outcome`, and, when
+    /// `component`, an excluded and residual distribution of every one.
     pub fn timings(&mut self, population: &Population, boundaries: &[(&str, &str, bool)]) {
         self.missing.extend(population.invalid.iter().cloned());
         for (boundary, outcome, component) in boundaries {
-            let elapsed = population.elapsed(boundary, outcome);
-            if elapsed.is_empty() {
+            let Some(elapsed) = population.elapsed(boundary, outcome) else {
                 self.missing.push(format!(
                     "no `{boundary}` timing observation has outcome `{outcome}`"
                 ));
                 continue;
-            }
+            };
             if *component {
-                if population.excluded(boundary, outcome).len() != elapsed.len() {
-                    self.missing.push(format!(
-                        "a `{boundary}` timing observation has no `excluded_ns` component"
-                    ));
-                } else if let Err(reason) = population.residuals(boundary, outcome) {
-                    self.missing.push(reason);
+                match population.residuals(boundary, outcome) {
+                    Ok(residual) if residual.len() == elapsed.len() => {}
+                    Ok(_) => self
+                        .missing
+                        .push(format!("a `{boundary}` timing observation has no residual")),
+                    Err(reason) => self.missing.push(reason),
                 }
             }
             self.proved
@@ -1599,22 +930,6 @@ impl Smoke {
                 self.missing.join("; ")
             ))
         }
-    }
-}
-
-/// A fresh W3C trace context for one benchmark request, so its server
-/// timing can be matched to it by trace id: the server's request span
-/// continues it. It is unsampled, so the server never stages a tenant copy
-/// of the request's spans, while the operator policy still records every
-/// span.
-#[must_use]
-pub fn request_trace() -> wyrd_spec::trace::TraceContext {
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    wyrd_spec::trace::TraceContext {
-        span_id: id[..16].to_owned(),
-        trace_id: id,
-        trace_flags: 0,
-        trace_state: String::new(),
     }
 }
 
@@ -1687,9 +1002,8 @@ pub fn install_tracing() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Collector, ExportTraceServiceRequest, KEPT_MALFORMED, KeyValue, Percentiles, Population,
-        QUERY_BOUNDARY, Readings, SCAN_SPAN, Selection, Smoke, TIMING_SPAN, Telemetry, Timing,
-        Usage, deltas, elapsed,
+        Distribution, IntervalScan, IntervalSeries, Percentiles, Population, Readings, Selection,
+        Smoke, Telemetry, TimingInterval, UNLABELLED, Usage, deltas, elapsed,
     };
     use crate::release_server::Metrics;
 
@@ -1823,183 +1137,104 @@ mod tests {
         assert_eq!(Percentiles::raw(&[], 1.0).p50, None);
     }
 
-    /// A real OTLP export past a small retention bound keeps only the bound,
-    /// and the overflow invalidates the window reading its boundary even
-    /// after a window over another boundary passed and dropped the kept
-    /// stragglers; an in-limit window stays exact; offered traces match
-    /// their own observations in any order, while a missing offered trace
-    /// beside an unrelated same-boundary span or a repeated trace is
-    /// invalid; each query's scan joins its own trace in any arrival order
-    /// and a query without one has no scan reading; and malformed reasons and
-    /// a stopped collector stay bounded, specific invalidity.
+    /// A snapshot window is invalid for every dropped, mislabelled, or
+    /// inconsistent observation and for a short or extra count; one case
+    /// and phase never satisfies another's count; scanned facts average as
+    /// bounds of their bucketed totals and a query without one is missing,
+    /// never zero.
     ///
     /// # Panics
     ///
-    /// Panics when the collector cannot start or a window's evidence is
-    /// wrong.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn collector_bounds_identity_and_loss() {
-        use wyrd_tonic::otlp::common::v1::{AnyValue, any_value::Value as Any};
-        use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
-        use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
-
-        let directory = tempfile::tempdir().expect("artifacts");
-        let mut collector = Collector::start(directory.path()).await.expect("collector");
-        collector.received.lock().expect("received").retain = 3;
-        let mut client = TraceServiceClient::connect(collector.endpoint.clone())
-            .await
-            .expect("connect");
-        let mut id = 0_u64;
-        let mut export = async |boundary: &str, traces: &[u64], elapsed: Option<i64>| {
-            let spans = traces
-                .iter()
-                .map(|trace| {
-                    id += 1;
-                    let attribute = |key: &str, value| KeyValue {
-                        key: key.to_owned(),
-                        value: Some(AnyValue { value: Some(value) }),
-                    };
-                    // A `SCAN_SPAN` boundary exports a scan of `elapsed`
-                    // rows and twice as many bytes instead of a timing.
-                    let (name, attributes) = if boundary == SCAN_SPAN {
-                        let scanned = elapsed.unwrap_or_default();
-                        (
-                            SCAN_SPAN,
-                            vec![
-                                attribute("rows_scanned", Any::IntValue(scanned)),
-                                attribute("bytes_scanned", Any::IntValue(scanned * 2)),
-                            ],
-                        )
-                    } else {
-                        let mut attributes = vec![
-                            attribute("boundary", Any::StringValue(boundary.to_owned())),
-                            attribute("outcome", Any::StringValue("success".to_owned())),
-                        ];
-                        attributes
-                            .extend(elapsed.map(|ns| attribute("elapsed_ns", Any::IntValue(ns))));
-                        (TIMING_SPAN, attributes)
-                    };
-                    Span {
-                        name: name.to_owned(),
-                        trace_id: [trace.to_be_bytes(), trace.to_be_bytes()].concat(),
-                        span_id: id.to_be_bytes().to_vec(),
-                        end_time_unix_nano: super::unix_nanos(std::time::SystemTime::now()),
-                        attributes,
-                        ..Span::default()
-                    }
-                })
-                .collect();
-            client
-                .export(ExportTraceServiceRequest {
-                    resource_spans: vec![ResourceSpans {
-                        scope_spans: vec![ScopeSpans {
-                            spans,
-                            ..ScopeSpans::default()
-                        }],
-                        ..ResourceSpans::default()
-                    }],
-                })
-                .await
-                .expect("export");
+    /// Panics when a reason, count, or reading is wrong.
+    #[test]
+    fn snapshot_windows_keep_classes_and_scans_apart() {
+        let durations =
+            |samples: &[u64]| Distribution::of_durations(samples).expect("in-range samples");
+        let series = |case: &str, phase: &str, samples: &[u64], out_of_range| IntervalSeries {
+            boundary: "bifrost.query".to_owned(),
+            outcome: "success".to_owned(),
+            case: case.to_owned(),
+            phase: phase.to_owned(),
+            count: samples.len() as u64 + out_of_range,
+            elapsed: durations(samples),
+            excluded: None,
+            residual: None,
+            missing_excluded: 0,
+            out_of_range,
+            negative_residual: 0,
         };
-
-        let opened = std::time::SystemTime::now();
-        export("a", &[0; 5], Some(10)).await;
-        let other = collector.smoke("other", opened, &[("b", 0)], &[]).await;
-        assert!(other.invalid.is_empty(), "{:?}", other.invalid);
-        let over = collector.smoke("over", opened, &[("a", 5)], &[]).await;
-        assert_eq!(
-            over.invalid,
-            [
-                "2 `a` timing observations overflowed the collector's 3-observation retention and were dropped",
-                "0 `a` timing observations arrived for 5 requests",
+        let scan = |rows: &[u64], missing_rows| IntervalScan {
+            outcome: "success".to_owned(),
+            case: "point-lookup".to_owned(),
+            phase: "steady".to_owned(),
+            count: rows.len() as u64 + missing_rows,
+            rows: durations(rows),
+            bytes: durations(&rows.iter().map(|rows| rows * 2).collect::<Vec<_>>()),
+            missing_rows,
+            missing_bytes: 0,
+            out_of_range: 0,
+        };
+        let interval = |series, scans, dropped, invalid_labels| TimingInterval {
+            process: "p".to_owned(),
+            nanos: 1,
+            series,
+            scans,
+            dropped,
+            invalid_labels,
+        };
+        let mut mixed = Population::from_interval(interval(
+            vec![
+                series("point-lookup", "steady", &[3, 5], 0),
+                series("full-scan", "steady", &[7], 0),
+                series("point-lookup", "overload", &[9], 0),
             ],
-            "the overflow outlives a window over another boundary"
+            vec![scan(&[3, 5], 0)],
+            0,
+            0,
+        ));
+        assert!(mixed.invalid.is_empty(), "{:?}", mixed.invalid);
+        let point = mixed.only("point-lookup", "steady");
+        assert_eq!(point.count("bifrost.query", "point-lookup"), 2);
+        assert_eq!(point.count("bifrost.query", "full-scan"), 0);
+        let [rows, bytes] = point.scanned_per_query("success");
+        assert_eq!(
+            (rows.value, rows.above, bytes.value),
+            (Some(4.0), None, Some(8.0))
+        );
+        mixed.expect(
+            &[
+                ("bifrost.query", "point-lookup", 3),
+                ("bifrost.query", "full-scan", 2),
+            ],
+            true,
+        );
+        assert_eq!(
+            mixed.invalid,
+            [
+                "1 `bifrost.query` timing observations of case full-scan were recorded for 2 requests"
+            ],
+            "a query class never satisfies another's count"
         );
 
-        let opened = std::time::SystemTime::now();
-        export("a", &[0; 2], Some(10)).await;
-        let within = collector.window("within", opened, &[("a", 2)]).await;
-        assert!(within.invalid.is_empty(), "{:?}", within.invalid);
-        assert_eq!(within.elapsed("a", "success"), [10, 10]);
-
-        let trace = |id: u64| format!("{id:016x}{id:016x}");
-        let (x, y, z) = (trace(7), trace(8), trace(9));
-        let opened = std::time::SystemTime::now();
-        export("a", &[9, 7], Some(10)).await;
-        let ordered = collector
-            .smoke("ordered", opened, &[("a", 2)], &[&x, &z])
-            .await;
-        assert!(ordered.invalid.is_empty(), "{:?}", ordered.invalid);
-        let opened = std::time::SystemTime::now();
-        export("a", &[7, 8], Some(10)).await;
-        let unrelated = collector
-            .smoke("unrelated", opened, &[("a", 2)], &[&x, &z])
-            .await;
+        let broken = Population::from_interval(interval(
+            vec![series(UNLABELLED, UNLABELLED, &[1], 1)],
+            vec![scan(&[3], 1)],
+            2,
+            3,
+        ));
         assert_eq!(
-            unrelated.invalid,
-            ["1 of 2 traced requests have no server timing observation"],
-            "an unrelated span never stands in for an offered trace"
+            broken.invalid,
+            [
+                "2 timing observations overflowed the server's series bound and were dropped",
+                "3 requests declared an unknown benchmark case or phase",
+                "`bifrost.query` (success, case none, phase none) has 1 durations outside the trackable range",
+                "`bifrost.query` (success, case none, phase none) recorded 1 elapsed observations for 2 requests",
+            ]
         );
-        let opened = std::time::SystemTime::now();
-        export("a", &[8, 8], Some(10)).await;
-        let repeated = collector
-            .smoke("repeated", opened, &[("a", 2)], &[&y])
-            .await;
         assert_eq!(
-            repeated.invalid,
-            ["1 of 1 traced requests have more than one server timing observation"]
-        );
-
-        collector.received.lock().expect("received").retain = 16;
-        let opened = std::time::SystemTime::now();
-        export(SCAN_SPAN, &[12], Some(5)).await;
-        export(QUERY_BOUNDARY, &[11, 12], Some(10)).await;
-        export(SCAN_SPAN, &[11], Some(3)).await;
-        let scanned = collector
-            .window("scanned", opened, &[(QUERY_BOUNDARY, 2)])
-            .await;
-        assert!(scanned.invalid.is_empty(), "{:?}", scanned.invalid);
-        let rows = |id: u64| {
-            scanned
-                .timings
-                .iter()
-                .find(|timing| timing.trace_id == trace(id))
-                .and_then(|timing| timing.scan.as_ref()?.rows)
-        };
-        assert_eq!(
-            (rows(11), rows(12)),
-            (Some(3), Some(5)),
-            "each scan joins its own trace"
-        );
-        let [rows, bytes] = scanned.scanned_per_query("success");
-        assert_eq!((rows.value, bytes.value), (Some(4.0), Some(8.0)));
-        let opened = std::time::SystemTime::now();
-        export(QUERY_BOUNDARY, &[13], Some(10)).await;
-        let unscanned = collector
-            .window("unscanned", opened, &[(QUERY_BOUNDARY, 1)])
-            .await;
-        let [rows, _] = unscanned.scanned_per_query("success");
-        assert_eq!(
-            rows.value, None,
-            "a query without its scan is missing, never zero"
-        );
-
-        let opened = std::time::SystemTime::now();
-        export("a", &[0; KEPT_MALFORMED + 2], None).await;
-        let malformed = collector.smoke("malformed", opened, &[("a", 0)], &[]).await;
-        assert_eq!(malformed.invalid.len(), KEPT_MALFORMED + 1);
-        assert_eq!(
-            malformed.invalid.last().map(String::as_str),
-            Some("2 more `wyrd.timing` spans are malformed, beyond the 16 kept")
-        );
-
-        drop(collector.stop.take());
-        let opened = std::time::SystemTime::now();
-        let lost = collector.smoke("lost", opened, &[("a", 0)], &[]).await;
-        assert_eq!(
-            lost.invalid,
-            ["the timing collector stopped reporting: its output closed"]
+            broken.scanned_per_query("success")[0].value,
+            None,
+            "a query without its scan fact is missing, never zero"
         );
     }
 
@@ -2011,23 +1246,28 @@ mod tests {
     /// Panics when a complete smoke fails or a broken one omits a piece.
     #[test]
     fn smoke_names_every_missing_piece() {
-        let timing = |boundary: &str, excluded_ns| Timing {
-            boundary: boundary.to_owned(),
-            outcome: "succeeded".to_owned(),
-            elapsed_ns: 10,
-            excluded_ns,
-            end_unix_ns: 1,
-            trace_id: "t".to_owned(),
-            span_id: "s".to_owned(),
-            instance: "i".to_owned(),
-            scan: None,
+        let timing = |boundary: &str, excluded: Option<u64>| {
+            let durations =
+                |samples: &[u64]| Distribution::of_durations(samples).expect("in-range samples");
+            IntervalSeries {
+                boundary: boundary.to_owned(),
+                outcome: "succeeded".to_owned(),
+                case: UNLABELLED.to_owned(),
+                phase: UNLABELLED.to_owned(),
+                count: 1,
+                elapsed: durations(&[10]),
+                excluded: excluded.map(|excluded| durations(&[excluded])),
+                residual: excluded.map(|excluded| durations(&[10 - excluded])),
+                missing_excluded: 0,
+                out_of_range: 0,
+                negative_residual: 0,
+            }
         };
         let usage = |server_cpu_seconds| Usage {
             seconds: 1.0,
             server_cpu_seconds,
             peak_memory_bytes: None,
             driver_cpu_seconds: Some(0.1),
-            collector_cpu_seconds: Some(0.01),
             telemetry: Telemetry::default(),
         };
         let judged = [
@@ -2039,7 +1279,7 @@ mod tests {
         complete.positive("staged captures", 4.0);
         complete.timings(
             &Population {
-                timings: vec![
+                series: vec![
                     timing("gateway.buffered", Some(3)),
                     timing("gateway.stream.end", Some(4)),
                 ],
@@ -2054,7 +1294,7 @@ mod tests {
         broken.positive("staged captures", 0.0);
         broken.timings(
             &Population {
-                timings: vec![timing("gateway.buffered", None)],
+                series: vec![timing("gateway.buffered", None)],
                 invalid: vec!["1 of 2 `gateway.buffered` timings arrived".to_owned()],
                 ..Population::default()
             },
@@ -2065,70 +1305,11 @@ mod tests {
             Err(
                 "gateway measurement is broken: server CPU-seconds are unavailable; \
                  staged captures was 0, not positive; 1 of 2 `gateway.buffered` timings \
-                 arrived; a `gateway.buffered` timing observation has no `excluded_ns` \
-                 component; no `gateway.stream.end` timing observation has outcome \
+                 arrived; no `gateway.buffered` timing observation with outcome \
+                 `succeeded` has a residual; no `gateway.stream.end` timing observation has outcome \
                  `succeeded`"
                     .to_owned()
             )
-        );
-    }
-
-    /// A timing span the server's own telemetry pipeline records and exports
-    /// over OTLP/gRPC reaches the collector as one well-formed observation
-    /// with its exact integer nanoseconds and residual, including a duration
-    /// above `u32::MAX`, while a `u64` field, which the layer exports as a
-    /// string, is refused as malformed rather than parsed.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the pipeline cannot start or the collected observation
-    /// is missing, malformed, or inexact.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn exported_timing_spans_parse_exactly() {
-        let directory = tempfile::tempdir().expect("artifacts");
-        let collector = Collector::start(directory.path()).await.expect("collector");
-        let guard = wyrd_telemetry::init(wyrd_telemetry::TelemetryConfig {
-            endpoint: Some(collector.endpoint.clone()),
-            sample_ratio: Some(1.0),
-            ..wyrd_telemetry::TelemetryConfig::default()
-        })
-        .expect("server telemetry pipeline");
-        let opened = std::time::SystemTime::now();
-        let elapsed = std::time::Duration::from_nanos(5_000_000_123);
-        let excluded = std::time::Duration::from_nanos(7);
-        tracing::info_span!("request").in_scope(|| {
-            wyrd_telemetry::record_timing(
-                &tracing::Span::current(),
-                "verification.direct",
-                "completed",
-                elapsed,
-                Some(excluded),
-            );
-            tracing::info_span!(
-                "wyrd.timing",
-                boundary = "verification.direct",
-                outcome = "completed",
-                elapsed_ns = 9_u64,
-            )
-            .in_scope(|| {});
-        });
-        tokio::task::spawn_blocking(move || guard.shutdown())
-            .await
-            .expect("telemetry shutdown");
-        let population = collector
-            .window("exported", opened, &[("verification.direct", 1)])
-            .await;
-        assert_eq!(
-            population.invalid,
-            ["a `wyrd.timing` span is malformed: a non-integer duration"]
-        );
-        assert_eq!(
-            (
-                population.elapsed("verification.direct", "completed"),
-                population.excluded("verification.direct", "completed"),
-                population.residuals("verification.direct", "completed"),
-            ),
-            (vec![5_000_000_123], vec![7], Ok(vec![5_000_000_116]))
         );
     }
 }

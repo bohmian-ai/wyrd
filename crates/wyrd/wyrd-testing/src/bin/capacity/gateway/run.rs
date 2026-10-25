@@ -7,15 +7,15 @@
 //! closes when the last client stops; a separate drain then waits for every
 //! in-flight call, capture, and outbox write before the final correctness
 //! scrape, so neither warmup work nor post-answer work is misattributed. The
-//! server's exact per-call timings arrive at the shared
-//! [`Collector`]; overhead is each call's elapsed time less the union of its
-//! own provider waits, before any percentile. The warmup runs the same calls
+//! server's per-call timings land in its benchmark histograms, read as a
+//! [`Population`] between two snapshots; overhead is each call's elapsed
+//! time less the union of its own provider waits, before any percentile. The warmup runs the same calls
 //! and is discarded; each repetition starts from the settled server the
 //! previous one left.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
@@ -23,7 +23,8 @@ use tokio::task::JoinSet;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_testing::capacity::{
-    Collector, Population, SMOKE_WINDOW, Selection, Smoke, Usage, Window, release_binary,
+    NANOS_PER_MS, Population, SMOKE_WINDOW, Selection, Smoke, UNLABELLED, Usage, Window,
+    release_binary,
 };
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
 use wyrd_testing::gateway_capture::GatewayCapture;
@@ -297,7 +298,6 @@ impl Observed {
             peak_memory_bytes: usage.peak_memory_bytes,
             memory_interval_ms: PEAK_SAMPLE_INTERVAL_MS,
             driver_cpu_seconds: usage.driver_cpu_seconds,
-            collector_cpu_seconds: usage.collector_cpu_seconds,
             ..Repetition::default()
         };
         repetition.set(
@@ -332,10 +332,9 @@ impl Observed {
         );
         repetition.set(
             "upstream_p99_ms",
-            Reading::percentile(
-                &population.excluded(answer, SUCCEEDED),
-                0.99,
-                wyrd_testing::capacity::NANOS_PER_MS,
+            population.excluded(answer, SUCCEEDED).map_or_else(
+                || Reading::missing("no succeeded call has a provider wait"),
+                |upstream| Reading::quantile(&upstream, 0.99, NANOS_PER_MS),
             ),
         );
         let failures: u64 = boundaries(self.stream)
@@ -413,8 +412,8 @@ impl Observed {
 /// The Gateway release smoke: sequential calls of every `(shape, capture)`
 /// pair, for an equal share of [`SMOKE_WINDOW`] each, from `tenant`'s first key, each pair under its capture
 /// policy, inside one window that then settles. Every call must be
-/// validated and reach `collector` as one succeeded timing at each of its
-/// boundaries with its provider wait excluded, beside positive server CPU,
+/// validated and land in the server's histograms as one succeeded timing at
+/// each of its boundaries with its provider wait excluded, beside positive server CPU,
 /// staged captures, and Scribe outbox writes.
 ///
 /// # Errors
@@ -423,7 +422,6 @@ impl Observed {
 /// message naming every missing piece of evidence.
 pub async fn smoke(
     server: &LocalServer,
-    collector: &Collector,
     tenant: &Tenant,
     shapes: &[(Shape, CapturePolicy)],
 ) -> Result<String> {
@@ -434,8 +432,8 @@ pub async fn smoke(
         .first()
         .ok_or("the tenant has no invoking key")?;
     let mut expected: BTreeMap<&str, u64> = BTreeMap::new();
-    let from = SystemTime::now();
-    let (window, baseline) = Window::open(server, collector, Selection::RESOURCES).await?;
+    let before = server.timings().await?;
+    let (window, baseline) = Window::open(server, Selection::RESOURCES).await?;
     let mut samples = Samples::default();
     for (shape, policy) in shapes {
         tenant.capture(*policy).await?;
@@ -460,11 +458,14 @@ pub async fn smoke(
     }
     smoke.positive("staged captures", integrity.staged);
     smoke.positive("Scribe outbox writes", integrity.written);
-    let expected: Vec<(&str, u64)> = expected.into_iter().collect();
-    let population = collector.smoke("smoke", from, &expected, &[]).await;
+    let expected: Vec<(&str, &str, u64)> = expected
+        .into_iter()
+        .map(|(boundary, calls)| (boundary, UNLABELLED, calls))
+        .collect();
+    let population = Population::smoke(server, &before, &expected).await;
     let judged: Vec<(&str, &str, bool)> = expected
         .iter()
-        .map(|(boundary, _)| (*boundary, SUCCEEDED, true))
+        .map(|(boundary, _, _)| (*boundary, SUCCEEDED, true))
         .collect();
     smoke.timings(&population, &judged);
     Ok(smoke.finish()?)
@@ -481,10 +482,7 @@ pub struct Overhead {
     tenant: Option<Tenant>,
     /// The capture policy the tenant has now.
     policy: Option<CapturePolicy>,
-    /// The collector the server exports its timings to, once prepared.
-    collector: Option<Collector>,
-    /// Where the server log is copied when it stops; its directory keeps
-    /// the raw timings.
+    /// Where the server log is copied when it stops.
     log: PathBuf,
 }
 
@@ -497,29 +495,19 @@ impl Overhead {
             upstream: None,
             tenant: None,
             policy: None,
-            collector: None,
             log,
         }
     }
 
-    /// Starts the timing collector, then the release server exporting to it
-    /// with one tenant, the instant upstream, and a key per client of the
-    /// largest step.
+    /// Starts the release server with one tenant, the instant upstream, and
+    /// a key per client of the largest step.
     ///
     /// # Errors
     ///
-    /// Returns a collector, server, upstream, or provisioning failure.
+    /// Returns a server, upstream, or provisioning failure.
     async fn start(&mut self) -> Result<()> {
         let binary = release_binary()?;
-        let artifacts = self.log.parent().unwrap_or(&self.log).to_path_buf();
-        let collector = Collector::start(&artifacts).await?;
-        let tracing = collector.server_env();
-        let variables: Vec<(&str, &str)> = tracing
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect();
-        let server = LocalServer::start(&binary, &["bench"], &variables).await?;
-        self.collector = Some(collector);
+        let server = LocalServer::start(&binary, &["bench"], &[]).await?;
         let [setup] = server.tenants() else {
             return Err("setup provisioned one tenant".into());
         };
@@ -546,9 +534,7 @@ impl Overhead {
             .number("clients")
             .and_then(|clients| usize::try_from(clients).ok())
             .ok_or_else(|| format!("step `{}` declares no client count", step.id))?;
-        let (Some(server), Some(tenant), Some(collector)) =
-            (&self.server, &self.tenant, &self.collector)
-        else {
+        let (Some(server), Some(tenant)) = (&self.server, &self.tenant) else {
             return Err("the workload was not prepared".into());
         };
         if clients > tenant.keys.len() {
@@ -564,19 +550,17 @@ impl Overhead {
             settle(server).await?;
             return Ok(Repetition::default());
         }
-        let from = SystemTime::now();
-        let (traffic, baseline) = Window::open(server, collector, Selection::RESOURCES).await?;
+        let before = server.timings().await?;
+        let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
         let samples = drive(tenant, &shape, clients, window).await?;
         let (usage, ended) = traffic.close(server).await?;
         let drain = settle(server).await?;
         let last = server.metrics().await?;
-        let expected: Vec<(&str, u64)> = boundaries(shape.stream)
+        let expected: Vec<(&str, &str, u64)> = boundaries(shape.stream)
             .iter()
-            .map(|boundary| (*boundary, samples.arrivals))
+            .map(|boundary| (*boundary, UNLABELLED, samples.arrivals))
             .collect();
-        let population = collector
-            .window(&format!("{}/{phase:?}", step.id), from, &expected)
-            .await;
+        let population = Population::collect(server, &before, &expected, true).await;
         let observed = Observed {
             stream: shape.stream,
             samples,
@@ -601,9 +585,7 @@ impl Workload for Overhead {
     /// missing evidence.
     async fn smoke(&mut self) -> std::result::Result<String, ExperimentError> {
         self.start().await.map_err(ExperimentError::workload)?;
-        let (Some(server), Some(tenant), Some(collector)) =
-            (&self.server, &self.tenant, &self.collector)
-        else {
+        let (Some(server), Some(tenant)) = (&self.server, &self.tenant) else {
             return Err(ExperimentError::workload("the workload did not start"));
         };
         let shapes: Vec<(Shape, CapturePolicy)> = Case::ALL
@@ -611,7 +593,7 @@ impl Workload for Overhead {
             .map(|case| (case.shape(), case.capture()))
             .collect();
         self.policy = shapes.last().map(|(_, policy)| *policy);
-        smoke(server, collector, tenant, &shapes)
+        smoke(server, tenant, &shapes)
             .await
             .map_err(ExperimentError::workload)
     }
@@ -739,24 +721,31 @@ async fn upstream() -> MockServer {
 mod tests {
     use std::collections::BTreeMap;
 
-    use wyrd_testing::capacity::{Population, Timing, Usage};
+    use wyrd_telemetry::timing::{Distribution, IntervalSeries};
+    use wyrd_testing::capacity::{Population, UNLABELLED, Usage};
     use wyrd_testing::experiment::Reading;
 
     use super::{BUFFERED, Drain, Integrity, Observed, STREAM_END, STREAM_HEAD, Samples};
 
-    /// One successful server timing at `boundary` of `elapsed_ns` with
-    /// `excluded_ns` of provider wait.
-    fn timing(boundary: &str, index: usize, elapsed_ns: u64, excluded_ns: u64) -> Timing {
-        Timing {
+    /// The successful server timings at `boundary` of `calls`, each
+    /// `(elapsed_ns, excluded_ns)` of provider wait.
+    fn timing(boundary: &str, calls: &[(u64, u64)]) -> IntervalSeries {
+        let durations =
+            |samples: Vec<u64>| Distribution::of_durations(&samples).expect("in-range samples");
+        IntervalSeries {
             boundary: boundary.to_owned(),
             outcome: "succeeded".to_owned(),
-            elapsed_ns,
-            excluded_ns: Some(excluded_ns),
-            end_unix_ns: 1,
-            trace_id: format!("{index:032x}"),
-            span_id: format!("{index:016x}"),
-            instance: "server".to_owned(),
-            scan: None,
+            case: UNLABELLED.to_owned(),
+            phase: UNLABELLED.to_owned(),
+            count: calls.len() as u64,
+            elapsed: durations(calls.iter().map(|(elapsed, _)| *elapsed).collect()),
+            excluded: Some(durations(calls.iter().map(|(_, wait)| *wait).collect())),
+            residual: Some(durations(
+                calls.iter().map(|(elapsed, wait)| elapsed - wait).collect(),
+            )),
+            missing_excluded: 0,
+            out_of_range: 0,
+            negative_residual: 0,
         }
     }
 
@@ -770,15 +759,22 @@ mod tests {
         } else {
             &[BUFFERED]
         };
-        let timings = boundaries
-            .iter()
-            .flat_map(|boundary| {
-                (0..calls).map(move |index| {
-                    let extra = if index < slow { slow_ns } else { 0 };
-                    timing(boundary, index, wait_ns + 100_000 + extra, wait_ns)
+        let series = if calls == 0 {
+            Vec::new()
+        } else {
+            boundaries
+                .iter()
+                .map(|boundary| {
+                    let calls: Vec<(u64, u64)> = (0..calls)
+                        .map(|index| {
+                            let extra = if index < slow { slow_ns } else { 0 };
+                            (wait_ns + 100_000 + extra, wait_ns)
+                        })
+                        .collect();
+                    timing(boundary, &calls)
                 })
-            })
-            .collect();
+                .collect()
+        };
         Observed {
             stream,
             samples: Samples {
@@ -792,11 +788,10 @@ mod tests {
                 server_cpu_seconds: Some(5.0),
                 peak_memory_bytes: Some(1 << 30),
                 driver_cpu_seconds: Some(2.0),
-                collector_cpu_seconds: Some(0.1),
                 ..Usage::default()
             },
             population: Population {
-                timings,
+                series,
                 ..Population::default()
             },
             integrity: Integrity {
@@ -818,8 +813,18 @@ mod tests {
         reading.above.is_none().then_some(reading.value).flatten()
     }
 
+    /// Whether `value` lies in a reading's bucket bounds: its exclusive
+    /// lower bound and inclusive upper bound, or its exact value.
+    fn holds(reading: &Reading, value: f64) -> bool {
+        match (reading.above, reading.value) {
+            (Some(above), Some(upper)) => above < value && value <= upper,
+            (None, Some(exact)) => (exact - value).abs() < 1e-9,
+            _ => false,
+        }
+    }
+
     /// An L1 repetition reads overhead as each call's server elapsed time
-    /// less its own provider wait, at the exact nearest-rank p99; server
+    /// less its own provider wait, at the nearest-rank p99's bucket; server
     /// latency comes from server timings, never the client round trip; it
     /// counts errors and every capture class separately (shedding apart
     /// from loss), leaves inapplicable and reset readings missing with a
@@ -832,16 +837,15 @@ mod tests {
     fn overhead_repetition_subtracts_waits_per_call_and_counts_capture() {
         let clean = observed(false, 1_000, 2_000_000, 5, 400_000).repetition();
         let overhead = clean.reading("overhead_p99_ms");
-        assert_eq!(
-            (overhead.above, overhead.value, overhead.samples),
-            (None, Some(0.1), Some(1_000)),
-            "rank 990 of 1,000 residuals is a fast call's 100 µs"
+        assert!(
+            holds(&overhead, 0.1) && overhead.samples == Some(1_000),
+            "rank 990 of 1,000 residuals is a fast call's 100 µs: {overhead:?}"
         );
-        assert_eq!(exact(&clean.reading("upstream_p99_ms")), Some(2.0));
-        assert_eq!(exact(&clean.reading("p99_ms")), Some(2.1));
+        assert!(holds(&clean.reading("upstream_p99_ms"), 2.0));
+        assert!(holds(&clean.reading("p99_ms"), 2.1));
         assert_eq!(exact(&clean.reading("client_p99_ms")), Some(0.4));
         let slow = observed(false, 1_000, 2_000_000, 20, 400_000).repetition();
-        assert_eq!(exact(&slow.reading("overhead_p99_ms")), Some(0.5));
+        assert!(holds(&slow.reading("overhead_p99_ms"), 0.5));
         assert_eq!(exact(&clean.reading("requests")), Some(1_000.0));
         assert_eq!(exact(&clean.reading("capture_unstaged")), Some(0.0));
         assert!(clean.reading("overhead_end_p99_ms").reason.is_some());
@@ -854,7 +858,7 @@ mod tests {
             "a clean window observes only its collection health"
         );
         let stream = observed(true, 1_000, 2_000_000, 5, 400_000).repetition();
-        assert_eq!(exact(&stream.reading("overhead_end_p99_ms")), Some(0.1));
+        assert!(holds(&stream.reading("overhead_end_p99_ms"), 0.1));
         assert_eq!(exact(&stream.reading("first_event_p99_ms")), Some(0.2));
 
         let mut broken = observed(false, 1_000, 2_000_000, 5, 400_000);
@@ -895,22 +899,13 @@ mod tests {
             ]
         );
         let mut missing = observed(false, 1_000, 2_000_000, 5, 400_000);
-        missing.population.timings.clear();
-        missing
-            .population
-            .invalid
-            .push("0 `gateway.buffered` timing observations arrived for 1000 requests".to_owned());
+        missing.population.series.clear();
+        missing.population.invalid.push(
+            "0 `gateway.buffered` timing observations of case none were recorded for 1000 requests"
+                .to_owned(),
+        );
         let missing = missing.repetition();
         assert!(!missing.reading("overhead_p99_ms").is_present());
-        assert!(missing.invalid[0].contains("arrived for 1000 requests"));
-        let mut negative = observed(false, 1_000, 2_000_000, 5, 400_000);
-        negative.population.timings[0].excluded_ns = Some(u64::MAX);
-        let negative = negative.repetition();
-        assert!(!negative.reading("overhead_p99_ms").is_present());
-        assert!(
-            negative.invalid[0].contains("exceeds its elapsed"),
-            "{:?}",
-            negative.invalid
-        );
+        assert!(missing.invalid[0].contains("recorded for 1000 requests"));
     }
 }

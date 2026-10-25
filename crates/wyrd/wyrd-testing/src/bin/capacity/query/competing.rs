@@ -346,8 +346,7 @@ impl Competing {
             outstanding.load(Ordering::Relaxed)
         };
         let work = async { tokio::join!(ingest, prober, queries, lanes, overload, stopped) };
-        let (driven, usage, after) = opened
-            .measure(server, end.into_std(), work)
+        let (driven, usage, after) = Box::pin(opened.measure(server, end.into_std(), work))
             .await
             .map_err(ExperimentError::workload)?;
         let (offered, visibility, queries, lanes, overload, backlog_end) = driven;

@@ -1086,6 +1086,25 @@ impl BifrostTelemetryDelta {
             .collect::<Vec<_>>()
             .join(" ")
     }
+
+    /// Renders this window's elapsed time and process resources as one
+    /// evidence line.
+    ///
+    /// CPU, Tokio busy time, and resident bytes are the whole test process —
+    /// every server role and the journey itself — never one writer or query.
+    /// `rss_peak_bytes` is the highest sample the window took: its endpoints
+    /// alone unless the window ran a [`BifrostTelemetrySampler`].
+    #[must_use]
+    pub fn resources(&self) -> String {
+        format!(
+            "elapsed_s={} process_cpu_s={} tokio_busy_s={} rss_end_bytes={} rss_peak_bytes={}",
+            self.interval_seconds,
+            self.process.cpu_seconds,
+            self.process.tokio_busy_seconds,
+            self.process.current_rss_bytes,
+            self.process.peak_rss_bytes,
+        )
+    }
 }
 
 /// Values retained by the single bounded gauge/process sampler.
@@ -4138,6 +4157,30 @@ mod tests {
         assert_eq!(phase.forge_input_bytes, 1);
         assert_eq!(phase.forge_output_files, 1);
         assert_eq!(phase.forge_output_bytes, 1);
+    }
+
+    /// Proves a window's elapsed time and process resources render with the
+    /// whole-process scope they were measured at.
+    #[test]
+    fn resources_render_elapsed_and_process_scope() {
+        let delta = BifrostTelemetryDelta {
+            metrics: Vec::new(),
+            gauge_maxima: Vec::new(),
+            gauge_final: Vec::new(),
+            spans: Vec::new(),
+            interval_seconds: 0.25,
+            process: ProcessWindow {
+                cpu_seconds: 0.5,
+                current_rss_bytes: 3,
+                peak_rss_bytes: 7,
+                tokio_busy_seconds: 0.75,
+                ..test_process_window()
+            },
+        };
+        assert_eq!(
+            delta.resources(),
+            "elapsed_s=0.25 process_cpu_s=0.5 tokio_busy_s=0.75 rss_end_bytes=3 rss_peak_bytes=7"
+        );
     }
 
     /// Proves a newly exposed phase destination cannot disappear silently.

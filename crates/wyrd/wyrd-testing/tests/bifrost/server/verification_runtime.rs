@@ -807,11 +807,12 @@ enum Report {
 }
 
 /// Production Oracle query families a measured read prints as its evidence:
-/// query count, files, row groups, pruning, bytes, rows, and the per-step
-/// profile nanoseconds that separate cut discovery, planning, admission, and
-/// operator time.
+/// query count, end-to-end query duration, files, row groups, pruning, bytes,
+/// rows, and the per-step profile nanoseconds that separate cut discovery,
+/// planning, admission, and operator time.
 const WORK_FAMILIES: &[&str] = &[
     "oracle_query_profiles_total",
+    "oracle_query_duration_seconds",
     "oracle_query_files_scanned_total",
     "oracle_query_row_groups_scanned_total",
     "oracle_query_row_groups_pruned_total",
@@ -842,6 +843,8 @@ struct ScanEvidence {
     bloom_pruned: f64,
     /// `oracle_query_bytes_scanned_total` delta.
     bytes: f64,
+    /// Wall seconds the whole measured future took, as its caller saw it.
+    elapsed: f64,
 }
 
 impl ScanEvidence {
@@ -881,9 +884,11 @@ impl ScanEvidence {
             row_groups: sum("oracle_query_row_groups_scanned_total"),
             bloom_pruned: sum("oracle_query_row_groups_pruned_bloom_total"),
             bytes: sum("oracle_query_bytes_scanned_total"),
+            elapsed: delta.interval_seconds,
         };
         println!(
-            "work {label}: {evidence:?} {}",
+            "work {label}: {evidence:?} {} {}",
+            delta.resources(),
             delta.evidence(WORK_FAMILIES)
         );
         Ok((value, evidence))

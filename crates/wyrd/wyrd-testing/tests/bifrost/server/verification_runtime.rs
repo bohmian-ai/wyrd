@@ -482,7 +482,12 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         .await?
         .write_batch(
             "bifrost.drift.observations",
-            &observation_batch(&record, &subject, observed_in_current_month(Utc::now())?)?,
+            &observation_batch(
+                &record,
+                &subject,
+                observed_in_current_month(Utc::now())?,
+                3.0,
+            )?,
         )
         .await?;
     seed.activate(client, &subject).await?;
@@ -604,8 +609,8 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
 }
 
 /// One Drift observation `record` of the Card `subject` at `event_time`: a
-/// drifting `score` and a `latency` feature, as the SDK's tall projection
-/// writes them.
+/// `score` feature valued `score` and a `latency` feature, as the SDK's tall
+/// projection writes them.
 ///
 /// The batch carries the table's own authored columns, its shared dimensions
 /// left null for the server to derive, and the `subject_card_uid` correlation.
@@ -618,6 +623,7 @@ fn observation_batch(
     record: &str,
     subject: &CardUid,
     event_time: DateTime<Utc>,
+    score: f64,
 ) -> Result<RecordBatch, ServerJourneyError> {
     use vala_bifrost_redux::tables::DomainTable;
     use vala_bifrost_redux::tables::drift::ObservationsTable;
@@ -631,7 +637,7 @@ fn observation_batch(
             match field.name().as_str() {
                 "record_id" => Arc::new(StringArray::from(vec![record, record])),
                 "series" => Arc::new(StringArray::from(vec!["score", "latency"])),
-                "num_value" => Arc::new(Float64Array::from(vec![3.0, 120.0])),
+                "num_value" => Arc::new(Float64Array::from(vec![score, 120.0])),
                 "created_at" => Arc::new(
                     TimestampMicrosecondArray::from(vec![event_time, event_time])
                         .with_data_type(field.data_type().clone()),
@@ -6828,15 +6834,15 @@ async fn exploration_filters_keep_exact_populations() -> Result<(), ServerJourne
     Ok(())
 }
 
-/// Run the production runtime on `server` until every one of `executions`
-/// settles, and return their rows in order.
+/// Run the production runtime on `server` until the tenant holds `count`
+/// executions and every one settles, and return their rows.
 ///
 /// # Errors
 /// Returns the runtime, fixture, or timeout error.
 async fn settle_all(
     server: &WyrdTestServer,
     seed: &VerificationFixture,
-    executions: &[ExecutionId],
+    count: usize,
 ) -> Result<Vec<ExecutionRow>, ServerJourneyError> {
     let runtime = VerificationRuntime::builder(server.state())
         .build()
@@ -6845,18 +6851,19 @@ async fn settle_all(
     let task = tokio::spawn(runtime.run(stop.clone()));
     let deadline = tokio::time::Instant::now() + WAIT;
     let rows = loop {
-        let mut rows = Vec::with_capacity(executions.len());
-        for execution in executions {
-            rows.push(seed.execution(*execution).await?);
+        let mut rows = Vec::with_capacity(count);
+        for execution in seed.executions().await? {
+            rows.push(seed.execution(execution).await?);
         }
-        if rows
-            .iter()
-            .all(|row| !["pending", "running", "retrying"].contains(&row.status.as_str()))
+        if rows.len() == count
+            && rows
+                .iter()
+                .all(|row| !["pending", "running", "retrying"].contains(&row.status.as_str()))
         {
             break rows;
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("the executions never settled: {rows:?}").into());
+            return Err(format!("{count} executions never settled: {rows:?}").into());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -6944,7 +6951,7 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
     let (rows, collection) = ScanEvidence::of(
         &cluster,
         "two trace executions",
-        settle_all(server, &seed, &executions),
+        settle_all(server, &seed, executions.len()),
     )
     .await?;
     if rows
@@ -6995,6 +7002,135 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
         };
         if !matches!(refused, WyrdError::VerificationExecutionNotFound { .. }) {
             return Err(format!("not-found expected, saw {refused:?}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// A scheduled Custom Drift window scores exactly its own subject's `score`
+/// rows in `[start, end)` with one Oracle statement per execution
+/// (Scenario 2 of TASK-007; REQ-026, REQ-040; AC-008, AC-014).
+///
+/// Three Card-bound Services are bound monthly to one Custom Drift Verifier
+/// whose score is the window mean. `inside` writes `score` 3 at the inclusive
+/// month start and 5 a minute ago, plus 1000 a microsecond before the start
+/// and an hour after the due end; `other` writes 50 in the window; `empty`
+/// writes nothing. Every record also carries a `latency` series. The
+/// production runtime then scores `inside` at 4 and `other` at 50, while
+/// `empty` stays unscored with no feature row, and the three executions cost
+/// three Oracle statements.
+///
+/// # Errors
+/// Returns cluster, seeding, client, runtime, or query errors, or the first
+/// population that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let tenant = cluster.data_tenant_id();
+    server
+        .ensure_builtin_table_for_test(tenant, "drift", "observations")
+        .await?;
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let verifier = seed
+        .custom_drift_verifier("window-mean", "score", 0.0, 1000.0)
+        .await?;
+    let now = Utc::now();
+    let start = now
+        .date_naive()
+        .with_day(1)
+        .and_then(|day| day.and_hms_opt(0, 0, 0))
+        .ok_or("the current month has no first instant")?
+        .and_utc();
+    let inside_scores = [
+        (start, 3.0),
+        (observed_in_current_month(now)?, 5.0),
+        (start - chrono::Duration::microseconds(1), 1000.0),
+        (now + chrono::Duration::hours(1), 1000.0),
+    ];
+    let mut bindings = Vec::new();
+    for (name, scores) in [
+        ("window-inside", &inside_scores[..]),
+        ("window-other", &[(observed_in_current_month(now)?, 50.0)][..]),
+        ("window-empty", &[][..]),
+    ] {
+        let card = server
+            .bootstrap_service_in_tenant(tenant, name, &[])
+            .await?
+            .card_ref()
+            .ok_or("a service bootstrap returned a user")?
+            .clone();
+        let Bootstrap::Machine { id, api_key, .. } =
+            server.credential_registered_service(&card, &["admin"]).await?
+        else {
+            return Err("a service credential returned a user".into());
+        };
+        let subject = card.uid.clone().ok_or("the subject Card has no UID")?;
+        let writer = Bifrost::connect_with(
+            &native_client(server, api_key.expose_secret())?.for_workload(subject.clone()),
+            BifrostOptions::default(),
+        )
+        .await?;
+        for (at, score) in scores {
+            let record = format!("{name}-{}", uuid::Uuid::now_v7());
+            writer
+                .write_batch(
+                    DRIFT_OBSERVATIONS,
+                    &observation_batch(&record, &subject, *at, *score)?,
+                )
+                .await?;
+        }
+        seed.activate(id, &subject).await?;
+        let binding = seed
+            .bind_schedule(&subject, &subject, &verifier, MONTHLY, Vec::new())
+            .await?;
+        seed.make_binding_due(binding).await?;
+        bindings.push(binding);
+    }
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let (rows, work) = ScanEvidence::of(
+        &cluster,
+        "three drift windows",
+        settle_all(server, &seed, bindings.len()),
+    )
+    .await?;
+    if rows
+        .iter()
+        .any(|row| row.status != "completed" || row.result_id.is_none())
+    {
+        return Err(format!("every window completes with a result: {rows:?}").into());
+    }
+    if work.queries != 3.0 {
+        return Err(format!("each window is one statement: {work:?}").into());
+    }
+    let unwritten = server
+        .state()
+        .bifrost
+        .scribe_outbox()
+        .settle(std::time::Instant::now() + WAIT)
+        .await;
+    if unwritten != 0 {
+        return Err(format!("{unwritten} results were never written").into());
+    }
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+    for (binding, expected) in bindings.iter().zip([Some("4.0"), Some("50.0"), None]) {
+        let scores = query_texts(
+            server,
+            tenant,
+            format!(
+                "SELECT CAST(score AS VARCHAR) FROM bifrost.drift.result_features \
+                 WHERE binding_id = '{binding}' AND feature = 'score'"
+            ),
+        )
+        .await?;
+        let scored: Vec<_> = expected.map(|score| vec![Some(score.to_owned())]).into_iter().collect();
+        if scores != scored {
+            return Err(format!("binding {binding} scored {scores:?}, not {expected:?}").into());
         }
     }
     cluster.shutdown().await?;

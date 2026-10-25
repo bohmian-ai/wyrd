@@ -796,7 +796,7 @@ async fn observe(
         tokio::time::sleep_until(start + offset).await;
         let metrics = scrape(server).await?;
         snapshots.push((offset, timings(server).await?));
-        ticks.push((offset - recovery.start, backlog(&metrics)));
+        ticks.push((offset.saturating_sub(recovery.start), backlog(&metrics)));
         if offset >= schedule.window {
             break metrics;
         }

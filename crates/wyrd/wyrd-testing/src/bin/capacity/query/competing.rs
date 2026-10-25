@@ -342,13 +342,13 @@ impl Competing {
             Population::collect(server, &timings, &expected(asked, &offered), false).await;
         let mut refused = Vec::new();
         let mut between = |low: &TimingSnapshot, high: &Result<TimingSnapshot, _>| match high {
-            Ok(high) => high
-                .since(low)
-                .map(Population::from_interval)
-                .unwrap_or_else(|reason| {
+            Ok(high) => high.since(low).map_or_else(
+                |reason| {
                     refused.push(reason);
                     Population::default()
-                }),
+                },
+                Population::from_interval,
+            ),
             Err(error) => {
                 refused.push(format!("the timing snapshot is unreadable: {error}"));
                 Population::default()
@@ -402,6 +402,10 @@ impl Competing {
         Ok(repetition)
     }
 }
+
+/// One judged phase: its name, its server timing population, and whether
+/// a client answer at an instant falls in it.
+type PhaseWindow<'a> = (&'a str, &'a Population, &'a dyn Fn(Instant) -> bool);
 
 /// Server timing populations between the repetition's phase snapshots.
 #[derive(Default)]
@@ -577,7 +581,7 @@ fn slowest(samples: &[u64], what: &str) -> Reading {
 /// query average the executed-plan scans of the mixed queries the server
 /// answered in the window.
 fn read_queries(repetition: &mut Repetition, asked: &[Asked], windows: &Windows, phases: &Phases) {
-    let phase_readings: [(&str, &Population, &dyn Fn(Instant) -> bool); 2] = [
+    let phase_readings: [PhaseWindow<'_>; 2] = [
         ("capacity", &windows.capacity, &|at| phases.capacity(at)),
         ("recovery", &windows.recovery, &|at| phases.recovered(at)),
     ];
@@ -665,7 +669,7 @@ fn read_ingest(
 ) {
     let writes = SPLIT.map(|(op, _)| op.boundary());
     let acked: Vec<&Acked> = offered.iter().flat_map(|offered| &offered.acked).collect();
-    let phase_readings: [(&str, &Population, &dyn Fn(Instant) -> bool); 2] = [
+    let phase_readings: [PhaseWindow<'_>; 2] = [
         ("capacity", &windows.capacity, &|at| phases.capacity(at)),
         ("recovery", &windows.recovery, &|at| phases.recovered(at)),
     ];

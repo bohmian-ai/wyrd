@@ -154,10 +154,12 @@ impl<T> Default for Offered<T> {
     }
 }
 
-/// Sends one arrival through `launch` every `interval` from `start` until
-/// `end`, never waiting on an answer before the next is due; a due arrival
-/// finding `bound` pending, or waking at or after `end`, is missed. Waits for every sent arrival and
-/// keeps its answer.
+/// Sends one arrival through `launch` every `interval` from `start`, the
+/// window's length over `interval` of them rounded, so the last is due at
+/// least half an interval before `end`; it never waits on an answer before
+/// the next is due, and a due arrival finding `bound` pending, or waking at
+/// or after `end`, is missed. Waits for every sent arrival and keeps its
+/// answer.
 async fn open_loop<T, Fut>(
     start: Instant,
     end: Instant,
@@ -171,11 +173,12 @@ where
 {
     let mut offered = Offered::default();
     let mut pending = JoinSet::new();
-    for arrival in 0_u32.. {
+    let planned = (end.saturating_duration_since(start).as_secs_f64() / interval.as_secs_f64())
+        .round()
+        .to_u32()
+        .unwrap_or(0);
+    for arrival in 0..planned {
         let due = start + interval.mul_f64(f64::from(arrival));
-        if due >= end {
-            break;
-        }
         tokio::time::sleep_until(due).await;
         while let Some(joined) = pending.try_join_next() {
             offered.acked.extend(joined.ok());
@@ -806,13 +809,13 @@ fn read_arrivals(
     let ingest_missed: u64 = offered.iter().map(|offered| offered.missed).sum();
     if ingest_missed > 0 {
         repetition.invalid.push(format!(
-            "the driver missed {ingest_missed} of {} scheduled ingest arrivals with {MAX_PENDING} pending",
+            "the driver missed {ingest_missed} of {} scheduled ingest arrivals: {MAX_PENDING} were pending or it woke at the window end",
             arrivals.scheduled - queries.scheduled
         ));
     }
     if queries.missed > 0 {
         repetition.invalid.push(format!(
-            "the driver missed {} of {} scheduled mixed queries with {QUERY_CLIENTS} in flight",
+            "the driver missed {} of {} scheduled mixed queries: {QUERY_CLIENTS} were in flight or it woke at the window end",
             queries.missed, queries.scheduled
         ));
     }
@@ -1209,8 +1212,9 @@ mod tests {
 
     /// A slow answer never postpones a due query: the open loop sends every
     /// arrival on schedule and keeps every answer, misses arrivals once its
-    /// bound is pending, and the declared rate offers at least 4,000 mixed
-    /// queries and 200 full scans per 360 s repetition.
+    /// bound is pending, the declared rate schedules exactly its rounded
+    /// count with none due too close to the end to send, and it offers at
+    /// least 4,000 mixed queries and 200 full scans per 360 s repetition.
     ///
     /// # Panics
     ///
@@ -1230,6 +1234,19 @@ mod tests {
         let start = Instant::now();
         let capped = open_loop(start, start + second, interval, 2, slow).await;
         assert_eq!((capped.scheduled, capped.sent, capped.missed), (10, 2, 8));
+        let start = Instant::now();
+        let declared = open_loop(
+            start,
+            start + Duration::from_secs(36),
+            Duration::from_secs_f64(1.0 / QUERY_RATE),
+            QUERY_CLIENTS,
+            || async {},
+        )
+        .await;
+        assert_eq!(
+            (declared.scheduled, declared.sent, declared.missed),
+            (432, 432, 0)
+        );
         let offered = (QUERY_RATE * 360.0).to_u64().expect("a whole count");
         let scans = (0..offered)
             .filter(|sequence| mixed_case(*sequence) == Case::FullScan)

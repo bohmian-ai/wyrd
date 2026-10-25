@@ -509,7 +509,7 @@ fn isolated_metrics() -> Vec<Metric> {
         Metric::raw(
             "retained_mib",
             "MiB",
-            "uncompressed Arrow bytes Scribe inserted into memtables (`bifrost_scribe_memtable_bytes_inserted_total`), 2^20 bytes; write steps only",
+            "uncompressed Arrow bytes Scribe inserted into memtables (`bifrost_scribe_memtable_bytes_inserted_total`) between the window open and its measured stop, the CPU interval, 2^20 bytes; write steps only",
         ),
         Metric::raw(
             "wire_bytes",
@@ -1215,7 +1215,7 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
         Metric::raw("queries_after_window", "queries", "exactly answered mixed queries in flight at the window end, answered after it and outside every work-per-CPU metric"),
         Metric::raw("scanned_rows_per_query", "rows/query", "mean rows each in-window mixed query's own executed-plan file scans output (`bifrost.oracle.stream` `rows_scanned` on its trace)"),
         Metric::raw("scanned_bytes_per_query", "B/query", "mean bytes each in-window mixed query's own executed plan scanned (`bifrost.oracle.stream` `bytes_scanned` on its trace)"),
-        Metric::raw("retained_mib", "MiB", "retained Arrow MiB the server inserted while the window was open (`bifrost_scribe_memtable_bytes_inserted_total`), including client-queue lanes and server-internal rows"),
+        Metric::raw("retained_mib", "MiB", "retained Arrow MiB the server inserted from the window open to its measured stop, the CPU interval, never during the drain (`bifrost_scribe_memtable_bytes_inserted_total`), including client-queue lanes and server-internal rows"),
         Metric::raw("otlp_wire_mib", "MiB", "encoded OTLP protobuf MiB of ingest acknowledged before the window end, before framing and compression"),
         Metric::raw("ingest_rows_after_window", "rows", "ingest rows in flight at the window end, acknowledged during the drain and outside every work-per-CPU metric"),
         Metric::raw("p50_ms", "ms", "server: capacity-phase point lookup handler entry until its result handoff (`bifrost.query`), exact nanoseconds (12 queries/s, at most 32 in flight, not the L1 64-client objective)"),

@@ -186,7 +186,7 @@ impl Isolated {
                 (None, None) => Err(ExperimentError::workload("unreachable op")),
             }
         };
-        let (driven, usage, after) = opened
+        let (driven, usage, stopped) = opened
             .measure(server, stop, work)
             .await
             .map_err(ExperimentError::workload)?;
@@ -235,7 +235,7 @@ impl Isolated {
             repetition.set(metric, reading.clone());
         }
         if let Some(write) = write {
-            let inserted = after.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
+            let inserted = stopped.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
             repetition.set("rows", Reading::count(outcome.rows - outcome.late_rows));
             repetition.set("late_rows", Reading::count(outcome.late_rows));
             repetition.set("retained_mib", Reading::exact(inserted / MIB));

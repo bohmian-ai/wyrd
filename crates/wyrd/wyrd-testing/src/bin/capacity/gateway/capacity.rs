@@ -328,7 +328,8 @@ pub struct Driven {
     pub scheduled: u64,
     /// Arrivals sent.
     pub sent: u64,
-    /// Arrivals dropped for being more than [`MISS_AFTER`] late.
+    /// Arrivals dropped for being more than [`MISS_AFTER`] late, or for
+    /// waking at or after the schedule's end, when measurement stopped.
     pub missed: u64,
     /// Arrivals dropped because [`MAX_IN_FLIGHT`] calls were open.
     pub capped: u64,
@@ -341,8 +342,9 @@ pub struct Driven {
 /// Launches every arrival of `schedule` from `start` as its instant comes,
 /// never waiting on a response: each sent arrival runs in `calls`, the
 /// measurement's owned task set, and holds one of `slots` (sized `cap`)
-/// until the future `launch` returns for it completes. Returns once every
-/// sent call has completed. Dropping the future stops launching at once;
+/// until the future `launch` returns for it completes; an arrival whose
+/// wake comes at or after the schedule's end is missed, never sent. Returns
+/// once every sent call has completed. Dropping the future stops launching at once;
 /// calls still in flight stay in `calls` for their owner to abort and join.
 pub async fn open_loop<F, Fut>(
     schedule: &Schedule,
@@ -357,12 +359,19 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let mut driven = Driven::default();
+    let end = start
+        + schedule
+            .segments
+            .iter()
+            .map(|(_, length)| *length)
+            .sum::<Duration>();
     for planned in schedule.planned() {
         let at = start + planned.offset;
         tokio::time::sleep_until(at).await;
         driven.scheduled += 1;
-        let late = Instant::now().saturating_duration_since(at);
-        if late > MISS_AFTER {
+        let woke = Instant::now();
+        let late = woke.saturating_duration_since(at);
+        if late > MISS_AFTER || woke >= end {
             driven.missed += 1;
             continue;
         }
@@ -1011,7 +1020,7 @@ impl Capacity {
         let end = (start + window).into_std();
         let work =
             async { tokio::join!(driving, sample(server, &slots, start, &stop), boundaries) };
-        let ((driven, backlog, boundaries), usage, ended) =
+        let ((driven, backlog, boundaries), usage, stopped) =
             traffic.measure(server, end, work).await?;
         let (driven, calls) = driven;
         let drain = settle(server).await?;
@@ -1081,7 +1090,7 @@ impl Capacity {
             capacity: cohort(&population, Period::Capacity),
             recovery: cohort(&population, Period::Recovery),
             population,
-            durable_bytes: Durable::between(&baseline, &ended).bytes,
+            durable_bytes: Durable::between(&baseline, &stopped).bytes,
             drain,
             late,
         };
@@ -1191,6 +1200,42 @@ mod tests {
     };
     use crate::gateway::run::{BUFFERED, Drain, Integrity, STREAM_END, STREAM_HEAD, SUCCEEDED};
     use crate::gateway::workload::{Outcome, Timed};
+
+    /// The last due arrival, waking past the schedule's end but within
+    /// [`super::MISS_AFTER`] behind a stalled call, is missed and never
+    /// sent, while every earlier call is still joined.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an arrival is admitted after the end or a call is lost.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_arrival_waking_after_the_end_is_missed() {
+        let calls = Mutex::new(JoinSet::new());
+        let done = Arc::new(AtomicU64::new(0));
+        let schedule = Schedule::new(vec![(100.0, Duration::from_secs(1))]);
+        let driven = open_loop(
+            &schedule,
+            Instant::now(),
+            Arc::new(Semaphore::new(1_000)),
+            1_000,
+            &calls,
+            |planned| {
+                let done = Arc::clone(&done);
+                async move {
+                    if planned.index == 98 {
+                        tokio::time::advance(Duration::from_millis(25)).await;
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            (driven.scheduled, driven.sent, driven.missed, driven.capped),
+            (100, 99, 1, 0)
+        );
+        assert_eq!(done.load(Ordering::SeqCst), 99);
+    }
 
     /// Cancelling the scheduler before a later due arrival launches nothing
     /// more, leaves the calls in flight in the measurement's owned set, and

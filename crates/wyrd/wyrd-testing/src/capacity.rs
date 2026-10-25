@@ -310,11 +310,11 @@ pub struct Usage {
 /// One server's resources, this process's CPU, and a selection's telemetry
 /// at a window's start, closed into a [`Usage`].
 ///
-/// Opening and closing each scrape `/metrics` once and hand that scrape back,
+/// Opening and closing each scrape `/metrics` and hand that scrape back,
 /// so a workload reading further series takes them from the same scrape. The
-/// window's seconds and both CPU readings freeze together, before the
-/// closing scrape and, through [`Self::measure`], before the requests in
-/// flight at the window's stop drain.
+/// window's seconds and both CPU readings freeze together with the start of
+/// the scrape handed back and, through [`Self::measure`], before the
+/// requests in flight at the window's stop drain.
 pub struct Window {
     /// Window start, taken once the opening readings are done.
     started: Instant,
@@ -360,14 +360,17 @@ impl Window {
 
     /// Runs `work` in the window and stops measuring at `stop`, or when
     /// `work` ends first: the window's seconds, server CPU, and driver CPU
-    /// freeze there, and only then do the requests `work` still has in
-    /// flight drain, outside them, before the closing scrape. `work` must
-    /// admit nothing after `stop` and counts what completes after it as
-    /// late. Returns `work`'s output, the usage, and the closing scrape.
+    /// freeze there and the stop scrape starts, so the server work counters
+    /// it returns share their interval; only then do the requests `work`
+    /// still has in flight drain, outside all of them. `work` must admit
+    /// nothing after `stop` and counts what completes after it as late.
+    /// Returns `work`'s output, the usage, whose selected telemetry also
+    /// covers the drain, and the stop scrape; a check of everything the
+    /// window caused, drain included, scrapes again afterwards.
     ///
     /// # Errors
     ///
-    /// Returns the closing scrape's failure.
+    /// Returns a stop or drained scrape's failure.
     pub async fn measure<T>(
         self,
         server: &LocalServer,
@@ -381,14 +384,16 @@ impl Window {
             driver_cpu_seconds: driver_opened,
         } = self;
         let mut driver = None;
-        let (output, stopped) = until_stop(stop, work, || {
+        let (output, at_stop, stopped) = until_stop(stop, work, || {
             resources.freeze([server]);
             driver = elapsed(driver_opened, driver_cpu_seconds());
+            server.metrics()
         })
         .await;
+        let at_stop = at_stop?;
         let drain_seconds = stopped.elapsed().as_secs_f64();
         let seconds = stopped.duration_since(started).as_secs_f64();
-        let metrics = server.metrics().await?;
+        let drained = server.metrics().await?;
         let resources = resources.finish([server], seconds);
         let (server_cpu_seconds, peak_memory_bytes) = resources
             .first()
@@ -399,32 +404,34 @@ impl Window {
             peak_memory_bytes,
             driver_cpu_seconds: driver,
             drain_seconds,
-            telemetry: readings.since(&metrics),
+            telemetry: readings.since(&drained),
         };
-        Ok((output, usage, metrics))
+        Ok((output, usage, at_stop))
     }
 }
 
 /// Runs `work` until `stop`, or until it ends first, then calls `freeze`
-/// and only after it lets `work` drain. Returns `work`'s output and when
-/// `freeze` ran, the measurement's end.
-async fn until_stop<T>(
+/// and only after it lets `work` drain, alongside the snapshot `freeze`
+/// started, which therefore excludes nothing before the stop. Returns
+/// `work`'s output, the snapshot, and when `freeze` ran, the
+/// measurement's end.
+async fn until_stop<T, S: Future>(
     stop: Instant,
     work: impl Future<Output = T>,
-    freeze: impl FnOnce(),
-) -> (T, Instant) {
+    freeze: impl FnOnce() -> S,
+) -> (T, S::Output, Instant) {
     let mut work = std::pin::pin!(work);
     let early = tokio::select! {
         output = &mut work => Some(output),
         () = tokio::time::sleep_until(stop.into()) => None,
     };
-    freeze();
+    let snapshot = freeze();
     let stopped = Instant::now();
-    let output = match early {
-        Some(output) => output,
-        None => work.await,
+    let (output, snapshot) = match early {
+        Some(output) => (output, snapshot.await),
+        None => tokio::join!(work, snapshot),
     };
-    (output, stopped)
+    (output, snapshot, stopped)
 }
 
 /// One server process's resource use over a measurement window.
@@ -1180,27 +1187,44 @@ mod tests {
     use crate::release_server::Metrics;
 
     /// Work still in flight at the stop drains only after the measurement
-    /// froze there, and work that ends first freezes it at its end.
+    /// froze there, and work that ends first freezes it at its end. The
+    /// stop snapshot holds the work done before the stop and none of the
+    /// bytes a drained write stages after it, which the final counter still
+    /// counts exactly once.
     ///
     /// # Panics
     ///
-    /// Panics when the freeze follows the drain or misses the stop.
+    /// Panics when the freeze follows the drain or misses the stop, or the
+    /// snapshot counts drained work.
     #[tokio::test]
     async fn the_measurement_freezes_at_the_stop_before_work_drains() {
+        const INSERTED: &str = "bifrost_scribe_memtable_bytes_inserted_total";
+        let inserted = std::sync::atomic::AtomicU64::new(0);
         let released = tokio::sync::Notify::new();
         let stop = std::time::Instant::now() + std::time::Duration::from_millis(20);
-        let (drained, stopped) = until_stop(
+        let (drained, at_stop, stopped) = until_stop(
             stop,
             async {
+                inserted.fetch_add(10, std::sync::atomic::Ordering::SeqCst);
                 released.notified().await;
+                inserted.fetch_add(5, std::sync::atomic::Ordering::SeqCst);
                 std::time::Instant::now()
             },
-            || released.notify_one(),
+            || {
+                released.notify_one();
+                let scrape = format!(
+                    "{INSERTED} {}",
+                    inserted.load(std::sync::atomic::Ordering::SeqCst)
+                );
+                std::future::ready(Metrics::parse(&scrape))
+            },
         )
         .await;
         assert!(stopped >= stop && drained >= stopped);
+        assert_eq!(at_stop.sum(INSERTED, &[]), 10.0);
+        assert_eq!(inserted.load(std::sync::atomic::Ordering::SeqCst), 15);
         let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let ((), early) = until_stop(later, async {}, || {}).await;
+        let ((), (), early) = until_stop(later, async {}, || std::future::ready(())).await;
         assert!(early < later);
     }
 

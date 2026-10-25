@@ -416,11 +416,18 @@ impl Bench {
         let resources = ResourceWindow::open([server]);
         let backlog_start = backlog(&first);
         let send = |op| {
+            let states = Arc::clone(&states);
+            let launch = move |next: u64| {
+                let state = states
+                    .get(usize::try_from(next).unwrap_or(0) % states.len().max(1))?
+                    .clone();
+                Some(async move { call(&state, op, next).await })
+            };
             arrivals(
                 op,
                 schedule,
                 start,
-                Arc::clone(&states),
+                launch,
                 Arc::clone(&tallies),
                 Arc::clone(&admitted),
                 Arc::clone(&sequence),
@@ -880,20 +887,25 @@ struct Offered {
 }
 
 /// Sends `op` arrivals at each phase's rate of `schedule` from `start`,
-/// rotating across `states`, each labelled with its admission phase,
-/// recording each answer into its schedule phase's tally and marking one
-/// after the window end late, counting each acknowledged direct call in
-/// `admitted` by its admission phase, and waits for every sent arrival to
-/// answer.
-async fn arrivals(
+/// each the call `launch` builds for its sequence number, labelled with its
+/// admission phase, recording each answer into its schedule phase's tally
+/// and marking one after the window end late, counting each acknowledged
+/// direct call in `admitted` by its admission phase, and waits for every
+/// sent arrival to answer. An arrival whose wake comes at or after the
+/// window end, or for which `launch` has no state to call, is missed:
+/// nothing is admitted once measurement stopped.
+async fn arrivals<Fut>(
     op: Op,
     schedule: Schedule,
     start: Instant,
-    states: Arc<Vec<WyrdState>>,
+    launch: impl Fn(u64) -> Option<Fut>,
     tallies: Arc<[[Mutex<Measured>; 2]; 3]>,
     admitted: Arc<[AtomicU64; 3]>,
     sequence: Arc<AtomicU64>,
-) -> Offered {
+) -> Offered
+where
+    Fut: Future<Output = Result<bool, WyrdError>> + Send + 'static,
+{
     let mut offered = Offered::default();
     let mut tasks = JoinSet::new();
     let slot = usize::from(op == Op::Submit);
@@ -916,18 +928,20 @@ async fn arrivals(
             while let Some(joined) = tasks.try_join_next() {
                 offered.panicked += u64::from(joined.is_err());
             }
-            if tasks.len() >= MAX_IN_FLIGHT || states.is_empty() {
+            if tasks.len() >= MAX_IN_FLIGHT || Instant::now() >= end {
                 offered.missed += 1;
                 continue;
             }
-            offered.lateness_us.push(micros(at));
             let next = sequence.fetch_add(1, Ordering::Relaxed);
-            let state = states[usize::try_from(next).unwrap_or(0) % states.len()].clone();
+            let Some(call) = launch(next) else {
+                offered.missed += 1;
+                continue;
+            };
+            offered.lateness_us.push(micros(at));
             let (tallies, admitted) = (Arc::clone(&tallies), Arc::clone(&admitted));
             tasks.spawn(async move {
                 let called = Instant::now();
-                let outcome =
-                    with_benchmark_labels(op.case(), STAGES[phase], call(&state, op, next)).await;
+                let outcome = with_benchmark_labels(op.case(), STAGES[phase], call).await;
                 let late = Instant::now() >= end;
                 if op == Op::Verify && outcome.is_ok() {
                     admitted[phase].fetch_add(1, Ordering::Relaxed);
@@ -1136,7 +1150,55 @@ mod tests {
 
     use std::time::Duration;
 
-    use super::{ADMISSION_REFUSAL, Measured, admission};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{ADMISSION_REFUSAL, Measured, Op, admission, arrivals};
+    use crate::verification::Schedule;
+
+    /// Once a stalled call carries the clock past the window end, every
+    /// remaining due arrival is missed rather than admitted after the
+    /// measurement stopped, the planned count is kept, and the earlier
+    /// admission still answers into its tally.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an arrival is admitted after the end or one is lost.
+    #[tokio::test(start_paused = true)]
+    async fn arrivals_waking_after_the_end_are_missed() {
+        let schedule = Schedule {
+            window: Duration::from_secs(12),
+            direct_rate: 1.0,
+            submit_rate: 1.0,
+            overload_factor: 2.0,
+        };
+        let tallies: Arc<[[std::sync::Mutex<Measured>; 2]; 3]> = Arc::default();
+        let admitted: Arc<[AtomicU64; 3]> = Arc::default();
+        let offered = arrivals(
+            Op::Verify,
+            schedule,
+            tokio::time::Instant::now(),
+            |next| {
+                Some(async move {
+                    if next == 0 {
+                        tokio::time::advance(Duration::from_secs(13)).await;
+                    }
+                    Ok(true)
+                })
+            },
+            Arc::clone(&tallies),
+            Arc::clone(&admitted),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        assert_eq!((offered.scheduled, offered.sent), (14, 1));
+        assert_eq!(offered.missed, 13);
+        let answered: u64 = admitted
+            .iter()
+            .map(|count| count.load(Ordering::SeqCst))
+            .sum();
+        assert_eq!(answered, 1);
+    }
 
     /// Arrivals keep their schedule phase's cohort except recovery's first
     /// 30 s, which join overload's, so recovery is judged after its grace

@@ -396,7 +396,7 @@ fn overhead_metrics() -> Vec<Metric> {
         Metric::raw(
             "capture_bytes",
             "bytes",
-            "server: accounted bytes the Scribe outbox wrote during the traffic window",
+            "server: accounted bytes the Scribe outbox wrote from the window open to its measured stop, the CPU interval; drained writes are excluded",
         ),
         Metric::raw(
             "drain_s",

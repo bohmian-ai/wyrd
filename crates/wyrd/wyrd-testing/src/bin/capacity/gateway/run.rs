@@ -578,7 +578,7 @@ impl Overhead {
         let before = server.timings().await?;
         let (traffic, baseline) = Window::open(server, Selection::RESOURCES).await?;
         let stop = Instant::now() + window;
-        let (samples, usage, ended) = traffic
+        let (samples, usage, stopped) = traffic
             .measure(server, stop, drive(tenant, &shape, clients, stop, labels))
             .await?;
         let samples = samples?;
@@ -601,7 +601,7 @@ impl Overhead {
             usage,
             population,
             integrity: Integrity::between(&baseline, &last),
-            durable: Durable::between(&baseline, &ended),
+            durable: Durable::between(&baseline, &stopped),
             drain,
         };
         Ok(observed.repetition())

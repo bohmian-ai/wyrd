@@ -156,7 +156,7 @@ impl<T> Default for Offered<T> {
 
 /// Sends one arrival through `launch` every `interval` from `start` until
 /// `end`, never waiting on an answer before the next is due; a due arrival
-/// finding `bound` pending is missed. Waits for every sent arrival and
+/// finding `bound` pending, or waking at or after `end`, is missed. Waits for every sent arrival and
 /// keeps its answer.
 async fn open_loop<T, Fut>(
     start: Instant,
@@ -181,7 +181,7 @@ where
             offered.acked.extend(joined.ok());
         }
         offered.scheduled += 1;
-        if pending.len() >= bound {
+        if pending.len() >= bound || Instant::now() >= end {
             offered.missed += 1;
             continue;
         }
@@ -346,7 +346,7 @@ impl Competing {
             outstanding.load(Ordering::Relaxed)
         };
         let work = async { tokio::join!(ingest, prober, queries, lanes, overload, stopped) };
-        let (driven, usage, after) = Box::pin(opened.measure(server, end.into_std(), work))
+        let (driven, usage, stopped) = Box::pin(opened.measure(server, end.into_std(), work))
             .await
             .map_err(ExperimentError::workload)?;
         let (offered, visibility, queries, lanes, overload, backlog_end) = driven;
@@ -377,7 +377,7 @@ impl Competing {
         population.validate(&mut repetition, "measured");
         read_queries(&mut repetition, asked, &population, &phases);
         read_ingest(&mut repetition, &offered, &visibility, &population, &phases);
-        let inserted = after.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
+        let inserted = stopped.sum(INSERTED, &[]) - before.sum(INSERTED, &[]);
         repetition.set("retained_mib", Reading::exact(inserted / MIB));
         read_arrivals(&mut repetition, &offered, &queries);
         read_overload(&mut repetition, &overload, &queries.acked, &phases);
@@ -1187,6 +1187,40 @@ mod tests {
             offered >= 4_000 && scans >= 200,
             "{offered} queries, {scans} scans"
         );
+    }
+
+    /// A due arrival whose wake comes after the end, behind a stall, is
+    /// missed and never sent, the schedule's count is kept, and the
+    /// admission sent before the stall still drains with its answer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an arrival is admitted after the end or one is lost.
+    #[tokio::test(start_paused = true)]
+    async fn arrivals_waking_after_the_end_are_missed() {
+        let start = Instant::now();
+        let mut stalled = false;
+        let offered = open_loop(
+            start,
+            start + Duration::from_secs(1),
+            Duration::from_millis(100),
+            QUERY_CLIENTS,
+            move || {
+                let stall = !std::mem::replace(&mut stalled, true);
+                async move {
+                    if stall {
+                        tokio::time::advance(Duration::from_secs(2)).await;
+                    }
+                    7
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            (offered.scheduled, offered.sent, offered.missed),
+            (10, 1, 9)
+        );
+        assert_eq!(offered.acked, [7]);
     }
 
     /// Only queries and ingest rows and wire bytes answered before the

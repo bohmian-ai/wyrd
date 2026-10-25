@@ -232,7 +232,9 @@ impl Isolated {
         repetition.set("drain_seconds", Reading::exact(usage.drain_seconds));
         if read.is_some() {
             let [rows, bytes] = population.scanned_per_query(SUCCESS);
-            if rows.value.is_none() || bytes.value.is_none() {
+            if self.experiment == Experiment::Parquet
+                && (rows.value.is_none() || bytes.value.is_none())
+            {
                 repetition
                     .invalid
                     .push("the answered queries' scan facts are missing".to_owned());

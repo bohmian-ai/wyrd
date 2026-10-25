@@ -17,7 +17,7 @@ use num_traits::ToPrimitive;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use wyrd_client::bifrost::{BifrostClientError, BifrostOptions, TableConfig};
-use wyrd_client::transport::trace::with_benchmark_labels;
+use wyrd_client::transport::trace::{benchmark_headers, with_benchmark_labels};
 use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
 use wyrd_testing::release_server::LocalServer;
@@ -670,17 +670,28 @@ pub fn micros(sent: Instant) -> u64 {
     u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-/// Wraps `body` in a gRPC request carrying the `x-wyrd-access-token` bearer.
+/// Wraps `body` in a gRPC request carrying the `x-wyrd-access-token` bearer
+/// and, inside [`with_benchmark_labels`], the benchmark case and phase the
+/// server classifies its timing by; outside a labelled scope it carries
+/// only the bearer.
 ///
 /// # Errors
 ///
-/// Returns `bearer` when it is not a valid metadata value.
+/// Returns `bearer` when it is not a valid metadata value, or `benchmark
+/// labels` when a label is not one.
 fn authorized<T>(body: T, token: &str) -> std::result::Result<Request<T>, String> {
     let mut request = Request::new(body);
-    request.metadata_mut().insert(
+    let metadata = request.metadata_mut();
+    metadata.insert(
         "x-wyrd-access-token",
         token.parse().map_err(|_| "bearer".to_owned())?,
     );
+    for (name, value) in benchmark_headers() {
+        metadata.insert(
+            name,
+            value.parse().map_err(|_| "benchmark labels".to_owned())?,
+        );
+    }
     Ok(request)
 }
 
@@ -688,7 +699,57 @@ fn authorized<T>(body: T, token: &str) -> std::result::Result<Request<T>, String
 mod tests {
     use std::time::Instant;
 
-    use super::{Admission, Outcome, accepted};
+    use wyrd_client::transport::trace::with_benchmark_labels;
+    use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
+    use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+    use wyrd_tonic::tonic::Request;
+
+    use super::{Admission, Outcome, accepted, authorized};
+
+    /// The `(bearer, case, phase)` metadata `request` carries.
+    fn metadata<T>(request: &Request<T>) -> [Option<String>; 3] {
+        [
+            "x-wyrd-access-token",
+            "x-wyrd-benchmark-case",
+            "x-wyrd-benchmark-phase",
+        ]
+        .map(|name| {
+            request
+                .metadata()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        })
+    }
+
+    /// Raw OTLP span and log exports carry the bearer plus the case and
+    /// phase their labelled scope declares, in every phase, so the server
+    /// times them in the cohort the driver expects; outside a scope they
+    /// carry the bearer alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a label is dropped, altered, or leaks out of its scope.
+    #[tokio::test]
+    async fn otlp_exports_carry_their_scoped_labels() {
+        let owned = |values: [&str; 3]| values.map(|value| Some(value.to_owned()));
+        for phase in ["warmup", "repetition-2", "capacity", "overload", "recovery"] {
+            let spans = with_benchmark_labels("otlp-spans", phase, async {
+                authorized(ExportTraceServiceRequest::default(), "bearer-1")
+            })
+            .await
+            .expect("a spans request");
+            assert_eq!(metadata(&spans), owned(["bearer-1", "otlp-spans", phase]));
+            let logs = with_benchmark_labels("otlp-logs", phase, async {
+                authorized(ExportLogsServiceRequest::default(), "bearer-1")
+            })
+            .await
+            .expect("a logs request");
+            assert_eq!(metadata(&logs), owned(["bearer-1", "otlp-logs", phase]));
+        }
+        let bare = authorized(ExportLogsServiceRequest::default(), "bearer-1").expect("a request");
+        assert_eq!(metadata(&bare), [Some("bearer-1".to_owned()), None, None]);
+    }
 
     /// A request completing after the admission stop is late: its work
     /// leaves the measured counts while its latency stays in the cohort.

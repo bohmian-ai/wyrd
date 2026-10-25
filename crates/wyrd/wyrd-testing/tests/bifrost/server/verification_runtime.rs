@@ -7271,3 +7271,185 @@ async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourney
     cluster.shutdown().await?;
     Ok(())
 }
+
+/// Call MCP `bifrost.query` on `server` as `token` with `arguments`, and
+/// return the structured content and whether the call was a tool error.
+///
+/// Hosted Agent `bifrost.query` and MCP `bifrost.query` collect through the
+/// same bounded query owner, so this is the declared-SQL path an Agent check
+/// reaches, minus its `tool:invoke` authorization.
+///
+/// # Errors
+/// Returns the transport error, or a description when the call carries no
+/// structured content.
+async fn mcp_query(
+    server: &WyrdTestServer,
+    token: &str,
+    arguments: Value,
+) -> Result<(Value, bool), ServerJourneyError> {
+    use rmcp::ClientServiceExt as _;
+    use rmcp::transport::StreamableHttpClientTransport;
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+    let base_url = server.base_url().ok_or("the server has no public listener")?;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp"));
+    config.allow_stateless = true;
+    config.custom_headers.insert(
+        http::HeaderName::from_static("x-wyrd-access-token"),
+        http::HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+    let client = ()
+        .serve_with_lifecycle(
+            StreamableHttpClientTransport::with_client(reqwest::Client::new(), config),
+            rmcp::ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await?;
+    let result = client
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("bifrost.query").with_arguments(
+                arguments
+                    .as_object()
+                    .ok_or("query arguments are an object")?
+                    .clone(),
+            ),
+        )
+        .await?;
+    Ok((
+        result
+            .structured_content
+            .ok_or("bifrost.query returns structured content")?,
+        result.is_error == Some(true),
+    ))
+}
+
+/// Declared SQL over a custom table returns exactly its own filtered,
+/// projected rows from live, published, Bloom-absent and Bloom-added data,
+/// with the filter reaching the scan, and its bounds still refuse rather than
+/// truncate (Scenario 4 of TASK-007; REQ-026, REQ-040; AC-008, AC-014).
+///
+/// The admin writes `eu` rows 1 and 2 and `us` row 3 as two published files
+/// with no Bloom column, adds a `region` Bloom column, publishes `eu` row 4
+/// and `us` row 5 as two more files, and leaves `eu` row 6 live. A
+/// workload-bound Service selecting `region = 'eu'` over MCP reads rows 1, 2,
+/// 4 and 6, in order, although none of them carries its workload, reading
+/// only the two `eu` files' row groups. The same statement under three rows or ten bytes, past a
+/// one-millisecond deadline, or as a caller with no read grant is refused
+/// with no rows.
+///
+/// # Errors
+/// Returns cluster, registration, ingest, credential, or MCP errors, or the
+/// first answer or refusal that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn custom_query_preserves_evidence_and_limits() -> Result<(), ServerJourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let key = |name: &'static str, roles: &'static [&'static str]| async move {
+        let service = server.bootstrap_service(name, roles).await?;
+        let uid = service
+            .card_ref()
+            .and_then(|card| card.uid.clone())
+            .ok_or("the Service has a Card UID")?;
+        let key = service.api_key().ok_or("the Service has an API key")?.clone();
+        Ok::<_, ServerJourneyError>((uid, key))
+    };
+    let (_, admin_key) = key("custom-admin", &["admin"]).await?;
+    let admin = native_client(server, admin_key.expose_secret())?;
+    let fqn = format!(
+        "bifrost.datasets.custom_lookup_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let bifrost = Bifrost::connect_with(
+        &admin,
+        BifrostOptions {
+            table: Some(TableConfig::from_arrow(&fqn, Arc::clone(&schema))?),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?;
+    bifrost.register().await?;
+    let write = |ids: Vec<i64>, region: &'static str| {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(vec![region; ids.len()])),
+            ],
+        );
+        let (bifrost, fqn) = (&bifrost, &fqn);
+        async move {
+            bifrost.write_batch(fqn, &batch?).await?;
+            Ok::<_, ServerJourneyError>(())
+        }
+    };
+    write(vec![1, 2], "eu").await?;
+    server.flush_bifrost().await?;
+    write(vec![3], "us").await?;
+    server.flush_bifrost().await?;
+    let (namespace, name) = fqn.rsplit_once('.').ok_or("the FQN names its table")?;
+    let before = bifrost.describe_table(namespace, name).await?;
+    bifrost
+        .alter_table(
+            namespace,
+            name,
+            &wyrd_spec::vala::api::AlterTableRequest {
+                expected_table_version: before.table_version,
+                physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutEdit {
+                    bloom_columns: Some(vec!["region".to_owned()]),
+                    ..wyrd_spec::vala::api::PhysicalLayoutEdit::default()
+                }),
+                add_columns: None,
+                rename_columns: None,
+            },
+        )
+        .await?;
+    write(vec![4], "eu").await?;
+    server.flush_bifrost().await?;
+    write(vec![5], "us").await?;
+    server.flush_bifrost().await?;
+    write(vec![6], "eu").await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let (agent, agent_key) = key("custom-agent", &["admin"]).await?;
+    let agent = server
+        .exchange_api_key_for_workload(&agent_key, &agent)
+        .await?;
+    let sql = format!("SELECT id FROM {fqn} WHERE region = 'eu' ORDER BY id");
+    let ((answer, refused), work) = ScanEvidence::of(
+        &cluster,
+        "custom eu lookup",
+        mcp_query(server, &agent, json!({ "sql": sql })),
+    )
+    .await?;
+    if refused || answer["rows"] != json!([[1], [2], [4], [6]]) {
+        return Err(format!("the declared SQL changed meaning: {answer}").into());
+    }
+    // The file count subtracts open-time statistics skips, which may land
+    // after the terminal; the two `eu` files' row groups are exact.
+    if work.queries != 1.0 || work.row_groups != 2.0 {
+        return Err(format!("the region filter reaches the scan: {work:?}").into());
+    }
+
+    let (_, outsider_key) = key("custom-outsider", &[]).await?;
+    let outsider = server.exchange_api_key(&outsider_key).await?;
+    for (caller, arguments, code) in [
+        (&agent, json!({ "sql": sql, "max_rows": 3 }), "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE"),
+        (&agent, json!({ "sql": sql, "max_bytes": 10 }), "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE"),
+        (&agent, json!({ "sql": sql, "deadline_ms": 1 }), "504"),
+        (&outsider, json!({ "sql": sql }), "403"),
+    ] {
+        let (problem, refused) = mcp_query(server, caller, arguments.clone()).await?;
+        let seen = problem["code"].as_str().unwrap_or_default();
+        if !refused || !seen.contains(code) || problem.get("rows").is_some() {
+            return Err(format!("{arguments} must refuse with {code}: {problem}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}

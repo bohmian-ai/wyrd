@@ -705,19 +705,24 @@ impl ExecutionPlan for LiveScribeExec {
 /// A [`LiveScribeExec`] is capped at one leader task, and the distributed
 /// planner reconciles a whole stage to its smallest cap, so a union holding
 /// the live leaf would pull every published sibling onto the leader. Placing
-/// a `CoalescePartitionsExec` above each sibling without a live leaf makes the
-/// planner open a separate coalesce stage for it: published scans keep their
+/// a coalesce above each sibling without a live leaf makes the planner open a
+/// separate coalesce stage for it: a `SortPreservingMergeExec` on the
+/// sibling's own ordering when it is sorted, so an order-dependent operator
+/// above the union still receives ordered input, and a
+/// `CoalescePartitionsExec` otherwise. Published scans keep their
 /// cut-derived worker tasks, while the union, the live leaf, and everything
 /// above stay in the leader stage. A sibling whose stage is one task is
 /// elided back into the leader by the planner itself.
 ///
-/// Only the analytical planning session installs it; the rule is a no-op for
-/// plans without a live leaf.
+/// The analytical planning session installs it, and Oracle plans every query
+/// through that session on a node with an analytical handle; the rule is a
+/// no-op for plans without a live leaf.
 #[derive(Debug)]
 pub(super) struct LiveUnionBoundary;
 
 impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary {
-    /// Wraps every non-live sibling of each union that holds a live leaf.
+    /// Wraps every non-live sibling of each union that holds a live leaf,
+    /// preserving the sibling's output ordering.
     ///
     /// # Errors
     ///
@@ -744,6 +749,13 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary
                 if holds_live(child)? {
                     live = true;
                     children.push(Arc::clone(child));
+                } else if let Some(ordering) = child.properties().output_ordering() {
+                    children.push(Arc::new(
+                        datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec::new(
+                            ordering.clone(),
+                            Arc::clone(child),
+                        ),
+                    ) as Arc<dyn ExecutionPlan>);
                 } else {
                     children.push(Arc::new(
                         datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
@@ -1167,6 +1179,73 @@ mod tests {
             matches!(root.physical_plan_type, Some(PhysicalPlanType::Filter(_))),
             "the fragment ships the filter above its placeholder"
         );
+    }
+
+    /// A sorted published sibling of a live leaf stays sorted across the
+    /// boundary the rule places above it, so a merge over the union still
+    /// receives ordered inputs and the plan passes `DataFusion`'s sanity check.
+    ///
+    /// # Panics
+    /// Panics when a fixture cannot be built, the rule fails, or the
+    /// rewritten published branch loses its `v ASC` ordering.
+    #[test]
+    fn boundary_keeps_a_sorted_sibling_sorted() {
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+        use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
+        use datafusion::physical_plan::sorts::sort::SortExec;
+        use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+        use datafusion::physical_plan::union::UnionExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(Column::new(
+            "v", 0,
+        )))])
+        .expect("one sort key orders");
+        let batch = |values: Vec<i64>| {
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(values))])
+                .expect("the batch builds")
+        };
+        let sorted = |input: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+            Arc::new(SortExec::new(ordering.clone(), input).with_preserve_partitioning(true))
+        };
+        let published = MemorySourceConfig::try_new_exec(
+            &[vec![batch(vec![1, 2])], vec![batch(vec![4])]],
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("the published scan builds");
+        let live = Arc::new(LiveScribeExec::new(
+            crate::oracle::exec::tests::one_live_route(wyrd_spec::DataTenantId::new_v7()),
+            crate::catalog::TimeAxis::new(
+                crate::oracle::exec::tests::FIXTURE_TIME_COLUMN,
+                crate::catalog::TimeGranularity::Hour,
+            ),
+            "f".repeat(64),
+            vec!["v".to_owned()],
+            Arc::clone(&schema),
+            1,
+        ));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SortPreservingMergeExec::new(
+            ordering.clone(),
+            UnionExec::try_new(vec![sorted(published), sorted(live)]).expect("the union plans"),
+        ));
+
+        let options = ConfigOptions::default();
+        let rewritten = LiveUnionBoundary
+            .optimize(plan, &options)
+            .expect("the boundary applies");
+        let union = rewritten.children()[0];
+        assert_eq!(
+            union.children()[0].properties().output_ordering(),
+            Some(&ordering),
+            "the published branch stays sorted"
+        );
+        SanityCheckPlan::new()
+            .optimize(rewritten, &options)
+            .expect("the merge still receives sorted inputs");
     }
 
     /// A scalar-subquery conjunct stays on the live leaf without deferring

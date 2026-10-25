@@ -36,6 +36,7 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
+use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::registry::LookupSpan as _;
 
@@ -687,13 +688,12 @@ impl Distribution {
             return None;
         }
         let value = self.0.value_at_quantile(q);
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss,
-            reason = "a rank in 1..=len is exact for any realistic count"
-        )]
-        let rank = ((q * self.0.len() as f64).ceil() as u64).clamp(1, self.0.len());
+        let len = self.0.len();
+        let rank = len
+            .to_f64()
+            .and_then(|n| (q * n).ceil().to_u64())
+            .unwrap_or(len)
+            .clamp(1, len);
         Some(Quantile {
             rank,
             lowest: self.0.lowest_equivalent(value),

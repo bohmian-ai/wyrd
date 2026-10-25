@@ -10866,6 +10866,7 @@ dependencies = [
  "hdrhistogram",
  "http",
  "metrics",
+ "num-traits",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-proto",

@@ -25,6 +25,7 @@ opentelemetry-proto = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 http = { workspace = true }
 hdrhistogram = { workspace = true }
+num-traits = { workspace = true }
 metrics = { workspace = true }
 ulid = { workspace = true }
 wyrd-tls = { workspace = true }

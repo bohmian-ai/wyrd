@@ -333,7 +333,7 @@ fn overhead_metrics() -> Vec<Metric> {
         Metric::raw(
             "server_failures",
             "requests",
-            "server: answer-handoff timings whose outcome is not `succeeded`, kept with their durations in timings.jsonl and never judged",
+            "server: answer-handoff timings whose outcome is not `succeeded`, counted in their own outcome series and never judged",
         ),
         Metric::raw(
             "first_event_p99_ms",
@@ -343,17 +343,17 @@ fn overhead_metrics() -> Vec<Metric> {
         Metric::raw(
             "overhead_p99_ms",
             "ms",
-            "server: per call, handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`) less the union of that call's own provider waits; exact `wyrd.timing` nanoseconds, nearest rank",
+            "server: per call, handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`) less the union of that call's own provider waits; nearest-rank bucket bounds of the server's timing histograms",
         ),
         Metric::raw(
             "overhead_end_p99_ms",
             "ms",
-            "server: per stream, handler entry until its final frame handoff (`gateway.stream.end`) less the union of its own provider waits; exact nanoseconds, nearest rank; streams only",
+            "server: per stream, handler entry until its final frame handoff (`gateway.stream.end`) less the union of its own provider waits; nearest-rank bucket bounds of the server's timing histograms; streams only",
         ),
         Metric::raw(
             "upstream_p99_ms",
             "ms",
-            "server: the union of a call's own provider waits until the answer handoff; exact nanoseconds, nearest rank",
+            "server: the union of a call's own provider waits until the answer handoff; nearest-rank bucket bounds of the server's timing histograms",
         ),
         Metric::raw("client_p50_ms", "ms", CLIENT_TIME),
         Metric::raw("client_p95_ms", "ms", CLIENT_TIME),
@@ -400,7 +400,7 @@ fn overhead_metrics() -> Vec<Metric> {
         ),
     ];
     metrics.extend(latency_metrics(
-        "server: handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`), successful calls; exact `wyrd.timing` nanoseconds, nearest rank",
+        "server: handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`), successful calls; nearest-rank bucket bounds of the server's timing histograms",
     ));
     metrics.extend(efficiency_metrics());
     metrics
@@ -631,13 +631,15 @@ fn capacity_declaration(mut base: Declaration, rate: Option<f64>, slo: Slo) -> D
 fn capacity_metrics() -> Vec<Metric> {
     let from = "server: handler entry until";
     let mut metrics = Vec::new();
-    for (phase, scope) in [
+    for (phase, scope, client) in [
         (
             "capacity",
+            "observations completed in the capacity phase, every tenant together",
             "calls scheduled in the capacity phase; the worst tenant's p99",
         ),
         (
             "recovery",
+            "observations completed after the recovery grace, every tenant together",
             "calls scheduled after the recovery grace; every tenant together",
         ),
     ] {
@@ -660,10 +662,10 @@ fn capacity_metrics() -> Vec<Metric> {
             ),
         ] {
             let boundary = if name == "chunk_lag" {
-                format!("diagnostic only, client: {boundary}, {scope}; never judged")
+                format!("diagnostic only, client: {boundary}, {client}; never judged")
             } else {
                 format!(
-                    "{from} {boundary}, {scope}; successful calls' exact `wyrd.timing` nanoseconds, nearest rank"
+                    "{from} {boundary}, {scope}; successful calls' nearest-rank bucket bounds of the server's timing histograms"
                 )
             };
             metrics.push(Metric::raw(
@@ -689,7 +691,7 @@ fn capacity_metrics() -> Vec<Metric> {
         Metric::raw(
             "capacity.overhead_p99_ms",
             "ms",
-            "server: diagnostic per-call buffered completion less the union of the call's own provider waits, calls scheduled in the capacity phase; exact nanoseconds, nearest rank",
+            "server: diagnostic per-call buffered completion less the union of the call's own provider waits, calls completed in the capacity phase; nearest-rank bucket bounds of the server's timing histograms",
         ),
         Metric::raw(
             "overload.refused",

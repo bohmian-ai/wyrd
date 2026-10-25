@@ -44,13 +44,19 @@ configuration declares server limits.
 
 - **Latency is server-side.** Each judged request is timed inside the server
   from handler entry until its result is ready, its write is acknowledged, or
-  its response is handed off. The server exports one `wyrd.timing` span per
-  request with exact integer nanoseconds, and the driver collects them over
-  OTLP. Percentiles are nearest-rank over those raw samples; there are no
-  histograms or buckets. Client round-trip times are recorded as diagnostics
-  and never judged.
+  its response is handed off, into bounded HDR histograms (3 significant
+  digits) the benchmark server serves as cumulative snapshots on its
+  loopback metrics port. A window is the bucket difference of two snapshots;
+  its counts must match the work it sent. Each percentile is the
+  nearest-rank bucket, and a limit passes or fails only when the whole
+  bucket is on one side of it. L2 takes a snapshot at every phase boundary
+  and keeps interleaved query classes apart by a closed benchmark case
+  label; native writes cannot carry one, so L2 write latency includes the
+  client-queue lanes' writes. Client round-trip times are recorded as
+  diagnostics and never judged.
 - **Overhead is per request.** It is the request's elapsed time minus the
-  union of its own provider or Verifier waits, from the same span.
+  union of its own provider or Verifier waits, recorded into its own
+  histogram per request.
 - **Throughput is reported twice.** `(W/T)/P` is work per wall second per
   provisioned vCPU (`work/s/vCPU`, P = logical CPUs available to the server).
   `W/C` is work per server CPU-second used (`work/cpu-s`), and `C/W` is CPU
@@ -61,11 +67,12 @@ configuration declares server limits.
   also pays for the competing work. Baselines compare `W/C`.
 - **Bytes have declared sources.** Writes report rows, retained Arrow MiB
   (uncompressed), and encoded OTLP wire MiB. Queries report the mean scanned
-  rows and bytes of each query's own executed plan, joined by trace. The L1
+  rows and bytes of each query's own executed plan, from the same snapshots. The L1
   storage ratio is published Parquet bytes over retained Arrow bytes of one
   settled sample per path, excluding WAL, staging, and catalog bytes.
-- The `timing` control records the method, the server's span exporter
-  settings, and the host's measured timer resolution.
+- The `timing` control records the method, precision, range, series bounds,
+  the server's benchmark snapshot setting, and the host's measured timer
+  resolution. Operator span export stays disabled.
 
 Run on a quiet machine, with no other build, test, server, or benchmark
 running. The run samples the whole host for 10 s before and after. If
@@ -193,8 +200,7 @@ a `-<n>` suffix. A record holds:
 - every reason, and the verdict.
 
 Raw evidence stays under `target/benchmarks/<engine>/<experiment>/`:
-`timings.jsonl` holds every server timing in nanoseconds, beside the server
-and collector logs and any profiles. The next run of that experiment replaces
+the server log sits beside any profiles. The next run of that experiment replaces
 it. The report printed at the end is regenerated from the record alone, so it
 can be reproduced after `target/` is gone:
 

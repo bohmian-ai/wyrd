@@ -603,14 +603,14 @@ fn isolated_metrics() -> Vec<Metric> {
 }
 
 /// The boundary of every judged Bifrost request time.
-const SERVER_TIME: &str = "server handler entry until the complete query result is handed off (`bifrost.query`), Gate's durable write acknowledgement (`bifrost.gate.write`), or the OTLP export response (`bifrost.otlp.traces`, `bifrost.otlp.logs`): successful requests' exact `wyrd.timing` nanoseconds, nearest rank";
+const SERVER_TIME: &str = "server handler entry until the complete query result is handed off (`bifrost.query`), Gate's durable write acknowledgement (`bifrost.gate.write`), or the OTLP export response (`bifrost.otlp.traces`, `bifrost.otlp.logs`): successful requests' nearest-rank bucket bounds of the server's timing histograms";
 
 /// The boundary of the diagnostic client round trip, which never judges.
 const CLIENT_TIME: &str =
     "diagnostic only: client send until its terminal or durable acknowledgement, never judged";
 
 /// What `server_failures` counts.
-const SERVER_FAILURES: &str = "server timings at the step's boundary whose outcome is not `success`, kept with their durations in timings.jsonl and never judged";
+const SERVER_FAILURES: &str = "server timings at the step's boundary whose outcome is not `success`, counted in their own outcome series and never judged";
 
 /// The settled-state facts the `parquet` experiment reads once after its
 /// settlement, outside every window, and reports on the step each
@@ -1001,7 +1001,7 @@ pub fn calibrate(
 }
 
 /// The boundary of every judged L2 query time.
-const QUERY_TIME: &str = "server: handler entry until the complete query result is handed off (`bifrost.query`), the query's own observation by trace id; exact nanoseconds, nearest rank";
+const QUERY_TIME: &str = "server: handler entry until the complete query result is handed off (`bifrost.query`), each query class's own case; nearest-rank bucket bounds of the server's timing histograms";
 
 /// The L2 phase metrics of `phase`, with their criteria on the one step.
 fn phase_metrics(phase: &str, step: &[String]) -> (Vec<Metric>, Vec<Criterion>) {
@@ -1041,7 +1041,7 @@ fn phase_metrics(phase: &str, step: &[String]) -> (Vec<Metric>, Vec<Criterion>) 
             &id("write_ack_p99_ms"),
             "ms",
             &format!(
-                "server: handler entry until the durable write acknowledgement (`bifrost.gate.write`) or OTLP export response (`bifrost.otlp.traces`, `bifrost.otlp.logs`), every successful write that ended in the phase, the client-queue lanes' included; exact nanoseconds, nearest rank{after}"
+                "server: handler entry until the durable write acknowledgement (`bifrost.gate.write`) or OTLP export response (`bifrost.otlp.traces`, `bifrost.otlp.logs`), every successful write that ended in the phase, the client-queue lanes' included; nearest-rank bucket bounds of the server's timing histograms{after}"
             ),
         ),
         Metric::raw(

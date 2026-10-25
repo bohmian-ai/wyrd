@@ -308,7 +308,7 @@ fn work_metrics() -> Vec<Metric> {
 /// client round-trip percentiles beside them.
 fn latency_metrics(scope: &str) -> Vec<Metric> {
     let server = format!(
-        "server: a direct execution's start until its result is ready (`verification.direct`, outcome `completed`), {scope}; exact `wyrd.timing` nanoseconds, nearest rank"
+        "server: a direct execution's start until its result is ready (`verification.direct`, outcome `completed`), {scope}; nearest-rank bucket bounds of the server's timing histograms"
     );
     let client = format!(
         "diagnostic only: public-client `verify` call until its judged result, {scope}; never judged"
@@ -356,7 +356,7 @@ fn direct(mut base: Declaration) -> Declaration {
         Metric::raw(
             "overhead_p99_ms",
             "ms",
-            "server: per execution, `verification.direct` elapsed less the union of its own Verifier blocks; exact nanoseconds, nearest rank",
+            "server: per execution, `verification.direct` elapsed less the union of its own Verifier blocks; nearest-rank bucket bounds of the server's timing histograms",
         ),
         Metric::raw(
             "overhead_mean_ms",
@@ -366,7 +366,7 @@ fn direct(mut base: Declaration) -> Declaration {
         Metric::raw(
             "verifier_p99_ms",
             "ms",
-            "server: the union of an execution's own Verifier blocks; exact nanoseconds, nearest rank",
+            "server: the union of an execution's own Verifier blocks; nearest-rank bucket bounds of the server's timing histograms",
         ),
         Metric::raw(
             "verifier_mean_ms",
@@ -376,7 +376,7 @@ fn direct(mut base: Declaration) -> Declaration {
         Metric::raw(
             "server_failures",
             "verifications",
-            "server: `verification.direct` timings whose outcome is not `completed`, kept with their durations in timings.jsonl and never judged",
+            "server: `verification.direct` timings whose outcome is not `completed`, counted in their own outcome series and never judged",
         ),
     ]);
     let objective = format!("direct-verify-c{OBJECTIVE_CLIENTS}");
@@ -494,7 +494,7 @@ fn competing(
                 &format!("{stage}.direct_overhead_p99_ms"),
                 "ms",
                 &format!(
-                    "server: per direct execution that ended {overhead}, `verification.direct` elapsed less the union of its own Verifier blocks; exact nanoseconds, nearest rank"
+                    "server: per direct execution that ended {overhead}, `verification.direct` elapsed less the union of its own Verifier blocks; nearest-rank bucket bounds of the server's timing histograms"
                 ),
             ),
             Metric::raw(

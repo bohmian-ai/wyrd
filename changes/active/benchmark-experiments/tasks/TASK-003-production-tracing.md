@@ -222,7 +222,7 @@ mise exec -- cargo nextest run --locked -p wyrd-telemetry --features test-suppor
 ### V5 — Existing real SDK timeline and tenant-negative journey
 
 ```bash
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=action_timeline::service_action_timeline_is_one_connected_tree) | test(=action_timeline::another_tenant_cannot_read_the_timeline)'"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E 'test(=action_timeline::service_action_timeline_is_one_connected_tree) | test(=action_timeline::service_action_timeline_survives_a_quiet_operator_policy) | test(=action_timeline::another_tenant_cannot_read_the_timeline)'"
 ```
 
 The existing tests are lifecycle-ignored, hence run-ignored; add no new ignore.

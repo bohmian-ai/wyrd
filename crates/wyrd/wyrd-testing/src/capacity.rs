@@ -427,9 +427,10 @@ async fn until_stop<T, S: Future>(
     };
     let snapshot = freeze();
     let stopped = Instant::now();
-    let (output, snapshot) = match early {
-        Some(output) => (output, snapshot.await),
-        None => tokio::join!(work, snapshot),
+    let (output, snapshot) = if let Some(output) = early {
+        (output, snapshot.await)
+    } else {
+        tokio::join!(work, snapshot)
     };
     (output, snapshot, stopped)
 }

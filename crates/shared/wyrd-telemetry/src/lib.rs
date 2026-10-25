@@ -99,8 +99,9 @@ pub enum OtlpProtocol {
 
 /// Guard returned by [`init`] and [`init_test_only_no_global`].
 ///
-/// Drop (or call [`TelemetryGuard::shutdown`]) to cleanly flush and shut down
-/// any wired OTLP exporters before the process exits.
+/// Drop it (or call [`TelemetryGuard::shutdown`]) after serving stops to
+/// flush and shut down the tracer provider, even though the global
+/// subscriber still holds a tracer.
 #[must_use = "TelemetryGuard must outlive the process and be dropped on shutdown"]
 #[derive(Debug)]
 pub struct TelemetryGuard {
@@ -297,12 +298,25 @@ impl TelemetryGuard {
         }
     }
 
-    /// Shut down telemetry exports.
+    /// Shut down telemetry exports now rather than when the guard drops.
     ///
-    /// When an OTLP exporter is wired, this flushes and shuts down the tracer
-    /// provider. Otherwise it is a no-op.
+    /// Equivalent to dropping the guard; see its [`Drop`] implementation.
     pub fn shutdown(self) {
-        if let Some(provider) = self.tracer_provider
+        drop(self);
+    }
+}
+
+impl Drop for TelemetryGuard {
+    /// Flush and shut down the tracer provider exactly once.
+    ///
+    /// The global subscriber's tracer keeps the provider alive after the
+    /// guard is gone, so the provider's own final-reference cleanup never
+    /// runs; the guard shuts it down explicitly. Shutdown exports the queued
+    /// spans, shuts down every exporter within the SDK's default timeout, and
+    /// logs the processor's lifetime dropped-span total. A shutdown error is
+    /// logged, never raised. Without a provider this does nothing.
+    fn drop(&mut self) {
+        if let Some(provider) = self.tracer_provider.take()
             && let Err(e) = provider.shutdown()
         {
             tracing::warn!(error = %e, "OTLP shutdown error");
@@ -1025,6 +1039,93 @@ mod tests {
             assert_eq!(shutdowns.recv(), Ok(()), "shutdown reaches the exporter");
         });
         assert_eq!(failed.load(Ordering::Acquire), 2);
+    }
+
+    /// Dropping the guard shuts down the provider even while a tracer still
+    /// holds it, as the global subscriber does in production: the queued span
+    /// is exported, the exporter is shut down once, and the SDK logs its
+    /// exact lifetime dropped total. An explicit shutdown also shuts the
+    /// exporter down once, and a guard without a provider drops harmlessly.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stalled export never starts, a drop is not warned,
+    /// the queued span is not drained, the dropped total is missing, or an
+    /// exporter is shut down other than exactly once.
+    #[test]
+    fn guard_drop_shuts_down_a_retained_provider() {
+        use opentelemetry::trace::{Span as _, Tracer as _};
+        use std::sync::mpsc::{TryRecvError, channel};
+
+        let guarded = |started, results, shut| {
+            let processor = opentelemetry_sdk::trace::BatchSpanProcessor::builder(Gated {
+                started: Mutex::new(started),
+                results: Mutex::new(results),
+                shut: Mutex::new(shut),
+            })
+            .with_batch_config(
+                opentelemetry_sdk::trace::BatchConfigBuilder::default()
+                    .with_max_queue_size(1)
+                    .with_max_export_batch_size(1)
+                    .with_scheduled_delay(std::time::Duration::from_secs(3600))
+                    .build(),
+            )
+            .build();
+            let provider = super::export::tracer_provider(
+                opentelemetry_sdk::trace::Sampler::AlwaysOn,
+                opentelemetry_sdk::Resource::builder_empty().build(),
+                Some(super::export::OperatorExport(processor)),
+            );
+            let tracer = provider.tracer("wyrd");
+            let guard = super::TelemetryGuard {
+                config: super::TelemetryConfig::default(),
+                tracer_provider: Some(provider),
+            };
+            (guard, tracer)
+        };
+        let (started, calls) = channel();
+        let (release, results) = channel();
+        let (shut, shutdowns) = channel();
+        let (guard, tracer) = guarded(started, results, shut);
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let end = |name: &'static str| tracer.start(name).end();
+            end("exported");
+            assert_eq!(calls.recv(), Ok(1), "the first export call is stalled");
+            end("queued");
+            end("dropped");
+            assert!(
+                logs.text()
+                    .contains("BatchSpanProcessor.SpanDroppingStarted")
+            );
+            for _ in 0..2 {
+                release.send(Ok(())).expect("the exporter waits");
+            }
+            drop(guard);
+            assert_eq!(calls.try_recv(), Ok(1), "the queued span is drained");
+            assert_eq!(shutdowns.try_recv(), Ok(()), "the exporter is shut down");
+            assert!(
+                logs.text().contains("dropped_span_count=1"),
+                "{}",
+                logs.text()
+            );
+        });
+        drop(tracer);
+        assert_eq!(shutdowns.try_recv(), Err(TryRecvError::Disconnected));
+
+        let (shut, shutdowns) = channel();
+        let (guard, _tracer) = guarded(channel().0, channel().1, shut);
+        guard.shutdown();
+        assert_eq!(shutdowns.try_recv(), Ok(()));
+        assert_eq!(shutdowns.try_recv(), Err(TryRecvError::Disconnected));
+        drop(super::init_test_only_no_global(
+            super::TelemetryConfig::default(),
+        ));
     }
 
     /// An unset operator ratio samples 1% of traces, an explicit ratio in

@@ -1372,6 +1372,11 @@ mod tests {
 
     /// One series of successful `boundary` observations, each `elapsed_ms`
     /// long, 0.1 ms of each outside its provider waits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a duration is outside the histogram's trackable range or
+    /// an `elapsed_ms` is under 0.1 ms.
     fn timing(boundary: &str, elapsed_ms: &[u64]) -> IntervalSeries {
         let durations = |samples: Vec<u64>| Distribution::of_durations(&samples).expect("in range");
         let elapsed: Vec<u64> = elapsed_ms.iter().map(|ms| ms * 1_000_000).collect();
@@ -1392,6 +1397,10 @@ mod tests {
 
     /// One phase's server timings: every tenant's buffered and streamed
     /// calls, the last tenant's slower, each stream's head at 10 ms.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`timing`] does.
     fn phase() -> Population {
         Population {
             series: vec![

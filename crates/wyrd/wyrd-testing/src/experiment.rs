@@ -4868,6 +4868,108 @@ limitations = "excluded"
         assert!(error.contains("replaced"), "{error}");
     }
 
+    /// A repetition's server timing snapshots are kept under the target
+    /// artifacts, outside the record, and rebuild its every judged
+    /// percentile, maximum, rank, and bound and its reconciliation after the
+    /// server and the in-memory population are gone; the record keeps the
+    /// ranks and reconciliation. Evidence that cannot be kept makes every
+    /// repetition INVALID.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the kept evidence is missing, rebuilds another reading,
+    /// or its loss is not invalid.
+    #[tokio::test(start_paused = true)]
+    async fn kept_timing_evidence_rebuilds_judged_readings() {
+        use crate::capacity::{Expected, Population, UNLABELLED};
+        use wyrd_telemetry::timing;
+
+        timing::enable();
+        let before = timing::snapshot();
+        for (micros, outcome) in [(100, "success"), (300, "success"), (900, "error")] {
+            wyrd_telemetry::record_timing(
+                &tracing::Span::none(),
+                "bifrost.query",
+                outcome,
+                Duration::from_micros(micros),
+                None,
+            );
+        }
+        let after = timing::snapshot();
+        let judged = [("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)];
+        let reduce = |before: &timing::TimingSnapshot, after: timing::TimingSnapshot| {
+            let mut population = Population::between(before, after).expect("one process");
+            population.expect(&[Expected {
+                boundary: "bifrost.query",
+                outcome: "success",
+                case: UNLABELLED,
+                phase: UNLABELLED,
+                count: 2,
+            }]);
+            let mut repetition = good();
+            population.validate(&mut repetition, "measured");
+            population.percentiles(&mut repetition, "bifrost.query", "success", false, &judged);
+            repetition
+        };
+        let measured = reduce(&before, after);
+        assert!(measured.invalid.is_empty(), "{:?}", measured.invalid);
+        let root = tempfile::tempdir().expect("root");
+        let artifacts = root.path().join("target/run");
+        let mut workload = Scripted::always(&measured);
+        let record = execute(
+            declaration(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(&artifacts),
+        )
+        .await;
+        let kept = std::fs::read(artifacts.join("timings/op-1/repetition-1.json")).expect("kept");
+        let kept: Vec<super::TimingEvidence> = serde_json::from_slice(&kept).expect("evidence");
+        let [window] = kept.as_slice() else {
+            panic!("one window: {kept:?}");
+        };
+        assert_eq!(window.window, "measured");
+        let rebuilt = reduce(&window.before, window.after.clone());
+        let stored = &record.steps[0].repetitions[0];
+        for id in ["p50_ms", "p95_ms", "p99_ms", "max_ms"] {
+            let reading = stored.reading(id);
+            assert!(
+                reading.is_present() && reading.rank.is_some(),
+                "{id}: {reading:?}"
+            );
+            assert_eq!(rebuilt.reading(id), reading, "{id}");
+        }
+        assert_eq!(window.reconciliation, stored.reconciliation);
+        assert_eq!(stored.reconciliation[0].recorded, 2);
+        let read = Record::parse(&serde_json::to_string(&record).expect("record json"))
+            .expect("a v2 record");
+        assert_eq!(
+            read.steps[0].repetitions[0].reconciliation,
+            stored.reconciliation
+        );
+
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, "a file").expect("blocker");
+        let mut workload = Scripted::always(&measured);
+        let lost = execute(
+            declaration(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(&blocked.join("run")),
+        )
+        .await;
+        for repetition in lost.steps.iter().flat_map(|step| &step.repetitions) {
+            assert!(
+                repetition.invalid.iter().any(
+                    |reason| reason.starts_with("the server timing evidence could not be kept")
+                ),
+                "{:?}",
+                repetition.invalid
+            );
+        }
+        assert_ne!(lost.exit_code(), 0);
+    }
+
     /// A written record is version 2 and names its histogram method and
     /// bucket bounds in the regenerated report; a legacy version-1 record
     /// reads and reports with its original raw-span method and collector

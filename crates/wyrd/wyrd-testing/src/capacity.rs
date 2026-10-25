@@ -380,18 +380,12 @@ impl Window {
             readings,
             driver_cpu_seconds: driver_opened,
         } = self;
-        let mut work = std::pin::pin!(work);
-        let early = tokio::select! {
-            output = &mut work => Some(output),
-            () = tokio::time::sleep_until(stop.into()) => None,
-        };
-        resources.freeze([server]);
-        let driver = elapsed(driver_opened, driver_cpu_seconds());
-        let stopped = Instant::now();
-        let output = match early {
-            Some(output) => output,
-            None => work.await,
-        };
+        let mut driver = None;
+        let (output, stopped) = until_stop(stop, work, || {
+            resources.freeze([server]);
+            driver = elapsed(driver_opened, driver_cpu_seconds());
+        })
+        .await;
         let drain_seconds = stopped.elapsed().as_secs_f64();
         let seconds = stopped.duration_since(started).as_secs_f64();
         let metrics = server.metrics().await?;
@@ -409,6 +403,28 @@ impl Window {
         };
         Ok((output, usage, metrics))
     }
+}
+
+/// Runs `work` until `stop`, or until it ends first, then calls `freeze`
+/// and only after it lets `work` drain. Returns `work`'s output and when
+/// `freeze` ran, the measurement's end.
+async fn until_stop<T>(
+    stop: Instant,
+    work: impl Future<Output = T>,
+    freeze: impl FnOnce(),
+) -> (T, Instant) {
+    let mut work = std::pin::pin!(work);
+    let early = tokio::select! {
+        output = &mut work => Some(output),
+        () = tokio::time::sleep_until(stop.into()) => None,
+    };
+    freeze();
+    let stopped = Instant::now();
+    let output = match early {
+        Some(output) => output,
+        None => work.await,
+    };
+    (output, stopped)
 }
 
 /// One server process's resource use over a measurement window.
@@ -1159,8 +1175,34 @@ mod tests {
     use super::{
         Distribution, Expected, IntervalScan, IntervalSeries, Percentiles, Population, Readings,
         Selection, Smoke, Telemetry, TimingInterval, UNLABELLED, Usage, deltas, elapsed,
+        until_stop,
     };
     use crate::release_server::Metrics;
+
+    /// Work still in flight at the stop drains only after the measurement
+    /// froze there, and work that ends first freezes it at its end.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the freeze follows the drain or misses the stop.
+    #[tokio::test]
+    async fn the_measurement_freezes_at_the_stop_before_work_drains() {
+        let released = tokio::sync::Notify::new();
+        let stop = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let (drained, stopped) = until_stop(
+            stop,
+            async {
+                released.notified().await;
+                std::time::Instant::now()
+            },
+            || released.notify_one(),
+        )
+        .await;
+        assert!(stopped >= stop && drained >= stopped);
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let ((), early) = until_stop(later, async {}, || {}).await;
+        assert!(early < later);
+    }
 
     /// A two-point streaming selection over one family and a breakdown by
     /// `point`, as a gateway or verification workload names them.
@@ -1358,6 +1400,14 @@ mod tests {
         };
         assert_eq!(point.count("bifrost.query"), 2);
         assert_eq!(point.recorded(&cohort("full-scan", "steady", 0)), 0);
+        let mut handed = point.clone();
+        handed.series[0].count = 3;
+        let [unmatched, _] = handed.scanned_per_query("success");
+        assert_eq!(
+            unmatched.reason.as_deref(),
+            Some("2 queries reported scans for 3 `bifrost.query` timings"),
+            "scans never average over another cohort's timings"
+        );
         let [rows, bytes] = point.scanned_per_query("success");
         assert_eq!(
             (rows.value, rows.above, bytes.value),

@@ -767,6 +767,11 @@ mod tests {
 
     /// The successful server timings at `boundary` of `calls`, each
     /// `(elapsed_ns, excluded_ns)` of provider wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a duration is outside the histogram's trackable range or
+    /// a wait exceeds its elapsed time.
     fn timing(boundary: &str, calls: &[(u64, u64)]) -> IntervalSeries {
         let durations =
             |samples: Vec<u64>| Distribution::of_durations(&samples).expect("in-range samples");
@@ -790,6 +795,10 @@ mod tests {
     /// A clean repetition of `arrivals` calls, each with one server timing
     /// per handoff of 1 ms waiting `wait_ns` on the provider, `slow` of
     /// them adding `slow_ns` of overhead.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`timing`] does.
     fn observed(stream: bool, arrivals: u64, wait_ns: u64, slow: usize, slow_ns: u64) -> Observed {
         let calls = usize::try_from(arrivals).unwrap_or(0);
         let boundaries: &[&str] = if stream {

@@ -143,7 +143,7 @@ Material limits:
 - Visibility probes are labelled `probe` and are not reconciled. Their client poll count is not kept.
 - The Verification per-second recovery curve stays completion-time diagnostic.
 - `MAX_SERIES` is 256 and `MAX_SCAN_SERIES` is 64, so they cover the declared label matrix.
-- The Gateway ingress activation has no dedicated fixture. Its path is the same `activate_request` call, exercised by the real smoke's labelled Gateway cohorts.
+- The Gateway ingress activation has no dedicated fixture. Its path is the same `activate_request` call. It is covered only when a real Gateway smoke reconciles labelled cohorts, and that smoke was not run for this remediation.
 - No real L1/L2 run or release smoke was executed for this remediation.
 
 Non-goals stayed excluded: no new collector, transport, SDK API, tenant label or dependency beyond the installed `num-traits`. No unrelated files changed. The untracked `benchmarks/` result directories predate this task.

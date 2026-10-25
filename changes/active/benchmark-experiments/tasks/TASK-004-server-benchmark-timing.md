@@ -321,3 +321,59 @@ trace export. Revision 8 approval and TASK-003 integration are prerequisites.
 - [Testing](../../../../TESTING.md).
 - [Bifrost telemetry meanings](../../../../architecture/bifrost-design.md#measurement-meanings).
 - [Security posture](../../../../architecture/wyrd-security-posture.md).
+
+## Execution Evidence
+
+Commits `b321c388c`..`2e6272c0d` on `change/benchmark-experiments`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-007, INV-005, AC-012 | `wyrd-telemetry/src/timing.rs` bounded HDR series, `since()` intervals; `record_timing` records histograms only (`wyrd.timing` span retired); boundary owners in verification `hosted/blocks.rs`, gateway telemetry, query routes, gRPC OTLP, Bifrost gate | V1; V2; V2a (all 8 selectors below); V8 smoke counts per boundary with operator span export at its default (disabled) | PASS |
+| REQ-002/003/006, INV-004, AC-004/005 | `capacity.rs::Population::collect` takes expected counts per window; L2 Bifrost phases from boundary snapshots (`query/competing.rs`), gateway capacity/recovery populations (`gateway/capacity.rs`) | V4; V6; V8 CPU, logical CPUs and work counters per engine | PASS |
+| REQ-013/014, INV-008, AC-006 | `experiment.rs` `SCHEMA_VERSION = 2`, reads legacy 1, refuses others; report prints `timing (schema N)` method | V5; V6 `reports_regenerate_from_persisted_records` | PASS |
+| REQ-015, INV-006/010, AC-008 | Snapshot opt-in by `WYRD_METRICS_BENCHMARK_SNAPSHOT=1` on the loopback metrics listener; no new dependency; wyrd-testing stays a dev/bench tool | V3; V7 `app::metrics::tests::*`; `check:deps` | PASS |
+
+Actual V2a selectors: the verification addition is
+`verification::hosted::blocks::tests::histogram_overhead_excludes_real_overlapping_blocks`
+(the overlapping-block owner lives in `hosted/blocks.rs`); the other planned
+selectors are unchanged.
+
+Commands run on the final source (all passed):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-telemetry --features test-support --lib -E 'test(=tests::benchmark_histograms_preserve_bounded_intervals)'   # 1 passed
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E '<V2, V2a server selectors, V3, test(/^app::metrics::tests::/)>'   # 16 passed
+mise exec -- cargo nextest run --locked -p wyrd-gateway --lib -E 'test(=engine::tests::execution_timing_separates_provider_wait_from_adapter_work)'   # 1 passed
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=gate::tests::query_request_lifecycle_reconciles_exact_terminal_outcomes) | test(=gate::tests::histogram_write_boundary_includes_durable_append)'   # 2 passed
+mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E '<V4, V5, V6 selectors>'   # 7 passed
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-testing --lib --bins'   # 91 passed
+mise run fmt && mise run lints && mise run check:deps && mise exec -- git diff --check
+mise run bench:smoke   # exit 0, committed tree, no --allow-dirty
+```
+
+V8 resolved manifest (`capacity.rs` timing controls): server env
+`WYRD_METRICS_BENCHMARK_SNAPSHOT=1` only; operator span export at its default
+(disabled). The first smoke run failed at boot because the driver passed
+`"true"` to the server's 0/1 flag; fixed in `2e6272c0d`, then rerun:
+
+| Path | Histogram counts | CPU / P | Work |
+|---|---|---|---|
+| L1 bifrost | 2 `otlp.traces`, 2 `otlp.logs`, 2 `gate.write`, 1 `query` | 0.050 s / 32 | 15,332,359 memtable bytes |
+| L1 verification | 4337 `verification.direct` | 1.270 s / 32 | 4337 verdicts, 38,016 component observations |
+| L1 gateway | 1811 `buffered`, 1193 `stream.head`, 1193 `stream.end` | 1.970 s / 32 | 3004 validated calls, 3004 staged captures, 379 outbox writes |
+| L2 bifrost | 2 `otlp.traces`, 2 `otlp.logs`, 2 `gate.write`, 1 `query` | 0.050 s / 32 | 15,339,863 memtable bytes |
+| L2 verification | 3971 `verification.direct` | 1.260 s / 32 | 3971 verdicts, 35,158 component observations |
+| L2 gateway | 5 `buffered`, 1 `stream.head`, 1 `stream.end` | 0.040 s / 32 | 6 validated calls, 6 staged captures, 19 outbox writes |
+
+Material limits:
+
+- Native Bifrost writes share one stream and carry no case label, so L2
+  `write_ack_p99` includes the client-queue lanes' writes and its
+  reconciliation counts are lower bounds.
+- Tenants are never a snapshot label, so gateway L2 capacity SLOs pool
+  tenants; chunk lag stays client-side and worst-tenant.
+- Spec revision 8 is still a draft; this work followed the maintainer's direct
+  instruction.
+
+Non-goals stayed excluded. No generated artifact, public SDK API or dependency
+changed. Untracked `benchmarks/**` records predate this task and were left alone.

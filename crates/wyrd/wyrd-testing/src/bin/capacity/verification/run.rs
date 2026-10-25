@@ -13,7 +13,8 @@
 //! histograms: each execution's elapsed time and its residual after the
 //! union of its own Verifier blocks, in the cohort of the phase that
 //! admitted it, read once every request drained. Recovery's judged cohort
-//! is admitted after its grace; the grace's arrivals join overload's. The
+//! is admitted after its grace (at most half of recovery); the grace's
+//! arrivals join overload's. The
 //! per-second recovery curve and the client round trips and remaining
 //! histograms are diagnostic.
 
@@ -33,8 +34,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::verification::VerificationVerdict;
 use wyrd_telemetry::timing::{Distribution, TimingSnapshot};
 use wyrd_testing::capacity::{
-    Expected, Histogram, HistogramKey, NANOS_PER_MS, Population, Readings, ResourceWindow, SMOKE,
-    SMOKE_WINDOW, Selection, Smoke, Telemetry, Window, driver_cpu_seconds, elapsed, release_binary,
+    Expected, Histogram, HistogramKey, NANOS_PER_MS, Population, Readings, ResourceWindow,
+    Selection, Telemetry, Window, driver_cpu_seconds, elapsed, release_binary,
 };
 use wyrd_testing::experiment::{
     ExperimentError, Level, Phase, Reading, Repetition, Step, Workload,
@@ -380,6 +381,12 @@ impl Bench {
         repetition.set("drain_seconds", Reading::exact(usage.drain_seconds));
         repetition.set("errors", Reading::count(measured.unexpected(None)));
         repetition.set("wrong", Reading::count(measured.wrong));
+        if !observed_components(telemetry) {
+            repetition.invalid.push(
+                "the verification runtime recorded no component observation in the window"
+                    .to_owned(),
+            );
+        }
         repetition
             .observations
             .extend(components(telemetry, measured.latencies_us.len()));
@@ -486,6 +493,12 @@ impl Bench {
             lateness_p99_us: Reading::percentile(&lateness, 0.99, 1.0).value,
         });
         population.validate(&mut repetition, "measured");
+        if !observed_components(&observed.whole) {
+            repetition.invalid.push(
+                "the verification runtime recorded no component observation in the window"
+                    .to_owned(),
+            );
+        }
         let panicked = direct.panicked + background.panicked;
         if panicked > 0 {
             repetition
@@ -599,89 +612,17 @@ impl Bench {
 
 #[async_trait]
 impl Workload for Bench {
-    /// Starts the release server through the guide,
-    /// provisions the tenant's applications (one per L1 client at the
-    /// largest declared count, or [`APPLICATIONS`] for the L2 rotation),
-    /// then sends sequential direct `verify` calls from one application
-    /// for [`SMOKE_WINDOW`]. Each must answer with the expected verdict and
-    /// land in the server's histograms as one completed `verification.direct`
-    /// timing with its Verifier component and residual, beside positive
-    /// server CPU and component observations.
+    /// Starts the release server through the guide and provisions the
+    /// tenant's applications: one per L1 client at the largest declared
+    /// count, or [`APPLICATIONS`] for the L2 rotation.
     ///
     /// # Errors
     ///
-    /// Returns a workload error for a start or provisioning failure, a
-    /// failed read, or the smoke's missing evidence. A started server is
-    /// kept even when the smoke fails, so [`Workload::finish`] stops it;
-    /// nothing is retried.
-    async fn smoke(&mut self) -> Result<String, ExperimentError> {
-        self.start().await?;
-        let server = self.server()?;
-        let state = self
-            .states
-            .first()
-            .ok_or_else(|| ExperimentError::workload("no application was provisioned"))?;
-        let mut smoke = Smoke::new("verification");
-        let before = timings(server).await?;
-        let (window, _) = Window::open(server, SELECTION)
-            .await
-            .map_err(ExperimentError::workload)?;
-        let mut measured = Measured::default();
-        let started = Instant::now();
-        for sequence in 0.. {
-            if started.elapsed() >= SMOKE_WINDOW {
-                break;
-            }
-            let sent = Instant::now();
-            let outcome =
-                with_benchmark_labels(DIRECT_CASE, SMOKE, call(state, Op::Verify, sequence)).await;
-            measured.record(micros(sent), outcome, false);
-        }
-        let (usage, _) = window
-            .close(server)
-            .await
-            .map_err(ExperimentError::workload)?;
-        smoke.usage(&usage);
-        let right = measured.latencies_us.len() as u64 - measured.wrong;
-        smoke.positive(
-            "direct verifications with the expected verdict",
-            right as f64,
-        );
-        for (code, count) in &measured.errors {
-            smoke.missing(format!("{count} direct calls were refused with `{code}`"));
-        }
-        smoke.positive(
-            "verification runtime component observations",
-            usage
-                .telemetry
-                .breakdown
-                .values()
-                .map(|(_, count)| count)
-                .sum(),
-        );
-        let population = Population::smoke(
-            server,
-            &before,
-            &[Expected {
-                boundary: DIRECT_TIMING,
-                outcome: COMPLETED,
-                case: DIRECT_CASE,
-                phase: SMOKE,
-                count: measured.latencies_us.len() as u64,
-            }],
-        )
-        .await;
-        smoke.timings(&population, &[(DIRECT_TIMING, COMPLETED, true)]);
-        smoke.finish().map_err(ExperimentError::Workload)
-    }
-
-    /// Nothing beyond what [`Self::smoke`] started and provisioned.
-    ///
-    /// # Errors
-    ///
-    /// Returns a workload error when the smoke did not start the server.
+    /// Returns a workload error for a start or provisioning failure. A
+    /// started server is kept even when provisioning fails, so
+    /// [`Workload::finish`] stops it; nothing is retried.
     async fn prepare(&mut self) -> Result<(), ExperimentError> {
-        self.server().map(|_| ())
+        self.start().await
     }
 
     /// The server's PID, once it runs.
@@ -910,7 +851,7 @@ where
     let mut tasks = JoinSet::new();
     let slot = usize::from(op == Op::Submit);
     let end = start + schedule.window;
-    let recovery = schedule.stages()[2].start;
+    let [_, _, recovery] = schedule.stages();
     for (index, stage) in schedule.stages().into_iter().enumerate() {
         let rate = match op {
             Op::Verify => stage.direct_rate,
@@ -922,7 +863,7 @@ where
                 break;
             }
             let at = start + stage.start + offset;
-            let phase = admission(recovery, index, stage.start + offset);
+            let phase = admission(recovery.start, recovery.length, index, stage.start + offset);
             tokio::time::sleep_until(at).await;
             offered.scheduled += 1;
             while let Some(joined) = tasks.try_join_next() {
@@ -958,10 +899,12 @@ where
 }
 
 /// The [`STAGES`] index of the admission phase of an arrival due `offset`
-/// after the start in schedule phase `index`: recovery's arrivals within
-/// [`RECOVERY_LIMIT`] of its start at `recovery` join overload's cohort.
-fn admission(recovery: Duration, index: usize, offset: Duration) -> usize {
-    if index == 2 && offset < recovery + RECOVERY_LIMIT {
+/// after the start in schedule phase `index`: recovery's arrivals within its
+/// grace of its start at `recovery`, [`RECOVERY_LIMIT`] or half its `length`
+/// when shorter, join overload's cohort, so a short smoke recovery still
+/// judges a cohort.
+fn admission(recovery: Duration, length: Duration, index: usize, offset: Duration) -> usize {
+    if index == 2 && offset < recovery + RECOVERY_LIMIT.min(length / 2) {
         1
     } else {
         index
@@ -1113,6 +1056,13 @@ fn mean(histogram: &Histogram) -> Reading {
     )
 }
 
+/// Whether `telemetry` holds any verification runtime component
+/// observation, as every executed `verify` records its phases and Verifier
+/// blocks.
+fn observed_components(telemetry: &Telemetry) -> bool {
+    telemetry.breakdown.values().any(|(_, count)| *count > 0.0)
+}
+
 /// The runtime's component times over a window, largest total first: each
 /// component's milliseconds per acknowledged call beside its mean per
 /// observation. Components nest and background work overlaps calls, so they
@@ -1201,8 +1151,9 @@ mod tests {
     }
 
     /// Arrivals keep their schedule phase's cohort except recovery's first
-    /// 30 s, which join overload's, so recovery is judged after its grace
-    /// however late each call completes.
+    /// 30 s (half of a recovery shorter than 60 s), which join overload's,
+    /// so recovery is judged after its grace however late each call
+    /// completes.
     ///
     /// # Panics
     ///
@@ -1211,10 +1162,14 @@ mod tests {
     fn recovery_grace_arrivals_join_overload() {
         let recovery = Duration::from_secs(100);
         let second = Duration::from_secs(1);
-        assert_eq!(admission(recovery, 0, second), 0);
-        assert_eq!(admission(recovery, 1, second * 99), 1);
-        assert_eq!(admission(recovery, 2, recovery + second * 29), 1);
-        assert_eq!(admission(recovery, 2, recovery + second * 30), 2);
+        let length = second * 100;
+        assert_eq!(admission(recovery, length, 0, second), 0);
+        assert_eq!(admission(recovery, length, 1, second * 99), 1);
+        assert_eq!(admission(recovery, length, 2, recovery + second * 29), 1);
+        assert_eq!(admission(recovery, length, 2, recovery + second * 30), 2);
+        let short = second * 15;
+        assert_eq!(admission(recovery, short, 2, recovery + second * 7), 1);
+        assert_eq!(admission(recovery, short, 2, recovery + second * 8), 2);
     }
 
     /// Answers count acknowledged and refused calls, only undeclared

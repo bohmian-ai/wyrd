@@ -26,8 +26,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_testing::capacity::{
-    Expected, NANOS_PER_MS, Population, SMOKE, SMOKE_WINDOW, Selection, Smoke, Usage, Window,
-    release_binary,
+    Expected, NANOS_PER_MS, Population, Selection, Usage, Window, release_binary,
 };
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
 use wyrd_testing::gateway_capture::GatewayCapture;
@@ -195,16 +194,23 @@ impl Integrity {
         }
     }
 
-    /// Why these counters cannot prove the Scribe writer ran for what was
-    /// staged, or `None` when they can.
+    /// Why these counters cannot prove capture staged work and the Scribe
+    /// writer ran for it, or `None` when they can; every case captures, so
+    /// a window that staged nothing measured no capture.
     #[must_use]
     pub fn unwritten(&self) -> Option<String> {
-        (!self.reset && self.staged > 0.0 && self.written <= 0.0).then(|| {
-            format!(
-                "{} captures were staged but no Scribe outbox write completed",
-                self.staged
-            )
-        })
+        if self.reset {
+            None
+        } else if self.staged <= 0.0 {
+            Some("no capture was staged in the window".to_owned())
+        } else {
+            (self.written <= 0.0).then(|| {
+                format!(
+                    "{} captures were staged but no Scribe outbox write completed",
+                    self.staged
+                )
+            })
+        }
     }
 }
 
@@ -419,82 +425,6 @@ impl Observed {
     }
 }
 
-/// The Gateway release smoke: sequential calls of every `(shape, capture)`
-/// pair, for an equal share of [`SMOKE_WINDOW`] each, from `tenant`'s first key, each pair under its capture
-/// policy and labelled with its case and the `smoke` phase, inside one
-/// window that then settles. Every call must be validated and land in the
-/// server's histograms as one succeeded timing in its cohort at each of its
-/// boundaries with its provider wait excluded, beside positive server CPU,
-/// staged captures, and Scribe outbox writes.
-///
-/// # Errors
-///
-/// Returns a client, capture-policy, or scrape failure, or the [`Smoke`]
-/// message naming every missing piece of evidence.
-pub async fn smoke(
-    server: &LocalServer,
-    tenant: &Tenant,
-    shapes: &[(Case, Shape, CapturePolicy)],
-) -> Result<String> {
-    let mut smoke = Smoke::new("gateway");
-    let http = http()?;
-    let key = tenant
-        .keys
-        .first()
-        .ok_or("the tenant has no invoking key")?;
-    let mut expected = Vec::new();
-    let before = server.timings().await?;
-    let (window, baseline) = Window::open(server, Selection::RESOURCES).await?;
-    let mut samples = Samples::default();
-    for (case, shape, policy) in shapes {
-        tenant.capture(*policy).await?;
-        let share = SMOKE_WINDOW / u32::try_from(shapes.len()).unwrap_or(u32::MAX);
-        let started = Instant::now();
-        let mut calls = 0;
-        while calls == 0 || started.elapsed() < share {
-            let timed = with_benchmark_labels(
-                case.label(),
-                SMOKE,
-                call(&http, key, shape, shape.body("smoke")),
-            )
-            .await;
-            samples.record(&timed, None);
-            calls += 1;
-        }
-        for boundary in boundaries(shape.stream) {
-            expected.push(Expected {
-                boundary,
-                outcome: SUCCEEDED,
-                case: case.label(),
-                phase: SMOKE,
-                count: calls,
-            });
-        }
-    }
-    let (usage, _) = window.close(server).await?;
-    settle(server).await?;
-    let integrity = Integrity::between(&baseline, &server.metrics().await?);
-    smoke.usage(&usage);
-    smoke.positive("validated calls", samples.completion_us.len() as f64);
-    for (outcome, count) in &samples.errors {
-        smoke.missing(format!("{count} calls ended `{outcome}`"));
-    }
-    smoke.positive("staged captures", integrity.staged);
-    smoke.positive("Scribe outbox writes", integrity.written);
-    let population = Population::smoke(server, &before, &expected).await;
-    let mut judged: Vec<(&str, &str, bool)> = Vec::new();
-    for cohort in &expected {
-        if !judged
-            .iter()
-            .any(|(boundary, ..)| *boundary == cohort.boundary)
-        {
-            judged.push((cohort.boundary, SUCCEEDED, true));
-        }
-    }
-    smoke.timings(&population, &judged);
-    Ok(smoke.finish()?)
-}
-
 /// The L1 workload: one server, one tenant holding a key per client, and
 /// the instant upstream.
 pub struct Overhead {
@@ -610,38 +540,13 @@ impl Overhead {
 
 #[async_trait]
 impl Workload for Overhead {
-    /// Starts the server, upstream, and tenant, and smokes every case's
-    /// shape under its capture policy ([`smoke`]).
+    /// Starts the server, upstream, and tenant.
     ///
     /// # Errors
     ///
-    /// Returns a server, upstream, or provisioning failure, or the smoke's
-    /// missing evidence.
-    async fn smoke(&mut self) -> std::result::Result<String, ExperimentError> {
-        self.start().await.map_err(ExperimentError::workload)?;
-        let (Some(server), Some(tenant)) = (&self.server, &self.tenant) else {
-            return Err(ExperimentError::workload("the workload did not start"));
-        };
-        let shapes: Vec<(Case, Shape, CapturePolicy)> = Case::ALL
-            .iter()
-            .map(|case| (*case, case.shape(), case.capture()))
-            .collect();
-        self.policy = shapes.last().map(|(.., policy)| *policy);
-        smoke(server, tenant, &shapes)
-            .await
-            .map_err(ExperimentError::workload)
-    }
-
-    /// Nothing beyond what [`Self::smoke`] started.
-    ///
-    /// # Errors
-    ///
-    /// Returns a workload error when the smoke did not start the server.
+    /// Returns a server, upstream, or provisioning failure.
     async fn prepare(&mut self) -> std::result::Result<(), ExperimentError> {
-        self.server
-            .as_ref()
-            .map(|_| ())
-            .ok_or_else(|| ExperimentError::workload("the workload was not smoked"))
+        self.start().await.map_err(ExperimentError::workload)
     }
 
     /// The server's PID while it runs.
@@ -944,6 +849,7 @@ mod tests {
                 "no `gateway.buffered` timing observation has outcome `succeeded`",
                 "no `gateway.buffered` timing observation has outcome `succeeded`",
                 "no call was sent in the window",
+                "no capture was staged in the window",
             ]
         );
         let mut missing = observed(false, 1_000, 2_000_000, 5, 400_000);

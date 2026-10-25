@@ -94,7 +94,6 @@ pub const CASES: &[&str] = &[
 
 /// The closed benchmark phases a request may declare.
 pub const PHASES: &[&str] = &[
-    "smoke",
     "warmup",
     "repetition-1",
     "repetition-2",

@@ -6,7 +6,7 @@ an append-only record in this directory. They are not part of any test lane,
 `gate`, verify lane, or CI job.
 
 ```bash
-mise run bench:smoke                 # every path's release smoke, in seconds
+mise run bench:smoke                 # every default plan at smoke scale
 mise run bench:l1                    # Level 1, all three engines in order
 mise run bench:l1:bifrost            # Level 1 Bifrost: writes, hot, parquet
 mise run bench:l1:bifrost:writes     # one Bifrost experiment
@@ -18,10 +18,21 @@ mise run bench:l2:bifrost            # Level 2, one engine
 mise run bench:l2:verification
 mise run bench:l2:gateway
 mise run bench:l1:gateway -- --profile --steps chat.c64
+mise run bench:l1:gateway -- --smoke # one plan at smoke scale
 ```
 
-`bench:smoke` proves every timing boundary, CPU reading and counter is
-collected, records nothing, and exits 0 or 2. Run it first. Verification and
+`--smoke` runs a normal command's whole workflow (fixture loading and
+publication waits, every selected step and phase, measured stop, drain,
+exact reconciliation, judgment, record, timing evidence and report) at
+smoke-scale fixtures with one short warmup and one repetition per step. It
+records `"mode": "smoke"` under `target/benchmarks/smoke/`, never here, and a
+smoke record is never a calibration or baseline wherever it is moved. Only
+percentiles below their sample floor and baseline comparisons are
+inapplicable to it; every integrity check still holds. Every full command
+first runs its own smoke as a prepass under a fresh Postgres, outside its
+clock and recorded beside it (`prepass`), and is INVALID before full-size
+preparation when that smoke fails. `bench:smoke` runs every default plan's
+smoke. Verification and
 Gateway L1 take up to 15 minutes each. The Bifrost L1 experiments take up to
 8 (`writes`), 5 (`hot`), and 9 (`parquet`) minutes, and `bench:l1` up to 52
 in all. An L2 engine takes 20 to 30 minutes.

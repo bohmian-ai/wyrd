@@ -44,7 +44,7 @@ use crate::query::run::{
     Admission, Bench, Overload, QUEUE_FULL, Sender, WRONG_RESULT, ask, micros,
 };
 use crate::query::workload::{Case, Fixture, INGEST_TABLE, TABLE};
-use crate::query::{Lane, PARQUET_ENV, Residence, SPLIT, WriteOp, client, lanes, smoke, start};
+use crate::query::{Lane, PARQUET_ENV, Residence, SPLIT, Scale, WriteOp, client, lanes, start};
 
 /// Mixed queries in flight at most; a due query finding this many
 /// unanswered is missed rather than sent.
@@ -256,13 +256,16 @@ pub struct Competing {
     tenant: Option<Arc<client_queue::Tenant>>,
     /// The statement sequence every repetition continues.
     sequence: Arc<AtomicU64>,
+    /// The fixture sizes it loads.
+    scale: Scale,
 }
 
 impl Competing {
-    /// An unprepared workload keeping its files under `logs`.
-    pub fn new(logs: PathBuf) -> Self {
+    /// An unprepared workload at `scale` keeping its files under `logs`.
+    pub fn new(logs: PathBuf, scale: Scale) -> Self {
         Self {
             logs,
+            scale,
             server: None,
             bench: None,
             senders: Vec::new(),
@@ -938,18 +941,28 @@ async fn enable_compaction(
 }
 
 impl Competing {
-    /// Loads and publishes the heavy fixture into the smoked server,
-    /// computes the exact answers, enables compaction on every ingest table
-    /// the smoke created, and provisions the client-queue tenant.
+    /// Writes one request through every ingest lane of the started server
+    /// so each ingest table exists, loads and publishes the heavy fixture of
+    /// [`Scale::heavy`] rows, computes the exact answers, enables compaction
+    /// on every ingest table, and provisions the client-queue tenant.
     ///
     /// # Errors
     ///
-    /// Returns a missing smoke, or a client, load, publication, catalog, or
-    /// provisioning failure.
+    /// Returns a server that did not start, a refused seed write, or a
+    /// client, load, publication, catalog, or provisioning failure.
     async fn start(&mut self) -> crate::query::Result<()> {
-        let server = self.server.as_ref().ok_or("the workload was not smoked")?;
+        let server = self.server.as_ref().ok_or("the server did not start")?;
         let client = client(server)?;
-        let fixture = Fixture::heavy();
+        for (op, sender, cursor) in &self.senders {
+            let chunk = sender.request_rows();
+            let first = cursor.fetch_add(chunk, Ordering::Relaxed);
+            sender.send(first, first + chunk).await.map_err(|code| {
+                format!("the `{}` seed write was refused with `{code}`", op.name())
+            })?;
+        }
+        let fixture = Fixture {
+            rows: self.scale.heavy,
+        };
         let loaded = Sender::native(&client, TABLE, fixture)
             .await?
             .closed_loop(
@@ -994,26 +1007,25 @@ impl Competing {
 
 #[async_trait]
 impl Workload for Competing {
-    /// Starts the server, registers each ingest path in
-    /// [`SPLIT`] order, and smokes every write path and the query boundary
-    /// ([`crate::query::smoke`]) before any fixture loads; the smoke's
-    /// writes also create every ingest table compaction is enabled on.
-    async fn smoke(&mut self) -> Result<String, ExperimentError> {
+    /// Starts the server, registers each ingest path in [`SPLIT`] order,
+    /// and loads everything [`Competing::start`] names.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workload error for a start, registration, or
+    /// [`Competing::start`] failure. A started server is kept so
+    /// [`Workload::finish`] stops it; nothing is retried.
+    async fn prepare(&mut self) -> Result<(), ExperimentError> {
         std::fs::create_dir_all(&self.logs).map_err(ExperimentError::workload)?;
         let server = start(&PARQUET_ENV)
             .await
             .map_err(ExperimentError::workload)?;
-        let client = client(&server).map_err(ExperimentError::workload)?;
-        self.senders = lanes(&client, &SPLIT.map(|(op, _)| op))
-            .await
-            .map_err(ExperimentError::workload)?;
-        let proved = smoke(&server, &client, &self.senders).await;
+        let senders = match client(&server) {
+            Ok(client) => lanes(&client, &SPLIT.map(|(op, _)| op)).await,
+            Err(error) => Err(error),
+        };
         self.server = Some(server);
-        proved.map_err(ExperimentError::Workload)
-    }
-
-    /// Loads everything [`Competing::start`] names.
-    async fn prepare(&mut self) -> Result<(), ExperimentError> {
+        self.senders = senders.map_err(ExperimentError::workload)?;
         Box::pin(self.start())
             .await
             .map_err(ExperimentError::workload)

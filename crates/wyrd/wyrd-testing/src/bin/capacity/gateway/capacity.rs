@@ -45,7 +45,6 @@ use wyrd_testing::release_server::{LocalServer, Metrics};
 
 use crate::gateway::run::{
     BUFFERED, Drain, Durable, Integrity, STREAM_END, STREAM_HEAD, SUCCEEDED, outcome_key, settle,
-    smoke,
 };
 use crate::gateway::workload::{CapturePolicy, Shape, Tenant, Timed, call, http};
 use crate::gateway::{Case, PROCESS, Result, param, shutdown};
@@ -1100,41 +1099,13 @@ impl Capacity {
 
 #[async_trait]
 impl Workload for Capacity {
-    /// Starts the server, upstream, tenants, and driver, and smokes the
-    /// driver's buffered and streamed shapes under metadata capture from
-    /// the first tenant ([`crate::gateway::run::smoke`]).
+    /// Starts the server, upstream, tenants, and driver.
     ///
     /// # Errors
     ///
-    /// Returns a server, upstream, or provisioning failure, or the smoke's
-    /// missing evidence.
-    async fn smoke(&mut self) -> std::result::Result<String, ExperimentError> {
-        self.start().await.map_err(ExperimentError::workload)?;
-        let (Some(server), Some(tenant), Some(driver)) =
-            (&self.server, self.tenants.first(), &self.driver)
-        else {
-            return Err(ExperimentError::workload("the workload did not start"));
-        };
-        let shapes: Vec<(Case, Shape, CapturePolicy)> = driver
-            .shapes
-            .iter()
-            .map(|shape| (mode(shape.stream), shape.clone(), CapturePolicy::Metadata))
-            .collect();
-        smoke(server, tenant, &shapes)
-            .await
-            .map_err(ExperimentError::workload)
-    }
-
-    /// Nothing beyond what [`Self::smoke`] started.
-    ///
-    /// # Errors
-    ///
-    /// Returns a workload error when the smoke did not start the server.
+    /// Returns a server, upstream, or provisioning failure.
     async fn prepare(&mut self) -> std::result::Result<(), ExperimentError> {
-        self.server
-            .as_ref()
-            .map(|_| ())
-            .ok_or_else(|| ExperimentError::workload("the workload was not smoked"))
+        self.start().await.map_err(ExperimentError::workload)
     }
 
     /// The server's PID while it runs.

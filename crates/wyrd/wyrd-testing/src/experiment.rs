@@ -9,6 +9,8 @@
 //! samples the host again, and judges every applicable criterion into a
 //! [`Record`]. The record is published append-only under
 //! `benchmarks/<engine>/<experiment>/` and every report is rendered from it.
+//! A [`Mode::Smoke`] runs that same workflow at reduced declared controls
+//! and keeps its record under [`SMOKE_DIRECTORY`].
 //!
 //! Judgment has three outcomes. PASS means valid evidence met every
 //! criterion; FAIL means valid evidence missed one; INVALID means the run did
@@ -52,6 +54,10 @@ pub const LEGACY_SCHEMA_VERSION: u64 = 1;
 
 /// Repetitions every measured step keeps.
 pub const REPETITIONS: u8 = 3;
+
+/// Where smoke records and evidence live, under the repository root:
+/// local build output, never committed history.
+pub const SMOKE_DIRECTORY: &str = "target/benchmarks/smoke";
 
 /// How long a workload may take to stop and drain after measurement before
 /// the run gives up waiting and records the overrun.
@@ -178,6 +184,66 @@ impl Level {
             },
         }
     }
+
+    /// The level's reduced smoke durations: one short discarded warmup and
+    /// one short measured repetition per step, within a bounded smoke
+    /// budget and no minimum. L2 windows stay long enough for every
+    /// capacity, overload, and recovery phase to admit each declared case.
+    #[must_use]
+    pub const fn smoke_timing(self) -> Timing {
+        match self {
+            Self::One => Timing {
+                warmup_seconds: 1,
+                repetition_seconds: 3,
+                repetitions: 1,
+                budget_seconds: 10 * 60,
+                minimum_seconds: 0,
+            },
+            Self::Two => Timing {
+                warmup_seconds: 3,
+                repetition_seconds: 36,
+                repetitions: 1,
+                budget_seconds: 15 * 60,
+                minimum_seconds: 0,
+            },
+        }
+    }
+}
+
+/// Whether a run is a full experiment or a smoke of the same workflow at
+/// reduced declared controls.
+///
+/// A smoke runs the same declaration, fixtures, steps, phases,
+/// measurement, judgment, and record as a full run with a smaller fixture
+/// and [`Level::smoke_timing`]. It is functional evidence only: it never
+/// qualifies performance or serves as a reference, its records stay under
+/// `target/benchmarks/smoke/`, and percentile floors and full-run
+/// reference comparisons are explicitly inapplicable to it. A record
+/// without a mode is a full run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// The full declared experiment.
+    #[default]
+    Full,
+    /// The reduced functional smoke.
+    Smoke,
+}
+
+/// The automatic smoke a full run executed in its own process, fresh
+/// database, and clock before preparing any full-size fixture.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Prepass {
+    /// The smoke's command, as argument values.
+    pub command: Vec<String>,
+    /// The smoke's declared budget, seconds.
+    pub budget_seconds: u64,
+    /// Wall seconds it took, outside the full run's clock.
+    pub elapsed_seconds: f64,
+    /// Its exit code; only 0 admits the full run.
+    pub exit_code: u8,
+    /// Where its record and timing evidence live.
+    pub records: String,
 }
 
 /// The durations every step of a run uses.
@@ -826,6 +892,10 @@ pub struct Declaration {
     pub host: HostRecord,
     /// Declaration-time refusals, such as a missing calibration.
     pub refusals: Vec<Reason>,
+    /// Full or smoke.
+    pub mode: Mode,
+    /// The smoke a full run passed first, or `None` for a smoke.
+    pub prepass: Option<Prepass>,
 }
 
 /// Controls every declaration names.
@@ -834,8 +904,8 @@ const REQUIRED_CONTROLS: [&str; 3] = ["fixture", "limits", "workload"];
 impl Declaration {
     /// The reasons this declaration cannot admit a workload: missing
     /// question, steps, controls, metrics, or source; criteria naming
-    /// undeclared metrics or steps; a dirty source without override; and
-    /// declaration-time refusals.
+    /// undeclared metrics or steps; a dirty source without override; a
+    /// failed smoke prepass; and declaration-time refusals.
     #[must_use]
     pub fn refusals(&self) -> Vec<Reason> {
         let mut reasons = self.refusals.clone();
@@ -907,6 +977,21 @@ impl Declaration {
             refuse(
                 "source.dirty",
                 "tracked files differ from HEAD; commit them or declare --allow-dirty".to_owned(),
+            );
+        }
+        if let Some(prepass) = self
+            .prepass
+            .as_ref()
+            .filter(|prepass| prepass.exit_code != 0)
+        {
+            refuse(
+                "prepass.failed",
+                format!(
+                    "the smoke prepass `{}` exited {}; its evidence is under {}",
+                    prepass.command.join(" "),
+                    prepass.exit_code,
+                    prepass.records
+                ),
             );
         }
         reasons
@@ -1454,34 +1539,20 @@ fn keep_timings(
 
 /// One engine's production work under the shared lifecycle.
 ///
-/// The runner calls [`Workload::smoke`] and then [`Workload::prepare`] once
-/// inside the clock, then [`Workload::measure`] for each step's warmup and
+/// The runner calls [`Workload::prepare`] once inside the clock, then [`Workload::measure`] for each step's warmup and
 /// repetitions, then [`Workload::finish`]. A workload establishes
 /// equivalent declared state before each repetition (fresh write
 /// identities, a whole stateful sequence) and reads only its own server's
 /// evidence.
 #[async_trait]
 pub trait Workload: Send {
-    /// Starts the servers and proves, before any fixture loads, that a
-    /// handful of real requests through every server timing boundary the
-    /// workload judges reach the harness as exact integer timings with
-    /// their excluded components, beside readable server CPU, provisioned
-    /// CPUs, and positive work counters. Returns what it proved, one line.
+    /// Starts the servers and loads and settles the fixtures at the
+    /// declaration's scale. The runner calls it once and never retries it.
     ///
     /// # Errors
     ///
-    /// Returns a workload error naming the engine and every missing or
-    /// malformed boundary, component, resource reading, or counter, or the
-    /// start failure; the runner then admits no further work.
-    async fn smoke(&mut self) -> Result<String, ExperimentError>;
-
-    /// Loads fixtures into the servers [`Self::smoke`] started. The runner
-    /// calls it once, only after a passing smoke, and never retries it.
-    ///
-    /// # Errors
-    ///
-    /// Returns a workload error for an unsmoked workload or a fixture that
-    /// did not load; the runner then measures no step. Cancellation at the
+    /// Returns a workload error naming the engine and what did not start
+    /// or load; the runner then measures no step. Cancellation at the
     /// budget or an interrupt drops the future, so fixtures may be partly
     /// loaded; [`Self::finish`] still runs and stops the servers.
     async fn prepare(&mut self) -> Result<(), ExperimentError>;
@@ -1541,10 +1612,21 @@ pub struct Judgment {
     pub values: Vec<Reading>,
     /// The regression operands, when a baseline rule judged.
     pub operands: Option<Value>,
-    /// PASS, FAIL, or INVALID; `None` for an advisory comparison.
+    /// PASS, FAIL, or INVALID; `None` for an advisory comparison or an
+    /// inapplicable criterion.
     pub verdict: Option<Verdict>,
-    /// Why it failed, was invalid, or is advisory.
+    /// Why it failed, was invalid, is advisory, or is inapplicable.
     pub reason: Option<String>,
+    /// Whether the criterion could be judged at the run's controls: false
+    /// only in a smoke, for a percentile under its sample floor or a
+    /// full-run reference comparison. Records without it were judged.
+    #[serde(default = "judged")]
+    pub applicable: bool,
+}
+
+/// The applicability of a judgment read from a record that predates it.
+const fn judged() -> bool {
+    true
 }
 
 /// One metric's spread over the repetitions.
@@ -1701,15 +1783,19 @@ pub struct Record {
     pub reasons: Vec<Reason>,
     /// Optional local artifacts.
     pub artifacts: Artifacts,
+    /// Full or smoke; a record without one is a full run.
+    #[serde(default)]
+    pub mode: Mode,
+    /// The smoke prepass a full run passed before its clock started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepass: Option<Prepass>,
 }
 
 /// Runs a sealed declaration's workload and returns its record.
 ///
 /// The clock starts here. A refused declaration admits no workload. Each
 /// host sample comes from `host`, given the declared sample length. The
-/// workload's smoke must prove measurement first; a failed smoke is an
-/// INVALID `smoke.failed` reason and admits no preparation or step. The
-/// workload is then prepared, each selected measured step warms up and measures
+/// workload is prepared, each selected measured step warms up and measures
 /// its repetitions, the workload finishes, and the host is sampled again.
 /// An overrun, interruption, or workload failure stops admission, keeps the
 /// partial evidence, and marks every remaining step unmeasured; it never
@@ -1753,22 +1839,15 @@ where
     }
     let admitted = validity.is_empty();
     if admitted {
-        match bounded(deadline, &interrupt, workload.smoke()).await {
-            Ok(Ok(proved)) => eprintln!("smoke: {proved}"),
-            Ok(Err(error)) => stopped = Some(Reason::new("smoke.failed", error.to_string())),
-            Err(reason) => stopped = Some(reason),
-        }
-        if stopped.is_none() {
-            match bounded(deadline, &interrupt, workload.prepare()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    stopped = Some(Reason::new(
-                        "workload.failed",
-                        format!("preparation failed: {error}"),
-                    ));
-                }
-                Err(reason) => stopped = Some(reason),
+        match bounded(deadline, &interrupt, workload.prepare()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                stopped = Some(Reason::new(
+                    "workload.failed",
+                    format!("preparation failed: {error}"),
+                ));
             }
+            Err(reason) => stopped = Some(reason),
         }
         let profiler = match (&options.profiler, stopped.is_none()) {
             (Some(program), true) => Profiler::start(
@@ -1955,6 +2034,8 @@ where
             directory: Some(options.artifacts.display().to_string()),
             profile,
         },
+        mode: declaration.mode,
+        prepass: declaration.prepass.clone(),
     }
 }
 
@@ -2095,6 +2176,7 @@ fn judge(
                     &repetitions,
                     &declaration.validity,
                     timing.repetitions,
+                    declaration.mode,
                 );
                 if let Some(verdict) = judgment.verdict.filter(|verdict| *verdict != Verdict::Pass)
                 {
@@ -2249,7 +2331,7 @@ fn scaling(
 }
 
 /// Why one repetition is invalid: workload reasons, process loss and
-/// missing CPU, driver and collector saturation, and open-loop misses or
+/// missing or zero CPU, driver and collector saturation, and open-loop misses or
 /// lateness.
 fn repetition_reasons(repetition: &Repetition, validity: &Validity) -> Vec<Reason> {
     let mut reasons: Vec<Reason> = repetition
@@ -2257,11 +2339,16 @@ fn repetition_reasons(repetition: &Repetition, validity: &Validity) -> Vec<Reaso
         .iter()
         .map(|reason| Reason::new("workload.invalid", reason.clone()))
         .collect();
-    if repetition.server_cpu_seconds.is_none() {
-        reasons.push(Reason::new(
+    match repetition.server_cpu_seconds {
+        None => reasons.push(Reason::new(
             "reading.missing",
             "server CPU-seconds are unavailable: a process was lost or a counter reset",
-        ));
+        )),
+        Some(cpu) if cpu <= 0.0 => reasons.push(Reason::new(
+            "reading.missing",
+            "server CPU-seconds were zero: the window measured no server work",
+        )),
+        Some(_) => {}
     }
     match repetition.driver_cpu_seconds {
         None => reasons.push(Reason::new(
@@ -2346,12 +2433,16 @@ fn summarize(declaration: &Declaration, repetitions: &[Repetition]) -> BTreeMap<
         .collect()
 }
 
-/// Judges one criterion over a step's repetitions.
+/// Judges one criterion over a step's repetitions. In a smoke, a
+/// full-run reference comparison, and a percentile whose every reading is
+/// present but under its sample floor, are inapplicable with the observed
+/// counts; a missing reading stays INVALID in both modes.
 fn judge_criterion(
     criterion: &Criterion,
     repetitions: &[Repetition],
     validity: &Validity,
     expected: u8,
+    mode: Mode,
 ) -> Judgment {
     let values: Vec<Reading> = repetitions
         .iter()
@@ -2364,7 +2455,25 @@ fn judge_criterion(
         operands: None,
         verdict: Some(Verdict::Invalid),
         reason: None,
+        applicable: true,
     };
+    let inapplicable = |mut judgment: Judgment, reason: String| {
+        judgment.verdict = None;
+        judgment.applicable = false;
+        judgment.reason = Some(reason);
+        judgment
+    };
+    if mode == Mode::Smoke
+        && matches!(
+            criterion.rule,
+            Rule::Regression { .. } | Rule::Advisory { .. } | Rule::Unusable { .. }
+        )
+    {
+        return inapplicable(
+            judgment,
+            "not judgeable at smoke size: a full-run reference does not apply to the reduced smoke controls".to_owned(),
+        );
+    }
     if let Rule::Advisory { baseline, reason } = &criterion.rule {
         judgment.verdict = None;
         judgment.reason = Some(reason.clone());
@@ -2401,6 +2510,20 @@ fn judge_criterion(
             .enumerate()
             .find(|(_, value)| value.samples.unwrap_or(0) < required)
     {
+        if mode == Mode::Smoke && short.samples.unwrap_or(0) > 0 {
+            let counts: Vec<String> = values
+                .iter()
+                .map(|value| value.samples.unwrap_or(0).to_string())
+                .collect();
+            return inapplicable(
+                judgment,
+                format!(
+                    "not judgeable at smoke size: p{} has {} samples per repetition, under its {required}-sample floor",
+                    criterion.percentile.unwrap_or_default(),
+                    counts.join("/")
+                ),
+            );
+        }
         judgment.reason = Some(format!(
             "repetition {} has {} samples behind p{}, under {required}",
             index + 1,
@@ -2562,20 +2685,23 @@ impl Record {
         }
     }
 
-    /// Publishes the record under `root/benchmarks/<engine>/<experiment>/`:
-    /// written to a temporary file in that directory, synced, then linked
-    /// to the first free collision-numbered name, so history is never
-    /// overwritten and a partial file never appears complete.
+    /// Publishes the record under `root/benchmarks/<engine>/<experiment>/`,
+    /// or a smoke's under `root/target/benchmarks/smoke/<engine>/<experiment>/`
+    /// outside committed history: written to a temporary file in that
+    /// directory, synced, then linked to the first free collision-numbered
+    /// name, so history is never overwritten and a partial file never
+    /// appears complete.
     ///
     /// # Errors
     ///
     /// Returns [`ExperimentError::Persist`] when the directory, write, sync,
     /// or rename fails.
     pub fn publish(&self, root: &Path) -> Result<PathBuf, ExperimentError> {
-        let directory = root
-            .join("benchmarks")
-            .join(self.engine.name())
-            .join(&self.experiment);
+        let history = match self.mode {
+            Mode::Full => root.join("benchmarks"),
+            Mode::Smoke => root.join(SMOKE_DIRECTORY),
+        };
+        let directory = history.join(self.engine.name()).join(&self.experiment);
         let fail = |path: &Path| {
             let path = path.to_path_buf();
             move |source| ExperimentError::Persist { path, source }
@@ -2680,6 +2806,16 @@ impl Record {
             self.validity.budget_seconds,
             self.started_at.to_rfc3339(),
         );
+        if self.mode == Mode::Smoke {
+            out.push_str("SMOKE: functional pipeline evidence at reduced controls, never a performance qualification or reference.\n\n");
+        }
+        if let Some(prepass) = &self.prepass {
+            let _ = writeln!(
+                out,
+                "smoke prepass: exit {} in {:.1}s of its {}s budget, outside this run's clock; evidence under {}\n",
+                prepass.exit_code, prepass.elapsed_seconds, prepass.budget_seconds, prepass.records
+            );
+        }
         if let Some(method) = self
             .controls
             .values
@@ -2740,6 +2876,10 @@ impl Record {
                         }
                         _ => verdict.label().to_owned(),
                     },
+                    None if !judgment.applicable => format!(
+                        "— inapplicable: {}",
+                        judgment.reason.as_deref().unwrap_or("not judgeable")
+                    ),
                     None => format!(
                         "— advisory: {}",
                         judgment.reason.as_deref().unwrap_or("not judged")
@@ -3176,9 +3316,9 @@ mod tests {
 
     use super::{
         Arrivals, Baselines, Criterion, Declaration, Derive, Direction, Eligibility, Engine,
-        ExperimentError, HostRecord, Invocation, Level, Metric, Op, Options, Phase, REPORT_HEADER,
-        Reading, Record, Repetition, Rule, Source, Status, Step, Validity, Verdict, Workload,
-        convert, regression, run,
+        ExperimentError, HostRecord, Invocation, Level, Metric, Mode, Op, Options, Phase,
+        REPORT_HEADER, Reading, Record, Repetition, Rule, Source, Status, Step, Validity, Verdict,
+        Workload, convert, regression, run,
     };
     use crate::capacity::{Histogram, Population, UNLABELLED};
     use crate::release_server::HostLoad;
@@ -3262,6 +3402,8 @@ mod tests {
                 fingerprint: "test cpu, 32 CPU / 16 GiB, linux".to_owned(),
             },
             refusals: Vec::new(),
+            mode: Mode::Full,
+            prepass: None,
         }
     }
 
@@ -3312,8 +3454,8 @@ mod tests {
         /// Real time the first measurement blocks, so an external profiler
         /// started just before it is running when the paused clock races on.
         settle: Option<Duration>,
-        /// What the smoke finds missing, when set.
-        smoke: Option<String>,
+        /// Why preparation fails, when set.
+        unprepared: Option<String>,
         /// A file whose presence finish notes as the drain begins.
         watch: Option<PathBuf>,
     }
@@ -3327,7 +3469,7 @@ mod tests {
                 stall: Duration::ZERO,
                 interrupt: None,
                 settle: None,
-                smoke: None,
+                unprepared: None,
                 watch: None,
             }
         }
@@ -3335,14 +3477,10 @@ mod tests {
 
     #[async_trait]
     impl Workload for Scripted {
-        async fn smoke(&mut self) -> Result<String, ExperimentError> {
-            self.smoke.take().map_or_else(
-                || Ok("scripted".to_owned()),
-                |missing| Err(ExperimentError::Workload(missing)),
-            )
-        }
-
         async fn prepare(&mut self) -> Result<(), ExperimentError> {
+            if let Some(missing) = self.unprepared.take() {
+                return Err(ExperimentError::Workload(missing));
+            }
             self.seen.lock().expect("seen").prepared = true;
             Ok(())
         }
@@ -3436,9 +3574,8 @@ mod tests {
     /// override, and an undeclared criterion metric each refuse the run as
     /// INVALID with no workload call; a dirty override stores the digest and
     /// still runs every other check; criteria the record keeps are the
-    /// sealed ones whatever the workload measured; a failed smoke is
-    /// INVALID with its named missing evidence and admits no preparation or
-    /// step.
+    /// sealed ones whatever the workload measured; a failed preparation is
+    /// INVALID with its named missing evidence and admits no step.
     ///
     /// # Panics
     ///
@@ -3547,7 +3684,7 @@ mod tests {
         assert_eq!(validity(&record), ["host.busy"]);
 
         let mut workload = Scripted::always(&good());
-        workload.smoke = Some("bifrost: no `bifrost.query` timing observation".to_owned());
+        workload.unprepared = Some("bifrost: the span fixture loaded short".to_owned());
         let record = execute(
             declaration(),
             &mut workload,
@@ -3557,11 +3694,11 @@ mod tests {
         .await;
         let seen = workload.seen.lock().expect("seen");
         assert_eq!(record.verdict, Verdict::Invalid);
-        assert_eq!(validity(&record), ["smoke.failed"]);
-        assert!(record.reasons[0].message.contains("`bifrost.query`"));
+        assert_eq!(validity(&record), ["workload.failed"]);
+        assert!(record.reasons[0].message.contains("loaded short"));
         assert!(
             !seen.prepared && seen.calls.is_empty() && seen.finished,
-            "a failed smoke admits no preparation or step, and still stops what it started"
+            "a failed preparation admits no step, and still stops what it started"
         );
     }
 

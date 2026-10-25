@@ -1,19 +1,20 @@
 //! The level commands every engine shares: `l1 <engine>`, the sequential
-//! `l1` aggregate, `l2 <engine>`, `smoke [l1|l2 <engine>]`, and
-//! `report <record.json>`.
+//! `l1` aggregate, `l2 <engine>`, and `report <record.json>`.
 //!
 //! An engine contributes only a [`Plan`]: its declaration (question, sweep,
 //! controls, metrics, criteria, steps) and the [`Workload`] that drives its
 //! production calls. This module fills the declaration's source, build, host,
-//! and invocation, applies `--steps`, `--allow-dirty`, and `--profile`, runs
+//! and invocation, applies `--steps`, `--allow-dirty`, `--profile`, and
+//! `--smoke`, runs a full plan's smoke prepass ([`prepass`]), runs
 //! [`wyrd_testing::experiment::run`], publishes the record under
-//! `benchmarks/<engine>/<experiment>/`, prints the report, and returns the
-//! verdict's exit code.
+//! `benchmarks/<engine>/<experiment>/` (a smoke's under
+//! [`SMOKE_DIRECTORY`]), prints the report, and returns the verdict's exit
+//! code.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::Instant;
 
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -21,8 +22,8 @@ use wyrd_testing::capacity::{
     binary_identity, release_binary, timer_resolution_ns, timing_declaration,
 };
 use wyrd_testing::experiment::{
-    Declaration, Engine, HostRecord, Invocation, Level, Options, Record, Source, Validity, Verdict,
-    Workload, run,
+    Declaration, Engine, HostRecord, Invocation, Level, Mode, Options, Prepass, Record,
+    SMOKE_DIRECTORY, Source, Validity, Verdict, Workload, run,
 };
 use wyrd_testing::profile::SAMPLY;
 use wyrd_testing::release_server::{Host, HostLoad};
@@ -30,7 +31,7 @@ use wyrd_testing::release_server::{Host, HostLoad};
 use crate::flags;
 
 /// Switches every level command accepts.
-pub const SWITCHES: [&str; 2] = ["--profile", "--allow-dirty"];
+pub const SWITCHES: [&str; 3] = ["--profile", "--allow-dirty", "--smoke"];
 
 /// Valued flags every level command accepts.
 pub const VALUED: [&str; 1] = ["--steps"];
@@ -62,6 +63,25 @@ impl Context<'_> {
         let valued: Vec<&str> = VALUED.iter().chain(valued).copied().collect();
         let switches: Vec<&str> = SWITCHES.iter().chain(switches).copied().collect();
         flags::known(self.arguments, &valued, &switches)
+    }
+
+    /// Whether `--smoke` asks for the plan's reduced functional smoke, so
+    /// the engine declares its smoke-scale fixture.
+    #[must_use]
+    pub fn smoke(&self) -> bool {
+        self.arguments.iter().any(|argument| argument == "--smoke")
+    }
+
+    /// Where `engine`'s `experiment` keeps its server logs and artifacts:
+    /// under `target/benchmarks/`, or [`SMOKE_DIRECTORY`] for a smoke.
+    #[must_use]
+    pub fn output(&self, engine: Engine, experiment: &str) -> PathBuf {
+        let history = if self.smoke() {
+            SMOKE_DIRECTORY
+        } else {
+            "target/benchmarks"
+        };
+        self.root.join(history).join(engine.name()).join(experiment)
     }
 }
 
@@ -157,6 +177,8 @@ pub fn assemble(
         command: Invocation::new(&command, config),
         host,
         refusals: Vec::new(),
+        mode: Mode::Full,
+        prepass: None,
     }
 }
 
@@ -179,6 +201,49 @@ pub fn select(declaration: &mut Declaration, arguments: &[String]) -> Result<(),
     Ok(())
 }
 
+/// Turns `declaration` into its smoke: [`Mode::Smoke`] with the level's
+/// [`Level::smoke_timing`]. The engine already declared its smoke-scale
+/// fixture from [`Context::smoke`]; every step, phase, and check stays.
+pub fn smoke(declaration: &mut Declaration) {
+    declaration.mode = Mode::Smoke;
+    declaration.timing = declaration.level.smoke_timing();
+}
+
+/// Runs the smoke of `declaration`'s exact command (`arguments`, program
+/// name first, without the level and engine) as a child under its own fresh
+/// Postgres, server, and storage ([`spawn`]), outside the full run's clock,
+/// and records it. `--profile` is not forwarded; `--smoke` makes the child
+/// a smoke, so it never runs a prepass of its own.
+pub fn prepass(root: &Path, declaration: &Declaration, arguments: &[String]) -> Prepass {
+    let mut command = vec![
+        format!("l{}", u8::from(declaration.level)),
+        declaration.engine.name().to_owned(),
+    ];
+    command.extend(
+        arguments
+            .iter()
+            .skip(1)
+            .filter(|argument| *argument != "--profile")
+            .cloned(),
+    );
+    command.push("--smoke".to_owned());
+    let started = Instant::now();
+    let named: Vec<&str> = command.iter().map(String::as_str).collect();
+    let exit_code = spawn(root, &named, &[]);
+    Prepass {
+        command,
+        budget_seconds: declaration.level.smoke_timing().budget_seconds,
+        elapsed_seconds: started.elapsed().as_secs_f64(),
+        exit_code,
+        records: root
+            .join(SMOKE_DIRECTORY)
+            .join(declaration.engine.name())
+            .join(&declaration.experiment)
+            .display()
+            .to_string(),
+    }
+}
+
 /// Runs a plan: seals its declaration, samples the host, runs the workload
 /// under the shared lifecycle, publishes the record, prints the report, and
 /// returns the verdict's exit code. A record that cannot be published exits
@@ -188,8 +253,12 @@ pub async fn execute(plan: Plan, root: &Path, profile: bool) -> u8 {
         declaration,
         mut workload,
     } = plan;
+    let history = match declaration.mode {
+        Mode::Full => "target/benchmarks",
+        Mode::Smoke => SMOKE_DIRECTORY,
+    };
     let artifacts = root
-        .join("target/benchmarks")
+        .join(history)
         .join(declaration.engine.name())
         .join(&declaration.experiment)
         .join(chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
@@ -296,47 +365,6 @@ pub fn spawn(root: &Path, command: &[&str], forwarded: &[String]) -> u8 {
             Verdict::Invalid.exit_code()
         }
     }
-}
-
-/// How long a standalone smoke may take before it is a failure.
-const SMOKE_BUDGET: Duration = Duration::from_secs(120);
-
-/// Runs only a plan's release smoke ([`Workload::smoke`]) within
-/// [`SMOKE_BUDGET`], then stops its servers. Nothing is recorded or
-/// published; diagnostics stay under `target/benchmarks/`. Exits 0 when
-/// every boundary, component, resource, and counter was observed, and 2
-/// with the engine's missing evidence otherwise.
-pub async fn smoke(plan: Plan) -> u8 {
-    let Plan {
-        declaration,
-        mut workload,
-    } = plan;
-    let label = format!(
-        "smoke l{} {}",
-        u8::from(declaration.level),
-        declaration.engine.name()
-    );
-    let smoked = tokio::time::timeout(SMOKE_BUDGET, workload.smoke()).await;
-    let finished = workload.finish().await;
-    let code = match smoked {
-        Ok(Ok(proved)) => {
-            println!("{label}: PASS: {proved}");
-            0
-        }
-        Ok(Err(error)) => {
-            eprintln!("{label}: INVALID: {error}");
-            Verdict::Invalid.exit_code()
-        }
-        Err(_) => {
-            eprintln!("{label}: INVALID: the smoke overran {SMOKE_BUDGET:?}");
-            Verdict::Invalid.exit_code()
-        }
-    };
-    if let Err(error) = finished {
-        eprintln!("{label}: INVALID: the servers did not stop: {error}");
-        return Verdict::Invalid.exit_code();
-    }
-    code
 }
 
 /// Reads a persisted record and prints its report.

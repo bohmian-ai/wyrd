@@ -194,11 +194,7 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
     };
     context.known(valued, &[])?;
     let declaration = declare(context.level, context.arguments, base, context.root)?;
-    let logs = context
-        .root
-        .join("target/benchmarks")
-        .join(Engine::Verification.name())
-        .join(&declaration.experiment);
+    let logs = context.output(Engine::Verification, &declaration.experiment);
     Ok(Plan {
         declaration,
         workload: Box::new(run::Bench::new(context.level, logs)),
@@ -597,7 +593,7 @@ mod tests {
     use std::time::Duration;
 
     use wyrd_testing::experiment::{
-        Declaration, Engine, HostRecord, Invocation, Level, Rule, Source, Validity,
+        Declaration, Engine, HostRecord, Invocation, Level, Mode, Rule, Source, Validity,
     };
 
     use super::{COMPETING, OVERHEAD_LIMIT_MS, STAGES, Schedule, declare};
@@ -631,6 +627,8 @@ mod tests {
                 fingerprint: "test".to_owned(),
             },
             refusals: Vec::new(),
+            mode: Mode::Full,
+            prepass: None,
         }
     }
 

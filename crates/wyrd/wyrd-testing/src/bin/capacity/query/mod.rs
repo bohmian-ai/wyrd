@@ -30,16 +30,14 @@ mod workload;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use wyrd_client::config::ClientConfig;
-use wyrd_client::transport::trace::with_benchmark_labels;
-use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
-use wyrd_testing::capacity::{Expected, Population, SMOKE, Selection, Smoke, Window};
+use wyrd_client::{GlobalConfig, WyrdClient};
 use wyrd_testing::experiment::{
-    Baselines, Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reason,
+    Baselines, Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Mode, Op, Reason,
     Record, Status, Step, Verdict,
 };
 use wyrd_testing::release_server::{LocalServer, SERVER_URL};
@@ -56,8 +54,49 @@ pub const PAIR: [u64; 2] = [1, 64];
 /// The one-client step of a read measured only unloaded.
 const ONE: [u64; 1] = [1];
 
-/// Spans the `hot` and `parquet` read fixtures load through OTLP.
-pub const SPAN_FIXTURE_ROWS: i64 = 1_000_000;
+/// The fixture sizes a Bifrost plan loads: the declared full sizes, or a
+/// smoke's smaller sizes of the same shape, which still write every path
+/// and table, publish, scan, and settle as the full run does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Scale {
+    /// Rows of the standard events fixture the read experiments load.
+    pub standard: i64,
+    /// Rows of the L2 heavy events fixture.
+    pub heavy: i64,
+    /// Spans the `hot` and `parquet` read fixtures load through OTLP.
+    pub spans: i64,
+    /// Rows `parquet` loads into each native and logs storage sample.
+    pub storage: i64,
+}
+
+impl Scale {
+    /// The full experiment's fixtures.
+    pub const FULL: Self = Self {
+        standard: workload::STANDARD_ROWS,
+        heavy: workload::HEAVY_ROWS,
+        spans: 1_000_000,
+        storage: 200_000,
+    };
+
+    /// A smoke's fixtures: many ingest requests and aggregate variants each,
+    /// so loading, publication, and pruning keep their shape.
+    pub const SMOKE: Self = Self {
+        standard: 640_000,
+        heavy: 1_280_000,
+        spans: 64_000,
+        storage: 32_768,
+    };
+
+    /// [`Self::SMOKE`] for a smoke, [`Self::FULL`] otherwise.
+    #[must_use]
+    pub const fn of(smoke: bool) -> Self {
+        if smoke { Self::SMOKE } else { Self::FULL }
+    }
+}
+
+/// The fixed open-loop ingest rate a Bifrost L2 smoke declares, rows per
+/// second, in place of a calibration a smoke must never take or give.
+const SMOKE_INGEST_ROWS_PER_S: f64 = 20_000.0;
 
 /// Rows the L1 native and OTLP write fixtures spread over their day; a
 /// window's rows continue past it, so every repetition writes fresh rows.
@@ -337,15 +376,17 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
         ..*context
     }
     .known(valued, &[])?;
-    let declaration = declare(experiment, &flags, base, context.root)?;
-    let logs = context
-        .root
-        .join("target/benchmarks")
-        .join(Engine::Bifrost.name())
-        .join(&declaration.experiment);
+    let mut declaration = declare(experiment, &flags, base, context.root)?;
+    let logs = context.output(Engine::Bifrost, &declaration.experiment);
+    let scale = Scale::of(context.smoke());
+    if context.smoke()
+        && let Some(Value::Object(fixture)) = declaration.controls.get_mut("fixture")
+    {
+        fixture.insert("smoke_rows".to_owned(), json!(scale));
+    }
     let workload: Box<dyn wyrd_testing::experiment::Workload> = match experiment {
-        Some(experiment) => Box::new(isolated::Isolated::new(logs, experiment)),
-        None => Box::new(competing::Competing::new(logs)),
+        Some(experiment) => Box::new(isolated::Isolated::new(logs, experiment, scale)),
+        None => Box::new(competing::Competing::new(logs, scale)),
     };
     Ok(Plan {
         declaration,
@@ -354,12 +395,14 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
 }
 
 /// The Bifrost declaration over `base`: the L1 `experiment`, or L2 when
-/// `None`, reading `--server-cores` from `arguments` (program name first),
+/// `None`, reading `--server-cores` and `--smoke` from `arguments` (program
+/// name first),
 /// the baselines under `root`, and, at L2, the L1 records under
 /// `root/benchmarks/bifrost/writes/`. Pure otherwise: it starts nothing.
 ///
 /// A missing or unusable calibration is a declaration refusal
-/// (`calibration.missing`), never a substituted rate.
+/// (`calibration.missing`), never a substituted rate; a smoke declares
+/// [`SMOKE_INGEST_ROWS_PER_S`] and reads no calibration.
 ///
 /// # Errors
 ///
@@ -375,7 +418,12 @@ pub fn declare(
         l1_declaration(experiment, base, baselines.as_ref().ok())
     } else {
         let cores = server_cores(arguments)?;
-        competing_declaration(base, cores, &l1_records(root))
+        let records = if arguments.iter().any(|argument| argument == "--smoke") {
+            None
+        } else {
+            Some(l1_records(root))
+        };
+        competing_declaration(base, cores, records.as_deref())
     };
     let note = match &baselines {
         Ok(baselines) => format!("{} entries loaded", baselines.baseline.len()),
@@ -437,11 +485,11 @@ fn write_fixture() -> Value {
 }
 
 /// The fixture control of a read experiment: the events fixture and the
-/// spans loaded after the release smoke, as the `tier` holds them.
+/// spans loaded before it, as the `tier` holds them.
 fn read_fixture(tier: &str) -> Value {
     json!({
         "read": format!("standard-10m-{tier}: 10,000,000 events rows in vala.datasets.events, loaded before any read step"),
-        "spans": format!("spans-1m-{tier}: {SPAN_FIXTURE_ROWS} spans of the spans-2m generator into vala.traces.spans after the smoke's, loaded before any read step"),
+        "spans": format!("spans-1m-{tier}: {} spans of the spans-2m generator into vala.traces.spans, loaded before any read step", Scale::FULL.spans),
     })
 }
 
@@ -948,8 +996,9 @@ impl Calibration {
 /// The calibration the newest compatible valid L1 record gives `base`: a
 /// Bifrost level-1 `isolated` record from the same host fingerprint and
 /// build profile, flags, and compiler, with the current L1 fixture and
-/// limits controls, no validity reason, and a measured non-INVALID sweep step
-/// of every write path. Each path's rate is the highest median
+/// limits controls, no validity reason, full (never smoke) mode wherever
+/// the record now lives, and a measured non-INVALID sweep step of every
+/// write path. Each path's rate is the highest median
 /// `rows_per_cpu_s` over its sweep.
 ///
 /// # Errors
@@ -973,6 +1022,7 @@ pub fn calibrate(
                 && record.controls.values.get("fixture") == Some(&write_fixture())
                 && record.controls.values.get("limits") == Some(&limits(&PARQUET_ENV))
                 && record.validity.reasons.is_empty()
+                && record.mode == Mode::Full
         })
         .collect();
     compatible.sort_by_key(|record| std::cmp::Reverse(record.started_at));
@@ -1134,17 +1184,23 @@ fn phase_metrics(phase: &str, step: &[String]) -> (Vec<Metric>, Vec<Criterion>) 
 }
 
 /// The L2 `competing` declaration at `cores` declared server cores, its
-/// ingest rate calibrated from the newest compatible record in `records`.
-fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) -> Declaration {
+/// ingest rate calibrated from the newest compatible record in `records`,
+/// or a smoke's [`SMOKE_INGEST_ROWS_PER_S`] when `records` is `None`.
+fn competing_declaration(
+    mut base: Declaration,
+    cores: f64,
+    records: Option<&[Record]>,
+) -> Declaration {
     let step = vec![COMPETING.to_owned()];
     COMPETING.clone_into(&mut base.experiment);
     base.question = String::from(
         "With 100M events rows published as Parquet and Forge compaction on, does open-loop mixed ingest at 70% of calibrated capacity beside mixed queries offered open loop at 12/s with at most 32 in flight keep point p99 under 5 ms, dashboard p95 under 100/300 ms, heavy scan p95 under 2 s, server write acknowledgements p99 within 100 ms, with every answer exact, every client-queue row durable exactly once, a bounded backlog, a declared queue-full refusal only under overload, and the SLOs restored within 30 s after it?",
     );
-    let calibration = calibrate(records, &base);
+    let calibration = records.map(|records| calibrate(records, &base));
     let rate = match &calibration {
-        Ok(calibration) => calibration.initial_rate(cores),
-        Err(message) => {
+        None => SMOKE_INGEST_ROWS_PER_S,
+        Some(Ok(calibration)) => calibration.initial_rate(cores),
+        Some(Err(message)) => {
             base.refusals
                 .push(Reason::new("calibration.missing", message.clone()));
             0.0
@@ -1157,14 +1213,15 @@ fn competing_declaration(mut base: Declaration, cores: f64, records: &[Record]) 
     base.controls.insert(
         "calibration".to_owned(),
         match &calibration {
-            Ok(calibration) => json!({
+            None => json!({ "smoke": "a fixed declared rate; a smoke neither takes nor gives a calibration" }),
+            Some(Ok(calibration)) => json!({
                 "record": calibration.record,
                 "commit": calibration.commit,
                 "rows_per_cpu_s": { "spans": calibration.rows_per_cpu_s[0], "logs": calibration.rows_per_cpu_s[1], "native": calibration.rows_per_cpu_s[2] },
                 "mixed_rows_per_cpu_s": calibration.mixed_capacity(),
                 "headroom": HEADROOM,
             }),
-            Err(message) => json!({ "missing": message }),
+            Some(Err(message)) => json!({ "missing": message }),
         },
     );
     base.controls
@@ -1315,16 +1372,6 @@ async fn start(settings: &[(&str, &str)]) -> Result<LocalServer> {
 /// One write path's sender and the cursor every later window continues.
 pub type Lane = (WriteOp, run::Sender, Arc<AtomicI64>);
 
-/// Requests the release smoke sends through each write path.
-const SMOKE_WRITES: i64 = 2;
-
-/// Queries the release smoke may send before the smoked native rows answer
-/// exactly, [`SMOKE_POLL`] apart.
-const SMOKE_QUERIES: u64 = 50;
-
-/// How long the release smoke waits between unanswered queries.
-const SMOKE_POLL: Duration = Duration::from_millis(100);
-
 /// Every write path of `ops`, in that order, over the public `client`, each
 /// cursor at zero.
 ///
@@ -1363,98 +1410,6 @@ async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
         lanes.push((*op, sender, Arc::new(AtomicI64::new(0))));
     }
     Ok(lanes)
-}
-
-/// The Bifrost release smoke over the started `server`: [`SMOKE_WRITES`]
-/// requests through every lane, advancing its cursor so later windows write
-/// fresh identities, then exact `count(*)` queries over the smoked native
-/// rows until one answers, all inside one window and without waiting for
-/// publication. Every request carries its case and the `smoke` phase and
-/// must land in the server's histograms as exactly one successful timing
-/// in that cohort at its boundary, with positive server CPU
-/// and inserted memtable bytes.
-///
-/// # Errors
-///
-/// Returns the scrape failure, or the [`Smoke`] message naming every missing
-/// piece of evidence.
-async fn smoke(
-    server: &LocalServer,
-    client: &WyrdClient,
-    lanes: &[Lane],
-) -> std::result::Result<String, String> {
-    let mut smoke = Smoke::new("bifrost");
-    let timings = server.timings().await.map_err(|error| error.to_string())?;
-    let (window, before) = Window::open(server, Selection::RESOURCES)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut expected = Vec::new();
-    let mut native_rows = 0;
-    for (op, sender, cursor) in lanes {
-        let chunk = sender.request_rows();
-        for _ in 0..SMOKE_WRITES {
-            let first = cursor.fetch_add(chunk, Ordering::Relaxed);
-            match with_benchmark_labels(op.name(), SMOKE, sender.send(first, first + chunk)).await {
-                Ok(wire) if *op != WriteOp::Native => {
-                    smoke.positive(&format!("{} wire bytes", op.name()), wire as f64);
-                }
-                Ok(_) => native_rows += chunk,
-                Err(code) => {
-                    smoke.missing(format!("a `{}` write was refused with `{code}`", op.name()));
-                }
-            }
-        }
-        expected.push(Expected {
-            boundary: op.boundary(),
-            outcome: isolated::SUCCESS,
-            case: op.name(),
-            phase: SMOKE,
-            count: SMOKE_WRITES.cast_unsigned(),
-        });
-    }
-    let queries = Bifrost::query_only(client);
-    let sql = format!("SELECT count(*) FROM {}", workload::INGEST_TABLE);
-    let mut asked = 0;
-    let mut answered = false;
-    while !answered && asked < SMOKE_QUERIES {
-        asked += 1;
-        answered = with_benchmark_labels(
-            "probe",
-            SMOKE,
-            run::ask(&queries, sql.clone(), &vec![vec![native_rows]]),
-        )
-        .await
-        .is_ok();
-        if !answered {
-            tokio::time::sleep(SMOKE_POLL).await;
-        }
-    }
-    if !answered {
-        smoke.missing(format!(
-            "none of {asked} `count(*)` queries answered the {native_rows} acknowledged native rows exactly"
-        ));
-    }
-    expected.push(Expected {
-        boundary: "bifrost.query",
-        outcome: isolated::SUCCESS,
-        case: "probe",
-        phase: SMOKE,
-        count: asked,
-    });
-    let (usage, after) = window
-        .close(server)
-        .await
-        .map_err(|error| error.to_string())?;
-    smoke.usage(&usage);
-    let delta = |family: &str| after.sum(family, &[]) - before.sum(family, &[]);
-    smoke.positive(isolated::INSERTED, delta(isolated::INSERTED));
-    let population = Population::smoke(server, &timings, &expected).await;
-    let boundaries: Vec<(&str, &str, bool)> = expected
-        .iter()
-        .map(|cohort| (cohort.boundary, cohort.outcome, false))
-        .collect();
-    smoke.timings(&population, &boundaries);
-    smoke.finish()
 }
 
 /// Where Scribe holds rows, from one `/metrics` scrape and the store.

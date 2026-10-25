@@ -83,20 +83,6 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    /// The standard 10-million-row fixture.
-    #[must_use]
-    pub const fn standard() -> Self {
-        Self {
-            rows: STANDARD_ROWS,
-        }
-    }
-
-    /// The 100-million-row heavy fixture.
-    #[must_use]
-    pub const fn heavy() -> Self {
-        Self { rows: HEAVY_ROWS }
-    }
-
     /// `event_time` of row `id`: the rows spread evenly over one day.
     #[must_use]
     pub const fn event_time(self, id: i64) -> i64 {
@@ -290,11 +276,12 @@ impl Case {
         }
     }
 
-    /// The `event_id` range an aggregate groups for `sequence`.
-    const fn range(self, fixture: Fixture, sequence: u64) -> (i64, i64) {
+    /// The `event_id` range an aggregate groups for `sequence`: its
+    /// declared rows, or one variant's share of a smaller (smoke) fixture.
+    fn range(self, fixture: Fixture, sequence: u64) -> (i64, i64) {
         let (rows, variants) = match self {
-            Self::SmallAggregate => (SMALL_ROWS, 64),
-            Self::MillionAggregate => (MILLION_ROWS, 8),
+            Self::SmallAggregate => (SMALL_ROWS.min(fixture.rows / 64), 64),
+            Self::MillionAggregate => (MILLION_ROWS.min(fixture.rows / 8), 8),
             _ => return (0, fixture.rows),
         };
         let first = (sequence % variants).cast_signed() * (fixture.rows / variants.cast_signed());
@@ -324,11 +311,18 @@ mod tests {
         let fixture = Fixture {
             rows: 64 * 1_000_000,
         };
-        let batch = Fixture::standard().batch(0, 3).expect("fixture rows");
+        let batch = Fixture {
+            rows: STANDARD_ROWS,
+        }
+        .batch(0, 3)
+        .expect("fixture rows");
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.schema(), schema());
         assert_eq!(
-            Fixture::standard().event_time(STANDARD_ROWS / 2),
+            Fixture {
+                rows: STANDARD_ROWS
+            }
+            .event_time(STANDARD_ROWS / 2),
             DAY_START_MS + 12 * HOUR_MS
         );
         assert!((16..=64).contains(&payload_len(7)));

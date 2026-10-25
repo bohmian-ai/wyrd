@@ -37,9 +37,6 @@ use wyrd_telemetry::timing::{
 use crate::experiment::{Reading, Reconciled, Repetition, TimingEvidence};
 use crate::release_server::{LocalServer, Metrics, PeakSampler};
 
-/// The benchmark phase every release smoke's requests declare.
-pub const SMOKE: &str = "smoke";
-
 /// Error type of the capacity helpers, matching the benchmark binaries.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -556,14 +553,6 @@ pub const QUERY_BOUNDARY: &str = "bifrost.query";
 /// around the response handoff, so the wait covers only that race.
 const COLLECTION_WAIT: Duration = Duration::from_secs(30);
 
-/// How long a smoke's handful of timing observations may take to land, so
-/// missing evidence fails promptly.
-const SMOKE_WAIT: Duration = Duration::from_secs(3);
-
-/// The least time a smoke keeps sending, so its server CPU outgrows the
-/// process counters' tick resolution.
-pub const SMOKE_WINDOW: Duration = Duration::from_secs(1);
-
 /// The timing method a record declares: the server's bounded histograms,
 /// read as cumulative snapshots from the loopback metrics listener and
 /// differenced per window.
@@ -633,16 +622,6 @@ impl Population {
         expected: &[Expected<'_>],
     ) -> Self {
         Self::wait(server, before, expected, COLLECTION_WAIT).await
-    }
-
-    /// [`Self::collect`] for a smoke's exact requests, waiting at most
-    /// [`SMOKE_WAIT`].
-    pub async fn smoke(
-        server: &LocalServer,
-        before: &TimingSnapshot,
-        expected: &[Expected<'_>],
-    ) -> Self {
-        Self::wait(server, before, expected, SMOKE_WAIT).await
     }
 
     /// Polls `server`'s snapshot until the counts are reached or `wait`
@@ -1007,111 +986,6 @@ fn merged<'a>(mut parts: impl Iterator<Item = Option<&'a Distribution>>) -> Opti
     Some(total)
 }
 
-/// What one engine's release smoke proved and found missing, judged from
-/// the same windows, snapshots, and counters the experiment reads.
-#[derive(Debug)]
-pub struct Smoke {
-    /// The engine smoked.
-    engine: &'static str,
-    /// Each proved fact, for the success line.
-    proved: Vec<String>,
-    /// Each missing or malformed piece of evidence.
-    missing: Vec<String>,
-}
-
-impl Smoke {
-    /// An empty smoke of `engine`.
-    #[must_use]
-    pub const fn new(engine: &'static str) -> Self {
-        Self {
-            engine,
-            proved: Vec::new(),
-            missing: Vec::new(),
-        }
-    }
-
-    /// Requires `usage` to carry positive server CPU-seconds and readable
-    /// driver CPU, and this host to report its available logical CPUs.
-    pub fn usage(&mut self, usage: &Usage) {
-        match usage.server_cpu_seconds {
-            Some(cpu) if cpu > 0.0 => self.proved.push(format!("server CPU {cpu:.3}s")),
-            Some(_) => self.missing.push("server CPU-seconds were zero".to_owned()),
-            None => self
-                .missing
-                .push("server CPU-seconds are unavailable".to_owned()),
-        }
-        if usage.driver_cpu_seconds.is_none() {
-            self.missing
-                .push("driver CPU-seconds are unavailable".to_owned());
-        }
-        match std::thread::available_parallelism() {
-            Ok(cpus) => self.proved.push(format!("{cpus} logical CPUs")),
-            Err(_) => self
-                .missing
-                .push("provisioned logical CPUs are unavailable".to_owned()),
-        }
-    }
-
-    /// Requires `population` to be complete and each `(boundary, outcome,
-    /// component)` to have a histogram observation with `outcome`, and, when
-    /// `component`, an excluded and residual distribution of every one.
-    pub fn timings(&mut self, population: &Population, boundaries: &[(&str, &str, bool)]) {
-        self.missing.extend(population.invalid.iter().cloned());
-        for (boundary, outcome, component) in boundaries {
-            let Some(elapsed) = population.elapsed(boundary, outcome) else {
-                self.missing.push(format!(
-                    "no `{boundary}` timing observation has outcome `{outcome}`"
-                ));
-                continue;
-            };
-            if *component {
-                match population.residuals(boundary, outcome) {
-                    Ok(residual) if residual.len() == elapsed.len() => {}
-                    Ok(_) => self
-                        .missing
-                        .push(format!("a `{boundary}` timing observation has no residual")),
-                    Err(reason) => self.missing.push(reason),
-                }
-            }
-            self.proved
-                .push(format!("{} `{boundary}` timings", elapsed.len()));
-        }
-    }
-
-    /// Requires the counter or work reading `name` to be positive.
-    pub fn positive(&mut self, name: &str, value: f64) {
-        if value > 0.0 {
-            self.proved.push(format!("{name} {value}"));
-        } else {
-            self.missing
-                .push(format!("{name} was {value}, not positive"));
-        }
-    }
-
-    /// Records `evidence` as missing, such as a refused smoke request.
-    pub fn missing(&mut self, evidence: String) {
-        self.missing.push(evidence);
-    }
-
-    /// The proved line, or every missing piece of evidence.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message naming the engine and each missing or malformed
-    /// boundary, component, resource reading, or counter.
-    pub fn finish(self) -> Result<String, String> {
-        if self.missing.is_empty() {
-            Ok(format!("{}: {}", self.engine, self.proved.join(", ")))
-        } else {
-            Err(format!(
-                "{} measurement is broken: {}",
-                self.engine,
-                self.missing.join("; ")
-            ))
-        }
-    }
-}
-
 /// The smallest nonzero step this host's monotonic clock shows between two
 /// successive reads, nanoseconds: its effective timer resolution, which
 /// the server's timers share on this host.
@@ -1182,8 +1056,7 @@ pub fn install_tracing() {
 mod tests {
     use super::{
         Distribution, Expected, IntervalScan, IntervalSeries, Percentiles, Population, Readings,
-        Selection, Smoke, Telemetry, TimingInterval, UNLABELLED, Usage, deltas, elapsed,
-        until_stop,
+        Selection, TimingInterval, UNLABELLED, deltas, elapsed, until_stop,
     };
     use crate::release_server::Metrics;
 
@@ -1470,82 +1343,6 @@ mod tests {
             broken.scanned_per_query("success")[0].value,
             None,
             "a query without its scan fact is missing, never zero"
-        );
-    }
-
-    /// A smoke passes only on complete evidence and otherwise names its
-    /// engine and every missing boundary, component, resource, and counter.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a complete smoke fails or a broken one omits a piece.
-    #[test]
-    fn smoke_names_every_missing_piece() {
-        let timing = |boundary: &str, excluded: Option<u64>| {
-            let durations =
-                |samples: &[u64]| Distribution::of_durations(samples).expect("in-range samples");
-            IntervalSeries {
-                boundary: boundary.to_owned(),
-                outcome: "succeeded".to_owned(),
-                case: UNLABELLED.to_owned(),
-                phase: UNLABELLED.to_owned(),
-                count: 1,
-                elapsed: durations(&[10]),
-                excluded: excluded.map(|excluded| durations(&[excluded])),
-                residual: excluded.map(|excluded| durations(&[10 - excluded])),
-                missing_excluded: 0,
-                out_of_range: 0,
-                negative_residual: 0,
-            }
-        };
-        let usage = |server_cpu_seconds| Usage {
-            seconds: 1.0,
-            server_cpu_seconds,
-            peak_memory_bytes: None,
-            driver_cpu_seconds: Some(0.1),
-            drain_seconds: 0.0,
-            telemetry: Telemetry::default(),
-        };
-        let judged = [
-            ("gateway.buffered", "succeeded", true),
-            ("gateway.stream.end", "succeeded", true),
-        ];
-        let mut complete = Smoke::new("gateway");
-        complete.usage(&usage(Some(0.5)));
-        complete.positive("staged captures", 4.0);
-        complete.timings(
-            &Population {
-                series: vec![
-                    timing("gateway.buffered", Some(3)),
-                    timing("gateway.stream.end", Some(4)),
-                ],
-                ..Population::default()
-            },
-            &judged,
-        );
-        assert!(complete.finish().is_ok());
-
-        let mut broken = Smoke::new("gateway");
-        broken.usage(&usage(None));
-        broken.positive("staged captures", 0.0);
-        broken.timings(
-            &Population {
-                series: vec![timing("gateway.buffered", None)],
-                invalid: vec!["1 of 2 `gateway.buffered` timings arrived".to_owned()],
-                ..Population::default()
-            },
-            &judged,
-        );
-        assert_eq!(
-            broken.finish(),
-            Err(
-                "gateway measurement is broken: server CPU-seconds are unavailable; \
-                 staged captures was 0, not positive; 1 of 2 `gateway.buffered` timings \
-                 arrived; no `gateway.buffered` timing observation with outcome \
-                 `succeeded` has a residual; no `gateway.stream.end` timing observation has outcome \
-                 `succeeded`"
-                    .to_owned()
-            )
         );
     }
 }

@@ -32,11 +32,11 @@ pub mod run;
 pub mod workload;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Value, json};
 use wyrd_testing::experiment::{
-    Criterion, Declaration, Derive, Direction, Level, Metric, Op, Step,
+    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Step,
 };
 use wyrd_testing::release_server::LocalServer;
 
@@ -182,7 +182,9 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
     };
     context.known(valued, &[])?;
     let declaration = declare(context.level, context.arguments, base, context.root)?;
-    let log = server_log(context.root, &declaration.experiment);
+    let log = context
+        .output(Engine::Gateway, &declaration.experiment)
+        .join("server.log");
     let workload: Box<dyn wyrd_testing::experiment::Workload> = match context.level {
         Level::One => Box::new(run::Overhead::new(log)),
         Level::Two => Box::new(capacity::Capacity::new(log)),
@@ -777,13 +779,6 @@ fn capacity_metrics() -> Vec<Metric> {
     metrics
 }
 
-/// Where a run of `experiment` keeps the server log it stops with.
-fn server_log(root: &Path, experiment: &str) -> PathBuf {
-    root.join("target/benchmarks/gateway")
-        .join(experiment)
-        .join("server.log")
-}
-
 /// Server log lines that report an outbox item lost.
 const LOSS_MARKERS: [&str; 3] = ["was lost", "items unwritten", "write task failed"];
 
@@ -848,7 +843,7 @@ mod tests {
 
     use serde_json::{Value, json};
     use wyrd_testing::experiment::{
-        Declaration, Engine, HostRecord, Invocation, Level, Op, Rule, Source, Validity,
+        Declaration, Engine, HostRecord, Invocation, Level, Mode, Op, Rule, Source, Validity,
     };
     use wyrd_testing::release_server::Host;
 
@@ -888,6 +883,8 @@ mod tests {
             command: Invocation::new(&[], &[]),
             host: HostRecord::new(&host, "test"),
             refusals: Vec::new(),
+            mode: Mode::Full,
+            prepass: None,
         }
     }
 

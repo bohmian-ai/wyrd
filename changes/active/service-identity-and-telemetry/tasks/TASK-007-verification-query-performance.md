@@ -284,7 +284,11 @@ prod ×4 rounds, billing 2.0.0 staging ×1 (skew), checkout 1.0.0 prod ×1, all
 sharing both components; spans, logs, points, observations, inputs, results and
 features. Every filter equals the unfiltered ground truth filtered in Rust, on
 eight attributable tables, at each of three stages. Files and row groups
-scanned (there is one row group per file):
+scanned (there is one row group per file). This first exploration left gateway
+calls empty and had no partial declaration; remediation R1
+(`review/TASK-007-dabe0e7dd/TASK-007-R1-complete-performance-evidence.md`)
+supersedes it with populated gateway calls, the audit log as the ninth table,
+and full, partial and empty declarations:
 
 | Filter | Published, default Blooms | Live, Blooms cleared | Published, Blooms cleared |
 |---|---|---|---|
@@ -392,14 +396,13 @@ Shared-subject columns are recorded as low-selectivity under shared components.
 
 ### Limits
 
-- `bifrost.gateway.calls` has no rows: no cluster write path exists
-  (`CallCapture` is crate-private, and `GatewayCapture` runs a separate
-  server).
-- Writer memory and CPU are not exposed to the harness (the process window is
-  crate-private). The supplement's ~2 MiB-per-column bitset remains a
-  source-derived estimate.
-- The encoded-bytes comparison is not a clean A/B, because the cleared round
-  also carries audit traffic.
+- Writer CPU and memory are whole-process observations only (R1 records them
+  through `BifrostTelemetryDelta::resources`); no per-writer attribution
+  exists. The supplement's ~2 MiB-per-column bitset remains a source-derived
+  estimate.
+- The encoded-bytes comparison above is not a clean A/B, because the cleared
+  round also carries audit traffic; R1 records stored filter bytes per
+  declaration separately for the writer tables and the audit log.
 - `oracle_query_files_scanned_total` subtracts open-time statistics skips, so
   the custom lookup reports 2 or 3 files across runs while row groups (2),
   bytes (174) and rows (4) stay constant. The proof asserts on row groups.
@@ -411,8 +414,8 @@ Shared-subject columns are recorded as low-selectivity under shared components.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
-| REQ-026,049–053; AC-008,017,024: exact cross-signal populations for every filter shape, fallback without Blooms, physical scans | `verification_runtime.rs::{Explored, Filter, StoredBlooms}`; `VerificationFixture::release_with` | `verification_runtime::exploration_filters_keep_exact_populations` | PASS |
-| REQ-043; AC-017: comparable final-contract evidence for every path and dimension | inventory and tables above; `ScanEvidence::of` | the four proofs plus exploration, with work lines recorded | PASS |
+| REQ-026,049–053; AC-008,017,024: exact cross-signal populations for every filter shape, fallback without Blooms, physical scans | `verification_runtime.rs::{Explored, Filter, StoredBlooms}`; `VerificationFixture::release_with` | `verification_runtime::exploration_filters_keep_exact_populations` (nine tables, populated gateway, partial stage per R1) | PASS (see R1) |
+| REQ-043; AC-017: comparable final-contract evidence for every path and dimension | inventory and tables above; `ScanEvidence::of` with elapsed and process resources | R1's three-repetition base/candidate comparison and writer windows | PASS (see R1) |
 | REQ-026,040; AC-008,014: exact result, no substitution, pending absent, tenant/unknown not found | unchanged `read_result` | `verification_runtime::completed_result_lookup_preserves_evidence` | PASS |
 | Window population, boundaries, other subject/series, empty window unscored | unchanged `ObservationWindow` | `verification_runtime::window_lookup_preserves_population`; `verification::drift::tests::one_statement_decides_completeness_and_scores_from_one_cut` | PASS |
 | Group occurrences separate, ordered, one statement per group | unchanged `GroupPoller` | `verification_runtime::group_lookup_preserves_source_occurrences` | PASS |

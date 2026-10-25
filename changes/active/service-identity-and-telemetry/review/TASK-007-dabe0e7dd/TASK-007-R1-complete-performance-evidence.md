@@ -96,3 +96,128 @@ mise exec -- cargo nextest run --locked -p vala-verify --lib -E 'test(=blocks::e
 The complete-result proof already exercises actual trace collection; reuse its bounded work observation rather than creating another trace loader or runtime. Run exact narrow owner tests for any telemetry evidence output changed, plus format/lints and the boundary checks applicable to the actual Rust write set. Do not add a full gate, complete Oracle suite, all SDK journeys or capacity benchmark to this remediation. The existing production ordering regressions remain accepted unless executable query code changes; if it does, justify that scope and rerun its exact focused tests.
 
 A later fresh task review compares the remediation diff to dabe0e7dd, validates closure of these IDs and affected paths, and carries forward the accepted production behavior and existing proof. It must retain the original task/base as cumulative acceptance context.
+
+## Implementation Evidence
+
+Candidate commits: `bf94447d6` (measured reads keep elapsed time, the
+`oracle_query_duration_seconds` histogram and whole-process resources through
+the new read-only `BifrostTelemetryDelta::resources`), `276192423` (nine-table
+exploration with populated gateway calls, audit keys and a partial Bloom stage),
+`2654e3299` (task citations removed from journey rustdoc). No production code
+changed.
+
+### Measurement method
+
+- Same host (macOS arm64), debug test profile, warm build, default settings,
+  one `BifrostClusterSpec::one_mixed()` cluster per journey, one journey at a
+  time (`--test-threads=1`), three repetitions per side.
+- Candidate: `dabe0e7dd` production. Base: `76e095738` production. The only
+  production difference is `oracle/live.rs` and `oracle/analytical.rs`; for the
+  base side those two files were checked out from `76e095738` into the
+  candidate tree and restored afterwards. **Test-only adaptation:** both sides
+  ran the candidate harness (the R1 journeys and `ScanEvidence`).
+- Each cell is the median (min–max) of three repetitions. A row is the sum over
+  every statement of that path within one repetition. "Caller elapsed" is the
+  awaited future as its caller saw it; "query duration" is the
+  `oracle_query_duration_seconds` sum; planning, listing (Scribe discovery),
+  cut (read + materialization) and scan (`DataSourceExec.time_elapsed_processing`)
+  are `QueryProfile` stage nanoseconds.
+- **Limits of the figures:**
+  - Operator times are summed across partitions and can exceed wall time.
+  - Process CPU, Tokio busy time and RSS cover the whole test process: every
+    server role plus the journey. Their granularity is 10 ms of CPU, and RSS is
+    taken at the window's endpoints (no sampler). RSS grows throughout a
+    journey, so it is reported, not attributed.
+  - Per-page counts and decode-only time are not separated by the existing
+    profile.
+  - The single-node cluster has no follower, so no distributed fan-out was
+    measured.
+
+### Read paths, base vs candidate
+
+| Path (proof) | Statements | Files / row groups / bytes | Caller elapsed ms, base → candidate | Planning ms, base → candidate | Conclusion |
+|---|---|---|---|---|---|
+| Pending status (result) | 0 | 0 | — | — | no Oracle read either side |
+| Completed result, passed / failed (result) | 1 / 1 | 1 / 1 / ~1.2 KB, equal | 29.4 (25.4–32.8) → 27.4 (27.2–30.1); 19.4 (17.9–22.2) → 18.0 (17.5–22.7) | 4.6 → 4.8; 4.3 → 4.3 | no attributable change |
+| Trace collection, two executions (result) | 2 | 2 / 2 / 3460, equal | 115.4 (59.2–190.8) → 168.4 (116.9–172.5) | 28.7 (17.7–83.5) → 55.2 (17.8–76.9) | equal work; overlapping spread dominated by first-read cut materialization; no attributable change |
+| Trace attempt sharing (`trace_checks_share_one_attempt_read`) | unit | N/A | test 0.035 s → 0.035 s | N/A | unchanged |
+| Three drift windows (window) | 3 | 3 / 3 / ~1250, equal | 31 277 → 31 235 | 33.7 → 30.9 | elapsed is scheduler wait for the due pass; query duration 13.2 → 11.5 ms; no attributable change |
+| Four turns, two groups (group) | 2 | 0 (live) | 5079 → 5091 | 46.8 → 50.7 | elapsed is runtime orchestration; query duration 35.9 → 38.0 ms; no attributable change |
+| Custom SQL `ORDER BY id` (custom query) | 1 | 2–4 / 2 / 174, equal | 53.1 → 58.0 | 6.9 → 6.9 | **base returned `[[4],[1],[2],[6]]` in reps 1–2** (journey failed) and the right order by arrival luck in rep 3; not a successful-answer comparison; equal work, planning cost of the appended sanity check not separable from noise |
+| Results' ten Bloom columns (exploration) | 10 | 23 / 23 / ~16.2 KB, equal | 147.4 → 146.6 | 36.1 → 36.4 | no attributable change |
+| Exploration, 9 tables × 12 filters + audit keys + aggregate, per stage | 112 | full published 381 / 381 / ~249 KB, equal; partial 449; empty 517 | full 2164 → 2161; partial 2260 → 2227; empty 2291 → 2284 | full 676 → 689; partial 706 → 694; empty 692 → 712 (≈6.0–6.4 ms per statement) | no attributable change |
+| Inline JSON / digest inputs (group) | 0 | N/A (no warehouse read) | within group row | N/A | unchanged |
+| Storage artifacts (`pg_hosted_artifacts`) | N/A | N/A (no warehouse read) | test 6.90 / 6.89 / 6.77 s → 6.80 / 6.76 / 6.99 s; refusals 1.60 / 1.54 / 1.54 → 1.58 / 1.53 / 1.53 s | N/A | unchanged |
+
+The live and published exploration stages, and the live trace, window and group
+reads, give the same statement, file, row-group and byte counts on both sides
+(files vary by ±1–3 between runs through open-time statistics skips; row
+groups do not). The appended `SanityCheckPlan` traversal is not visible above
+run-to-run spread in planning time on any path.
+
+### Writer windows per Bloom declaration (exploration)
+
+One equal checkout round per stage: 2 subjects × 4 native frames, 2 gateway
+calls, 2 inputs, and 2 results. Medians of three candidate repetitions; base
+within spread.
+
+| Declaration | Ingest elapsed ms | Publish elapsed ms | Publish process CPU s | Upload bytes (all roles) | Stored filter bytes, eight writer tables | Stored filter bytes, audit log |
+|---|---|---|---|---|---|---|
+| Defaults (full) | 195.9 | 851.0 | 1.45 | 233 212 | 2 585 (8 filtered files) | 413 (1 file) |
+| Leading half of each default set | 213.8 | 760.8 | 1.06 | 268 517 | 1 269 (8 filtered files) | 507 (2 files) |
+| None | 210.3 | 656.2 | 0.57 | 265 244 | 0 (8 bare files) | 94 (1 filtered, 1 bare) |
+
+The writer tables' stored filter bytes follow the declaration exactly. Each
+publish window also writes the audit decisions that the preceding reads made:
+more audit files land in the later stages, so upload bytes are not a Bloom
+comparison. Publish CPU and elapsed fall with fewer declared filters, but the
+CPU is whole-process and also includes audit encoding. It is an association
+under equal writer workloads, not a measured per-writer Bloom cost. The
+audit log's bytes come from decisions retained under the previous declaration.
+
+### Exploration population
+
+- **Gateway:** each release's runtime account calls the public
+  `/v1/chat/completions` with a workload-rooted token, `wyrd-card-uid`, and
+  `x-wyrd-deployment-environment`, once per subject per round. Captured calls
+  are awaited before any read or publish.
+- **Answers:** all nine tables answer every filter exactly against their
+  unfiltered ground truth, under each of the three declarations, both live and
+  published.
+- **Positive populations:** each of the eight writer tables (gateway included)
+  answers all ten positive filters with rows. Exact release UID equals
+  name + version, and exact subject UID equals kind + name + version.
+- **Audit:** read up to a settled instant after `await_audit_retained`. It
+  answers the shared filters, including `service_name IS NULL`, against its
+  own truthful values, and its
+  `sub_principal_id`, `act_principal_id`, `wyrd_request_id` and `resource`
+  keys.
+- **Partial declaration:** keeps the leading half of each table's defaults
+  (for example spans `service_name, subject_name, workload_card_uid`; audit
+  `sub_principal_id, act_principal_id`). It is asserted nonempty and is a
+  strict subset.
+- **Fixture fix:** query JSON omits null columns. The exploration therefore
+  reads attribution and audit keys by column name (`Attributed::of`) instead
+  of by position, which had misread all-null audit rows as `{}`.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `bifrost::telemetry::tests::resources_render_elapsed_and_process_scope` (RED: method missing) | PASS |
+| `verification_runtime::{completed_result_lookup_preserves_evidence, window_lookup_preserves_population, group_lookup_preserves_source_occurrences, custom_query_preserves_evidence_and_limits, exploration_filters_keep_exact_populations}` ×3, candidate | PASS |
+| Same ×3 on base production | custom query FAIL ×2 on the ordering defect, others PASS |
+| `pg_hosted_artifacts::{artifact_evidence_and_code_reach_every_consumer, artifact_reads_refuse_before_use}` ×3 each side | PASS |
+| `blocks::engine::tests::trace_checks_share_one_attempt_read` ×3 each side | PASS |
+| `mise run fmt`, `mise run lints`, `mise run check:tenant-isolation`, `git diff --check` | PASS |
+
+`typed_builtin_payloads_are_queryable` was not changed and was not rerun.
+
+| Finding | Closure evidence | Result |
+|---|---|---|
+| FIND-TASK-007-1 | Three-repetition base/candidate record per path above, with elapsed, stage, work and spread. Scheduler and orchestration wait is separated from query duration. Inline and storage cells are N/A. The wrong base answer is labelled. Writer windows carry their whole-process and audit attribution. Remaining limits are listed. | PASS |
+| FIND-TASK-007-2 | Populated gateway positives and exact negatives. Audit has truthful null and key coverage. One proper-subset declaration sits between full and empty, with equal answers and retained work and filter bytes under each. | PASS |
+
+Non-goals stayed excluded: no cache, index, store, lookback, SLO, default,
+public contract, dependency, capture API, or profiler. Production code is
+unchanged in R1.

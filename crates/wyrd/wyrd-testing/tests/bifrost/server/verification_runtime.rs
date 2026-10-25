@@ -6827,3 +6827,176 @@ async fn exploration_filters_keep_exact_populations() -> Result<(), ServerJourne
     cluster.shutdown().await?;
     Ok(())
 }
+
+/// Run the production runtime on `server` until every one of `executions`
+/// settles, and return their rows in order.
+///
+/// # Errors
+/// Returns the runtime, fixture, or timeout error.
+async fn settle_all(
+    server: &WyrdTestServer,
+    seed: &VerificationFixture,
+    executions: &[ExecutionId],
+) -> Result<Vec<ExecutionRow>, ServerJourneyError> {
+    let runtime = VerificationRuntime::builder(server.state())
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let rows = loop {
+        let mut rows = Vec::with_capacity(executions.len());
+        for execution in executions {
+            rows.push(seed.execution(*execution).await?);
+        }
+        if rows
+            .iter()
+            .all(|row| !["pending", "running", "retrying"].contains(&row.status.as_str()))
+        {
+            break rows;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the executions never settled: {rows:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    Ok(rows)
+}
+
+/// A completed execution's status returns its own canonical result through
+/// one exact result read, whatever other results its tenant retains
+/// (Scenario 1 of TASK-007; REQ-026, REQ-040; AC-008, AC-014).
+///
+/// Results of the same tenant are published today, yesterday, and three
+/// days ago. Two queued trace executions of one Verifier and subject judge
+/// different traces, one passing and one failing. While they are pending,
+/// each status carries no result and costs no Oracle read. The runtime then
+/// collects each trace once. After publication each status, read through the
+/// Rust SDK, returns its own verdict and execution with one Oracle statement
+/// that scans no more files than the day-partitioned result table holds
+/// results for that execution; another execution's result never substitutes.
+/// Another tenant's caller and an unknown execution are refused as not found.
+///
+/// # Errors
+/// Returns cluster, fixture, ingest, runtime, SDK, or query errors, or the
+/// first status that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourneyError> {
+    use wyrd_client::verify::Execution;
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let tenant = cluster.data_tenant_id();
+    server
+        .ensure_builtin_table_for_test(tenant, "traces", "spans")
+        .await?;
+    let older = ResultLayoutJourney::start(&cluster).await?;
+    let now = Utc::now();
+    for days in [0, 1, 3] {
+        older
+            .publish(now - chrono::Duration::days(days), Report::Drift, false)
+            .await?;
+    }
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (checkout, _) = seed.service("result-checkout").await?;
+    let (admin, schema) = span_writer(server).await?;
+    let verifier = seed
+        .verifier(
+            "result-lookup",
+            &trace_spec(&[("names", "$.spans[*].name", json!("retrieve"))]),
+        )
+        .await?;
+    let (passing, failing) = (fresh_trace()?, fresh_trace()?);
+    let start = nanos_from_now(0);
+    for (trace, name) in [(passing, "retrieve"), (failing, "rank")] {
+        native_spans(
+            &admin,
+            uuid::Uuid::now_v7(),
+            &trace_batch(&schema, trace, &[(1, name, start)]),
+        )
+        .await?;
+    }
+    server.flush_bifrost().await?;
+    let mut executions = Vec::new();
+    for trace in [passing, failing] {
+        let accepted: Value = admin
+            .request_json(
+                reqwest::Method::POST,
+                "/v1/verification/enqueue",
+                Some(&trace_body(&verifier, &checkout, trace)),
+            )
+            .await?;
+        executions.push(await_queued(&seed, &accepted).await?);
+    }
+    for execution in &executions {
+        let (pending, work) = ScanEvidence::of(&cluster, "pending status", async {
+            Ok(Execution::connect_with(*execution, &admin).await?.status().await?)
+        })
+        .await?;
+        if pending.result.is_some() || work.queries != 0.0 {
+            return Err(format!("a pending status read a result: {pending:?} {work:?}").into());
+        }
+    }
+
+    let (rows, collection) = ScanEvidence::of(
+        &cluster,
+        "two trace executions",
+        settle_all(server, &seed, &executions),
+    )
+    .await?;
+    if rows
+        .iter()
+        .any(|row| row.status != "completed" || row.attempts != 1 || row.result_id.is_none())
+    {
+        return Err(format!("both executions complete on attempt one: {rows:?}").into());
+    }
+    if collection.queries != 2.0 {
+        return Err(format!("each execution collects its trace once: {collection:?}").into());
+    }
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    for (execution, verdict) in executions.iter().zip(["passed", "failed"]) {
+        let (state, work) = ScanEvidence::of(&cluster, &format!("{verdict} status"), async {
+            Ok(Execution::connect_with(*execution, &admin).await?.status().await?)
+        })
+        .await?;
+        let result = state.result.ok_or("a completed status carries its result")?;
+        let read = serde_json::to_value(&result.outcome)?;
+        if result.execution_id != *execution || read["verdict"] != verdict {
+            return Err(format!("{execution} read another result: {read}").into());
+        }
+        if work.queries != 1.0 || work.files > 1.0 {
+            return Err(format!("one exact result read scans one file: {work:?}").into());
+        }
+    }
+
+    let other = server.seed_tenant("result-lookup-other").await?;
+    let outsider = server
+        .bootstrap_service_in_tenant(other, "result-outsider", &["admin"])
+        .await?;
+    let outsider = native_client(
+        server,
+        outsider
+            .api_key()
+            .ok_or("the outsider has an API key")?
+            .expose_secret(),
+    )?;
+    for (caller, execution) in [
+        (&outsider, executions[0]),
+        (&admin, ExecutionId::new_v7()),
+    ] {
+        let refused = match Execution::connect_with(execution, caller).await?.status().await {
+            Ok(state) => return Err(format!("{execution} is visible: {state:?}").into()),
+            Err(refused) => refused,
+        };
+        if !matches!(refused, WyrdError::VerificationExecutionNotFound { .. }) {
+            return Err(format!("not-found expected, saw {refused:?}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}

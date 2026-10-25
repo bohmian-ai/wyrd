@@ -306,4 +306,76 @@ mod tests {
         assert!(verifier >= 0.05, "{text}");
         assert!(overhead < 0.025, "{text}");
     }
+
+    /// Two concurrent 50 ms actions of one real engine run land in the
+    /// benchmark histograms as one `verification.direct` observation whose
+    /// excluded wait counts their overlap once, about 50 ms rather than
+    /// 100, and whose residual is the execution less that union.
+    ///
+    /// # Panics
+    /// Panics when the run fails or the histogram observation, wait, or
+    /// residual is wrong.
+    #[tokio::test]
+    async fn histogram_overhead_excludes_real_overlapping_blocks() {
+        use wyrd_telemetry::timing;
+
+        timing::enable();
+        let before = timing::snapshot();
+        let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct, None);
+        let blocks = Arc::new(Slow);
+        let engine = VerificationEngine::new(
+            Arc::clone(&blocks) as Arc<dyn ActionExecutor>,
+            blocks,
+            Arc::new(vala_verify::InMemoryTraceSource::new()),
+            STEP_CONCURRENCY,
+        )
+        .with_clock(telemetry.clock());
+        let action = serde_json::json!({"kind": "code", "entrypoint": "run", "source": {"inline": "def run(): pass"}, "inputs": {}});
+        let spec: wyrd_spec::card::verifier::VerifierSpec = serde_json::from_value(serde_json::json!({
+            "steps": [{"id": "left", "action": action}, {"id": "right", "action": action}],
+            "requirements": [{"id": "done", "statement": "Work ran", "check": {"kind": "assert", "path": "steps.left.status", "operator": "equals", "expected": "succeeded"}}]
+        }))
+        .expect("Verifier");
+        engine
+            .run(
+                Arc::new(spec),
+                BTreeMap::new(),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("outcome");
+        telemetry.finish("completed", false);
+        let interval = timing::snapshot().since(&before).expect("one process");
+        let [series] = interval.series.as_slice() else {
+            panic!("one series: {:?}", interval.series);
+        };
+        assert_eq!(
+            (
+                series.boundary.as_str(),
+                series.outcome.as_str(),
+                series.count
+            ),
+            ("verification.direct", "completed", 1)
+        );
+        assert!(series.problems().is_empty(), "{:?}", series.problems());
+        let ms = |distribution: Option<&timing::Distribution>| {
+            let bucket = distribution
+                .and_then(timing::Distribution::maximum)
+                .expect("one observation");
+            (bucket.lowest / 1_000_000, bucket.highest / 1_000_000)
+        };
+        let (_, waited) = ms(series.excluded.as_ref());
+        let (lowest, _) = ms(series.excluded.as_ref());
+        assert!(
+            lowest >= 50 && waited < 90,
+            "overlap counted once: {lowest}..{waited} ms"
+        );
+        let (_, residual) = ms(series.residual.as_ref());
+        assert!(
+            residual < 25,
+            "the residual is the execution less the union: {residual} ms"
+        );
+        let (elapsed, _) = ms(Some(&series.elapsed));
+        assert!(elapsed >= lowest, "the execution holds its blocks");
+    }
 }

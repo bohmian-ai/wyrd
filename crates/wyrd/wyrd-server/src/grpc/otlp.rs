@@ -215,8 +215,8 @@ where
 }
 
 /// Boxes one export's service future and records its server time, from the
-/// service call through the built response, as one
-/// [`wyrd_telemetry::record_timing`] span at `boundary`: `success` when the
+/// service call through the built response, through
+/// [`wyrd_telemetry::record_timing`] at `boundary`: `success` when the
 /// response carries no error `grpc-status`, else `failed`.
 fn timed(
     boundary: &'static str,
@@ -797,5 +797,59 @@ impl Decoder for LogsRequestDecoder {
         let request = decode_logs_protobuf(bytes).map_err(ingest_status)?;
         source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Proof of the OTLP export boundary's benchmark histogram observations.
+
+    use super::*;
+    use wyrd_telemetry::timing;
+
+    /// An export's observation runs from the service call until its
+    /// response is built, so a 30 ms acknowledgement is inside it; an error
+    /// `grpc-status` is `failed`, and a missing or zero status `success`.
+    ///
+    /// # Panics
+    /// Panics when an outcome, count, or elapsed bound is wrong.
+    #[tokio::test]
+    async fn histograms_cover_service_call_through_acknowledgement() {
+        timing::enable();
+        let before = timing::snapshot();
+        let export = |status: Option<&'static str>| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let mut response = HttpResponse::new(TonicBody::empty());
+            if let Some(status) = status {
+                response.headers_mut().insert(
+                    "grpc-status",
+                    status.parse().expect("a static header value"),
+                );
+            }
+            Ok(response)
+        };
+        for status in [None, Some("0"), Some("14")] {
+            let _ = timed("bifrost.otlp.traces", export(status)).await;
+        }
+        let interval = timing::snapshot().since(&before).expect("one process");
+        let series = |outcome: &str| {
+            interval
+                .series
+                .iter()
+                .find(|series| {
+                    series.boundary == "bifrost.otlp.traces" && series.outcome == outcome
+                })
+                .unwrap_or_else(|| panic!("no {outcome} series: {:?}", interval.series))
+        };
+        assert_eq!((series("success").count, series("failed").count), (2, 1));
+        let lowest = series("success")
+            .elapsed
+            .quantile(0.0)
+            .expect("observations")
+            .lowest;
+        assert!(
+            lowest >= 29_000_000,
+            "through the acknowledgement: {lowest} ns"
+        );
     }
 }

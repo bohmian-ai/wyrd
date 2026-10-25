@@ -68,9 +68,9 @@ fn projection_error(signal: &str, error: &TableError) -> IngestError {
     }
 }
 /// Record the bounded-cardinality Gate request families used by D24, and
-/// the request's exact server time as one
-/// [`wyrd_telemetry::record_timing`] span at boundary `bifrost.gate.write`
-/// or `bifrost.gate.query` under the current span.
+/// the request's server time through [`wyrd_telemetry::record_timing`] at
+/// boundary `bifrost.gate.write` or `bifrost.gate.query` under the current
+/// span's benchmark classification.
 fn record_gate_request(operation: &'static str, outcome: &'static str, elapsed: Duration) {
     wyrd_telemetry::record_timing(
         &tracing::Span::current(),
@@ -2857,6 +2857,109 @@ mod tests {
             super::validate_batch(&frame(uuid::Uuid::now_v7().as_bytes().to_vec()), &limits)
                 .is_ok()
         );
+    }
+
+    /// Scribe double whose admission, the write's durable append, takes
+    /// 30 ms.
+    struct SlowScribe;
+
+    #[async_trait]
+    impl Scribe for SlowScribe {
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        /// Give the Gate a registered identity for any test destination.
+        ///
+        /// # Errors
+        /// This test implementation never returns an error.
+        async fn resolve_write_table(
+            &self,
+            _tenant: DataTenantId,
+            _table: &TableRef,
+        ) -> Result<TableUid, ScribeError> {
+            Ok(TableUid::from_bytes([7; 16]))
+        }
+
+        /// Admits the frame after 30 ms.
+        ///
+        /// # Errors
+        /// This test implementation never returns an error.
+        async fn ingest_frame(
+            &self,
+            _frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            Ok(FrameAdmission {
+                batch_id: uuid::Uuid::now_v7(),
+                rows_accepted: 0,
+                receipt_micros: 0,
+                first_commit: true,
+            })
+        }
+    }
+
+    /// A native write's `bifrost.gate.write` observation runs until Scribe
+    /// admitted it durably, so a 30 ms append is inside it; a write refused
+    /// before Scribe is its own `failed` observation.
+    ///
+    /// # Panics
+    /// Panics when an outcome, count, or elapsed bound is wrong.
+    #[tokio::test]
+    async fn histogram_write_boundary_includes_durable_append() {
+        use wyrd_telemetry::timing;
+
+        timing::enable();
+        let before = timing::snapshot();
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
+            Arc::new(SlowScribe),
+            test_interceptor(),
+            IngestLimits::default(),
+        )
+        .with_audit(RecordingAudit::new());
+        let caller = context_with(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            [Permission::bifrost_record_write()],
+        );
+        let request = |table_version| {
+            let mut request =
+                wyrd_tonic::tonic::Request::new(wyrd_tonic::wyrd::v1::InsertBatchRequest {
+                    table_version,
+                    ..native_frame("vala.datasets.events")
+                });
+            request.extensions_mut().insert(super::auth::ResolvedCaller(
+                wyrd_auth_verify::VerifiedToken {
+                    principal: caller.principal.clone(),
+                    delegation_chain: Vec::new(),
+                    exp: chrono::Utc::now() + chrono::Duration::hours(1),
+                },
+            ));
+            request
+        };
+        gate.write_batch(request(1))
+            .await
+            .expect("the write is admitted");
+        assert!(gate.write_batch(request(0)).await.is_err());
+        let interval = timing::snapshot().since(&before).expect("one process");
+        let series = |outcome: &str| {
+            interval
+                .series
+                .iter()
+                .find(|series| series.boundary == "bifrost.gate.write" && series.outcome == outcome)
+                .unwrap_or_else(|| panic!("no {outcome} series: {:?}", interval.series))
+        };
+        assert_eq!(series("success").count, 1);
+        let lowest = series("success")
+            .elapsed
+            .quantile(0.0)
+            .expect("one observation")
+            .lowest;
+        assert!(
+            lowest >= 29_000_000,
+            "through the durable append: {lowest} ns"
+        );
+        assert_eq!(series("failed").count, 1);
     }
 
     /// Query request lifecycles emit one exact terminal and drain active work.

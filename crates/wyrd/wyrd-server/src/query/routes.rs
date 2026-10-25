@@ -79,8 +79,8 @@ fn encode_query_frame(
         .map_err(|error| query_body_error(QueryBodyFailure::FrameEncoding, error))
 }
 
-/// One public query's server timing, recorded once as a
-/// [`wyrd_telemetry::record_timing`] span at boundary `bifrost.query` when
+/// One public query's server timing, recorded once through
+/// [`wyrd_telemetry::record_timing`] at boundary `bifrost.query` when
 /// dropped: from its HTTP arrival through the handoff of its terminal frame
 /// to the response body, or through its refusal.
 ///
@@ -89,7 +89,7 @@ fn encode_query_frame(
 /// `cancelled` for a body dropped before its terminal. A query without an
 /// arrival records nothing.
 struct QueryTiming {
-    /// The request span the timing span is recorded under.
+    /// The request span whose benchmark classification the timing takes.
     parent: tracing::Span,
     /// When the request reached the server.
     arrival: Option<std::time::Instant>,
@@ -963,5 +963,98 @@ mod tests {
             dropped.load(Ordering::Acquire),
             "transport body drop must release Oracle stream guards"
         );
+    }
+
+    /// A query's `bifrost.query` observation spans its arrival through the
+    /// handoff of its terminal frame to the body, so a terminal that comes
+    /// 30 ms after the batch is inside it; a stream error is `failed` and a
+    /// body dropped before its terminal is `cancelled`.
+    ///
+    /// # Panics
+    /// Panics when an outcome, count, or elapsed bound is wrong.
+    #[tokio::test]
+    async fn histograms_cover_arrival_through_terminal_handoff() {
+        use wyrd_telemetry::timing;
+
+        timing::enable();
+        let before = timing::snapshot();
+        let arrived = || QueryTiming {
+            parent: tracing::Span::none(),
+            arrival: std::time::Instant::now().checked_sub(std::time::Duration::from_millis(20)),
+            outcome: "cancelled",
+        };
+        let respond = |frames: Vec<Result<QueryStreamFrame, BifrostError>>, delay| {
+            let frames = futures_util::stream::iter(frames).then(move |frame| async move {
+                if matches!(frame, Ok(QueryStreamFrame::Terminal(_))) {
+                    tokio::time::sleep(delay).await;
+                }
+                frame
+            });
+            query_stream_response_with_fault(
+                OracleQueryStream::test_new(
+                    "abcd".to_owned(),
+                    Box::pin(frames),
+                    tokio_util::sync::CancellationToken::new(),
+                ),
+                None,
+                None,
+                arrived(),
+            )
+        };
+        let schema = || {
+            Ok(QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "abcd".to_owned(),
+                arrow_ipc_schema: vec![1],
+            }))
+        };
+        let terminal = Ok(QueryStreamFrame::Terminal(QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Success,
+            query_class: wyrd_spec::vala::api::QueryClass::Interactive,
+            row_count: 0,
+            warnings: Vec::new(),
+            source_completion: complete_sources(),
+            error: None,
+            arrow_ipc_eos: EOS.to_vec(),
+        }));
+        let delay = std::time::Duration::from_millis(30);
+        respond(vec![schema(), terminal], delay)
+            .into_body()
+            .collect()
+            .await
+            .expect("a complete body");
+        let failed = respond(
+            vec![schema(), Err(BifrostError::QueryExecutionFailed)],
+            delay,
+        );
+        assert!(failed.into_body().collect().await.is_err());
+        drop(respond(vec![schema()], delay));
+        let interval = timing::snapshot().since(&before).expect("one process");
+        let count = |outcome: &str| {
+            interval
+                .series
+                .iter()
+                .filter(|series| series.boundary == "bifrost.query" && series.outcome == outcome)
+                .map(|series| series.count)
+                .sum::<u64>()
+        };
+        assert_eq!(
+            (count("success"), count("failed"), count("cancelled")),
+            (1, 1, 1)
+        );
+        let success = interval
+            .series
+            .iter()
+            .find(|series| series.outcome == "success")
+            .expect("the success series");
+        let lowest = success
+            .elapsed
+            .quantile(0.0)
+            .expect("one observation")
+            .lowest;
+        assert!(
+            lowest >= 49_000_000,
+            "arrival through the delayed terminal: {lowest} ns"
+        );
+        assert!(success.excluded.is_none(), "a query excludes no wait");
     }
 }

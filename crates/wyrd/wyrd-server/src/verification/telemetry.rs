@@ -206,9 +206,9 @@ impl ExecutionTelemetry {
     /// Emit the outcome families of [`finish`](Self::finish): each phase,
     /// the whole execution, the Verifier's block time, and the overhead.
     ///
-    /// The exact execution and block-union durations are also recorded,
-    /// unsubtracted, as one [`wyrd_telemetry::record_timing`] span under the
-    /// current span at boundary `verification.direct` or
+    /// The execution and block-union durations are also recorded through
+    /// [`wyrd_telemetry::record_timing`] under the current span's benchmark
+    /// classification at boundary `verification.direct` or
     /// `verification.queued`.
     fn emit(&self, outcome: &'static str, failed: bool) {
         let total = self.started.elapsed();

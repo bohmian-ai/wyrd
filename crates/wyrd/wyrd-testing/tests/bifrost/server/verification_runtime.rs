@@ -7136,3 +7136,138 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
     cluster.shutdown().await?;
     Ok(())
 }
+
+/// Interleaved support conversations each form their own group snapshot of
+/// exactly their turns, in recorded order, with one Oracle statement per
+/// group (Scenario 3 of TASK-007; REQ-026, REQ-040; AC-008, AC-014).
+///
+/// The `support` Service declares a per-turn `turn-check` and a `group_end`
+/// `conversation-verifier` whose `turns` slot reads turn inputs and whose
+/// `answered` slot reads turn results. The Service enqueues conversation
+/// `long` (`a`, a blank answer, `c`) interleaved with conversation `short`
+/// (`z`). The production runtime judges the four turns, then hands each
+/// expired group off once: `long` lists its three turns in order under both
+/// slots and fails on the blank turn, `short` lists only its turn and
+/// passes, and the whole runtime pass costs one statement per group, since
+/// the turns read no warehouse evidence.
+///
+/// # Errors
+/// Returns cluster, declaration, credential, route, runtime, or SDK
+/// errors, or the first snapshot that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourneyError> {
+    use wyrd_client::verify::Execution;
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let tenant = cluster.data_tenant_id();
+    for table in ["execution_inputs", "results"] {
+        server
+            .ensure_builtin_table_for_test(tenant, "verification", table)
+            .await?;
+    }
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let admin = server.bootstrap_service("group-admin", &["admin"]).await?;
+    let admin = native_client(
+        server,
+        admin
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let receipt = Box::pin(
+        wyrd_client::cards::Cards::connect_with(&admin)
+            .await?
+            .declare_from_path(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../fixtures/cards/verify_in_real_time/support.yaml"
+            )),
+    )
+    .await?;
+    let uid = |name: &str| {
+        receipt
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.card_ref.name.as_str() == name)
+            .and_then(|outcome| outcome.card_ref.uid.clone())
+            .ok_or(format!("the receipt names {name}"))
+    };
+    let (agent, turn_check) = (uid("assistant-agent")?, uid("turn-check")?);
+    let root = receipt.root.uid.clone().ok_or("the Service has a UID")?;
+    let machine = server
+        .credential_registered_service(&receipt.root, &["editor"])
+        .await?;
+    let token = server
+        .exchange_api_key_for_workload(
+            machine.api_key().ok_or("the Service has an API key")?,
+            &root,
+        )
+        .await?;
+    let service = native_client(server, &token)?;
+    let mut turns: BTreeMap<&str, Vec<ExecutionId>> = BTreeMap::new();
+    for (group, answer) in [("long", "a"), ("short", "z"), ("long", ""), ("long", "c")] {
+        let accepted: Value = service
+            .request_json(
+                reqwest::Method::POST,
+                "/v1/verification/enqueue",
+                Some(&json!({
+                    "verifier_card_uid": turn_check,
+                    "card_uid": agent,
+                    "group_id": group,
+                    "inputs": {"turn": {"kind": "json", "value": {"answer": answer}}},
+                })),
+            )
+            .await?;
+        turns
+            .entry(group)
+            .or_default()
+            .push(await_queued(&seed, &accepted).await?);
+    }
+
+    let (rows, work) = ScanEvidence::of(
+        &cluster,
+        "four turns and two groups",
+        settle_all(server, &seed, 6),
+    )
+    .await?;
+    if rows.iter().any(|row| row.status != "completed") {
+        return Err(format!("every execution completes: {rows:?}").into());
+    }
+    if work.queries != 2.0 {
+        return Err(format!("each group is read by one statement: {work:?}").into());
+    }
+    let mut groups = BTreeMap::new();
+    for execution in seed.executions().await? {
+        let state = Execution::connect_with(execution, &admin)
+            .await?
+            .status()
+            .await?;
+        if let (Some(group), Some(snapshot)) = (state.group_id.clone(), state.group.clone()) {
+            let verdict = serde_json::to_value(&state.result.ok_or("a group result")?.outcome)?
+                ["verdict"]
+                .clone();
+            let listed: BTreeMap<String, Vec<ExecutionId>> = snapshot
+                .sources
+                .into_iter()
+                .map(|(slot, source)| (slot.to_string(), source.execution_ids))
+                .collect();
+            groups.insert(group.to_string(), (listed, verdict));
+        }
+    }
+    for (group, verdict) in [("long", "failed"), ("short", "passed")] {
+        let own = &turns[group];
+        let expected = (
+            BTreeMap::from([
+                ("answered".to_owned(), own.clone()),
+                ("turns".to_owned(), own.clone()),
+            ]),
+            json!(verdict),
+        );
+        if groups.get(group) != Some(&expected) {
+            return Err(format!("{group} snapshot differs: {groups:?}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}

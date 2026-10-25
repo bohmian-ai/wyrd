@@ -16,8 +16,7 @@
 //! pass and by the request's benchmark classification ([`CASES`] and
 //! [`PHASES`]), which [`label_request`] reads from the
 //! [`CASE_HEADER`]/[`PHASE_HEADER`] metadata of a benchmark client onto the
-//! request span and [`activate_request`] activates once the caller is
-//! authenticated. A classification confers nothing but a series; an unknown
+//! request span. A classification confers nothing but a series; an unknown
 //! value is counted and kept under [`INVALID`]. There are at most
 //! [`MAX_SERIES`] timing series and [`MAX_SCAN_SERIES`] scan series; an
 //! observation that would open another is counted in `dropped`, never
@@ -165,23 +164,12 @@ impl Labels {
     }
 }
 
-/// A request's declared classification before authentication activates
-/// it; it selects no series and counts nothing.
-#[derive(Debug, Clone, Copy)]
-struct Pending(
-    /// The case and phase the request declared, inert until
-    /// [`activate_request`] confirms authentication and moves them onto
-    /// the span as its recording classification.
-    Labels,
-);
-
-/// Reads the benchmark metadata in `headers` of the request `span` opens,
-/// before authentication. It does nothing unless timing is [`enable`]d or
-/// when the request declares neither; otherwise the declaration waits on
-/// the span until [`activate_request`] runs on successful authentication.
-/// A request never authenticated keeps recording unlabelled and never
-/// counts in `invalid_labels`. The classification only selects a series:
-/// it carries no authority, tenant, or sampling choice.
+/// Reads the benchmark metadata in `headers` onto the request `span`
+/// opens, so every timing recorded under it lands in its case and phase
+/// series; an unknown value is counted once in `invalid_labels` and
+/// classified [`INVALID`]. It does nothing unless timing is [`enable`]d or
+/// when the request declares neither. The classification only selects a
+/// series: it carries no authority, tenant, or sampling choice.
 pub fn label_request(span: &tracing::Span, headers: &http::HeaderMap) {
     if !enabled() {
         return;
@@ -194,48 +182,21 @@ pub fn label_request(span: &tracing::Span, headers: &http::HeaderMap) {
         case: Labels::label(case, CASES),
         phase: Labels::label(phase, PHASES),
     };
+    if labels.case == INVALID || labels.phase == INVALID {
+        lock().invalid_labels += 1;
+    }
     span.with_subscriber(|(id, dispatch)| {
         if let Some(span) = dispatch
             .downcast_ref::<tracing_subscriber::Registry>()
             .and_then(|registry| registry.span(id))
         {
-            span.extensions_mut().replace(Pending(labels));
-        }
-    });
-}
-
-/// Activates the classification [`label_request`] read for the request
-/// `span` belongs to, once its caller is authenticated: every timing
-/// recorded under it afterwards lands in its case and phase series, and an
-/// unknown value is counted once in `invalid_labels` and classified
-/// [`INVALID`]. Only a successful authentication owner calls it; a second
-/// call, or a span without a declaration, does nothing.
-pub fn activate_request(span: &tracing::Span) {
-    if !enabled() {
-        return;
-    }
-    span.with_subscriber(|(id, dispatch)| {
-        let Some(span) = dispatch
-            .downcast_ref::<tracing_subscriber::Registry>()
-            .and_then(|registry| registry.span(id))
-        else {
-            return;
-        };
-        for span in span.scope() {
-            let Some(Pending(labels)) = span.extensions_mut().remove::<Pending>() else {
-                continue;
-            };
-            if labels.case == INVALID || labels.phase == INVALID {
-                lock().invalid_labels += 1;
-            }
             span.extensions_mut().replace(labels);
-            return;
         }
     });
 }
 
 /// The classification of the nearest span from `span` to its root that
-/// [`activate_request`] activated, or none.
+/// [`label_request`] labelled, or none.
 fn labels_of(span: &tracing::Span) -> Labels {
     span.with_subscriber(|(id, dispatch)| {
         let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;

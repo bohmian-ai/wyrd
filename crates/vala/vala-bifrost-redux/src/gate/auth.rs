@@ -69,9 +69,7 @@ impl AuthContext {
     /// verified gRPC caller passes through here, so this also routes the
     /// current request's tenant span copies to that tenant and principal; a
     /// request that did not continue a sampled client trace is not routed.
-    /// The deployment environment is read from `metadata` here too. Once the
-    /// request is accepted, this also activates its declared benchmark
-    /// classification, which only an authenticated caller's request selects.
+    /// The deployment environment is read from `metadata` here too.
     ///
     /// # Errors
     /// Returns [`IngestError::RequestContext`] when the deployment environment
@@ -87,7 +85,6 @@ impl AuthContext {
                 .map(wyrd_tonic::tonic::metadata::MetadataValue::as_bytes),
         )
         .map_err(IngestError::RequestContext)?;
-        wyrd_telemetry::timing::activate_request(&tracing::Span::current());
         wyrd_telemetry::bind_tenant_route(wyrd_telemetry::TenantSpanRoute {
             tenant: verified.principal.tenant_id,
             attribution: wyrd_runtime::delegated_attribution(

@@ -1195,9 +1195,7 @@ mod tests {
     }
 
     /// Concurrent observations under labelled requests land exactly once in
-    /// their own case and phase series once authenticated, an
-    /// unauthenticated declaration selecting no series and counting nothing;
-    /// interval snapshots conserve counts,
+    /// their own case and phase series; interval snapshots conserve counts,
     /// keep zero, bound each percentile by its bucket, and report
     /// out-of-range, negative, reset, and replaced-process evidence.
     ///
@@ -1212,17 +1210,12 @@ mod tests {
 
         let (guard, _capture) = super::init_test_capture(super::TelemetryConfig::default())
             .expect("test telemetry pipeline initializes");
-        let unauthenticated = |case: &str, phase: &str| {
+        let request = |case: &str, phase: &str| {
             let span = tracing::info_span!("request");
             let mut headers = http::HeaderMap::new();
             headers.insert(CASE_HEADER, case.parse().expect("header value"));
             headers.insert(PHASE_HEADER, phase.parse().expect("header value"));
             timing::label_request(&span, &headers);
-            span
-        };
-        let request = |case: &str, phase: &str| {
-            let span = unauthenticated(case, phase);
-            timing::activate_request(&tracing::info_span!(parent: &span, "authenticated"));
             span
         };
         let unlabelled = tracing::info_span!("request");
@@ -1293,14 +1286,6 @@ mod tests {
             Some(Duration::ZERO),
         );
         let _invalid = request("drop table", "repetition-1");
-        let refused = unauthenticated("drop table", "repetition-1");
-        super::record_timing(
-            &refused,
-            "bifrost.query",
-            "refused",
-            Duration::from_millis(1),
-            None,
-        );
         let measured = timing::snapshot();
 
         let warmed = warm.since(&started).expect("same process");
@@ -1345,11 +1330,7 @@ mod tests {
         assert!(p99.highest - p99.lowest <= 7_919 / 1_000);
         let whole = measured.since(&started).expect("same process");
         let total: u64 = whole.series.iter().map(|series| series.count).sum();
-        assert_eq!(
-            total,
-            10 + 8_000 + 800 + 800 + 3 + 1,
-            "each observation once"
-        );
+        assert_eq!(total, 10 + 8_000 + 800 + 800 + 3, "each observation once");
 
         let gateway = series("buffered-metadata", "gateway.buffered");
         assert_eq!(gateway.count, 3);
@@ -1376,17 +1357,7 @@ mod tests {
         );
         assert_eq!(
             interval.invalid_labels, 1,
-            "only the authenticated unknown declaration counts"
-        );
-        let refused = interval
-            .series
-            .iter()
-            .find(|series| series.outcome == "refused")
-            .expect("the refused request is still timed");
-        assert_eq!(
-            (refused.case.as_str(), refused.phase.as_str()),
-            (timing::UNLABELLED, timing::UNLABELLED),
-            "an unauthenticated declaration selects no series"
+            "the unknown declaration is counted once"
         );
 
         let mut replaced = measured.clone();

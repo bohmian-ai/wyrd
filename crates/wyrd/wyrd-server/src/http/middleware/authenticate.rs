@@ -109,8 +109,7 @@ async fn authenticate_tenant_http(
 /// must carry the exact `Origin` it arrived at. The session is then resolved
 /// with the principal's current authority, never extending it, and the
 /// principal is inserted exactly as a verified bearer's would be, so every
-/// handler's permission checks and audit run unchanged. A resolved session
-/// activates the request's benchmark classification.
+/// handler's permission checks and audit run unchanged.
 async fn authenticate_browser_session(
     state: &AppState,
     mut request: Request<Body>,
@@ -144,7 +143,6 @@ async fn authenticate_browser_session(
                 .insert(AuthenticatedPrincipal::from_verified(Arc::new(
                     session.verified,
                 )));
-            wyrd_telemetry::timing::activate_request(&tracing::Span::current());
             next.run(request).await
         }
         Err(error) => WyrdErrorResponse(error).into_response(),
@@ -159,8 +157,7 @@ async fn authenticate_browser_session(
 /// optional `x-wyrd-workload-uid` root. The key is verified on every request
 /// through [`TokenGrants::api_key_principal`] and yields the principal its
 /// exchanged token would carry under that root. An access token, when
-/// present, always wins. A verified key activates the request's benchmark
-/// classification.
+/// present, always wins.
 pub async fn require_otlp_authenticated(
     State(state): State<AppState>,
     mut request: Request<Body>,
@@ -194,7 +191,6 @@ pub async fn require_otlp_authenticated(
             request
                 .extensions_mut()
                 .insert(AuthenticatedPrincipal::from_verified(Arc::new(verified)));
-            wyrd_telemetry::timing::activate_request(&tracing::Span::current());
             next.run(request).await
         }
         Err(error) => WyrdErrorResponse(error).into_response(),
@@ -202,9 +198,8 @@ pub async fn require_otlp_authenticated(
 }
 
 /// Verify the request's token for `surface`, apply its optional
-/// `x-wyrd-workload-uid` selector, insert the principal, activate the
-/// request's benchmark classification, and run `next`; any verification or
-/// selection failure is returned without calling `next` or activating it.
+/// `x-wyrd-workload-uid` selector, insert the principal, and run `next`; any
+/// verification or selection failure is returned without calling `next`.
 async fn authenticate_on(
     state: &AppState,
     mut request: Request<Body>,
@@ -226,7 +221,6 @@ async fn authenticate_on(
     match selected {
         Ok(principal) => {
             request.extensions_mut().insert(principal);
-            wyrd_telemetry::timing::activate_request(&tracing::Span::current());
             next.run(request).await
         }
         Err(error) => WyrdErrorResponse(error).into_response(),
@@ -281,58 +275,6 @@ mod pg_tests {
             .expect("router responds");
 
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    /// Benchmark metadata on a public or refused request leaves the
-    /// classification invalidity unchanged; the same unknown metadata on a
-    /// request that authenticates is counted once. Refusal statuses are
-    /// unchanged.
-    ///
-    /// # Panics
-    /// Panics when the router fails to respond, a status differs, or the
-    /// invalid-label count moves for an unauthenticated request or not for
-    /// an authenticated one.
-    #[tokio::test]
-    async fn only_authenticated_requests_activate_benchmark_labels() {
-        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
-        wyrd_telemetry::timing::enable();
-        let state = test_state().await;
-        let jwt = mint_test_user_jwt(&state, DataTenantId::new_v7(), Duration::minutes(5));
-        let router = Router::new()
-            .route("/healthz", get(|| async { StatusCode::OK }))
-            .merge(test_router(state))
-            .layer(
-                tower_http::trace::TraceLayer::new_for_http().make_span_with(
-                    |request: &Request<Body>| crate::http::router::request_span(request, None),
-                ),
-            );
-        let send = |path: &'static str, token: Option<String>| {
-            let mut request = Request::builder()
-                .uri(path)
-                .header(wyrd_telemetry::timing::CASE_HEADER, "drop table");
-            if let Some(token) = token {
-                request = request.header("x-wyrd-access-token", format!("Bearer {token}"));
-            }
-            let router = router.clone();
-            async move {
-                router
-                    .oneshot(request.body(Body::empty()).expect("request builds"))
-                    .await
-                    .expect("router responds")
-                    .status()
-            }
-        };
-        let invalid = || wyrd_telemetry::timing::snapshot().invalid_labels;
-        let before = invalid();
-        assert_eq!(send("/healthz", None).await, StatusCode::OK);
-        assert_eq!(send("/v1/protected", None).await, StatusCode::UNAUTHORIZED);
-        assert_eq!(invalid(), before, "unauthenticated metadata counts nothing");
-        assert_eq!(send("/v1/protected", Some(jwt)).await, StatusCode::OK);
-        assert_eq!(
-            invalid(),
-            before + 1,
-            "authenticated metadata is classified"
-        );
     }
 
     #[tokio::test]

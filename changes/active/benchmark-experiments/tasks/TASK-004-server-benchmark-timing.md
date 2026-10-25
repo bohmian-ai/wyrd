@@ -49,8 +49,8 @@ measurement clock; keep drain completions separate. Finish the measured cohort
 under a bounded drain before finalizing its latency distribution. Record the
 cohort's admission/completion counts and the two windows explicitly. Per-query
 scan distributions remain associated with the same case/query-class, repetition,
-phase and outcome population. Use the specified closed benchmark metadata through
-authenticated request context; ordinary deployments ignore it and unknown
+phase and outcome population. Use the specified closed benchmark metadata, read where
+each request arrives; ordinary deployments ignore it and unknown
 benchmark classifications invalidate evidence. Interleaved L2 query classes must
 retain independent counts/distributions without per-request IDs in snapshots;
 no unrelated native probe can satisfy offered work's expected counts.

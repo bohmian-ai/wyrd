@@ -1200,13 +1200,15 @@ mod tests {
         use datafusion::physical_plan::union::UnionExec;
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(Column::new(
-            "v", 0,
-        )))])
-        .expect("one sort key orders");
+        let ordering =
+            LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(Column::new("v", 0)))])
+                .expect("one sort key orders");
         let batch = |values: Vec<i64>| {
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(values))])
-                .expect("the batch builds")
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values))],
+            )
+            .expect("the batch builds")
         };
         let sorted = |input: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
             Arc::new(SortExec::new(ordering.clone(), input).with_preserve_partitioning(true))

@@ -845,6 +845,11 @@ struct ScanEvidence {
 }
 
 impl ScanEvidence {
+    /// Whether the integral counter delta `value` is `expected`.
+    fn is(value: f64, expected: u32) -> bool {
+        (value - f64::from(expected)).abs() < 0.5
+    }
+
     /// Await `read` and return its value with the Oracle work done while it
     /// ran, printing that work under `label` as one evidence line.
     ///
@@ -6309,8 +6314,8 @@ impl StoredBlooms {
                     .metadata()
                     .row_groups()
                     .iter()
-                    .flat_map(|group| group.columns())
-                    .filter_map(|chunk| chunk.bloom_filter_length())
+                    .flat_map(parquet::file::metadata::RowGroupMetaData::columns)
+                    .filter_map(parquet::file::metadata::ColumnChunkMetaData::bloom_filter_length)
                     .map(i64::from)
                     .sum();
                 stored.filter_bytes += bytes;
@@ -6940,10 +6945,13 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
     }
     for execution in &executions {
         let (pending, work) = ScanEvidence::of(&cluster, "pending status", async {
-            Ok(Execution::connect_with(*execution, &admin).await?.status().await?)
+            Ok(Execution::connect_with(*execution, &admin)
+                .await?
+                .status()
+                .await?)
         })
         .await?;
-        if pending.result.is_some() || work.queries != 0.0 {
+        if pending.result.is_some() || !ScanEvidence::is(work.queries, 0) {
             return Err(format!("a pending status read a result: {pending:?} {work:?}").into());
         }
     }
@@ -6960,7 +6968,7 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
     {
         return Err(format!("both executions complete on attempt one: {rows:?}").into());
     }
-    if collection.queries != 2.0 {
+    if !ScanEvidence::is(collection.queries, 2) {
         return Err(format!("each execution collects its trace once: {collection:?}").into());
     }
     server.flush_bifrost().await?;
@@ -6968,15 +6976,20 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
 
     for (execution, verdict) in executions.iter().zip(["passed", "failed"]) {
         let (state, work) = ScanEvidence::of(&cluster, &format!("{verdict} status"), async {
-            Ok(Execution::connect_with(*execution, &admin).await?.status().await?)
+            Ok(Execution::connect_with(*execution, &admin)
+                .await?
+                .status()
+                .await?)
         })
         .await?;
-        let result = state.result.ok_or("a completed status carries its result")?;
+        let result = state
+            .result
+            .ok_or("a completed status carries its result")?;
         let read = serde_json::to_value(&result.outcome)?;
         if result.execution_id != *execution || read["verdict"] != verdict {
             return Err(format!("{execution} read another result: {read}").into());
         }
-        if work.queries != 1.0 || work.files > 1.0 {
+        if !ScanEvidence::is(work.queries, 1) || work.files > 1.0 {
             return Err(format!("one exact result read scans one file: {work:?}").into());
         }
     }
@@ -6992,11 +7005,12 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
             .ok_or("the outsider has an API key")?
             .expose_secret(),
     )?;
-    for (caller, execution) in [
-        (&outsider, executions[0]),
-        (&admin, ExecutionId::new_v7()),
-    ] {
-        let refused = match Execution::connect_with(execution, caller).await?.status().await {
+    for (caller, execution) in [(&outsider, executions[0]), (&admin, ExecutionId::new_v7())] {
+        let refused = match Execution::connect_with(execution, caller)
+            .await?
+            .status()
+            .await
+        {
             Ok(state) => return Err(format!("{execution} is visible: {state:?}").into()),
             Err(refused) => refused,
         };
@@ -7053,7 +7067,10 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
     let mut bindings = Vec::new();
     for (name, scores) in [
         ("window-inside", &inside_scores[..]),
-        ("window-other", &[(observed_in_current_month(now)?, 50.0)][..]),
+        (
+            "window-other",
+            &[(observed_in_current_month(now)?, 50.0)][..],
+        ),
         ("window-empty", &[][..]),
     ] {
         let card = server
@@ -7062,8 +7079,9 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
             .card_ref()
             .ok_or("a service bootstrap returned a user")?
             .clone();
-        let Bootstrap::Machine { id, api_key, .. } =
-            server.credential_registered_service(&card, &["admin"]).await?
+        let Bootstrap::Machine { id, api_key, .. } = server
+            .credential_registered_service(&card, &["admin"])
+            .await?
         else {
             return Err("a service credential returned a user".into());
         };
@@ -7104,7 +7122,7 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
     {
         return Err(format!("every window completes with a result: {rows:?}").into());
     }
-    if work.queries != 3.0 {
+    if !ScanEvidence::is(work.queries, 3) {
         return Err(format!("each window is one statement: {work:?}").into());
     }
     let unwritten = server
@@ -7128,7 +7146,10 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
             ),
         )
         .await?;
-        let scored: Vec<_> = expected.map(|score| vec![Some(score.to_owned())]).into_iter().collect();
+        let scored: Vec<_> = expected
+            .map(|score| vec![Some(score.to_owned())])
+            .into_iter()
+            .collect();
         if scores != scored {
             return Err(format!("binding {binding} scored {scores:?}, not {expected:?}").into());
         }
@@ -7234,7 +7255,7 @@ async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourney
     if rows.iter().any(|row| row.status != "completed") {
         return Err(format!("every execution completes: {rows:?}").into());
     }
-    if work.queries != 2.0 {
+    if !ScanEvidence::is(work.queries, 2) {
         return Err(format!("each group is read by one statement: {work:?}").into());
     }
     let mut groups = BTreeMap::new();
@@ -7244,9 +7265,9 @@ async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourney
             .status()
             .await?;
         if let (Some(group), Some(snapshot)) = (state.group_id.clone(), state.group.clone()) {
-            let verdict = serde_json::to_value(&state.result.ok_or("a group result")?.outcome)?
-                ["verdict"]
-                .clone();
+            let verdict =
+                serde_json::to_value(&state.result.ok_or("a group result")?.outcome)?["verdict"]
+                    .clone();
             let listed: BTreeMap<String, Vec<ExecutionId>> = snapshot
                 .sources
                 .into_iter()
@@ -7291,7 +7312,9 @@ async fn mcp_query(
     use rmcp::transport::StreamableHttpClientTransport;
     use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
-    let base_url = server.base_url().ok_or("the server has no public listener")?;
+    let base_url = server
+        .base_url()
+        .ok_or("the server has no public listener")?;
     let mut config = StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp"));
     config.allow_stateless = true;
     config.custom_headers.insert(
@@ -7352,7 +7375,10 @@ async fn custom_query_preserves_evidence_and_limits() -> Result<(), ServerJourne
             .card_ref()
             .and_then(|card| card.uid.clone())
             .ok_or("the Service has a Card UID")?;
-        let key = service.api_key().ok_or("the Service has an API key")?.clone();
+        let key = service
+            .api_key()
+            .ok_or("the Service has an API key")?
+            .clone();
         Ok::<_, ServerJourneyError>((uid, key))
     };
     let (_, admin_key) = key("custom-admin", &["admin"]).await?;
@@ -7432,15 +7458,23 @@ async fn custom_query_preserves_evidence_and_limits() -> Result<(), ServerJourne
     }
     // The file count subtracts open-time statistics skips, which may land
     // after the terminal; the two `eu` files' row groups are exact.
-    if work.queries != 1.0 || work.row_groups != 2.0 {
+    if !ScanEvidence::is(work.queries, 1) || !ScanEvidence::is(work.row_groups, 2) {
         return Err(format!("the region filter reaches the scan: {work:?}").into());
     }
 
     let (_, outsider_key) = key("custom-outsider", &[]).await?;
     let outsider = server.exchange_api_key(&outsider_key).await?;
     for (caller, arguments, code) in [
-        (&agent, json!({ "sql": sql, "max_rows": 3 }), "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE"),
-        (&agent, json!({ "sql": sql, "max_bytes": 10 }), "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE"),
+        (
+            &agent,
+            json!({ "sql": sql, "max_rows": 3 }),
+            "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+        ),
+        (
+            &agent,
+            json!({ "sql": sql, "max_bytes": 10 }),
+            "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+        ),
         (&agent, json!({ "sql": sql, "deadline_ms": 1 }), "504"),
         (&outsider, json!({ "sql": sql }), "403"),
     ] {

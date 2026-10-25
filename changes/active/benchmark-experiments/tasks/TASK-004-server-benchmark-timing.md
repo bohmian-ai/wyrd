@@ -68,8 +68,10 @@ replacement proof passes; retain useful production spans, tests and diagnostics.
    cumulative snapshots; prove privacy, opt-in exposure and interval arithmetic.
 3. Wire the existing Verification, Gateway and Bifrost boundary timers and scan
    facts to the same collection contract.
-4. Make mandatory release smoke validate histograms and CPU/work, independent of
-   tracing, before fixture preparation.
+4. Make `--smoke` run the normal L1/L2 workflow at reduced scale (one warmup,
+   one repetition, every selected step and phase) and validate histograms and
+   CPU/work through normal validity, independent of tracing; full commands run
+   an isolated smoke prepass before full-size preparation.
 5. Adapt shared accounting, records and report readers to version 2; preserve
    legacy evidence and remove the obsolete mandatory raw-span collection path.
 
@@ -136,19 +138,25 @@ recorder or transport if the implementation introduced one.
 
 ### Scenario 4 — Every engine proves timing before expensive work
 
-**Behavior.** Release smoke uses a handful of real requests for every required
-boundary, with operator export disabled. Each has integer-duration histogram
-observations, positive work, valid server CPU and available-core readings.
-Missing fields name engine/boundary/counter and abort before full fixture load.
-Smoke is mandatory in every direct/aggregate L1/L2 dispatch.
+**Behavior.** `--smoke` on the normal L1/L2 commands runs the full workflow at
+reduced fixture scale and windows (one warmup, one repetition, every selected
+step and phase), with operator export disabled. Each boundary has
+integer-duration histogram observations, positive work, valid server CPU and
+available-core readings; a missing reading is INVALID under normal validity.
+Only below-floor percentiles and full-run reference comparisons are inapplicable
+in smoke. Records carry `mode`, smoke output stays under
+`target/benchmarks/smoke/`, and a smoke record is never a baseline. Every full
+direct/aggregate L1/L2 dispatch runs an isolated smoke prepass that stops it
+before full-size preparation on failure.
 
-**RED.** Extend the existing missing-piece smoke test V6 to require the new
-histogram evidence. Run V8 with trace export disabled to demonstrate that the
+**RED.** Extend V6 so smoke mode must run the selected workflow, judge missing
+histogram evidence INVALID and stay out of history. Run V8 with trace export disabled to demonstrate that the
 current raw-span-only contract cannot satisfy independent timing collection.
 
-**GREEN.** Replace smoke evidence at the existing Workload::smoke and common
-runner seam. Do not wait for publication or use normal sample floors. Rerun
-V1–V3/V6 and each engine's release smoke before long measurements.
+**GREEN.** Implement smoke as a mode of the common runner and each engine's
+normal prepare/execute path, including its normal publication waits; delete the
+per-engine request-only smoke. Rerun V1–V3/V6 and each engine's release smoke
+before long measurements.
 
 **REFACTOR.** Delete obsolete raw-span parsing/collection and helper requirements
 only after all engine consumers have moved; keep any still-used diagnostic seam
@@ -274,7 +282,7 @@ mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experime
 ### V6 — Existing accounting, smoke and report regressions
 
 ```bash
-mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::metrics_preserve_process_scope_and_units) | test(=experiment::tests::repetitions_exclude_warmup_and_bound_execution) | test(=experiment::tests::reports_regenerate_from_persisted_records) | test(=capacity::tests::shared_measurements_preserve_workload_deltas) | test(=capacity::tests::smoke_names_every_missing_piece)'
+mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::metrics_preserve_process_scope_and_units) | test(=experiment::tests::repetitions_exclude_warmup_and_bound_execution) | test(=experiment::tests::reports_regenerate_from_persisted_records) | test(=capacity::tests::shared_measurements_preserve_workload_deltas) | test(=experiment::tests::smoke_runs_the_selected_workflow_and_stays_out_of_history)'
 ```
 
 ### V7 — Existing metrics owner and required checks

@@ -582,7 +582,7 @@ fn slowest(samples: &[u64], what: &str) -> Reading {
 
 /// Sets every query reading: per-phase server latencies and answered
 /// counts of the queries admitted in the phase, however late they
-/// completed; the capacity-phase point percentiles; totals, errors, and
+/// completed; the capacity-phase point percentiles and maximum; totals, errors, and
 /// wrong answers. Totals credit only queries answered before the window
 /// end, the endpoint of the measured CPU; later answers are counted
 /// separately. Scanned rows and bytes per query average the executed-plan
@@ -611,7 +611,12 @@ fn read_queries(
             Reading::count(answered.to_u64().unwrap_or(0)),
         );
     }
-    for (id, q) in [("p50_ms", 0.5), ("p95_ms", 0.95), ("p99_ms", 0.99)] {
+    for (id, q) in [
+        ("p50_ms", 0.5),
+        ("p95_ms", 0.95),
+        ("p99_ms", 0.99),
+        ("max_ms", 1.0),
+    ] {
         let point = Case::Selective.label();
         repetition.set(
             id,
@@ -1056,8 +1061,9 @@ mod tests {
     use tokio::time::Instant;
 
     use wyrd_telemetry::timing::{Distribution, IntervalScan, IntervalSeries};
+    use wyrd_testing::capacity::NANOS_PER_MS;
     use wyrd_testing::capacity::Population;
-    use wyrd_testing::experiment::Repetition;
+    use wyrd_testing::experiment::{Reading, Repetition};
 
     use num_traits::ToPrimitive;
 
@@ -1108,6 +1114,7 @@ mod tests {
         };
         let asked = [
             asked("capacity", Ok(1)),
+            asked("capacity", Ok(1)),
             asked("capacity", Err(WRONG_RESULT.to_owned())),
             asked("capacity", Err("WYRD_X".to_owned())),
         ];
@@ -1116,12 +1123,13 @@ mod tests {
             .iter()
             .find(|cohort| cohort.case == "point-lookup" && cohort.phase == "capacity")
             .expect("the capacity point cohort");
-        assert_eq!(point.count, 2);
+        assert_eq!(point.count, 3);
         let mut covered = Population {
             series: vec![
                 timed("point-lookup", "capacity", 9_000_000),
-                timed("probe", "capacity", 1_000_000),
-                timed("point-lookup", "overload", 1_000_000),
+                timed("point-lookup", "capacity", 2_000_000),
+                timed("probe", "capacity", 50_000_000),
+                timed("point-lookup", "overload", 40_000_000),
             ],
             ..Population::default()
         };
@@ -1129,7 +1137,7 @@ mod tests {
         assert_eq!(
             covered.invalid,
             [
-                "1 `bifrost.query` timing observations of case point-lookup in phase capacity have outcome `success` for 2 completed requests",
+                "2 `bifrost.query` timing observations of case point-lookup in phase capacity have outcome `success` for 3 completed requests",
                 "1 `bifrost.query` timing observations of case point-lookup in phase overload have outcome `success` for 0 completed requests",
             ]
         );
@@ -1137,7 +1145,15 @@ mod tests {
         read_queries(&mut repetition, &asked, &covered, &phases);
         let p99 = repetition.reading("capacity.point_p99_ms");
         assert!(p99.value.is_some_and(|ms| ms >= 9.0), "{p99:?}");
-        assert_eq!(repetition.reading("capacity.queries").value, Some(1.0));
+        let selected = covered
+            .only("point-lookup", "capacity")
+            .elapsed("bifrost.query", "success")
+            .expect("the selected capacity point cohort");
+        let max = repetition.reading("max_ms");
+        assert_eq!(max, Reading::quantile(&selected, 1.0, NANOS_PER_MS));
+        assert_eq!((max.rank, max.samples), (Some(2), Some(2)), "{max:?}");
+        assert!(max.value.is_some_and(|ms| ms >= 9.0), "{max:?}");
+        assert_eq!(repetition.reading("capacity.queries").value, Some(2.0));
     }
 
     /// A slow answer never postpones a due query: the open loop sends every

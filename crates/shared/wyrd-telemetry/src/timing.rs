@@ -169,7 +169,12 @@ impl Labels {
 /// A request's declared classification before authentication activates
 /// it; it selects no series and counts nothing.
 #[derive(Debug, Clone, Copy)]
-struct Pending(Labels);
+struct Pending(
+    /// The case and phase the request declared, inert until
+    /// [`activate_request`] confirms authentication and moves them onto
+    /// the span as its recording classification.
+    Labels,
+);
 
 /// Reads the benchmark metadata in `headers` of the request `span` opens,
 /// before authentication. It does nothing unless timing is [`enable`]d or

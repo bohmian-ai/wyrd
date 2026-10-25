@@ -188,7 +188,6 @@ async fn service_action_timeline_is_one_connected_tree() {
 /// Panics when telemetry does not install, a step fails, or the timeline
 /// differs.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn service_action_timeline_survives_a_quiet_operator_policy() {
     let _telemetry = wyrd_telemetry::init(wyrd_telemetry::TelemetryConfig {
         filter: "error".to_owned(),

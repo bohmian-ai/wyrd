@@ -257,3 +257,164 @@ measurement blocker instead of substituting intermediate shapes or numbers.
 - [Testing](../../../../TESTING.md)
 - [Spec-driven development](../../../spec-driven-development.md)
 - [Implementation execution](../../../implementation-execution.md)
+
+## Implementation Evidence
+
+All measurements use the final contracts on a `BifrostClusterSpec::one_mixed()`
+cluster: macOS arm64, debug test profile, warm build, default settings, and
+`ScanEvidence::of`, which takes cluster telemetry checkpoint deltas of the
+`oracle_query_*`, `scribe_write_profile_*` and `bifrost_*upload*` families. Every
+figure below was stable across at least two runs unless stated otherwise.
+
+### Inventory
+
+| Path | Caller and authority | Projection and predicates | Source and layout | Measured work |
+|---|---|---|---|---|
+| Inline JSON and digest-addressed inputs | queued execution; pinned `TenantEvidence` | no warehouse read; storage length, hash and format validation | Postgres and object storage | 0 Oracle statements for 4 inline turns (group proof) |
+| Completed result | `VerificationControl::get_execution` → `read_result` as the caller | `outcome, run_id` by canonical `result_id`, `LIMIT 1` | results, daily on `ended_at`, Bloom `result_id` | 1 statement, 1 of 5 result files, about 1.2 KB; pending status: 0 statements |
+| Repeated trace checks (TASK-006) | `CallerTraces` as the accepted caller | exact `trace_id`, no time bound | spans, hourly | 1 statement per trace per attempt (2 executions → 2 statements, 2 files) |
+| Subject/series window | `DriftEngine` as tenant SYSTEM serving the owner | exact subject, series, `[start, end)`, one combined statement | observations, daily on `created_at` | 3 windows → 3 statements, 3 files, 1250 B |
+| Grouped inputs/results | `GroupPoller::poll` as SYSTEM serving the owner | one `UNION ALL` by `group_id` and eligible tuples; payload read only for slots that read it | inputs and results, live tail | 2 groups → 2 statements, 0 files (rows served live) |
+| Declared Agent SQL | `HostedTools` and MCP → `BoundedQuery` as the caller | the supplied SQL only; no workload predicate | custom table: iceberg + hot + live | 1 statement; 2 of 4 published row groups, 174 B |
+
+### Exploration (`verification_runtime::exploration_filters_keep_exact_populations`)
+
+Fixture: Prompt plus same-named Agent and Model `lookup-component`; billing 1.0.0
+prod ×4 rounds, billing 2.0.0 staging ×1 (skew), checkout 1.0.0 prod ×1, all
+sharing both components; spans, logs, points, observations, inputs, results and
+features. Every filter equals the unfiltered ground truth filtered in Rust, on
+eight attributable tables, at each of three stages. Files and row groups
+scanned (there is one row group per file):
+
+| Filter | Published, default Blooms | Live, Blooms cleared | Published, Blooms cleared |
+|---|---|---|---|
+| Service family (across versions) | 5 | 5 | 5 |
+| Exact release (UID/version) | 1 | 1 | 2 |
+| Environment | 5 | 5 | 6 |
+| Subject kind + name (across versions) | 6 | 6 | 7 |
+| Exact subject UID | 6 | 6 | 7 |
+| Service + subject | 1 | 1 | 2 |
+| Empty result | 0 | 0 | 0 |
+| Time-bounded / unbounded | 6 / 6 | 6 / 6 | 7 / 7 |
+
+Results' ten Bloom columns: `result_id`, `execution_id`, `binding_id`, and
+`service_name`/`workload_card_uid` for a single Service each scan 1 file;
+`verifier_card_uid`, `subject_name` and `subject_card_uid` scan 6, because every
+file holds the shared subjects; `run_id`/`group_id` (absent) scan 0. The audit
+principal lookup scans 6. Physical planning takes about 5–7 ms per statement.
+
+Stored Blooms with defaults: 48 files, 14,946 filter bytes (about 311 B per
+file), 1,085,169 file bytes. After one Bloom-cleared round: 49 filtered, 7 bare,
+15,359 filter bytes. Encoded persistence bytes for one checkout round: 164,660
+with Blooms and 173,668 without.
+
+### Changes made
+
+- **Defect fixed:** `LiveUnionBoundary` wrapped each published sibling of a
+  live leaf in `CoalescePartitionsExec`, which dropped the sibling's sort. The
+  `SortPreservingMergeExec` above then merged unsorted input, so
+  `ORDER BY id` over published plus live data returned `4, 1, 2, 6`. Oracle
+  plans every query through this session on a node with an analytical handle,
+  so interactive, scheduled and MCP reads were all exposed. A sorted sibling is
+  now merged on its own ordering by `SortPreservingMergeExec`, which the
+  distributed planner treats as the same network-coalesce boundary
+  (`datafusion-distributed` `network_coalesce.rs:110-111`).
+- No other avoidable work was measured: every path already issues one
+  statement per logical read, with narrow projections and exact predicates.
+  `read_result` keeps no time bound, because Postgres and server clocks can
+  skew and no lookback is authorized.
+
+### Nine-table Bloom default review (for TASK-008)
+
+The defaults are unchanged.
+- Attributable tables: `service_name`, `subject_name`, `workload_card_uid`,
+  `subject_card_uid`, `run_id`, plus each table's own lookup keys:
+  - spans and logs: `trace_id`;
+  - points: `metric_name`;
+  - calls: `call_id`;
+  - observations: `series`;
+  - features: `result_id`;
+  - inputs: `execution_id`, `verifier_card_uid`, `binding_id`, `group_id`;
+  - results: `result_id`, `execution_id`, `verifier_card_uid`, `binding_id`,
+    `group_id`.
+- Audit: `sub_principal_id`, `act_principal_id`, `wyrd_request_id`, `resource`.
+
+Every exploration predicate matched the unfiltered population with defaults
+present, absent and cleared. At fixture scale (one row group per file),
+pruning comes from file statistics on the per-writer sort (E, S, V, time).
+Bloom row-group pruning was 0 everywhere and cannot be observed until files
+hold several row groups. Clearing Blooms cost one extra file on the
+exact-release, environment, subject and combined filters, and none on the
+Service family. High-cardinality ID columns (`result_id`, `execution_id`,
+`trace_id`) are the predicates the verification read paths actually issue.
+Shared-subject columns are recorded as low-selectivity under shared components.
+
+### Diagnoses
+
+- **Symptom:** custom-query proof: MCP `bifrost.query` returned
+  `[[4],[1],[2],[6]]` for `ORDER BY id`. **Evidence:** the operator profile
+  shows `CoalescePartitionsExec` under `SortPreservingMergeExec`. The
+  diagnostician's per-rule plan log shows a valid plan after
+  `SanityCheckPlan`, then `bifrost_live_union_boundary`
+  (`oracle/live.rs::LiveUnionBoundary::optimize`, appended after the sanity
+  check in `analytical.rs:6679`) rewriting the sorted published branch.
+  **Cause:** coalescing interleaves the sorted partitions `[1,2]` and `[4]`
+  in arrival order, which is timing-dependent; the scheduled path passed by
+  arrival luck. **Fix site:** `LiveUnionBoundary::optimize`, the one shared
+  rule. Other callers checked: the typed HTTP query route, `ScheduledQueryCaller`,
+  SDK `Bifrost`, and order-dependent operators (`ORDER BY … LIMIT`, windows,
+  sort-merge joins). Regression:
+  `oracle::live::tests::boundary_keeps_a_sorted_sibling_sorted` (RED observed:
+  ordering `None`).
+- **Symptom:** a trace fixture judged both executions `failed`. **Evidence:**
+  `actual: "retrieve"` against `expected: ["retrieve"]`. **Cause:** a
+  one-span selector yields a scalar. **Fix site:** the fixture's expected
+  value.
+- **Symptom:** the window proof saw no executions. **Cause:** scheduled
+  executions are created by the runtime's scheduler, which was not yet
+  running. **Fix site:** `settle_all` starts the runtime and waits for a
+  count.
+- **Symptom:** the first native exploration write was refused with
+  `CardScopeDenied`. **Evidence:** `execution_lanes.rs:1160`. **Cause:** the
+  subject Card was not among the Service's components. **Fix site:** the
+  fixture declares components via the now-public `VerificationFixture::release_with`.
+- **Symptom:** planning error `Timestamp(ns) >= Int64`. **Cause:** the
+  exploration bounded nanosecond time columns with integers. **Fix site:** the
+  test's `timestamp()` literal.
+
+### Limits
+
+- `bifrost.gateway.calls` has no rows: no cluster write path exists
+  (`CallCapture` is crate-private, and `GatewayCapture` runs a separate
+  server).
+- Writer memory and CPU are not exposed to the harness (the process window is
+  crate-private). The supplement's ~2 MiB-per-column bitset remains a
+  source-derived estimate.
+- The encoded-bytes comparison is not a clean A/B, because the cleared round
+  also carries audit traffic.
+- `oracle_query_files_scanned_total` subtracts open-time statistics skips, so
+  the custom lookup reports 2 or 3 files across runs while row groups (2),
+  bytes (174) and rows (4) stay constant. The proof asserts on row groups.
+- Hosted Agent SQL was measured through MCP `bifrost.query`. Both use one
+  `BoundedQuery`, and the hosted path adds only `tool:invoke` authorization,
+  which `pg_hosted_artifacts` covers.
+- The window proof takes about 34 s because it waits for the scheduler's due
+  pass; there are no sleeps beyond 50 ms readiness polls.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-026,049–053; AC-008,017,024: exact cross-signal populations for every filter shape, fallback without Blooms, physical scans | `verification_runtime.rs::{Explored, Filter, StoredBlooms}`; `VerificationFixture::release_with` | `verification_runtime::exploration_filters_keep_exact_populations` | PASS |
+| REQ-043; AC-017: comparable final-contract evidence for every path and dimension | inventory and tables above; `ScanEvidence::of` | the four proofs plus exploration, with work lines recorded | PASS |
+| REQ-026,040; AC-008,014: exact result, no substitution, pending absent, tenant/unknown not found | unchanged `read_result` | `verification_runtime::completed_result_lookup_preserves_evidence` | PASS |
+| Window population, boundaries, other subject/series, empty window unscored | unchanged `ObservationWindow` | `verification_runtime::window_lookup_preserves_population`; `verification::drift::tests::one_statement_decides_completeness_and_scores_from_one_cut` | PASS |
+| Group occurrences separate, ordered, one statement per group | unchanged `GroupPoller` | `verification_runtime::group_lookup_preserves_source_occurrences` | PASS |
+| Declared SQL meaning across live/hot/published and absent/added Blooms; row, byte, deadline and permission refusals; no workload predicate | `oracle/live.rs::LiveUnionBoundary` | `verification_runtime::custom_query_preserves_evidence_and_limits`; `oracle::live::tests::boundary_keeps_a_sorted_sibling_sorted`; `oracle::live::tests::` (7); `oracle::analytical::` (18); oracle `distributed::` live journeys (5) and `peer_network::{analytical,live_subquery}::` (10) | PASS |
+| REQ-035,038,042,044; AC-016,018: equal answers with absent/disabled Blooms; nine defaults reviewed unchanged | review above | exploration; `verification_runtime::result_layout_partitions_blooms_and_prunes_by_result` | PASS |
+| REQ-043,045; AC-019: one trace collection per trace per attempt; TASK-006 unchanged | unchanged | U1 `blocks::engine::tests::trace_checks_share_one_attempt_read`; I1–I3 `pg_verification_runtime::{missing_trace_retries_same_execution, missing_trace_exhaustion_keeps_decision_rule, trace_unavailability_preserves_execution_mode}`; J1 `visible_trace_spans_preserve_binding_ownership`; J2 `late_trace_spans_require_new_verification`; completed-result proof's 2 statements for 2 executions | PASS |
+| Profile and storage regressions | unchanged | `oracle::profile::tests::profile_folds_oracle_steps_and_operator_metrics`; `pg_hosted_artifacts::{artifact_evidence_and_code_reach_every_consumer, artifact_reads_refuse_before_use}` | PASS |
+| Format, lints, boundaries | — | `mise run fmt`, `mise run lints`, `mise run check:tenant-isolation`, `git diff --check` | PASS |
+
+Non-goals stayed excluded: there is no cache, index, store, lookback, latency SLO,
+or change to partition, sort or Bloom defaults, and no public or generated
+contract change. Custom tables gain no InputSlot discovery. Unrelated files were
+not changed.

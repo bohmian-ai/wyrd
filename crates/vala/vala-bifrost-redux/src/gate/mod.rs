@@ -2865,6 +2865,8 @@ mod tests {
 
     #[async_trait]
     impl Scribe for SlowScribe {
+        /// Always ready, so the Gate admits the write and its slow append
+        /// is the only delay.
         fn is_ready(&self) -> bool {
             true
         }

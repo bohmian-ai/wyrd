@@ -516,7 +516,10 @@ impl Method {
 /// exact bucket counts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Buckets(pub Vec<[u64; 2]>);
+pub struct Buckets(
+    /// `[highest equivalent value, count]` per nonzero bucket, ascending.
+    pub Vec<[u64; 2]>,
+);
 
 impl Buckets {
     /// The nonzero buckets of `histogram`.
@@ -605,7 +608,10 @@ pub struct TimingSnapshot {
 
 /// A rebuilt duration or scan-fact distribution of one interval.
 #[derive(Debug, Clone)]
-pub struct Distribution(Histogram<u64>);
+pub struct Distribution(
+    /// The interval's bucket counts, in the parameters of its owning kind.
+    Histogram<u64>,
+);
 
 /// One percentile of a [`Distribution`]: its nearest rank and the
 /// inclusive bounds of the bucket that holds it.
@@ -622,6 +628,10 @@ pub struct Quantile {
 impl Distribution {
     /// Rebuilds a distribution of `buckets` in a histogram of `empty`'s
     /// parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns which bucket value is outside `empty`'s range.
     fn rebuild(buckets: &Buckets, mut empty: Histogram<u64>) -> Result<Self, String> {
         for [value, count] in &buckets.0 {
             empty
@@ -632,6 +642,10 @@ impl Distribution {
     }
 
     /// The bucket counts `self` added to `earlier`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reset message when any bucket of `earlier` exceeds `self`'s.
     fn since(&self, earlier: &Self) -> Result<Self, String> {
         let mut interval = self.0.clone();
         interval
@@ -918,7 +932,11 @@ impl TimingSnapshot {
     }
 }
 
-/// `later - earlier`, or why a counter went backwards.
+/// `later - earlier` of the counter named `what`.
+///
+/// # Errors
+///
+/// Returns a reset message naming `what` when `later` is below `earlier`.
 fn counted(later: u64, earlier: u64, what: &str) -> Result<u64, String> {
     later
         .checked_sub(earlier)
@@ -927,6 +945,11 @@ fn counted(later: u64, earlier: u64, what: &str) -> Result<u64, String> {
 
 /// The interval distribution of `later` since `earlier`, `earlier` absent
 /// counting from empty.
+///
+/// # Errors
+///
+/// Returns why either side cannot rebuild in `empty`'s range, or a reset
+/// when a bucket count went backwards.
 fn interval_of(
     later: &Buckets,
     earlier: Option<&Buckets>,
@@ -942,6 +965,11 @@ fn interval_of(
 impl IntervalSeries {
     /// `later` since `earlier`, or `None` when nothing was recorded in
     /// between.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reset message when any count or bucket went backwards, or a
+    /// range message when a bucket cannot rebuild.
     fn between(
         later: &SeriesSnapshot,
         earlier: Option<&SeriesSnapshot>,
@@ -987,6 +1015,11 @@ impl IntervalSeries {
 impl IntervalScan {
     /// `later` since `earlier`, or `None` when nothing was recorded in
     /// between.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reset message when any count or bucket went backwards, or a
+    /// range message when a bucket cannot rebuild.
     fn between(
         later: &ScanSnapshot,
         earlier: Option<&ScanSnapshot>,
@@ -1046,6 +1079,10 @@ mod tests {
     }
 
     /// Unknown labels are classified invalid, absent ones unlabelled.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a label is classified other than declared.
     #[test]
     fn labels_are_closed() {
         let value = |text: &str| http::HeaderValue::from_str(text).ok();
@@ -1062,6 +1099,10 @@ mod tests {
 
     /// A series opened beyond the bound is dropped and counted, never
     /// merged into another series.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the extra series is kept or not counted dropped.
     #[test]
     fn series_beyond_the_bound_are_dropped() {
         let mut registry = Registry::new();

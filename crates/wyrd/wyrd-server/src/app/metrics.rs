@@ -538,6 +538,11 @@ mod tests {
 
     /// Fetches `path` with `method` from `router`, returning the status and
     /// body text.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request cannot build, the router does not respond, or
+    /// the body is not collected UTF-8.
     async fn fetch(router: &Router, method: &str, path: &str) -> (StatusCode, String) {
         let response = router
             .clone()
@@ -561,6 +566,10 @@ mod tests {
     }
 
     /// The snapshot route of an enabled router, parsed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the route does not answer 200 with a `TimingSnapshot`.
     async fn timings(router: &Router) -> wyrd_telemetry::timing::TimingSnapshot {
         let (status, body) = fetch(router, "GET", BENCHMARK_TIMINGS_PATH).await;
         assert_eq!(status, StatusCode::OK, "{body}");

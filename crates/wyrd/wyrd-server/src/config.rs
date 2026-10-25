@@ -5877,6 +5877,13 @@ minimum_slots = 2
 
     // ── 40b. Benchmark snapshot requires a loopback metrics listener ────────
 
+    /// The benchmark snapshot is refused on an exposed or disabled metrics
+    /// listener and accepted on a loopback one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a configuration does not parse, or validation accepts an
+    /// exposed or absent listener or refuses a loopback one.
     #[test]
     fn benchmark_snapshot_requires_a_loopback_metrics_listener() {
         for toml in [

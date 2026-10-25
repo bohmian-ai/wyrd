@@ -4973,9 +4973,8 @@ limitations = "excluded"
             &options,
         )
         .await;
-        let seen = workload.seen.lock().expect("seen");
         assert_eq!(
-            seen.calls,
+            workload.seen.lock().expect("seen").calls,
             [
                 ("op-64".to_owned(), Phase::Warmup, Duration::from_secs(1)),
                 (
@@ -4986,7 +4985,6 @@ limitations = "excluded"
             ],
             "only the selected step, one warmup and one repetition"
         );
-        drop(seen);
         assert_eq!(record.verdict, Verdict::Pass, "{:?}", record.reasons);
         let step = record
             .steps
@@ -5079,9 +5077,10 @@ limitations = "excluded"
         )
         .await;
         assert_eq!(validity(&refused), ["prepass.failed"]);
-        let seen = unprepared.seen.lock().expect("seen");
-        assert!(!seen.prepared && seen.calls.is_empty());
-        drop(seen);
+        {
+            let seen = unprepared.seen.lock().expect("seen");
+            assert!(!seen.prepared && seen.calls.is_empty());
+        }
         let mut passed = declaration();
         passed.prepass = Some(prepass(0));
         let admitted = execute(

@@ -1109,7 +1109,7 @@ mod tests {
                 Some(excluded),
             );
             outer_elapsed = outer_elapsed.max(outer.elapsed());
-            outer_own = outer_own.max(outer.elapsed() - excluded);
+            outer_own = outer_own.max(outer.elapsed().saturating_sub(excluded));
         }
         let interval = wyrd_telemetry::timing::snapshot()
             .since(&before)

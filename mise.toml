@@ -545,9 +545,9 @@ depends = ["bench:build"]
 run = """
 worst=0
 keep() { [ "$1" -gt "$worst" ] && worst=$1; return 0; }
-target/profiling/release/capacity l1 --smoke; keep $?
+target/profiling/release/capacity l1 --smoke || keep $?
 for engine in bifrost verification gateway; do
-  scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l2 "$engine" --smoke; keep $?
+  scripts/postgres/with-test-postgres.sh -- target/profiling/release/capacity l2 "$engine" --smoke || keep $?
 done
 exit "$worst"
 """

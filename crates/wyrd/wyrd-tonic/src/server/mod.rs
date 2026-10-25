@@ -223,7 +223,8 @@ where
 /// leaves the span the root of a new trace. The span carries the RPC service
 /// and method from the request path, never metadata values. A continued
 /// trace stages its tenant span copies on the serving server's
-/// `tenant_spans` sink.
+/// `tenant_spans` sink. A benchmark server classifies it from its benchmark
+/// metadata ([`wyrd_telemetry::timing::label_request`]).
 fn request_span(
     request: &HttpRequest<()>,
     tenant_spans: Option<&Arc<dyn wyrd_telemetry::TenantSpanSink>>,
@@ -246,6 +247,7 @@ fn request_span(
         wyrd_telemetry::inbound_context(request.headers()).as_ref(),
         tenant_spans,
     );
+    wyrd_telemetry::timing::label_request(&span, request.headers());
     span
 }
 

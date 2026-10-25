@@ -565,7 +565,9 @@ impl QueryTelemetryGuard {
     }
 
     /// Emits the final query and stream outcome exactly once, with the
-    /// executed plan's scan rows and bytes on the query span when known.
+    /// executed plan's scan rows and bytes on the query span when known,
+    /// and records them into the benchmark scan histograms under the
+    /// request's classification.
     fn finish(&mut self, outcome: &'static str) {
         if self.finalization == QueryTelemetryFinalization::Closed {
             return;
@@ -574,6 +576,12 @@ impl QueryTelemetryGuard {
         self.finish_source_span(outcome);
         self.span.record("outcome", outcome);
         self.scan_stats.finalize();
+        wyrd_telemetry::timing::record_scan(
+            &self.span,
+            outcome,
+            self.scan_stats.physical_rows_scanned,
+            self.scan_stats.physical_bytes_scanned,
+        );
         metrics::counter!(
             "oracle_query_files_scanned_total",
             "class" => query_class_label(self.query_class)

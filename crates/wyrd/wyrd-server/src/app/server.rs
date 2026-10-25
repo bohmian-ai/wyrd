@@ -724,7 +724,7 @@ impl BoundServer {
                 Some(handle) => handle,
                 None => install_recorder().map_err(|e| BootExit::Other(Box::new(e)))?,
             };
-            let router = metrics_router(handle);
+            let router = metrics_router(handle, self.config.metrics.benchmark_snapshot);
             set.spawn(fallible_task(
                 TaskId::Metrics,
                 serve_metrics(router, listener, shutdown.clone()),

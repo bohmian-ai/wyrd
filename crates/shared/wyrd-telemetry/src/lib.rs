@@ -4,6 +4,7 @@
 
 mod context;
 mod export;
+pub mod timing;
 
 pub use context::{
     caller_sampled, continued_context, current_context, inbound_context, serve_linked_work,
@@ -372,7 +373,11 @@ pub const TIMING_SPAN: &str = "wyrd.timing";
 /// as `i64`, which the OpenTelemetry layer exports as an OTLP integer (it
 /// would export a `u64` field as its debug string); a duration beyond
 /// `i64::MAX` nanoseconds saturates. Without an OpenTelemetry layer, or when the
-/// filter disables the span, this does nothing.
+/// filter disables the span, no span is emitted.
+///
+/// When [`timing::enable`]d, the same exact durations are also recorded into
+/// the bounded benchmark histograms under the request's classification; see
+/// [`timing`].
 pub fn record_timing(
     parent: &tracing::Span,
     boundary: &'static str,
@@ -393,6 +398,7 @@ pub fn record_timing(
     if let Some(excluded) = excluded {
         span.record("excluded_ns", nanos(excluded));
     }
+    timing::record(parent, boundary, outcome, elapsed, excluded);
 }
 
 /// Resolve the effective log filter from multiple sources in priority order.
@@ -1261,6 +1267,178 @@ mod tests {
             .find(|span| span.name == "request")
             .expect("the request span was exported");
         assert_eq!(timings[0].parent_span_id, request.span_id);
+        guard.shutdown();
+    }
+
+    /// Concurrent observations under labelled requests land exactly once in
+    /// their own case and phase series; interval snapshots conserve counts,
+    /// keep zero, bound each percentile by its bucket, and report
+    /// out-of-range, negative, reset, and replaced-process evidence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the test pipeline does not initialize or any count,
+    /// bound, or invalidity is wrong.
+    #[test]
+    fn benchmark_histograms_preserve_bounded_intervals() {
+        use super::timing::{self, CASE_HEADER, PHASE_HEADER};
+        use std::time::Duration;
+
+        let (guard, _capture) = super::init_test_capture(super::TelemetryConfig::default())
+            .expect("test telemetry pipeline initializes");
+        let request = |case: &str, phase: &str| {
+            let span = tracing::info_span!("request");
+            let mut headers = http::HeaderMap::new();
+            headers.insert(CASE_HEADER, case.parse().expect("header value"));
+            headers.insert(PHASE_HEADER, phase.parse().expect("header value"));
+            timing::label_request(&span, &headers);
+            span
+        };
+        let unlabelled = tracing::info_span!("request");
+        let ignored = request("point-lookup", "warmup");
+        super::record_timing(&ignored, "bifrost.query", "success", Duration::ZERO, None);
+        timing::enable();
+        assert_eq!(
+            timing::snapshot().series.len(),
+            0,
+            "nothing is recorded before enable, and labels set then are ignored"
+        );
+        let started = timing::snapshot();
+
+        let warmup = request("point-lookup", "warmup");
+        for _ in 0..10 {
+            super::record_timing(
+                &warmup,
+                "bifrost.query",
+                "success",
+                Duration::from_micros(3),
+                None,
+            );
+        }
+        let warm = timing::snapshot();
+        let point = request("point-lookup", "repetition-1");
+        let scan = request("full-scan", "repetition-1");
+        std::thread::scope(|threads| {
+            for thread in 0..8_u64 {
+                let (point, scan, unlabelled) = (&point, &scan, &unlabelled);
+                threads.spawn(move || {
+                    for i in 0..1_000_u64 {
+                        let elapsed = Duration::from_nanos(thread * 1_000 + i);
+                        super::record_timing(point, "bifrost.query", "success", elapsed, None);
+                        if i % 10 == 0 {
+                            super::record_timing(scan, "bifrost.query", "success", elapsed, None);
+                            super::record_timing(
+                                unlabelled,
+                                "bifrost.query",
+                                "success",
+                                elapsed,
+                                None,
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        let gateway = request("buffered-metadata", "repetition-1");
+        super::record_timing(
+            &gateway,
+            "gateway.buffered",
+            "success",
+            Duration::from_micros(500),
+            Some(Duration::from_micros(400)),
+        );
+        super::record_timing(
+            &gateway,
+            "gateway.buffered",
+            "success",
+            Duration::from_nanos(10),
+            Some(Duration::from_nanos(11)),
+        );
+        super::record_timing(
+            &gateway,
+            "gateway.buffered",
+            "success",
+            Duration::from_secs(600),
+            Some(Duration::ZERO),
+        );
+        let _invalid = request("drop table", "repetition-1");
+        let measured = timing::snapshot();
+
+        let warmed = warm.since(&started).expect("same process");
+        assert_eq!(warmed.series.len(), 1);
+        assert_eq!(warmed.series[0].phase, "warmup");
+        assert_eq!(warmed.series[0].count, 10);
+
+        let interval = measured.since(&warm).expect("same process");
+        let series = |case: &str, boundary: &str| {
+            interval
+                .series
+                .iter()
+                .find(|series| series.case == case && series.boundary == boundary)
+                .unwrap_or_else(|| panic!("no {case} {boundary} series"))
+        };
+        let point = series("point-lookup", "bifrost.query");
+        assert_eq!(point.phase, "repetition-1");
+        assert_eq!((point.count, point.elapsed.len()), (8_000, 8_000));
+        assert!(point.problems().is_empty(), "{:?}", point.problems());
+        assert_eq!(series("full-scan", "bifrost.query").count, 800);
+        assert_eq!(series(timing::UNLABELLED, "bifrost.query").count, 800);
+        assert!(
+            interval
+                .series
+                .iter()
+                .all(|series| series.phase != "warmup"),
+            "warmup observations stay in the warmup interval"
+        );
+        let zero = point.elapsed.quantile(0.0).expect("observations");
+        assert_eq!(
+            (zero.lowest, zero.highest),
+            (0, 0),
+            "zero is counted exactly"
+        );
+        let p99 = point.elapsed.quantile(0.99).expect("observations");
+        assert_eq!(p99.rank, 7_920);
+        assert!(p99.lowest <= 7_919 && 7_919 <= p99.highest);
+        assert!(p99.highest - p99.lowest <= 7_919 / 1_000);
+        let whole = measured.since(&started).expect("same process");
+        let total: u64 = whole.series.iter().map(|series| series.count).sum();
+        assert_eq!(total, 10 + 8_000 + 800 + 800 + 3, "each observation once");
+
+        let gateway = series("buffered-metadata", "gateway.buffered");
+        assert_eq!(gateway.count, 3);
+        let residual = gateway.residual.as_ref().expect("residual component");
+        assert_eq!(
+            residual.len(),
+            1,
+            "only the in-range, non-negative residual"
+        );
+        let half = gateway.elapsed.quantile(0.0).expect("observation");
+        assert!(half.lowest <= 10 && 10 <= half.highest);
+        let problems = gateway.problems().join("; ");
+        assert!(
+            problems.contains("2 durations outside the trackable range"),
+            "{problems}"
+        );
+        assert!(
+            problems.contains("1 excluded waits exceeding elapsed time"),
+            "{problems}"
+        );
+        assert!(
+            problems.contains("2 elapsed observations for 3 requests"),
+            "{problems}"
+        );
+        assert_eq!(interval.invalid_labels, 1);
+
+        let mut replaced = measured.clone();
+        replaced.process = "another".to_owned();
+        assert!(replaced.since(&warm).is_err_and(|e| e.contains("replaced")));
+        assert!(
+            warm.since(&measured).is_err(),
+            "a reversed interval is a reset"
+        );
+        let mut reset = measured.clone();
+        reset.series.retain(|series| series.case != "point-lookup");
+        assert!(reset.since(&warm).is_err(), "a vanished series is a reset");
         guard.shutdown();
     }
 }

@@ -10863,6 +10863,7 @@ dependencies = [
 name = "wyrd-telemetry"
 version = "0.3.0"
 dependencies = [
+ "hdrhistogram",
  "http",
  "metrics",
  "opentelemetry",

@@ -10,6 +10,11 @@ parent_task:
 remediates: []
 ---
 
+Superseded by the proposed revision-8 tasks once that revision is approved.
+Preserve this task and its evidence as history; do not execute its conflicting
+raw-span or older matrix instructions alongside the replacement packet.
+
+
 ## Outcome and Value
 
 Bifrost Level 1 becomes three short experiments, each with its own record,

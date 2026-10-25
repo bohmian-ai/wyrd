@@ -10,6 +10,11 @@ parent_task:
 remediates: []
 ---
 
+Superseded by the proposed revision-8 tasks once that revision is approved.
+Preserve this task and its evidence as history; do not execute its conflicting
+raw-span or older matrix instructions alongside the replacement packet.
+
+
 Approval: the maintainer approved spec revision 5 and this task. All prior
 implementation and evidence were rejected and confer no acceptance credit.
 

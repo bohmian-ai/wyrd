@@ -143,11 +143,11 @@ reduced fixture scale and windows (one warmup, one repetition, every selected
 step and phase), with operator export disabled. Each boundary has
 integer-duration histogram observations, positive work, valid server CPU and
 available-core readings; a missing reading is INVALID under normal validity.
-Only below-floor percentiles and full-run reference comparisons are inapplicable
-in smoke. Records carry `mode`, smoke output stays under
+A smoke judges no target: every criterion is inapplicable, so a smoke is PASS
+or INVALID. Records carry `mode`, smoke output stays under
 `target/benchmarks/smoke/`, and a smoke record is never a baseline. Every full
 direct/aggregate L1/L2 dispatch runs an isolated smoke prepass that stops it
-before full-size preparation on failure.
+before full-size preparation when the smoke is INVALID.
 
 **RED.** Extend V6 so smoke mode must run the selected workflow, judge missing
 histogram evidence INVALID and stay out of history. Run V8 with trace export disabled to demonstrate that the

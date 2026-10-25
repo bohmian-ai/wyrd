@@ -214,12 +214,11 @@ impl Level {
 /// reduced declared controls.
 ///
 /// A smoke runs the same declaration, fixtures, steps, phases,
-/// measurement, judgment, and record as a full run with a smaller fixture
-/// and [`Level::smoke_timing`]. It is functional evidence only: it never
-/// qualifies performance or serves as a reference, its records stay under
-/// `target/benchmarks/smoke/`, and percentile floors and full-run
-/// reference comparisons are explicitly inapplicable to it. A record
-/// without a mode is a full run.
+/// measurement, validity, and record as a full run with a smaller fixture
+/// and [`Level::smoke_timing`]. It only shows the workflow runs: it judges
+/// no criterion, so it is PASS or INVALID, never qualifies performance or
+/// serves as a reference, and its records stay under
+/// `target/benchmarks/smoke/`. A record without a mode is a full run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -2433,10 +2432,10 @@ fn summarize(declaration: &Declaration, repetitions: &[Repetition]) -> BTreeMap<
         .collect()
 }
 
-/// Judges one criterion over a step's repetitions. In a smoke, a
-/// full-run reference comparison, and a percentile whose every reading is
-/// present but under its sample floor, are inapplicable with the observed
-/// counts; a missing reading stays INVALID in both modes.
+/// Judges one criterion over a step's repetitions. A smoke judges no
+/// target: once its evidence is present, every criterion is inapplicable,
+/// so a smoke is only PASS or INVALID; a missing reading or an empty
+/// percentile population stays INVALID in both modes.
 fn judge_criterion(
     criterion: &Criterion,
     repetitions: &[Repetition],
@@ -2531,6 +2530,12 @@ fn judge_criterion(
             criterion.percentile.unwrap_or_default()
         ));
         return judgment;
+    }
+    if mode == Mode::Smoke {
+        return inapplicable(
+            judgment,
+            "not judged in a smoke: a smoke only shows the workflow runs".to_owned(),
+        );
     }
     match &criterion.rule {
         Rule::Limit { op, limit, over } => {
@@ -4942,18 +4947,18 @@ limitations = "excluded"
     }
 
     /// A smoke runs the same lifecycle over the selected steps with one
-    /// short warmup and one repetition each: a present percentile under its
-    /// floor is inapplicable with its count, while an empty population and
-    /// zero CPU stay INVALID; its record round-trips `mode: smoke` under
-    /// `target/benchmarks/smoke/` and a failed write is still a persistence
-    /// error. A full run refuses before preparation when its prepass failed
+    /// short warmup and one repetition each: it judges no target, so a
+    /// short percentile and a missed limit are inapplicable, while an empty
+    /// population and zero CPU stay INVALID; its record round-trips
+    /// `mode: smoke` under `target/benchmarks/smoke/` and a failed write is
+    /// still a persistence error. A full run refuses before preparation when its prepass failed
     /// and keeps a passing prepass beside its own clock; a record without a
     /// mode reads as full.
     ///
     /// # Panics
     ///
     /// Panics when a smoke skips or repeats work, waives an integrity check,
-    /// judges a short percentile, lands in history, or a failed prepass
+    /// judges a target, lands in history, or a failed prepass
     /// admits preparation.
     #[tokio::test(start_paused = true)]
     async fn smoke_runs_the_selected_workflow_and_stays_out_of_history() {
@@ -5017,6 +5022,21 @@ limitations = "excluded"
             floored.verdict,
             Verdict::Invalid,
             "a full run keeps its floor"
+        );
+        let mut slow = good();
+        slow.set("p99_ms", Reading::exact(9.0).with_samples(2_000));
+        let missed = execute(
+            smoke.clone(),
+            &mut Scripted::always(&slow),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        assert_eq!(
+            missed.verdict,
+            Verdict::Pass,
+            "a smoke judges no target: {:?}",
+            missed.reasons
         );
 
         let mut empty = good();

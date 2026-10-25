@@ -7145,7 +7145,7 @@ async fn settle_all(
 
 /// A completed execution's status returns its own canonical result through
 /// one exact result read, whatever other results its tenant retains
-/// (Scenario 1 of TASK-007; REQ-026, REQ-040; AC-008, AC-014).
+/// (REQ-026, REQ-040; AC-008, AC-014).
 ///
 /// Results of the same tenant are published today, yesterday, and three
 /// days ago. Two queued trace executions of one Verifier and subject judge
@@ -7290,7 +7290,7 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
 
 /// A scheduled Custom Drift window scores exactly its own subject's `score`
 /// rows in `[start, end)` with one Oracle statement per execution
-/// (Scenario 2 of TASK-007; REQ-026, REQ-040; AC-008, AC-014).
+/// (REQ-026, REQ-040; AC-008, AC-014).
 ///
 /// Three Card-bound Services are bound monthly to one Custom Drift Verifier
 /// whose score is the window mean. `inside` writes `score` 3 at the inclusive
@@ -7426,7 +7426,7 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
 
 /// Interleaved support conversations each form their own group snapshot of
 /// exactly their turns, in recorded order, with one Oracle statement per
-/// group (Scenario 3 of TASK-007; REQ-026, REQ-040; AC-008, AC-014).
+/// group (REQ-026, REQ-040; AC-008, AC-014).
 ///
 /// The `support` Service declares a per-turn `turn-check` and a `group_end`
 /// `conversation-verifier` whose `turns` slot reads turn inputs and whose
@@ -7616,7 +7616,7 @@ async fn mcp_query(
 /// Declared SQL over a custom table returns exactly its own filtered,
 /// projected rows from live, published, Bloom-absent and Bloom-added data,
 /// with the filter reaching the scan, and its bounds still refuse rather than
-/// truncate (Scenario 4 of TASK-007; REQ-026, REQ-040; AC-008, AC-014).
+/// truncate (REQ-026, REQ-040; AC-008, AC-014).
 ///
 /// The admin writes `eu` rows 1 and 2 and `us` row 3 as two published files
 /// with no Bloom column, adds a `region` Bloom column, publishes `eu` row 4

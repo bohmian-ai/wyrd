@@ -221,3 +221,28 @@ audit log's bytes come from decisions retained under the previous declaration.
 Non-goals stayed excluded: no cache, index, store, lookback, SLO, default,
 public contract, dependency, capture API, or profiler. Production code is
 unchanged in R1.
+
+## CI Failure Diagnoses
+
+PR CI (`gate:rust:bifrost`, `gate:rust:families`) failed after approval. Each
+failure was reproduced locally with `WYRD_LOG` tracing, except the gateway
+ordering, which passed 8 of 8 local runs; independent read-only diagnosticians
+confirmed the causes before the test changes.
+
+- **Server-stamped dimensions in fixtures.**
+  - *Symptom:* `forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite` refused with "service_name is stamped from the accepted request context; send it null". The four `pg_bifrost_e2e::trace_timeline` tests refused with "canonical field service_name differs from the value its source fields derive".
+  - *Cause:* `flat_builtin_batch` fills every column, the six shared dimensions included. The timeline span fixture sent `service_name` with no resource `service.name` to derive it from.
+  - *Fix site:* the two fixtures now send those columns null. The production validators (`refuse_supplied_dimensions`, `refuse_forged`) are unchanged.
+- **Scribe retries under a new principal.**
+  - *Symptom:* resends of an acknowledged batch failed. `staged_backlog_survives_abrupt_restart` and `scribe_write_flush_read_user_journey` got "scribe batch commit identity mismatch". `accepted_batch_revision_survives_alteration_and_restart` and `mixed_runtime_specifications_preserve_rows_and_pins` got `TableVersionConflict`.
+  - *Evidence:* the per-column `logical batch identity column contribution` digests differ only in `sub_principal_id` and `act_principal_id`.
+  - *Cause:* each resend went through a newly minted service principal. The account pair is a correlation column bound into batch identity, and `bifrost-design.md` requires a retry to preserve origin. Production was correct; the tests were not.
+  - *Fix site:*
+    - The scribe test `support::tenant_key` mints one key per case, and every client in a case is built from it.
+    - `ScribeWorkloadTenantBinding` carries one key per tenant for every append, replay and read.
+    - `acknowledged_rows_survive_stage_pressure_and_restart` and `composite_partitions_survive_lifecycle_and_peers` resent from the same new-principal pattern without checking the result. They now use the one key and expect the resend to be acknowledged.
+- **Gateway capture frame order.**
+  - *Symptom:* `gateway_capture_follows_policy_and_never_affects_the_call` asserted calls before spans and saw spans first.
+  - *Cause:* `ScribeSink::submit` delivers frames of one phase concurrently: up to `FRAMES_IN_FLIGHT`, each encoded on its own blocking task. Its rustdoc says acknowledgement order is not row order.
+  - *Fix site:* the test now compares the frame tables without order, as the sibling outbox test does. The outbox is unchanged.
+- **Open drift:** a same-version batch-identity mismatch surfaces as a 500 internal invariant (`scribe_batch_commits.rs`), not the stable batch-identity conflict that `bifrost-design.md` names. This is not changed here.

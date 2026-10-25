@@ -319,6 +319,14 @@ with Blooms and 173,668 without.
   now merged on its own ordering by `SortPreservingMergeExec`, which the
   distributed planner treats as the same network-coalesce boundary
   (`datafusion-distributed` `network_coalesce.rs:110-111`).
+- **Class closed (reviewer decision):** `LiveUnionBoundary::install` appends
+  the rule and then an unconditional `SanityCheckPlan`, so an ordering or
+  distribution requirement broken by Wyrd's rule fails planning through the
+  existing planning-error path. The check runs before distributed rewriting
+  (the distributed query planner) and has no bypass or option. Scoping the
+  boundary to distributing plans was rejected because distribution is decided
+  later in planning. The stale workspace `Cargo.toml` comment ("Wyrd ships no
+  distributed query path") now describes the shipped dependency.
 - No other avoidable work was measured: every path already issues one
   statement per logical read, with narrow projections and exact predicates.
   `read_result` keeps no time bound, because Postgres and server clocks can
@@ -408,7 +416,7 @@ Shared-subject columns are recorded as low-selectivity under shared components.
 | REQ-026,040; AC-008,014: exact result, no substitution, pending absent, tenant/unknown not found | unchanged `read_result` | `verification_runtime::completed_result_lookup_preserves_evidence` | PASS |
 | Window population, boundaries, other subject/series, empty window unscored | unchanged `ObservationWindow` | `verification_runtime::window_lookup_preserves_population`; `verification::drift::tests::one_statement_decides_completeness_and_scores_from_one_cut` | PASS |
 | Group occurrences separate, ordered, one statement per group | unchanged `GroupPoller` | `verification_runtime::group_lookup_preserves_source_occurrences` | PASS |
-| Declared SQL meaning across live/hot/published and absent/added Blooms; row, byte, deadline and permission refusals; no workload predicate | `oracle/live.rs::LiveUnionBoundary` | `verification_runtime::custom_query_preserves_evidence_and_limits`; `oracle::live::tests::boundary_keeps_a_sorted_sibling_sorted`; `oracle::live::tests::` (7); `oracle::analytical::` (18); oracle `distributed::` live journeys (5) and `peer_network::{analytical,live_subquery}::` (10) | PASS |
+| Declared SQL meaning across live/hot/published and absent/added Blooms; row, byte, deadline and permission refusals; no workload predicate | `oracle/live.rs::LiveUnionBoundary::{optimize, install}` | `verification_runtime::custom_query_preserves_evidence_and_limits` (`ORDER BY id` and `ORDER BY id LIMIT 3` over two pruned published files plus live); `oracle::live::tests::boundary_keeps_a_sorted_sibling_sorted`; `oracle::live::tests::installed_chain_rejects_a_lost_ordering` (RED observed without the appended check); `oracle::live::` and `oracle::analytical::` (26); `mise run test:bifrost:journey:oracle` (whole lane) | PASS |
 | REQ-035,038,042,044; AC-016,018: equal answers with absent/disabled Blooms; nine defaults reviewed unchanged | review above | exploration; `verification_runtime::result_layout_partitions_blooms_and_prunes_by_result` | PASS |
 | REQ-043,045; AC-019: one trace collection per trace per attempt; TASK-006 unchanged | unchanged | U1 `blocks::engine::tests::trace_checks_share_one_attempt_read`; I1–I3 `pg_verification_runtime::{missing_trace_retries_same_execution, missing_trace_exhaustion_keeps_decision_rule, trace_unavailability_preserves_execution_mode}`; J1 `visible_trace_spans_preserve_binding_ownership`; J2 `late_trace_spans_require_new_verification`; completed-result proof's 2 statements for 2 executions | PASS |
 | Profile and storage regressions | unchanged | `oracle::profile::tests::profile_folds_oracle_steps_and_operator_metrics`; `pg_hosted_artifacts::{artifact_evidence_and_code_reach_every_consumer, artifact_reads_refuse_before_use}` | PASS |

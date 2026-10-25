@@ -7357,7 +7357,8 @@ async fn mcp_query(
 /// and `us` row 5 as two more files, and leaves `eu` row 6 live. A
 /// workload-bound Service selecting `region = 'eu'` over MCP reads rows 1, 2,
 /// 4 and 6, in order, although none of them carries its workload, reading
-/// only the two `eu` files' row groups. The same statement under three rows or ten bytes, past a
+/// only the two `eu` files' row groups, and with `LIMIT 3` reads exactly rows
+/// 1, 2 and 4. The same statement under three rows or ten bytes, past a
 /// one-millisecond deadline, or as a caller with no read grant is refused
 /// with no rows.
 ///
@@ -7460,6 +7461,11 @@ async fn custom_query_preserves_evidence_and_limits() -> Result<(), ServerJourne
     // after the terminal; the two `eu` files' row groups are exact.
     if !ScanEvidence::is(work.queries, 1) || !ScanEvidence::is(work.row_groups, 2) {
         return Err(format!("the region filter reaches the scan: {work:?}").into());
+    }
+    let (top, refused) =
+        mcp_query(server, &agent, json!({ "sql": format!("{sql} LIMIT 3") })).await?;
+    if refused || top["rows"] != json!([[1], [2], [4]]) {
+        return Err(format!("the limit keeps the lowest ids: {top}").into());
     }
 
     let (_, outsider_key) = key("custom-outsider", &[]).await?;

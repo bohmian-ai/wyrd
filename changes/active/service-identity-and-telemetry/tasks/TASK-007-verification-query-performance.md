@@ -3,7 +3,7 @@ id: TASK-007
 kind: implementation
 spec: SPEC-service-identity-and-telemetry
 spec_revision: 16
-status: proposed
+status: approved
 depends_on: [TASK-003, TASK-004, TASK-005, TASK-006]
 requirements: [REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-026, REQ-035, REQ-038, REQ-040, REQ-042, REQ-043, REQ-044, REQ-045]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008]

@@ -342,9 +342,12 @@ impl Competing {
         drop(visible);
         let prober = probe(bench.queries(), probes, &admitting);
         let queries = mixed(bench, start, end, &self.sequence, &admitting);
-        let lanes = futures_util::future::join_all(LANES.iter().map(|lane| {
+        // Each lane is its own task: its WyrdState load and submissions are
+        // synchronous work that, polled beside the open-loop schedulers,
+        // would make their arrivals late.
+        let lanes = futures_util::future::join_all((0..LANES.len()).map(|index| {
             let tenant = Arc::clone(tenant);
-            async move { lane.run(&tenant, end).await }
+            tokio::spawn(async move { LANES[index].run(&tenant, end).await })
         }));
         let overload = async {
             tokio::time::sleep_until(admitting.overload).await;
@@ -401,7 +404,9 @@ impl Competing {
         read_arrivals(&mut repetition, &offered, &queries);
         read_overload(&mut repetition, &overload, &queries.acked, &phases);
         for (lane, emitted) in LANES.iter().zip(lanes) {
-            let emitted = emitted.map_err(ExperimentError::workload)?;
+            let emitted = emitted
+                .map_err(ExperimentError::workload)?
+                .map_err(ExperimentError::workload)?;
             read_lane(&mut repetition, lane.name, &emitted, &phases);
         }
         Ok(repetition)

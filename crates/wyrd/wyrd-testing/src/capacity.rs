@@ -1060,6 +1060,128 @@ mod tests {
     };
     use crate::release_server::Metrics;
 
+    /// Controlled delays, waits, and CPU calibrate the shared measurement
+    /// path against references measured independently of it. Each request
+    /// times itself as a server boundary does, around a real sleep of a
+    /// declared length, and records through the production recorder; the
+    /// judged percentiles come back through the snapshot, interval, and
+    /// [`Population`] the engines read. A sleep never ends early, so the
+    /// declared length bounds each time from below, and the test's own
+    /// outer clock, read around the whole request, bounds it from above;
+    /// the judged bucket must overlap that range, and 3 significant digits
+    /// keep it within 0.1% of its value. The residual of a request that
+    /// excludes a known wait must lie within its own work's declared and
+    /// outer bounds, never at zero. Server CPU is read by the same per-PID
+    /// reader over this process: one thread computing for a known wall time
+    /// uses at most that wall time plus two 10 ms accounting ticks and, on
+    /// a host that preempts it, still at least half of it; sleeping uses
+    /// at most two ticks.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a judged time falls outside its independent reference or
+    /// the CPU reader disagrees with the known work beyond its tolerance.
+    #[test]
+    fn known_delay_overhead_and_cpu_calibrate_the_measurement_path() {
+        use std::time::{Duration, Instant};
+
+        use crate::experiment::Reading;
+        use crate::release_server::os::process_cpu_usec;
+
+        wyrd_telemetry::timing::enable();
+        let request = tracing::Span::none();
+        let wait = Duration::from_millis(4);
+        let work = Duration::from_millis(1);
+        let before = wyrd_telemetry::timing::snapshot();
+        let (mut outer_elapsed, mut outer_own) = (Duration::ZERO, Duration::ZERO);
+        for _ in 0..20 {
+            let outer = Instant::now();
+            let started = Instant::now();
+            let waited = Instant::now();
+            std::thread::sleep(wait);
+            let excluded = waited.elapsed();
+            std::thread::sleep(work);
+            wyrd_telemetry::record_timing(
+                &request,
+                "verification.direct",
+                "completed",
+                started.elapsed(),
+                Some(excluded),
+            );
+            outer_elapsed = outer_elapsed.max(outer.elapsed());
+            outer_own = outer_own.max(outer.elapsed() - excluded);
+        }
+        let interval = wyrd_telemetry::timing::snapshot()
+            .since(&before)
+            .expect("one process");
+        let mut population = Population::from_interval(interval);
+        population.expect(&[Expected {
+            boundary: "verification.direct",
+            outcome: "completed",
+            case: UNLABELLED,
+            phase: UNLABELLED,
+            count: 20,
+        }]);
+        let mut repetition = crate::experiment::Repetition::default();
+        population.validate(&mut repetition, "measured");
+        population.percentiles(
+            &mut repetition,
+            "verification.direct",
+            "completed",
+            false,
+            &[("p50_ms", 0.5)],
+        );
+        population.percentiles(
+            &mut repetition,
+            "verification.direct",
+            "completed",
+            true,
+            &[("overhead_p50_ms", 0.5)],
+        );
+        assert!(repetition.invalid.is_empty(), "{:?}", repetition.invalid);
+        let within = |reading: &Reading, low: Duration, high: Duration| {
+            let (Some(above), Some(value)) = (reading.above, reading.value) else {
+                panic!("a bucketed reading: {reading:?}");
+            };
+            let ms = |duration: Duration| duration.as_secs_f64() * 1e3;
+            assert!(
+                above < ms(high) && value >= ms(low),
+                "bucket ({above}, {value}] ms misses the reference [{}, {}] ms",
+                ms(low),
+                ms(high)
+            );
+            assert!(value - above <= value * 1e-3, "3 significant digits");
+        };
+        within(&repetition.reading("p50_ms"), wait + work, outer_elapsed);
+        within(&repetition.reading("overhead_p50_ms"), work, outer_own);
+
+        let pid = std::process::id();
+        let cpu = || process_cpu_usec(pid).expect("this process's CPU");
+        let tick = 20_000;
+        let idle = cpu();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            cpu() - idle <= tick,
+            "sleeping uses no CPU beyond accounting ticks"
+        );
+        let busy = cpu();
+        let started = Instant::now();
+        let mut state = 0_u64;
+        while started.elapsed() < Duration::from_millis(300) {
+            state = std::hint::black_box(
+                state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1),
+            );
+        }
+        let wall = u64::try_from(started.elapsed().as_micros()).expect("short");
+        let used = cpu() - busy;
+        assert!(
+            used <= wall + tick && used >= wall / 2,
+            "{used} µs CPU for {wall} µs of one thread's computation"
+        );
+    }
+
     /// Work still in flight at the stop drains only after the measurement
     /// froze there, and work that ends first freezes it at its end. The
     /// stop snapshot holds the work done before the stop and none of the

@@ -176,8 +176,8 @@ mod tests {
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
     use wyrd_testing::experiment::{
-        Arrivals, Declaration, Engine, ExperimentError, HostRecord, Level, Op, Options, Phase,
-        Reading, Record, Repetition, Rule, Source, Status, Step, StepKind, Timing, Verdict,
+        Arrivals, Declaration, Engine, ExperimentError, HostRecord, Level, Mode, Op, Options,
+        Phase, Reading, Record, Repetition, Rule, Source, Status, Step, StepKind, Timing, Verdict,
         Workload, run,
     };
     use wyrd_testing::release_server::{HostLoad, PEAK_SAMPLE_INTERVAL_MS};
@@ -846,7 +846,9 @@ mod tests {
     }
 
     /// V11: L2 refuses an uncalibrated Bifrost run, calibrates from the
-    /// newest compatible L1 record by the harmonic mix, runs every
+    /// newest compatible L1 record by the harmonic mix and never from a
+    /// smoke record even moved into history, declares a fixed rate for its
+    /// own smoke, runs every
     /// repetition through the whole stateful sequence, and judges
     /// concurrent SLO, backlog, drain, recovery, loss, and shedding at
     /// their boundaries even where isolated work passed.
@@ -928,6 +930,38 @@ mod tests {
         );
         let mixed = 1.0 / (0.5 / 300_000.0 + 0.3 / 150_000.0 + 0.2 / 600_000.0);
         assert!((calibration.mixed_capacity() - mixed).abs() < 1e-6);
+
+        let mut smoked = l1.clone();
+        smoked.mode = Mode::Smoke;
+        let relocated = tempfile::tempdir().expect("relocated");
+        let smoke_path = smoked.publish(relocated.path()).expect("publish smoke");
+        let history = relocated.path().join("benchmarks/bifrost/writes");
+        std::fs::create_dir_all(&history).expect("history");
+        std::fs::rename(&smoke_path, history.join("moved.json")).expect("relocate");
+        let relocated_l2 = declare(
+            Engine::Bifrost,
+            Level::Two,
+            &[],
+            BASELINE_HOST,
+            relocated.path(),
+        );
+        assert!(
+            relocated_l2
+                .refusals()
+                .iter()
+                .any(|reason| reason.code == "calibration.missing"),
+            "a smoke record moved into history never calibrates"
+        );
+        let smoke_l2 = declare(
+            Engine::Bifrost,
+            Level::Two,
+            &["--smoke"],
+            BASELINE_HOST,
+            empty.path(),
+        );
+        assert!(smoke_l2.refusals().is_empty(), "{:?}", smoke_l2.refusals());
+        assert!(smoke_l2.controls["calibration"].get("smoke").is_some());
+        assert!(smoke_l2.variables["ingest_rows_per_s"].as_f64() > Some(0.0));
 
         let root = tempfile::tempdir().expect("root");
         l1.publish(root.path()).expect("publish L1");

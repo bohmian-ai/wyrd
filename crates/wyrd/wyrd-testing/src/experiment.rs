@@ -3316,7 +3316,7 @@ mod tests {
 
     use super::{
         Arrivals, Baselines, Criterion, Declaration, Derive, Direction, Eligibility, Engine,
-        ExperimentError, HostRecord, Invocation, Level, Metric, Mode, Op, Options, Phase,
+        ExperimentError, HostRecord, Invocation, Level, Metric, Mode, Op, Options, Phase, Prepass,
         REPORT_HEADER, Reading, Record, Repetition, Rule, Source, Status, Step, Validity, Verdict,
         Workload, convert, regression, run,
     };
@@ -4939,6 +4939,166 @@ limitations = "excluded"
             complete.publish(&blocked),
             Err(ExperimentError::Persist { .. })
         ));
+    }
+
+    /// A smoke runs the same lifecycle over the selected steps with one
+    /// short warmup and one repetition each: a present percentile under its
+    /// floor is inapplicable with its count, while an empty population and
+    /// zero CPU stay INVALID; its record round-trips `mode: smoke` under
+    /// `target/benchmarks/smoke/` and a failed write is still a persistence
+    /// error. A full run refuses before preparation when its prepass failed
+    /// and keeps a passing prepass beside its own clock; a record without a
+    /// mode reads as full.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a smoke skips or repeats work, waives an integrity check,
+    /// judges a short percentile, lands in history, or a failed prepass
+    /// admits preparation.
+    #[tokio::test(start_paused = true)]
+    async fn smoke_runs_the_selected_workflow_and_stays_out_of_history() {
+        let root = tempfile::tempdir().expect("root");
+        let options = options(&root.path().join("target"));
+        let mut smoke = declaration();
+        smoke.mode = Mode::Smoke;
+        smoke.timing = Level::One.smoke_timing();
+        smoke.selection = Some(vec!["op-64".to_owned()]);
+        let mut short = good();
+        short.set("p99_ms", Reading::exact(0.3).with_samples(40));
+        let mut workload = Scripted::always(&short);
+        let record = execute(
+            smoke.clone(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        let seen = workload.seen.lock().expect("seen");
+        assert_eq!(
+            seen.calls,
+            [
+                ("op-64".to_owned(), Phase::Warmup, Duration::from_secs(1)),
+                (
+                    "op-64".to_owned(),
+                    Phase::Repetition(0),
+                    Duration::from_secs(3)
+                ),
+            ],
+            "only the selected step, one warmup and one repetition"
+        );
+        drop(seen);
+        assert_eq!(record.verdict, Verdict::Pass, "{:?}", record.reasons);
+        let step = record
+            .steps
+            .iter()
+            .find(|step| step.id == "op-64")
+            .expect("selected step");
+        let slo = step
+            .criteria
+            .iter()
+            .find(|judgment| judgment.criterion == "overhead-slo")
+            .expect("slo judgment");
+        assert!(!slo.applicable && slo.verdict.is_none());
+        assert!(
+            slo.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("40 samples")),
+            "{slo:?}"
+        );
+        let mut full = smoke.clone();
+        full.mode = Mode::Full;
+        full.timing = Level::One.timing();
+        let floored = execute(
+            full,
+            &mut Scripted::always(&short),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        assert_eq!(
+            floored.verdict,
+            Verdict::Invalid,
+            "a full run keeps its floor"
+        );
+
+        let mut empty = good();
+        empty.set("p99_ms", Reading::missing("no timing observation"));
+        let mut idle = good();
+        idle.server_cpu_seconds = Some(0.0);
+        for broken in [empty, idle] {
+            let record = execute(
+                smoke.clone(),
+                &mut Scripted::always(&broken),
+                [Some(quiet()), Some(quiet())],
+                &options,
+            )
+            .await;
+            assert_eq!(record.verdict, Verdict::Invalid, "{:?}", record.reasons);
+        }
+
+        let path = record.publish(root.path()).expect("publish");
+        assert!(
+            path.starts_with(
+                root.path()
+                    .join("target/benchmarks/smoke/verification/direct-verify")
+            )
+        );
+        assert!(
+            !root.path().join("benchmarks").exists(),
+            "nothing in history"
+        );
+        let read = Record::read(&path).expect("read back");
+        assert_eq!(read.mode, Mode::Smoke);
+        assert!(read.render().contains("SMOKE"));
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, "a file where the directory must be").expect("blocker");
+        assert!(matches!(
+            record.publish(&blocked),
+            Err(ExperimentError::Persist { .. })
+        ));
+
+        let prepass = |exit_code| Prepass {
+            command: vec![
+                "l1".to_owned(),
+                "verification".to_owned(),
+                "--smoke".to_owned(),
+            ],
+            budget_seconds: 600,
+            elapsed_seconds: 42.0,
+            exit_code,
+            records: "target/benchmarks/smoke/verification/direct-verify".to_owned(),
+        };
+        let mut failed = declaration();
+        failed.prepass = Some(prepass(2));
+        let mut unprepared = Scripted::always(&good());
+        let refused = execute(
+            failed,
+            &mut unprepared,
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        assert_eq!(validity(&refused), ["prepass.failed"]);
+        let seen = unprepared.seen.lock().expect("seen");
+        assert!(!seen.prepared && seen.calls.is_empty());
+        drop(seen);
+        let mut passed = declaration();
+        passed.prepass = Some(prepass(0));
+        let admitted = execute(
+            passed,
+            &mut Scripted::always(&good()),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        assert_eq!(admitted.verdict, Verdict::Pass, "{:?}", admitted.reasons);
+        assert_eq!(admitted.prepass, Some(prepass(0)));
+        assert!(admitted.render().contains("smoke prepass: exit 0 in 42.0s"));
+
+        let mut legacy: serde_json::Value = serde_json::to_value(&admitted).expect("json");
+        legacy.as_object_mut().expect("object").remove("mode");
+        let legacy = Record::parse(&legacy.to_string()).expect("legacy record");
+        assert_eq!(legacy.mode, Mode::Full);
     }
 
     /// A cohort's latency is read from the window start until it drained,

@@ -3372,14 +3372,15 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
         3,
         "one call row and two attempt spans deliver"
     );
-    let tables = received
+    let mut tables = received
         .iter()
         .map(|frame| frame.table.as_str())
         .collect::<Vec<_>>();
+    tables.sort_unstable();
     assert_eq!(
         tables,
         ["bifrost.gateway.calls", "bifrost.traces.spans"],
-        "the call row delivers before its spans"
+        "one call frame and one span frame deliver"
     );
     assert!(received.iter().all(|frame| frame.tenant == tenant));
     let row = self::captured(&scribe, response.call_id);

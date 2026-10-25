@@ -42,8 +42,13 @@ use tokio_util::sync::CancellationToken;
 use crate::profile::{ProfileNote, Profiler};
 use crate::release_server::{Host, HostLoad};
 
-/// The persisted record version this module writes and reads.
-pub const SCHEMA_VERSION: u64 = 1;
+/// The persisted record version this module writes: server timings from
+/// bounded histogram snapshots, percentiles as bucket bounds.
+pub const SCHEMA_VERSION: u64 = 2;
+
+/// The earlier record version this module still reads and reports with its
+/// original meaning: exact raw timing spans from a collector process.
+pub const LEGACY_SCHEMA_VERSION: u64 = 1;
 
 /// Repetitions every measured step keeps.
 pub const REPETITIONS: u8 = 3;
@@ -67,11 +72,11 @@ pub enum ExperimentError {
         #[source]
         source: std::io::Error,
     },
-    /// The record is not well-formed version 1 JSON.
-    #[error("record is not a well-formed v1 record: {0}")]
+    /// The record is not a well-formed record of a version this reader reads.
+    #[error("record is not a well-formed v1 or v2 record: {0}")]
     Malformed(String),
     /// The record names a schema version this reader does not interpret.
-    #[error("record schema_version {0} is not supported; this reader reads version 1")]
+    #[error("record schema_version {0} is not supported; this reader reads versions 1 and 2")]
     Unsupported(u64),
     /// A baselines file could not be read or parsed.
     #[error("baselines {path} could not be read: {message}")]
@@ -1563,11 +1568,12 @@ pub struct CriteriaRecord {
     pub criteria: Vec<Criterion>,
 }
 
-/// One persisted experiment record, schema version 1.
+/// One persisted experiment record: schema version [`SCHEMA_VERSION`] when
+/// written, or a [`LEGACY_SCHEMA_VERSION`] record read back unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {
-    /// Always [`SCHEMA_VERSION`].
+    /// [`SCHEMA_VERSION`], or [`LEGACY_SCHEMA_VERSION`] for a legacy read.
     pub schema_version: u64,
     /// The engine.
     pub engine: Engine,
@@ -2532,12 +2538,13 @@ impl Record {
     /// # Errors
     ///
     /// Returns [`ExperimentError::Unsupported`] for a version other than 1
-    /// and [`ExperimentError::Malformed`] for anything not a v1 record.
+    /// or 2 and [`ExperimentError::Malformed`] for anything not a record of
+    /// its version.
     pub fn parse(text: &str) -> Result<Self, ExperimentError> {
         let value: Value = serde_json::from_str(text)
             .map_err(|error| ExperimentError::Malformed(error.to_string()))?;
         match value.get("schema_version").and_then(Value::as_u64) {
-            Some(SCHEMA_VERSION) => {}
+            Some(SCHEMA_VERSION | LEGACY_SCHEMA_VERSION) => {}
             Some(other) => return Err(ExperimentError::Unsupported(other)),
             None => {
                 return Err(ExperimentError::Malformed(
@@ -2584,6 +2591,15 @@ impl Record {
             self.validity.budget_seconds,
             self.started_at.to_rfc3339(),
         );
+        if let Some(method) = self
+            .controls
+            .values
+            .get("timing")
+            .and_then(|timing| timing.get("method"))
+            .and_then(Value::as_str)
+        {
+            let _ = writeln!(out, "timing (schema {}): {method}\n", self.schema_version);
+        }
         out.push_str(REPORT_HEADER);
         out.push('\n');
         out.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
@@ -4662,10 +4678,10 @@ limitations = "excluded"
         assert_eq!(missing["value"], serde_json::Value::Null);
 
         let text = std::fs::read_to_string(&first).expect("record text");
-        let future = text.replacen("\"schema_version\": 1", "\"schema_version\": 2", 1);
+        let future = text.replacen("\"schema_version\": 2", "\"schema_version\": 3", 1);
         assert!(matches!(
             Record::parse(&future),
-            Err(ExperimentError::Unsupported(2))
+            Err(ExperimentError::Unsupported(3))
         ));
         assert!(matches!(
             Record::parse("{\"verdict\": \"PASS\"}"),
@@ -4690,6 +4706,133 @@ limitations = "excluded"
         assert!(matches!(
             complete.publish(&blocked),
             Err(ExperimentError::Persist { .. })
+        ));
+    }
+
+    /// A cohort's latency is read from the window start until it drained,
+    /// so a completion after the CPU window's end is in its distribution
+    /// and drain accounting while its work counts only what completed
+    /// before; warmup observations before the first snapshot are in
+    /// neither, and a replaced server never yields an interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a window keeps the wrong observations or a replaced
+    /// process differences.
+    #[test]
+    fn histogram_cohorts_preserve_measurement_and_drain_windows() {
+        use crate::capacity::{Population, UNLABELLED};
+        use wyrd_telemetry::timing;
+
+        timing::enable();
+        let record = |micros: u64| {
+            wyrd_telemetry::record_timing(
+                &tracing::Span::none(),
+                "bifrost.query",
+                "success",
+                Duration::from_micros(micros),
+                None,
+            );
+        };
+        record(5_000_000);
+        record(5_000_000);
+        let before = timing::snapshot();
+        for _ in 0..3 {
+            record(100);
+        }
+        let closed = timing::snapshot();
+        record(900_000);
+        let drained = timing::snapshot();
+        let window = |after: &timing::TimingSnapshot| {
+            Population::from_interval(after.since(&before).expect("one process"))
+        };
+        let (measured, mut cohort) = (window(&closed), window(&drained));
+        cohort.expect(&[("bifrost.query", UNLABELLED, 4)], true);
+        assert!(cohort.invalid.is_empty(), "{:?}", cohort.invalid);
+        assert_eq!(measured.count("bifrost.query", UNLABELLED), 3, "work");
+        let latency = cohort.elapsed("bifrost.query", "success").expect("latency");
+        let p99 = Reading::quantile(&latency, 0.99, crate::capacity::NANOS_PER_MS);
+        assert!(
+            p99.above.is_some_and(|above| above < 900.0)
+                && p99.value.is_some_and(|value| value >= 900.0),
+            "the drained completion is the cohort's p99, never the warmup: {p99:?}"
+        );
+        let mut short = window(&closed);
+        short.expect(&[("bifrost.query", UNLABELLED, 4)], true);
+        assert_eq!(short.invalid.len(), 1, "the drain completion is owed");
+        let mut replaced = drained.clone();
+        replaced.process = "another".to_owned();
+        let error = replaced.since(&before).expect_err("a replaced process");
+        assert!(error.contains("replaced"), "{error}");
+    }
+
+    /// A written record is version 2 and names its histogram method and
+    /// bucket bounds in the regenerated report; a legacy version-1 record
+    /// reads and reports with its original raw-span method and collector
+    /// CPU unchanged; any other version is refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a version, method, bound, or legacy cell is lost.
+    #[tokio::test(start_paused = true)]
+    async fn histogram_records_preserve_method_and_legacy_reports() {
+        let root = tempfile::tempdir().expect("root");
+        let options = options(&root.path().join("target"));
+        let mut declared = declaration();
+        declared
+            .controls
+            .insert("timing".to_owned(), crate::capacity::timing_declaration());
+        let mut bounded = good();
+        bounded.set(
+            "p99_ms",
+            Reading::bounded(399_000.0, 401_000.0, 1e6).with_samples(2_000),
+        );
+        bounded.collector_cpu_seconds = None;
+        let mut workload = Scripted::always(&bounded);
+        let record = execute(
+            declared,
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        let path = record.publish(root.path()).expect("publish");
+        let text = std::fs::read_to_string(&path).expect("record text");
+        let read = Record::parse(&text).expect("a v2 record");
+        assert_eq!(read.schema_version, super::SCHEMA_VERSION);
+        let report = read.render();
+        assert_eq!(report, record.render(), "the report regenerates");
+        assert!(
+            report.contains("timing (schema 2): server benchmark histograms"),
+            "{report}"
+        );
+        assert!(report.contains("(0.399, 0.401] ms | PASS"), "{report}");
+        assert!(!report.contains("collector"), "{report}");
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&text).expect("record json");
+        legacy["schema_version"] = json!(super::LEGACY_SCHEMA_VERSION);
+        legacy["controls"]["values"]["timing"]["method"] = json!("server wyrd.timing spans");
+        for repetition in legacy["steps"][0]["repetitions"]
+            .as_array_mut()
+            .expect("repetitions")
+        {
+            repetition["collector_cpu_seconds"] = json!(0.5);
+        }
+        let legacy = Record::parse(&legacy.to_string()).expect("a legacy record");
+        assert_eq!(legacy.schema_version, super::LEGACY_SCHEMA_VERSION);
+        let report = legacy.render();
+        assert!(
+            report.contains("timing (schema 1): server wyrd.timing spans"),
+            "{report}"
+        );
+        assert!(report.contains("(collector 0.5 s)"), "{report}");
+        let reread = Record::parse(&serde_json::to_string(&legacy).expect("legacy json"))
+            .expect("a legacy round trip");
+        assert_eq!(reread, legacy, "a legacy record is never rewritten");
+        let future = text.replacen("\"schema_version\": 2", "\"schema_version\": 3", 1);
+        assert!(matches!(
+            Record::parse(&future),
+            Err(ExperimentError::Unsupported(3))
         ));
     }
 

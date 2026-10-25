@@ -670,7 +670,10 @@ mod tests {
 
     /// Span names of every tenant copy staged, in end order.
     #[derive(Default)]
-    struct Staged(Mutex<Vec<String>>);
+    struct Staged(
+        /// The staged span names.
+        Mutex<Vec<String>>,
+    );
 
     impl TenantSpanSink for Staged {
         /// Record the staged copy's span names.
@@ -694,6 +697,11 @@ mod tests {
     ///
     /// The request runs a catalog child, a debug diagnostic span, an info
     /// event, and an error event.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed caller traceparent or principal id fails to
+    /// parse.
     fn serve(logs: &str, traces: &str, ratio: f64) -> (Vec<String>, Vec<String>, String) {
         let operator = super::CaptureExporter {
             spans: Arc::default(),
@@ -755,6 +763,12 @@ mod tests {
     /// a sampled client's request unchanged; only the operator's diagnostic
     /// spans follow the operator filter, and an error in a request the
     /// operator did not sample is still logged inside its request span.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a tenant copy differs between filter settings, the
+    /// operator receives the wrong spans, or the unsampled error is missing
+    /// from the log or lacks its request's span context.
     #[test]
     fn production_filters_preserve_tenant_traces() {
         let (tenant, operator, logs) = serve("info", "info", 0.0);
@@ -788,7 +802,10 @@ mod tests {
 
     /// Log output shared between a test and the subscriber writing it.
     #[derive(Clone, Default)]
-    struct Logs(Arc<Mutex<Vec<u8>>>);
+    struct Logs(
+        /// The bytes written so far.
+        Arc<Mutex<Vec<u8>>>,
+    );
 
     impl Logs {
         /// Everything written so far.
@@ -800,6 +817,10 @@ mod tests {
 
     impl std::io::Write for Logs {
         /// Append `bytes`.
+        ///
+        /// # Errors
+        ///
+        /// Never fails.
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0
                 .lock()
@@ -809,6 +830,10 @@ mod tests {
         }
 
         /// Nothing is buffered.
+        ///
+        /// # Errors
+        ///
+        /// Never fails.
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
@@ -828,6 +853,10 @@ mod tests {
 
     impl opentelemetry_sdk::trace::SpanExporter for Gated {
         /// Report the call, then wait for the test to release its result.
+        ///
+        /// # Errors
+        ///
+        /// Returns the error the test released for this call.
         fn export(
             &self,
             batch: Vec<opentelemetry_sdk::trace::SpanData>,
@@ -866,7 +895,10 @@ mod tests {
     }
 
     /// Counts increments of the failed-batch counter and nothing else.
-    struct FailedBatchCount(Arc<std::sync::atomic::AtomicU64>);
+    struct FailedBatchCount(
+        /// The failed-batch counter's cell.
+        Arc<std::sync::atomic::AtomicU64>,
+    );
 
     impl metrics::Recorder for FailedBatchCount {
         /// Descriptions are not recorded.
@@ -932,6 +964,13 @@ mod tests {
     /// counts one failed batch while its error reaches the processor, and a
     /// stalled shutdown returns within its timeout before the exporter is
     /// shut down.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another metrics recorder is installed, an export call
+    /// does not start or complete as released, a failed call is miscounted
+    /// or its error altered, a drop signal is missing, or the stalled
+    /// shutdown does not time out before reaching the exporter.
     #[test]
     fn operator_export_loss_is_observable() {
         use opentelemetry::trace::{Span as _, Tracer as _};
@@ -1130,6 +1169,11 @@ mod tests {
 
     /// An unset operator ratio samples 1% of traces, an explicit ratio in
     /// `0.0..=1.0` is honored exactly, and anything else is refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the default is not 1%, an explicit ratio is altered, or
+    /// an invalid ratio is accepted.
     #[test]
     fn operator_sampling_defaults_are_explicit() {
         let sampler = |sample_ratio| {

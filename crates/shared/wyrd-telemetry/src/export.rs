@@ -252,10 +252,17 @@ pub const TRACE_EXPORT_FAILED_BATCHES_TOTAL: &str = "wyrd_trace_export_failed_ba
 /// The result is returned unchanged, and flush, shutdown, and resource
 /// calls go straight to the wrapped exporter.
 #[derive(Debug)]
-pub(crate) struct FailedBatches<E>(pub(crate) E);
+pub(crate) struct FailedBatches<E>(
+    /// The operator's exporter, which performs every call.
+    pub(crate) E,
+);
 
 impl<E: SpanExporter> SpanExporter for FailedBatches<E> {
     /// Export `batch`, counting the call once if it fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped exporter's export failure unchanged.
     fn export(
         &self,
         batch: Vec<SpanData>,

@@ -5681,6 +5681,10 @@ async fn native_signal_values_and_attribution_are_validated_before_ack()
 type TraceSpan = (u64, &'static str, i64);
 
 /// `spans` of `trace` as one batch of the described span `schema`.
+///
+/// # Panics
+/// Panics when the described schema does not assemble the span rows, as
+/// [`canonical_signals::trace_spans`] does.
 fn trace_batch(schema: &SchemaRef, trace: TraceId, spans: &[TraceSpan]) -> RecordBatch {
     canonical_signals::trace_spans(schema, trace.as_bytes(), spans)
 }

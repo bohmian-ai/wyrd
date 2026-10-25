@@ -1760,6 +1760,10 @@ impl TraceSource for CountingTraces {
 
 /// A Verifier over trace slots `a`, `b` (naming the same trace as `a`), and
 /// `late`: two concurrent checks on `a`, one on `b`, and one on `late`.
+///
+/// # Panics
+/// Panics when the fixture is not a valid Verifier spec, as [`verifier`]
+/// does.
 fn shared_trace_verifier() -> Arc<VerifierSpec> {
     let check = |slot: &str, selector: &str, expected: Value| json!({"kind": "trace", "on": format!("inputs.{slot}"), "span_selector": selector, "operator": "equals", "expected": expected});
     verifier(json!({

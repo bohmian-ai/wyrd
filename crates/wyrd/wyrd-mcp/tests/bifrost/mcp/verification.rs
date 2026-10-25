@@ -2348,6 +2348,11 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns describe, encode, ingest, or publication failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the described span schema does not assemble the span
+    /// rows, as `canonical_signals::trace_spans` does.
     async fn write_spans(
         server: &WyrdTestServer,
         client: &wyrd_client::WyrdClient,

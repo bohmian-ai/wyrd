@@ -1,7 +1,7 @@
 ---
 id: TASK-006
 kind: implementation
-status: proposed
+status: approved
 spec: SPEC-service-identity-and-telemetry
 spec_revision: 16
 requirements: [REQ-014, REQ-015, REQ-040, REQ-043, REQ-045, REQ-046, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, AC-014, AC-017, AC-019, AC-020]

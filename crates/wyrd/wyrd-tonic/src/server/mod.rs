@@ -223,8 +223,9 @@ where
 /// leaves the span the root of a new trace. The span carries the RPC service
 /// and method from the request path, never metadata values. A continued
 /// trace stages its tenant span copies on the serving server's
-/// `tenant_spans` sink. A benchmark server classifies it from its benchmark
-/// metadata ([`wyrd_telemetry::timing::label_request`]).
+/// `tenant_spans` sink. A benchmark server reads its declared benchmark
+/// metadata ([`wyrd_telemetry::timing::label_request`]); only a successful
+/// authentication owner later activates them.
 fn request_span(
     request: &HttpRequest<()>,
     tenant_spans: Option<&Arc<dyn wyrd_telemetry::TenantSpanSink>>,

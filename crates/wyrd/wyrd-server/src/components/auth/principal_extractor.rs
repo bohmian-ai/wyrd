@@ -120,7 +120,8 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
     /// Reuses the principal `require_authenticated` already verified and
     /// inserted into the request extensions; otherwise runs the shared
     /// Wyrd-audience verify pipeline against the request headers, so off-nest
-    /// routes authenticate identically to `/v1`.
+    /// routes authenticate identically to `/v1`. A resolved principal
+    /// activates the request's benchmark classification.
     ///
     /// # Errors
     /// Returns `401` when the access-token header is missing or verification
@@ -147,6 +148,9 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
                 },
                 |principal| Ok(principal.clone()),
             );
+        if resolved.is_ok() {
+            wyrd_telemetry::timing::activate_request(&tracing::Span::current());
+        }
         std::future::ready(resolved)
     }
 }

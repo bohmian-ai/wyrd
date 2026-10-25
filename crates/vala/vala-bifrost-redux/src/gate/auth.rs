@@ -60,8 +60,11 @@ impl AuthContext {
     /// verified gRPC caller passes through here, so this also routes the
     /// current request's tenant span copies to that tenant and principal; a
     /// request that did not continue a sampled client trace is not routed.
+    /// It also activates the request's declared benchmark classification,
+    /// which only an authenticated caller's request selects.
     #[must_use]
     pub fn from_verified(verified: VerifiedToken, metadata: &MetadataMap) -> Self {
+        wyrd_telemetry::timing::activate_request(&tracing::Span::current());
         wyrd_telemetry::bind_tenant_route(wyrd_telemetry::TenantSpanRoute {
             tenant: verified.principal.tenant_id,
             attribution: wyrd_runtime::delegated_attribution(

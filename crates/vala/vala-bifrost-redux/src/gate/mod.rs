@@ -2964,6 +2964,74 @@ mod tests {
         assert_eq!(series("failed").count, 1);
     }
 
+    /// Benchmark metadata on a native write refused for lacking a
+    /// credential leaves the classification invalidity unchanged, while the
+    /// same unknown metadata on a verified caller's write is counted once.
+    ///
+    /// # Panics
+    /// Panics when the test pipeline does not initialize, a write's
+    /// admission differs, or the invalid-label count moves for the refused
+    /// write or not for the verified one.
+    #[tokio::test]
+    async fn only_verified_writes_activate_benchmark_labels() {
+        use tracing::Instrument as _;
+        use wyrd_telemetry::timing;
+
+        let _telemetry =
+            wyrd_telemetry::init_test_capture(wyrd_telemetry::TelemetryConfig::default())
+                .expect("test telemetry pipeline initializes");
+        timing::enable();
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
+            Arc::new(SlowScribe),
+            test_interceptor(),
+            IngestLimits::default(),
+        )
+        .with_audit(RecordingAudit::new());
+        let caller = context_with(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            [Permission::bifrost_record_write()],
+        );
+        let labelled = || {
+            let span = tracing::info_span!("request");
+            let mut headers = http::HeaderMap::new();
+            headers.insert(timing::CASE_HEADER, http::HeaderValue::from_static("drop"));
+            timing::label_request(&span, &headers);
+            span
+        };
+        let request = || {
+            wyrd_tonic::tonic::Request::new(wyrd_tonic::wyrd::v1::InsertBatchRequest {
+                table_version: 1,
+                ..native_frame("vala.datasets.events")
+            })
+        };
+        let invalid = || timing::snapshot().invalid_labels;
+        let before = invalid();
+        assert!(
+            gate.write_batch(request())
+                .instrument(labelled())
+                .await
+                .is_err(),
+            "a write without a credential is refused"
+        );
+        assert_eq!(invalid(), before, "a refused write counts nothing");
+        let mut verified = request();
+        verified
+            .extensions_mut()
+            .insert(super::auth::ResolvedCaller(
+                wyrd_auth_verify::VerifiedToken {
+                    principal: caller.principal.clone(),
+                    delegation_chain: Vec::new(),
+                    exp: chrono::Utc::now() + chrono::Duration::hours(1),
+                },
+            ));
+        gate.write_batch(verified)
+            .instrument(labelled())
+            .await
+            .expect("the verified write is admitted");
+        assert_eq!(invalid(), before + 1, "a verified write is classified");
+    }
+
     /// Query request lifecycles emit one exact terminal and drain active work.
     #[test]
     fn query_request_lifecycle_reconciles_exact_terminal_outcomes() {

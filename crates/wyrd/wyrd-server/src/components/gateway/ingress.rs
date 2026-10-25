@@ -125,7 +125,8 @@ impl GatewayIngress {
     /// refuses, is refused in the protocol's envelope without reading the
     /// body; a refused key never falls back to token verification. An
     /// authenticated request also carries the [`IngressClock`] its handler
-    /// uses to time the call from the request's arrival.
+    /// uses to time the call from the request's arrival, and activates its
+    /// benchmark classification.
     async fn authenticate(self, state: AppState, mut request: Request, next: Next) -> Response {
         let authenticating = std::time::Instant::now();
         let native = self.native_header();
@@ -167,6 +168,7 @@ impl GatewayIngress {
                 let extensions = request.extensions_mut();
                 extensions.insert(principal);
                 extensions.insert(IngressClock::authenticated(arrival, authenticating));
+                wyrd_telemetry::timing::activate_request(&tracing::Span::current());
                 next.run(request).await
             }
             Err(error) => self.error(&error),

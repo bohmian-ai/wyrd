@@ -215,9 +215,9 @@ impl Level {
 ///
 /// A smoke runs the same declaration, fixtures, steps, phases,
 /// measurement, validity, and record as a full run with a smaller fixture
-/// and [`Level::smoke_timing`]. It only shows the workflow runs: it judges
-/// no criterion, so it is PASS or INVALID, never qualifies performance or
-/// serves as a reference, and its records stay under
+/// and [`Level::smoke_timing`]. It only shows the workflow runs correctly:
+/// it judges correctness criteria and no numeric target, never qualifies
+/// performance or serves as a reference, and its records stay under
 /// `target/benchmarks/smoke/`. A record without a mode is a full run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -2432,10 +2432,11 @@ fn summarize(declaration: &Declaration, repetitions: &[Repetition]) -> BTreeMap<
         .collect()
 }
 
-/// Judges one criterion over a step's repetitions. A smoke judges no
-/// target: once its evidence is present, every criterion is inapplicable,
-/// so a smoke is only PASS or INVALID; a missing reading or an empty
-/// percentile population stays INVALID in both modes.
+/// Judges one criterion over a step's repetitions. A smoke judges only
+/// correctness criteria (judged over every repetition, such as no server
+/// errors); once its evidence is present every numeric target is
+/// inapplicable. A missing reading or an empty percentile population stays
+/// INVALID in both modes.
 fn judge_criterion(
     criterion: &Criterion,
     repetitions: &[Repetition],
@@ -2531,10 +2532,18 @@ fn judge_criterion(
         ));
         return judgment;
     }
-    if mode == Mode::Smoke {
+    if mode == Mode::Smoke
+        && !matches!(
+            criterion.rule,
+            Rule::Limit {
+                over: Over::Every,
+                ..
+            }
+        )
+    {
         return inapplicable(
             judgment,
-            "not judged in a smoke: a smoke only shows the workflow runs".to_owned(),
+            "not judged in a smoke: a smoke judges correctness, not targets".to_owned(),
         );
     }
     match &criterion.rule {
@@ -4947,8 +4956,9 @@ limitations = "excluded"
     }
 
     /// A smoke runs the same lifecycle over the selected steps with one
-    /// short warmup and one repetition each: it judges no target, so a
-    /// short percentile and a missed limit are inapplicable, while an empty
+    /// short warmup and one repetition each: it judges no numeric target, so
+    /// a short percentile and a missed limit are inapplicable, server errors
+    /// still FAIL it, and an empty
     /// population and zero CPU stay INVALID; its record round-trips
     /// `mode: smoke` under `target/benchmarks/smoke/` and a failed write is
     /// still a persistence error. A full run refuses before preparation when its prepass failed
@@ -4958,7 +4968,7 @@ limitations = "excluded"
     /// # Panics
     ///
     /// Panics when a smoke skips or repeats work, waives an integrity check,
-    /// judges a target, lands in history, or a failed prepass
+    /// judges a target, waives correctness, lands in history, or a failed prepass
     /// admits preparation.
     #[tokio::test(start_paused = true)]
     async fn smoke_runs_the_selected_workflow_and_stays_out_of_history() {
@@ -5037,6 +5047,20 @@ limitations = "excluded"
             Verdict::Pass,
             "a smoke judges no target: {:?}",
             missed.reasons
+        );
+        let mut failing = good();
+        failing.set("errors", Reading::count(3));
+        let errored = execute(
+            smoke.clone(),
+            &mut Scripted::always(&failing),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        assert_eq!(
+            errored.verdict,
+            Verdict::Fail,
+            "a smoke still judges correctness"
         );
 
         let mut empty = good();

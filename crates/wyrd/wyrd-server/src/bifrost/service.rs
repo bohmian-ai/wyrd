@@ -1,4 +1,5 @@
-//! RBAC-gated Bifrost catalog service functions (register / list / describe).
+//! RBAC-gated Bifrost catalog service functions (register / alter / list /
+//! describe).
 //!
 //! Each function authorizes the caller against the runtime RBAC model *before*
 //! touching the Redux catalog, mirroring `storage::service`. Engine errors cross
@@ -6,11 +7,14 @@
 //! rendered by the single `WyrdErrorResponse`.
 
 use arrow::datatypes::Field;
-use vala_bifrost_redux::catalog::{BifrostCatalogError, CompactionRegistration, TableRef};
+use vala_bifrost_redux::catalog::{
+    BifrostCatalogError, CompactionRegistration, TableAlteration, TableRef,
+};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    BifrostTableDescription, BifrostTableEntry, RegisterTableRequest, RegisterTableResponse,
+    AlterTableRequest, BifrostTableDescription, BifrostTableEntry, RegisterTableRequest,
+    RegisterTableResponse,
 };
 use wyrd_types::spec_to_field;
 
@@ -61,14 +65,14 @@ pub async fn register_table(
         state,
         &caller,
         &Permission::bifrost_table_write(),
-        "vala.bifrost.register",
+        "bifrost.bifrost.register",
         &fqn_for_audit,
     )?;
 
     let ns = convert::namespace_from_wire(&body.namespace)?;
     if ns != vala_bifrost_redux::namespaces::BifrostNamespace::Datasets {
         return Err(WyrdError::Validation {
-            message: "only vala.datasets registrations are caller-owned".to_owned(),
+            message: "only bifrost.datasets registrations are caller-owned".to_owned(),
             details: serde_json::json!({ "table": fqn_for_audit }),
         });
     }
@@ -119,7 +123,7 @@ pub async fn list_tables(
         state,
         &caller,
         &Permission::bifrost_table_read(),
-        "vala.bifrost.list",
+        "bifrost.bifrost.list",
         "bifrost.tables",
     )?;
     state
@@ -159,7 +163,7 @@ pub async fn describe_table(
         state,
         &caller,
         &Permission::bifrost_table_read(),
-        "vala.bifrost.describe",
+        "bifrost.bifrost.describe",
         &requested_fqn,
     )?;
     let ns = convert::namespace_from_wire(&namespace)?;
@@ -169,6 +173,71 @@ pub async fn describe_table(
         .catalog()
         .ok_or(wyrd_spec::vala::BifrostError::ScribeRoleUnavailable)?
         .describe_table(&table, caller.data_tenant_id)
+        .await
+        .map_err(map_engine_error)
+}
+
+/// Explicitly alter one table's definition in the caller's tenant.
+///
+/// Altering requires `bifrost_table:write`, the tenant-wide table
+/// administration grant, for built-in and dynamic tables alike; record and
+/// query grants never authorize it. Exactly one canonical audit row records
+/// the verdict, staged before validation, so the edit never waits on the
+/// audit commit. The table is looked up in the caller's own tenant only, so
+/// another tenant's same-named table is never seen.
+///
+/// # Errors
+///
+/// Returns a permission error when the caller lacks `bifrost_table:write`,
+/// a validation error for an unknown namespace,
+/// [`wyrd_spec::vala::BifrostError::UnsupportedType`] for an added column
+/// Bifrost cannot store,
+/// [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
+/// carries no catalog, and the mapped catalog error (not found, stale or
+/// exhausted version, invalid edit or layout) otherwise.
+///
+/// # Cancellation and partial progress
+///
+/// As [`vala_bifrost_redux::catalog::BifrostCatalog::alter_table`]: the edit
+/// commits or rolls back as one, so a dropped request changes nothing or
+/// leaves the whole edit committed, and a lost response can hide only a
+/// complete commit.
+pub async fn alter_table(
+    state: &AppState,
+    caller: Caller,
+    namespace: String,
+    name: String,
+    body: AlterTableRequest,
+) -> Result<BifrostTableDescription, WyrdError> {
+    let requested_fqn = format!("{namespace}.{name}");
+    audit::authorize(
+        state,
+        &caller,
+        &Permission::bifrost_table_write(),
+        "bifrost.bifrost.alter",
+        &requested_fqn,
+    )?;
+    let ns = convert::namespace_from_wire(&namespace)?;
+    let add_columns = body.add_columns.unwrap_or_default();
+    wyrd_types::schema::check_supported(&add_columns)?;
+    let table = TableRef::new(ns, name);
+    state
+        .bifrost
+        .catalog()
+        .ok_or(wyrd_spec::vala::BifrostError::ScribeRoleUnavailable)?
+        .alter_table(
+            caller.data_tenant_id,
+            &table,
+            TableAlteration {
+                expected_table_version: body.expected_table_version,
+                physical_layout: body.physical_layout.unwrap_or_default(),
+                add_columns: add_columns
+                    .iter()
+                    .map(|spec| spec_to_field(spec, true))
+                    .collect(),
+                rename_columns: body.rename_columns.unwrap_or_default(),
+            },
+        )
         .await
         .map_err(map_engine_error)
 }
@@ -296,12 +365,12 @@ mod pg_tests {
         assert_eq!(row.request_id, caller.request_id.as_str());
     }
 
-    /// Builds a `vala.datasets` registration request for `name` with the given
+    /// Builds a `bifrost.datasets` registration request for `name` with the given
     /// fields and every optional layout and compaction setting left unset, so
     /// each test exercises the server defaults.
     fn register_req(name: &str, fields: Vec<FieldSpec>) -> RegisterTableRequest {
         RegisterTableRequest {
-            namespace: "vala.datasets".to_owned(),
+            namespace: "bifrost.datasets".to_owned(),
             name: name.to_owned(),
             fields,
             physical_layout: None,
@@ -365,7 +434,7 @@ mod pg_tests {
                 describe_table(
                     &state,
                     caller.clone(),
-                    "vala.datasets".to_owned(),
+                    "bifrost.datasets".to_owned(),
                     name.clone(),
                 )
                 .await
@@ -417,7 +486,7 @@ mod pg_tests {
             let default = describe_table(
                 &state,
                 caller.clone(),
-                "vala.datasets".to_owned(),
+                "bifrost.datasets".to_owned(),
                 default_name,
             )
             .await
@@ -460,7 +529,7 @@ mod pg_tests {
                 let state = &state;
                 let caller = caller.clone();
                 async move {
-                    describe_table(state, caller, "vala.datasets".to_owned(), name)
+                    describe_table(state, caller, "bifrost.datasets".to_owned(), name)
                         .await
                         .expect("registered table describes")
                         .compaction_type
@@ -536,8 +605,13 @@ mod pg_tests {
                 .await
                 .expect_err("an undeclarable layout is refused");
 
-            let rows =
-                audit_rows_for(&state, &scribe, &caller, &format!("vala.datasets.{name}")).await;
+            let rows = audit_rows_for(
+                &state,
+                &scribe,
+                &caller,
+                &format!("bifrost.datasets.{name}"),
+            )
+            .await;
             assert_eq!(rows.len(), 1, "one received verdict, one row");
             assert_eq!(rows[0].outcome, "allowed");
         });
@@ -572,7 +646,7 @@ mod pg_tests {
             );
             assert_eq!(first.table_uid, second.table_uid);
 
-            let resource = format!("vala.datasets.{name}");
+            let resource = format!("bifrost.datasets.{name}");
             for caller in [&first_caller, &second_caller] {
                 let rows = audit_rows_for(&state, &scribe, caller, &resource).await;
                 assert_eq!(rows.len(), 1, "each request records one verdict");
@@ -624,13 +698,19 @@ mod pg_tests {
         });
     }
 
+    /// Proves a caller holding table write cannot register into a built-in
+    /// namespace such as `bifrost.traces`, which only the server owns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the registration succeeds or fails with a status other than 400.
     #[test]
     fn bifrost_tables_register_reserved_namespace_is_rejected() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
             let writer = caller_with([Permission::bifrost_table_write()]);
             let mut denied = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
-            denied.namespace = "vala.traces".to_owned();
+            denied.namespace = "bifrost.traces".to_owned();
             let err = register_table(&state, writer, denied)
                 .await
                 .expect_err("built-in namespace is not caller-owned");
@@ -638,6 +718,14 @@ mod pg_tests {
         });
     }
 
+    /// Proves a registered table is listed and described with its user field,
+    /// and that list, register, and describe each audit one allowed verdict.
+    ///
+    /// # Panics
+    ///
+    /// Panics when register, list, or describe fails, the table or its `value`
+    /// field is missing, or the audit rows differ from one allowed list row and
+    /// one allowed register then describe row for the table.
     #[test]
     fn bifrost_tables_list_and_describe_reflect_registration() {
         wyrd_runtime::runtime().block_on(async {
@@ -660,14 +748,14 @@ mod pg_tests {
             assert!(
                 entries
                     .iter()
-                    .any(|e| e.name == name && e.namespace == "vala.datasets"),
+                    .any(|e| e.name == name && e.namespace == "bifrost.datasets"),
                 "registered table is listed"
             );
 
             let described = describe_table(
                 &state,
                 caller.clone(),
-                "vala.datasets".to_owned(),
+                "bifrost.datasets".to_owned(),
                 name.clone(),
             )
             .await
@@ -687,17 +775,22 @@ mod pg_tests {
                 1,
                 "a permitted list audits its own read verdict exactly once"
             );
-            assert_eq!(list_rows[0].operation, "vala.bifrost.list");
+            assert_eq!(list_rows[0].operation, "bifrost.bifrost.list");
             assert_eq!(list_rows[0].outcome, "allowed");
-            let table_rows =
-                audit_rows_for(&state, &scribe, &caller, &format!("vala.datasets.{name}")).await;
+            let table_rows = audit_rows_for(
+                &state,
+                &scribe,
+                &caller,
+                &format!("bifrost.datasets.{name}"),
+            )
+            .await;
             let operations: Vec<&str> = table_rows
                 .iter()
                 .map(|row| row.operation.as_str())
                 .collect();
             assert_eq!(
                 operations,
-                vec!["vala.bifrost.register", "vala.bifrost.describe"],
+                vec!["bifrost.bifrost.register", "bifrost.bifrost.describe"],
                 "register and describe each audit their own verdict once"
             );
             assert!(
@@ -708,6 +801,11 @@ mod pg_tests {
     }
 
     /// A denied list returns 403 and leaves one canonical deny row behind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the list succeeds or is not a 403, or the audit log does not
+    /// hold exactly one denied `bifrost.bifrost.list` row for this caller.
     #[test]
     fn bifrost_tables_list_requires_read_permission() {
         wyrd_runtime::runtime().block_on(async {
@@ -720,11 +818,16 @@ mod pg_tests {
 
             let rows = audit_rows_for(&state, &scribe, &caller, "bifrost.tables").await;
             assert_eq!(rows.len(), 1, "denied list appends exactly one audit row");
-            assert_read_denial_row(&rows[0], "vala.bifrost.list", "bifrost.tables", &caller);
+            assert_read_denial_row(&rows[0], "bifrost.bifrost.list", "bifrost.tables", &caller);
         });
     }
 
     /// A denied describe returns 403 and audits the requested table name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the describe succeeds or is not a 403, or the audit log does
+    /// not hold exactly one denied `bifrost.bifrost.describe` row for the table.
     #[test]
     fn bifrost_tables_describe_requires_read_permission() {
         wyrd_runtime::runtime().block_on(async {
@@ -734,21 +837,21 @@ mod pg_tests {
             let err = describe_table(
                 &state,
                 caller.clone(),
-                "vala.datasets".to_owned(),
+                "bifrost.datasets".to_owned(),
                 name.clone(),
             )
             .await
             .expect_err("no read permission is denied");
             assert_eq!(err.status(), 403);
 
-            let resource = format!("vala.datasets.{name}");
+            let resource = format!("bifrost.datasets.{name}");
             let rows = audit_rows_for(&state, &scribe, &caller, &resource).await;
             assert_eq!(
                 rows.len(),
                 1,
                 "denied describe appends exactly one audit row"
             );
-            assert_read_denial_row(&rows[0], "vala.bifrost.describe", &resource, &caller);
+            assert_read_denial_row(&rows[0], "bifrost.bifrost.describe", &resource, &caller);
         });
     }
 }

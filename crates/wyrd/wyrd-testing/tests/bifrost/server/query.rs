@@ -83,7 +83,7 @@ fn journey_delegation_chain() -> Vec<wyrd_runtime::DelegationStep> {
 
 /// Reads the retained read-decision detail for one request id.
 ///
-/// The decision is read from retained history in `vala.system.audit_log` once
+/// The decision is read from retained history in `bifrost.system.audit_log` once
 /// the Scribe outbox has settled every decision staged so far.
 ///
 /// # Errors
@@ -99,7 +99,9 @@ async fn read_decision_detail(
         .retained_audit_records(
             tenant,
             "detail",
-            &format!("operation = 'bifrost.query.read_decision' AND request_id = '{request_id}'"),
+            &format!(
+                "operation = 'bifrost.query.read_decision' AND wyrd_request_id = '{request_id}'"
+            ),
         )
         .await?;
     let [record] = records.as_slice() else {
@@ -117,7 +119,7 @@ const READINESS_CEILING: std::time::Duration = std::time::Duration::from_secs(30
 
 /// Counts retained audit rows written under one operation name.
 ///
-/// The harness settles the Scribe outbox and counts `vala.system.audit_log`;
+/// The harness settles the Scribe outbox and counts `bifrost.system.audit_log`;
 /// its own inspection reads are excluded there by principal, so counting read
 /// decisions never counts itself.
 ///
@@ -256,7 +258,7 @@ async fn signed_forwarding_preserves_shorter_absolute_deadline() -> Result<(), S
             physical_layout: None,
         })
         .await?;
-    let query = request(&format!("SELECT value FROM vala.bifrost.{table}"));
+    let query = request(&format!("SELECT value FROM bifrost.bifrost.{table}"));
     assert_eq!(query.deadline_ms, Some(30_000));
     let deadline = chrono::Utc::now().timestamp_millis() + 5_000;
     let mut stream = server
@@ -346,7 +348,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
             physical_layout: None,
         })
         .await?;
-    let sql = format!("SELECT value FROM vala.bifrost.{table} ORDER BY value");
+    let sql = format!("SELECT value FROM bifrost.bifrost.{table} ORDER BY value");
 
     // Readiness first: every claim below is about a node that is actually
     // serving, not one that answered before its dependencies resolved.
@@ -382,7 +384,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
     .await?;
     writer
         .write(
-            &format!("vala.bifrost.{table}"),
+            &format!("bifrost.bifrost.{table}"),
             &value_schema(),
             FIXTURE_VALUES.map(value_row),
         )
@@ -491,7 +493,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
 
     // A refused public request carries the canonical Wyrd problem document.
     let mut unknown = wyrd_tonic::tonic::Request::new(proto::BifrostQueryRequest::from(request(
-        "SELECT value FROM vala.bifrost.no_such_journey_table",
+        "SELECT value FROM bifrost.bifrost.no_such_journey_table",
     )));
     unknown.metadata_mut().insert(
         "x-wyrd-access-token",
@@ -644,7 +646,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
     for _ in 0..2 {
         writer
             .write(
-                &format!("vala.bifrost.{table}"),
+                &format!("bifrost.bifrost.{table}"),
                 &value_schema(),
                 FIXTURE_VALUES.map(value_row),
             )
@@ -653,7 +655,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
     }
     cluster.refresh_oracle_snapshots().await?;
     let sql = format!(
-        "SELECT value, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY value ORDER BY value"
+        "SELECT value, COUNT(*) AS matched FROM bifrost.bifrost.{table} GROUP BY value ORDER BY value"
     );
     prove_scheduled_analytical_completion(&cluster, &sql).await?;
 
@@ -807,7 +809,7 @@ async fn oracle_only_pod_retains_audit_staged_before_its_drain() -> Result<(), S
         .bifrost
         .query_sql(
             scheduled_context(tenant)?,
-            request(&format!("SELECT value FROM vala.bifrost.{table}")),
+            request(&format!("SELECT value FROM bifrost.bifrost.{table}")),
         )
         .await?;
     while let Some(frame) = stream.frames.next().await {
@@ -1018,13 +1020,13 @@ const QUERY_OPERATION: &str = "vala.query.sync";
 /// Audited operation name Oracle commits one accepted read decision under.
 const READ_DECISION_OPERATION: &str = "bifrost.query.read_decision";
 
-/// Non-sensitive projection of `vala.logs.records`.
-const LOGS_SQL: &str = "SELECT severity_text FROM vala.logs.records";
-/// Non-sensitive projection of `vala.traces.spans`.
-const TRACES_SQL: &str = "SELECT name FROM vala.traces.spans";
+/// Non-sensitive projection of `bifrost.logs.records`.
+const LOGS_SQL: &str = "SELECT severity_text FROM bifrost.logs.records";
+/// Non-sensitive projection of `bifrost.traces.spans`.
+const TRACES_SQL: &str = "SELECT name FROM bifrost.traces.spans";
 /// One plan whose resolved scan set spans both schemas.
 const MIXED_SQL: &str = "SELECT r.severity_text, s.name \
-     FROM vala.logs.records r JOIN vala.traces.spans s ON r.trace_id = s.trace_id";
+     FROM bifrost.logs.records r JOIN bifrost.traces.spans s ON r.trace_id = s.trace_id";
 
 /// Drives the complete `analyst` / `data_scientist` access matrix.
 ///
@@ -1046,7 +1048,7 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
         .ensure_builtin(
             tenant,
             vala_bifrost_redux::tables::builtin_table("logs", "records")
-                .ok_or("no canonical vala.logs.records definition")?,
+                .ok_or("no canonical bifrost.logs.records definition")?,
             wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
@@ -1054,7 +1056,7 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
         .ensure_builtin(
             tenant,
             vala_bifrost_redux::tables::builtin_table("traces", "spans")
-                .ok_or("no canonical vala.traces.spans definition")?,
+                .ok_or("no canonical bifrost.traces.spans definition")?,
             wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
@@ -1062,14 +1064,14 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
     let base = server.base_url().ok_or("missing HTTP URL")?.to_owned();
     await_server_ready(&base).await?;
 
-    // `analyst` holds the whole `vala.logs` schema; `data_scientist` holds the
-    // single resolved `vala.traces.spans` UID and nothing else.
+    // `analyst` holds the whole `bifrost.logs` schema; `data_scientist` holds the
+    // single resolved `bifrost.traces.spans` UID and nothing else.
     let analyst = scoped_client(
         &server,
         "analyst",
         wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Schema(
             wyrd_runtime::BifrostSchemaScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "logs".to_owned(),
             },
         )),
@@ -1080,7 +1082,7 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
         "data_scientist",
         wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Table(
             wyrd_runtime::BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "traces".to_owned(),
                 table_uid: uuid::Uuid::from_bytes(*spans_uid.as_bytes()),
             },
@@ -1132,11 +1134,77 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
     Ok(())
 }
 
+/// The public catalog is `bifrost` alone, for SQL names and grants alike.
+///
+/// A `bifrost.logs` schema grant reads `bifrost.logs.records`, while the
+/// retired `vala.logs.records` spelling is an invalid table reference for the
+/// same caller, and a grant written under catalog `vala` authorizes nothing.
+///
+/// # Panics
+///
+/// Panics when the canonical name is refused, the retired name or retired
+/// grant reads a row, or a refusal carries an unexpected code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn canonical_catalog_queries_and_grants_agree() {
+    prove_canonical_catalog()
+        .await
+        .expect("canonical catalog journey");
+}
+
+/// Drives the canonical-catalog name and grant agreement.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_canonical_catalog() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::start_bound().await?;
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .ok_or("server composed no Bifrost catalog")?;
+    catalog
+        .ensure_builtin(
+            server.data_tenant_id(),
+            vala_bifrost_redux::tables::builtin_table("logs", "records")
+                .ok_or("no canonical bifrost.logs.records definition")?,
+            wyrd_spec::auth::Attribution::unresolved(),
+        )
+        .await?;
+    await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
+
+    let schema_grant = |catalog: &str| {
+        wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Schema(
+            wyrd_runtime::BifrostSchemaScope {
+                catalog: catalog.to_owned(),
+                schema: "logs".to_owned(),
+            },
+        ))
+    };
+    let canonical = scoped_client(&server, "canonical_reader", schema_grant("bifrost")).await?;
+    let retired = scoped_client(&server, "retired_reader", schema_grant("vala")).await?;
+
+    accepts(&canonical, LOGS_SQL).await?;
+    refuses_with(
+        &canonical,
+        "SELECT severity_text FROM vala.logs.records",
+        INVALID_TABLE_REFERENCE,
+    )
+    .await?;
+    refuses(&retired, LOGS_SQL).await?;
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Stable code a query naming a table outside the public catalog receives.
+const INVALID_TABLE_REFERENCE: &str = "WYRD_VALA_400_QUERY_INVALID_SQL";
+
 /// Presents one schema-scoped bearer on the generated gRPC query service.
 ///
 /// The HTTP matrix above proves Oracle's table decision; this proves the gRPC
-/// adapter hands the same signed `permissions` to it. The `vala.logs` bearer
-/// drains its covered query, and an uncovered `vala.traces` query is refused
+/// adapter hands the same signed `permissions` to it. The `bifrost.logs` bearer
+/// drains its covered query, and an uncovered `bifrost.traces` query is refused
 /// with `WYRD_VALA_403_QUERY_FORBIDDEN` from the call itself, before any
 /// response stream exists.
 ///
@@ -1237,7 +1305,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         .ensure_builtin(
             tenant,
             vala_bifrost_redux::tables::builtin_table("traces", "spans")
-                .ok_or("no canonical vala.traces.spans definition")?,
+                .ok_or("no canonical bifrost.traces.spans definition")?,
             wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
@@ -1248,7 +1316,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         action: wyrd_runtime::Action::Read,
         scope: wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Table(
             wyrd_runtime::BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "traces".to_owned(),
                 table_uid: uuid::Uuid::from_bytes(*spans_uid.as_bytes()),
             },
@@ -1260,7 +1328,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         action: wyrd_runtime::Action::Read,
         scope: wyrd_runtime::PermissionScope::Bifrost(
             wyrd_runtime::BifrostPermissionScope::Schema(wyrd_runtime::BifrostSchemaScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "datasets".to_owned(),
             }),
         ),
@@ -1322,7 +1390,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
 
     accepts(&delegated, TRACES_SQL).await?;
     let register = wyrd_spec::vala::api::RegisterTableRequest {
-        namespace: "vala.datasets".to_owned(),
+        namespace: "bifrost.datasets".to_owned(),
         name: "delegation_events".to_owned(),
         fields: vec![wyrd_spec::vala::api::FieldSpec {
             name: "value".to_owned(),
@@ -1371,7 +1439,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
 
     // Native ingest: Gate refuses the delegated write before Scribe sees it,
     // and B's own client writes the same table.
-    let events = "vala.datasets.delegation_events";
+    let events = "bifrost.datasets.delegation_events";
     let described = wyrd_client::bifrost::TableConfig::describe_with(&b_client, events).await?;
     let delegated_writer = wyrd_client::Bifrost::connect_with(
         &delegated,
@@ -1740,7 +1808,7 @@ async fn prove_stream_admission_expiry() -> Result<(), ServerJourneyError> {
         .ensure_builtin(
             tenant,
             vala_bifrost_redux::tables::builtin_table("logs", "records")
-                .ok_or("no canonical vala.logs.records definition")?,
+                .ok_or("no canonical bifrost.logs.records definition")?,
             wyrd_spec::auth::Attribution::unresolved(),
         )
         .await?;
@@ -1846,7 +1914,7 @@ async fn query_edge_timeout_yields_to_oracle_deadline() -> Result<(), ServerJour
         .bifrost_query()
         .map(|query| std::sync::Arc::clone(query.engine()))
         .ok_or("missing Oracle")?;
-    let sql = format!("SELECT value FROM vala.bifrost.{table}");
+    let sql = format!("SELECT value FROM bifrost.bifrost.{table}");
 
     // Released before Oracle expiry: the edge limit no longer applies.
     let (pause, response) = edge.paused_query(&oracle, &sql, 10_000).await?;
@@ -1970,7 +2038,7 @@ async fn silent_remote_oracle_delivery_yields_typed_query_timeout() -> Result<()
         peer.set_armed(true);
     }
 
-    let mut body = request(&format!("SELECT value FROM vala.bifrost.{table}"));
+    let mut body = request(&format!("SELECT value FROM bifrost.bifrost.{table}"));
     body.deadline_ms = Some(2_000);
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -1998,7 +2066,7 @@ async fn silent_remote_oracle_delivery_yields_typed_query_timeout() -> Result<()
     for peer in &peers {
         peer.set_armed(false);
     }
-    let body = request(&format!("SELECT value FROM vala.bifrost.{table}"));
+    let body = request(&format!("SELECT value FROM bifrost.bifrost.{table}"));
     let response = edge.post("/v1/query").json(&body).send().await?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let mut decoder = wyrd_tonic::frame_codec::FrameDecoder::new(16 * 1024 * 1024);
@@ -2183,7 +2251,7 @@ async fn configured_default_deadline_is_shared_by_local_and_forwarded_queries()
             physical_layout: None,
         })
         .await?;
-    let sql = format!("SELECT value FROM vala.bifrost.{table}");
+    let sql = format!("SELECT value FROM bifrost.bifrost.{table}");
     for (path, server) in [("forwarded", ingress), ("local", local)] {
         for (requested, expected) in [
             (None, CONFIGURED_DEADLINE_MS),

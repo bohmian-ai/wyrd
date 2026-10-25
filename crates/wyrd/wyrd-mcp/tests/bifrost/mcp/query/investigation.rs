@@ -89,7 +89,7 @@ impl EvidenceInvestigation {
         .await?;
         let bifrost = Bifrost::connect_with(&http, BifrostOptions::default()).await?;
         bifrost.use_table(
-            TableConfig::describe_with(&http, "vala.datasets.investigation_events").await?,
+            TableConfig::describe_with(&http, "bifrost.datasets.investigation_events").await?,
         );
         for id in [1, 2] {
             bifrost.insert(
@@ -260,6 +260,10 @@ impl EvidenceInvestigation {
     ///
     /// # Errors
     /// Returns MCP or schema response failures.
+    ///
+    /// # Panics
+    /// Panics when the catalog omits any evidence table or its description
+    /// omits the field the investigation selects from it.
     pub(super) async fn describe_evidence(&self) -> Result<(), McpJourneyError> {
         let listed = structured(
             self.agent
@@ -270,11 +274,11 @@ impl EvidenceInvestigation {
             .as_array()
             .ok_or("table catalog is an array")?;
         for (namespace, name, field) in [
-            ("vala.traces", "spans", "trace_id"),
-            ("vala.logs", "records", "span_id"),
-            ("vala.datasets", "investigation_events", "value"),
-            ("vala.verification", "results", "verifier_card_uid"),
-            ("vala.drift", "result_features", "score"),
+            ("bifrost.traces", "spans", "trace_id"),
+            ("bifrost.logs", "records", "span_id"),
+            ("bifrost.datasets", "investigation_events", "value"),
+            ("bifrost.verification", "results", "verifier_card_uid"),
+            ("bifrost.drift", "result_features", "score"),
         ] {
             assert!(
                 tables
@@ -304,10 +308,14 @@ impl EvidenceInvestigation {
     ///
     /// # Errors
     /// Returns MCP or SQL failures.
+    ///
+    /// # Panics
+    /// Panics when the query is not a successful terminal or the join returns
+    /// anything but the one error log on the failed tool span.
     pub(super) async fn correlate_trace(&self) -> Result<(), McpJourneyError> {
         let trace_id =
             wyrd_spec::vala::ids::TraceId::from_bytes(canonical_signals::TRACE_ID)?.to_hex();
-        let rows = self.query(&format!("SELECT l.severity_text, l.event_name, s.name FROM vala.logs.records l JOIN vala.traces.spans s ON l.trace_id = s.trace_id AND l.span_id = s.span_id WHERE s.trace_id = X'{trace_id}' AND l.scope_name = '{}' LIMIT 20", self.scope)).await?;
+        let rows = self.query(&format!("SELECT l.severity_text, l.event_name, s.name FROM bifrost.logs.records l JOIN bifrost.traces.spans s ON l.trace_id = s.trace_id AND l.span_id = s.span_id WHERE s.trace_id = X'{trace_id}' AND l.scope_name = '{}' LIMIT 20", self.scope)).await?;
         assert_eq!(
             rows,
             json!([["ERROR", "tool.retry.exhausted", "execute_tool search"]])
@@ -319,6 +327,11 @@ impl EvidenceInvestigation {
     ///
     /// # Errors
     /// Returns MCP, SQL, or missing-identity failures.
+    ///
+    /// # Panics
+    /// Panics when a Verifier Card reads back another name or UID, a query is
+    /// not a successful terminal, the subject's results are not both failed
+    /// judgments, or the Drift result lacks its single drifted feature row.
     pub(super) async fn follow_subject_and_results(&self) -> Result<(), McpJourneyError> {
         for reference in [&self.drift_verifier, &self.assertion_verifier] {
             let response: GetCardResponse = serde_json::from_value(structured(
@@ -333,7 +346,7 @@ impl EvidenceInvestigation {
             assert_eq!(response.card.metadata.uid, reference.uid);
         }
         let uid = self.subject.uid.as_ref().ok_or("subject UID")?;
-        let rows = self.query(&format!("SELECT result_id, verdict FROM vala.verification.results WHERE card_uid = '{uid}' ORDER BY result_id LIMIT 20")).await?;
+        let rows = self.query(&format!("SELECT result_id, verdict FROM bifrost.verification.results WHERE subject_card_uid = '{uid}' ORDER BY result_id LIMIT 20")).await?;
         let mut expected = [
             self.drift_result.to_string(),
             self.assertion_result.to_string(),
@@ -343,7 +356,7 @@ impl EvidenceInvestigation {
             rows,
             json!(expected.map(|result_id| json!([result_id, "failed"])))
         );
-        let rows = self.query(&format!("SELECT feature, score, threshold, verdict FROM vala.drift.result_features WHERE result_id = '{}' LIMIT 20", self.drift_result)).await?;
+        let rows = self.query(&format!("SELECT feature, score, threshold, verdict FROM bifrost.drift.result_features WHERE result_id = '{}' LIMIT 20", self.drift_result)).await?;
         assert_eq!(rows, json!([["latency", 3.0, 1.0, "drift"]]));
         Ok(())
     }
@@ -352,15 +365,19 @@ impl EvidenceInvestigation {
     ///
     /// # Errors
     /// Returns MCP or SQL failures.
+    ///
+    /// # Panics
+    /// Panics when a query is not a successful terminal, the declared table
+    /// returns other rows, or the absent result ID returns any row.
     pub(super) async fn read_custom_data(&self) -> Result<(), McpJourneyError> {
         assert_eq!(
             self.query(
-                "SELECT id, value FROM vala.datasets.investigation_events ORDER BY id LIMIT 20"
+                "SELECT id, value FROM bifrost.datasets.investigation_events ORDER BY id LIMIT 20"
             )
             .await?,
             json!([[1, "observed"], [2, "observed"]])
         );
-        assert_eq!(self.query("SELECT result_id FROM vala.verification.results WHERE result_id = 'absent' LIMIT 20").await?, json!([]));
+        assert_eq!(self.query("SELECT result_id FROM bifrost.verification.results WHERE result_id = 'absent' LIMIT 20").await?, json!([]));
         Ok(())
     }
 
@@ -372,14 +389,14 @@ impl EvidenceInvestigation {
     /// # Panics
     /// Panics when a `max_rows` or `max_bytes` refusal does not carry
     /// `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE`, when the restricted reader's
-    /// `vala.gateway.calls` read is not refused with status 403, or when any
+    /// `bifrost.gateway.calls` read is not refused with status 403, or when any
     /// refusal includes `rows`.
     pub(super) async fn refuse_unauthorized_or_oversized_reads(
         &self,
     ) -> Result<(), McpJourneyError> {
         for arguments in [
-            json!({ "sql": "SELECT id, value FROM vala.datasets.investigation_events", "max_rows": 1 }),
-            json!({ "sql": "SELECT id, value FROM vala.datasets.investigation_events", "max_bytes": 1 }),
+            json!({ "sql": "SELECT id, value FROM bifrost.datasets.investigation_events", "max_rows": 1 }),
+            json!({ "sql": "SELECT id, value FROM bifrost.datasets.investigation_events", "max_bytes": 1 }),
         ] {
             let failure = problem(
                 self.agent
@@ -410,7 +427,8 @@ impl EvidenceInvestigation {
                 discover(),
             )
             .await?;
-        let arguments = json!({ "sql": "SELECT request_payload FROM vala.gateway.calls LIMIT 20" });
+        let arguments =
+            json!({ "sql": "SELECT request_payload FROM bifrost.gateway.calls LIMIT 20" });
         let failure = problem(
             restricted
                 .call_tool(Self::request("bifrost.query", &arguments)?)

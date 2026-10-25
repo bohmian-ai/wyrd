@@ -258,11 +258,11 @@ const PARQUET_READS: [(&str, Read, &[u64]); 6] = [
 /// The three ingest paths an experiment writes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOp {
-    /// Native Arrow writes into `vala.datasets.events_ingest`.
+    /// Native Arrow writes into `bifrost.datasets.events_ingest`.
     Native,
-    /// OTLP spans into `vala.traces.spans`.
+    /// OTLP spans into `bifrost.traces.spans`.
     Spans,
-    /// OTLP bulky Kubernetes logs into `vala.logs.records`.
+    /// OTLP bulky Kubernetes logs into `bifrost.logs.records`.
     Logs,
 }
 
@@ -277,7 +277,7 @@ impl WriteOp {
         match self {
             Self::Native => workload::INGEST_TABLE,
             Self::Spans => telemetry::TABLE,
-            Self::Logs => "vala.logs.records",
+            Self::Logs => "bifrost.logs.records",
         }
     }
 
@@ -478,9 +478,9 @@ fn l1_records(root: &Path) -> Vec<Record> {
 /// calibrating L2 must match.
 fn write_fixture() -> Value {
     json!({
-        "native": format!("native-2m: events rows into vala.datasets.events_ingest, {WRITE_FIXTURE_ROWS} rows per day, fresh ids every window"),
-        "spans": format!("spans-2m: GenAI/HTTP spans into vala.traces.spans, {WRITE_FIXTURE_ROWS} spans per day, fresh ids every window"),
-        "logs": format!("logs-2m: bulky Kubernetes logs into vala.logs.records, {WRITE_FIXTURE_ROWS} records per day, fresh ids every window"),
+        "native": format!("native-2m: events rows into bifrost.datasets.events_ingest, {WRITE_FIXTURE_ROWS} rows per day, fresh ids every window"),
+        "spans": format!("spans-2m: GenAI/HTTP spans into bifrost.traces.spans, {WRITE_FIXTURE_ROWS} spans per day, fresh ids every window"),
+        "logs": format!("logs-2m: bulky Kubernetes logs into bifrost.logs.records, {WRITE_FIXTURE_ROWS} records per day, fresh ids every window"),
     })
 }
 
@@ -488,8 +488,8 @@ fn write_fixture() -> Value {
 /// spans loaded before it, as the `tier` holds them.
 fn read_fixture(tier: &str) -> Value {
     json!({
-        "read": format!("standard-10m-{tier}: 10,000,000 events rows in vala.datasets.events, loaded before any read step"),
-        "spans": format!("spans-1m-{tier}: {} spans of the spans-2m generator into vala.traces.spans, loaded before any read step", Scale::FULL.spans),
+        "read": format!("standard-10m-{tier}: 10,000,000 events rows in bifrost.datasets.events, loaded before any read step"),
+        "spans": format!("spans-1m-{tier}: {} spans of the spans-2m generator into bifrost.traces.spans, loaded before any read step", Scale::FULL.spans),
     })
 }
 
@@ -1229,7 +1229,7 @@ fn competing_declaration(
     base.controls.insert(
         "fixture".to_owned(),
         json!({
-            "read": "heavy-100m-parquet: 100,000,000 events rows in vala.datasets.events, published as Parquet before the step",
+            "read": "heavy-100m-parquet: 100,000,000 events rows in bifrost.datasets.events, published as Parquet before the step",
             "ingest": write_fixture(),
             "client_queue": "one Service tenant emitting Drift observations of 100 features (100 rows each) through `WyrdState`",
         }),
@@ -1509,9 +1509,11 @@ pub fn table_files(root: &Path, table: &str) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// The `/<segment>/<name>/` key part of `table`'s objects.
+/// The `/<segment>/<name>/` key part of `table`'s objects: the name without
+/// its `bifrost` catalog, which object keys do not carry.
 fn segment(table: &str) -> String {
-    format!("/{}/", table.trim_start_matches("vala.").replace('.', "/"))
+    let name = table.strip_prefix("bifrost.").unwrap_or(table);
+    format!("/{}/", name.replace('.', "/"))
 }
 
 /// Counts the Parquet objects under the `file://` store rooted at `root`.

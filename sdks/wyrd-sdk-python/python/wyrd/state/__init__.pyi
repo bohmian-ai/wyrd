@@ -188,7 +188,7 @@ class WyrdState:
         """Connect this state's one Bifrost writer and describe the fixed table.
 
         The writer acts as the state's client: the one given to ``from_path``,
-        else the ambient client. Startup describes ``vala.drift.observations``
+        else the ambient client. Startup describes ``bifrost.drift.observations``
         before succeeding, so a run can never enqueue against a missing,
         unauthorized, or incompatible system table.
 

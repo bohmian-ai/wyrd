@@ -46,7 +46,7 @@ pub struct ResolvedTable {
 /// [`TableConfig::resolved`] is `None`.
 ///
 /// The declared schema holds **user columns only**. Correlation inputs
-/// (`card_uid`, `run_id`) and managed columns (`wyrd_*`, `sub_principal_id`,
+/// (`subject_card_uid`, `run_id`) and managed columns (`wyrd_*`, `sub_principal_id`,
 /// `act_principal_id`) are appended by the producer and the server
 /// respectively, so declaring one here is a reserved name error rather than a
 /// way to control it.
@@ -95,7 +95,7 @@ impl TableConfig {
     /// Returns [`BifrostClientError::Queue`] with code `WYRD_VALA_400_SCHEMA_PARSE`
     /// when `fqn` is not `<namespace>.<name>`, and
     /// `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` when a column uses a reserved
-    /// `wyrd_*`, `card_uid`, or `run_id` name, and
+    /// `wyrd_*`, `subject_card_uid`, or `run_id` name, and
     /// `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` naming the field and type when
     /// a column's Arrow type has no wire form or no Iceberg column
     /// ([`wyrd_types::schema::check_supported`]) — before any request is sent.
@@ -523,12 +523,12 @@ impl WriterTable {
 ///
 /// Both fields are optional on the wire: the server stores an uncorrelated row
 /// against the authenticated `sub_principal_id`/`act_principal_id` pair with a
-/// null `card_uid`, so the default is a valid write rather than a degraded one.
+/// null `subject_card_uid`, so the default is a valid write rather than a degraded one.
 #[derive(Debug, Clone, Default)]
 pub struct Correlation {
     /// The UID of the Card this row belongs to, which the server stores as
-    /// `card_uid` once it confirms the writer may correlate to that Card.
-    pub card_uid: Option<CardUid>,
+    /// `subject_card_uid` once it confirms the writer may correlate to that Card.
+    pub subject_card_uid: Option<CardUid>,
     /// The run that produced this row.
     pub run_id: Option<RunId>,
 }

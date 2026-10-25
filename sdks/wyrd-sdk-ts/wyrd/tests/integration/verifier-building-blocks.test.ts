@@ -3,7 +3,8 @@
 // (`assert`, `trace`, `agent`, `code`) over an answer, its refund policy PDF,
 // and the trace that produced it; `document-formats` extracts each of the nine
 // extractable formats into its locked output; `scored-review` returns custom
-// Verdict data from plain, expanded, Agent, code, and step checks.
+// Verdict data from plain, expanded, Agent, code, and step checks; `whole-trace`
+// judges every span of a trace, whichever workload wrote it.
 //
 // The local upstream stands in for the model provider: the refund reader first
 // calls `fs.read` on its workspace copy of the policy and then answers a
@@ -12,11 +13,12 @@
 // Card, Bifrost, and code tools at once and then finishes. Scripted answer
 // texts also fail the reader's provider, schema, and deadline and the code step
 // and check; scoped and delegated principals exercise every tool grant.
+import { randomBytes } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { context, trace } from "@opentelemetry/api";
+import { context, trace, TraceFlags } from "@opentelemetry/api";
 import { BasicTracerProvider, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { expect, vi } from "vitest";
 import { z } from "zod";
@@ -90,7 +92,10 @@ const INVESTIGATION = [
   toolCall("call-card", TOOLS[0], {
     card_ref: { kind: "Service", name: "policy-desk", version: "1.0.0" },
   }),
-  toolCall("call-query", TOOLS[1], { sql: "SELECT execution_id FROM vala.verification.results LIMIT 1", max_rows: 1 }),
+  toolCall("call-query", TOOLS[1], {
+    sql: "SELECT execution_id FROM bifrost.verification.results LIMIT 1",
+    max_rows: 1,
+  }),
   toolCall("call-code", TOOLS[2], { source: "6 * 7" }),
 ];
 
@@ -234,6 +239,37 @@ async function recordTrace(
   const traceId = span.spanContext().traceId;
   expect(await timeline(server, traceId), "both spans are stored").toHaveLength(2);
   return traceId;
+}
+
+/**
+ * Export the Service's `retrieve` span with an untagged writer's `score` span
+ * started 1ms later inside it, wait until both are stored, and return the trace
+ * ID. Given `traceId`, both spans join that trace.
+ */
+async function recordWholeTrace(server: { flushBifrost(): void }, desk: PolicyDesk, traceId?: string): Promise<string> {
+  const exporting = (client: WyrdClient) =>
+    new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(spanExporter(client))] });
+  const [own, untagged] = [exporting(desk.client), exporting(WyrdClient.connect())];
+  const parent =
+    traceId === undefined
+      ? context.active()
+      : trace.setSpanContext(context.active(), {
+          traceId,
+          spanId: randomBytes(8).toString("hex"),
+          traceFlags: TraceFlags.SAMPLED,
+          isRemote: true,
+        });
+  const start = Date.now();
+  const span = own.getTracer("journey.desk").startSpan("retrieve", { startTime: new Date(start) }, parent);
+  untagged
+    .getTracer("journey.scorer")
+    .startSpan("score", { startTime: new Date(start + 1) }, trace.setSpan(parent, span))
+    .end();
+  span.end();
+  await Promise.all([own.shutdown(), untagged.shutdown()]);
+  const traced = span.spanContext().traceId;
+  expect(await timeline(server, traced), "both spans are stored").toHaveLength(2);
+  return traced;
 }
 
 /** Ask the investigator `question` with `tool-review` now, as `client`, on the hydrated Service with Bifrost not started. */
@@ -425,6 +461,31 @@ test("submitted review is judged in the background", async ({ desk }) => {
   expect(status.error).toBeUndefined();
   expect(result.outcome.verdict).toBe("failed");
   expect(requirement(result, "refund-within-limit").outcome).toBe("failed");
+});
+
+test("trace evidence keeps whole trace and waits when submitted", async ({ server, desk }) => {
+  const whole = await recordWholeTrace(server, desk);
+  expect((await desk.state.run().observe.verify("whole-trace", { trace: whole })).outcome.verdict).toBe("passed");
+
+  const absent = await desk.state.run().observe.verify("whole-trace", { trace: randomBytes(16).toString("hex") });
+  const [unlanded] = absent.outcome.requirements;
+  expect(unlanded?.outcome).toBe("inconclusive");
+  expect(unlanded?.reason).toContain("not yet landed");
+
+  const late = randomBytes(16).toString("hex");
+  const submitted = await desk.state.run().observe.submit("whole-trace", { trace: late });
+  if (submitted.kind !== "queued") {
+    throw new Error("Run evidence queues an execution");
+  }
+  const { execution } = submitted;
+  const status = () => execution.status().catch((error: WyrdError) => ({ status: error.code, error: undefined }));
+  await expect.poll(async () => (await status()).status, { timeout: WAIT_MS, interval: 100 }).toBe("retrying");
+  expect((await execution.status()).error?.code).toBe("evidence_unavailable");
+  await recordWholeTrace(server, desk, late);
+
+  const result = await execution.wait({ timeoutMs: WAIT_MS });
+  expect(result.outcome.verdict).toBe("passed");
+  expect((await execution.status()).result).toEqual(result);
 });
 
 test("every format extracts its locked output", async ({ desk }) => {
@@ -620,7 +681,7 @@ test("delegated tools keep the narrower authority", async ({ server, provider, d
   assertTools(provider, result, "delegated", [TOOLS[0]]);
   server.flushBifrost();
   const attributed = await (await Bifrost.connect()).sql(
-    "SELECT sub_principal_id, act_principal_id FROM vala.verification.results WHERE execution_id = $1",
+    "SELECT sub_principal_id, act_principal_id FROM bifrost.verification.results WHERE execution_id = $1",
     [result.execution_id],
     z.object({ sub_principal_id: z.string(), act_principal_id: z.string() }),
   );
@@ -680,7 +741,7 @@ test("custom_verdict_data_survives_readback", async ({ server, desk }) => {
   const retained = async (executionId: string): Promise<unknown> => {
     server.flushBifrost();
     const rows = await (await Bifrost.connect()).sql(
-      "SELECT to_json(outcome) AS outcome FROM vala.verification.results WHERE execution_id = $1",
+      "SELECT to_json(outcome) AS outcome FROM bifrost.verification.results WHERE execution_id = $1",
       [executionId],
       z.object({ outcome: z.string() }),
     );

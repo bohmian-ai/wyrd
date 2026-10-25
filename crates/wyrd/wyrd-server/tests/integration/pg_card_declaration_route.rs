@@ -3922,7 +3922,7 @@ fn tickets_schema() -> Value {
 /// A Service's declared tables are ensured before it becomes active, and an
 /// incompatible or unsupported declaration refuses the declaration first.
 ///
-/// Declaring `ticket-desk` creates `vala.datasets.tickets` with exactly its
+/// Declaring `ticket-desk` creates `bifrost.datasets.tickets` with exactly its
 /// four declared fields; a second Service declaring the same table with the
 /// same schema declares against it. A Service declaring `tickets` with a
 /// different field is refused with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`
@@ -3950,7 +3950,7 @@ async fn service_declared_tables_are_ensured_before_activation() {
     let describe = || {
         Request::builder()
             .method(Method::GET)
-            .uri("/v1/bifrost/tables/vala.datasets/tickets")
+            .uri("/v1/bifrost/tables/bifrost.datasets/tickets")
             .body(Body::empty())
             .expect("describe request builds")
     };

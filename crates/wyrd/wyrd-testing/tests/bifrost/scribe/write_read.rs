@@ -21,8 +21,8 @@ use wyrd_testing::bifrost::{
 };
 
 use super::support::{
-    append_values, published_rows, register_table, sorted_values, start_scribe_server,
-    tenant_client, unique_table,
+    append_values, endpoint_client, published_rows, register_table, sorted_values,
+    start_scribe_server, tenant_client, tenant_key, unique_table,
 };
 
 /// The complete client-to-server Scribe contract, end to end.
@@ -133,7 +133,7 @@ async fn assert_canonical_genai_span_is_tenant_isolated(server: &wyrd_testing::W
     /// The fixed event-time anchor every canonical fixture row is written at.
     const ANCHOR: i64 = 1_760_000_000_000_000_000;
     /// The canonical span ledger both tenants provision and read.
-    const SPANS: &str = "vala.traces.spans";
+    const SPANS: &str = "bifrost.traces.spans";
 
     let tenant = server.data_tenant_id();
     server
@@ -162,9 +162,10 @@ async fn assert_canonical_genai_span_is_tenant_isolated(server: &wyrd_testing::W
         &format!(
             "SELECT name, CAST(gen_ai_usage_input_tokens AS BIGINT) AS input_tokens, \
              CAST(status_code AS BIGINT) AS status_code FROM {SPANS} \
-             WHERE scope_name = '{scope}' AND service_name = 'wyrd.fixture.service' \
+             WHERE scope_name = '{scope}' AND deployment_environment = '{environment}' \
              AND gen_ai_request_model = '{model}' AND resource_present AND scope_present \
              ORDER BY start_time_unix_nano",
+            environment = fixture::SPAN_ENVIRONMENT,
             model = fixture::MODEL
         ),
     )
@@ -860,7 +861,7 @@ async fn scribe_unbound_writer_card_attribution_journey() {
     let stamped = read_correlation(&client, &table)
         .await
         .into_iter()
-        .map(|(value, card_uid, _principal)| (value, card_uid))
+        .map(|(value, subject_card_uid, _principal)| (value, subject_card_uid))
         .collect::<Vec<_>>();
     assert_eq!(
         stamped,
@@ -1038,7 +1039,7 @@ async fn append_correlated(
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new(
-            wyrd_spec::vala::managed_columns::CARD_UID,
+            wyrd_spec::vala::managed_columns::SUBJECT_CARD_UID,
             DataType::Utf8,
             true,
         ),
@@ -1080,7 +1081,8 @@ async fn read_correlation(
     client: &wyrd_client::WyrdClient,
     table: &str,
 ) -> Vec<(i64, Option<String>, String)> {
-    let sql = format!("SELECT value, card_uid, sub_principal_id FROM {table} ORDER BY value");
+    let sql =
+        format!("SELECT value, subject_card_uid, sub_principal_id FROM {table} ORDER BY value");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             params: Vec::new(),
@@ -1100,9 +1102,9 @@ async fn read_correlation(
             .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
             .expect("value is Int64");
         let uids = batch
-            .column_by_name("card_uid")
+            .column_by_name("subject_card_uid")
             .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>())
-            .expect("card_uid is Utf8");
+            .expect("subject_card_uid is Utf8");
         let principals = batch
             .column_by_name("sub_principal_id")
             .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>())
@@ -1161,7 +1163,8 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
     let tenant = server.data_tenant_id();
     let name = unique_table("stage_pressure_restart");
     let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
-    let client = tenant_client(&server, tenant).await;
+    let key = tenant_key(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
 
     let batch_id = uuid::Uuid::now_v7();
     let rows: Vec<i64> = (0..MAX_REQUEST_ROWS).collect();
@@ -1225,17 +1228,19 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("the pod restarts on its retained data root");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_eq!(
         sorted_values(&client, &table).await,
         rows,
         "restart serves exactly the acknowledged rows"
     );
-    let resent = append_values(&client, &table, batch_id, &rows).await;
+    append_values(&client, &table, batch_id, &rows)
+        .await
+        .expect("a resent acknowledged batch is acknowledged");
     assert_eq!(
         sorted_values(&client, &table).await,
         rows,
-        "a resent acknowledged batch may not duplicate its rows: {resent:?}"
+        "a resent acknowledged batch may not duplicate its rows"
     );
     server
         .flush_bifrost()
@@ -1330,7 +1335,8 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
     let tenant = server.data_tenant_id();
     let name = unique_table("composite_lifecycle");
     let table = register_composite_table(&server, tenant, &name).await;
-    let client = tenant_client(&server, tenant).await;
+    let key = tenant_key(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     let batch_id = uuid::Uuid::now_v7();
     super::support::append_batch(&client, &table, batch_id, &composite_batch())
         .await
@@ -1340,7 +1346,7 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("restarts");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_composite_reads(&client, &table, "replayed").await;
 
     let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
@@ -1352,7 +1358,7 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("restarts");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_composite_reads(&client, &table, "restored staged").await;
 
     server.flush_bifrost().await.expect("publishes");
@@ -1365,10 +1371,12 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("restarts");
-    let client = tenant_client(&server, tenant).await;
-    let resent = super::support::append_batch(&client, &table, batch_id, &composite_batch()).await;
+    let client = endpoint_client(&server, &key);
+    super::support::append_batch(&client, &table, batch_id, &composite_batch())
+        .await
+        .expect("a resent acknowledged batch is acknowledged");
     server.flush_bifrost().await.expect("drains");
-    assert_composite_reads(&client, &table, &format!("resent {resent:?}")).await;
+    assert_composite_reads(&client, &table, "resent").await;
     assert_eq!(
         published_rows(&server, tenant, &name).await,
         COMPOSITE_ROWS as u64
@@ -1429,7 +1437,8 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
     let name = unique_table("accepted_revision");
     let table = register_composite_table(&server, tenant, &name).await;
     let table_ref = vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &name);
-    let client = tenant_client(&server, tenant).await;
+    let key = tenant_key(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     let accepted = uuid::Uuid::now_v7();
     super::support::append_batch(&client, &table, accepted, &composite_batch())
         .await
@@ -1488,7 +1497,7 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("restarts");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_eq!(
         read_all(client.clone()).await,
         all,
@@ -1556,7 +1565,7 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("replay suppresses the provisional attempt the fence never accepted");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_eq!(
         read_all(client.clone()).await,
         all,
@@ -1596,7 +1605,8 @@ async fn mixed_runtime_specifications_preserve_rows_and_pins() {
     let name = unique_table("mixed_specs");
     let table = register_composite_table(&server, tenant, &name).await;
     let table_ref = vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &name);
-    let client = tenant_client(&server, tenant).await;
+    let key = tenant_key(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     super::support::append_batch(&client, &table, uuid::Uuid::now_v7(), &composite_batch())
         .await
         .expect("the spec-0 batch is acknowledged");
@@ -1626,13 +1636,13 @@ async fn mixed_runtime_specifications_preserve_rows_and_pins() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("restarts");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_mixed_reads(&client, &table, "restored").await;
     server.flush_bifrost().await.expect("publishes");
     assert_mixed_reads(&client, &table, "published").await;
 
     let described = wyrd_client::Bifrost::query_only(&client)
-        .describe_table("vala.datasets", &name)
+        .describe_table("bifrost.datasets", &name)
         .await
         .expect("the evolved table describes");
     let spec_revision = wyrd_spec::vala::ids::TableVersion::INITIAL

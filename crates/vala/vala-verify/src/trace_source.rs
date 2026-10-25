@@ -17,7 +17,7 @@ use wyrd_spec::vala::trace::SpanRecord;
 
 /// Failure returned by a trace source when spans cannot be supplied yet or at
 /// all for the requested trace id.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum TraceUnavailable {
     /// The trace has not landed in the backing store yet.
     #[error("trace not yet landed: {trace_id}")]

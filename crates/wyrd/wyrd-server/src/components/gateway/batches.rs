@@ -37,8 +37,8 @@ use wyrd_sql::queries::gateway::{
 use wyrd_sql::row_types::gateway::{GatewayBatchFileRow, GatewayBatchRow};
 
 use super::invocation::{
-    CallFailure, GatewayCallRequest, GatewayCallResponse, GatewayInvocation, OPERATION,
-    invalid_request,
+    CallFailure, GatewayCallAttribution, GatewayCallRequest, GatewayCallResponse,
+    GatewayInvocation, OPERATION, invalid_request,
 };
 use super::multipart::{FileSink, FormReader};
 use super::service::{GatewayAdministration, internal, unavailable};
@@ -206,31 +206,6 @@ fn invocable(caller: &Caller) -> (Vec<String>, Vec<String>, bool) {
     (deployments, models, all)
 }
 
-/// Governed Batches call of `action` for the exact `model`, pinned to
-/// `deployment` when it continues provider state.
-fn request(
-    model: ModelRef,
-    deployment: Option<ProviderDeploymentName>,
-    action: BatchAction,
-    body: Value,
-) -> GatewayCallRequest {
-    GatewayCallRequest {
-        operation: GatewayOperation::Batches,
-        ingress: IngressDialect::OpenAi,
-        model,
-        fallback: None,
-        body,
-        media: None,
-        batch: Some(action),
-        deployment,
-        stream: false,
-        usage_bound: None,
-        timeout: BATCH_CALL_TIMEOUT,
-        prompt_provider: None,
-        subject: None,
-    }
-}
-
 /// Stable absence of a tenant file or batch.
 fn missing(resource: &str, id: &str) -> WyrdError {
     WyrdError::GatewayResourceNotFound {
@@ -275,13 +250,44 @@ fn pinned(model: &str, deployment: &str) -> Result<(ModelRef, ProviderDeployment
 pub struct GatewayBatches<'a> {
     /// Server state carrying storage and the governed invocation pipeline.
     state: &'a AppState,
+    /// Caller-requested attribution every provider action of this request
+    /// carries, admitted like an invoke call's.
+    context: Option<GatewayCallAttribution>,
 }
 
 impl<'a> GatewayBatches<'a> {
-    /// Borrows Batches dependencies from server state.
+    /// Borrows Batches dependencies from server state for one request whose
+    /// provider actions carry `context`.
     #[must_use]
-    pub fn new(state: &'a AppState) -> Self {
-        Self { state }
+    pub fn new(state: &'a AppState, context: Option<GatewayCallAttribution>) -> Self {
+        Self { state, context }
+    }
+
+    /// Governed Batches call of `action` for the exact `model`, pinned to
+    /// `deployment` when it continues provider state, attributed to this
+    /// request's context.
+    fn request(
+        &self,
+        model: ModelRef,
+        deployment: Option<ProviderDeploymentName>,
+        action: BatchAction,
+        body: Value,
+    ) -> GatewayCallRequest {
+        GatewayCallRequest {
+            operation: GatewayOperation::Batches,
+            ingress: IngressDialect::OpenAi,
+            model,
+            fallback: None,
+            body,
+            media: None,
+            batch: Some(action),
+            deployment,
+            stream: false,
+            usage_bound: None,
+            timeout: BATCH_CALL_TIMEOUT,
+            prompt_provider: None,
+            subject: self.context.clone(),
+        }
     }
 
     /// Uploads one batch input file from a `multipart/form-data` body.
@@ -338,7 +344,7 @@ impl<'a> GatewayBatches<'a> {
         let response = self
             .call(
                 caller,
-                request(model, None, action, json!({ "purpose": "batch" })),
+                self.request(model, None, action, json!({ "purpose": "batch" })),
                 &self.state.shutdown_token,
             )
             .await?;
@@ -442,19 +448,20 @@ impl<'a> GatewayBatches<'a> {
         };
         let mut native = body;
         native["input_file_id"] = Value::String(file.upstream_file_id);
-        let request = request(model, Some(deployment), BatchAction::CreateBatch, native);
+        let request = self.request(model, Some(deployment), BatchAction::CreateBatch, native);
         let cancel = self.state.shutdown_token.child_token();
         // Dropping this future cancels the call; the tracked task still
         // settles the claim from the call's dispatch evidence.
         let _cancel_on_drop = cancel.clone().drop_guard();
         let state = self.state.clone();
+        let context = self.context.clone();
         let task_caller = caller.clone();
         let creation = self
             .state
             .gateway
             .tasks()
             .spawn(async move {
-                GatewayBatches::new(&state)
+                GatewayBatches::new(&state, context)
                     .claim_and_settle(&task_caller, claim, &digest, request, &cancel)
                     .await
             })
@@ -733,7 +740,7 @@ impl<'a> GatewayBatches<'a> {
         let response = self
             .call(
                 caller,
-                request(
+                self.request(
                     model,
                     Some(deployment),
                     BatchAction::FileContent(upstream),
@@ -761,7 +768,7 @@ impl<'a> GatewayBatches<'a> {
         let response = self
             .call(
                 caller,
-                request(
+                self.request(
                     model,
                     Some(deployment),
                     BatchAction::DeleteFile(row.upstream_file_id),
@@ -807,7 +814,7 @@ impl<'a> GatewayBatches<'a> {
         let response = self
             .call(
                 caller,
-                request(model, Some(deployment), action(upstream.clone()), json!({})),
+                self.request(model, Some(deployment), action(upstream.clone()), json!({})),
                 &self.state.shutdown_token,
             )
             .await?;

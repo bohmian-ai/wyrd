@@ -446,7 +446,7 @@ pub fn backlog_growth(backlog: &[Backlog], until: f64) -> Option<f64> {
     })
 }
 
-/// Rows a tenant could read in `vala.gateway.calls` over a repetition,
+/// Rows a tenant could read in `bifrost.gateway.calls` over a repetition,
 /// beside the calls it answered and the most it could have had admitted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Ownership {

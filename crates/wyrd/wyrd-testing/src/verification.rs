@@ -117,6 +117,15 @@ impl VerificationFixture {
         })
     }
 
+    /// This fixture with its registering actor holding exactly
+    /// `permissions`, so a submission's accepted authority can read
+    /// evidence such as traces.
+    #[must_use]
+    pub fn with_actor_permissions(mut self, permissions: PermissionSet) -> Self {
+        self.actor.effective_permissions = permissions;
+        self
+    }
+
     /// The tenant under test.
     #[must_use]
     pub const fn tenant(&self) -> DataTenantId {
@@ -172,8 +181,13 @@ impl VerificationFixture {
         self.release_with(name, "1.0.0", spec).await
     }
 
-    /// [`Self::release`] with an explicit Service `spec`.
-    async fn release_with(
+    /// [`Self::release`] with an explicit Service `spec`, such as one whose
+    /// components let several releases of one family tag the same subjects.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when `spec` is not a Service spec
+    /// or a write fails.
+    pub async fn release_with(
         &self,
         name: &str,
         version: &str,

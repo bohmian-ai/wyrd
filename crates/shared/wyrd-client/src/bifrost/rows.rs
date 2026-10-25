@@ -1,5 +1,5 @@
 //! Typed cell readers over query result batches, and the decoder from a
-//! `vala.traces.spans` row to the canonical [`SpanRecord`].
+//! `bifrost.traces.spans` row to the canonical [`SpanRecord`].
 //!
 //! Cell readers index each column in its stored Arrow type rather than casting
 //! it, and report a missing or mistyped column as a description the caller
@@ -17,13 +17,13 @@ use wyrd_spec::vala::trace::{
     InstrumentationScope, Resource, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus,
 };
 
-/// The `vala.traces.spans` columns [`span_record`] reads, as a SELECT list.
+/// The `bifrost.traces.spans` columns [`span_record`] reads, as a SELECT list.
 pub const SPAN_COLUMNS: &str = "trace_id, span_id, parent_span_id, trace_state, flags, name, kind, \
      start_time_unix_nano, end_time_unix_nano, status_code, status_message, \
      attributes, dropped_attributes_count, events, dropped_events_count, \
      links, dropped_links_count, scope_name, service_name";
 
-/// Decode row `row` of a `vala.traces.spans` result into the canonical span
+/// Decode row `row` of a `bifrost.traces.spans` result into the canonical span
 /// record, including its persisted events, links, and dropped counts.
 ///
 /// The batch must select at least [`SPAN_COLUMNS`] by name.

@@ -61,7 +61,7 @@ export declare class NativeBifrost {
    * Card UID, no-active-table, and queue-full refusals are returned in
    * [`NativeLifecycleResult`].
    */
-  insert(row: string, cardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
+  insert(row: string, subjectCardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
    * Writes one already-built Arrow batch to `table` and awaits durability.
    *
@@ -124,7 +124,7 @@ export declare class NativeBifrost {
    * unparsable or unmappable schema and an invalid Card UID are
    * returned in [`NativeLifecycleResult`].
    */
-  record(table: string, schemaJson: string, row: string, cardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
+  record(table: string, schemaJson: string, row: string, subjectCardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
    * Starts one terminal-safe query through the Rust SDK owner.
    *
@@ -216,6 +216,25 @@ export declare class NativeBifrost {
    * Wyrd control failures are returned in [`NativeLifecycleResult`].
    */
   describeTable(namespace: string, name: string): Promise<NativeLifecycleResult>
+  /**
+   * Alters one registered table's definition at its observed table version
+   * and resolves to the committed description.
+   *
+   * `request_json` is one serialized `AlterTableRequest`, decoded strictly
+   * here; every edit decision belongs to the server.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the native result cannot be projected;
+   * a malformed request and every Wyrd control failure are returned in
+   * [`NativeLifecycleResult`].
+   *
+   * # Cancellation
+   *
+   * The edit runs to completion once started; a lost or abandoned result
+   * may leave it committed, so describe the table before retrying.
+   */
+  alterTable(namespace: string, name: string, requestJson: string): Promise<NativeLifecycleResult>
 }
 
 /** Native query stream that retains Rust terminal validation and emits raw IPC. */
@@ -692,7 +711,7 @@ export declare class NativeRun {
    */
   submit(verifier: string, inputs: Array<NativeVerifierInput>, groupId?: string | undefined | null): Promise<NativeSubmission>
   /**
-   * Emits one row into a registered `vala.datasets` table.
+   * Emits one row into a registered `bifrost.datasets` table.
    *
    * Asynchronous because the first call for a table describes it; later calls
    * reuse the cached schema and producer.

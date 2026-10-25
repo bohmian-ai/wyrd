@@ -113,7 +113,7 @@ def assert_turn(spans: list[SpanRecord], run_id: str, card_uid: str) -> None:
 
 
 class Drift(BaseModel):
-    """One ``vala.drift.observations`` value."""
+    """One ``bifrost.drift.observations`` value."""
 
     num_value: float
 
@@ -122,7 +122,7 @@ def drift(server: WyrdTestServer, run_id: str) -> list[float]:
     """Publish captured rows, then read Run ``run_id``'s drift values as the administrator."""
     server.flush_bifrost()
     rows = Bifrost(client=client_of(server)).sql(
-        "SELECT num_value FROM vala.drift.observations WHERE run_id = $1", [run_id], model=Drift
+        "SELECT num_value FROM bifrost.drift.observations WHERE run_id = $1", [run_id], model=Drift
     )
     return [row.num_value for row in rows]
 

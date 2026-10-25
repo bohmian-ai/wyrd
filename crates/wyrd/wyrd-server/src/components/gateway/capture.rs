@@ -2,7 +2,7 @@
 //!
 //! After a call's accounting settles, [`CallCapture`] projects its terminal
 //! facts under the policy admitted with the call into one
-//! `vala.gateway.calls` row and one linked GenAI span per attempt, applying
+//! `bifrost.gateway.calls` row and one linked GenAI span per attempt, applying
 //! mandatory secret redaction and binary-content references to any selected
 //! payload. Once every referenced object is persisted, the capture is staged
 //! on the process [`crate::scribe_outbox::ScribeOutbox`], which owns its
@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::json::ReaderBuilder;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -40,7 +40,9 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::trace::TraceContext;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::vala::{CARD_UID, RUN_ID};
+use wyrd_spec::vala::{
+    DEPLOYMENT_ENVIRONMENT, RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID, WYRD_REQUEST_ID,
+};
 use wyrd_storage::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 use wyrd_tonic::otlp::common::v1::any_value::Value as AnyValueKind;
@@ -50,7 +52,7 @@ use wyrd_tonic::otlp::trace::v1::span::SpanKind;
 use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
-use super::invocation::GatewayCallSubject;
+use super::invocation::GatewayCallContext;
 use crate::scribe_outbox::{Owner, ScribeTable, project_spans};
 use crate::state::AppState;
 
@@ -150,7 +152,7 @@ pub(crate) struct CallFacts {
     /// Capture policy admitted with the call.
     pub(crate) policy: GatewayCapturePolicy,
     /// Authorized Run and Card attribution, its Card carrying the UID.
-    pub(crate) subject: Option<GatewayCallSubject>,
+    pub(crate) subject: Option<GatewayCallContext>,
     /// Context of the call's `gateway.call` span when the call continued a
     /// caller's trace, the parent of every attempt span.
     pub(crate) trace: Option<TraceContext>,
@@ -174,7 +176,7 @@ pub struct CallCapture {
     tenant: DataTenantId,
     /// Operation, which names the GenAI spans.
     operation: GatewayOperation,
-    /// The `vala.gateway.calls` row.
+    /// The `bifrost.gateway.calls` row.
     payload: GatewayCallPayloadV1,
     /// Bytes of every object the row references, persisted before delivery.
     objects: PayloadObjects,
@@ -184,7 +186,7 @@ pub struct CallCapture {
     /// Subject and actor pair both batches are stamped with.
     attribution: Attribution,
     /// Authorized Run and Card the row is correlated to.
-    subject: Option<GatewayCallSubject>,
+    subject: Option<GatewayCallContext>,
     /// Context of the `gateway.call` span the attempt spans are children of,
     /// when the call continued a caller's trace.
     trace: Option<TraceContext>,
@@ -313,14 +315,15 @@ impl CallCapture {
             + self.objects.bytes()
     }
 
-    /// Builds one `vala.gateway.calls` batch holding one row per capture, in
-    /// order, over the table's user fields followed by its `card_uid` and
-    /// `run_id` correlation inputs.
+    /// Builds one `bifrost.gateway.calls` batch holding one row per capture, in
+    /// order, over the table's user fields followed by its `workload_card_uid`,
+    /// `subject_card_uid`, and `run_id` correlation inputs.
     ///
-    /// The correlation inputs carry each authorized subject's Card UID, which
-    /// Scribe confirms against the frame's attributed UIDs, and its Run, each
-    /// null when the subject names none; both are null for an uncorrelated
-    /// call.
+    /// Each row carries its admitted [`GatewayCallContext`]: the owning
+    /// workload, the authorized subject Card, which Scribe confirms against the
+    /// frame's attributed UIDs, the Run, and the request's deployment
+    /// environment, each null when absent. The readable Service and subject
+    /// dimensions stay null here; Scribe derives them from the carried UIDs.
     ///
     /// The scalar columns decode from the serialized payloads in one decoder
     /// pass; the `request_payload` and `response_payload` Variant columns
@@ -350,7 +353,7 @@ impl CallCapture {
             .ok()
             .flatten()
             .ok_or(CaptureDrop::Projection)?;
-        let subject = |pick: fn(&GatewayCallSubject) -> Option<&str>| -> ArrayRef {
+        let subject = |pick: fn(&GatewayCallContext) -> Option<&str>| -> ArrayRef {
             Arc::new(StringArray::from_iter(
                 captures
                     .iter()
@@ -371,12 +374,18 @@ impl CallCapture {
                         .iter()
                         .map(|capture| capture.payload.response_payload_json.as_deref()),
                 ),
-                CARD_UID => Ok(subject(|subject| {
-                    subject.card_uid.as_ref().map(CardUid::as_str)
+                WORKLOAD_CARD_UID => Ok(subject(|context| {
+                    context.workload_card_uid.as_ref().map(CardUid::as_str)
                 })),
-                RUN_ID => Ok(subject(|subject| {
-                    subject.run_id.as_ref().map(RunId::as_str)
+                SUBJECT_CARD_UID => Ok(subject(|context| {
+                    context.subject_card_uid.as_ref().map(CardUid::as_str)
                 })),
+                RUN_ID => Ok(subject(|context| {
+                    context.run_id.as_ref().map(RunId::as_str)
+                })),
+                DEPLOYMENT_ENVIRONMENT => {
+                    Ok(subject(|context| context.deployment_environment.as_deref()))
+                }
                 name => decoded
                     .column_by_name(name)
                     .cloned()
@@ -411,7 +420,7 @@ impl CallCapture {
             .collect()
     }
 
-    /// Builds one canonical `vala.traces.spans` batch of every capture's
+    /// Builds one canonical `bifrost.traces.spans` batch of every capture's
     /// attempt spans, capture by capture in ordinal order, in one projection.
     ///
     /// Every span of a call shares one trace, so they link to each other and
@@ -424,14 +433,25 @@ impl CallCapture {
     /// standard GenAI operation, provider, and request-model attributes.
     /// Returns `None` when no capture made an attempt.
     ///
+    /// Every attempt also carries its call's admitted [`GatewayCallContext`]
+    /// and request, as [`Self::calls_batch`] does: the canonical
+    /// `deployment_environment` and the projection's `subject_card_uid` and
+    /// `run_id` correlation columns hold the call's, and `workload_card_uid`
+    /// and `wyrd_request_id` follow them, so Scribe stamps each attempt with
+    /// the same accepted origin as its call. The gateway resource labels stay
+    /// as projected.
+    ///
     /// # Errors
     ///
     /// Returns [`CaptureDrop::Projection`] when the canonical projection fails
     /// or rejects any span, so every span of the batch lands or none does.
     pub(crate) fn spans_batch(captures: &[&Self]) -> Result<Option<RecordBatch>, CaptureDrop> {
         let mut spans = Vec::new();
+        let mut attempts = Vec::new();
         for capture in captures {
-            spans.extend(capture.otlp_spans()?);
+            let projected = capture.otlp_spans()?;
+            attempts.extend(std::iter::repeat_n(*capture, projected.len()));
+            spans.extend(projected);
         }
         if spans.is_empty() {
             return Ok(None);
@@ -454,9 +474,49 @@ impl CallCapture {
             }],
             ..Default::default()
         };
-        project_spans(&resource)
+        let projected = project_spans(&resource).ok_or(CaptureDrop::Projection)?;
+        let context = |pick: fn(&GatewayCallContext) -> Option<&str>| -> ArrayRef {
+            Arc::new(StringArray::from_iter(
+                attempts
+                    .iter()
+                    .map(|capture| capture.subject.as_ref().and_then(pick)),
+            ))
+        };
+        let schema = projected.schema();
+        let mut fields = schema.fields().to_vec();
+        let mut columns = projected.columns().to_vec();
+        for (name, column) in [
+            (
+                DEPLOYMENT_ENVIRONMENT,
+                context(|context| context.deployment_environment.as_deref()),
+            ),
+            (
+                SUBJECT_CARD_UID,
+                context(|context| context.subject_card_uid.as_ref().map(CardUid::as_str)),
+            ),
+            (
+                RUN_ID,
+                context(|context| context.run_id.as_ref().map(RunId::as_str)),
+            ),
+        ] {
+            let index = schema.index_of(name).map_err(|_| CaptureDrop::Projection)?;
+            columns[index] = column;
+        }
+        fields.push(Arc::new(Field::new(
+            WORKLOAD_CARD_UID,
+            DataType::Utf8,
+            true,
+        )));
+        columns.push(context(|context| {
+            context.workload_card_uid.as_ref().map(CardUid::as_str)
+        }));
+        fields.push(Arc::new(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false)));
+        columns.push(Arc::new(StringArray::from_iter_values(
+            attempts.iter().map(|capture| capture.request_id()),
+        )));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map(Some)
-            .ok_or(CaptureDrop::Projection)
+            .map_err(|_| CaptureDrop::Projection)
     }
 
     /// Projects the captures of `group`, each with its slice position, into
@@ -713,12 +773,13 @@ impl PayloadObjects {
     }
 }
 
-/// The `vala.gateway.calls` row schema with its correlation inputs, and the
+/// The `bifrost.gateway.calls` row schema with its correlation inputs, and the
 /// same schema without the two payload columns, which the JSON row decoder
 /// builds. Built once, so every row shares both `Arc`s: rows of one frame
 /// compare by pointer and no row rebuilds or frees the schema tree.
 static CALLS_SCHEMAS: LazyLock<(Arc<Schema>, Arc<Schema>)> = LazyLock::new(|| {
     let mut fields = CallsTable::arrow_fields();
+    fields.push(Field::new(WORKLOAD_CARD_UID, DataType::Utf8, true));
     fields.extend(correlation_fields());
     let scalars = fields
         .iter()
@@ -732,7 +793,7 @@ static CALLS_SCHEMAS: LazyLock<(Arc<Schema>, Arc<Schema>)> = LazyLock::new(|| {
 });
 
 /// Whether `name` is one of the two Variant payload columns of
-/// `vala.gateway.calls`, which the JSON row decoder cannot build.
+/// `bifrost.gateway.calls`, which the JSON row decoder cannot build.
 fn is_payload_column(name: &str) -> bool {
     name == REQUEST_PAYLOAD || name == RESPONSE_PAYLOAD
 }
@@ -1170,7 +1231,12 @@ pub(crate) mod tests {
 
         let calls = CallCapture::calls_batch(&[&capture]).expect("calls batch");
         assert_eq!(calls.num_rows(), 1);
-        for column in ["card_uid", "run_id", "request_payload", "response_payload"] {
+        for column in [
+            "subject_card_uid",
+            "run_id",
+            "request_payload",
+            "response_payload",
+        ] {
             let array = calls.column_by_name(column).expect(column);
             assert_eq!(array.null_count(), 1, "{column} is null");
         }
@@ -1507,7 +1573,7 @@ pub(crate) mod recording {
     use crate::state::AppState;
 
     /// One authorization decision the recording Scribe acknowledged on
-    /// `vala.system.audit_log`, decoded from its frame for content checks.
+    /// `bifrost.system.audit_log`, decoded from its frame for content checks.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct AuditDecision {
         /// Tenant whose audit history the decision was written to.
@@ -1668,7 +1734,7 @@ pub(crate) mod recording {
             AppState::from_owners_for_test(owners)
         }
 
-        /// Every acknowledged `vala.system.audit_log` row, in arrival order.
+        /// Every acknowledged `bifrost.system.audit_log` row, in arrival order.
         ///
         /// Settles nothing itself: settle the outbox first, after which every
         /// staged decision is here.
@@ -1680,7 +1746,7 @@ pub(crate) mod recording {
             self.audit.lock().expect("audit").clone()
         }
 
-        /// Every acknowledged `vala.system.audit_log` frame, in arrival order.
+        /// Every acknowledged `bifrost.system.audit_log` frame, in arrival order.
         ///
         /// Settles nothing itself: settle the outbox first.
         ///
@@ -1732,7 +1798,7 @@ pub(crate) mod recording {
             self.received().iter().map(|frame| frame.rows).sum()
         }
 
-        /// Every acknowledged `vala.gateway.calls` row as a JSON object of
+        /// Every acknowledged `bifrost.gateway.calls` row as a JSON object of
         /// its scalar columns, in arrival order; the Variant payload columns
         /// are omitted.
         ///
@@ -1784,7 +1850,7 @@ pub(crate) mod recording {
         }
     }
 
-    /// Decodes every row of one `vala.system.audit_log` batch for `tenant`.
+    /// Decodes every row of one `bifrost.system.audit_log` batch for `tenant`.
     ///
     /// # Panics
     ///
@@ -1805,7 +1871,7 @@ pub(crate) mod recording {
                 let required = |name: &str| text(name, row).unwrap_or_else(|| panic!("{name}"));
                 AuditDecision {
                     tenant,
-                    request_id: required("request_id"),
+                    request_id: required("wyrd_request_id"),
                     operation: required("operation"),
                     resource: required("resource"),
                     sub_principal_id: uuid(required("sub_principal_id")),

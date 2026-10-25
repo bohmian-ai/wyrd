@@ -98,7 +98,7 @@ pub(super) fn wire_binding(cut: &PinnedSealedTable) -> Result<TenantTableBinding
         namespace: cut
             .binding
             .logical_namespace
-            .strip_prefix("vala.")
+            .strip_prefix("bifrost.")
             .ok_or(BifrostError::QueryVisibilityUnavailable)?
             .to_owned(),
         table: cut.binding.table_name.clone(),

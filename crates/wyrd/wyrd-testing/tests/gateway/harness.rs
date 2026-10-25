@@ -312,7 +312,7 @@ impl Journey {
             .expect("request recording is on")
     }
 
-    /// Every cell of every `vala.gateway.calls` row the tenant of `inspector`
+    /// Every cell of every `bifrost.gateway.calls` row the tenant of `inspector`
     /// retains, rendered as text, once at least `expected` rows have landed.
     ///
     /// # Panics
@@ -326,7 +326,7 @@ impl Journey {
 
         let mut rows = Vec::new();
         for batch in self
-            .captured(inspector, "SELECT * FROM vala.gateway.calls", expected)
+            .captured(inspector, "SELECT * FROM bifrost.gateway.calls", expected)
             .await
         {
             let formatters: Vec<_> = batch
@@ -460,7 +460,7 @@ impl Journey {
         for batch in self
             .captured(
                 &self.api_keys[0],
-                "SELECT attempt_count, usage FROM vala.gateway.calls ORDER BY started_at",
+                "SELECT attempt_count, usage FROM bifrost.gateway.calls ORDER BY started_at",
                 expected,
             )
             .await

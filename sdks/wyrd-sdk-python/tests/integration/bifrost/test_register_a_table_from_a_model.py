@@ -7,11 +7,14 @@ registers as a Variant column for open data, queried with ``->`` and ``->>``.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import BaseModel
-from wyrd.bifrost import Bifrost, TableConfig
+from wyrd import WyrdError
+from wyrd.bifrost import AsyncBifrost, Bifrost, TableConfig
+from wyrd.client import WyrdClient
 
 if TYPE_CHECKING:
     from wyrd.testing import WyrdTestServer
@@ -61,9 +64,9 @@ REQUESTS = [
 
 @pytest.fixture(scope="module")
 def api_requests(wyrd_server: WyrdTestServer) -> Bifrost:
-    """Register the ``vala.datasets.api_requests`` table and write ``REQUESTS``."""
+    """Register the ``bifrost.datasets.api_requests`` table and write ``REQUESTS``."""
 
-    api_requests = Bifrost(TableConfig(ApiRequest, "vala.datasets.api_requests"))
+    api_requests = Bifrost(TableConfig(ApiRequest, "bifrost.datasets.api_requests"))
     api_requests.register()
     for request in REQUESTS:
         api_requests.insert(request)
@@ -86,7 +89,7 @@ class Region(BaseModel):
 def test_api_requests_read_back_as_the_same_models(api_requests: Bifrost) -> None:
     rows = api_requests.sql(
         "SELECT request_id, outcome, prediction, attributes "
-        "FROM vala.datasets.api_requests ORDER BY request_id",
+        "FROM bifrost.datasets.api_requests ORDER BY request_id",
         model=ApiRequest,
     )
 
@@ -97,7 +100,7 @@ def test_api_requests_read_back_as_the_same_models(api_requests: Bifrost) -> Non
 def test_a_nested_model_field_is_selected_by_its_path(api_requests: Bifrost) -> None:
     rows = api_requests.sql(
         "SELECT request_id, prediction['feature_importance']['importance'] AS importance "
-        "FROM vala.datasets.api_requests ORDER BY request_id",
+        "FROM bifrost.datasets.api_requests ORDER BY request_id",
         model=Importance,
     )
 
@@ -111,7 +114,7 @@ def test_a_nested_model_field_is_selected_by_its_path(api_requests: Bifrost) -> 
 def test_a_nested_model_field_filters_rows(api_requests: Bifrost) -> None:
     rows = api_requests.sql(
         "SELECT request_id, prediction['feature_importance']['importance'] AS importance "
-        "FROM vala.datasets.api_requests "
+        "FROM bifrost.datasets.api_requests "
         "WHERE prediction['feature_importance']['importance'] > 0.5",
         model=Importance,
     )
@@ -123,7 +126,7 @@ def test_a_nested_model_field_filters_rows(api_requests: Bifrost) -> None:
 def test_an_open_dict_field_is_queried_by_key(api_requests: Bifrost) -> None:
     rows = api_requests.sql(
         "SELECT request_id, attributes -> 'client' ->> 'region' AS region "
-        "FROM vala.datasets.api_requests ORDER BY request_id",
+        "FROM bifrost.datasets.api_requests ORDER BY request_id",
         model=Region,
     )
 
@@ -138,3 +141,79 @@ def test_registering_the_same_model_again_finds_the_existing_table(
     api_requests: Bifrost,
 ) -> None:
     assert api_requests.register() == "already_exists"
+
+
+class Scored(BaseModel):
+    request_id: str
+    region: str | None
+
+
+class Labelled(BaseModel):
+    request_id: str
+    area: str | None
+    note: str | None
+
+
+@pytest.mark.integration
+def test_table_configuration_preserves_versions_and_values(wyrd_server: WyrdTestServer) -> None:
+    scored = Bifrost(TableConfig(Scored, "bifrost.datasets.scored"))
+    scored.register()
+    scored.insert(Scored(request_id="req-1", region="us-east"))
+    scored.flush()
+    described = scored.describe_table("bifrost.datasets", "scored")
+    assert described["table_version"] == 1
+
+    edited = scored.alter_table(
+        "bifrost.datasets",
+        "scored",
+        expected_table_version=described["table_version"],
+        bloom_columns=["area"],
+        add_columns=[{"name": "note", "data_type": "Utf8", "nullable": True}],
+        rename_columns={"region": "area"},
+    )
+
+    assert edited["table_version"] == 2
+    assert [field["name"] for field in edited["user_fields"]] == ["request_id", "area", "note"]
+    assert edited["physical_layout"]["bloom_columns"] == ["area"]
+    assert edited["physical_layout"]["partition_by"] == described["physical_layout"]["partition_by"]
+    assert scored.describe_table("bifrost.datasets", "scored") == edited
+    assert scored.sql(
+        "SELECT request_id, area, note FROM bifrost.datasets.scored", model=Labelled
+    ) == [Labelled(request_id="req-1", area="us-east", note=None)]
+
+    cleared = asyncio.run(
+        AsyncBifrost().alter_table(
+            "bifrost.datasets",
+            "scored",
+            expected_table_version=edited["table_version"],
+            bloom_columns=[],
+        )
+    )
+    assert cleared["table_version"] == 3
+    assert cleared["physical_layout"]["bloom_columns"] == []
+    assert cleared["user_fields"] == edited["user_fields"]
+
+    with pytest.raises(WyrdError) as stale:
+        scored.alter_table(
+            "bifrost.datasets", "scored", expected_table_version=2, bloom_columns=["area"]
+        )
+    assert stale.value.code == "WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT"
+
+    viewer = Bifrost(
+        client=WyrdClient(credential=wyrd_server.bootstrap_service(["viewer"], name="table-viewer"))
+    )
+    assert viewer.describe_table("bifrost.datasets", "scored") == cleared
+    with pytest.raises(WyrdError) as denied:
+        viewer.alter_table(
+            "bifrost.datasets", "scored", expected_table_version=3, bloom_columns=["area"]
+        )
+    assert denied.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
+
+    for version in (0, 2**63, True):
+        with pytest.raises(WyrdError) as invalid:
+            scored.alter_table(
+                "bifrost.datasets", "scored", expected_table_version=version, bloom_columns=[]
+            )
+        assert invalid.value.code == "WYRD_SPEC_400_VALIDATION"
+    assert scored.describe_table("bifrost.datasets", "scored") == cleared
+    scored.shutdown()

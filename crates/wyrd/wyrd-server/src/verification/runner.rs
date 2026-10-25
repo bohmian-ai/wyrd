@@ -70,7 +70,7 @@ use super::leases::LeaseRenewal;
 use super::results::{ResultPayloadBuilder, ResultRun};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
-use crate::components::gateway::GatewayCallSubject;
+use crate::components::gateway::GatewayCallContext;
 use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
 use crate::state::AppState;
 
@@ -403,8 +403,11 @@ impl VerifierRunner {
     /// snapshot runs over its pinned source lists. The engine
     /// executes as the authority accepted with the execution, executed by
     /// `system`, with model calls attributed to the verified Card and the
-    /// submission's application Run. Under `test-support` a scripted outcome,
-    /// when queued, replaces the engine.
+    /// submission's application Run. Every attempt before the last defers a
+    /// not-yet-landed trace, so the queue retries the same execution under
+    /// its backoff; the last attempt judges it inconclusive and completes
+    /// under the Verifier's decision rule. Under `test-support` a scripted
+    /// outcome, when queued, replaces the engine.
     async fn dispatch(
         &self,
         tenant: DataTenantId,
@@ -450,19 +453,23 @@ impl VerifierRunner {
             ),
         };
         let caller = Caller::accepted(&run.authority, system);
-        let accepted_at = Utc::now()
-            - chrono::Duration::from_std(run.age).unwrap_or_else(|_| chrono::Duration::zero());
         let engine = match self.blocks.engine(
             &self.state,
             Execution {
                 caller: &caller,
                 evidence,
                 routes,
-                subject: GatewayCallSubject {
+                subject: GatewayCallContext {
+                    workload_card_uid: run
+                        .owner_card_uid
+                        .as_ref()
+                        .or_else(|| run.authority.owning_root())
+                        .cloned(),
+                    subject_card_uid: Some(run.card_uid.clone()),
                     run_id,
-                    card_uid: Some(run.card_uid.clone()),
+                    deployment_environment: run.deployment_environment.clone(),
                 },
-                accepted_at,
+                defer_unlanded_traces: run.attempt < run.max_attempts,
                 drift,
                 clock: telemetry.clock(),
             },
@@ -903,7 +910,8 @@ fn result(
 ///
 /// An expired deadline times out, an unplannable Verifier, an uncapturable
 /// actual value, or nonconforming evidence terminates `errored`, a stopped
-/// block task or unreadable evidence metadata retries, and a block refused
+/// block task, unreadable evidence metadata, or a deferred not-yet-landed
+/// trace retries, and a block refused
 /// process capacity defers without spending an attempt.
 fn engine_failure(run: &ClaimedExecution, error: &EngineError) -> EngineOutcome {
     tracing::warn!(execution_id = %run.lease.execution_id, %error, "the verification engine failed");

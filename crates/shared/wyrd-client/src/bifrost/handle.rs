@@ -171,9 +171,9 @@ impl WriterPool {
     /// later calls reuse the pooled producer, so the schema a table was first
     /// registered under is the one its batches are sealed with.
     ///
-    /// Both correlation fields are optional. An omitted `card_uid` becomes a
+    /// Both correlation fields are optional. An omitted `subject_card_uid` becomes a
     /// null in the sealed batch, which the server stores against the
-    /// authenticated principal with a null `card_uid`.
+    /// authenticated principal with a null `subject_card_uid`.
     ///
     /// The queue-domain [`WyrdQueueError`] is propagated verbatim (rather than
     /// projected onto the shared catalog) so the client-tier code —
@@ -191,10 +191,10 @@ impl WriterPool {
         &self,
         table: &WriterTable,
         json: Vec<u8>,
-        card_uid: Option<CardUid>,
+        subject_card_uid: Option<CardUid>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        self.insert_rows(table, vec![json], card_uid, run_id)
+        self.insert_rows(table, vec![json], subject_card_uid, run_id)
     }
 
     /// Enqueue every row of one logical record, or none of them, propagating
@@ -218,12 +218,12 @@ impl WriterPool {
         &self,
         table: &WriterTable,
         rows: Vec<Vec<u8>>,
-        card_uid: Option<CardUid>,
+        subject_card_uid: Option<CardUid>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
         self.producer_for(table, table.user_schema())?.enqueue_rows(
             rows,
-            card_uid,
+            subject_card_uid,
             run_id,
             crate::transport::trace::producer(table.fqn()),
         )

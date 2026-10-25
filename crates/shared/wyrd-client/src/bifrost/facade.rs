@@ -34,8 +34,9 @@ use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkE
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryResponse,
-    QueryParam, QueryTerminalFrame, RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
+    AlterTableRequest, BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry,
+    CancelRunningQueryResponse, QueryParam, QueryTerminalFrame, RegisterOutcome,
+    RegisterTableResponse, RunningQuerySummary,
 };
 use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::vala::trace::SpanRecord;
@@ -610,7 +611,7 @@ impl Bifrost {
         correlation: Correlation,
     ) -> Result<(), BifrostClientError> {
         self.writer
-            .insert(table, row, correlation.card_uid, correlation.run_id)
+            .insert(table, row, correlation.subject_card_uid, correlation.run_id)
             .map_err(Into::into)
     }
 
@@ -666,7 +667,12 @@ impl Bifrost {
         correlation: Correlation,
     ) -> Result<(), BifrostClientError> {
         self.writer
-            .insert_rows(table, rows, correlation.card_uid, correlation.run_id)
+            .insert_rows(
+                table,
+                rows,
+                correlation.subject_card_uid,
+                correlation.run_id,
+            )
             .map_err(Into::into)
     }
 
@@ -715,7 +721,12 @@ impl Bifrost {
             .and_then(TableConfig::writer_table)
             .ok_or(BifrostClientError::NoActiveTable)?;
         self.writer
-            .insert(&table, row, correlation.card_uid, correlation.run_id)
+            .insert(
+                &table,
+                row,
+                correlation.subject_card_uid,
+                correlation.run_id,
+            )
             .map_err(Into::into)
     }
 
@@ -945,7 +956,7 @@ impl Bifrost {
     /// trace is not read. Spans are ordered by start time, then trace id, then
     /// span id, and a span id stored more than once keeps only its first copy
     /// in that order. The read is one
-    /// query over the caller's authorized `vala.traces.spans` with the trace
+    /// query over the caller's authorized `bifrost.traces.spans` with the trace
     /// id bound as a parameter, so it inherits the query deadline and result
     /// limits, and another tenant's trace or one never seen reads empty.
     ///
@@ -959,10 +970,10 @@ impl Bifrost {
         trace_id: TraceId,
     ) -> Result<Vec<SpanRecord>, BifrostClientError> {
         let query = format!(
-            "SELECT {SPAN_COLUMNS} FROM vala.traces.spans \
+            "SELECT {SPAN_COLUMNS} FROM bifrost.traces.spans \
              WHERE trace_id = decode($1, 'hex') OR trace_id IN ( \
                SELECT trace_id FROM ( \
-                 SELECT trace_id, unnest(links) AS link FROM vala.traces.spans) \
+                 SELECT trace_id, unnest(links) AS link FROM bifrost.traces.spans) \
                WHERE link['trace_id'] = decode($1, 'hex'))"
         );
         let result = match self
@@ -1169,7 +1180,7 @@ impl Bifrost {
     /// physical layout exactly as the server holds them.
     ///
     /// # Arguments
-    /// * `namespace` - The table's namespace, such as `vala.traces`.
+    /// * `namespace` - The table's namespace, such as `bifrost.traces`.
     /// * `name` - The table's name within `namespace`, such as `spans`.
     ///
     /// # Errors
@@ -1186,6 +1197,59 @@ impl Bifrost {
         name: &str,
     ) -> Result<BifrostTableDescription, BifrostClientError> {
         self.query.describe_table(namespace, name).await
+    }
+
+    /// Alter one registered table's definition at its observed table version.
+    ///
+    /// Sends `PATCH /v1/bifrost/tables/{namespace}/{name}`: the server
+    /// validates the whole post-edit schema and layout, commits it once at the
+    /// next table version, and returns the committed description. The server
+    /// owns every decision; this method only carries the request and drops
+    /// this client's cached destination for the table, so the next write
+    /// describes the committed definition.
+    ///
+    /// # Arguments
+    /// * `namespace` - The table's namespace.
+    /// * `name` - The table's name within `namespace`.
+    /// * `request` - The expected table version and the edits to apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable invalid-edit, version-conflict, version-exhausted,
+    /// not-found, authentication, authorization, availability, or protocol
+    /// error the server reported; a refused edit changes nothing.
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future, or losing the response, may leave the edit
+    /// committed server-side, with this client's cached destination for the
+    /// table still held; describe the table to observe which version
+    /// committed before retrying, since a retry at the old version conflicts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the described-table lock is poisoned.
+    pub async fn alter_table(
+        &self,
+        namespace: &str,
+        name: &str,
+        request: &AlterTableRequest,
+    ) -> Result<BifrostTableDescription, BifrostClientError> {
+        let description = self
+            .query
+            .client()
+            .http
+            .request_json(
+                reqwest::Method::PATCH,
+                &format!("/v1/bifrost/tables/{namespace}/{name}"),
+                Some(request),
+            )
+            .await?;
+        self.described
+            .lock()
+            .expect("described table lock poisoned")
+            .remove(format!("{namespace}.{name}").as_str());
+        Ok(description)
     }
 
     /// The client scope every pooled producer is keyed under.

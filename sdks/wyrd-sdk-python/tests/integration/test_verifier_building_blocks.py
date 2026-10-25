@@ -21,18 +21,23 @@ exercise every tool grant.
 from __future__ import annotations
 
 import json
+import secrets
+import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from pydantic import BaseModel, RootModel
 from wyrd import WyrdError, verify
 from wyrd.auth import Principals
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
+from wyrd.otel import span_exporter
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
@@ -204,6 +209,33 @@ def record_trace(
     trace_id = format(span.get_span_context().trace_id, "032x")
     assert len(timeline(server, trace_id)) == 2, "both spans are stored"
     return trace_id
+
+
+def record_whole_trace(desk: WyrdState, server: WyrdTestServer, trace_id: str | None = None) -> str:
+    """Export the desk's ``retrieve`` span with an untagged writer's ``score`` span inside it, and return the trace ID.
+
+    Given ``trace_id``, both spans join that trace.
+    """
+    desk.start_telemetry()
+    writer = TracerProvider()
+    writer.add_span_processor(SimpleSpanProcessor(span_exporter(client_of(server))))
+    parent = None
+    if trace_id is not None:
+        remote = trace.SpanContext(
+            int(trace_id, 16),
+            int(secrets.token_hex(8), 16),
+            is_remote=True,
+            trace_flags=trace.TraceFlags(trace.TraceFlags.SAMPLED),
+        )
+        parent = trace.set_span_in_context(trace.NonRecordingSpan(remote))
+    with trace.get_tracer("journey.desk").start_as_current_span("retrieve", context=parent) as span:
+        with writer.get_tracer("journey.scorer").start_as_current_span("score"):
+            pass
+    writer.shutdown()
+    desk.flush()
+    traced = format(span.get_span_context().trace_id, "032x")
+    assert len(timeline(server, traced)) == 2, "both spans are stored"
+    return traced
 
 
 SCORED_TEXT = "Refunds follow our policy."
@@ -488,6 +520,39 @@ def test_submitted_review_is_judged_in_the_background(
     assert requirement(result, "refund-within-limit")["outcome"] == "failed"
 
 
+def test_trace_evidence_keeps_whole_trace_and_waits_when_submitted(
+    desk: WyrdState, wyrd_server: WyrdTestServer, fresh_tracer_provider: None
+) -> None:
+    whole = record_whole_trace(desk, wyrd_server)
+    assert desk.run().observe.verify("whole-trace", trace=whole).verdict == "passed"
+
+    [unlanded] = desk.run().observe.verify("whole-trace", trace=secrets.token_hex(16)).requirements
+    assert unlanded["outcome"] == "inconclusive"
+    assert "not yet landed" in unlanded["reason"]
+
+    late = secrets.token_hex(16)
+    execution = desk.run().observe.submit("whole-trace", trace=late)
+    assert isinstance(execution, verify.Execution)
+    deadline = time.monotonic() + WAIT_SECONDS
+    while True:
+        try:
+            state = execution.status()
+        except WyrdError as error:
+            assert error.code == "WYRD_VERIFICATION_404_EXECUTION_NOT_FOUND", error
+        else:
+            if state["status"] == "retrying":
+                break
+            assert state["status"] in ("pending", "running"), state
+        assert time.monotonic() < deadline, "the absent trace never retried"
+        time.sleep(0.1)
+    assert state["error"]["code"] == "evidence_unavailable"
+    record_whole_trace(desk, wyrd_server, late)
+
+    result = execution.wait(WAIT_SECONDS)
+    assert result.verdict == "passed"
+    assert execution.status()["result"]["execution_id"] == execution.id
+
+
 def test_every_format_extracts_its_locked_output(desk: WyrdState) -> None:
     evidence = FIXTURES / "cards/verifier_building_blocks/samples"
     for name, expected in DOCUMENTS.items():
@@ -598,7 +663,7 @@ def test_delegated_tools_keep_the_narrower_authority(
     wyrd_server.flush_bifrost()
     attributed = Bifrost(client=client_of(wyrd_server)).sql(
         "SELECT sub_principal_id, act_principal_id "
-        "FROM vala.verification.results WHERE execution_id = $1",
+        "FROM bifrost.verification.results WHERE execution_id = $1",
         [result.execution_id],
         model=Attribution,
     )
@@ -637,7 +702,7 @@ def retained(wyrd_server: WyrdTestServer, execution_id: str) -> object:
     """The retained outcome of ``execution_id``, read back from Bifrost after publishing."""
     wyrd_server.flush_bifrost()
     [row] = Bifrost(client=client_of(wyrd_server)).sql(
-        "SELECT to_json(outcome) AS outcome FROM vala.verification.results WHERE execution_id = $1",
+        "SELECT to_json(outcome) AS outcome FROM bifrost.verification.results WHERE execution_id = $1",
         [execution_id],
         model=RetainedOutcome,
     )

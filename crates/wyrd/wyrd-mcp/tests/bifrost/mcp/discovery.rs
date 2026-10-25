@@ -19,6 +19,8 @@ mod pg_tests {
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use wyrd_client::transport::credential::ResolvedCredential;
+    use wyrd_runtime::Permission;
+    use wyrd_spec::vala::api::{AlterTableRequest, PhysicalLayoutEdit};
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::bifrost::canonical_signals;
     use wyrd_testing::bifrost::seed_query_fixture;
@@ -249,7 +251,7 @@ mod pg_tests {
                 "verify",
                 "submit",
                 "verification.get_execution",
-                "vala.verification.results",
+                "bifrost.verification.results",
                 "Model Card",
             ] {
                 assert!(steps.contains(taught), "start teaches {taught}: {steps}");
@@ -261,6 +263,10 @@ mod pg_tests {
         ///
         /// # Errors
         /// Returns missing SQL or a query refusal.
+        ///
+        /// # Panics
+        /// Panics when the substituted guide example does not finish with a
+        /// `success` terminal outcome.
         async fn execute_sql_example(&self, example: &JsonValue) -> Result<(), McpJourneyError> {
             let mut arguments = example["arguments"].clone();
             let trace_id =
@@ -269,7 +275,7 @@ mod pg_tests {
                 .as_str()
                 .ok_or("query example has sql")?
                 .replace("<custom_table>", &self.table)
-                .replace("<card_uid>", "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
+                .replace("<subject_card_uid>", "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
                 .replace("<result_id>", "guide-absent-result")
                 .replace("<trace_id>", &trace_id);
             arguments["sql"] = json!(sql);
@@ -335,7 +341,16 @@ mod pg_tests {
     /// than a formatting one: both tables exist in the same catalog, and only
     /// the caller's own is nameable — by listing, by describing, and by the
     /// error a foreign name produces, which is the same not-found the absent
-    /// name produces so nothing leaks across the boundary.
+    /// name produces so nothing leaks across the boundary. An administrator's
+    /// SDK edit is then what the next describe reads, for the administrator
+    /// and for a caller holding only table read.
+    ///
+    /// # Errors
+    /// Returns fixture, SDK, MCP, role, or shutdown failures.
+    ///
+    /// # Panics
+    /// Panics when a listing, description, refusal, or edited layout differs
+    /// from what the caller is authorized to see.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn agent_discovers_only_authorized_tables_and_layout() -> Result<(), McpJourneyError> {
@@ -343,7 +358,7 @@ mod pg_tests {
         let fixture = seed_query_fixture(&server, "mcp-discovery").await?;
         let authorized = fixture
             .table
-            .strip_prefix("vala.bifrost.")
+            .strip_prefix("bifrost.bifrost.")
             .ok_or("the fixture table is Bifrost-qualified")?
             .to_owned();
 
@@ -425,9 +440,9 @@ mod pg_tests {
         assert!(
             tables.iter().any(|table| {
                 table["name"] == authorized
-                    && table["namespace"] == serde_json::json!("vala.bifrost")
+                    && table["namespace"] == serde_json::json!("bifrost.bifrost")
             }),
-            "the caller's own table is listed in vala.bifrost: {tables:?}"
+            "the caller's own table is listed in bifrost.bifrost: {tables:?}"
         );
         assert!(
             !listed_names.contains(&foreign_table.as_str()),
@@ -439,7 +454,7 @@ mod pg_tests {
                 .call_tool(
                     CallToolRequestParams::new("bifrost.describe_table").with_arguments(
                         serde_json::json!({
-                            "namespace": "vala.bifrost",
+                            "namespace": "bifrost.bifrost",
                             "name": authorized,
                         })
                         .as_object()
@@ -469,7 +484,8 @@ mod pg_tests {
             .filter_map(|field| field["name"].as_str())
             .collect();
         assert!(
-            correlation_names.contains(&"card_uid") && correlation_names.contains(&"run_id"),
+            correlation_names.contains(&"subject_card_uid")
+                && correlation_names.contains(&"run_id"),
             "the server-resolved correlation columns are their own class: {correlation_names:?}"
         );
         assert!(
@@ -498,6 +514,95 @@ mod pg_tests {
             "the Bloom columns are described: {layout}"
         );
 
+        // An administrator's SDK edit is what the next MCP describe reads,
+        // for the administrator and for a caller holding only table read.
+        let bloom_columns = if layout["bloom_columns"] == json!([]) {
+            vec!["value".to_owned()]
+        } else {
+            Vec::new()
+        };
+        let sdk = crate::connectivity::client(
+            &server,
+            ResolvedCredential::BearerToken(fixture.token.clone().into()),
+        )?;
+        let committed = wyrd_client::Bifrost::query_only(&sdk)
+            .alter_table(
+                "bifrost.bifrost",
+                &authorized,
+                &AlterTableRequest {
+                    expected_table_version: described["table_version"]
+                        .as_str()
+                        .ok_or("describe returns the table version as a string")?
+                        .parse()?,
+                    physical_layout: Some(PhysicalLayoutEdit {
+                        bloom_columns: Some(bloom_columns.clone()),
+                        ..PhysicalLayoutEdit::default()
+                    }),
+                    add_columns: None,
+                    rename_columns: None,
+                },
+            )
+            .await?;
+        assert_eq!(committed.physical_layout.bloom_columns, bloom_columns);
+        server
+            .seed_role("mcp_table_reader", &[Permission::bifrost_table_read()])
+            .await?;
+        let reader = server
+            .bootstrap_service("mcp-discovery-reader", &["mcp_table_reader"])
+            .await?;
+        let reader_client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::ApiKey(
+                        reader
+                            .api_key()
+                            .ok_or("service bootstrap carries a key")?
+                            .clone(),
+                    ),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+        let reader_tools: Vec<String> = reader_client
+            .list_all_tools()
+            .await?
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(
+            reader_tools
+                .iter()
+                .any(|tool| tool == "bifrost.describe_table"),
+            "a table reader discovers describe: {reader_tools:?}"
+        );
+        for viewer in [&client, &reader_client] {
+            let edited = structured(
+                viewer
+                    .call_tool(
+                        CallToolRequestParams::new("bifrost.describe_table").with_arguments(
+                            json!({"namespace": "bifrost.bifrost", "name": authorized})
+                                .as_object()
+                                .ok_or("describe arguments are an object")?
+                                .clone(),
+                        ),
+                    )
+                    .await?,
+            )?;
+            assert_eq!(
+                edited["table_version"],
+                json!(committed.table_version.to_string()),
+                "describe reads the committed version as its canonical decimal string"
+            );
+            assert_eq!(
+                edited["physical_layout"],
+                serde_json::to_value(&committed.physical_layout)?,
+                "describe reads the committed layout override"
+            );
+        }
+        reader_client.cancel().await?;
+
         for absent in [
             format!("absent_{}", uuid::Uuid::now_v7().simple()),
             foreign_table.clone(),
@@ -506,7 +611,7 @@ mod pg_tests {
                 client
                     .call_tool(
                         CallToolRequestParams::new("bifrost.describe_table").with_arguments(
-                            serde_json::json!({"namespace": "vala.bifrost", "name": absent})
+                            serde_json::json!({"namespace": "bifrost.bifrost", "name": absent})
                                 .as_object()
                                 .ok_or("describe arguments are an object")?
                                 .clone(),
@@ -543,7 +648,7 @@ mod pg_tests {
             )
             .await?;
         let describe_arguments = serde_json::json!({
-            "namespace": "vala.bifrost",
+            "namespace": "bifrost.bifrost",
             "name": authorized,
         })
         .as_object()

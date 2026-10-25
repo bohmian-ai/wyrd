@@ -9,7 +9,7 @@
 //! on a Scribe outbox writing to the server's own Scribe, wrapped in a
 //! [`PublicationFault`] that records every submitted batch; execution state is
 //! read back from `wyrd.verifier_executions` and audit from the tenant's retained
-//! `vala.system.audit_log` history.
+//! `bifrost.system.audit_log` history.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,6 +27,7 @@ use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use wyrd_runtime::{Permission, PermissionSet};
 use wyrd_server::verification::drift::DRIFT_INVALID;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::fault::{PublicationFault, SentBatch};
@@ -37,8 +38,10 @@ use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRunt
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
 use wyrd_spec::card::verifier::{Check, DriftBaselineState};
-use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, FeatureName};
+use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, FeatureName, SlotName};
+use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::verification::TaskId;
+use wyrd_spec::verification::execution::InputDeclaration;
 use wyrd_spec::verification::execution::{
     RequirementDetail, RequirementOutcome, RequirementResult, VerificationOutcome,
 };
@@ -60,10 +63,10 @@ use wyrd_testing::verification::{ExecutionRow, VerificationFixture};
 const WAIT: Duration = Duration::from_mins(1);
 
 /// Summary table every completed result ends with.
-const RESULTS: &str = "vala.verification.results";
+const RESULTS: &str = "bifrost.verification.results";
 
 /// Drift detail table.
-const FEATURES: &str = "vala.drift.result_features";
+const FEATURES: &str = "bifrost.drift.result_features";
 
 /// One bound server, one seeded tenant, and the controls a runtime is built with.
 struct Harness {
@@ -90,12 +93,22 @@ impl Harness {
     /// # Panics
     /// Panics when the server, seeding, or the audit floor read fails.
     async fn start() -> Self {
+        Self::start_with(true).await
+    }
+
+    /// Boot a bound server and seed its fixture tenant, with every built-in
+    /// table when `tables` holds and with none otherwise, so a test can
+    /// observe a tenant whose span table no export has created yet.
+    ///
+    /// # Panics
+    /// Panics when the server, seeding, or the audit floor read fails.
+    async fn start_with(tables: bool) -> Self {
         let server = WyrdTestServer::builder()
             .start_bound()
             .await
             .expect("bound server starts");
         let tenant = server.pg_fixture().data_tenant_id();
-        let (seed, subject, verifier) = seed_tenant(&server, tenant).await;
+        let (seed, subject, verifier) = seed_tenant(&server, tenant, tables).await;
         let assertion = server
             .pg_fixture()
             .superuser_pool()
@@ -483,19 +496,22 @@ impl RunningRuntime {
     }
 }
 
-/// Provision `tenant` with every built-in table and register one subject
-/// Service and one Drift Verifier.
+/// Provision `tenant`, with every built-in table when `tables` holds, and
+/// register one subject Service and one Drift Verifier.
 ///
 /// # Panics
 /// Panics when any seed write fails.
 async fn seed_tenant(
     server: &WyrdTestServer,
     tenant: DataTenantId,
+    tables: bool,
 ) -> (VerificationFixture, CardUid, CardUid) {
-    server
-        .ensure_builtin_tables_for_test(tenant)
-        .await
-        .expect("tenant receives every built-in table");
+    if tables {
+        server
+            .ensure_builtin_tables_for_test(tenant)
+            .await
+            .expect("tenant receives every built-in table");
+    }
     let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant)
         .await
         .expect("tenant provisions");
@@ -1190,7 +1206,8 @@ async fn verifier_runs_execute_beyond_the_former_permit_ceilings() {
         .seed_additional_tenant_with_uuid(other_tenant, "verification-other")
         .await
         .expect("second tenant seeds");
-    let (other, other_subject, other_verifier) = seed_tenant(&harness.server, other_tenant).await;
+    let (other, other_subject, other_verifier) =
+        seed_tenant(&harness.server, other_tenant, true).await;
     let script = EngineScript::default();
     script.hold();
     for _ in 0..22 {
@@ -1329,7 +1346,8 @@ async fn a_flooding_tenant_does_not_delay_another_tenants_run() {
         .seed_additional_tenant_with_uuid(quiet_tenant, "verification-quiet")
         .await
         .expect("quiet tenant seeds");
-    let (quiet, quiet_subject, quiet_verifier) = seed_tenant(&harness.server, quiet_tenant).await;
+    let (quiet, quiet_subject, quiet_verifier) =
+        seed_tenant(&harness.server, quiet_tenant, true).await;
     let mut flood = Vec::new();
     for _ in 0..FLOOD {
         flood.push(harness.submit().await);
@@ -1433,7 +1451,8 @@ async fn baseline_fits_do_not_wait_for_verifier_executions() {
         .seed_additional_tenant_with_uuid(other_tenant, "verification-fit-other")
         .await
         .expect("second tenant seeds");
-    let (other, other_subject, other_verifier) = seed_tenant(&harness.server, other_tenant).await;
+    let (other, other_subject, other_verifier) =
+        seed_tenant(&harness.server, other_tenant, true).await;
     let script = EngineScript::default();
     script.hold();
     let mut busy = Vec::new();
@@ -2817,7 +2836,7 @@ async fn claim_first_round(tenants: usize, slots: usize) {
             .seed_additional_tenant_with_uuid(tenant, &format!("claim-round-{index}"))
             .await
             .expect("tenant seeds");
-        let (seed, subject, verifier) = seed_tenant(&harness.server, tenant).await;
+        let (seed, subject, verifier) = seed_tenant(&harness.server, tenant, true).await;
         let run = seed
             .submit(&verifier, &subject, BTreeMap::new())
             .await
@@ -3329,7 +3348,7 @@ async fn linked_attempts(
         .collect()
 }
 
-/// One span a tenant reads back from its own `vala.traces.spans`.
+/// One span a tenant reads back from its own `bifrost.traces.spans`.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TenantSpan {
     /// Hex span id, equal to the operator's id for the same span.
@@ -4258,7 +4277,7 @@ async fn accepted_authority_survives_account_and_context_changes() {
         panic!("one result is published: {}", results.len());
     };
     assert_eq!(
-        sent_values(result, "owner_card_uid"),
+        sent_values(result, "workload_card_uid"),
         std::collections::BTreeSet::from([harness.subject.to_string()]),
         "the shared component's other owner never becomes the result owner"
     );
@@ -4536,7 +4555,9 @@ async fn only_associated_account_activity_activates_exact_root() {
 /// `WYRD_SPEC_400_VALIDATION` before any execution exists. The runtime stops
 /// with every accepted execution unfinished; a fresh runtime completes them,
 /// and status reads and the retained `execution_inputs` and `results` rows
-/// return each one's own subject and exactly its supplied tag.
+/// return each one's own subject and exactly its supplied tag, and every
+/// retained row names the owning Service and its own subject by kind, name,
+/// and version.
 ///
 /// # Panics
 /// Panics when the empty tag is accepted or leaves an execution, an accepted
@@ -4654,6 +4675,11 @@ async fn configured_service_context_survives_acceptance_and_restart() {
         (&service_check, &service, Some("staging")),
         (&agent_check, &agent, Some("staging")),
     ] {
+        let described = if *subject == service {
+            ["Service", "ask-service"]
+        } else {
+            ["Agent", "ask-agent"]
+        };
         let (code, body) = send(
             server,
             &jwt,
@@ -4668,7 +4694,7 @@ async fn configured_service_context_survives_acceptance_and_restart() {
             .and_then(|id| id.parse().ok())
             .unwrap_or_else(|| panic!("the run is accepted: {body}"));
         harness.wait_execution(run, |_| true).await;
-        accepted.push((run, subject.clone(), supplied));
+        accepted.push((run, subject.clone(), supplied, described));
     }
     let after = harness.seed.executions().await.expect("executions read");
     assert_eq!(
@@ -4678,7 +4704,7 @@ async fn configured_service_context_survives_acceptance_and_restart() {
     );
     runtime.stop().await;
 
-    for (run, subject, supplied) in &accepted {
+    for (run, subject, supplied, _) in &accepted {
         let (environment, card_uid): (Option<String>, Uuid) = sqlx::query_as(
             "SELECT deployment_environment, card_uid FROM wyrd.verifier_executions \
              WHERE execution_id = $1",
@@ -4710,7 +4736,7 @@ async fn configured_service_context_survives_acceptance_and_restart() {
     }
     restarted.stop().await;
     harness.durable_rows().await;
-    for (run, subject, supplied) in &accepted {
+    for (run, subject, supplied, [kind, name]) in &accepted {
         let (code, state) = send(
             server,
             &jwt,
@@ -4735,8 +4761,9 @@ async fn configured_service_context_survives_acceptance_and_restart() {
                 .retained_records(
                     server.data_tenant_id(),
                     format!(
-                        "SELECT deployment_environment FROM vala.verification.{table} \
-                         WHERE execution_id = '{run}'"
+                        "SELECT service_name, service_version, deployment_environment, \
+                         subject_kind, subject_name, subject_version \
+                         FROM bifrost.verification.{table} WHERE execution_id = '{run}'"
                     ),
                 )
                 .await
@@ -4745,10 +4772,557 @@ async fn configured_service_context_survives_acceptance_and_restart() {
             for row in stored {
                 assert_eq!(
                     row,
-                    vec![supplied.map(str::to_owned)],
+                    [
+                        Some("ask-service"),
+                        Some("1.0.0"),
+                        *supplied,
+                        Some(*kind),
+                        Some(*name),
+                        Some("1.0.0"),
+                    ]
+                    .map(|value| value.map(str::to_owned)),
                     "{table} row of {run}"
                 );
             }
         }
     }
+}
+
+/// A trace Verifier combining `extra` requirements with `traced`, which
+/// requires the first span of `inputs.trace` to be named `first`, under
+/// `decide`; `inputs.x` is the extra requirements' JSON input.
+fn trace_verifier(
+    first: &str,
+    extra: &[serde_json::Value],
+    decide: &serde_json::Value,
+) -> serde_json::Value {
+    let mut requirements = vec![serde_json::json!({
+        "id": "traced", "statement": "The trace starts as expected.",
+        "check": { "kind": "trace", "on": "inputs.trace", "span_selector": "$.spans[0].name",
+            "operator": "equals", "expected": first }
+    })];
+    requirements.extend(extra.iter().cloned());
+    serde_json::json!({
+        "inputs": { "trace": { "type": "trace" }, "x": { "type": "json" } },
+        "requirements": requirements,
+        "decide": decide,
+    })
+}
+
+/// An assertion requiring `inputs.x` to equal one.
+fn x_is_one() -> serde_json::Value {
+    serde_json::json!({
+        "id": "x_is_one", "statement": "The input x equals one.",
+        "check": { "kind": "assert", "path": "inputs.x", "operator": "equals", "expected": 1 }
+    })
+}
+
+/// The evidence of [`trace_verifier`]: trace `trace` and JSON `x`.
+///
+/// # Panics
+/// Panics when a slot name is invalid.
+fn trace_inputs(trace: TraceId, x: i64) -> BTreeMap<SlotName, InputDeclaration> {
+    BTreeMap::from([
+        (
+            SlotName::new("trace").expect("slot"),
+            InputDeclaration::Trace { trace_id: trace },
+        ),
+        (
+            SlotName::new("x").expect("slot"),
+            InputDeclaration::Json {
+                value: serde_json::json!(x),
+            },
+        ),
+    ])
+}
+
+/// A fresh random trace ID.
+///
+/// # Panics
+/// Panics when a v7 UUID is not a valid trace ID, which never happens.
+fn fresh_trace() -> TraceId {
+    TraceId::from_bytes(*Uuid::now_v7().as_bytes()).expect("a v7 UUID is a valid trace ID")
+}
+
+/// The permissions a submission's accepted authority needs to read traces.
+fn trace_reader() -> PermissionSet {
+    [Permission::bifrost_query_read()].into_iter().collect()
+}
+
+impl Harness {
+    /// Export `names` as spans of `trace` through the public OTLP/HTTP
+    /// collector as a tenant admin service, the n-th span starting
+    /// `ages[n]` before now, then publish them.
+    ///
+    /// # Panics
+    /// Panics when the exporter cannot bootstrap, the collector refuses the
+    /// export, or publication fails.
+    async fn export_spans(&self, trace: TraceId, spans: &[(&str, chrono::Duration)]) {
+        use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
+        use wyrd_tonic::prost::Message as _;
+        let exporter = self
+            .server
+            .bootstrap_service(
+                &format!("trace-writer-{}", Uuid::now_v7().simple()),
+                &["admin"],
+            )
+            .await
+            .expect("the exporter bootstraps");
+        let token = self
+            .server
+            .exchange_api_key(exporter.api_key().expect("the exporter has an API key"))
+            .await
+            .expect("the exporter key exchanges");
+        let now = Utc::now();
+        let spans = spans
+            .iter()
+            .zip(1_u64..)
+            .map(|((name, age), id)| {
+                let start = u64::try_from(
+                    (now - *age)
+                        .timestamp_nanos_opt()
+                        .expect("the span start is representable"),
+                )
+                .expect("the span starts after the epoch");
+                Span {
+                    trace_id: trace.as_bytes().to_vec(),
+                    span_id: id.to_be_bytes().to_vec(),
+                    name: (*name).to_owned(),
+                    kind: 1,
+                    start_time_unix_nano: start,
+                    end_time_unix_nano: start + 1_000_000,
+                    ..Span::default()
+                }
+            })
+            .collect();
+        let request = wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans,
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            }],
+        };
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/traces",
+                self.server.base_url().expect("the server binds HTTP")
+            ))
+            .header("content-type", "application/x-protobuf")
+            .header("x-wyrd-access-token", format!("Bearer {token}"))
+            .body(request.encode_to_vec())
+            .send()
+            .await
+            .expect("the collector responds");
+        let status = response.status();
+        assert!(
+            status.is_success(),
+            "the collector accepts the spans ({status}): {}",
+            response.text().await.unwrap_or_default()
+        );
+        self.server
+            .flush_bifrost()
+            .await
+            .expect("the exported spans publish");
+    }
+
+    /// The frozen acceptance of `execution`: its authority, inputs,
+    /// attribution, idempotency, attempt budget, and exact identities.
+    ///
+    /// # Panics
+    /// Panics when the execution cannot be read.
+    async fn accepted(&self, execution: ExecutionId) -> serde_json::Value {
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object('authority', authority, 'inputs', inputs, \
+                    'sub', sub_principal_id, 'act', act_principal_id, \
+                    'key', idempotency_key, 'sha', request_sha256, \
+                    'max_attempts', max_attempts, 'verifier', verifier_card_uid, \
+                    'card', card_uid, 'created_at', created_at) \
+             FROM wyrd.verifier_executions WHERE execution_id = $1",
+        )
+        .bind(execution.as_uuid())
+        .fetch_one(&self.assertion)
+        .await
+        .expect("the accepted execution reads")
+    }
+
+    /// The retry delay PostgreSQL stored for `execution`'s next attempt, in
+    /// whole seconds after the settlement that scheduled it.
+    ///
+    /// # Panics
+    /// Panics when the execution cannot be read or has no next attempt.
+    async fn retry_delay(&self, execution: ExecutionId) -> i64 {
+        sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM next_attempt_at - updated_at)::bigint \
+             FROM wyrd.verifier_executions WHERE execution_id = $1",
+        )
+        .bind(execution.as_uuid())
+        .fetch_one(&self.assertion)
+        .await
+        .expect("the retry deadline reads")
+    }
+
+    /// The verdict of every submitted result row naming `result`; one
+    /// batch may carry several executions' results.
+    ///
+    /// # Panics
+    /// Panics when a submitted batch is not an Arrow IPC stream with
+    /// `result_id` and `verdict` columns.
+    async fn verdicts(&self, result: Uuid) -> Vec<String> {
+        let render = |batch: &arrow::record_batch::RecordBatch, column: &str, row| {
+            let array = batch
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("a {column} column"));
+            arrow::util::display::array_value_to_string(array, row).expect("the value renders")
+        };
+        let mut verdicts = Vec::new();
+        for sent in sent_to(&self.fault, RESULTS).await {
+            let reader =
+                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&sent.bytes), None)
+                    .expect("a sent batch is an Arrow IPC stream");
+            for batch in reader {
+                let batch = batch.expect("the stream decodes");
+                for row in 0..batch.num_rows() {
+                    if render(&batch, "result_id", row) == result.to_string() {
+                        verdicts.push(render(&batch, "verdict", row));
+                    }
+                }
+            }
+        }
+        verdicts
+    }
+}
+
+/// A queued trace check whose evidence has not landed retries the same
+/// execution instead of completing: first with no span table, then with an
+/// empty one, across a runtime restart, and the third attempt judges the
+/// spans that arrived meanwhile, including a span older than the former
+/// seven-day read window (REQ-046, AC-020).
+///
+/// Each deferral is `retrying` with `evidence_unavailable`, due 30 and then
+/// 60 seconds after its settlement by PostgreSQL's clock, and publishes no
+/// result; the accepted authority, inputs, attribution, and idempotency are
+/// unchanged, and only the final completed result is written.
+///
+/// # Panics
+/// Panics when an attempt settles otherwise, a delay or accepted field
+/// differs, or a result is written before completion.
+#[tokio::test]
+async fn missing_trace_retries_same_execution() {
+    let harness = Harness::start_with(false).await;
+    let verifier = harness
+        .seed
+        .verifier(
+            "trace-retry",
+            &trace_verifier("retrieve", &[], &serde_json::json!("all")),
+        )
+        .await
+        .expect("trace Verifier registers");
+    let trace = fresh_trace();
+    let run = harness
+        .seed
+        .clone()
+        .with_actor_permissions(trace_reader())
+        .submit(&verifier, &harness.subject, trace_inputs(trace, 1))
+        .await
+        .expect("submission is accepted");
+    let accepted = harness.accepted(run).await;
+    let tenant = harness.seed.tenant();
+
+    let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
+    let row = harness
+        .wait_execution(run, |row| row.status == "retrying" && row.attempts == 1)
+        .await;
+    assert_eq!(row.error_code.as_deref(), Some("evidence_unavailable"));
+    assert_eq!(harness.retry_delay(run).await, 30);
+    runtime.stop().await;
+
+    harness
+        .server
+        .ensure_traces_spans_table_for_test(tenant)
+        .await
+        .expect("the span table is created");
+    harness
+        .seed
+        .make_retry_due(run)
+        .await
+        .expect("retry is due");
+    let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
+    let row = harness
+        .wait_execution(run, |row| row.status == "retrying" && row.attempts == 2)
+        .await;
+    assert_eq!(row.error_code.as_deref(), Some("evidence_unavailable"));
+    assert_eq!(harness.retry_delay(run).await, 60);
+    assert!(harness.writes().await.is_empty(), "no intermediate result");
+
+    harness
+        .export_spans(
+            trace,
+            &[
+                ("retrieve", chrono::Duration::days(30)),
+                ("rank", chrono::Duration::zero()),
+            ],
+        )
+        .await;
+    harness
+        .seed
+        .make_retry_due(run)
+        .await
+        .expect("retry is due");
+    let row = harness.wait_execution(run, status("completed")).await;
+    runtime.stop().await;
+    assert_eq!((row.attempts, row.error_code), (3, None));
+    let result = row.result_id.expect("a completed run has a result");
+    assert_eq!(harness.verdicts(result).await, ["passed"]);
+    assert_eq!(harness.writes().await, [RESULTS], "one final result");
+    assert_eq!(harness.accepted(run).await, accepted);
+}
+
+/// A queued trace check still unavailable after three attempts completes
+/// once, its trace requirement inconclusive, under the Verifier's own
+/// decision rule: trace-only is inconclusive, a definite failure beside it
+/// still fails under `all`, and a pass reaching a `pass_rate` threshold
+/// still passes (REQ-046, AC-020).
+///
+/// # Panics
+/// Panics when a run retries otherwise, completes with another verdict, or
+/// writes more than its final result.
+#[tokio::test]
+async fn missing_trace_exhaustion_keeps_decision_rule() {
+    let harness = Harness::start().await;
+    let reader = harness.seed.clone().with_actor_permissions(trace_reader());
+    let cases = [
+        (
+            "trace-only",
+            Vec::new(),
+            serde_json::json!("all"),
+            1,
+            "inconclusive",
+        ),
+        (
+            "mixed-failure",
+            vec![x_is_one()],
+            serde_json::json!("all"),
+            2,
+            "failed",
+        ),
+        (
+            "threshold-pass",
+            vec![x_is_one()],
+            serde_json::json!({ "pass_rate": { "threshold": 0.5 } }),
+            1,
+            "passed",
+        ),
+    ];
+    let mut runs = Vec::new();
+    for (name, extra, decide, x, verdict) in cases {
+        let verifier = harness
+            .seed
+            .verifier(name, &trace_verifier("retrieve", &extra, &decide))
+            .await
+            .expect("trace Verifier registers");
+        let run = reader
+            .submit(&verifier, &harness.subject, trace_inputs(fresh_trace(), x))
+            .await
+            .expect("submission is accepted");
+        runs.push((run, verdict));
+    }
+
+    let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
+    for (attempt, delay) in [(1, 30), (2, 60)] {
+        for (run, _) in &runs {
+            let row = harness
+                .wait_execution(*run, |row| {
+                    row.status == "retrying" && row.attempts == attempt
+                })
+                .await;
+            assert_eq!(row.error_code.as_deref(), Some("evidence_unavailable"));
+            assert_eq!(harness.retry_delay(*run).await, delay);
+            harness
+                .seed
+                .make_retry_due(*run)
+                .await
+                .expect("retry is due");
+        }
+    }
+    for (run, verdict) in &runs {
+        let row = harness.wait_execution(*run, status("completed")).await;
+        assert_eq!((row.attempts, row.error_code), (3, None));
+        let result = row.result_id.expect("a completed run has a result");
+        assert_eq!(harness.verdicts(result).await, [*verdict]);
+    }
+    runtime.stop().await;
+    assert!(
+        harness.writes().await.iter().all(|table| table == RESULTS),
+        "only final results are written; group commit may batch them"
+    );
+}
+
+/// Only queued not-yet-landed evidence retries (REQ-045/046, AC-017/020).
+///
+/// A direct execution over an absent trace evaluates once: one inconclusive
+/// trace requirement, nothing enqueued. Queued failed judgments, denied
+/// span reads, traces over the span ceiling, and nonconforming evidence each
+/// settle on their first attempt through their existing handling. The
+/// direct and per-attempt deadlines keep their defaults.
+///
+/// # Panics
+/// Panics when an execution retries, a direct execution enqueues, or a
+/// verdict, error, or default differs.
+#[tokio::test]
+async fn trace_unavailability_preserves_execution_mode() {
+    assert_eq!(
+        RuntimeLimits::default().execution_timeout,
+        Duration::from_mins(5)
+    );
+    assert_eq!(
+        wyrd_server::verification::hosted::HostedLimits::default().verify_timeout,
+        Duration::from_mins(1)
+    );
+    let harness = Harness::start().await;
+    let seed = &harness.seed;
+    let verifier = seed
+        .verifier(
+            "trace-mode",
+            &trace_verifier("rank", &[], &serde_json::json!("all")),
+        )
+        .await
+        .expect("trace Verifier registers");
+
+    harness
+        .server
+        .seed_role(
+            "trace_direct",
+            &[
+                Permission::card_read(),
+                Permission::verifier_run_any(),
+                Permission::bifrost_query_read(),
+                Permission::bifrost_table_read(),
+            ],
+        )
+        .await
+        .expect("role seeds");
+    let jwt = harness
+        .server
+        .bootstrap_user("trace-direct", &["trace_direct"])
+        .await
+        .expect("user bootstraps")
+        .jwt()
+        .expect("a user has a token")
+        .to_owned();
+    let body = serde_json::json!({
+        "verifier_card_uid": verifier, "card_uid": harness.subject,
+        "inputs": { "trace": { "kind": "trace", "trace_id": fresh_trace().to_hex() },
+                    "x": { "kind": "json", "value": 1 } },
+    });
+    let response = harness
+        .server
+        .oneshot_authenticated(
+            &jwt,
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/verification/execute")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("execute request builds"),
+        )
+        .await
+        .expect("execute responds");
+    let status = response.status();
+    let direct: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("execute body reads"),
+    )
+    .expect("execute body is JSON");
+    assert_eq!(status, axum::http::StatusCode::OK, "{direct}");
+    assert_eq!(direct["outcome"]["verdict"], "inconclusive", "{direct}");
+    let traced = &direct["outcome"]["requirements"][0];
+    assert_eq!(traced["outcome"], "inconclusive", "{direct}");
+    assert!(
+        traced["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("not yet landed")),
+        "{direct}"
+    );
+    assert!(
+        seed.executions().await.expect("executions read").is_empty(),
+        "nothing enqueued"
+    );
+
+    let landed = fresh_trace();
+    harness
+        .export_spans(landed, &[("retrieve", chrono::Duration::zero())])
+        .await;
+    let oversized = fresh_trace();
+    harness
+        .export_spans(
+            oversized,
+            &vec![("retrieve", chrono::Duration::zero()); 10_001],
+        )
+        .await;
+    let reader = seed.clone().with_actor_permissions(trace_reader());
+    let invalid = BTreeMap::from([(
+        SlotName::new("x").expect("slot"),
+        InputDeclaration::Trace { trace_id: landed },
+    )]);
+    let cases = [
+        (
+            "failed judgment",
+            reader
+                .submit(&verifier, &harness.subject, trace_inputs(landed, 1))
+                .await,
+            "completed",
+            None,
+        ),
+        (
+            "denied read",
+            seed.submit(&verifier, &harness.subject, trace_inputs(landed, 1))
+                .await,
+            "completed",
+            None,
+        ),
+        (
+            "oversized trace",
+            reader
+                .submit(&verifier, &harness.subject, trace_inputs(oversized, 1))
+                .await,
+            "completed",
+            None,
+        ),
+        (
+            "invalid evidence",
+            reader.submit(&verifier, &harness.subject, invalid).await,
+            "errored",
+            Some("input_invalid"),
+        ),
+    ];
+    let runtime = harness.spawn(&Harness::limits(), &EngineScript::default());
+    let mut verdicts = Vec::new();
+    for (case, run, settled, code) in cases {
+        let run = run.expect("submission is accepted");
+        let row = harness
+            .wait_execution(run, |row| {
+                !["pending", "running"].contains(&row.status.as_str())
+            })
+            .await;
+        assert_eq!(
+            (row.status.as_str(), row.attempts, row.error_code.as_deref()),
+            (settled, 1, code),
+            "{case}"
+        );
+        if let Some(result) = row.result_id {
+            verdicts.push((case, harness.verdicts(result).await));
+        }
+    }
+    runtime.stop().await;
+    assert_eq!(
+        verdicts,
+        [
+            ("failed judgment", vec!["failed".to_owned()]),
+            ("denied read", vec!["inconclusive".to_owned()]),
+            ("oversized trace", vec!["inconclusive".to_owned()]),
+        ]
+    );
 }

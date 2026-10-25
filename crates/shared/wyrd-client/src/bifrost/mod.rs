@@ -159,7 +159,7 @@ mod sdk {
     /// One row correlated to the harness card.
     fn correlated() -> Correlation {
         Correlation {
-            card_uid: Some(card()),
+            subject_card_uid: Some(card()),
             run_id: None,
         }
     }
@@ -314,10 +314,10 @@ mod sdk {
         assert_eq!(bifrost.producer_count(), 2, "a new table is a new producer");
     }
 
-    /// An omitted `card_uid` is a valid write, not a client-side refusal.
+    /// An omitted `subject_card_uid` is a valid write, not a client-side refusal.
     ///
     /// The server stores an uncorrelated row against the authenticated
-    /// principal with a null `card_uid`; the pool must reach it, so this proves
+    /// principal with a null `subject_card_uid`; the pool must reach it, so this proves
     /// the client no longer forces a correlation the wire never required.
     #[test]
     fn omitted_card_uid_is_accepted() {
@@ -782,10 +782,15 @@ mod sdk {
     }
 
     /// A server-owned column may not be declared as a user column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a schema declaring `subject_card_uid` builds a config, or
+    /// the refusal's code is not `WYRD_VALA_400_BIFROST_RESERVED_COLUMN`.
     #[test]
     fn table_config_rejects_a_reserved_column() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "card_uid",
+            "subject_card_uid",
             DataType::Utf8,
             true,
         )]));
@@ -847,7 +852,7 @@ mod sdk {
             .expect("client assembles");
         let bifrost = Bifrost::with_sink(
             &client,
-            Some(table("vala.datasets.bound")),
+            Some(table("bifrost.datasets.bound")),
             Arc::new(MockSink::new()),
             QueueConfig::default(),
         );
@@ -858,11 +863,13 @@ mod sdk {
         let bound = bifrost.table().expect("the bound table stays bound");
         let bound_identity = bound.resolved().cloned().expect("bound table resolved");
         assert!(
-            bifrost.cached_writer_table("vala.datasets.bound").is_some(),
+            bifrost
+                .cached_writer_table("bifrost.datasets.bound")
+                .is_some(),
             "a registered table is cached for named writes"
         );
 
-        bifrost.use_table(table("vala.datasets.inflight"));
+        bifrost.use_table(table("bifrost.datasets.inflight"));
         let register = bifrost.register();
         tokio::pin!(register);
         tokio::select! {
@@ -879,7 +886,7 @@ mod sdk {
         );
 
         let active = bifrost.table().expect("the rebound table stays bound");
-        assert_eq!(active.fqn(), "vala.datasets.bound");
+        assert_eq!(active.fqn(), "bifrost.datasets.bound");
         assert_eq!(
             active.resolved(),
             Some(&bound_identity),
@@ -903,6 +910,7 @@ mod sdk {
             Bifrost::status,
             Bifrost::cancel,
             Bifrost::describe_table,
+            Bifrost::alter_table,
         );
         let _ = (
             crate::bifrost::blocking::Bifrost::query,
@@ -913,6 +921,7 @@ mod sdk {
             crate::bifrost::blocking::Bifrost::status,
             crate::bifrost::blocking::Bifrost::cancel,
             crate::bifrost::blocking::Bifrost::describe_table,
+            crate::bifrost::blocking::Bifrost::alter_table,
         );
     }
 }

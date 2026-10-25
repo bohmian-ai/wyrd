@@ -739,7 +739,7 @@ mod pg_tests {
     /// `verification.get_execution` reaches `completed` with a failed result
     /// naming the exact Verifier and subject, and no Operator dispatch.
     /// `bifrost.query` returns exactly one failed summary row for that
-    /// execution, stamped with the calling Service as `owner_card_uid`, a null
+    /// execution, stamped with the calling Service as `workload_card_uid`, a null
     /// `binding_id` and the exact subject UID. A reader is refused the enqueue; another tenant's
     /// administrator cannot read the execution back, and its `bifrost.query`
     /// reads its own provisioned, empty result table.
@@ -830,8 +830,8 @@ mod pg_tests {
         let summary = rows(
             &agent_client,
             format!(
-                "SELECT execution_status, verdict, card_uid, owner_card_uid, binding_id \
-                 FROM vala.verification.results WHERE execution_id = '{execution_id}'"
+                "SELECT execution_status, verdict, subject_card_uid, workload_card_uid, binding_id \
+                 FROM bifrost.verification.results WHERE execution_id = '{execution_id}'"
             ),
         )
         .await?;
@@ -882,7 +882,7 @@ mod pg_tests {
         );
         let foreign_rows = rows(
             &foreign_client,
-            "SELECT result_id FROM vala.verification.results".to_owned(),
+            "SELECT result_id FROM bifrost.verification.results".to_owned(),
         )
         .await?;
         assert_eq!(
@@ -996,7 +996,7 @@ mod pg_tests {
             &agent_client,
             format!(
                 "SELECT to_json(outcome -> 'requirements' -> 0 -> 'data') \
-                 FROM vala.verification.results WHERE execution_id = '{execution_id}'"
+                 FROM bifrost.verification.results WHERE execution_id = '{execution_id}'"
             ),
         )
         .await?;
@@ -1022,7 +1022,7 @@ mod pg_tests {
                 .call_tool(call(
                     QUERY,
                     serde_json::json!({
-                        "sql": format!("SELECT outcome FROM vala.verification.results WHERE execution_id = '{execution_id}'"),
+                        "sql": format!("SELECT outcome FROM bifrost.verification.results WHERE execution_id = '{execution_id}'"),
                         "max_rows": 1
                     }),
                 )?)
@@ -1770,7 +1770,7 @@ mod pg_tests {
         let persisted = rows(
             &agent_client,
             format!(
-                "SELECT execution_id, group_id FROM vala.verification.results \
+                "SELECT execution_id, group_id FROM bifrost.verification.results \
                  WHERE execution_id IN ('{first}', '{solo}', '{group_execution_id}') ORDER BY ended_at"
             ),
         )
@@ -2197,7 +2197,7 @@ mod pg_tests {
         server.flush_bifrost().await?;
         let staged = rows(
             &agent_client,
-            "SELECT count(*) FROM vala.verification.execution_inputs".to_owned(),
+            "SELECT count(*) FROM bifrost.verification.execution_inputs".to_owned(),
         )
         .await?;
         assert_eq!(
@@ -2321,7 +2321,7 @@ mod pg_tests {
                 let stored = rows(
                     &caller_client,
                     format!(
-                        "SELECT deployment_environment FROM vala.verification.{table} \
+                        "SELECT deployment_environment FROM bifrost.verification.{table} \
                          WHERE execution_id = '{execution_id}'"
                     ),
                 )
@@ -2334,6 +2334,199 @@ mod pg_tests {
             }
         }
         caller_client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A trace Verifier requiring its trace's span names to be `retrieve`
+    /// then `rank`.
+    const TRACE_VERIFIER: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: mcp-trace\n  version: 1.0.0\nspec:\n  inputs:\n    trace: {type: trace}\n  requirements:\n    - id: whole-trace\n      statement: The trace retrieves then ranks\n      check: {kind: trace, on: inputs.trace, span_selector: \"$.spans[*].name\", operator: equals, expected: [retrieve, rank]}\n";
+
+    /// Write `names` as consecutive spans of `trace` through native ingest
+    /// as `client`, then publish them.
+    ///
+    /// # Errors
+    ///
+    /// Returns describe, encode, ingest, or publication failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the described span schema does not assemble the span
+    /// rows, as `canonical_signals::trace_spans` does.
+    async fn write_spans(
+        server: &WyrdTestServer,
+        client: &wyrd_client::WyrdClient,
+        trace: &[u8; 16],
+        names: &[(u64, &str)],
+    ) -> Result<(), McpJourneyError> {
+        let described =
+            wyrd_client::bifrost::TableConfig::describe_with(client, "bifrost.traces.spans")
+                .await?;
+        let start = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let spans: Vec<(u64, &str, i64)> = names
+            .iter()
+            .map(|&(id, name)| (id, name, start + i64::try_from(id).unwrap_or_default()))
+            .collect();
+        let batch = wyrd_testing::bifrost::canonical_signals::trace_spans(
+            described.user_schema(),
+            trace,
+            &spans,
+        );
+        let mut ipc = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &batch.schema())?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        drop(writer);
+        wyrd_testing::bifrost::RawIngest::connect(client)
+            .await?
+            .insert("bifrost.traces.spans", uuid::Uuid::now_v7(), ipc)
+            .await?;
+        server.flush_bifrost().await?;
+        Ok(())
+    }
+
+    /// An agent's trace evidence is judged whole, and a queued execution
+    /// waits for evidence that has not landed (REQ-040/045/046,
+    /// AC-014/019/020).
+    ///
+    /// A trace written partly by the agent's own Service and partly by an
+    /// untagged writer is judged whole by `verification.execute`. Direct
+    /// execution over an absent trace answers at once with an inconclusive
+    /// requirement. `verification.enqueue` over an absent trace is
+    /// `retrying` with `evidence_unavailable`; once the spans land and the
+    /// retry is due, the same execution completes and passes, with no
+    /// second enqueue from the agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns server, fixture, ingest, MCP transport, or tool-call
+    /// failures, or an error when the execution never retries or settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a verdict, requirement outcome, or execution identity
+    /// differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn trace_evidence_keeps_whole_trace_and_waits_when_submitted()
+    -> Result<(), McpJourneyError> {
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .start_bound(),
+        )
+        .await?;
+        let tenant = server.data_tenant_id();
+        server
+            .ensure_builtin_table_for_test(tenant, "traces", "spans")
+            .await?;
+        let admin = server
+            .bootstrap_service("mcp-trace-admin", &["admin"])
+            .await?;
+        let admin_client = client(&server, api_key(&admin)?)?;
+        let cards = Cards::connect_with(&admin_client)
+            .await
+            .expect("handle connects");
+        let fixture = register_fixture(&cards).await?;
+        let root = std::env::temp_dir().join(format!("wyrd-mcp-trace-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("verifier.yaml"), TRACE_VERIFIER)?;
+        let verifier = Box::pin(cards.declare_from_path(&root.join("verifier.yaml"))).await?;
+        std::fs::remove_dir_all(&root)?;
+        let verifier = verifier.root.uid.ok_or("a registered Card has a UID")?;
+        let agent = server
+            .credential_registered_service(&fixture.service_ref, &["editor"])
+            .await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
+        let request = |trace: &[u8; 16]| {
+            serde_json::json!({
+                "verifier_card_uid": verifier, "card_uid": fixture.service_uid,
+                "inputs": { "trace": { "kind": "trace", "trace_id": uuid::Uuid::from_bytes(*trace).simple().to_string() } },
+            })
+        };
+
+        let whole = *uuid::Uuid::now_v7().as_bytes();
+        write_spans(
+            &server,
+            &rooted_client(&server, &agent)?,
+            &whole,
+            &[(1, "retrieve")],
+        )
+        .await?;
+        write_spans(&server, &admin_client, &whole, &[(2, "rank")]).await?;
+        let judged = structured(
+            agent_client
+                .call_tool(call(EXECUTE, request(&whole))?)
+                .await?,
+        )?;
+        assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+
+        let absent = structured(
+            agent_client
+                .call_tool(call(EXECUTE, request(uuid::Uuid::now_v7().as_bytes()))?)
+                .await?,
+        )?;
+        assert_eq!(
+            text(&absent, "/outcome/requirements/0/outcome")?,
+            "inconclusive"
+        );
+        assert!(
+            text(&absent, "/outcome/requirements/0/reason")?.contains("not yet landed"),
+            "{absent}"
+        );
+
+        let late = *uuid::Uuid::now_v7().as_bytes();
+        let accepted = structured(
+            agent_client
+                .call_tool(call(ENQUEUE, request(&late))?)
+                .await?,
+        )?;
+        let execution_id = text(&accepted, "/execution_id")?.to_owned();
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        loop {
+            let state = agent_client
+                .call_tool(call(
+                    GET_EXECUTION,
+                    serde_json::json!({ "execution_id": execution_id }),
+                )?)
+                .await;
+            if let Ok(state) = state
+                && state.is_error != Some(true)
+            {
+                let state = structured(state)?;
+                if state["status"] == "retrying" {
+                    assert_eq!(state["error"]["code"], "evidence_unavailable", "{state}");
+                    break;
+                }
+                assert!(
+                    matches!(state["status"].as_str(), Some("pending" | "running")),
+                    "an absent trace waits: {state}"
+                );
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("execution {execution_id} never retried").into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        write_spans(
+            &server,
+            &admin_client,
+            &late,
+            &[(1, "retrieve"), (2, "rank")],
+        )
+        .await?;
+        wyrd_testing::verification::VerificationFixture::provision(
+            server.state().postgres.wyrd(),
+            tenant,
+        )
+        .await?
+        .make_retry_due(execution_id.parse()?)
+        .await?;
+        let state = settle(&agent_client, &execution_id).await?;
+        assert_eq!(state["status"], "completed", "{state}");
+        assert_eq!(text(&state, "/result/execution_id")?, execution_id);
+        assert_eq!(state["result"]["outcome"]["verdict"], "passed", "{state}");
+        agent_client.cancel().await?;
         server.shutdown().await?;
         Ok(())
     }

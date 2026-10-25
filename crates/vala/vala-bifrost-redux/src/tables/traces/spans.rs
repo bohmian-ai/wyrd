@@ -1,4 +1,4 @@
-//! `vala.traces.spans` — the sole canonical durable table for the OTLP trace
+//! `bifrost.traces.spans` — the sole canonical durable table for the OTLP trace
 //! signal.
 //!
 //! [`SPAN_FIELDS`] is the table's ledger: one immutable declaration per logical
@@ -15,8 +15,7 @@ use arrow::datatypes::Field;
 use crate::tables::fields::{CanonicalField as F, CanonicalType as T, canonical_arrow_fields};
 use crate::tables::signal;
 use crate::tables::{
-    CanonicalBatchValidator, CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc,
-    sort_desc,
+    CanonicalBatchValidator, DomainTable, PayloadClass, attributed_layout, hourly_layout,
 };
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::PhysicalLayoutWire;
@@ -56,7 +55,7 @@ pub static SPAN_LINK_ELEMENT: F = F::sensitive(
     false,
 );
 
-/// The canonical `vala.traces.spans` ledger.
+/// The canonical `bifrost.traces.spans` ledger.
 ///
 /// `?` in the specification ledger is `nullable = true` here; every other field is
 /// non-null. Presence booleans (`status_present`, `resource_present`,
@@ -65,7 +64,9 @@ pub static SPAN_LINK_ELEMENT: F = F::sensitive(
 /// values when the presence bit is false. The trailing promoted columns copy
 /// one well-known semantic-convention attribute each out of the Variant
 /// collections so it can be filtered without decoding; each is null when the
-/// attribute is absent or carries the wrong type.
+/// attribute is absent or carries the wrong type. `is_exception` is non-null
+/// and true exactly when any event is named `exception`. The subject columns
+/// are reserved for server attribution and stay null on projection.
 pub static SPAN_FIELDS: &[F] = &[
     F::meta("trace_id", T::FixedSizeBinary(16), false),
     F::meta("span_id", T::FixedSizeBinary(8), false),
@@ -110,13 +111,25 @@ pub static SPAN_FIELDS: &[F] = &[
     F::meta("gen_ai_usage_output_tokens", T::Int64, true),
     F::meta("service_version", T::Utf8, true),
     F::meta("deployment_environment", T::Utf8, true),
+    F::meta("service_namespace", T::Utf8, true),
+    F::meta("service_instance_id", T::Utf8, true),
+    F::meta("process_pid", T::Int64, true),
+    F::meta("telemetry_sdk_name", T::Utf8, true),
+    F::meta("telemetry_sdk_language", T::Utf8, true),
+    F::meta("telemetry_sdk_version", T::Utf8, true),
+    F::meta("subject_kind", T::Utf8, true),
+    F::meta("subject_name", T::Utf8, true),
+    F::meta("subject_version", T::Utf8, true),
     F::meta("http_request_method", T::Utf8, true),
     F::meta("http_route", T::Utf8, true),
     F::meta("http_response_status_code", T::Int64, true),
     F::meta("url_full", T::Utf8, true),
+    F::meta("url_path", T::Utf8, true),
+    F::meta("url_query", T::Utf8, true),
     F::meta("exception_type", T::Utf8, true),
     F::meta("exception_message", T::Utf8, true),
     F::meta("exception_stacktrace", T::Utf8, true),
+    F::meta("is_exception", T::Bool, false),
 ];
 
 /// The canonical durable table for the OTLP trace signal.
@@ -125,7 +138,6 @@ pub struct SpansTable;
 impl DomainTable for SpansTable {
     const NAMESPACE: &'static str = "traces";
     const NAME: &'static str = "spans";
-    const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[
         "attributes",
@@ -146,20 +158,12 @@ impl DomainTable for SpansTable {
         canonical_arrow_fields(SPAN_FIELDS)
     }
 
+    /// Declares the attributed hourly layout on `start_time_unix_nano`: rows sort by
+    /// environment, Service name, and Service version, then newest first, and
+    /// the Bloom set is the attribution columns plus
+    /// `trace_id` so a trace lookup prunes span files.
     fn physical_layout() -> PhysicalLayoutWire {
-        hourly_layout(
-            "start_time_unix_nano",
-            vec![sort_desc("start_time_unix_nano"), sort_asc("trace_id")],
-            &[
-                "run_id",
-                "card_uid",
-                "sub_principal_id",
-                "act_principal_id",
-                "trace_id",
-                "span_id",
-                "service_name",
-            ],
-        )
+        attributed_layout(hourly_layout, "start_time_unix_nano", &["trace_id"])
     }
 }
 
@@ -174,9 +178,12 @@ impl DomainTable for SpansTable {
 ///
 /// Returns the catalogued refusal of the shared canonical validation when
 /// the supplied schema drifts from the declared ledger or a Variant value
-/// cannot be stored.
+/// cannot be stored, and the refusal of a derived column that differs from
+/// its source fields.
 fn validate_canonical_user_batch_for_table(
     batch: &RecordBatch,
 ) -> Result<RecordBatch, BifrostError> {
-    signal::validate_canonical_user_batch(SPAN_FIELDS, batch)
+    let validated = signal::validate_canonical_user_batch(SPAN_FIELDS, batch)?;
+    super::projection::refuse_forged_span_derivations(&validated)?;
+    Ok(validated)
 }

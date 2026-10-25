@@ -21,7 +21,7 @@ from wyrd.bifrost import Bifrost, TableConfig
 if TYPE_CHECKING:
     from wyrd.testing import WyrdTestServer
 
-NAMESPACE = "vala.datasets"
+NAMESPACE = "bifrost.datasets"
 READINGS = "py_time_column_readings"
 DEFAULTS = "py_time_column_defaults"
 REFUSED = "py_time_column_refused"

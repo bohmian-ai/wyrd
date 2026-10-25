@@ -726,7 +726,7 @@ mod tests {
         ForgeTableKey {
             tenant: DataTenantId::new(Uuid::from_u128(0x0190_0000_0000_7000_8000_0000_0000_0007))
                 .expect("UUIDv7 test tenant"),
-            table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", table)
+            table: ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", table)
                 .expect("identity"),
         }
     }

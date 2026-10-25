@@ -11,8 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, ca
 
 import pyarrow
 
-# The native ``_wyrd.bifrost`` submodule is private and has no stub.
-from .._wyrd import bifrost as _native  # ty: ignore[unresolved-import]
+from .._wyrd import bifrost as _native
 from ..client import WyrdClient
 from ..types import TIMESTAMP_TYPES, TimestampLTZ, TimestampNTZ, TimestampTZ
 
@@ -158,6 +157,42 @@ def _description(wire: Any) -> TableDescription:
     return cast("TableDescription", wire)
 
 
+def _alter_json(
+    expected_table_version: int,
+    partition_by: list[PartitionField] | None,
+    sort_keys: list[SortKey] | None,
+    bloom_columns: list[str] | None,
+    add_columns: list[FieldSpec] | None,
+    rename_columns: Mapping[str, str] | None,
+) -> str:
+    """Assemble one table edit for the native edge.
+
+    ``None`` omits a field, so the server keeps that part of the definition;
+    a supplied list, even an empty one, replaces it. The version travels as
+    the canonical decimal string the wire requires.
+    """
+
+    layout = {
+        key: value
+        for key, value in (
+            ("partition_by", partition_by),
+            ("sort_keys", sort_keys),
+            ("bloom_columns", bloom_columns),
+        )
+        if value is not None
+    }
+    request: dict[str, Any] = {"expected_table_version": str(expected_table_version)}
+    if layout:
+        request["physical_layout"] = layout
+    if add_columns is not None:
+        request["add_columns"] = add_columns
+    if rename_columns is not None:
+        request["rename_columns"] = [
+            {"from": old, "to": new} for old, new in rename_columns.items()
+        ]
+    return json.dumps(request)
+
+
 def _row_json(row: Any) -> str:
     """Serialize one row the three ways a caller supplies it.
 
@@ -209,7 +244,7 @@ class ResolvedTable(TypedDict):
 class Correlation(TypedDict, total=False):
     """Optional per-row correlation; an omitted key is a null on the wire."""
 
-    card_uid: str
+    subject_card_uid: str
     run_id: str
 
 
@@ -248,8 +283,9 @@ class TableConfig:
                 Datetime fields declare the timestamp types in
                 ``wyrd.types``: ``NaiveDatetime`` is ``TIMESTAMP_NTZ`` and any
                 other ``datetime`` is ``TIMESTAMP_LTZ``.
-                ``card_uid``, ``run_id``, ``sub_principal_id``,
-                ``act_principal_id``, and ``wyrd_*`` names are reserved.
+                ``workload_card_uid``, ``subject_card_uid``, ``run_id``,
+                ``sub_principal_id``, ``act_principal_id``, and ``wyrd_*`` names
+                are reserved.
             table: the ``"<namespace>.<name>"`` name SQL uses.
             partition_by: up to three ``PartitionField`` mappings: exactly
                 one ``"hour"`` or ``"day"`` transform of the time column plus
@@ -339,8 +375,9 @@ class TableConfig:
         Args:
             table: the ``"<namespace>.<name>"`` name SQL uses.
             schema: a JSON Schema object with a ``properties`` mapping.
-                ``card_uid``, ``run_id``, ``sub_principal_id``,
-                ``act_principal_id``, and ``wyrd_*`` names are reserved.
+                ``workload_card_uid``, ``subject_card_uid``, ``run_id``,
+                ``sub_principal_id``, ``act_principal_id``, and ``wyrd_*`` names
+                are reserved.
             partition_by: up to three ``PartitionField`` mappings, as for
                 ``TableConfig()``.
             sort_keys: up to four ``SortKey`` mappings, as for
@@ -722,13 +759,13 @@ class _BifrostBase:
         Args:
             row: a Pydantic model instance, a mapping, or a JSON object string
                 holding the table's declared columns.
-            correlation: optional ``card_uid`` and ``run_id`` for this row.
+            correlation: optional ``subject_card_uid`` and ``run_id`` for this row.
                 Omitted keys are stored as null.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an unparsable
-                ``card_uid``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
-                is bound; ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
+                ``subject_card_uid``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no
+                table is bound; ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
                 queue is full; or, on a handle not yet connected, the error
                 ``connect`` raises.
 
@@ -737,7 +774,7 @@ class _BifrostBase:
         correlation = correlation or {}
         self._native.insert(
             _row_json(row),
-            correlation.get("card_uid"),
+            correlation.get("subject_card_uid"),
             correlation.get("run_id"),
         )
 
@@ -1046,6 +1083,57 @@ class Bifrost(_BifrostBase):
 
         return _description(self._native.describe_table(namespace, name))
 
+    def alter_table(
+        self,
+        namespace: str,
+        name: str,
+        *,
+        expected_table_version: int,
+        partition_by: list[PartitionField] | None = None,
+        sort_keys: list[SortKey] | None = None,
+        bloom_columns: list[str] | None = None,
+        add_columns: list[FieldSpec] | None = None,
+        rename_columns: Mapping[str, str] | None = None,
+    ) -> TableDescription:
+        """Alter the registered ``namespace.name`` table at its described version.
+
+        The server validates the whole edited definition and commits it once
+        at the next table version. An omitted argument keeps that part of the
+        definition; a supplied list, including an empty one, replaces it.
+
+        Args:
+            namespace: the table namespace.
+            name: the table name.
+            expected_table_version: the ``table_version`` last described.
+            partition_by: the complete new partition list.
+            sort_keys: the complete new sort order.
+            bloom_columns: the complete new Bloom column set.
+            add_columns: nullable top-level custom columns to append.
+            rename_columns: top-level custom columns to rename, old name to
+                new; each keeps its values.
+
+        Returns:
+            The committed description at its new version.
+
+        Raises:
+            WyrdError: ``WYRD_VALA_409_BIFROST_TABLE_VERSION_CONFLICT`` for a
+                superseded version, ``WYRD_VALA_400_BIFROST_INVALID_TABLE_EDIT``
+                or ``WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT`` for a
+                refused edit, or an authorization, not-found, or transport
+                failure. A refused edit changes nothing.
+
+        """
+
+        request = _alter_json(
+            expected_table_version,
+            partition_by,
+            sort_keys,
+            bloom_columns,
+            add_columns,
+            rename_columns,
+        )
+        return _description(self._native.alter_table(namespace, name, request))
+
 
 class AsyncBifrost(_BifrostBase):
     """The ``await`` surface over the same native client.
@@ -1304,6 +1392,49 @@ class AsyncBifrost(_BifrostBase):
 
         return _description(await asyncio.to_thread(self._native.describe_table, namespace, name))
 
+    async def alter_table(
+        self,
+        namespace: str,
+        name: str,
+        *,
+        expected_table_version: int,
+        partition_by: list[PartitionField] | None = None,
+        sort_keys: list[SortKey] | None = None,
+        bloom_columns: list[str] | None = None,
+        add_columns: list[FieldSpec] | None = None,
+        rename_columns: Mapping[str, str] | None = None,
+    ) -> TableDescription:
+        """Alter the registered ``namespace.name`` table at its described version.
+
+        Args:
+            namespace: the table namespace.
+            name: the table name.
+            expected_table_version: the ``table_version`` last described.
+            partition_by: the complete new partition list.
+            sort_keys: the complete new sort order.
+            bloom_columns: the complete new Bloom column set.
+            add_columns: nullable top-level custom columns to append.
+            rename_columns: top-level custom columns to rename, old name to new.
+
+        Returns:
+            The committed description at its new version.
+
+        Raises:
+            WyrdError: As for ``Bifrost.alter_table()``.
+        """
+
+        request = _alter_json(
+            expected_table_version,
+            partition_by,
+            sort_keys,
+            bloom_columns,
+            add_columns,
+            rename_columns,
+        )
+        return _description(
+            await asyncio.to_thread(self._native.alter_table, namespace, name, request)
+        )
+
 
 class DataTypeSpecVariants(TypedDict, total=False):
     """The parameterized `DataTypeSpec` forms, tagged by their variant name.
@@ -1419,7 +1550,7 @@ class TableDescription(_TableDescriptionOptional):
     ``table_version`` is the exact version the schema and layout describe;
     a writer sends it with every batch, and a batch naming any other version
     is refused. ``user_fields`` are the declared columns,
-    ``correlation_fields`` the write-time ``card_uid``/``run_id`` inputs.
+    ``correlation_fields`` the write-time ``subject_card_uid``/``run_id`` inputs.
     """
 
     entry: TableEntry

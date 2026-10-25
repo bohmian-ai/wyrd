@@ -165,7 +165,7 @@ impl Lane {
         let durable = durable(tenant, &own_rows, expected).await?;
         let uneven = tenant
             .count(&format!(
-                "SELECT COUNT(*) AS n FROM (SELECT record_id FROM vala.drift.observations \
+                "SELECT COUNT(*) AS n FROM (SELECT record_id FROM bifrost.drift.observations \
                  WHERE {own_rows} GROUP BY record_id HAVING COUNT(*) <> {FEATURES}) AS uneven"
             ))
             .await?;
@@ -186,7 +186,7 @@ impl Lane {
 ///
 /// Returns the query failure.
 async fn durable(tenant: &Tenant, filter: &str, expected: u64) -> Result<u64> {
-    let sql = format!("SELECT COUNT(*) AS n FROM vala.drift.observations WHERE {filter}");
+    let sql = format!("SELECT COUNT(*) AS n FROM bifrost.drift.observations WHERE {filter}");
     let deadline = Instant::now() + DURABLE_WAIT;
     loop {
         let rows = tenant.count(&sql).await?;

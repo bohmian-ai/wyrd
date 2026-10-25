@@ -29,7 +29,7 @@ mod pg_tests {
                 wal_lsn_min, wal_lsn_max, promotion_record,
                 compacted, committed_snapshot_id
             ) VALUES (
-                $1, $2, 'vala.traces', 'spans', $3,
+                $1, $2, 'bifrost.traces', 'spans', $3,
                 $4, 100, now(), now(),
                 'day', date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
                 $5, 1, 100, 200, '{"fixture": "pg-forge-file-list"}'::jsonb, $6, $7
@@ -73,7 +73,7 @@ mod pg_tests {
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant_a)
             .await
             .expect("tenant connection");
-        let broad = list_nonterminal_file_paths(&mut conn, "vala.traces", "spans", None)
+        let broad = list_nonterminal_file_paths(&mut conn, "bifrost.traces", "spans", None)
             .await
             .expect("broad nonterminal read");
         assert_eq!(
@@ -84,15 +84,23 @@ mod pg_tests {
                 "table/c.parquet".to_owned()
             ]
         );
-        let focused =
-            list_nonterminal_file_paths(&mut conn, "vala.traces", "spans", Some("table/c.parquet"))
-                .await
-                .expect("focused nonterminal read");
+        let focused = list_nonterminal_file_paths(
+            &mut conn,
+            "bifrost.traces",
+            "spans",
+            Some("table/c.parquet"),
+        )
+        .await
+        .expect("focused nonterminal read");
         assert_eq!(focused, vec!["table/c.parquet".to_owned()]);
-        let terminal =
-            list_nonterminal_file_paths(&mut conn, "vala.traces", "spans", Some("table/d.parquet"))
-                .await
-                .expect("focused terminal read");
+        let terminal = list_nonterminal_file_paths(
+            &mut conn,
+            "bifrost.traces",
+            "spans",
+            Some("table/d.parquet"),
+        )
+        .await
+        .expect("focused terminal read");
         assert!(terminal.is_empty());
         conn.commit().await.expect("commit read transaction");
     }
@@ -112,7 +120,7 @@ mod pg_tests {
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant connection");
-        let error = list_nonterminal_files(&mut conn, "vala.traces", "spans")
+        let error = list_nonterminal_files(&mut conn, "bifrost.traces", "spans")
             .await
             .expect_err("negative file size must fail closed");
         assert!(matches!(

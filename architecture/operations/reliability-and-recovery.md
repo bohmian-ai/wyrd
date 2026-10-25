@@ -206,7 +206,7 @@ fabricate task completion to make health checks pass.
 
 ## Audit history failure boundaries
 
-Retained audit history is the tenant-qualified Bifrost `vala.system.audit_log`
+Retained audit history is the tenant-qualified Bifrost `bifrost.system.audit_log`
 table. Audit decisions, gateway captures, and Verifier results are held only in
 memory on the process Scribe outbox until Scribe acknowledges them, so there is
 no audit staging state to restore or reconcile. A retryable failure resubmits

@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::gate::IngestError;
+use vala_bifrost_redux::gate::attribution::CardRegistry;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::{Request, Response, Status};
@@ -30,13 +31,17 @@ use crate::scribe_outbox::{ScribeBatch, ScribeTable};
 pub struct ScribeCapturePeerGrpc {
     /// This pod's Scribe.
     scribe: Arc<dyn Scribe>,
+    /// The tenant registry each frame's Cards are described from; `None`
+    /// stamps no shared dimension.
+    cards: Option<CardRegistry>,
 }
 
 impl ScribeCapturePeerGrpc {
-    /// Creates the adapter around this pod's Scribe.
+    /// Creates the adapter around this pod's Scribe, describing frames from
+    /// `cards` when given.
     #[must_use]
-    pub fn new(scribe: Arc<dyn Scribe>) -> Self {
-        Self { scribe }
+    pub fn new(scribe: Arc<dyn Scribe>, cards: Option<CardRegistry>) -> Self {
+        Self { scribe, cards }
     }
 
     /// Returns the generated service wrapper for peer-router mounting.
@@ -94,11 +99,30 @@ impl ScribeCapturePeerService for ScribeCapturePeerGrpc {
     /// Scribe refusals cross through Gate's one ingest status mapping, so the
     /// caller sees saturation as `ResourceExhausted` and a closed writer as
     /// `Unavailable`, exactly as public ingest would report them.
+    ///
+    /// # Errors
+    ///
+    /// - A malformed frame is refused before any Scribe work: `InvalidArgument`
+    ///   for an unparseable tenant, batch, or request id, and `PermissionDenied`
+    ///   for a table outside the server-internal destinations or the reserved
+    ///   system tenant outside audit history.
+    /// - `Unavailable` when the tenant registry cannot describe the frame's
+    ///   Cards, so the peer retries rather than writing unstamped rows.
+    /// - A Scribe refusal carries Gate's ingest status with its Wyrd error code:
+    ///   `ResourceExhausted` for saturation (with `retry-after-ms`), payload
+    ///   limits, or a full WAL disk; `Unavailable` for a closed writer;
+    ///   `NotFound` for a missing table; `FailedPrecondition` for a schema
+    ///   fingerprint mismatch; `InvalidArgument` for an invalid frame or a
+    ///   row contract violation;
+    ///   `PermissionDenied` for a Card scope refusal; and `Internal` otherwise.
     async fn ingest_capture(
         &self,
         request: Request<IngestCaptureRequest>,
     ) -> Result<Response<IngestCaptureResponse>, Status> {
-        let frame = Self::batch(request.into_inner())?.into_frame();
+        let frame = Self::batch(request.into_inner())?
+            .into_frame(self.cards.as_ref())
+            .await
+            .map_err(|_| Status::unavailable("the tenant registry is unavailable"))?;
         self.scribe
             .ingest_frame(frame)
             .await
@@ -145,42 +169,42 @@ mod tests {
     fn requests_are_confined_to_tenant_capture_destinations() {
         let tenant = DataTenantId::new_v7();
         for (tenant, table) in [
-            (tenant, "vala.system.audit_log"),
-            (DataTenantId::SYSTEM_OWNER, "vala.system.audit_log"),
-            (tenant, "vala.gateway.calls"),
-            (tenant, "vala.traces.spans"),
-            (tenant, "vala.verification.results"),
-            (tenant, "vala.drift.result_features"),
-            (tenant, "vala.verification.execution_inputs"),
+            (tenant, "bifrost.system.audit_log"),
+            (DataTenantId::SYSTEM_OWNER, "bifrost.system.audit_log"),
+            (tenant, "bifrost.gateway.calls"),
+            (tenant, "bifrost.traces.spans"),
+            (tenant, "bifrost.verification.results"),
+            (tenant, "bifrost.drift.result_features"),
+            (tenant, "bifrost.verification.execution_inputs"),
         ] {
             let batch = ScribeCapturePeerGrpc::batch(request(tenant, table)).expect("accepted");
             assert_eq!((batch.tenant, batch.table.fqn()), (tenant, table));
         }
         let refusals = [
             (
-                request(DataTenantId::SYSTEM_OWNER, "vala.gateway.calls"),
+                request(DataTenantId::SYSTEM_OWNER, "bifrost.gateway.calls"),
                 Code::PermissionDenied,
             ),
             (
-                request(DataTenantId::SYSTEM_OWNER, "vala.verification.results"),
+                request(DataTenantId::SYSTEM_OWNER, "bifrost.verification.results"),
                 Code::PermissionDenied,
             ),
             (
-                request(tenant, "vala.drift.observations"),
+                request(tenant, "bifrost.drift.observations"),
                 Code::PermissionDenied,
             ),
             (request(tenant, "user.events"), Code::PermissionDenied),
             (
                 IngestCaptureRequest {
                     tenant_id: "not-a-tenant".to_owned(),
-                    ..request(tenant, "vala.gateway.calls")
+                    ..request(tenant, "bifrost.gateway.calls")
                 },
                 Code::InvalidArgument,
             ),
             (
                 IngestCaptureRequest {
                     batch_id: "not-a-uuid".to_owned(),
-                    ..request(tenant, "vala.gateway.calls")
+                    ..request(tenant, "bifrost.gateway.calls")
                 },
                 Code::InvalidArgument,
             ),
@@ -202,13 +226,13 @@ mod tests {
     async fn scribe_saturation_answers_resource_exhausted() {
         let scribe = Arc::new(RecordingScribe::default());
         scribe.refuse_next(ScribeError::IngestBusy {
-            table: "vala.gateway.calls".to_owned(),
+            table: "bifrost.gateway.calls".to_owned(),
         });
-        let service = ScribeCapturePeerGrpc::new(Arc::clone(&scribe) as _);
+        let service = ScribeCapturePeerGrpc::new(Arc::clone(&scribe) as _, None);
         let status = service
             .ingest_capture(Request::new(request(
                 DataTenantId::new_v7(),
-                "vala.gateway.calls",
+                "bifrost.gateway.calls",
             )))
             .await
             .expect_err("saturated");

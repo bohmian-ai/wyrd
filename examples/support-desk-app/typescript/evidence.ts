@@ -29,9 +29,9 @@ export async function evidence(runId: string, client?: WyrdClient) {
     return await bifrost.sql(
       `SELECT c.run_id, c.question, c.answer, s.name AS span, encode(s.trace_id, 'hex') AS trace_id, g.call_id, r.verdict, r.execution_id
          FROM ${TICKETS} c
-         JOIN vala.traces.spans s ON s.run_id = c.run_id AND s.name LIKE 'invoke_agent %'
-         JOIN vala.gateway.calls g ON g.run_id = c.run_id
-         JOIN vala.verification.results r ON r.run_id = c.run_id
+         JOIN bifrost.traces.spans s ON s.run_id = c.run_id AND s.name LIKE 'invoke_agent %'
+         JOIN bifrost.gateway.calls g ON g.run_id = c.run_id
+         JOIN bifrost.verification.results r ON r.run_id = c.run_id
         WHERE c.run_id = $1`,
       [runId],
       Evidence,

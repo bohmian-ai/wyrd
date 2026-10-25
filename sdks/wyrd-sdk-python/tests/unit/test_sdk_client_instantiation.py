@@ -76,8 +76,8 @@ def test_async_bifrost_constructor_does_not_block() -> None:
 @pytest.mark.usefixtures("no_credentials")
 def test_local_access_never_connects(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:1")
-    first = TableConfig(Event, "vala.datasets.first")
-    second = TableConfig(Event, "vala.datasets.second")
+    first = TableConfig(Event, "bifrost.datasets.first")
+    second = TableConfig(Event, "bifrost.datasets.second")
 
     def local(bifrost: Bifrost | AsyncBifrost) -> None:
         assert bifrost.table is not None and bifrost.table.fqn == first.fqn

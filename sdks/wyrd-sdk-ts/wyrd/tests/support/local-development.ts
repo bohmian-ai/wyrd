@@ -23,7 +23,7 @@ export const COMPLETION = {
 };
 
 /** One evidence row: the Card it is attributed to. */
-export const Attributed = z.object({ card_uid: z.string().nullable() });
+export const Attributed = z.object({ subject_card_uid: z.string().nullable() });
 
 /** What {@link work} leaves running for a caller to keep using. */
 export interface Worked {
@@ -65,11 +65,11 @@ export async function work(client: WyrdClient): Promise<Worked> {
 
   const bifrost = await Bifrost.connect({ client });
   for (const [table, alias] of [
-    ["vala.drift.observations", "model"],
-    ["vala.traces.spans", "agent"],
+    ["bifrost.drift.observations", "model"],
+    ["bifrost.traces.spans", "agent"],
   ] as const) {
-    const rows = await bifrost.sql(`SELECT card_uid FROM ${table} WHERE run_id = $1`, [run.runId], Attributed);
-    expect(rows, table).toEqual([{ card_uid: state.cardRef(alias).uid }]);
+    const rows = await bifrost.sql(`SELECT subject_card_uid FROM ${table} WHERE run_id = $1`, [run.runId], Attributed);
+    expect(rows, table).toEqual([{ subject_card_uid: state.cardRef(alias).uid }]);
   }
   return { state, bundle, agentUid: state.cardRef("agent").uid ?? "" };
 }

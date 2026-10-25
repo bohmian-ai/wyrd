@@ -66,7 +66,7 @@ def test_unknown_alias_is_refused(state: WyrdState) -> None:
 def test_record_refuses_a_table_outside_vala_datasets(state: WyrdState) -> None:
     """``record`` writes registered caller-owned tables only."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.record("vala.drift.observations", {"value": 1})
+        state.run().observe.record("bifrost.drift.observations", {"value": 1})
     assert raised.value.code == "WYRD_SDK_400_INVALID_OBSERVATION"
 
 
@@ -87,7 +87,7 @@ def test_shutdown_without_startup_succeeds(state: WyrdState) -> None:
 def test_record_refuses_a_non_string_mapping_key(state: WyrdState, key: object) -> None:
     """``json.dumps`` would stringify the key, so it is refused before the writer."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        state.run().observe.record("vala.datasets.latency", {key: 1.0})
+        state.run().observe.record("bifrost.datasets.latency", {key: 1.0})
     assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
@@ -616,7 +616,7 @@ def test_otel_imports_without_the_agents_sdk() -> None:
 def _record_reaches_the_ordinary_boundary(run: Run) -> None:
     """Record one explicit row and assert its ordinary offline error."""
     with pytest.raises(wyrd.WyrdError) as raised:
-        run.observe.record("vala.datasets.latency", {"latency_ms": 1.0})
+        run.observe.record("bifrost.datasets.latency", {"latency_ms": 1.0})
     assert raised.value.code == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 

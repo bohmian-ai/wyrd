@@ -36,7 +36,7 @@ const asReturned = { parse: (row: unknown) => row as Record<string, unknown> };
  */
 const test = serverTest().extend<{ table: string; bifrost: Bifrost }>({
   table: async ({}, use) => {
-    await use(`vala.datasets.events_${crypto.randomUUID().replaceAll("-", "")}`);
+    await use(`bifrost.datasets.events_${crypto.randomUUID().replaceAll("-", "")}`);
   },
   bifrost: async ({ table }, use) => {
     const bifrost = await Bifrost.connect({ table: TableConfig.fromJsonSchema(table, Event) });
@@ -91,7 +91,7 @@ test("returns inserted rows as native values", async ({ server, bifrost, table }
 });
 
 test("copies query results into another table", async ({ server, bifrost, table }) => {
-  const archive = `vala.datasets.archive_${crypto.randomUUID().replaceAll("-", "")}`;
+  const archive = `bifrost.datasets.archive_${crypto.randomUUID().replaceAll("-", "")}`;
   const archiver = await Bifrost.connect({
     table: TableConfig.fromJsonSchema(archive, Event),
   });
@@ -133,7 +133,7 @@ test("refuses a model allowing extra keys", () => {
 
   let error: unknown;
   try {
-    TableConfig.fromJsonSchema("vala.datasets.loose", Loose);
+    TableConfig.fromJsonSchema("bifrost.datasets.loose", Loose);
   } catch (thrown) {
     error = thrown;
   }

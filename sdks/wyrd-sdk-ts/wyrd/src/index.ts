@@ -5,12 +5,14 @@ import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
 import type {
+  AlterTableRequest as AlterTableRequestWire,
   BifrostTableDescription as TableDescriptionWire,
   BifrostTableEntry as TableEntry,
   CancelRunningQueryResponse,
   CardRef,
   CardDeclarationOutcome,
   CardSummary,
+  ColumnRename,
   CompactionTypeWire as CompactionType,
   CreateOperatorConnectionRequest,
   CreateServicePrincipalRequest,
@@ -45,6 +47,7 @@ import type {
   OperatorConnectionView,
   PartitionFieldWire as PartitionField,
   PhysicalLayoutWire as PhysicalLayout,
+  PhysicalLayoutEdit,
   PrincipalKindTag as PrincipalKind,
   PrincipalPage,
   PrincipalQuery,
@@ -146,6 +149,7 @@ export type { WyrdErrorCode } from "./error-codes.js";
 export type {
   CardDeclarationOutcome,
   CardSummary,
+  ColumnRename,
   CompactionType,
   CreateOperatorConnectionRequest,
   CreateServicePrincipalRequest,
@@ -180,6 +184,7 @@ export type {
   OperatorConnectionView,
   PartitionField,
   PhysicalLayout,
+  PhysicalLayoutEdit,
   PrincipalKind,
   PrincipalPage,
   PrincipalQuery,
@@ -421,6 +426,23 @@ function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
  */
 export type TableDescription = Omit<TableDescriptionWire, "table_version"> & { readonly table_version: bigint };
 
+/**
+ * One edit to a registered table, built from the version last described.
+ *
+ * `expected_table_version` is a `bigint`; the edit commits only while the
+ * table is still at that version. Supplied layout lists name columns after
+ * any rename in the same edit; an omitted list keeps the current one.
+ */
+export type TableAlteration = Omit<AlterTableRequestWire, "expected_table_version"> & {
+  readonly expected_table_version: bigint;
+};
+
+function tableDescription(result: NativeLifecycleResult): TableDescription {
+  const wire = lifecycleValue<TableDescriptionWire>(result);
+  // The native client already refused any non-canonical or out-of-range spelling.
+  return { ...wire, table_version: BigInt(wire.table_version) };
+}
+
 function lifecycleValue<T>(result: NativeLifecycleResult): T {
   const error = projectedError(result);
   if (error !== undefined) {
@@ -638,7 +660,7 @@ export interface TableLayout {
 
 /** Optional per-row correlation; an omitted field is a null on the wire. */
 export interface Correlation {
-  cardUid?: string;
+  subjectCardUid?: string;
   runId?: string;
 }
 
@@ -1212,12 +1234,12 @@ export class Bifrost {
    * saturated queue throws the stable refusal rather than dropping the row.
    *
    * @param row - One row object matching the active table's columns.
-   * @param correlation - Optional `cardUid` and `runId` stamped on the row.
+   * @param correlation - Optional `subjectCardUid` and `runId` stamped on the row.
    * @throws {@link WyrdError} with no active table, for a malformed
-   * `cardUid`, or when the queue is full.
+   * `subjectCardUid`, or when the queue is full.
    */
   insert(row: Readonly<Record<string, unknown>>, correlation: Correlation = {}): void {
-    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardUid, correlation.runId));
+    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.subjectCardUid, correlation.runId));
   }
 
   /**
@@ -1462,16 +1484,33 @@ export class Bifrost {
   /**
    * Describe one registered table's stored physical schema.
    *
-   * @param namespace - The table's namespace, such as `vala.datasets`.
+   * @param namespace - The table's namespace, such as `bifrost.datasets`.
    * @param name - The table's name within `namespace`.
    * @returns The server's projection of the stored schema.
    * @throws {@link WyrdError} when the table is unknown or unauthorized, or
    * for a transport failure.
    */
   async describeTable(namespace: string, name: string): Promise<TableDescription> {
-    const wire = lifecycleValue<TableDescriptionWire>(await this.#native.describeTable(namespace, name));
-    // The native client already refused any non-canonical or out-of-range spelling.
-    return { ...wire, table_version: BigInt(wire.table_version) };
+    return tableDescription(await this.#native.describeTable(namespace, name));
+  }
+
+  /**
+   * Edit one registered table's layout or custom columns.
+   *
+   * @param namespace - The table's namespace, such as `bifrost.datasets`.
+   * @param name - The table's name within `namespace`.
+   * @param alteration - The edit and the table version it was built from.
+   * @returns The server's projection of the committed table version.
+   * @throws {@link WyrdError} when the edit is invalid, the table moved past
+   * `expected_table_version`, the table is unknown or unauthorized, or for a
+   * transport failure.
+   */
+  async alterTable(namespace: string, name: string, alteration: TableAlteration): Promise<TableDescription> {
+    const request: AlterTableRequestWire = {
+      ...alteration,
+      expected_table_version: String(alteration.expected_table_version),
+    };
+    return tableDescription(await this.#native.alterTable(namespace, name, JSON.stringify(request)));
   }
 }
 
@@ -1504,11 +1543,11 @@ function cardRefText(ref: CardRef | string): string {
  * @param schema - The table's JSON Schema, or a schema that emits one, mapped
  * to the Arrow schema of the row.
  * @param row - One row object matching `schema`.
- * @param correlation - Optional `cardUid` and `runId` stamped on the row;
+ * @param correlation - Optional `subjectCardUid` and `runId` stamped on the row;
  * omitted, the row is uncorrelated.
  * @throws {@link WyrdError} `WYRD_VALA_400_SCHEMA_PARSE` for a schema that
  * does not map to Arrow, or `WYRD_SPEC_400_VALIDATION` for unparsable schema
- * text or a malformed `cardUid`.
+ * text or a malformed `subjectCardUid`.
  */
 export function record(
   bifrost: Bifrost,
@@ -1522,7 +1561,7 @@ export function record(
       table,
       jsonSchemaText(schema),
       JSON.stringify(row),
-      correlation.cardUid,
+      correlation.subjectCardUid,
       correlation.runId,
     ),
   );
@@ -2454,14 +2493,14 @@ export class Observe {
   }
 
   /**
-   * Emit one row into a registered `vala.datasets.<name>` table.
+   * Emit one row into a registered `bifrost.datasets.<name>` table.
    *
    * The first call for a table describes it; later calls reuse the cached
    * schema and producer, so only the first awaits a lookup.
    *
-   * @param table - The table's `vala.datasets.<name>`.
+   * @param table - The table's `bifrost.datasets.<name>`.
    * @param row - One JSON row matching the table's columns.
-   * @throws a {@link WyrdError} for a table outside `vala.datasets`, an unknown
+   * @throws a {@link WyrdError} for a table outside `bifrost.datasets`, an unknown
    * or unauthorized table, before startup, or after shutdown.
    */
   async record(table: string, row: unknown): Promise<void> {
@@ -3109,7 +3148,7 @@ export class WyrdState {
   /**
    * Connect this state's one Bifrost writer and describe the fixed table.
    *
-   * Runs as the state's client. Startup describes `vala.drift.observations`
+   * Runs as the state's client. Startup describes `bifrost.drift.observations`
    * before resolving, so submitted samples can never enqueue against a
    * missing, unauthorized, or incompatible system table.
    *

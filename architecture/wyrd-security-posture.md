@@ -80,7 +80,7 @@ physical location, so callers of one tenant may share a frame but tenants never
 do. Outbox frames name `PLATFORM_AUDIT_PRINCIPAL`, the no-verified-caller
 marker, as their transport principal; it grants nothing and never replaces a
 row's verified pair or the invocation caller in audit. Gate refuses every
-public write to `vala.gateway.calls`. A pod without Scribe sends its outbox
+public write to `bifrost.gateway.calls`. A pod without Scribe sends its outbox
 writes over the peer plane's capture RPC, admitted by `wyrd-peer` mTLS alone.
 Each request's rows carry the subject/actor pairs the local writer would
 stamp, and the RPC accepts only the six server-internal destinations: retained audit history, the two capture tables,
@@ -135,7 +135,7 @@ token or Gate; Gate refuses every public write to the result tables. It
 performs a Verifier's agent-check calls, which the gateway authorizes against
 the execution's accepted authority, never SYSTEM's. And it carries a tokenless
 `bifrost_query:read` authority scoped by table UID to exactly the input table
-a scheduled window Verifier reads (`vala.drift.observations`), recorded for the
+a scheduled window Verifier reads (`bifrost.drift.observations`), recorded for the
 execution's subject. That read
 authority is not a general Bifrost grant and is never inferred from the
 subject, and Oracle authorizes and audits every read under it like any
@@ -231,11 +231,11 @@ credential.
 - Internal verification work mints no token. Results are staged on the
   process Scribe outbox under the operation's pair: a direct request's
   verified caller, or a queued run's subject with SYSTEM as actor. Trace
-  input reads are ordinary Bifrost queries of `vala.traces.spans` under the
+  input reads are ordinary Bifrost queries of `bifrost.traces.spans` under the
   execution's accepted caller, so Oracle authorizes and audits them like any
   query that caller makes. Scheduled drift window reads use the credentialless
   SYSTEM read authority described above, granted `bifrost_query:read` only on
-  the registered `vala.drift.observations` table UID; a missing SYSTEM
+  the registered `bifrost.drift.observations` table UID; a missing SYSTEM
   principal or unreadable table identity fails closed before any row is
   returned.
 - Revoking a credential, suspending or deleting a principal, suspending a
@@ -524,7 +524,7 @@ change; there are no custom runtime permission strings and no
   table_uid }` covers exactly that registered table UID and does not follow a
   dropped-and-recreated table; catalog and schema ride with the UID so the
   synchronous check needs no catalog lookup. Catalog and schema are the logical
-  SQL names (catalog `vala`, schema `logs`), validated as identifier segments.
+  SQL names (catalog `bifrost`, schema `logs`), validated as identifier segments.
 
 A future domain that needs object scope adds its own typed variant rather than
 reusing another domain's identity spelling.
@@ -554,9 +554,9 @@ the direct serde projection of `Permission`:
   {"resource": "cards", "action": "write", "scope": "all"},
   {"resource": {"any_of": ["operators", "triggers"]}, "action": "invoke", "scope": "all"},
   {"resource": "bifrost_query", "action": "read",
-   "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}},
+   "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}},
   {"resource": "bifrost_query", "action": "read",
-   "scope": {"bifrost": {"table": {"catalog": "vala", "schema": "traces",
+   "scope": {"bifrost": {"table": {"catalog": "bifrost", "schema": "traces",
                                    "table_uid": "0199f0c1-2f7e-7c2a-9a6f-1c9b2f4d5e60"}}}}
 ]
 ```
@@ -805,7 +805,7 @@ publisher, surface-specific WAL, disk spool, durable queue, relay, or sink
 exists.
 
 Retained audit history lives in the tenant-qualified Bifrost
-`vala.system.audit_log` table, written only through Scribe, never through Gate.
+`bifrost.system.audit_log` table, written only through Scribe, never through Gate.
 Audit frames are submitted under the platform audit principal, the one
 principal Scribe admits for the reserved system owner's audit history. A row
 carries only decision content (request, trace, operation, resource, audit Card,

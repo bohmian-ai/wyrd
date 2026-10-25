@@ -9,4 +9,4 @@ export const SERVICE_DIR = resolve(import.meta.dirname, "../service");
 export const BUNDLE_DIR = process.env.BUNDLE_DIR ?? resolve(import.meta.dirname, "../.wyrd-bundle");
 
 /** The Bifrost table the Service declares. */
-export const TICKETS = "vala.datasets.tickets";
+export const TICKETS = "bifrost.datasets.tickets";

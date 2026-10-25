@@ -3682,7 +3682,7 @@ pub(super) mod tests {
             objects: fixture_objects(),
             hot_files: Vec::new(),
             context,
-            table_name: "vala.traces.spans".to_owned(),
+            table_name: "bifrost.traces.spans".to_owned(),
             live: live_routes,
         })
         .await

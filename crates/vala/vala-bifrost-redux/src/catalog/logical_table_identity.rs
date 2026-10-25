@@ -52,7 +52,7 @@ impl<'a> LogicalTableIdentity<'a> {
         }
         let logical_namespace = table.namespace.as_str();
         let logical_segment = logical_namespace
-            .strip_prefix("vala.")
+            .strip_prefix("bifrost.")
             .filter(|segment| !segment.is_empty() && !segment.contains('.'))
             .ok_or(LogicalTableIdentityError::InvalidLogicalNamespace)?;
         Ok(Self {
@@ -105,7 +105,7 @@ impl<'a> LogicalTableIdentity<'a> {
         &self,
     ) -> Result<PhysicalProjectionFacts, LogicalTableIdentityError<()>> {
         let namespace_bytes = checked_sum(&[
-            "vala".len(),
+            "bifrost".len(),
             1,
             "tenants".len(),
             1,
@@ -160,7 +160,7 @@ impl<'a> LogicalTableIdentity<'a> {
             .hyphenated()
             .encode_lower(&mut tenant_buffer);
         let mut namespace = String::with_capacity(facts.namespace_bytes);
-        namespace.push_str("vala.tenants.");
+        namespace.push_str("bifrost.tenants.");
         namespace.push_str(tenant_text);
         namespace.push('.');
         namespace.push_str(self.logical_segment);

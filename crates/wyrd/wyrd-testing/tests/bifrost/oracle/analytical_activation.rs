@@ -98,7 +98,7 @@ async fn seed_table(
     for object in 0..objects {
         let start = object * per_object;
         rows.write(
-            &format!("vala.bifrost.{table}"),
+            &format!("bifrost.bifrost.{table}"),
             &journey_schema(),
             (start..start + per_object)
                 .map(|id| journey_row(id, &format!("group_{}", id % FIXTURE_GROUPS)))
@@ -247,9 +247,9 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
     let query = wyrd_client::Bifrost::query_only(&public);
 
     let plain =
-        format!("SELECT id FROM vala.bifrost.{interactive_table} WHERE filter_key = 'group_0'");
+        format!("SELECT id FROM bifrost.bifrost.{interactive_table} WHERE filter_key = 'group_0'");
     let grouped = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} GROUP BY filter_key"
     );
 
     // A normal root is graphless. It owns no graph while it streams and leaves
@@ -718,9 +718,10 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let remote_before = RemoteWork::observe(&cluster)?;
 
     let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
-    let scan_sql = format!("SELECT id FROM vala.bifrost.{scan_table} WHERE filter_key = 'group_0'");
+    let scan_sql =
+        format!("SELECT id FROM bifrost.bifrost.{scan_table} WHERE filter_key = 'group_0'");
     let grouped_sql = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
 
@@ -763,8 +764,8 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let remote_before_join = RemoteWork::observe(&cluster)?;
     let self_join_sql = format!(
         "SELECT l.id AS left_id, r.id AS right_id \
-         FROM vala.bifrost.{table} l \
-         JOIN vala.bifrost.{table} r ON l.filter_key = r.filter_key \
+         FROM bifrost.bifrost.{table} l \
+         JOIN bifrost.bifrost.{table} r ON l.filter_key = r.filter_key \
          WHERE l.filter_key = 'group_0' AND r.id > 5 \
          ORDER BY left_id, right_id"
     );
@@ -1122,10 +1123,10 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
 
     let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
     let analytical_sql = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
-    let ui_sql = format!("SELECT id FROM vala.bifrost.{ui_table} WHERE filter_key = 'group_0'");
+    let ui_sql = format!("SELECT id FROM bifrost.bifrost.{ui_table} WHERE filter_key = 'group_0'");
 
     // Held at a real follower boundary, so the Analytical class is occupied by
     // production queries while the UI query below asks for its own path. Two
@@ -1277,7 +1278,7 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
     let table = seed_table(&cluster, "under_privileged", 2).await?;
     let query_server = cluster.server(0).ok_or("missing query node")?;
     let grouped = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} GROUP BY filter_key"
     );
 
     // Denied before planning, peers, or sources: a caller holding no query
@@ -1343,7 +1344,7 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     }
 
     let sql = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
     let paused = PEER_FOLLOWERS[0];
@@ -1585,10 +1586,10 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
     }
 
     let analytical_sql = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
-    let ui_sql = format!("SELECT id FROM vala.bifrost.{ui_table} WHERE filter_key = 'group_0'");
+    let ui_sql = format!("SELECT id FROM bifrost.bifrost.{ui_table} WHERE filter_key = 'group_0'");
 
     // Every eligible remote is armed, so whichever two the attempt selects are
     // held at their own execute seam and the third is left to prove it was

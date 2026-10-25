@@ -1,4 +1,4 @@
-//! Table-owned OTLP trace projection for `vala.traces.spans`.
+//! Table-owned OTLP trace projection for `bifrost.traces.spans`.
 //!
 //! [`project_resource_spans`] is the single deterministic, IO-free conversion
 //! from decoded OTLP resource spans into the canonical span row. It performs no
@@ -10,14 +10,16 @@
 //! Column order and field meaning come exclusively from
 //! [`super::spans::SPAN_FIELDS`]; nothing in this module restates them.
 
-use arrow::array::ArrayRef;
-use arrow::datatypes::{Fields, Schema};
+use arrow::array::{ArrayRef, AsArray};
+use arrow::datatypes::{Fields, Schema, TimestampNanosecondType};
 use arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 use wyrd_queue::variant::EncodedVariant;
+use wyrd_spec::vala::BifrostError;
 use wyrd_tonic::otlp::common::v1::any_value::Value;
 use wyrd_tonic::otlp::common::v1::{EntityRef, KeyValue};
+use wyrd_tonic::otlp::trace::v1::span::Event;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
 use super::spans::{SPAN_EVENT_ELEMENT, SPAN_FIELDS, SPAN_LINK_ELEMENT};
@@ -25,12 +27,13 @@ use crate::otlp_contract::IngestOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope,
-    attributes_variant, bool_column, checked_i64, entity_refs_column, fixed_binary_column,
-    fixed_binary_opt_column, fixed_row_bytes, i32_column, i32_opt_column, i64_column,
-    i64_opt_column, internal, last_attribute, list_column, nested_fields, otlp_instant_column,
-    projected_signal_schema, promoted_int, promoted_string, span_id_bytes, struct_column,
-    trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, variant_column,
+    ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope,
+    ResourcePromotionColumns, ScopeEnvelope, attributes_variant, bool_column, checked_i64,
+    entity_refs_column, fixed_binary_column, fixed_binary_opt_column, fixed_row_bytes, i32_column,
+    i32_opt_column, i64_column, i64_opt_column, internal, last_attribute, list_column,
+    nested_fields, otlp_instant_column, projected_signal_schema, promoted_int, promoted_string,
+    refuse_forged, span_id_bytes, stored_attributes, struct_column, trace_id_bytes,
+    u32_as_i64_column, utf8_column, utf8_opt_column, variant_column,
 };
 use wyrd_spec::ids::CardUid;
 
@@ -296,6 +299,8 @@ struct SpanColumns {
     service_version: Vec<Option<String>>,
     /// Promoted `deployment.environment.name`, else `deployment.environment`.
     deployment_environment: Vec<Option<String>>,
+    /// The descriptive resource promotions and subject descriptors that follow.
+    resource_promotions: ResourcePromotionColumns,
     /// Promoted `http.request.method` attribute string.
     http_request_method: Vec<Option<String>>,
     /// Promoted `http.route` attribute string.
@@ -304,12 +309,18 @@ struct SpanColumns {
     http_response_status_code: Vec<Option<i64>>,
     /// Promoted `url.full` attribute string.
     url_full: Vec<Option<String>>,
+    /// Promoted `url.path` attribute string.
+    url_path: Vec<Option<String>>,
+    /// Promoted `url.query` attribute string.
+    url_query: Vec<Option<String>>,
     /// Promoted `exception.type` attribute string.
     exception_type: Vec<Option<String>>,
     /// Promoted `exception.message` attribute string.
     exception_message: Vec<Option<String>>,
     /// Promoted `exception.stacktrace` attribute string.
     exception_stacktrace: Vec<Option<String>>,
+    /// Whether the span carries any event named `exception`.
+    is_exception: Vec<bool>,
     card_uid: Vec<Option<String>>,
     run_id: Vec<Option<String>>,
 }
@@ -437,9 +448,16 @@ impl SpanColumns {
         self.http_response_status_code
             .push(http.response_status_code);
         self.url_full.push(http.url_full);
+        self.url_path.push(http.url_path);
+        self.url_query.push(http.url_query);
         self.exception_type.push(exception.exception_type);
         self.exception_message.push(exception.message);
         self.exception_stacktrace.push(exception.stacktrace);
+        self.is_exception.push(
+            span.events
+                .iter()
+                .any(|event| event.name == EXCEPTION_EVENT_NAME),
+        );
         self.card_uid.push(correlation.card_uid);
         self.run_id.push(correlation.run_id);
 
@@ -458,10 +476,13 @@ impl SpanColumns {
         self.entity_ref_lengths
             .push(Some(resource.entity_refs.len()));
         self.entity_refs.extend_from_slice(&resource.entity_refs);
-        self.service_name.push(resource.service_name.clone());
-        self.service_version.push(resource.service_version.clone());
+        self.service_name
+            .push(resource.promotions.service_name.clone());
+        self.service_version
+            .push(resource.promotions.service_version.clone());
         self.deployment_environment
-            .push(resource.deployment_environment.clone());
+            .push(resource.promotions.deployment_environment.clone());
+        self.resource_promotions.push(&resource.promotions);
 
         self.scope_present.push(scope.present);
         self.scope_name.push(scope.name.clone());
@@ -636,7 +657,7 @@ impl SpanColumns {
 
         let mut gen_ai_strings = self.gen_ai_strings.into_iter();
         let mut gen_ai_ints = self.gen_ai_ints.into_iter();
-        let columns: Vec<ArrayRef> = vec![
+        let mut columns: Vec<ArrayRef> = vec![
             fixed_binary_column(16, &self.trace_id).map_err(internal)?,
             fixed_binary_column(8, &self.span_id).map_err(internal)?,
             fixed_binary_opt_column(8, &self.parent_span_id).map_err(internal)?,
@@ -678,23 +699,182 @@ impl SpanColumns {
             i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
             utf8_opt_column(&self.service_version),
             utf8_opt_column(&self.deployment_environment),
+        ];
+        columns.extend(self.resource_promotions.finish());
+        columns.extend([
             utf8_opt_column(&self.http_request_method),
             utf8_opt_column(&self.http_route),
             i64_opt_column(self.http_response_status_code),
             utf8_opt_column(&self.url_full),
+            utf8_opt_column(&self.url_path),
+            utf8_opt_column(&self.url_query),
             utf8_opt_column(&self.exception_type),
             utf8_opt_column(&self.exception_message),
             utf8_opt_column(&self.exception_stacktrace),
+            bool_column(self.is_exception),
             utf8_opt_column(&self.card_uid),
             utf8_opt_column(&self.run_id),
-        ];
+        ]);
 
         RecordBatch::try_new(Arc::clone(&SPAN_SCHEMA), columns)
             .map_err(|error| TableError::Internal(format!("canonical span batch: {error}")))
     }
 }
 
-/// Return the canonical user-column schema of `vala.traces.spans`.
+/// Refuse a native canonical span batch whose derived columns differ from
+/// what [`project_resource_spans`] derives from the same source fields.
+///
+/// `duration_nano`, the `GenAI`, HTTP, URL, and exception promotions, and
+/// `is_exception` are re-derived from each row's times, `attributes`, and
+/// `events` with the projection's own extractors, so a native writer cannot
+/// store a filter value the projection would not, and a wrongly typed `GenAI`
+/// source refuses the batch as it rejects an OTLP span.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] for a span that ends before it
+/// starts, a wrongly typed `GenAI` source, a malformed nested column, or the
+/// first derived column that differs.
+pub(crate) fn refuse_forged_span_derivations(batch: &RecordBatch) -> Result<(), BifrostError> {
+    let refused = |detail: String| BifrostError::SchemaParse { detail };
+    let column = |name: &str| {
+        batch
+            .column_by_name(name)
+            .ok_or_else(|| refused(format!("canonical batch is missing column {name}")))
+    };
+    let attributes = column("attributes")?;
+    let events = column("events")?
+        .as_list_opt::<i32>()
+        .ok_or_else(|| refused("events is not a list".to_owned()))?;
+    let event_fields = events
+        .values()
+        .as_struct_opt()
+        .ok_or_else(|| refused("events does not hold structs".to_owned()))?;
+    let event_names = event_fields
+        .column_by_name("name")
+        .and_then(|names| names.as_string_opt::<i32>())
+        .ok_or_else(|| refused("events carry no name".to_owned()))?;
+    let event_attributes = event_fields
+        .column_by_name("attributes")
+        .ok_or_else(|| refused("events carry no attributes".to_owned()))?;
+    let instant = |name: &str| {
+        column(name)?
+            .as_primitive_opt::<TimestampNanosecondType>()
+            .ok_or_else(|| refused(format!("{name} is not an OTLP instant")))
+            .cloned()
+    };
+    let (start, end) = (
+        instant("start_time_unix_nano")?,
+        instant("end_time_unix_nano")?,
+    );
+
+    let rows = batch.num_rows();
+    let mut duration = Vec::with_capacity(rows);
+    let mut gen_ai = Vec::with_capacity(rows);
+    let mut http = Vec::with_capacity(rows);
+    let mut exception = Vec::with_capacity(rows);
+    let mut is_exception = Vec::with_capacity(rows);
+    for row in 0..rows {
+        duration.push(
+            end.value(row)
+                .checked_sub(start.value(row))
+                .filter(|duration| *duration >= 0)
+                .ok_or_else(|| refused(format!("span row {row} ends before it starts")))?,
+        );
+        let offsets = events.value_offsets();
+        let span = Span {
+            attributes: stored_attributes(attributes.as_ref(), row)?,
+            events: (offsets[row]..offsets[row + 1])
+                .map(|event| {
+                    let event = usize::try_from(event).unwrap_or(usize::MAX);
+                    Ok(Event {
+                        name: event_names.value(event).to_owned(),
+                        attributes: stored_attributes(event_attributes.as_ref(), event)?,
+                        ..Event::default()
+                    })
+                })
+                .collect::<Result<_, BifrostError>>()?,
+            ..Span::default()
+        };
+        gen_ai.push(
+            GenAiPromotions::extract(&span.attributes)
+                .map_err(|reason| refused(format!("span row {row}: {reason}")))?,
+        );
+        http.push(HttpPromotions::extract(&span.attributes));
+        exception.push(SpanColumns::exception_promotions(&span));
+        is_exception.push(
+            span.events
+                .iter()
+                .any(|event| event.name == EXCEPTION_EVENT_NAME),
+        );
+    }
+
+    let text = |values: Vec<Option<String>>| utf8_opt_column(&values);
+    // Each `GenAI` column is its convention key with `.` spelled `_`.
+    let column_of = |key: &str| key.replace('.', "_");
+    let mut derived: Vec<(String, ArrayRef)> =
+        vec![("duration_nano".to_owned(), i64_column(duration))];
+    for (index, key) in GEN_AI_STRING_PROMOTIONS.into_iter().enumerate() {
+        let values = gen_ai
+            .iter()
+            .map(|row| row.strings[index].clone())
+            .collect();
+        derived.push((column_of(key), text(values)));
+    }
+    for (index, key) in GEN_AI_INT_PROMOTIONS.into_iter().enumerate() {
+        let values = gen_ai.iter().map(|row| row.ints[index]).collect();
+        derived.push((column_of(key), i64_opt_column(values)));
+    }
+    derived.extend([
+        (
+            "http_request_method".to_owned(),
+            text(http.iter().map(|row| row.request_method.clone()).collect()),
+        ),
+        (
+            "http_route".to_owned(),
+            text(http.iter().map(|row| row.route.clone()).collect()),
+        ),
+        (
+            "http_response_status_code".to_owned(),
+            i64_opt_column(http.iter().map(|row| row.response_status_code).collect()),
+        ),
+        (
+            "url_full".to_owned(),
+            text(http.iter().map(|row| row.url_full.clone()).collect()),
+        ),
+        (
+            "url_path".to_owned(),
+            text(http.iter().map(|row| row.url_path.clone()).collect()),
+        ),
+        (
+            "url_query".to_owned(),
+            text(http.iter().map(|row| row.url_query.clone()).collect()),
+        ),
+        (
+            "exception_type".to_owned(),
+            text(
+                exception
+                    .iter()
+                    .map(|row| row.exception_type.clone())
+                    .collect(),
+            ),
+        ),
+        (
+            "exception_message".to_owned(),
+            text(exception.iter().map(|row| row.message.clone()).collect()),
+        ),
+        (
+            "exception_stacktrace".to_owned(),
+            text(exception.iter().map(|row| row.stacktrace.clone()).collect()),
+        ),
+        ("is_exception".to_owned(), bool_column(is_exception)),
+    ]);
+    derived
+        .iter()
+        .try_for_each(|(name, values)| refuse_forged(batch, name, values))
+}
+
+/// Return the canonical user-column schema of `bifrost.traces.spans`.
 ///
 /// The schema is derived from the ledger on every call rather than cached, so
 /// there is exactly one place a span column order can come from.
@@ -760,6 +940,10 @@ struct HttpPromotions {
     response_status_code: Option<i64>,
     /// `url.full`.
     url_full: Option<String>,
+    /// `url.path`.
+    url_path: Option<String>,
+    /// `url.query`.
+    url_query: Option<String>,
 }
 
 impl HttpPromotions {
@@ -770,15 +954,23 @@ impl HttpPromotions {
             route: promoted_string(attributes, "http.route"),
             response_status_code: promoted_int(attributes, "http.response.status_code"),
             url_full: promoted_string(attributes, "url.full"),
+            url_path: promoted_string(attributes, "url.path"),
+            url_query: promoted_string(attributes, "url.query"),
         }
     }
 
     /// Returns the promoted text bytes these values add to one row.
     fn bytes(&self) -> usize {
-        [&self.request_method, &self.route, &self.url_full]
-            .into_iter()
-            .flatten()
-            .map(String::len)
-            .sum()
+        [
+            &self.request_method,
+            &self.route,
+            &self.url_full,
+            &self.url_path,
+            &self.url_query,
+        ]
+        .into_iter()
+        .flatten()
+        .map(String::len)
+        .sum()
     }
 }

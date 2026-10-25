@@ -20,8 +20,8 @@ use wyrd_testing::bifrost::{
 };
 
 use super::support::{
-    append_values, await_persistence_drained, published_rows, register_table, sorted_values,
-    tenant_client, unique_table,
+    append_values, await_persistence_drained, endpoint_client, published_rows, register_table,
+    sorted_values, tenant_client, tenant_key, unique_table,
 };
 
 /// Longest a settled pod may take to retire the members its publication replaced.
@@ -364,10 +364,11 @@ async fn staged_backlog_survives_abrupt_restart() {
     let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
     let rows: Vec<i64> = (0..48).collect();
     let batch_id = uuid::Uuid::now_v7();
-    let (node, before) = {
+    let (node, before, key) = {
         let server = cluster.server(0).expect("the mixed pod is running");
         register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
-        let client = tenant_client(server, tenant).await;
+        let key = tenant_key(server, tenant).await;
+        let client = endpoint_client(server, &key);
         append_values(&client, &table, batch_id, &rows)
             .await
             .expect("the batch is acknowledged");
@@ -385,6 +386,7 @@ async fn staged_backlog_survives_abrupt_restart() {
         (
             server.node_id(),
             scrape_staging(server, &telemetry, "staged before restart"),
+            key,
         )
     };
     let [Some(members), Some(bytes), Some(oldest), _] = before else {
@@ -410,7 +412,7 @@ async fn staged_backlog_survives_abrupt_restart() {
         restored_oldest, oldest,
         "the restored backlog keeps its persisted oldest ready time"
     );
-    let client = tenant_client(server, tenant).await;
+    let client = endpoint_client(server, &key);
     assert_eq!(
         sorted_values(&client, &table).await,
         rows,

@@ -121,6 +121,35 @@ export interface AgentSpec {
 }
 
 /**
+ * Explicitly alter one table's definition (`PATCH /v1/bifrost/tables/{namespace}/{name}`).
+ *
+ * The whole request applies atomically against `expected_table_version` and
+ * publishes exactly one new table version; a stale version changes nothing.
+ * At least one field besides the version must make an effective change.
+ * Unknown fields and explicit `null`s are refused, so a field is either
+ * omitted or carries a value.
+ */
+export interface AlterTableRequest {
+  /**
+   * Nullable top-level custom columns to append, in the field-declaration
+   * shape registration uses.
+   */
+  readonly add_columns?: readonly FieldSpec2Input[];
+  /**
+   * The table version this edit was built from, as last described.
+   */
+  readonly expected_table_version: TableVersion;
+  /**
+   * Layout lists to replace; an omitted list keeps the current one.
+   */
+  readonly physical_layout?: PhysicalLayoutEdit;
+  /**
+   * Top-level custom columns to rename; each keeps its field id and values.
+   */
+  readonly rename_columns?: readonly ColumnRename[];
+}
+
+/**
  * Validated value for free-form Card annotations.
  */
 export type AnnotationValue = string;
@@ -213,12 +242,12 @@ export interface BifrostTableDescription {
   /**
    * The correlation inputs a writer supplies alongside its user fields.
    *
-   * Exactly nullable `card_uid: Utf8` then nullable `run_id: Utf8`, each
+   * Exactly nullable `subject_card_uid: Utf8` then nullable `run_id: Utf8`, each
    * with the field id its physical column holds.
    *
-   * Card correlation is optional, so a writer may omit `card_uid` entirely;
+   * Card correlation is optional, so a writer may omit `subject_card_uid` entirely;
    * the server then stores the row with its authenticated subject/actor
-   * pair and a null `card_uid`. A supplied UID is stored only once the server has
+   * pair and a null `subject_card_uid`. A supplied UID is stored only once the server has
    * confirmed the writer may correlate to that Card.
    */
   readonly correlation_fields: readonly FieldSpec2[];
@@ -734,6 +763,20 @@ export type ColorMode = "Rgb" | "Rgba" | "Grayscale";
  */
 export type ColumnName = string;
 
+/**
+ * One top-level custom column rename in an [`AlterTableRequest`].
+ */
+export interface ColumnRename {
+  /**
+   * The column's current name.
+   */
+  readonly from: string;
+  /**
+   * The column's new name, unused by any other column.
+   */
+  readonly to: string;
+}
+
 export type CommitSha = string;
 
 /**
@@ -1231,6 +1274,9 @@ export interface DataStats {
  * Arrow-free logical column type. The exhaustive set Bifrost accepts on the
  * register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the
  * server/engine, never in `wyrd-spec`.
+ *
+ * A parameterized variant refuses unknown members, so a misspelled
+ * parameter fails decoding instead of being dropped.
  */
 export type DataTypeSpec = "Bool" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Float32" | "Float64" | "Utf8" | "LargeUtf8" | "Binary" | "LargeBinary" | DataTypeSpecFixedSizeBinary | "Date32" | "Date64" | DataTypeSpecTimestamp | DataTypeSpecTime32 | DataTypeSpecTime64 | DataTypeSpecDecimal128 | DataTypeSpecList | DataTypeSpecStruct | DataTypeSpecMap | "Variant";
 
@@ -1264,6 +1310,139 @@ export interface DataTypeSpecFixedSizeBinaryFixedSizeBinary {
    * Byte width.
    */
   readonly len: number;
+}
+
+/**
+ * Arrow-free logical column type. The exhaustive set Bifrost accepts on the
+ * register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the
+ * server/engine, never in `wyrd-spec`.
+ *
+ * A parameterized variant refuses unknown members, so a misspelled
+ * parameter fails decoding instead of being dropped.
+ */
+export type DataTypeSpecInput = "Bool" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Float32" | "Float64" | "Utf8" | "LargeUtf8" | "Binary" | "LargeBinary" | DataTypeSpecInputFixedSizeBinary | "Date32" | "Date64" | DataTypeSpecInputTimestamp | DataTypeSpecInputTime32 | DataTypeSpecInputTime64 | DataTypeSpecInputDecimal128 | DataTypeSpecInputList | DataTypeSpecInputStruct | DataTypeSpecInputMap | "Variant";
+
+/**
+ * 128-bit fixed-point decimal.
+ */
+export interface DataTypeSpecInputDecimal128 {
+  readonly Decimal128: DataTypeSpecInputDecimal128Decimal128;
+}
+
+export interface DataTypeSpecInputDecimal128Decimal128 {
+  /**
+   * Total number of digits.
+   */
+  readonly precision: number;
+  /**
+   * Number of fractional digits.
+   */
+  readonly scale: number;
+}
+
+/**
+ * Fixed-width binary.
+ */
+export interface DataTypeSpecInputFixedSizeBinary {
+  readonly FixedSizeBinary: DataTypeSpecInputFixedSizeBinaryFixedSizeBinary;
+}
+
+export interface DataTypeSpecInputFixedSizeBinaryFixedSizeBinary {
+  /**
+   * Byte width.
+   */
+  readonly len: number;
+}
+
+/**
+ * Variable-length list whose boxed element declaration carries the child's
+ * name, nullability, metadata, and stable field id.
+ *
+ * The element is a full [`FieldSpec`] rather than a bare type so a nested
+ * child keeps the same identity the physical schema stores; a client that
+ * rebuilds an Arrow schema from a description reproduces the stored list
+ * child exactly instead of inventing a nullable `item`.
+ */
+export interface DataTypeSpecInputList {
+  readonly List: FieldSpec2Input;
+}
+
+/**
+ * Unordered key/value entries, the Iceberg `map` type.
+ *
+ * Key and value are full [`FieldSpec`]s for the same reason as
+ * [`Self::List`]'s element: each keeps its name, nullability, metadata,
+ * and stable field id. An Iceberg map key is always required, so register
+ * stores a key declared nullable as non-nullable.
+ */
+export interface DataTypeSpecInputMap {
+  readonly Map: DataTypeSpecInputMapMap;
+}
+
+export interface DataTypeSpecInputMapMap {
+  /**
+   * Declaration of every entry's key.
+   */
+  readonly key: FieldSpec2Input;
+  /**
+   * Declaration of every entry's value.
+   */
+  readonly value: FieldSpec2Input;
+}
+
+/**
+ * Nested struct of named fields.
+ */
+export interface DataTypeSpecInputStruct {
+  readonly Struct: readonly FieldSpec2Input[];
+}
+
+/**
+ * Time-of-day at second/millisecond precision.
+ */
+export interface DataTypeSpecInputTime32 {
+  readonly Time32: DataTypeSpecInputTime32Time32;
+}
+
+export interface DataTypeSpecInputTime32Time32 {
+  /**
+   * Precision.
+   */
+  readonly unit: TimeUnit;
+}
+
+/**
+ * Time-of-day at microsecond/nanosecond precision.
+ */
+export interface DataTypeSpecInputTime64 {
+  readonly Time64: DataTypeSpecInputTime64Time64;
+}
+
+export interface DataTypeSpecInputTime64Time64 {
+  /**
+   * Precision.
+   */
+  readonly unit: TimeUnit;
+}
+
+/**
+ * Timestamp with explicit precision and optional timezone.
+ */
+export interface DataTypeSpecInputTimestamp {
+  readonly Timestamp: DataTypeSpecInputTimestampTimestamp;
+}
+
+export interface DataTypeSpecInputTimestampTimestamp {
+  /**
+   * IANA timezone string, or `None` for timezone-naive.
+   *
+   * Omitted when `None`; an explicit `null` is refused.
+   */
+  readonly tz?: string;
+  /**
+   * Precision.
+   */
+  readonly unit: TimeUnit;
 }
 
 /**
@@ -1347,8 +1526,10 @@ export interface DataTypeSpecTimestamp {
 export interface DataTypeSpecTimestampTimestamp {
   /**
    * IANA timezone string, or `None` for timezone-naive.
+   *
+   * Omitted when `None`; an explicit `null` is refused.
    */
-  readonly tz: string | null;
+  readonly tz?: string;
   /**
    * Precision.
    */
@@ -1810,6 +1991,9 @@ export interface FieldSpec {
 /**
  * Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
  * but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
+ *
+ * Unknown members are refused, so a misspelled key fails decoding instead of
+ * being dropped.
  */
 export interface FieldSpec2 {
   /**
@@ -1831,6 +2015,35 @@ export interface FieldSpec2 {
    * Whether the column is nullable. Defaults to `true`.
    */
   readonly nullable: boolean;
+}
+
+/**
+ * Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
+ * but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
+ *
+ * Unknown members are refused, so a misspelled key fails decoding instead of
+ * being dropped.
+ */
+export interface FieldSpec2Input {
+  /**
+   * Logical column type.
+   */
+  readonly data_type: DataTypeSpecInput;
+  /**
+   * String metadata carried verbatim through every schema conversion.
+   *
+   * [`PARQUET_FIELD_ID_KEY`] is meaningful to Bifrost: it holds the stored
+   * stable field id as decimal text.
+   */
+  readonly metadata?: Readonly<Record<string, string>>;
+  /**
+   * Column name.
+   */
+  readonly name: string;
+  /**
+   * Whether the column is nullable. Defaults to `true`.
+   */
+  readonly nullable?: boolean;
 }
 
 /**
@@ -3571,6 +3784,8 @@ export interface ParquetMeta {
  * `buckets` is required for and only accepted on a `bucket` transform (2
  * through 1024); `width` is required for and only accepted on a `truncate`
  * transform (a positive integer counting Unicode code points for strings).
+ * Each parameter is either omitted or carries a value; an explicit `null` is
+ * refused.
  */
 export interface PartitionFieldWire {
   /**
@@ -3600,6 +3815,31 @@ export interface PartitionFieldWire {
  * transform semantics, including null preservation.
  */
 export type PartitionTransformWire = "hour" | "day" | "identity" | "bucket" | "truncate";
+
+/**
+ * The layout lists one [`AlterTableRequest`] replaces.
+ *
+ * Each supplied list replaces the table's complete current list and an
+ * omitted one is kept; `bloom_columns: []` removes every Bloom column. The
+ * time column is fixed at creation, so `time_column` is an unknown field
+ * here.
+ */
+export interface PhysicalLayoutEdit {
+  /**
+   * The complete new Bloom column set, which may be empty.
+   */
+  readonly bloom_columns?: readonly string[];
+  /**
+   * The complete new partition list, holding exactly one `hour` or `day`
+   * field over the time column.
+   */
+  readonly partition_by?: readonly PartitionFieldWire[];
+  /**
+   * The complete new sort order; an empty list sorts by the time column
+   * descending, nulls last.
+   */
+  readonly sort_keys?: readonly SortKeyWire[];
+}
 
 /**
  * The authoritative physical layout of one Bifrost table.
@@ -3640,6 +3880,7 @@ export interface PhysicalLayoutWire {
    *
    * Omitted on a request, the time column is `wyrd_ingested_at`. The
    * canonical form in a description and the control row always names it.
+   * An explicit `null` is refused.
    */
   readonly time_column?: string;
 }
@@ -5244,7 +5485,7 @@ export interface ServiceSpec {
   /**
    * Bifrost dataset tables this Service writes.
    *
-   * Registration validates and ensures each one in `vala.datasets` before
+   * Registration validates and ensures each one in `bifrost.datasets` before
    * the Service becomes active; removing the Service never drops them.
    */
   readonly tables?: readonly ServiceTable[];
@@ -5263,7 +5504,7 @@ export interface ServiceSpec {
  */
 export interface ServiceTable {
   /**
-   * Dataset table name inside `vala.datasets`.
+   * Dataset table name inside `bifrost.datasets`.
    */
   readonly name: string;
   /**
@@ -5303,7 +5544,7 @@ export type SlotName = string;
 export type SortDirectionWire = "asc" | "desc";
 
 /**
- * One declared physical sort key.
+ * One declared physical sort key; unknown members are refused.
  */
 export interface SortKeyWire {
   /**

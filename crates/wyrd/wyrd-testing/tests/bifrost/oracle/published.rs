@@ -93,7 +93,7 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     let owner_tenant = cluster.data_tenant_id();
     let neighbour_tenant = cluster.add_tenant("oracle-published-neighbour").await?;
     let table = unique_table("oracle_published");
-    let fqn = format!("vala.bifrost.{table}");
+    let fqn = format!("bifrost.bifrost.{table}");
     register_table(server, owner_tenant, &table).await?;
     register_table(server, neighbour_tenant, &table).await?;
     let owner = writer_for_tenant(server, owner_tenant, "published-owner").await?;
@@ -240,6 +240,11 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
 ///
 /// Returns a client, ingest, or lifecycle error, and a descriptive error when
 /// the stalled read is not reached, does not terminate, or returns rows.
+///
+/// # Panics
+///
+/// Panics when the read cancelled under the stalled backend returns rows
+/// instead of an error.
 async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
     let mut server = WyrdTestServer::builder()
         .with_shutdown_drain_for_test(CANCELLED_READ_DRAIN)
@@ -248,7 +253,7 @@ async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
         .map_err(|error| format!("the bound production server starts: {error}"))?;
     let tenant = server.data_tenant_id();
     let table = unique_table("oracle_cancelled");
-    let fqn = format!("vala.bifrost.{table}");
+    let fqn = format!("bifrost.bifrost.{table}");
     register_table(&server, tenant, &table).await?;
     let reader = writer(&server, "cancelled-reader").await?;
     reader
@@ -336,7 +341,7 @@ async fn prove_planning_read_stall_times_out() -> Result<(), JourneyError> {
         .ok_or("the one-pod cluster runs one server")?;
     let tenant = cluster.data_tenant_id();
     let table = unique_table("oracle_planning_stall");
-    let fqn = format!("vala.bifrost.{table}");
+    let fqn = format!("bifrost.bifrost.{table}");
     register_table(server, tenant, &table).await?;
     let reader = writer(server, "planning-stall-reader").await?;
     reader
@@ -860,6 +865,11 @@ async fn variant_sql_registry_covers_every_session() {
 /// # Errors
 ///
 /// Returns the first claim that broke.
+///
+/// # Panics
+///
+/// Panics when the remote-work snapshot holds fewer lease counts than the
+/// topology has followers.
 async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     let cluster = PeerCluster::start_with_slots(&[
         (BifrostTarget::Oracle, Some(2)),
@@ -901,7 +911,7 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
              to_json({ROW_VARIANT} -> 'o') AS o, to_json({ROW_VARIANT}) AS root, \
              named_struct('m', filter_key)['m'] AS s, \
              try_parse_json('{{bad') IS NULL AS lenient \
-             FROM vala.bifrost.{ui_table} WHERE ({ROW_VARIANT} ->> 'k') = 'group_0' ORDER BY id"
+             FROM bifrost.bifrost.{ui_table} WHERE ({ROW_VARIANT} ->> 'k') = 'group_0' ORDER BY id"
         ),
     )
     .await?;
@@ -928,7 +938,7 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
         &format!(
             "SELECT {ROW_VARIANT} ->> 'k' AS k, COUNT(*) AS matched, \
              MAX(to_json({ROW_VARIANT} -> 'o')) AS o \
-             FROM vala.bifrost.{table} WHERE ({ROW_VARIANT} ->> 'n') IS NOT NULL \
+             FROM bifrost.bifrost.{table} WHERE ({ROW_VARIANT} ->> 'n') IS NOT NULL \
              GROUP BY 1 ORDER BY 1"
         ),
     )
@@ -956,13 +966,15 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     for (case, sql) in [
         (
             "Interactive invalid JSON",
-            format!("SELECT parse_json('{{bad' || filter_key) AS v FROM vala.bifrost.{ui_table}"),
+            format!(
+                "SELECT parse_json('{{bad' || filter_key) AS v FROM bifrost.bifrost.{ui_table}"
+            ),
         ),
         (
             "Analytical invalid JSON",
             format!(
                 "SELECT parse_json('{{bad' || filter_key) ->> 'k' AS k, COUNT(*) AS matched \
-                 FROM vala.bifrost.{table} GROUP BY 1"
+                 FROM bifrost.bifrost.{table} GROUP BY 1"
             ),
         ),
     ] {
@@ -1007,7 +1019,7 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     let remote_before = RemoteWork::observe(&cluster)?;
     match run_rows(
         &unprivileged,
-        "SELECT request_payload ->> 'model' AS model FROM vala.gateway.calls",
+        "SELECT request_payload ->> 'model' AS model FROM bifrost.gateway.calls",
     )
     .await
     {
@@ -1071,14 +1083,14 @@ async fn prove_late_failures(
     cluster.refresh_snapshots().await?;
     let generic = wyrd_spec::error::WyrdError::from(BifrostError::QueryExecutionFailed).problem();
     let sorted =
-        format!("(SELECT id FROM vala.bifrost.{analytical} ORDER BY id LIMIT 81920) AS sorted");
+        format!("(SELECT id FROM bifrost.bifrost.{analytical} ORDER BY id LIMIT 81920) AS sorted");
     let late = |value: &str, source: &str| {
         format!(
             "SELECT id, FIRST_VALUE({value}) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW \
              AND CURRENT ROW) AS v FROM {source}"
         )
     };
-    let interactive = format!("vala.bifrost.{interactive}");
+    let interactive = format!("bifrost.bifrost.{interactive}");
     for (case, path, sql, delivered, expected) in [
         (
             "Interactive late invalid JSON",
@@ -1187,7 +1199,7 @@ async fn prove_worker_tenant_refusal(
     let remote_before = RemoteWork::observe(cluster)?;
     let case = "worker tenant refusal";
     let sql = format!(
-        "SELECT id FROM (SELECT id FROM vala.bifrost.{table} ORDER BY id LIMIT 8193) AS sorted"
+        "SELECT id FROM (SELECT id FROM bifrost.bifrost.{table} ORDER BY id LIMIT 8193) AS sorted"
     );
     let error = match wyrd_client::Bifrost::query_only(client)
         .sql(&sql, &[])
@@ -1332,7 +1344,7 @@ async fn struct_and_variant_share_physical_pushdown() -> Result<(), JourneyError
         .ok_or("the one-pod cluster runs one server")?;
     let tenant = cluster.data_tenant_id();
     let table = unique_table("oracle_pushdown");
-    let fqn = format!("vala.bifrost.{table}");
+    let fqn = format!("bifrost.bifrost.{table}");
     let schema: SchemaRef = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new(
@@ -1602,7 +1614,7 @@ async fn prove_time_column_pruning() -> Result<(), JourneyError> {
     for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
         let time_type = DataType::Timestamp(unit, Some("+00:00".into()));
         let table = unique_table("oracle_time_column");
-        let fqn = format!("vala.bifrost.{table}");
+        let fqn = format!("bifrost.bifrost.{table}");
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new(EVENT_TIME, time_type.clone(), false),
@@ -1836,7 +1848,7 @@ async fn prove_source_transitions() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
     let tenant = cluster.data_tenant_id();
     let table = unique_table("source_transitions");
-    let fqn = format!("vala.bifrost.{table}");
+    let fqn = format!("bifrost.bifrost.{table}");
     let sql = format!("SELECT id FROM {fqn}");
     let writer_node = cluster.server(0).ok_or("missing node 0")?;
     register_table(writer_node, tenant, &table).await?;
@@ -1976,7 +1988,7 @@ async fn prove_unvalidated_captures() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
     let tenant = cluster.data_tenant_id();
     let table = unique_table("unvalidated_captures");
-    let fqn = format!("vala.bifrost.{table}");
+    let fqn = format!("bifrost.bifrost.{table}");
     let sql = format!("SELECT id FROM {fqn}");
     let writer_node = cluster.server(0).ok_or("missing node 0")?;
     register_table(writer_node, tenant, &table).await?;

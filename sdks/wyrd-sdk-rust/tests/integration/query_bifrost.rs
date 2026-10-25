@@ -14,8 +14,8 @@ use wyrd_spec::vala::ids::RunId;
 
 use crate::support::Deployment;
 
-/// The `vala.datasets` table the stories read, holding rows 1 to 3.
-const QUERY_ROWS: &str = "vala.datasets.query_rows";
+/// The `bifrost.datasets` table the stories read, holding rows 1 to 3.
+const QUERY_ROWS: &str = "bifrost.datasets.query_rows";
 
 /// One [`QUERY_ROWS`] row, as written and as read back.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -92,7 +92,7 @@ async fn live() -> (Deployment, Bifrost) {
             .insert(
                 serde_json::to_vec(&row).expect("row serializes"),
                 Correlation {
-                    card_uid: None,
+                    subject_card_uid: None,
                     run_id: Some(run_id.clone()),
                 },
             )
@@ -174,7 +174,10 @@ async fn unwritten_builtin_table_reads_as_empty() {
     let rows: Vec<Count> = Bifrost::connect_with(&deployment.admin(), BifrostOptions::default())
         .await
         .expect("Bifrost connects")
-        .sql_as("SELECT COUNT(*) AS n FROM vala.drift.result_features", &[])
+        .sql_as(
+            "SELECT COUNT(*) AS n FROM bifrost.drift.result_features",
+            &[],
+        )
         .await
         .expect("query runs");
 
@@ -342,7 +345,7 @@ async fn unknown_column_carries_the_planners_suggestion() {
         format!("SELECT r.valeu FROM {QUERY_ROWS} r"),
         format!(
             "SELECT r.valeu, r.valeu AS again FROM {QUERY_ROWS} r JOIN {QUERY_ROWS} s ON r.id = s.id \
-             JOIN vala.verification.results v ON v.result_id = s.value"
+             JOIN bifrost.verification.results v ON v.result_id = s.value"
         ),
         format!("SELECT id FROM {QUERY_ROWS} WHERE id IN (SELECT r.valeu FROM {QUERY_ROWS} r)"),
     ] {
@@ -403,7 +406,7 @@ async fn type_mismatch_and_ambiguous_reference_carry_the_planners_detail() {
     deployment.shutdown().await;
 }
 
-/// A caller granted only `vala.datasets` who names another schema's table is
+/// A caller granted only `bifrost.datasets` who names another schema's table is
 /// refused without learning its columns, even when the SQL misspells one.
 ///
 /// # Panics
@@ -415,7 +418,7 @@ async fn unauthorized_table_refusal_reveals_no_columns() {
     let datasets_only = json!({
         "resource": "bifrost_query",
         "action": "read",
-        "scope": { "bifrost": { "schema": { "catalog": "vala", "schema": "datasets" } } },
+        "scope": { "bifrost": { "schema": { "catalog": "bifrost", "schema": "datasets" } } },
     });
     deployment
         .server()
@@ -443,7 +446,7 @@ async fn unauthorized_table_refusal_reveals_no_columns() {
             .sql(
                 &format!(
                     "SELECT q.id, v.verdcit FROM {QUERY_ROWS} q \
-                     JOIN vala.verification.results v ON v.result_id = q.value"
+                     JOIN bifrost.verification.results v ON v.result_id = q.value"
                 ),
                 &[],
             )
@@ -459,8 +462,8 @@ async fn unauthorized_table_refusal_reveals_no_columns() {
     deployment.shutdown().await;
 }
 
-/// The `vala.datasets` table the attribution story writes.
-const ATTRIBUTED_ROWS: &str = "vala.datasets.attributed_rows";
+/// The `bifrost.datasets` table the attribution story writes.
+const ATTRIBUTED_ROWS: &str = "bifrost.datasets.attributed_rows";
 
 /// One [`ATTRIBUTED_ROWS`] row read back with the pair Wyrd stamped on it.
 #[derive(Debug, PartialEq, Deserialize)]
@@ -666,7 +669,7 @@ async fn subject_actor_rows_and_reserved_columns() {
 
     for column in ["sub_principal_id", "act_principal_id"] {
         let declared = TableConfig::from_json_schema(
-            "vala.datasets.spoofed_rows",
+            "bifrost.datasets.spoofed_rows",
             &json!({ "type": "object", "properties": { column: { "type": "string" } } }),
         )
         .expect_err("a managed name is not a user column");
@@ -677,7 +680,7 @@ async fn subject_actor_rows_and_reserved_columns() {
                 reqwest::Method::POST,
                 "/v1/bifrost/tables",
                 Some(&wyrd_spec::vala::api::RegisterTableRequest {
-                    namespace: "vala.datasets".to_owned(),
+                    namespace: "bifrost.datasets".to_owned(),
                     name: "spoofed_rows".to_owned(),
                     fields: vec![wyrd_spec::vala::api::FieldSpec {
                         name: column.to_owned(),

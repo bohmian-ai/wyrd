@@ -132,9 +132,9 @@ fn non_empty_tail_batch() -> RecordBatch {
 
 /// The caller-owned logical table the private-tail fixtures read.
 ///
-/// `vala.bifrost` is a control namespace with no registrable table, and the
+/// `bifrost.bifrost` is a control namespace with no registrable table, and the
 /// Scribe catalog owner refuses an unregistered logical frame. A caller-owned
-/// `vala.datasets` table is the only registrable shape for a fixture schema,
+/// `bifrost.datasets` table is the only registrable shape for a fixture schema,
 /// so the tail fixtures seed and read this one.
 const TAIL_TABLE: &str = "tail_events";
 
@@ -209,7 +209,9 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             .as_ref(),
         ScribeIngressFrame {
             attributed_cards: None,
+            dimensions: None,
             authenticated_tenant: tenant,
+            workload: principal.workload_uid.clone(),
             attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             principal,
             table,
@@ -630,7 +632,7 @@ async fn ingest_logical_batch(
     tokio::spawn(async move { serve_grpc(router, bind, token).await });
 
     let mut request = Request::new(InsertBatchRequest {
-        table: format!("vala.datasets.{table_name}"),
+        table: format!("bifrost.datasets.{table_name}"),
         arrow_ipc: valid_arrow_ipc().into(),
         wyrd_batch_id: batch_id.as_bytes().to_vec().into(),
         table_version: 1,
@@ -861,19 +863,19 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Encodes one complete `vala.verification.results` row with `card_uid`.
+/// Encodes one complete `bifrost.verification.results` row with `subject_card_uid`.
 ///
 /// Carries every authored column of the built-in result table, taken from
 /// [`ResultsTable::arrow_fields`] so the row tracks the canonical declaration:
 /// a completed passing result with an empty outcome, every optional column
-/// null, and `card_uid` in the correlation column.
+/// null, and `subject_card_uid` in the correlation column.
 ///
 /// # Panics
 ///
 /// Panics when the fixed Arrow batch or IPC stream cannot be constructed.
-fn verification_result_ipc(card_uid: &str) -> Vec<u8> {
+fn verification_result_ipc(subject_card_uid: &str) -> Vec<u8> {
     let mut fields = ResultsTable::arrow_fields();
-    fields.push(Field::new("card_uid", DataType::Utf8, true));
+    fields.push(Field::new("subject_card_uid", DataType::Utf8, true));
     let now = Utc::now().timestamp_micros();
     let columns: Vec<ArrayRef> = fields
         .iter()
@@ -887,7 +889,7 @@ fn verification_result_ipc(card_uid: &str) -> Vec<u8> {
             ("started_at" | "ended_at", data_type) => Arc::new(
                 TimestampMicrosecondArray::from(vec![now]).with_data_type(data_type.clone()),
             ),
-            ("card_uid", _) => Arc::new(StringArray::from(vec![card_uid])),
+            ("subject_card_uid", _) => Arc::new(StringArray::from(vec![subject_card_uid])),
             ("outcome", _) => {
                 VariantColumnBuilder::encode("outcome", [Some(serde_json::json!({}))], |value| {
                     EncodedVariant::from_json(&value)
@@ -1166,7 +1168,10 @@ async fn public_result_writes_are_refused_over_grpc() {
         ("service", service_jwt),
     ];
     let mut expected = Vec::new();
-    for table in ["vala.verification.results", "vala.drift.result_features"] {
+    for table in [
+        "bifrost.verification.results",
+        "bifrost.drift.result_features",
+    ] {
         for (kind, jwt) in &writers {
             let refused = insert_as(
                 harness.bind,
@@ -1246,7 +1251,7 @@ async fn system_read_authority_reads_only_the_named_table() {
     let authority = resolve(system).await.expect("authority resolves");
     let table_uid: Vec<u8> = sqlx::query_scalar(
         "SELECT table_uid FROM vala.bifrost_tables \
-         WHERE data_tenant_id = $1 AND fqn = 'vala.drift.observations'",
+         WHERE data_tenant_id = $1 AND fqn = 'bifrost.drift.observations'",
     )
     .bind(harness.tenant.as_uuid())
     .fetch_one(&harness.assertion_pool)
@@ -1263,7 +1268,7 @@ async fn system_read_authority_reads_only_the_named_table() {
         principal.effective_permissions,
         PermissionSet::from_iter([wyrd_runtime::Permission {
             scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "drift".to_owned(),
                 table_uid: Uuid::from_slice(&table_uid).expect("16-byte table UID"),
             })),
@@ -1284,10 +1289,10 @@ async fn system_read_authority_reads_only_the_named_table() {
         };
         async move { caller.run(request).await }
     };
-    query("SELECT COUNT(*) AS n FROM vala.drift.observations")
+    query("SELECT COUNT(*) AS n FROM bifrost.drift.observations")
         .await
         .expect("the authority reads its observation table");
-    let denied = query("SELECT COUNT(*) AS n FROM vala.verification.results")
+    let denied = query("SELECT COUNT(*) AS n FROM bifrost.verification.results")
         .await
         .expect_err("the authority is refused another table");
     assert_eq!(
@@ -1382,7 +1387,7 @@ async fn forged_tenant_result_writes_are_refused() {
         let refused = insert_as(
             harness.bind,
             &jwt,
-            "vala.verification.results",
+            "bifrost.verification.results",
             verification_result_ipc(&Uuid::now_v7().to_string()),
         )
         .await

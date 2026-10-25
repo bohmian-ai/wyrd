@@ -1,13 +1,19 @@
 """Bifrost construction and table configuration, checked before any request."""
 
+import ast
+import inspect
+from pathlib import Path
+
 import pyarrow
 import pytest
+import wyrd
 from pydantic import BaseModel
 from wyrd import WyrdError
+from wyrd._wyrd import bifrost as native_bifrost
 from wyrd.bifrost import Bifrost, TableConfig
 from wyrd.bifrost._client import _description
 
-TABLE = "vala.datasets.events"
+TABLE = "bifrost.datasets.events"
 TARGET_FILE_SIZE_BYTES = 256 * 1024 * 1024
 
 
@@ -86,3 +92,30 @@ def test_a_table_description_projects_its_version_as_an_exact_int(version: int) 
 
     assert type(described["table_version"]) is int
     assert described["table_version"] == version
+
+
+def _stub_parameters(function: ast.FunctionDef) -> list[tuple[str, bool]]:
+    arguments = function.args
+    names = [arg.arg for arg in arguments.args if arg.arg != "self"]
+    defaulted = len(arguments.defaults)
+    return [(name, index >= len(names) - defaulted) for index, name in enumerate(names)]
+
+
+def test_native_bifrost_stub_matches_runtime_signatures() -> None:
+    stub = ast.parse((Path(wyrd.__file__).parent / "_wyrd" / "bifrost.pyi").read_text())
+    declared = {
+        (cls.name, method.name): _stub_parameters(method)
+        for cls in stub.body
+        if isinstance(cls, ast.ClassDef)
+        for method in cls.body
+        if isinstance(method, ast.FunctionDef) and method.name != "__getattr__"
+    }
+    assert ("Bifrost", "alter_table") in declared
+    for (owner, name), parameters in declared.items():
+        runtime = getattr(native_bifrost, owner)
+        signature = inspect.signature(runtime if name == "__init__" else getattr(runtime, name))
+        assert [
+            (parameter.name, parameter.default is not inspect.Parameter.empty)
+            for parameter in signature.parameters.values()
+            if parameter.name != "self"
+        ] == parameters, f"{owner}.{name}"

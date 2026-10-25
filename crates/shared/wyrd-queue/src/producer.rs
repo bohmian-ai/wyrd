@@ -482,8 +482,8 @@ impl Producer {
 
     /// Admits one row without waiting.
     ///
-    /// `card_uid` is optional because Card correlation is: an omitted value
-    /// becomes a null in the sealed batch's `card_uid` column, which the server
+    /// `subject_card_uid` is optional because Card correlation is: an omitted value
+    /// becomes a null in the sealed batch's `subject_card_uid` column, which the server
     /// stores against the authenticated principal with no Card. `trace` is as
     /// for [`Self::enqueue_prepared`].
     ///
@@ -493,11 +493,11 @@ impl Producer {
     pub fn enqueue(
         &self,
         json: Vec<u8>,
-        card_uid: Option<CardUid>,
+        subject_card_uid: Option<CardUid>,
         run_id: Option<RunId>,
         trace: Option<TraceContext>,
     ) -> Result<(), WyrdQueueError> {
-        self.enqueue_rows(vec![json], card_uid, run_id, trace)
+        self.enqueue_rows(vec![json], subject_card_uid, run_id, trace)
     }
 
     /// Prepares and admits every row of one logical record, or none of them,
@@ -515,13 +515,13 @@ impl Producer {
     pub fn enqueue_rows(
         &self,
         rows: Vec<Vec<u8>>,
-        card_uid: Option<CardUid>,
+        subject_card_uid: Option<CardUid>,
         run_id: Option<RunId>,
         trace: Option<TraceContext>,
     ) -> Result<(), WyrdQueueError> {
         let prepared = self
             .preflight
-            .prepare(&rows, card_uid.as_ref(), run_id.as_ref())?;
+            .prepare(&rows, subject_card_uid.as_ref(), run_id.as_ref())?;
         drop(rows);
         self.enqueue_prepared(prepared, trace)
     }
@@ -1197,6 +1197,12 @@ mod tests {
     }
 
     /// A configuration that cannot work is refused before any task starts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a zero in-flight limit, a zero message size, or a client
+    /// byte limit below two messages builds a producer, or the sink saw any
+    /// attempt.
     #[test]
     fn invalid_config_is_refused_before_any_task() {
         let sink = Arc::new(MockSink::new());
@@ -1216,7 +1222,7 @@ mod tests {
         ] {
             assert!(matches!(
                 Producer::new(
-                    "vala.bifrost.invalid",
+                    "bifrost.bifrost.invalid",
                     wyrd_spec::vala::ids::TableVersion::INITIAL,
                     schema(),
                     sink.clone(),
@@ -1230,6 +1236,12 @@ mod tests {
 
     /// One budget serves a thousand table producers: none is refused, an idle
     /// one holds zero bytes, and every table's row publishes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any producer is refused, idle producers hold budget bytes,
+    /// an enqueue or shutdown fails, the sink receives other than 1,000 rows,
+    /// or bytes remain reserved after the drain.
     #[test]
     fn a_thousand_tables_share_one_budget_and_idle_producers_hold_nothing() {
         let config = QueueConfig::default();
@@ -1238,7 +1250,7 @@ mod tests {
         let producers = (0..1_000)
             .map(|index| {
                 Producer::with_budget(
-                    &format!("vala.bifrost.table_{index}"),
+                    &format!("bifrost.bifrost.table_{index}"),
                     wyrd_spec::vala::ids::TableVersion::INITIAL,
                     schema(),
                     sink.clone(),
@@ -1263,6 +1275,13 @@ mod tests {
 
     /// A dropped handle's task keeps its retained batch and bytes, retries it
     /// under one identity and allocation, and releases everything on ACK.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the row is refused, flush or shutdown does not time out
+    /// within its bounded deadline, the dropped task does not retain its bytes,
+    /// batch, and retry entry, the batch never settles, or the retries change
+    /// batch id or frame allocation.
     #[test]
     fn dropped_handle_keeps_retrying_its_retained_batch() {
         let sink = Arc::new(TimeoutSink::default());
@@ -1272,7 +1291,7 @@ mod tests {
             ..QueueConfig::default()
         };
         let producer = Producer::with_budget(
-            "vala.bifrost.drop_timeout",
+            "bifrost.bifrost.drop_timeout",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -1315,13 +1334,19 @@ mod tests {
     }
 
     /// Ambiguous sends retain one identity, uncapped, until a retry ACKs it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the first flush succeeds, the row never ACKs, the sink
+    /// sees other than three attempts under one batch id, or bytes, batches,
+    /// or retry entries remain after settlement.
     #[test]
     fn ambiguous_sends_retry_one_identity_until_acked() {
         let sink = Arc::new(MockSink::new());
         sink.fail_next(2);
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
-            "vala.bifrost.queue",
+            "bifrost.bifrost.queue",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -1379,7 +1404,7 @@ mod tests {
         let sink = Arc::new(MockSink::new());
         sink.fail_next(usize::MAX);
         let producer = Producer::with_budget(
-            "vala.bifrost.context_bytes",
+            "bifrost.bifrost.context_bytes",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -1439,12 +1464,19 @@ mod tests {
     }
 
     /// Preserves one exact owner when the queue deadline cancels a borrow.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the flush does not time out, the timeout drops the
+    /// retained bytes, batch, or retry entry or cancels no borrow, the retry
+    /// never settles, a later flush fails, or the retries change batch id or
+    /// leave bytes reserved.
     #[test]
     fn flush_timeout_retains_batch_until_later_ack() {
         let sink = Arc::new(TimeoutSink::default());
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
-            "vala.bifrost.timeout",
+            "bifrost.bifrost.timeout",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -1483,13 +1515,20 @@ mod tests {
 
     /// A shutdown that cannot settle everything keeps serving controls and
     /// retrying; a later shutdown then drains the producer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the first shutdown succeeds, a post-shutdown enqueue is
+    /// not refused as `QueueFull`, the retained batch never ACKs, the later
+    /// shutdown fails or leaves the producer undrained, or the retries change
+    /// batch id or deliver other than one row.
     #[test]
     fn failed_shutdown_keeps_serving_controls_and_retries() {
         let sink = Arc::new(MockSink::new());
         sink.fail_next(1);
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
-            "vala.bifrost.failed_shutdown",
+            "bifrost.bifrost.failed_shutdown",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -1569,7 +1608,7 @@ mod tests {
             attempted: Mutex::new(signal),
         });
         let producer = Producer::new(
-            "vala.bifrost.background_refusal",
+            "bifrost.bifrost.background_refusal",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink,
@@ -1628,6 +1667,13 @@ mod tests {
     /// without a later enqueue, and releases every owner before the observer
     /// reads the handle's ownership. Shutdown still drains and reports the
     /// first background refusal exactly once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either batch is not admitted, losses never settle, the
+    /// observer sees owned bytes or retry entries still held, shutdown does not
+    /// report one `Sink` refusal, other than four rows are lost and dropped,
+    /// a refused batch publishes, or any batch, retry entry, or byte remains.
     #[test]
     fn accepted_batch_losses_settle_exactly_once() {
         let sink = Arc::new(MockSink::new());
@@ -1647,7 +1693,7 @@ mod tests {
             }
         });
         let producer = Producer::with_budget(
-            "vala.gateway.calls",
+            "bifrost.gateway.calls",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -1702,13 +1748,20 @@ mod tests {
     }
 
     /// An owned Arrow batch is sealed by the background owner under one stable retried identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch is refused, the sink sees other than two
+    /// attempts under one batch id, the receipt changes table, row count,
+    /// request id, or columns, the counters are not two accepted and none
+    /// dropped, or flush, shutdown, or the byte release fails.
     #[test]
     fn arrow_batch_enqueue_seals_nested_columns_through_the_retry_owner() {
         let sink = Arc::new(MockSink::new());
         sink.fail_next(1);
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
-            "vala.gateway.calls",
+            "bifrost.gateway.calls",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -1728,7 +1781,7 @@ mod tests {
         assert_eq!(attempts.len(), 2, "one ambiguity then one resolving retry");
         assert_eq!(attempts[0], attempts[1], "retry keeps the sealed UUIDv7");
         let receipt = &sink.received()[0];
-        assert_eq!(receipt.table, "vala.gateway.calls");
+        assert_eq!(receipt.table, "bifrost.gateway.calls");
         assert_eq!(receipt.rows, 2);
         assert_eq!(
             receipt.request_id,
@@ -1744,12 +1797,19 @@ mod tests {
     }
 
     /// Admission returns at once while a sink stalls, and refuses at once when bytes are exhausted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either batch is refused or the second takes 50 ms or
+    /// more to admit, the second batch never seals, a third batch is not
+    /// refused as `Backpressure` with its two rows counted dropped, or shutdown
+    /// does not drain both batches and release every byte.
     #[test]
     fn arrow_batch_enqueue_never_waits_for_publication() {
         let sink = Arc::new(TimeoutSink::default());
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
-            "vala.traces.spans",
+            "bifrost.traces.spans",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -1796,12 +1856,19 @@ mod tests {
     /// keeps admitting far more rows than any fixed slot count. A due linger
     /// does not seal while every slot is busy, so the rows admitted behind
     /// the stalled sends accumulate and leave as one batch on release.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any row is refused, the staged rows never reach 1,000 or
+    /// seal while both slots are busy, shutdown fails, the sink sees other
+    /// than three attempts or a peak other than two, or the counters or byte
+    /// budget do not settle to 1,002 accepted, none dropped, and zero bytes.
     #[test]
     fn stalled_sends_bound_concurrency_and_grow_the_next_batch() {
         let sink = Arc::new(TimeoutSink::default());
         let budget = ClientByteBudget::new(QueueConfig::DEFAULT_CLIENT_BYTE_LIMIT);
         let producer = Producer::with_budget(
-            "vala.bifrost.in_flight_intake",
+            "bifrost.bifrost.in_flight_intake",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -1855,6 +1922,14 @@ mod tests {
     /// depth, budget, counters, and the sink stay untouched. Dropping a
     /// prepared record before hand-over (cancellation) changes nothing; once
     /// handed over, the record settles whole through the ordinary flush.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a record with an undeclared, too-deep, too-large, or
+    /// out-of-range final row is admitted or refused with any error but the
+    /// matching row-2 contract error, a refusal or a cancelled preparation
+    /// moves the counters or budget, or the handed-over record does not
+    /// publish as one two-row batch and release every byte.
     #[test]
     fn prepared_rows_reject_atomically_before_reservation() {
         let config = QueueConfig {
@@ -1868,7 +1943,7 @@ mod tests {
             wyrd_types::variant::variant_field("payload", true),
         ]));
         let producer = Producer::with_budget(
-            "vala.bifrost.prepared",
+            "bifrost.bifrost.prepared",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             Arc::clone(&schema),
             sink.clone(),
@@ -1965,6 +2040,13 @@ mod tests {
     /// than the whole admission budget is refused as too large, a byte
     /// refusal releases every row's reservation, and the sink receives
     /// exactly the admitted rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the oversized record is not refused as `PayloadTooLarge`,
+    /// the blocked record is not refused as `Backpressure` or keeps any bytes,
+    /// a refused record admits a prefix or miscounts its dropped rows, or the
+    /// fitting record does not publish exactly nine rows and release its bytes.
     #[test]
     fn multi_row_admission_is_all_or_none() {
         let config = QueueConfig {
@@ -1975,7 +2057,7 @@ mod tests {
         let budget = ClientByteBudget::for_config(&config);
         let sink = Arc::new(MockSink::new());
         let producer = Producer::with_budget(
-            "vala.bifrost.atomic_admission",
+            "bifrost.bifrost.atomic_admission",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -2017,11 +2099,17 @@ mod tests {
 
     /// Staged rows seal on their own, with no flush, once their JSON bytes
     /// reach the message ceiling, and once the linger elapses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either producer fails to start or admit, the staged JSON
+    /// stays below the byte ceiling, the byte-full or lingered rows never
+    /// publish without a flush, or either shutdown fails.
     #[test]
     fn byte_and_linger_triggers_seal_without_a_flush() {
         let sink = Arc::new(MockSink::new());
         let by_bytes = Producer::new(
-            "vala.bifrost.byte_trigger",
+            "bifrost.bifrost.byte_trigger",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -2042,7 +2130,7 @@ mod tests {
             received_rows(&sink) == count
         });
         let by_linger = Producer::new(
-            "vala.bifrost.linger_trigger",
+            "bifrost.bifrost.linger_trigger",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),
@@ -2067,6 +2155,12 @@ mod tests {
     /// flush still reserves its frame and publishes the staged row with that
     /// context, whose admitted charge moves to the sealed batch rather than
     /// being reserved a second time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the last traced row is refused, the budget still admits a
+    /// byte, the flush cannot reserve its frame, or the sink does not receive
+    /// the one row with its producer trace context.
     #[test]
     fn admitted_rows_cannot_take_the_sealing_headroom() {
         let config = QueueConfig {
@@ -2076,7 +2170,7 @@ mod tests {
         let budget = ClientByteBudget::for_config(&config);
         let sink = Arc::new(MockSink::new());
         let producer = Producer::with_budget(
-            "vala.bifrost.sealing_headroom",
+            "bifrost.bifrost.sealing_headroom",
             wyrd_spec::vala::ids::TableVersion::INITIAL,
             schema(),
             sink.clone(),

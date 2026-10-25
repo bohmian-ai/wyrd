@@ -1,7 +1,7 @@
 ---
 id: TASK-006
 kind: implementation
-status: proposed
+status: approved
 spec: SPEC-service-identity-and-telemetry
 spec_revision: 16
 requirements: [REQ-014, REQ-015, REQ-040, REQ-043, REQ-045, REQ-046, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, AC-014, AC-017, AC-019, AC-020]
@@ -240,3 +240,64 @@ private fixture/lifecycle/error plumbing remains implementation-owned.
 - [Approved revision 16](../spec.md), [whole-trace/availability contract](../supplements/table-storage-and-correlation.md#whole-trace-verification-decision), [auth](../supplements/auth-system.md), [signal schemas](../supplements/telemetry-schemas.md).
 - [Verifier](../../../../architecture/wyrd-design.md#verifier), [Bifrost](../../../../architecture/bifrost-design.md), [security](../../../../architecture/wyrd-security-posture.md), [SQL rules](../../../../crates/wyrd/wyrd-sql/AGENTS.md).
 - [Spec workflow](../../../spec-driven-development.md), [execution](../../../implementation-execution.md), [testing](../../../../TESTING.md), [Python rules](../../../../sdks/wyrd-sdk-python/AGENTS.md), [TypeScript rules](../../../../sdks/wyrd-sdk-ts/AGENTS.md).
+
+## Implementation Evidence
+
+Revalidated owners: `CallerTraces` already queried as the accepted caller
+with `SPAN_COLUMNS`, ordering, and the 10,001-row probe; the gap was the
+acceptance-anchored time predicate. `VerificationEngine` fetched per check and
+caught every trace error as inconclusive; the gap was per-attempt sharing and
+a deferral seam. The runner already mapped `EngineError::EvidenceUnavailable`
+to `EngineOutcome::Retry` (`evidence_unavailable`) through the existing
+three-attempt, 30/60-second PostgreSQL-due retry; the gap was choosing
+deferral only for a queued attempt before its last. No new error, setting,
+cache, table, or retry path was added.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-043/045, AC-017/019: all retained authorized exact-ID spans, cross-workload and untagged, outside the former window; other trace/tenant excluded; denied query refused; 10,000 judged / 10,001 explicit | `verification/hosted/traces.rs::CallerTraces::statement` (no time bound; anchor/lookback/chrono removed) | J1 `verification_runtime::visible_trace_spans_preserve_binding_ownership` | PASS |
+| One read per trace per attempt, shared by concurrent checks; deferral only on a deferring engine | `vala-verify/src/blocks/engine.rs::{run, read, trace}`, `with_unlanded_traces_deferred` | U1 `blocks::engine::tests::trace_checks_share_one_attempt_read`, `unlanded_traces_defer_only_a_deferring_engine`; all 24 `blocks::engine::tests::` | PASS |
+| REQ-014/015/040, AC-014/020: missing table and zero rows retry the same execution across restart; 30/60 s; no intermediate result; accepted authority, inputs, attribution, idempotency unchanged; third attempt judges arrived spans (one 30 days old) | `verification/runner.rs` (`defer_unlanded_traces: run.attempt < run.max_attempts`), `hosted/blocks.rs::Execution` | I1 `pg_verification_runtime::missing_trace_retries_same_execution` | PASS |
+| REQ-046, AC-020: exhaustion completes under `decide` (trace-only inconclusive, mixed `all` failed, `pass_rate` passed) | existing aggregation; last attempt not deferred | I2 `pg_verification_runtime::missing_trace_exhaustion_keeps_decision_rule` | PASS |
+| REQ-043/045/046, AC-017/020: direct absence inconclusive with nothing enqueued; failed judgment, denied read, oversized trace, invalid evidence settle on attempt 1; 5 min / 60 s defaults | `components/verification/service.rs` (`defer_unlanded_traces: false`) | I3 `pg_verification_runtime::trace_unavailability_preserves_execution_mode` | PASS |
+| REQ-045, AC-019: nonempty evidence judged on attempt 1; late spans never revise a completed result; a new execution sees them | unchanged completion path | J2 `verification_runtime::late_trace_spans_require_new_verification` | PASS |
+| REQ-040/045/046, INV-006, AC-014/019/020: whole trace, direct absence, queued absence then landed evidence under the same execution, no client retry, on every surface | `fixtures/cards/verifier_building_blocks/whole-trace.yaml`; shared `wyrd_testing::bifrost::canonical_signals::trace_spans` | P1 `test_trace_evidence_keeps_whole_trace_and_waits_when_submitted`; T1 `trace evidence keeps whole trace and waits when submitted`; M1 `verification::pg_tests::trace_evidence_keeps_whole_trace_and_waits_when_submitted` | PASS |
+| Delegated trace reads keep accepted history across bounded retries | journey updated to make each retry due and require three attempts and a decision per attempt | `verification_runtime::delegated_input_reads_keep_history` | PASS |
+| Generic retry exhaustion and SQL backoff unchanged | no change | `pg_verification_runtime::retryable_engine_failures_exhaust_to_errored`; `queries::verifier_executions::tests::retry_delays_double_and_cap`; `pg_hosted_artifacts::` (12) | PASS |
+| Architecture and rustdoc agree | `architecture/wyrd-design.md` (Verifier checks), `architecture/bifrost-design.md` (query service); rustdoc on changed items | static review; `rg` for lookback/anchor/window prose | PASS |
+| Format, lints, boundaries | — | `mise run fmt`, `lints`, `check:tenant-isolation`, `py:format`, `py:lints`, `py:typecheck`, `ts:format`, `ts:lints`, `ts:typecheck`, `ts:napi:check`, `git diff --check` | PASS |
+
+Limits: RED was not executed separately for U1, J1, or the I-tests; the
+production change was written before the tests, so their failure against the
+prior reader/engine is argued from source (the 30-day span and the per-check
+fetch), not observed. P1 and T1 wait the real 30-second PostgreSQL backoff
+(about 35 s each) because the Python and TypeScript harnesses expose no
+retry-due control, and adding one was not needed for the proof.
+
+Non-goals stayed excluded: no workload-only mode, cache/service, absolute
+expiry, completion protocol, mutable completed result, client-owned retry,
+or retry-until-pass behavior.
+
+### Diagnoses
+
+- **Symptom:** I2 panicked in `sent_result_id` ("one batch names one
+  result"). **Evidence:** three runs' results arrived in fewer submitted
+  batches. **Cause:** the Scribe outbox group-commits results, so one batch
+  can carry several executions' rows. **Fix site:** the test's `verdicts`
+  helper reads `(result_id, verdict)` per row; the write-count assertion only
+  requires every write to be a result.
+- **Symptom:** I1's precondition "no span table yet" failed.
+  **Evidence:** `WyrdTestServer::retained_records` rustdoc: "A table the
+  tenant has never published reads as no rows." **Cause:** the inspection
+  helper cannot distinguish a missing table. **Fix site:** dropped the
+  precondition; the harness's `start_with(false)` creates no built-in
+  tables, so the first attempt still exercises the missing-table path.
+- **Symptom:** I3's "denied read" judged `failed`, not inconclusive.
+  **Evidence:** `query/service.rs::QueryAuthority::admit_capability` admits on
+  `BifrostQuery/Read` alone. **Cause:** the case granted `bifrost_query_read`,
+  which is sufficient, so the read succeeded. **Fix site:** the case submits
+  with no permissions; `trace_reader` grants only `bifrost_query_read`.
+- **Symptom:** J1's denial assertion found `retrieve` in the response.
+  **Evidence:** the response echoes the authored `check.expected`.
+  **Cause:** the assertion matched authored text, not leaked evidence.
+  **Fix site:** assert each reason names the `BifrostQuery/Read` refusal.

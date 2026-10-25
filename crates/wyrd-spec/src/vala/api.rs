@@ -118,12 +118,12 @@ pub struct BifrostTableDescription {
     pub user_fields: Vec<FieldSpec>,
     /// The correlation inputs a writer supplies alongside its user fields.
     ///
-    /// Exactly nullable `card_uid: Utf8` then nullable `run_id: Utf8`, each
+    /// Exactly nullable `subject_card_uid: Utf8` then nullable `run_id: Utf8`, each
     /// with the field id its physical column holds.
     ///
-    /// Card correlation is optional, so a writer may omit `card_uid` entirely;
+    /// Card correlation is optional, so a writer may omit `subject_card_uid` entirely;
     /// the server then stores the row with its authenticated subject/actor
-    /// pair and a null `card_uid`. A supplied UID is stored only once the server has
+    /// pair and a null `subject_card_uid`. A supplied UID is stored only once the server has
     /// confirmed the writer may correlate to that Card.
     pub correlation_fields: Vec<FieldSpec>,
     /// Lower-case 64-character hex of the complete canonical physical
@@ -197,8 +197,12 @@ pub enum TimeUnit {
 /// Arrow-free logical column type. The exhaustive set Bifrost accepts on the
 /// register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the
 /// server/engine, never in `wyrd-spec`.
+///
+/// A parameterized variant refuses unknown members, so a misspelled
+/// parameter fails decoding instead of being dropped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub enum DataTypeSpec {
     /// Boolean.
     Bool,
@@ -244,7 +248,14 @@ pub enum DataTypeSpec {
         /// Precision.
         unit: TimeUnit,
         /// IANA timezone string, or `None` for timezone-naive.
-        #[serde(default)]
+        ///
+        /// Omitted when `None`; an explicit `null` is refused.
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
         tz: Option<String>,
     },
     /// Time-of-day at second/millisecond precision.
@@ -317,8 +328,12 @@ pub const VARIANT_MAX_ENCODED_BYTES: u64 = 8_388_608;
 
 /// Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
 /// but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
+///
+/// Unknown members are refused, so a misspelled key fails decoding instead of
+/// being dropped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct FieldSpec {
     /// Column name.
     pub name: String,
@@ -386,9 +401,10 @@ pub enum NullOrderWire {
     Last,
 }
 
-/// One declared physical sort key.
+/// One declared physical sort key; unknown members are refused.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct SortKeyWire {
     /// Sorted column; must exist in the complete physical schema.
     pub column: String,
@@ -425,6 +441,8 @@ pub enum PartitionTransformWire {
 /// `buckets` is required for and only accepted on a `bucket` transform (2
 /// through 1024); `width` is required for and only accepted on a `truncate`
 /// transform (a positive integer counting Unicode code points for strings).
+/// Each parameter is either omitted or carries a value; an explicit `null` is
+/// refused.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -434,12 +452,20 @@ pub struct PartitionFieldWire {
     /// Transform applied to `column`.
     pub transform: PartitionTransformWire,
     /// Bucket count of a `bucket` transform.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::schema::skipped_option::<u32>")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "u32")]
     pub buckets: Option<u32>,
     /// Truncation width of a `truncate` transform.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::schema::skipped_option::<u32>")]
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "u32")]
     pub width: Option<u32>,
 }
 
@@ -483,8 +509,13 @@ pub struct PhysicalLayoutWire {
     ///
     /// Omitted on a request, the time column is `wyrd_ingested_at`. The
     /// canonical form in a description and the control row always names it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "crate::schema::skipped_option::<String>")]
+    /// An explicit `null` is refused.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "String")]
     pub time_column: Option<String>,
     /// Ordered partition fields; at most three may be declared.
     #[serde(default)]
@@ -505,7 +536,7 @@ pub struct RegisterTableRequest {
     pub namespace: String,
     /// Table name.
     pub name: String,
-    /// User fields only; `wyrd_*`, `card_uid`, `run_id`, `sub_principal_id`, and
+    /// User fields only; `wyrd_*`, `workload_card_uid`, `subject_card_uid`, `run_id`, `sub_principal_id`, and
     /// `act_principal_id` reserved names are rejected.
     pub fields: Vec<FieldSpec>,
     /// Optional physical layout declaration.
@@ -560,6 +591,113 @@ pub struct RegisterTableResponse {
     pub fingerprint: String,
     /// The table's current version, `1` for a newly created table.
     pub table_version: TableVersion,
+}
+
+/// Deserializes a field that may be omitted but, when present, is never
+/// `null`: an explicit `null` fails as a type error instead of reading as
+/// omitted.
+///
+/// Pair it with `#[serde(default, skip_serializing_if = "Option::is_none")]`
+/// so `None` serializes as an omission this function accepts.
+///
+/// # Errors
+///
+/// Returns the deserializer's error when the value is `null` or is not a `T`.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// Explicitly alter one table's definition (`PATCH /v1/bifrost/tables/{namespace}/{name}`).
+///
+/// The whole request applies atomically against `expected_table_version` and
+/// publishes exactly one new table version; a stale version changes nothing.
+/// At least one field besides the version must make an effective change.
+/// Unknown fields and explicit `null`s are refused, so a field is either
+/// omitted or carries a value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct AlterTableRequest {
+    /// The table version this edit was built from, as last described.
+    pub expected_table_version: TableVersion,
+    /// Layout lists to replace; an omitted list keeps the current one.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "PhysicalLayoutEdit")]
+    pub physical_layout: Option<PhysicalLayoutEdit>,
+    /// Nullable top-level custom columns to append, in the field-declaration
+    /// shape registration uses.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Vec<FieldSpec>")]
+    pub add_columns: Option<Vec<FieldSpec>>,
+    /// Top-level custom columns to rename; each keeps its field id and values.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Vec<ColumnRename>")]
+    pub rename_columns: Option<Vec<ColumnRename>>,
+}
+
+/// The layout lists one [`AlterTableRequest`] replaces.
+///
+/// Each supplied list replaces the table's complete current list and an
+/// omitted one is kept; `bloom_columns: []` removes every Bloom column. The
+/// time column is fixed at creation, so `time_column` is an unknown field
+/// here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalLayoutEdit {
+    /// The complete new partition list, holding exactly one `hour` or `day`
+    /// field over the time column.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Vec<PartitionFieldWire>")]
+    pub partition_by: Option<Vec<PartitionFieldWire>>,
+    /// The complete new sort order; an empty list sorts by the time column
+    /// descending, nulls last.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Vec<SortKeyWire>")]
+    pub sort_keys: Option<Vec<SortKeyWire>>,
+    /// The complete new Bloom column set, which may be empty.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Vec<String>")]
+    pub bloom_columns: Option<Vec<String>>,
+}
+
+/// One top-level custom column rename in an [`AlterTableRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ColumnRename {
+    /// The column's current name.
+    pub from: String,
+    /// The column's new name, unused by any other column.
+    pub to: String,
 }
 
 /// Maximum number of warnings carried by a terminal frame.
@@ -2457,7 +2595,7 @@ pub enum AuditOutcome {
 ///
 /// `card_ref` is the **writer-identity card** (who performed the op), derived
 /// from the resolved `Principal`; it is `None` only for a `User` principal.
-/// This is decoupled from the per-row `card_uid` data column.
+/// This is decoupled from the per-row `subject_card_uid` data column.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct AuditEvent {
@@ -2565,10 +2703,11 @@ mod bifrost_wire_tests {
     use std::collections::BTreeMap;
 
     use crate::vala::api::{
-        BifrostTableDescription, BifrostTableEntry, CompactionTypeWire, DataTypeSpec, FieldSpec,
-        NullOrderWire, PARQUET_FIELD_ID_KEY, PartitionFieldWire, PartitionTransformWire,
-        PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
-        SortDirectionWire, SortKeyWire, TableStatus, TimeUnit,
+        AlterTableRequest, BifrostTableDescription, BifrostTableEntry, CompactionTypeWire,
+        DataTypeSpec, FieldSpec, NullOrderWire, PARQUET_FIELD_ID_KEY, PartitionFieldWire,
+        PartitionTransformWire, PhysicalLayoutEdit, PhysicalLayoutWire, RegisterOutcome,
+        RegisterTableRequest, RegisterTableResponse, SortDirectionWire, SortKeyWire, TableStatus,
+        TimeUnit,
     };
     use schemars::schema_for;
 
@@ -2627,10 +2766,18 @@ mod bifrost_wire_tests {
         assert!(minimal.metadata.is_empty());
     }
 
+    /// A field's `wyrd:column_class` metadata survives the wire round trip, so a
+    /// correlation column keeps its class between SDK and server.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the field spec fails to serialize, deserialize, or compare
+    /// equal after the round trip, or the decoded metadata no longer names the
+    /// column `correlation`.
     #[test]
     fn bifrost_wire_field_spec_carries_correlation_metadata() {
         let mut spec = FieldSpec {
-            name: "card_uid".to_string(),
+            name: "subject_card_uid".to_string(),
             data_type: DataTypeSpec::Utf8,
             nullable: true,
             metadata: BTreeMap::default(),
@@ -2646,10 +2793,15 @@ mod bifrost_wire_tests {
 
     /// An omitted `physical_layout` stays `None` on the wire so the server can
     /// distinguish "no declaration" (defaults apply) from an explicit object.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request fails to deserialize or serialize, decodes a
+    /// `physical_layout`, or re-encodes with a `physical_layout` key.
     #[test]
     fn bifrost_wire_register_request_omits_physical_layout() {
         let req: RegisterTableRequest =
-            serde_json::from_str(r#"{"namespace":"vala.bifrost","name":"events","fields":[]}"#)
+            serde_json::from_str(r#"{"namespace":"bifrost.bifrost","name":"events","fields":[]}"#)
                 .expect("deserialize");
         assert!(req.physical_layout.is_none());
         let json = serde_json::to_string(&req).expect("serialize");
@@ -2662,10 +2814,16 @@ mod bifrost_wire_tests {
     /// The wire distinction between `None` and an explicit object survives; what
     /// the server no longer distinguishes is an empty `sort_keys` from an
     /// omitted one, which both resolve to the canonical event-time default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request fails to deserialize, decodes without a layout,
+    /// decodes a non-empty `partition_by`, `sort_keys`, or `bloom_columns`, or
+    /// differs from itself after a serialize/deserialize round trip.
     #[test]
     fn bifrost_wire_register_request_keeps_explicit_empty_layout_lists() {
         let req: RegisterTableRequest = serde_json::from_str(
-            r#"{"namespace":"vala.bifrost","name":"events","fields":[],
+            r#"{"namespace":"bifrost.bifrost","name":"events","fields":[],
                 "physical_layout":{"partition_by":[],
                 "sort_keys":[],"bloom_columns":[]}}"#,
         )
@@ -2689,19 +2847,19 @@ mod bifrost_wire_tests {
     #[test]
     fn bifrost_wire_register_request_carries_hyphenated_compaction_type() {
         let req: RegisterTableRequest = serde_json::from_str(
-            r#"{"namespace":"vala.datasets","name":"events","fields":[],
+            r#"{"namespace":"bifrost.datasets","name":"events","fields":[],
                 "compaction_type":"small-files"}"#,
         )
         .expect("deserialize");
         assert_eq!(req.compaction_type, Some(CompactionTypeWire::SmallFiles));
         bifrost_wire_round_trip(&req);
         let omitted: RegisterTableRequest =
-            serde_json::from_str(r#"{"namespace":"vala.datasets","name":"events","fields":[]}"#)
+            serde_json::from_str(r#"{"namespace":"bifrost.datasets","name":"events","fields":[]}"#)
                 .expect("deserialize");
         assert_eq!(omitted.compaction_type, None);
         assert!(
             serde_json::from_str::<RegisterTableRequest>(
-                r#"{"namespace":"vala.datasets","name":"events","fields":[],
+                r#"{"namespace":"bifrost.datasets","name":"events","fields":[],
                     "compaction_type":"small_files"}"#,
             )
             .is_err()
@@ -2850,7 +3008,7 @@ mod bifrost_wire_tests {
     #[test]
     fn bifrost_wire_table_entry_and_description_round_trip() {
         let entry = BifrostTableEntry {
-            namespace: "vala.bifrost".to_string(),
+            namespace: "bifrost.bifrost".to_string(),
             name: "events".to_string(),
             table_uid: "ab".repeat(16),
             status: TableStatus::Active,
@@ -2870,7 +3028,7 @@ mod bifrost_wire_tests {
             }],
             correlation_fields: vec![
                 FieldSpec {
-                    name: "card_uid".to_string(),
+                    name: "subject_card_uid".to_string(),
                     data_type: DataTypeSpec::Utf8,
                     nullable: true,
                     metadata: BTreeMap::from([(
@@ -2935,8 +3093,107 @@ mod bifrost_wire_tests {
         });
     }
 
+    /// A PATCH body decodes only with a canonical string version, no unknown
+    /// field (the time column included), and no explicit `null` at any depth;
+    /// omitted and empty lists stay distinct.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a refused body decodes or an accepted one decodes
+    /// differently.
+    #[test]
+    fn alter_table_request_decodes_strictly() {
+        let decode = |body: serde_json::Value| serde_json::from_value::<AlterTableRequest>(body);
+        let cleared = decode(serde_json::json!({
+            "expected_table_version": "12",
+            "physical_layout": {"bloom_columns": []}
+        }))
+        .expect("the supplement's Bloom-clearing body decodes");
+        assert_eq!(cleared.expected_table_version.get(), 12);
+        assert_eq!(
+            cleared.physical_layout,
+            Some(PhysicalLayoutEdit {
+                bloom_columns: Some(Vec::new()),
+                ..PhysicalLayoutEdit::default()
+            })
+        );
+        assert_eq!(cleared.add_columns, None);
+        bifrost_wire_round_trip(&cleared);
+        let added = decode(serde_json::json!({
+            "expected_table_version": "3",
+            "add_columns": [
+                {"name": "note", "data_type": "Utf8"},
+                {"name": "seen", "data_type": {"Timestamp": {"unit": "Microsecond"}},
+                 "metadata": {"PARQUET:field_id": "9", "origin": "caller"}}
+            ],
+            "physical_layout": {"partition_by": [{"column": "t", "transform": "day"}]}
+        }))
+        .expect("omitted nested members take their defaults");
+        let columns = added.add_columns.as_deref().expect("columns decode");
+        assert!(columns.iter().all(|column| column.nullable));
+        assert_eq!(
+            columns[1].data_type,
+            DataTypeSpec::Timestamp {
+                unit: TimeUnit::Microsecond,
+                tz: None
+            }
+        );
+        assert_eq!(columns[1].metadata.len(), 2);
+        let encoded = serde_json::to_value(&added).expect("the request encodes");
+        assert_eq!(
+            encoded["add_columns"][1]["data_type"],
+            serde_json::json!({"Timestamp": {"unit": "Microsecond"}}),
+            "an unset zone is omitted, never sent as null"
+        );
+        assert_eq!(
+            encoded["physical_layout"]["partition_by"][0],
+            serde_json::json!({"column": "t", "transform": "day"})
+        );
+        assert_eq!(decode(encoded).expect("the encoding decodes"), added);
+        let max = decode(serde_json::json!({"expected_table_version": "9223372036854775807"}))
+            .expect("the maximum version decodes");
+        assert_eq!(max.expected_table_version.get(), i64::MAX);
+
+        for refused in [
+            serde_json::json!({"expected_table_version": 12}),
+            serde_json::json!({"expected_table_version": "0"}),
+            serde_json::json!({"expected_table_version": "012"}),
+            serde_json::json!({"expected_table_version": "9223372036854775808"}),
+            serde_json::json!({"physical_layout": {"bloom_columns": []}}),
+            serde_json::json!({"expected_table_version": "1", "table_version": "1"}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": null}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": null}),
+            serde_json::json!({"expected_table_version": "1", "rename_columns": null}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": {"bloom_columns": null}}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": {"time_column": "t"}}),
+            serde_json::json!({"expected_table_version": "1", "rename_columns": [{"from": "a", "to": "b", "x": 1}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": "Utf8", "x": 1}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": "Utf8", "nullable": null}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": "Utf8", "metadata": null}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": {"Timestamp": {"unit": "Microsecond", "tz": null}}}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": {"Timestamp": {"unit": "Microsecond", "zone": "UTC"}}}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": {"Decimal128": {"precision": 9, "scale": 2, "x": 1}}}]}),
+            serde_json::json!({"expected_table_version": "1", "add_columns": [{"name": "n", "data_type": {"List": {"name": "item", "data_type": "Utf8", "x": 1}}}]}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": {"sort_keys": [{"column": "a", "direction": "asc", "null_order": "last", "x": 1}]}}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": {"partition_by": [{"column": "t", "transform": "day", "buckets": null}]}}),
+            serde_json::json!({"expected_table_version": "1", "physical_layout": {"partition_by": [{"column": "t", "transform": "day", "width": null}]}}),
+        ] {
+            assert!(
+                decode(refused.clone()).is_err(),
+                "{refused} must be refused"
+            );
+        }
+    }
+
+    /// Every Bifrost wire type, the strict nested declarations included,
+    /// yields a JSON Schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when schema generation panics for any listed type.
     #[test]
     fn bifrost_wire_schema_for_wire_types_does_not_panic() {
+        let _ = schema_for!(AlterTableRequest);
         let _ = schema_for!(BifrostTableEntry);
         let _ = schema_for!(BifrostTableDescription);
         let _ = schema_for!(DataTypeSpec);

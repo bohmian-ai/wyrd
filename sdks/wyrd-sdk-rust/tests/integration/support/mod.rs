@@ -333,7 +333,7 @@ impl Deployment {
     }
 
     /// The first retained result of `binding`, read back as the
-    /// administrator: publish captured rows until `vala.verification.results`
+    /// administrator: publish captured rows until `bifrost.verification.results`
     /// names one, then wait for that execution's typed result by its ID.
     ///
     /// # Panics
@@ -344,7 +344,7 @@ impl Deployment {
         binding: &BindingId,
         timeout: Duration,
     ) -> VerificationResult {
-        /// One `vala.verification.results` row's execution identity.
+        /// One `bifrost.verification.results` row's execution identity.
         #[derive(serde::Deserialize)]
         struct Retained {
             /// The execution the result belongs to.
@@ -359,7 +359,7 @@ impl Deployment {
             self.server.flush_bifrost().await.expect("rows publish");
             let rows: Vec<Retained> = bifrost
                 .sql_as(
-                    "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1",
+                    "SELECT execution_id FROM bifrost.verification.results WHERE binding_id = $1",
                     &[QueryParam::String(binding.to_string())],
                 )
                 .await

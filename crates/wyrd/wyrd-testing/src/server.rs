@@ -100,7 +100,7 @@ use crate::time::ClockHandle;
 use crate::verification::{VerificationFixture, VerificationFixtureError};
 
 /// Retained authorization history: the durable home of every decision.
-const AUDIT_LOG: &str = "vala.system.audit_log";
+const AUDIT_LOG: &str = "bifrost.system.audit_log";
 
 /// Bound on every wait for staged audit to reach retained history.
 const RETAINED_AUDIT_BUDGET: Duration = Duration::from_secs(90);
@@ -1973,7 +1973,7 @@ impl WyrdTestServer {
         .await
     }
 
-    /// Reads the tenant's retained `vala.traces.spans` rows, every selected
+    /// Reads the tenant's retained `bifrost.traces.spans` rows, every selected
     /// column projected as text, in `(start_time_unix_nano, span_id)` order.
     ///
     /// `projection` is the `SELECT` list and must cast each scalar column to
@@ -1992,7 +1992,7 @@ impl WyrdTestServer {
         self.retained_records(
             tenant,
             format!(
-                "SELECT {projection} FROM vala.traces.spans WHERE ({predicate}) \
+                "SELECT {projection} FROM bifrost.traces.spans WHERE ({predicate}) \
                  ORDER BY start_time_unix_nano, span_id"
             ),
         )
@@ -2003,7 +2003,7 @@ impl WyrdTestServer {
     /// context, every selected column decoded as text or Variant JSON.
     ///
     /// A journey reads retained tables that have no dedicated reader here,
-    /// such as `vala.verification.execution_inputs`, through this one query
+    /// such as `bifrost.verification.execution_inputs`, through this one query
     /// path; the audit and span readers frame their SQL around it.
     ///
     /// # Errors
@@ -2243,7 +2243,7 @@ impl WyrdTestServer {
 
     /// Count the fixture tenant's retained, allowed describes of `fqn`.
     ///
-    /// The server stages exactly one `vala.bifrost.describe` decision per
+    /// The server stages exactly one `bifrost.bifrost.describe` decision per
     /// describe it serves, so this is the server-observed describe count a
     /// journey uses to prove a writer reused its cached schema. The count
     /// first waits for every decision already staged to be retained.
@@ -2255,7 +2255,7 @@ impl WyrdTestServer {
         self.retained_audit_count(
             self.data_tenant_id(),
             &format!(
-                "operation = 'vala.bifrost.describe' AND resource = '{fqn}' \
+                "operation = 'bifrost.bifrost.describe' AND resource = '{fqn}' \
                  AND outcome = 'allowed'"
             ),
         )
@@ -2335,7 +2335,7 @@ impl WyrdTestServer {
         self.await_audit_retained().await?;
         self.retained_audit_count(
             tenant,
-            &format!("operation = '{READ_DECISION}' AND request_id = '{request_id}'"),
+            &format!("operation = '{READ_DECISION}' AND wyrd_request_id = '{request_id}'"),
         )
         .await
     }
@@ -2757,7 +2757,7 @@ impl WyrdTestServer {
     /// table without requiring an Iceberg snapshot.
     ///
     /// This is the authoritative body; the `&str` form above is the
-    /// `vala.bifrost` shorthand every built-in journey uses.
+    /// `bifrost.bifrost` shorthand every built-in journey uses.
     ///
     /// # Errors
     ///

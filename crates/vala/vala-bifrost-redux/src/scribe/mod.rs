@@ -582,6 +582,8 @@ pub struct NativeIngressTestFrame {
     pub request_id: wyrd_spec::request_id::RequestId,
     /// Stable idempotency identifier for this test batch.
     pub batch_id: uuid::Uuid,
+    /// Table version the writer claims, or `None` to bind the current one.
+    pub table_version: Option<wyrd_spec::vala::ids::TableVersion>,
     /// Exact native IPC bytes supplied to the private decoder.
     pub payload: bytes::Bytes,
 }
@@ -723,12 +725,14 @@ impl ScribeImpl {
             self,
             ScribeIngressFrame {
                 attributed_cards: None,
+                dimensions: None,
                 authenticated_tenant: frame.principal.tenant_id,
+                workload: frame.principal.workload_uid.clone(),
                 attribution: wyrd_spec::auth::Attribution::direct(frame.principal.id).into(),
                 principal: frame.principal,
                 table: frame.table,
                 expected_schema_fingerprint: Some(frame.expected_schema_fingerprint),
-                table_version: None,
+                table_version: frame.table_version,
                 request_id: frame.request_id,
                 batch_id: frame.batch_id,
                 measured_wire_bytes,

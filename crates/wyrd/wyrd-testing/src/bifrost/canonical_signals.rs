@@ -373,13 +373,34 @@ fn default_cell(field: &Field) -> Cell {
     }
 }
 
+/// Typed resource environment both fixture spans report.
+pub const SPAN_ENVIRONMENT: &str = "fixture";
+
+/// Raw `attributes` of the fixture's root GenAI span: the message payloads
+/// plus every source key its promoted `gen_ai_*` columns derive from, retained
+/// unchanged as the stored Variant reads back.
+#[must_use]
+pub fn root_span_attributes() -> Value {
+    serde_json::json!({
+        "gen_ai.input.messages": INPUT_MESSAGES,
+        "gen_ai.output.messages": OUTPUT_MESSAGES,
+        "gen_ai.operation.name": "chat",
+        "gen_ai.provider.name": "anthropic",
+        "gen_ai.request.model": MODEL,
+        "gen_ai.conversation.id": "conversation-fixture",
+        "gen_ai.usage.input_tokens": INPUT_TOKENS,
+        "gen_ai.usage.output_tokens": OUTPUT_TOKENS,
+    })
+}
+
 /// Build the two-span parent/child trace batch over a described span schema.
 ///
 /// The parent is the GenAI chat operation carrying promoted operation,
 /// provider, model, conversation and token columns plus the structured
 /// input/output message payloads; the child is the tool call it made, which
-/// ends in error status. Both carry resource and scope metadata so a reader
-/// can attribute them to a service.
+/// ends in error status. Each promoted column is the value its own
+/// attributes derive. Both carry resource and scope metadata, including
+/// [`SPAN_ENVIRONMENT`], so a reader can attribute them to a service.
 ///
 /// # Panics
 ///
@@ -397,17 +418,14 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         ("status_present", Cell::Bool(true)),
         ("status_code", Cell::Int32(1)),
         ("status_message", Cell::Text("ok".to_owned())),
-        (
-            "attributes",
-            Cell::Variant(attributes(&[
-                ("gen_ai.input.messages", INPUT_MESSAGES),
-                ("gen_ai.output.messages", OUTPUT_MESSAGES),
-            ])),
-        ),
+        ("attributes", Cell::Variant(root_span_attributes())),
         ("resource_present", Cell::Bool(true)),
         (
             "resource_attributes",
-            Cell::Variant(attributes(&[("service.name", "wyrd.fixture.service")])),
+            Cell::Variant(attributes(&[
+                ("service.name", "wyrd.fixture.service"),
+                ("deployment.environment.name", SPAN_ENVIRONMENT),
+            ])),
         ),
         ("scope_present", Cell::Bool(true)),
         ("scope_name", Cell::Text(scope.to_owned())),
@@ -415,6 +433,10 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         (
             "service_name",
             Cell::Text("wyrd.fixture.service".to_owned()),
+        ),
+        (
+            "deployment_environment",
+            Cell::Text(SPAN_ENVIRONMENT.to_owned()),
         ),
         ("gen_ai_operation_name", Cell::Text("chat".to_owned())),
         ("gen_ai_provider_name", Cell::Text("anthropic".to_owned())),
@@ -467,12 +489,23 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         ),
         (
             "attributes",
-            Cell::Variant(attributes(&[("gen_ai.tool.name", "search")])),
+            Cell::Variant(serde_json::json!({
+                "gen_ai.tool.name": "search",
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.provider.name": "anthropic",
+                "gen_ai.request.model": MODEL,
+                "gen_ai.conversation.id": "conversation-fixture",
+                "gen_ai.usage.input_tokens": 64,
+                "gen_ai.usage.output_tokens": 16,
+            })),
         ),
         ("resource_present", Cell::Bool(true)),
         (
             "resource_attributes",
-            Cell::Variant(attributes(&[("service.name", "wyrd.fixture.service")])),
+            Cell::Variant(attributes(&[
+                ("service.name", "wyrd.fixture.service"),
+                ("deployment.environment.name", SPAN_ENVIRONMENT),
+            ])),
         ),
         ("scope_present", Cell::Bool(true)),
         ("scope_name", Cell::Text(scope.to_owned())),
@@ -480,6 +513,10 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         (
             "service_name",
             Cell::Text("wyrd.fixture.service".to_owned()),
+        ),
+        (
+            "deployment_environment",
+            Cell::Text(SPAN_ENVIRONMENT.to_owned()),
         ),
         (
             "gen_ai_operation_name",
@@ -495,6 +532,36 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         ("gen_ai_usage_output_tokens", Cell::Int64(16)),
     ]);
     batch(schema, &[parent, child])
+}
+
+/// Build one-millisecond spans of `trace_id` over a described span schema,
+/// each `(span_id, name, start)` naming its span ID, name, and start time in
+/// Unix nanoseconds, so a journey controls exactly which spans a trace holds.
+///
+/// # Panics
+///
+/// Panics when the described schema does not assemble the rows.
+#[must_use]
+pub fn trace_spans(
+    schema: &SchemaRef,
+    trace_id: &[u8; 16],
+    spans: &[(u64, &str, i64)],
+) -> RecordBatch {
+    let rows: Vec<Row> = spans
+        .iter()
+        .map(|&(span_id, name, start)| {
+            BTreeMap::from([
+                ("trace_id", Cell::Bytes(trace_id.to_vec())),
+                ("span_id", Cell::Bytes(span_id.to_be_bytes().to_vec())),
+                ("name", Cell::Text(name.to_owned())),
+                ("kind", Cell::Int32(1)),
+                ("start_time_unix_nano", Cell::Int64(start)),
+                ("end_time_unix_nano", Cell::Int64(start + 1_000_000)),
+                ("duration_nano", Cell::Int64(1_000_000)),
+            ])
+        })
+        .collect();
+    batch(schema, &rows)
 }
 
 /// Build the trace-correlated error log batch over a described log schema.
@@ -528,6 +595,11 @@ pub fn logs(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch {
         ("scope_present", Cell::Bool(true)),
         ("scope_name", Cell::Text(scope.to_owned())),
         ("scope_version", Cell::Text("1.0.0".to_owned())),
+        (
+            "service_name",
+            Cell::Text("wyrd.fixture.service".to_owned()),
+        ),
+        ("body_text", Cell::Text(LOG_BODY.to_owned())),
     ]);
     batch(schema, &[record])
 }
@@ -562,6 +634,10 @@ pub fn points(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch
             ("scope_present", Cell::Bool(true)),
             ("scope_name", Cell::Text(scope.to_owned())),
             ("scope_version", Cell::Text("1.0.0".to_owned())),
+            (
+                "service_name",
+                Cell::Text("wyrd.fixture.service".to_owned()),
+            ),
         ])
     };
     let mut counter = common("wyrd.fixture.requests", "sum");
@@ -663,11 +739,11 @@ pub async fn seed_canonical_signals(
     let anchor = 1_760_000_000_000_000_000_i64;
     for (fqn, build) in [
         (
-            "vala.traces.spans",
+            "bifrost.traces.spans",
             spans as fn(&SchemaRef, &str, i64) -> RecordBatch,
         ),
-        ("vala.logs.records", logs),
-        ("vala.metrics.points", points),
+        ("bifrost.logs.records", logs),
+        ("bifrost.metrics.points", points),
     ] {
         let described = wyrd_client::bifrost::TableConfig::describe_with(writer.client(), fqn)
             .await

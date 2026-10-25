@@ -867,6 +867,9 @@ pub async fn compose_bifrost(
     // The one process membership poller: every role, the forwarder, and the
     // Scribe outbox read this registry, and it outlives their drain.
     let membership_poller = Arc::clone(&cluster_registry).start_snapshot_poller();
+    // The one process Card registry reader: Gate describes public frames and
+    // the outbox its trusted frames through the same descriptor cache.
+    let cards = vala_bifrost_redux::gate::attribution::CardRegistry::new(postgres.wyrd().clone());
     // The one process Scribe outbox: Gate, Oracle, peer security, every
     // request-path decision, gateway capture, and Verifier results stage on
     // it. It submits to the local Scribe, else to a peer Scribe, in frames
@@ -876,6 +879,7 @@ pub async fn compose_bifrost(
             scribe.as_ref().map(|parts| &parts.scribe),
             &cluster_registry,
             peer_tls.as_ref(),
+            Some(cards.clone()),
         ),
         scribe_config.ingest_request_bytes,
         wyrd_runtime::outbox::OutboxLimits {
@@ -983,9 +987,7 @@ pub async fn compose_bifrost(
         Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
     )
     .with_audit(Arc::clone(&scribe_outbox))
-    .with_card_registry(vala_bifrost_redux::gate::attribution::CardRegistry::new(
-        postgres.wyrd().clone(),
-    ));
+    .with_card_registry(cards);
     Ok(crate::state::ComposedBifrost {
         bifrost: crate::state::Bifrost::assembled(crate::state::BifrostComposition {
             gate,

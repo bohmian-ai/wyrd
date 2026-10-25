@@ -18,7 +18,10 @@ use wyrd_spec::vala::api::{
     NullOrderWire, PartitionFieldWire, PartitionTransformWire, PhysicalLayoutWire,
     SortDirectionWire, SortKeyWire,
 };
-use wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT;
+use wyrd_spec::vala::managed_columns::{
+    DEPLOYMENT_ENVIRONMENT, RUN_ID, SERVICE_NAME, SERVICE_VERSION, SUBJECT_CARD_UID, SUBJECT_KIND,
+    SUBJECT_NAME, SUBJECT_VERSION, WORKLOAD_CARD_UID, WYRD_INGESTED_AT,
+};
 use wyrd_types::is_extension_key;
 use wyrd_types::variant::is_variant;
 
@@ -59,15 +62,6 @@ pub enum TableError {
         /// Expanded-data limit in bytes.
         limit: usize,
     },
-}
-
-/// Correlation columns appended to a built-in table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CorrelationPolicy {
-    /// Traces, metrics, logs, `GenAI`, verification, and drift rows.
-    Observation,
-    /// Audit content has its own identity columns.
-    None,
 }
 
 /// Payload handling classification for a built-in table.
@@ -162,6 +156,110 @@ pub fn hourly_layout(
     }
 }
 
+/// The six nullable Utf8 Service and subject dimensions every system table
+/// declares once, in ledger order.
+///
+/// They are domain columns, not managed ones: a dynamic table never carries
+/// them, and the canonical signals already declare the three Service
+/// columns among their resource fields.
+pub const SHARED_DIMENSIONS: [&str; 6] = [
+    SERVICE_NAME,
+    SERVICE_VERSION,
+    DEPLOYMENT_ENVIRONMENT,
+    SUBJECT_KIND,
+    SUBJECT_NAME,
+    SUBJECT_VERSION,
+];
+
+/// Appends the [`SHARED_DIMENSIONS`] to a system table's own fields.
+#[must_use]
+pub fn with_shared_dimensions(mut fields: Vec<Field>) -> Vec<Field> {
+    fields.extend(
+        SHARED_DIMENSIONS
+            .iter()
+            .map(|name| Field::new(*name, DataType::Utf8, true)),
+    );
+    fields
+}
+
+/// The registered identity one Card UID names.
+///
+/// A Card UID never changes kind, name, or version, so a descriptor read once
+/// from the tenant registry stays true for that UID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardDescriptor {
+    /// The Card's kind.
+    pub kind: wyrd_spec::envelope::CardKind,
+    /// The Card's registered name.
+    pub name: String,
+    /// The Card's registered version.
+    pub version: String,
+}
+
+/// The accepted context a frame's [`SHARED_DIMENSIONS`] are stamped from.
+///
+/// It is resolved once per frame, before Scribe admits the rows: Gate
+/// resolves a public frame's from its validated workload, request
+/// environment, and authorized subjects; a trusted row-attributed frame's
+/// comes from the workloads and subjects its producer carried. Labels in the
+/// rows never contribute to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrameDimensions {
+    /// The accepted request environment; `None` keeps each row's own.
+    pub environment: Option<String>,
+    /// Descriptors of the Cards the frame's rows may name as workload or
+    /// subject. A row whose workload has none keeps its observed Service
+    /// values.
+    pub cards: Vec<(wyrd_spec::ids::CardUid, CardDescriptor)>,
+}
+
+impl FrameDimensions {
+    /// Returns the descriptor of the Card `uid` names, if the frame holds it.
+    #[must_use]
+    pub fn describe(&self, uid: &str) -> Option<&CardDescriptor> {
+        self.cards
+            .iter()
+            .find(|(owned, _)| owned.as_str() == uid)
+            .map(|(_, descriptor)| descriptor)
+    }
+}
+
+/// The attribution Bloom columns every attributable system table's creation
+/// default starts with.
+pub const ATTRIBUTION_BLOOMS: [&str; 5] = [
+    SERVICE_NAME,
+    SUBJECT_NAME,
+    WORKLOAD_CARD_UID,
+    SUBJECT_CARD_UID,
+    RUN_ID,
+];
+
+/// Builds an attributable system table's creation-default layout.
+///
+/// `granularity` is [`hourly_layout`] or [`daily_layout`] on `time_column`.
+/// Rows sort by environment, Service name, and Service version, nulls first,
+/// then newest first on the time column; the Bloom set is
+/// [`ATTRIBUTION_BLOOMS`] followed by the table's own `lookup` keys. It is a
+/// complete, replaceable default, never a validation floor.
+#[must_use]
+pub fn attributed_layout(
+    granularity: fn(&str, Vec<SortKeyWire>, &[&str]) -> PhysicalLayoutWire,
+    time_column: &str,
+    lookup: &[&str],
+) -> PhysicalLayoutWire {
+    let blooms: Vec<&str> = ATTRIBUTION_BLOOMS.iter().chain(lookup).copied().collect();
+    granularity(
+        time_column,
+        vec![
+            sort_asc_nulls_first(DEPLOYMENT_ENVIRONMENT),
+            sort_asc_nulls_first(SERVICE_NAME),
+            sort_asc_nulls_first(SERVICE_VERSION),
+            sort_desc(time_column),
+        ],
+        &blooms,
+    )
+}
+
 /// The one hourly layout Scribe's unit fixtures encode under.
 ///
 /// Fixture schemas carry a non-null `event_time` timestamp as their time
@@ -177,7 +275,7 @@ pub(crate) fn hourly_test_layout(
     schema: &arrow::datatypes::Schema,
 ) -> crate::catalog::PhysicalLayout {
     crate::catalog::PhysicalLayout::resolve(
-        "vala.bifrost.test",
+        "bifrost.bifrost.test",
         schema,
         Some(&hourly_layout(
             "event_time",
@@ -204,8 +302,6 @@ pub struct BuiltinTableDefinition {
     pub namespace: &'static str,
     /// Logical table name.
     pub name: &'static str,
-    /// Correlation policy.
-    pub correlation_policy: CorrelationPolicy,
     /// Payload classification.
     pub payload_class: PayloadClass,
     /// Sensitive payload columns.
@@ -463,8 +559,6 @@ pub trait DomainTable: Send + Sync + 'static {
     const NAMESPACE: &'static str;
     /// Logical table name.
     const NAME: &'static str;
-    /// Correlation policy.
-    const CORRELATION_POLICY: CorrelationPolicy;
     /// Payload classification.
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Standard;
     /// Sensitive payload fields.
@@ -510,7 +604,6 @@ pub trait DomainTable: Send + Sync + 'static {
             )),
             None => SchemaRef::new(Schema::new(managed_columns::ensure_managed_columns(
                 Self::arrow_fields(),
-                Self::CORRELATION_POLICY,
             ))),
         }
     }
@@ -1170,7 +1263,6 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
     BuiltinTableDefinition {
         namespace: T::NAMESPACE,
         name: T::NAME,
-        correlation_policy: T::CORRELATION_POLICY,
         payload_class: T::PAYLOAD_CLASS,
         sensitive_payload_columns: T::SENSITIVE_PAYLOAD_COLUMNS,
         arrow_fields: T::arrow_fields,
@@ -1215,14 +1307,15 @@ pub fn builtin_table(namespace: &str, name: &str) -> Option<&'static BuiltinTabl
 pub fn builtin_fqns() -> Vec<String> {
     BUILTIN_TABLES
         .iter()
-        .map(|definition| format!("vala.{}.{}", definition.namespace, definition.name))
+        .map(|definition| format!("bifrost.{}.{}", definition.namespace, definition.name))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use arrow::array::{
-        ArrayRef, BinaryArray, Int64Array, StringArray, StructArray, make_array, new_null_array,
+        ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray, StructArray, make_array,
+        new_null_array,
     };
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, TimeUnit as ArrowTimeUnit};
@@ -1236,7 +1329,7 @@ mod tests {
     use fields::{boolean, float64, ts_us_utc, utf8};
     use wyrd_queue::variant::VariantViolation;
     use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
-    use wyrd_spec::vala::{ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT};
+    use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
     use wyrd_types::variant::variant_field;
 
     /// The registry owns three `OTel` signal tables and no removed physical name.
@@ -1277,13 +1370,13 @@ mod tests {
         ] {
             assert!(
                 builtin_table(namespace, name).is_none(),
-                "the removed vala.{namespace}.{name} table must not resolve"
+                "the removed bifrost.{namespace}.{name} table must not resolve"
             );
         }
         let fqns = builtin_fqns();
         assert_eq!(BUILTIN_TABLES.len(), fqns.len());
         assert!(
-            !fqns.iter().any(|fqn| fqn.starts_with("vala.genai.")),
+            !fqns.iter().any(|fqn| fqn.starts_with("bifrost.genai.")),
             "no GenAI namespace table remains: {fqns:?}"
         );
     }
@@ -1336,40 +1429,81 @@ mod tests {
         }
     }
 
-    /// Every built-in partitions and sorts on its pinned time column.
-    ///
-    /// Continuous high-rate `OTel` signals and gateway calls partition hourly;
-    /// retained audit history and the five verification tables are low-rate,
-    /// read over date ranges, and partition daily. Each
-    /// table's time column is a non-null timestamp in its own schema, OTLP
-    /// instants are nanosecond UTC, and the resolved layout leads its sort
-    /// order with that column descending.
+    /// Every built-in matches the storage ledger: its pinned time column is a
+    /// non-null zoned timestamp, partitioned alone at the ledger granularity;
+    /// attributable tables sort environment, Service name, and Service version
+    /// nulls first, then time newest first, while audit sorts on time alone;
+    /// each Bloom default is exactly the ledger's; and every table declares
+    /// the six shared dimensions once.
     ///
     /// # Panics
     ///
-    /// Panics when a built-in declares no pinned time column, or drifts from
-    /// its pinned column, granularity, type, or leading sort key.
+    /// Panics when a built-in drifts from its ledger row.
     #[test]
     fn every_builtin_partitions_and_sorts_on_its_time_column() {
+        const ATTRIBUTION: [&str; 5] = [
+            "service_name",
+            "subject_name",
+            "workload_card_uid",
+            "subject_card_uid",
+            "run_id",
+        ];
         let otlp_instant = DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("+00:00".into()));
         for definition in builtin_tables() {
-            let fqn = format!("vala.{}.{}", definition.namespace, definition.name);
-            let (column, transform) = match (definition.namespace, definition.name) {
-                ("traces", "spans") => ("start_time_unix_nano", PartitionTransformWire::Hour),
-                ("metrics", "points") | ("logs", "records") => {
-                    ("time_unix_nano", PartitionTransformWire::Hour)
-                }
-                ("gateway", "calls") => ("started_at", PartitionTransformWire::Hour),
-                ("drift", "observations") | ("system", "audit_log") => {
-                    ("created_at", PartitionTransformWire::Day)
-                }
-                ("verification", "results") => ("ended_at", PartitionTransformWire::Day),
-                ("verification", "execution_inputs") => {
-                    ("recorded_at", PartitionTransformWire::Day)
-                }
-                ("drift", "result_features") => (WYRD_INGESTED_AT, PartitionTransformWire::Day),
-                _ => panic!("{fqn} declares no pinned time column"),
-            };
+            let fqn = format!("bifrost.{}.{}", definition.namespace, definition.name);
+            let (column, transform, lookup): (_, _, &[&str]) =
+                match (definition.namespace, definition.name) {
+                    ("traces", "spans") => (
+                        "start_time_unix_nano",
+                        PartitionTransformWire::Hour,
+                        &["trace_id"],
+                    ),
+                    ("logs", "records") => (
+                        "time_unix_nano",
+                        PartitionTransformWire::Hour,
+                        &["trace_id"],
+                    ),
+                    ("metrics", "points") => (
+                        "time_unix_nano",
+                        PartitionTransformWire::Hour,
+                        &["metric_name"],
+                    ),
+                    ("gateway", "calls") => {
+                        ("started_at", PartitionTransformWire::Hour, &["call_id"])
+                    }
+                    ("drift", "observations") => {
+                        ("created_at", PartitionTransformWire::Day, &["series"])
+                    }
+                    ("verification", "results") => (
+                        "ended_at",
+                        PartitionTransformWire::Day,
+                        &[
+                            "result_id",
+                            "execution_id",
+                            "verifier_card_uid",
+                            "binding_id",
+                            "group_id",
+                        ],
+                    ),
+                    ("verification", "execution_inputs") => (
+                        "recorded_at",
+                        PartitionTransformWire::Day,
+                        &[
+                            "execution_id",
+                            "verifier_card_uid",
+                            "binding_id",
+                            "group_id",
+                        ],
+                    ),
+                    ("drift", "result_features") => (
+                        WYRD_INGESTED_AT,
+                        PartitionTransformWire::Day,
+                        &["result_id"],
+                    ),
+                    ("system", "audit_log") => ("created_at", PartitionTransformWire::Day, &[]),
+                    _ => panic!("{fqn} declares no pinned time column"),
+                };
+            let audit = definition.name == "audit_log";
             let declared = (definition.physical_layout)();
             assert_eq!(declared.time_column.as_deref(), Some(column), "{fqn}");
             assert_eq!(
@@ -1377,7 +1511,43 @@ mod tests {
                 vec![PartitionFieldWire::new(column, transform)],
                 "{fqn} partitions only on its time column"
             );
+            let sort = if audit {
+                vec![sort_desc(column)]
+            } else {
+                vec![
+                    sort_asc_nulls_first("deployment_environment"),
+                    sort_asc_nulls_first("service_name"),
+                    sort_asc_nulls_first("service_version"),
+                    sort_desc(column),
+                ]
+            };
+            assert_eq!(declared.sort_keys, sort, "{fqn} sort keys");
+            let blooms: Vec<&str> = if audit {
+                vec![
+                    "sub_principal_id",
+                    "act_principal_id",
+                    "wyrd_request_id",
+                    "resource",
+                ]
+            } else {
+                ATTRIBUTION.iter().chain(lookup).copied().collect()
+            };
+            assert_eq!(declared.bloom_columns, blooms, "{fqn} Bloom defaults");
             let schema = (definition.schema)();
+            for dimension in SHARED_DIMENSIONS {
+                let declared: Vec<_> = schema
+                    .fields()
+                    .iter()
+                    .filter(|field| field.name() == dimension)
+                    .collect();
+                assert_eq!(declared.len(), 1, "{fqn} declares {dimension} once");
+                assert_eq!(
+                    declared[0].data_type(),
+                    &DataType::Utf8,
+                    "{fqn}.{dimension}"
+                );
+                assert!(declared[0].is_nullable(), "{fqn}.{dimension} is nullable");
+            }
             let field = schema
                 .field_with_name(column)
                 .unwrap_or_else(|_| panic!("{fqn} has its time column {column}"));
@@ -1396,13 +1566,6 @@ mod tests {
                 crate::catalog::layout::PhysicalLayout::resolve(&fqn, &schema, Some(&declared))
                     .unwrap_or_else(|error| panic!("{fqn} resolves: {error}"));
             assert_eq!(resolved.time_column(), column, "{fqn}");
-            let first = resolved.sort_keys().first().expect("a leading sort key");
-            assert_eq!(
-                first.column(),
-                column,
-                "{fqn} sorts first on its time column"
-            );
-            assert!(first.is_descending(), "{fqn} sorts newest first");
         }
     }
 
@@ -1431,12 +1594,19 @@ mod tests {
                     utf8("str_value", true),
                     utf8("session_id", true),
                     ts_us_utc("created_at", false),
+                    utf8("service_name", true),
+                    utf8("service_version", true),
+                    utf8("deployment_environment", true),
+                    utf8("subject_kind", true),
+                    utf8("subject_name", true),
+                    utf8("subject_version", true),
                 ],
                 blooms: &[
+                    "service_name",
+                    "subject_name",
+                    WORKLOAD_CARD_UID,
+                    SUBJECT_CARD_UID,
                     RUN_ID,
-                    CARD_UID,
-                    SUB_PRINCIPAL_ID,
-                    ACT_PRINCIPAL_ID,
                     "series",
                 ],
             },
@@ -1446,22 +1616,29 @@ mod tests {
                 name: "execution_inputs",
                 columns: vec![
                     utf8("execution_id", false),
-                    utf8("owner_card_uid", true),
                     utf8("verifier_card_uid", false),
                     utf8("binding_id", true),
                     utf8("group_id", true),
-                    utf8("deployment_environment", true),
                     boolean("queue_execution", false),
                     variant_field("inputs", false),
                     variant_field("activation", true),
                     ts_us_utc("recorded_at", false),
+                    utf8("service_name", true),
+                    utf8("service_version", true),
+                    utf8("deployment_environment", true),
+                    utf8("subject_kind", true),
+                    utf8("subject_name", true),
+                    utf8("subject_version", true),
                 ],
                 blooms: &[
+                    "service_name",
+                    "subject_name",
+                    WORKLOAD_CARD_UID,
+                    SUBJECT_CARD_UID,
                     RUN_ID,
-                    CARD_UID,
-                    SUB_PRINCIPAL_ID,
-                    ACT_PRINCIPAL_ID,
                     "execution_id",
+                    "verifier_card_uid",
+                    "binding_id",
                     "group_id",
                 ],
             },
@@ -1471,7 +1648,6 @@ mod tests {
                 columns: vec![
                     utf8("result_id", false),
                     utf8("requirement_id", false),
-                    utf8("owner_card_uid", true),
                     utf8("verifier_card_uid", false),
                     utf8("binding_id", true),
                     ts_us_utc("window_start", false),
@@ -1481,12 +1657,19 @@ mod tests {
                     float64("score", true),
                     float64("threshold", true),
                     utf8("verdict", false),
+                    utf8("service_name", true),
+                    utf8("service_version", true),
+                    utf8("deployment_environment", true),
+                    utf8("subject_kind", true),
+                    utf8("subject_name", true),
+                    utf8("subject_version", true),
                 ],
                 blooms: &[
+                    "service_name",
+                    "subject_name",
+                    WORKLOAD_CARD_UID,
+                    SUBJECT_CARD_UID,
                     RUN_ID,
-                    CARD_UID,
-                    SUB_PRINCIPAL_ID,
-                    ACT_PRINCIPAL_ID,
                     "result_id",
                 ],
             },
@@ -1505,23 +1688,28 @@ mod tests {
                 utf8("execution_status", false),
                 utf8("verdict", false),
                 utf8("verifier_version", false),
-                utf8("owner_card_uid", true),
                 utf8("verifier_card_uid", false),
                 utf8("binding_id", true),
                 utf8("group_id", true),
-                utf8("deployment_environment", true),
                 utf8("trigger_identity", true),
                 ts_us_utc("window_start", true),
                 ts_us_utc("window_end", true),
                 ts_us_utc("started_at", false),
                 ts_us_utc("ended_at", false),
                 variant_field("outcome", false),
+                utf8("service_name", true),
+                utf8("service_version", true),
+                utf8("deployment_environment", true),
+                utf8("subject_kind", true),
+                utf8("subject_name", true),
+                utf8("subject_version", true),
             ],
             blooms: &[
+                "service_name",
+                "subject_name",
+                WORKLOAD_CARD_UID,
+                SUBJECT_CARD_UID,
                 RUN_ID,
-                CARD_UID,
-                SUB_PRINCIPAL_ID,
-                ACT_PRINCIPAL_ID,
                 "result_id",
                 "execution_id",
                 "verifier_card_uid",
@@ -1534,16 +1722,17 @@ mod tests {
     /// The managed envelope Bifrost appends after a verification table's
     /// authored columns, in physical order.
     ///
-    /// This is the `CorrelationPolicy::Observation` envelope the Bifrost design
-    /// fixes for every table: nullable `run_id` and `card_uid`, the required
-    /// `sub_principal_id`/`act_principal_id` pair, and the required request and ingestion-time
-    /// columns. The tenant is a property of
+    /// This is the seven-field envelope the Bifrost design fixes for every
+    /// table: nullable `workload_card_uid`, `subject_card_uid`, and `run_id`,
+    /// the required `sub_principal_id`/`act_principal_id` pair, and the
+    /// required request and ingestion-time columns. The tenant is a property of
     /// the physical table and of each Parquet footer, never a row column, and
     /// Bifrost stamps no per-row position.
     fn verification_managed_envelope() -> Vec<Field> {
         vec![
+            utf8(WORKLOAD_CARD_UID, true),
+            utf8(SUBJECT_CARD_UID, true),
             utf8(RUN_ID, true),
-            utf8(CARD_UID, true),
             utf8(SUB_PRINCIPAL_ID, false),
             utf8(ACT_PRINCIPAL_ID, false),
             utf8(wyrd_spec::vala::WYRD_REQUEST_ID, false),
@@ -1553,14 +1742,14 @@ mod tests {
 
     /// The five verification tables carry exactly their approved physical
     /// contract: authored columns, the appended managed envelope, order, types,
-    /// nullability, daily partition, Observation correlation, and the resolved
+    /// nullability, daily partition, and the resolved
     /// Bloom-column union.
     ///
     /// These schemas are a published contract — three SDKs project rows into
     /// them and dashboards query them — so a reordered, retyped, renamed, or
     /// newly nullable column is a breaking change rather than an
     /// implementation detail. Pinning the whole physical list here, including
-    /// nullable `owner_card_uid` and the `outcome` Variant, is what makes that break
+    /// the shared dimensions and the `outcome` Variant, is what makes that break
     /// fail in this crate instead of at a caller's insert.
     ///
     /// # Panics
@@ -1576,11 +1765,11 @@ mod tests {
                 blooms,
             } = contract;
             let definition = builtin_table(namespace, name)
-                .unwrap_or_else(|| panic!("vala.{namespace}.{name} is a registered built-in"));
+                .unwrap_or_else(|| panic!("bifrost.{namespace}.{name} is a registered built-in"));
             assert_eq!(
                 (definition.arrow_fields)(),
                 columns,
-                "vala.{namespace}.{name} authored columns, order, types, and nullability"
+                "bifrost.{namespace}.{name} authored columns, order, types, and nullability"
             );
             let mut physical = columns.clone();
             physical.extend(verification_managed_envelope());
@@ -1591,22 +1780,17 @@ mod tests {
                     .map(|field| field.as_ref().clone())
                     .collect::<Vec<_>>(),
                 physical,
-                "vala.{namespace}.{name} complete physical schema"
-            );
-            assert_eq!(
-                definition.correlation_policy,
-                CorrelationPolicy::Observation,
-                "vala.{namespace}.{name} appends run_id, card_uid, and the subject/actor pair"
+                "bifrost.{namespace}.{name} complete physical schema"
             );
 
             let layout = (definition.physical_layout)();
             assert_eq!(
                 crate::catalog::TimeAxis::of_wire(&layout).granularity(),
                 crate::catalog::layout::TimeGranularity::Day,
-                "vala.{namespace}.{name} partitions by UTC day"
+                "bifrost.{namespace}.{name} partitions by UTC day"
             );
             let canonical = crate::catalog::layout::PhysicalLayout::resolve(
-                &format!("vala.{namespace}.{name}"),
+                &format!("bifrost.{namespace}.{name}"),
                 &(definition.schema)(),
                 Some(&layout),
             )
@@ -1614,7 +1798,7 @@ mod tests {
             assert_eq!(
                 canonical.bloom_columns(),
                 blooms.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>(),
-                "vala.{namespace}.{name} resolves exactly its declared Bloom set"
+                "bifrost.{namespace}.{name} resolves exactly its declared Bloom set"
             );
         }
     }
@@ -1623,7 +1807,7 @@ mod tests {
     /// binding, or a user-authored correlation column.
     ///
     /// `drift_ref` is the retired Verifier pointer, and
-    /// `run_id`/`card_uid` are managed correlation the queue appends. Any of
+    /// the workload, subject, and Run columns are managed correlation. Any of
     /// them reappearing as an authored payload column would let one raw input
     /// be attributed to, or duplicated per, a Verifier binding.
     ///
@@ -1632,7 +1816,10 @@ mod tests {
     /// Panics when the observation table authors a forbidden column.
     #[test]
     fn observation_tables_author_no_verifier_or_correlation_columns() {
-        for (namespace, forbidden) in [("drift", ["drift_ref", "run_id", "card_uid"])] {
+        for (namespace, forbidden) in [(
+            "drift",
+            ["drift_ref", RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID],
+        )] {
             let authored: Vec<String> = (builtin_table(namespace, "observations")
                 .expect("observation table")
                 .arrow_fields)()
@@ -1642,7 +1829,7 @@ mod tests {
             for column in forbidden {
                 assert!(
                     !authored.iter().any(|name| name == column),
-                    "vala.{namespace}.observations authors no {column}: {authored:?}"
+                    "bifrost.{namespace}.observations authors no {column}: {authored:?}"
                 );
             }
         }
@@ -1670,7 +1857,7 @@ mod tests {
     /// Panics when any built-in violates one of those invariants.
     fn assert_builtin_layouts_are_canonical_fixed_points() {
         for definition in builtin_tables() {
-            let fqn = format!("vala.{}.{}", definition.namespace, definition.name);
+            let fqn = format!("bifrost.{}.{}", definition.namespace, definition.name);
             let schema = (definition.schema)();
             let declared = (definition.physical_layout)();
             let canonical =
@@ -1832,6 +2019,325 @@ mod tests {
             }],
             schema_url: String::new(),
         }]
+    }
+
+    /// The four resource shapes the promotion test repeats on every signal:
+    /// absent, present but empty, final-occurrence and wrong-type edges, and
+    /// correctly typed values with an older environment key.
+    fn promotion_resources() -> [Option<wyrd_tonic::otlp::resource::v1::Resource>; 4] {
+        let resource = |attributes| {
+            Some(wyrd_tonic::otlp::resource::v1::Resource {
+                attributes,
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            })
+        };
+        let text = |value: &str| Value::StringValue(value.to_owned());
+        [
+            None,
+            resource(Vec::new()),
+            resource(vec![
+                attribute("service.namespace", text("first")),
+                attribute("service.namespace", text("final")),
+                attribute("service.instance.id", text("pod-1")),
+                attribute("service.instance.id", Value::IntValue(9)),
+                attribute("process.pid", text("42")),
+                attribute("telemetry.sdk.name", text("")),
+                attribute("telemetry.sdk.language", Value::BoolValue(true)),
+            ]),
+            resource(vec![
+                attribute("service.instance.id", text("pod-2")),
+                attribute("process.pid", Value::IntValue(9_007_199_254_740_993)),
+                attribute("telemetry.sdk.name", text("opentelemetry")),
+                attribute("telemetry.sdk.language", text("python")),
+                attribute("telemetry.sdk.version", text("1.38.0")),
+                attribute("deployment.environment.name", Value::IntValue(1)),
+                attribute("deployment.environment", text("staging")),
+            ]),
+        ]
+    }
+
+    /// Assert one signal batch's promoted resource columns for the four
+    /// [`promotion_resources`] rows, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a presence bit, promoted value, or retained raw attribute
+    /// differs from the final typed occurrence.
+    fn assert_resource_promotions(batch: &RecordBatch, signal: &str) {
+        let text = |name: &str| -> Vec<Option<String>> {
+            let values = batch
+                .column_by_name(name)
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .unwrap_or_else(|| panic!("{signal} has text column {name}"));
+            (0..values.len())
+                .map(|row| values.is_valid(row).then(|| values.value(row).to_owned()))
+                .collect()
+        };
+        let owned = |values: [Option<&str>; 4]| values.map(|value| value.map(str::to_owned));
+        assert_eq!(batch.num_rows(), 4, "{signal} accepts every resource shape");
+        let present = batch
+            .column_by_name("resource_present")
+            .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+            .expect("resource presence");
+        assert_eq!(
+            (0..4).map(|row| present.value(row)).collect::<Vec<_>>(),
+            [false, true, true, true],
+            "{signal} keeps absent apart from present-empty"
+        );
+        for (name, expected) in [
+            ("service_namespace", [None, None, Some("final"), None]),
+            ("service_instance_id", [None, None, None, Some("pod-2")]),
+            (
+                "telemetry_sdk_name",
+                [None, None, Some(""), Some("opentelemetry")],
+            ),
+            ("telemetry_sdk_language", [None, None, None, Some("python")]),
+            ("telemetry_sdk_version", [None, None, None, Some("1.38.0")]),
+            (
+                "deployment_environment",
+                [None, None, None, Some("staging")],
+            ),
+            ("subject_kind", [None; 4]),
+            ("subject_name", [None; 4]),
+            ("subject_version", [None; 4]),
+        ] {
+            assert_eq!(text(name), owned(expected), "{signal} {name}");
+        }
+        let pid = batch
+            .column_by_name("process_pid")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .expect("process_pid is Int64");
+        assert_eq!(
+            (0..4)
+                .map(|row| pid.is_valid(row).then(|| pid.value(row)))
+                .collect::<Vec<_>>(),
+            [None, None, None, Some(9_007_199_254_740_993)],
+            "{signal} promotes only an integer pid, exactly"
+        );
+        let raw = batch
+            .column_by_name("resource_attributes")
+            .expect("resource attributes");
+        let raw = |row| {
+            wyrd_queue::variant::variant_cell_to_json(raw.as_ref(), row).expect("raw decodes")
+        };
+        assert_eq!(raw(1), serde_json::json!({}));
+        assert_eq!(raw(2)["service.instance.id"], serde_json::json!(9));
+        assert_eq!(raw(2)["process.pid"], serde_json::json!("42"));
+        assert_eq!(raw(3)["deployment.environment.name"], serde_json::json!(1));
+        assert_eq!(
+            raw(3)["deployment.environment"],
+            serde_json::json!("staging")
+        );
+    }
+
+    /// Every signal promotes the same final typed resource values and keeps
+    /// the raw attributes, and each ledger has its approved width.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a promotion parses, stringifies, or reads an earlier
+    /// occurrence, when absent and present-empty resources merge, when a raw
+    /// value is lost, or when a signal's complete column count differs.
+    #[test]
+    fn resource_promotions_preserve_final_typed_values() {
+        let [spans, logs, metrics] = promotion_batches();
+        assert_resource_promotions(&spans, "spans");
+        assert_resource_promotions(&logs, "logs");
+        assert_resource_promotions(&metrics, "metrics");
+
+        for (fields, width) in [
+            (traces::spans::SPAN_FIELDS, 65),
+            (logs::records::LOG_FIELDS, 46),
+            (metrics::points::METRIC_FIELDS, 58),
+        ] {
+            assert_eq!(
+                managed_columns::canonical_physical_fields(fields).len(),
+                width
+            );
+        }
+    }
+
+    /// The span, log, and metric batches projected from every
+    /// [`promotion_resources`] shape, with correlation columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture does not project.
+    fn promotion_batches() -> [RecordBatch; 3] {
+        let resources = promotion_resources();
+        let template = span_fixture().remove(0);
+        let spans: Vec<_> = resources
+            .iter()
+            .cloned()
+            .map(|resource| wyrd_tonic::otlp::trace::v1::ResourceSpans {
+                resource,
+                ..template.clone()
+            })
+            .collect();
+        let template = log_fixture().remove(0);
+        let logs: Vec<_> = resources
+            .iter()
+            .cloned()
+            .map(|resource| wyrd_tonic::otlp::logs::v1::ResourceLogs {
+                resource,
+                ..template.clone()
+            })
+            .collect();
+        let template = metric_fixture().remove(0);
+        let metrics: Vec<_> = resources
+            .iter()
+            .cloned()
+            .map(|resource| wyrd_tonic::otlp::metrics::v1::ResourceMetrics {
+                resource,
+                ..template.clone()
+            })
+            .collect();
+        [
+            traces::project_resource_spans(&spans, None, usize::MAX)
+                .expect("spans project")
+                .0,
+            logs::project_resource_logs(&logs, None, usize::MAX)
+                .expect("logs project")
+                .0,
+            metrics::project_resource_metrics(&metrics, None, usize::MAX)
+                .expect("metrics project")
+                .0,
+        ]
+    }
+
+    /// Replace every row of `name` with a value no source field derives.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the column is missing or of an unforgeable type.
+    fn forged(batch: &RecordBatch, name: &str) -> RecordBatch {
+        let index = batch.schema().index_of(name).expect("the column exists");
+        let rows = batch.num_rows();
+        let column = batch.column(index);
+        let forged: ArrayRef = match column.data_type() {
+            DataType::Utf8 => Arc::new(StringArray::from(vec![Some("forged"); rows])),
+            DataType::Int64 => Arc::new(Int64Array::from(vec![424_242_i64; rows])),
+            DataType::Boolean => Arc::new(
+                arrow::compute::not(
+                    column
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .expect("bool"),
+                )
+                .expect("negation"),
+            ),
+            other => panic!("{name} has unforgeable type {other}"),
+        };
+        let mut columns = batch.columns().to_vec();
+        columns[index] = forged;
+        RecordBatch::try_new(batch.schema(), columns).expect("the forged batch assembles")
+    }
+
+    /// A native canonical signal batch is accepted only when every derived
+    /// column equals what the projection derives from the row's own source
+    /// fields; one forged filter value refuses the whole batch, and a
+    /// wrongly typed `GenAI` source refuses as it rejects an OTLP span.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a projected batch is refused, a forged derived column is
+    /// accepted, or a refusal is not the catalogued schema-parse error.
+    #[test]
+    fn native_canonical_signals_refuse_forged_derivations() {
+        let resource = [
+            "service_name",
+            "service_version",
+            "deployment_environment",
+            "service_namespace",
+            "service_instance_id",
+            "process_pid",
+            "telemetry_sdk_name",
+            "telemetry_sdk_language",
+            "telemetry_sdk_version",
+            "subject_kind",
+            "subject_name",
+            "subject_version",
+        ];
+        let span_only = [
+            "duration_nano",
+            "gen_ai_operation_name",
+            "gen_ai_provider_name",
+            "gen_ai_request_model",
+            "gen_ai_conversation_id",
+            "gen_ai_usage_input_tokens",
+            "gen_ai_usage_output_tokens",
+            "http_request_method",
+            "http_route",
+            "http_response_status_code",
+            "url_full",
+            "url_path",
+            "url_query",
+            "exception_type",
+            "exception_message",
+            "exception_stacktrace",
+            "is_exception",
+        ];
+        let log_only = [
+            "exception_type",
+            "exception_message",
+            "exception_stacktrace",
+            "body_text",
+            "is_exception",
+        ];
+        let [spans, logs, metrics] = promotion_batches();
+        for (signal, batch, validate, derived) in [
+            (
+                "spans",
+                spans,
+                traces::SpansTable::CANONICAL_VALIDATOR,
+                [&resource[..], &span_only[..]].concat(),
+            ),
+            (
+                "logs",
+                logs,
+                logs::records::RecordsTable::CANONICAL_VALIDATOR,
+                [&resource[..], &log_only[..]].concat(),
+            ),
+            (
+                "metrics",
+                metrics,
+                metrics::points::PointsTable::CANONICAL_VALIDATOR,
+                resource.to_vec(),
+            ),
+        ] {
+            let native = signal::without_correlation_columns(&batch).expect("user block");
+            validate(&native)
+                .unwrap_or_else(|error| panic!("{signal} projection is native: {error}"));
+            for name in derived {
+                let refusal = validate(&forged(&native, name))
+                    .err()
+                    .unwrap_or_else(|| panic!("{signal} refuses a forged {name}"));
+                assert!(
+                    matches!(&refusal, BifrostError::SchemaParse { detail } if detail.contains(name)),
+                    "{signal} {name} refusal names the column: {refusal:?}"
+                );
+            }
+        }
+
+        let [spans, ..] = promotion_batches();
+        let native = signal::without_correlation_columns(&spans).expect("user block");
+        let index = native.schema().index_of("attributes").expect("attributes");
+        let wrong = signal::attributes_variant(
+            "attributes",
+            &[attribute("gen_ai.operation.name", Value::IntValue(5))],
+        )
+        .expect("encodes");
+        let mut columns = native.columns().to_vec();
+        columns[index] =
+            signal::variant_column(std::iter::repeat_n(Some(&wrong), native.num_rows()));
+        let wrongly_typed = RecordBatch::try_new(native.schema(), columns).expect("assembles");
+        let refusal = (traces::SpansTable::CANONICAL_VALIDATOR)(&wrongly_typed)
+            .expect_err("a wrongly typed GenAI source refuses");
+        assert!(
+            matches!(&refusal, BifrostError::SchemaParse { detail } if detail.contains("gen_ai")),
+            "{refusal:?}"
+        );
     }
 
     /// Assert two field lists have one exact Arrow layout.
@@ -2860,10 +3366,10 @@ mod tests {
             for column in variants {
                 let field = schema
                     .field_with_name(column)
-                    .unwrap_or_else(|_| panic!("vala.{namespace}.{name}.{column} exists"));
+                    .unwrap_or_else(|_| panic!("bifrost.{namespace}.{name}.{column} exists"));
                 assert!(
                     is_variant(field),
-                    "vala.{namespace}.{name}.{column} is Variant"
+                    "bifrost.{namespace}.{name}.{column} is Variant"
                 );
             }
             if matches!(namespace, "traces" | "logs" | "metrics") {
@@ -2878,7 +3384,7 @@ mod tests {
                         false,
                     )]),
                     &Fields::from(vec![refs.clone()]),
-                    &format!("vala.{namespace}.{name}.resource_entity_refs"),
+                    &format!("bifrost.{namespace}.{name}.resource_entity_refs"),
                 );
                 let DataType::List(element) = refs.data_type() else {
                     panic!("resource_entity_refs is a list");

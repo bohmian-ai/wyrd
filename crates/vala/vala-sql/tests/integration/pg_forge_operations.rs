@@ -1623,7 +1623,7 @@ mod pg_tests {
             ForgeClaimTable {
                 table_uid: [7_u8; 16],
                 catalog_name: "wyrd-redux".to_owned(),
-                namespace_name: "vala.bifrost".to_owned(),
+                namespace_name: "bifrost.bifrost".to_owned(),
                 table_name: "tbl".to_owned(),
                 table_uuid,
             }
@@ -1641,7 +1641,7 @@ mod pg_tests {
             authority: &ForgeExpirationAuthority,
             table: &ForgeClaimTable,
         ) {
-            sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout,sub_principal_id,act_principal_id) VALUES ($1,$2,'vala.bifrost.tbl',decode(repeat('00',32),'hex'),'{}'::jsonb,'00000000-0000-7000-8000-000000000000','00000000-0000-7000-8000-000000000000')")
+            sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout,sub_principal_id,act_principal_id) VALUES ($1,$2,'bifrost.bifrost.tbl',decode(repeat('00',32),'hex'),'{}'::jsonb,'00000000-0000-7000-8000-000000000000','00000000-0000-7000-8000-000000000000')")
                 .bind(tenant.as_uuid())
                 .bind(table.table_uid.as_slice())
                 .execute(superuser)
@@ -2038,17 +2038,17 @@ mod pg_tests {
                     .await
                     .expect("seed decoy operation state");
             }
-            sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout,sub_principal_id,act_principal_id) VALUES ($1,decode(repeat('aa',16),'hex'),'vala.bifrost.other',decode(repeat('22',32),'hex'),'{}'::jsonb,'00000000-0000-7000-8000-000000000000','00000000-0000-7000-8000-000000000000')")
+            sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout,sub_principal_id,act_principal_id) VALUES ($1,decode(repeat('aa',16),'hex'),'bifrost.bifrost.other',decode(repeat('22',32),'hex'),'{}'::jsonb,'00000000-0000-7000-8000-000000000000','00000000-0000-7000-8000-000000000000')")
                 .bind(tenant.as_uuid())
                 .execute(&superuser)
                 .await
                 .expect("seed decoy bifrost table");
-            sqlx::query("INSERT INTO vala.bifrost_table_maintenance_authority (data_tenant_id,catalog_name,namespace_name,table_name,table_uid) VALUES ($1,'wyrd-redux','vala.bifrost','other',decode(repeat('aa',16),'hex'))")
+            sqlx::query("INSERT INTO vala.bifrost_table_maintenance_authority (data_tenant_id,catalog_name,namespace_name,table_name,table_uid) VALUES ($1,'wyrd-redux','bifrost.bifrost','other',decode(repeat('aa',16),'hex'))")
                 .bind(tenant.as_uuid())
                 .execute(&superuser)
                 .await
                 .expect("seed decoy maintenance authority");
-            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,'wyrd-redux','vala.bifrost','other','snapshot_expiry',79,'{}'::jsonb,decode(repeat('22',32),'hex'),1,1,'ready',now())")
+            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,'wyrd-redux','bifrost.bifrost','other','snapshot_expiry',79,'{}'::jsonb,decode(repeat('22',32),'hex'),1,1,'ready',now())")
                 .bind(stranger)
                 .bind(tenant.as_uuid())
                 .execute(&superuser)

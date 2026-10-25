@@ -112,31 +112,43 @@ pub struct GatewayCallRequest {
 pub enum GatewayCallAttribution {
     /// Asserted by the caller through the `wyrd-run-id` and `wyrd-card-uid`
     /// headers; admission authorizes the Card against the caller.
-    Requested(GatewayCallSubject),
+    Requested(GatewayCallContext),
     /// Derived by the server from an operation that already resolved the
     /// Card in the caller's tenant, such as the subject and optional Run of a
     /// direct verification whose agent check calls a model. Admission records it
     /// as is.
-    Resolved(GatewayCallSubject),
+    Resolved(GatewayCallContext),
 }
 
-/// Application Run and Card one governed call is attributed to, each
-/// independently optional.
+/// The origin one governed call is attributed to, frozen at admission.
 ///
-/// Ingress builds it from the independent `wyrd-run-id` and `wyrd-card-uid`
-/// headers; a Verifier execution builds it from its subject Card and the Run
-/// it executes for, if any. Admission authorizes a requested UID against the
+/// It carries only what the server cannot derive: the owning Service release,
+/// the subject Card, the application Run, and the descriptive deployment
+/// environment, each independently optional. Readable Service and subject
+/// names, versions, and kind are never carried; Scribe derives them from the
+/// UIDs when the captured row is delivered, so no request label can relabel a
+/// registered identity and every retry resolves the same values.
+///
+/// Ingress builds it from the verified principal's workload root and the
+/// `wyrd-card-uid`, `wyrd-run-id`, and `x-wyrd-deployment-environment`
+/// headers; a Verifier execution builds it from its accepted owner, subject,
+/// Run, and environment. Admission authorizes a requested subject against the
 /// caller before any provider sees the call, and the captured
-/// `vala.gateway.calls` row records whichever is present, an absent one as
-/// null.
-#[derive(Debug, Clone)]
-pub struct GatewayCallSubject {
+/// `bifrost.gateway.calls` row records each value, an absent one as null.
+#[derive(Debug, Clone, Default)]
+pub struct GatewayCallContext {
+    /// UID of the exact Service release the call ran for; `None` for a
+    /// rootless caller.
+    pub workload_card_uid: Option<CardUid>,
+    /// UID of the Card the call is attributed to; `None` when the
+    /// originating request named no Card.
+    pub subject_card_uid: Option<CardUid>,
     /// Application Run the call belongs to; `None` when the originating
     /// request carried no Run.
     pub run_id: Option<RunId>,
-    /// UID of the Card the call is attributed to; `None` when the
-    /// originating request named no Card.
-    pub card_uid: Option<CardUid>,
+    /// Descriptive deployment environment of the originating request or
+    /// accepted execution; `None` when unknown. It grants nothing.
+    pub deployment_environment: Option<String>,
 }
 
 /// Provider answer of a governed call: a completion, or the refusal that
@@ -236,7 +248,7 @@ struct AdmittedCall {
     /// Model the caller requested.
     requested: ModelRef,
     /// Authorized Run and Card attribution, carrying the Card's UID.
-    subject: Option<GatewayCallSubject>,
+    subject: Option<GatewayCallContext>,
     /// Context of the call's `gateway.call` span when the call continues a
     /// caller's trace; its captured attempt spans are children of that span.
     trace: Option<TraceContext>,
@@ -547,13 +559,24 @@ impl<'a> GatewayInvocation<'a> {
         let started = std::time::Instant::now();
         self.decide(caller, OPERATION, &request.model, &snapshot)
             .map_err(permission_deny_reason_to_wyrd)?;
-        let subject = match request.subject.take() {
-            Some(GatewayCallAttribution::Requested(subject)) => {
-                Some(self.attribute(caller, subject).await?)
-            }
-            Some(GatewayCallAttribution::Resolved(subject)) => Some(subject),
-            None => None,
-        };
+        // A caller's own call is owned by its verified workload root; a
+        // server-derived context already names its accepted owner.
+        let subject = Some(match request.subject.take() {
+            Some(GatewayCallAttribution::Resolved(context)) => context,
+            requested => GatewayCallContext {
+                workload_card_uid: wyrd_runtime::owning_root(
+                    &caller.principal,
+                    &caller.delegation_chain,
+                )
+                .cloned(),
+                ..match requested {
+                    Some(GatewayCallAttribution::Requested(context)) => {
+                        self.attribute(caller, context).await?
+                    }
+                    _ => GatewayCallContext::default(),
+                }
+            },
+        });
         telemetry.since(Phase::Authorize, started);
         // A call continuing a caller's trace parents its captured attempts on
         // this `gateway.call` span; an untraced call keeps its own trace.
@@ -843,9 +866,9 @@ impl<'a> GatewayInvocation<'a> {
     async fn attribute(
         &self,
         caller: &Caller,
-        subject: GatewayCallSubject,
-    ) -> Result<GatewayCallSubject, WyrdError> {
-        let Some(card_uid) = &subject.card_uid else {
+        subject: GatewayCallContext,
+    ) -> Result<GatewayCallContext, WyrdError> {
+        let Some(card_uid) = &subject.subject_card_uid else {
             return Ok(subject);
         };
         let authorized = match caller.principal.card_attribution() {

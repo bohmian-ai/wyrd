@@ -144,7 +144,7 @@ impl SupportDesk {
     }
 
     /// Answer `question` as `run`'s Agent through the Wyrd gateway and record
-    /// the ticket in `vala.datasets.tickets`.
+    /// the ticket in `bifrost.datasets.tickets`.
     ///
     /// Renders the Agent's Prompt, sends it to `<deployment>/<model>` on the
     /// OpenAI-compatible gateway ingress with a fresh access token, and tags
@@ -204,7 +204,7 @@ impl SupportDesk {
             .to_owned();
         run.observe()
             .record(
-                "vala.datasets.tickets",
+                "bifrost.datasets.tickets",
                 &json!({ "question": question, "answer": answer }),
             )
             .await?;
@@ -222,10 +222,10 @@ const ANSWER_TIMEOUT: Duration = Duration::from_mins(10);
 const EVIDENCE: &str = "\
     SELECT t.run_id, t.question, t.answer, s.trace_id, s.name AS span, \
            g.call_id, r.verdict \
-    FROM vala.datasets.tickets t \
-    JOIN vala.traces.spans s ON s.run_id = t.run_id \
-    JOIN vala.gateway.calls g ON g.run_id = t.run_id \
-    JOIN vala.verification.results r ON r.run_id = t.run_id \
+    FROM bifrost.datasets.tickets t \
+    JOIN bifrost.traces.spans s ON s.run_id = t.run_id \
+    JOIN bifrost.gateway.calls g ON g.run_id = t.run_id \
+    JOIN bifrost.verification.results r ON r.run_id = t.run_id \
     WHERE t.run_id = $1 AND s.name LIKE 'support-desk.%'";
 
 /// One joined evidence row.

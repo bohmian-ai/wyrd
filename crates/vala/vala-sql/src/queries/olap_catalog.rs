@@ -106,6 +106,47 @@ pub async fn get_by_fqn(
     .map_err(SqlError::from)
 }
 
+/// Publish one table definition edit's Iceberg pointer and version reference
+/// in the caller's tenant transaction.
+///
+/// Calls `vala.bifrost_publish_table_definition`, the narrow definer that
+/// derives the physical namespace from the transaction's tenant, swaps the
+/// registered table's pointer from `expected_location` to
+/// `published_location`, and records `table_version`'s retained reference
+/// for the table whose metadata UUID is `table_uuid`. Both writes commit or
+/// roll back with the rest of `conn`'s transaction, so the caller's control
+/// row refresh and change announcement share them.
+///
+/// Returns `false`, writing nothing, when the pointer is no longer
+/// `expected_location` or the table is not at `table_version - 1`.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails, including when the table is not
+/// registered for the tenant, `table_uuid` is not its identity, or the
+/// arguments are outside the publication contract.
+pub async fn publish_definition(
+    conn: &mut TenantConn<'_>,
+    namespace_name: &str,
+    table_name: &str,
+    table_uuid: &str,
+    table_version: i64,
+    expected_location: &str,
+    published_location: &str,
+) -> Result<bool, SqlError> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT vala.bifrost_publish_table_definition($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(namespace_name)
+    .bind(table_name)
+    .bind(table_uuid)
+    .bind(table_version)
+    .bind(expected_location)
+    .bind(published_location)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
+
 /// Reads the canonical physical layout registered for one tenant's table.
 ///
 /// Scribe resolves its write recipe from this control row once per write task

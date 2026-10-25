@@ -596,7 +596,7 @@ async fn init_first_run_is_client_ready() {
             .contains("# retain unrelated settings")
     );
     let table = TableConfig::from_json_schema(
-        "vala.datasets.local_rows",
+        "bifrost.datasets.local_rows",
         &json!({
             "type": "object",
             "properties": { "id": { "type": "integer" } },
@@ -625,7 +625,7 @@ async fn init_first_run_is_client_ready() {
         Bifrost::connect_with(&local.client(), BifrostOptions::default())
             .await
             .expect("fresh reader")
-            .sql_as("SELECT id FROM vala.datasets.local_rows", &[])
+            .sql_as("SELECT id FROM bifrost.datasets.local_rows", &[])
             .await
             .expect("fresh saved client reads");
     assert_eq!(rows, [json!({ "id": 1 })]);

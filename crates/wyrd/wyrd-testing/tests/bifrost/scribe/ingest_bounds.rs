@@ -91,7 +91,7 @@ async fn register_public(
     fields: Vec<Field>,
 ) -> Result<RegisterOutcome, BifrostClientError> {
     let config = TableConfig::from_arrow(
-        &format!("vala.datasets.{name}"),
+        &format!("bifrost.datasets.{name}"),
         Arc::new(Schema::new(fields)),
     )?;
     wyrd_client::Bifrost::connect_with(
@@ -231,7 +231,7 @@ async fn widest_registrable_table_stages_publishes_and_reads_back() {
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("wide batch");
     append_batch(
         &client,
-        &format!("vala.datasets.{name}"),
+        &format!("bifrost.datasets.{name}"),
         uuid::Uuid::now_v7(),
         &batch,
     )
@@ -245,7 +245,7 @@ async fn widest_registrable_table_stages_publishes_and_reads_back() {
         &client,
         tenant,
         &name,
-        &format!("SELECT c{last} AS value FROM vala.datasets.{name} ORDER BY value"),
+        &format!("SELECT c{last} AS value FROM bifrost.datasets.{name} ORDER BY value"),
         &rows.iter().map(|row| row + offset).collect::<Vec<_>>(),
     )
     .await;
@@ -283,7 +283,7 @@ async fn forty_mib_row_stages_publishes_and_reads_back_at_48_mib_wire() {
     .expect("large-row batch");
     append_batch(
         &client,
-        &format!("vala.datasets.{name}"),
+        &format!("bifrost.datasets.{name}"),
         uuid::Uuid::now_v7(),
         &batch,
     )
@@ -297,7 +297,7 @@ async fn forty_mib_row_stages_publishes_and_reads_back_at_48_mib_wire() {
         &name,
         &format!(
             "SELECT value + CAST(octet_length(CAST(payload AS VARCHAR)) AS BIGINT) AS value \
-             FROM vala.datasets.{name}"
+             FROM bifrost.datasets.{name}"
         ),
         &[7 + 40 * 1024 * 1024],
     )
@@ -327,7 +327,7 @@ async fn composite_partition_fanout_is_atomic() {
     let tenant = server.data_tenant_id();
     let client = tenant_client(&server, tenant).await;
     let name = unique_table("composite_fanout");
-    let fqn = format!("vala.datasets.{name}");
+    let fqn = format!("bifrost.datasets.{name}");
     let schema = Arc::new(Schema::new(vec![
         Field::new(
             "event_time",

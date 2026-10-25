@@ -4031,12 +4031,19 @@ mod tests {
         }
     }
 
+    /// Recovery refuses a WAL slice whose table FQN is unsafe or whose magic is
+    /// corrupted, so a malformed identity never replays into a table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture fails to encode, or either malformed payload decodes
+    /// or fails with another refusal than the invalid-FQN or magic-mismatch error.
     #[test]
     fn slice_payload_decoder_rejects_invalid_table_identity() {
         let tenant = crate::test_support::tenant();
         let mut payload = encode_slice_payload_parts(
             tenant.as_uuid().as_bytes(),
-            "vala.bifrost.invalid/table",
+            "bifrost.bifrost.invalid/table",
             &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
                 2026, 1, 1,
             )),
@@ -4078,7 +4085,7 @@ mod tests {
 
         let payload = encode_slice_payload_parts(
             system.as_bytes(),
-            "vala.bifrost.events",
+            "bifrost.bifrost.events",
             &crate::catalog::PhysicalPartition::from(crate::test_support::day_partition(
                 2026, 1, 1,
             )),

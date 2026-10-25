@@ -171,10 +171,10 @@ pub enum Sender {
         /// The rows' generator.
         fixture: Fixture,
     },
-    /// Telemetry spans through the trace service into `vala.traces.spans`.
+    /// Telemetry spans through the trace service into `bifrost.traces.spans`.
     Spans(Otlp, Telemetry),
     /// Bulky Kubernetes logs through the logs service into
-    /// `vala.logs.records`.
+    /// `bifrost.logs.records`.
     Logs(Otlp, Logs),
 }
 

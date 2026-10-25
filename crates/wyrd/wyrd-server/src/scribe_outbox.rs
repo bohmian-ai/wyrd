@@ -64,7 +64,7 @@ use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::contracts::{
     IngressPayload, Scribe, ScribeError, ScribeIngressFrame, StampedAttribution,
 };
-use vala_bifrost_redux::gate::attribution::native_card_uids;
+use vala_bifrost_redux::gate::attribution::{CardRegistry, native_card_uids};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::tables::audit::projection::project_audit_event;
@@ -80,7 +80,9 @@ use wyrd_spec::auth::{Attribution, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 use wyrd_spec::ids::{CardUid, GroupId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditEvent, NodeId};
-use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
+use wyrd_spec::vala::{
+    ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID, WYRD_REQUEST_ID,
+};
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::verifier_executions::{GroupActivity, Submission, VerifierExecutionQueue};
 use wyrd_tonic::otlp::trace::v1::ResourceSpans;
@@ -149,7 +151,7 @@ const fn frame_budget(request_bytes: usize) -> usize {
 #[derive(Debug)]
 pub enum ScribeWrite {
     /// One authorization decision bound for retained audit history,
-    /// projected into its `vala.system.audit_log` row when it is staged, so
+    /// projected into its `bifrost.system.audit_log` row when it is staged, so
     /// the staging caller, not the one writer every tenant write waits on,
     /// pays for the projection; `None` when the decision could not be
     /// projected, which the sink counts lost.
@@ -160,14 +162,14 @@ pub enum ScribeWrite {
     /// One Verifier judgment's summary and detail rows.
     Result {
         /// The result's rows, details before the summary, each naming the
-        /// Card verified as its `card_uid`.
+        /// Card verified as its `subject_card_uid`.
         payload: ResultPayload,
         /// The run's subject and actor, which Scribe stamps on every row.
         attribution: Attribution,
     },
     /// One Verifier execution's pinned inputs row.
     ExecutionInputs {
-        /// The `vala.verification.execution_inputs` row.
+        /// The `bifrost.verification.execution_inputs` row.
         row: ResultBatch,
         /// The execution's subject and actor, which Scribe stamps on the row.
         attribution: Attribution,
@@ -219,7 +221,7 @@ struct Rows {
     batch: RecordBatch,
 }
 
-/// Projects `spans` into one canonical `vala.traces.spans` batch.
+/// Projects `spans` into one canonical `bifrost.traces.spans` batch.
 ///
 /// Gateway capture and server-span tenant copies both project their spans
 /// here. `None` when the projection fails or rejects any span, since every
@@ -303,8 +305,8 @@ impl ScribeWrite {
         };
         let group_id = GroupId::new(cell("group_id")?).ok()?;
         Some(GroupActivity {
-            owner_card_uid: CardUid::new(cell("owner_card_uid")?).ok()?,
-            card_uid: CardUid::new(cell("card_uid")?).ok()?,
+            owner_card_uid: CardUid::new(cell(WORKLOAD_CARD_UID)?).ok()?,
+            card_uid: CardUid::new(cell(SUBJECT_CARD_UID)?).ok()?,
             verifier_card_uid: CardUid::new(cell("verifier_card_uid")?).ok()?,
             group_id,
         })
@@ -316,17 +318,17 @@ impl ScribeWrite {
 /// inputs table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeTable {
-    /// `vala.system.audit_log`, one row per authorization decision.
+    /// `bifrost.system.audit_log`, one row per authorization decision.
     AuditLog,
-    /// `vala.gateway.calls`, one row per captured call.
+    /// `bifrost.gateway.calls`, one row per captured call.
     Calls,
-    /// `vala.traces.spans`, one span per captured attempt or server span.
+    /// `bifrost.traces.spans`, one span per captured attempt or server span.
     Spans,
-    /// `vala.verification.results`, one canonical summary row per judgment.
+    /// `bifrost.verification.results`, one canonical summary row per judgment.
     Results,
-    /// `vala.drift.result_features`, a result's drift feature rows.
+    /// `bifrost.drift.result_features`, a result's drift feature rows.
     DriftFeatures,
-    /// `vala.verification.execution_inputs`, one row per execution's inputs.
+    /// `bifrost.verification.execution_inputs`, one row per execution's inputs.
     ExecutionInputs,
 }
 
@@ -345,12 +347,12 @@ impl ScribeTable {
     #[must_use]
     pub const fn fqn(self) -> &'static str {
         match self {
-            Self::AuditLog => "vala.system.audit_log",
-            Self::Calls => "vala.gateway.calls",
-            Self::Spans => "vala.traces.spans",
-            Self::Results => "vala.verification.results",
-            Self::DriftFeatures => "vala.drift.result_features",
-            Self::ExecutionInputs => "vala.verification.execution_inputs",
+            Self::AuditLog => "bifrost.system.audit_log",
+            Self::Calls => "bifrost.gateway.calls",
+            Self::Spans => "bifrost.traces.spans",
+            Self::Results => "bifrost.verification.results",
+            Self::DriftFeatures => "bifrost.drift.result_features",
+            Self::ExecutionInputs => "bifrost.verification.execution_inputs",
         }
     }
 
@@ -467,23 +469,39 @@ pub(crate) struct ScribeBatch {
 impl ScribeBatch {
     /// Builds the Scribe frame for this batch.
     ///
-    /// Scribe stamps each row's own subject and actor, which it carries as
-    /// content, and authorizes each row's `card_uid` against the UID-bearing
-    /// Cards the rows name, which the producing owner authorized before
-    /// staging. Every frame names the platform audit principal, the
-    /// no-verified-caller marker, as its required tenant principal; it grants
-    /// nothing, since every write here is server-internal and evaluates no
-    /// permission. Audit decisions carry their pair as content, so an audit
-    /// frame submits the unresolved pair; every other frame is row-attributed
-    /// with each row's verified subject and actor.
-    pub(crate) fn into_frame(self) -> ScribeIngressFrame {
-        let attribution = match self.table {
-            ScribeTable::AuditLog => Attribution::unresolved().into(),
-            _ => StampedAttribution::Rows,
+    /// Every frame is row-attributed: Scribe stamps each row's own carried
+    /// subject and actor, workload, and request — an audit decision's being
+    /// the decision's own — and authorizes each row's `subject_card_uid`
+    /// against the UID-bearing Cards the rows name, which the producing owner
+    /// authorized before staging. Every frame names the platform audit
+    /// principal, the no-verified-caller marker, as its required tenant
+    /// principal; it grants nothing, since every write here is server-internal
+    /// and evaluates no permission. With `cards`, each row's shared dimensions
+    /// are stamped from the descriptors of its own carried workload and
+    /// subject, so a mixed-origin frame keeps every producer's context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeRefusal::Unavailable`] when the tenant registry cannot
+    /// be read, so the frame is retried.
+    pub(crate) async fn into_frame(
+        self,
+        cards: Option<&CardRegistry>,
+    ) -> Result<ScribeIngressFrame, ScribeRefusal> {
+        let dimensions = match cards {
+            Some(cards) => Some(
+                cards
+                    .row_dimensions(self.tenant, &self.ipc)
+                    .await
+                    .map_err(|_| ScribeRefusal::Unavailable)?,
+            ),
+            None => None,
         };
-        ScribeIngressFrame {
+        Ok(ScribeIngressFrame {
             attributed_cards: Some(native_card_uids(&self.ipc)).filter(|uids| !uids.is_empty()),
-            attribution,
+            dimensions,
+            attribution: StampedAttribution::Rows,
+            workload: None,
             principal: Principal::new(
                 PLATFORM_AUDIT_PRINCIPAL,
                 PrincipalKind::User,
@@ -499,7 +517,7 @@ impl ScribeBatch {
             batch_id: self.batch_id,
             measured_wire_bytes: self.ipc.len(),
             payload: IngressPayload::ArrowIpc(self.ipc),
-        }
+        })
     }
 }
 
@@ -596,8 +614,9 @@ impl ScribePeers {
 
 /// Where the sink submits.
 pub(crate) enum ScribeRoute {
-    /// Scribe runs in this pod and acknowledges in-process.
-    Local(Arc<dyn Scribe>),
+    /// Scribe runs in this pod and acknowledges in-process; frames are
+    /// described from the tenant registry when one is given.
+    Local(Arc<dyn Scribe>, Option<CardRegistry>),
     /// This pod runs no Scribe and submits over the peer plane.
     Peer(ScribePeers),
 }
@@ -612,9 +631,10 @@ impl ScribeRoute {
         local: Option<&Arc<vala_bifrost_redux::scribe::ScribeImpl>>,
         cluster: &Arc<ClusterRegistry>,
         tls: Option<&BifrostPeerTls>,
+        cards: Option<CardRegistry>,
     ) -> Option<Self> {
         match (local, tls) {
-            (Some(scribe), _) => Some(Self::Local(Arc::clone(scribe) as Arc<dyn Scribe>)),
+            (Some(scribe), _) => Some(Self::Local(Arc::clone(scribe) as Arc<dyn Scribe>, cards)),
             (None, Some(tls)) => Some(Self::Peer(ScribePeers {
                 cluster: Arc::clone(cluster),
                 tls: tls.clone(),
@@ -632,8 +652,8 @@ impl ScribeRoute {
     /// Returns the classified Scribe refusal.
     async fn submit(&self, batch: &ScribeBatch, attempt: usize) -> Result<(), ScribeRefusal> {
         match self {
-            Self::Local(scribe) => scribe
-                .ingest_frame(batch.clone().into_frame())
+            Self::Local(scribe, cards) => scribe
+                .ingest_frame(batch.clone().into_frame(cards.as_ref()).await?)
                 .await
                 .map(|_| ())
                 .map_err(|error| ScribeRefusal::from_scribe(&error)),
@@ -762,7 +782,8 @@ impl ScribeSink {
 
     /// Starts an outbox submitting in-process to `scribe`, standing in for a
     /// pod's own Scribe at the default request ceiling, and recording
-    /// acknowledged grouped activity through `groups`, when given.
+    /// acknowledged grouped activity through `groups` and describing each
+    /// frame's Cards from its registry, when given.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn local_outbox(
@@ -770,7 +791,10 @@ impl ScribeSink {
         groups: Option<WyrdPostgres>,
     ) -> Arc<ScribeOutbox> {
         Self::bounded_outbox(
-            Some(ScribeRoute::Local(scribe)),
+            Some(ScribeRoute::Local(
+                scribe,
+                groups.clone().map(CardRegistry::new),
+            )),
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
             Self::DEFAULT_LIMITS,
             groups,
@@ -1055,6 +1079,12 @@ impl Chunk {
     /// `rows` with each row's owner's subject and actor appended as the
     /// `sub_principal_id` and `act_principal_id` columns Scribe stamps from.
     ///
+    /// A gateway call row also carries its admitting request as content, so
+    /// that request is appended as the row's `wyrd_request_id`, the key that
+    /// joins the call to its audit decisions. A gateway attempt span arrives
+    /// already carrying its call's request; every other row takes the
+    /// frame's request.
+    ///
     /// # Errors
     ///
     /// Returns the Arrow error when the columns cannot be appended.
@@ -1078,6 +1108,11 @@ impl Chunk {
         let mut columns = rows.columns().to_vec();
         columns.push(column(|pair| pair.sub_principal_id));
         columns.push(column(|pair| pair.act_principal_id));
+        if let (ScribeTable::Calls, Some(request)) = (self.table, rows.column_by_name("request_id"))
+        {
+            fields.push(Arc::new(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false)));
+            columns.push(Arc::clone(request));
+        }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
     }
 
@@ -1300,7 +1335,7 @@ impl OutboxSink for ScribeSink {
         let request_id = match item {
             ScribeWrite::Capture(capture) => Some(capture.request_id()),
             ScribeWrite::Audit(Some(batch)) => batch
-                .column_by_name("request_id")
+                .column_by_name(WYRD_REQUEST_ID)
                 .and_then(|column| column.as_string_opt::<i32>())
                 .filter(|column| !column.is_empty() && column.is_valid(0))
                 .map(|column| column.value(0)),
@@ -1638,9 +1673,9 @@ mod tests {
         assert_eq!(
             frames,
             [
-                ("vala.gateway.calls", 2),
-                ("vala.traces.spans", 2),
-                ("vala.verification.results", 3),
+                ("bifrost.gateway.calls", 2),
+                ("bifrost.traces.spans", 2),
+                ("bifrost.verification.results", 3),
             ]
         );
         for frame in &received[..2] {
@@ -1735,7 +1770,7 @@ mod tests {
 
     /// Proves audit decisions stage through the [`AuditStage`] seam and frame
     /// like every other write: one request's decisions share a lane and one
-    /// `vala.system.audit_log` frame under the platform audit principal with
+    /// `bifrost.system.audit_log` frame under the platform audit principal with
     /// no Card scope, the reserved system owner's decisions travel in their
     /// own frame, and every frame carries a v7 content identity.
     ///
@@ -1761,7 +1796,7 @@ mod tests {
             .audit_frames()
             .into_iter()
             .map(|frame| {
-                assert_eq!(frame.table, "vala.system.audit_log");
+                assert_eq!(frame.table, "bifrost.system.audit_log");
                 assert_eq!(frame.principal, PLATFORM_AUDIT_PRINCIPAL);
                 assert!(frame.card_scope.is_empty());
                 assert_eq!(frame.batch_id.get_version_num(), 7);
@@ -1820,7 +1855,7 @@ mod tests {
     async fn a_retry_resubmits_identical_frames() {
         let scribe = Arc::new(RecordingScribe::default());
         scribe.refuse_next(ScribeError::IngestBusy {
-            table: "vala.gateway.calls".to_owned(),
+            table: "bifrost.gateway.calls".to_owned(),
         });
         let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _, None);
         let tenant = DataTenantId::new_v7();
@@ -1869,7 +1904,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(tables.len(), 3, "{tables:?}");
         tables[1..].sort_unstable();
-        assert_eq!(tables[1..], ["vala.gateway.calls", "vala.traces.spans"]);
+        assert_eq!(
+            tables[1..],
+            ["bifrost.gateway.calls", "bifrost.traces.spans"]
+        );
         assert_eq!(scribe.attempts(), 4, "the rejected frame is never retried");
     }
 
@@ -1929,7 +1967,7 @@ mod tests {
             Vec::new(),
             secrecy::SecretString::from(String::new()),
         );
-        let route = ScribeRoute::select(None, &cluster, Some(&tls));
+        let route = ScribeRoute::select(None, &cluster, Some(&tls), None);
         assert!(matches!(route, Some(ScribeRoute::Peer(_))));
         ScribeSink::outbox(route, BIFROST_INGEST_REQUEST_LIMIT_BYTES)
     }
@@ -2029,7 +2067,7 @@ mod tests {
         settle(&outbox).await;
         let received = scribe.received();
         assert_eq!(received.len(), 1, "{received:?}");
-        assert_eq!(received[0].table, "vala.traces.spans");
+        assert_eq!(received[0].table, "bifrost.traces.spans");
         assert_eq!(received[0].pairs, [route.attribution]);
         every_permit_returns(&spans).await;
     }
@@ -2075,7 +2113,7 @@ mod tests {
     fn detail_features(frames: &[Received]) -> Vec<String> {
         frames
             .iter()
-            .filter(|frame| frame.table == "vala.drift.result_features")
+            .filter(|frame| frame.table == "bifrost.drift.result_features")
             .flat_map(|frame| {
                 StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
                     .expect("an item frame opens")
@@ -2110,12 +2148,15 @@ mod tests {
             .map(|frame| frame.table.as_str())
             .collect::<Vec<_>>();
         let (summary, items) = tables.split_last().expect("frames were written");
-        assert_eq!(*summary, "vala.verification.results", "the summary is last");
+        assert_eq!(
+            *summary, "bifrost.verification.results",
+            "the summary is last"
+        );
         assert!(
             items.len() > 1
                 && items
                     .iter()
-                    .all(|table| *table == "vala.drift.result_features"),
+                    .all(|table| *table == "bifrost.drift.result_features"),
             "the detail splits into several item frames before the summary: {tables:?}"
         );
         let budget = frame_budget(SMALL_REQUEST_BYTES);
@@ -2202,7 +2243,10 @@ mod tests {
             lose: 1,
             seen: AtomicUsize::new(0),
         };
-        let outbox = route_outbox(ScribeRoute::Local(Arc::new(scribe)), SMALL_REQUEST_BYTES);
+        let outbox = route_outbox(
+            ScribeRoute::Local(Arc::new(scribe), None),
+            SMALL_REQUEST_BYTES,
+        );
         outbox.stage(
             DataTenantId::new_v7(),
             drift_result(&uid(), background(), DETAIL_FEATURES, 0),
@@ -2289,7 +2333,7 @@ mod tests {
         const JUDGMENTS: usize = 8;
         let scribe = Arc::new(Overlapping::default());
         let outbox = route_outbox(
-            ScribeRoute::Local(Arc::clone(&scribe) as _),
+            ScribeRoute::Local(Arc::clone(&scribe) as _, None),
             SMALL_REQUEST_BYTES,
         );
         let tenant = DataTenantId::new_v7();
@@ -2317,7 +2361,7 @@ mod tests {
         assert!(frames.iter().all(|frame| frame.ipc.len() <= budget));
         let summaries = frames
             .iter()
-            .position(|frame| frame.table == "vala.verification.results")
+            .position(|frame| frame.table == "bifrost.verification.results")
             .expect("summaries were written");
         let rows = |table: &str| {
             frames
@@ -2329,14 +2373,14 @@ mod tests {
         assert!(
             frames[summaries..]
                 .iter()
-                .all(|frame| frame.table == "vala.verification.results"),
+                .all(|frame| frame.table == "bifrost.verification.results"),
             "every summary follows every detail frame"
         );
         assert_eq!(
-            rows("vala.drift.result_features"),
+            rows("bifrost.drift.result_features"),
             JUDGMENTS * DETAIL_FEATURES
         );
-        assert_eq!(rows("vala.verification.results"), JUDGMENTS);
+        assert_eq!(rows("bifrost.verification.results"), JUDGMENTS);
     }
 
     /// Proves a single row larger than the budget is still submitted alone
@@ -2354,7 +2398,7 @@ mod tests {
             limit: SMALL_REQUEST_BYTES,
         });
         let outbox = route_outbox(
-            ScribeRoute::Local(Arc::clone(&scribe) as _),
+            ScribeRoute::Local(Arc::clone(&scribe) as _, None),
             SMALL_REQUEST_BYTES,
         );
         outbox.stage(
@@ -2484,7 +2528,7 @@ mod tests {
         let ready_address = serve_peer(
             &ca,
             &leaf,
-            ScribeCapturePeerGrpc::new(Arc::clone(&recording) as _).into_server(),
+            ScribeCapturePeerGrpc::new(Arc::clone(&recording) as _, None).into_server(),
         )
         .await;
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -2541,7 +2585,7 @@ mod tests {
         others.sort_unstable();
         assert_eq!(
             others,
-            ["vala.gateway.calls", "vala.traces.spans"],
+            ["bifrost.gateway.calls", "bifrost.traces.spans"],
             "the other tenant's capture is written"
         );
     }

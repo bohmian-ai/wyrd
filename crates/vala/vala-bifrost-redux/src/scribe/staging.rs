@@ -1134,7 +1134,7 @@ pub(crate) mod tests {
         ScribePublishedHotFileV1::from_metrics(
             &crate::scribe::promotion::PublishedHotFileIdentity {
                 data_tenant_id: tenant.as_uuid(),
-                namespace: "vala.traces",
+                namespace: "bifrost.traces",
                 table_name: "spans",
                 file_list_id,
                 object_key,
@@ -1408,6 +1408,12 @@ pub(crate) mod tests {
     }
 
     /// Proves restart loads a typed publication transaction without Arrow replay.
+    ///
+    /// # Panics
+    ///
+    /// Panics when staging, election, or persisting or recovering the manifest
+    /// fails, or recovery does not return exactly the one publication with its
+    /// writer stream and the staged object key.
     #[tokio::test]
     async fn publication_manifest_recovers_rows_and_source_fence_fail_closed() {
         let directory = tempfile::tempdir().expect("stage root");
@@ -1445,7 +1451,7 @@ pub(crate) mod tests {
         let rows = vec![FileListArtifactInsert {
             id: row_id,
             data_tenant_id: tenant,
-            namespace: "vala.traces".to_owned(),
+            namespace: "bifrost.traces".to_owned(),
             table_name: "spans".to_owned(),
             file_path: object_key.to_owned(),
             file_size: i64::try_from(content.len()).expect("fixture length"),

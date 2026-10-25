@@ -1,5 +1,5 @@
 //! Dual export of server spans: the operator's trace backend and the
-//! requesting tenant's `vala.traces.spans`.
+//! requesting tenant's `bifrost.traces.spans`.
 //!
 //! The process has one tracer provider, so each span gets one recording
 //! decision. [`ServerSampler`] makes that one decision carry two independent
@@ -317,7 +317,7 @@ impl<E: SpanExporter> SpanExporter for FailedBatches<E> {
 /// never a span attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TenantSpanRoute {
-    /// Tenant whose `vala.traces.spans` receives the copies.
+    /// Tenant whose `bifrost.traces.spans` receives the copies.
     pub tenant: DataTenantId,
     /// Subject and actor of the emitting operation, stamped on each row.
     pub attribution: Attribution,

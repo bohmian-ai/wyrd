@@ -23,9 +23,9 @@ from wyrd.types import TimestampLTZ, TimestampNTZ, TimestampTZ
 if TYPE_CHECKING:
     from wyrd.testing import WyrdTestServer
 
-WYRD_ORDERS = "vala.datasets.wyrd_orders"
-PYDANTIC_ORDERS = "vala.datasets.pydantic_orders"
-ARROW_ORDERS = "vala.datasets.arrow_orders"
+WYRD_ORDERS = "bifrost.datasets.wyrd_orders"
+PYDANTIC_ORDERS = "bifrost.datasets.pydantic_orders"
+ARROW_ORDERS = "bifrost.datasets.arrow_orders"
 
 RECEIVED = datetime(2026, 10, 6, 17, 0, tzinfo=timezone.utc)
 STORE_OPENS = datetime(2026, 10, 6, 9, 0)

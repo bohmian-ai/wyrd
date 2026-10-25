@@ -1734,7 +1734,7 @@ pub(crate) mod pg_tests {
                 { "resource": "audit", "action": "read", "scope": "all" },
                 { "resource": "bifrost_record", "action": "write", "scope": "all" },
                 { "resource": "bifrost_query", "action": "read",
-                  "scope": { "bifrost": { "schema": { "catalog": "vala", "schema": "logs" } } } }
+                  "scope": { "bifrost": { "schema": { "catalog": "bifrost", "schema": "logs" } } } }
             ]),
         )
         .await;
@@ -1742,7 +1742,7 @@ pub(crate) mod pg_tests {
             resource: Resource::BifrostQuery,
             action: Action::Read,
             scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "logs".to_owned(),
                 table_uid: table,
             })),

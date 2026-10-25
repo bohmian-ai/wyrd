@@ -34,7 +34,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, CompactionTypeWire, PhysicalLayoutWire, QueryParam, QueryTerminalFrame,
+    AlterTableRequest, BifrostQueryRequest, CompactionTypeWire, PhysicalLayoutWire, QueryParam,
+    QueryTerminalFrame,
 };
 use wyrd_spec::vala::ids::{RunId, TraceId};
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
@@ -779,15 +780,15 @@ impl Bifrost {
     /// or `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated; on a
     /// handle not yet connected, any connection error [`Bifrost::handle`]
     /// raises.
-    #[pyo3(signature = (row, card_uid=None, run_id=None))]
+    #[pyo3(signature = (row, subject_card_uid=None, run_id=None))]
     fn insert(
         &self,
         py: Python<'_>,
         row: &str,
-        card_uid: Option<&str>,
+        subject_card_uid: Option<&str>,
         run_id: Option<String>,
     ) -> WyrdPyResult<()> {
-        let correlation = correlation(card_uid, run_id)?;
+        let correlation = correlation(subject_card_uid, run_id)?;
         let bifrost = self.handle(py)?;
         crate::trace::traced(|| bifrost.insert(row.as_bytes().to_vec(), correlation))
             .map_err(client_error)?;
@@ -969,6 +970,38 @@ impl Bifrost {
         to_python_json(py, serde_json::to_value(description))
     }
 
+    /// Alters one registered table's definition at its observed table version
+    /// and returns the committed description.
+    ///
+    /// `request_json` is one serialized `AlterTableRequest`; it is decoded
+    /// strictly here and every edit decision belongs to the server.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WYRD_SPEC_400_VALIDATION` when `request_json` is not one
+    /// `AlterTableRequest`, and `WyrdError` carrying the server's invalid-edit,
+    /// version-conflict, authorization, not-found, or transport code.
+    ///
+    /// # Cancellation
+    ///
+    /// The call runs to completion with the GIL released; a transport failure
+    /// after the server committed may leave the edit committed, so describe
+    /// the table before retrying, since a retry at the old version conflicts.
+    fn alter_table(
+        &self,
+        py: Python<'_>,
+        namespace: &str,
+        name: &str,
+        request_json: &str,
+    ) -> WyrdPyResult<Py<PyAny>> {
+        let request: AlterTableRequest = serde_json::from_str(request_json)
+            .map_err(|error| invalid_argument("request_json", error))?;
+        let description =
+            crate::trace::block_on(py, self.handle(py)?.alter_table(namespace, name, &request))
+                .map_err(client_error)?;
+        to_python_json(py, serde_json::to_value(description))
+    }
+
     /// Rows dropped by the fire-and-forget observe path under backpressure.
     ///
     /// Always zero for [`Bifrost::insert`], which refuses rather than drops,
@@ -1040,15 +1073,18 @@ fn apply_compaction_type(config: TableConfig, raw: Option<&str>) -> WyrdPyResult
 ///
 /// # Errors
 ///
-/// Returns the stable Wyrd validation error when `card_uid` is not one
+/// Returns the stable Wyrd validation error when `subject_card_uid` is not one
 /// parsable Card UID.
-fn correlation(card_uid: Option<&str>, run_id: Option<String>) -> WyrdPyResult<Correlation> {
-    let card_uid = card_uid
+fn correlation(
+    subject_card_uid: Option<&str>,
+    run_id: Option<String>,
+) -> WyrdPyResult<Correlation> {
+    let subject_card_uid = subject_card_uid
         .map(str::parse::<CardUid>)
         .transpose()
-        .map_err(|error| invalid_argument("card_uid", error))?;
+        .map_err(|error| invalid_argument("subject_card_uid", error))?;
     Ok(Correlation {
-        card_uid,
+        subject_card_uid,
         run_id: run_id.map(RunId::from_string),
     })
 }
@@ -1384,7 +1420,7 @@ impl PyBifrostQueryStream {
 /// * `table` - The destination `<namespace>.<name>` table.
 /// * `schema` - The table's JSON Schema as JSON text.
 /// * `row` - One row as JSON object text.
-/// * `card_uid` - The optional UID of the Card the row correlates to.
+/// * `subject_card_uid` - The optional UID of the Card the row correlates to.
 /// * `run_id` - The optional run identifier stamped on the row.
 ///
 /// # Errors
@@ -1395,14 +1431,14 @@ impl PyBifrostQueryStream {
 /// same code `TableConfig.from_json_schema` raises, and the connection error
 /// of a handle connecting on this first use.
 #[pyfunction]
-#[pyo3(signature = (bifrost, table, schema, row, card_uid=None, run_id=None))]
+#[pyo3(signature = (bifrost, table, schema, row, subject_card_uid=None, run_id=None))]
 fn record(
     py: Python<'_>,
     bifrost: &Bound<'_, Bifrost>,
     table: &str,
     schema: &str,
     row: &str,
-    card_uid: Option<&str>,
+    subject_card_uid: Option<&str>,
     run_id: Option<String>,
 ) -> WyrdPyResult<()> {
     let schema_value: Value =
@@ -1410,7 +1446,7 @@ fn record(
     let schema = wyrd_types::json_schema_to_arrow(&schema_value)
         .map_err(|error| client_error(error.into()))?;
     let schema = std::sync::Arc::new(schema);
-    let correlation = correlation(card_uid, run_id)?;
+    let correlation = correlation(subject_card_uid, run_id)?;
     let bifrost = bifrost.borrow();
     let handle = bifrost.handle(py)?;
     let row = row.as_bytes().to_vec();

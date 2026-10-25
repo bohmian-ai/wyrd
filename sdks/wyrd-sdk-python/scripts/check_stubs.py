@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 PACKAGE_DIR = Path("python/wyrd")
-ROOT_STUBS = {"_wyrd.pyi", "__init__.pyi"}
+ROOT_STUBS = {"__init__.pyi"}
 FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 ARGS_ENTRY = re.compile(r"^\s+\**(\w+)(?:\s*\([^)]*\))?\s*:")
 

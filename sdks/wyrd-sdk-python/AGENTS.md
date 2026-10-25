@@ -103,7 +103,7 @@ non-network hydrated graph.
 
 ## Stubs
 
-- The package-local `.pyi` files, including `_wyrd.pyi`, are the one authored
+- The package-local `.pyi` files, including `_wyrd/`, are the one authored
   declaration of the native API. Edit them in the same change as the native
   API; there is no generator or second stub tree.
 - Declare a pure-Python definition once, inline, and re-export it from the

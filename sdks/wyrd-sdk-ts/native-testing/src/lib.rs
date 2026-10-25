@@ -670,7 +670,7 @@ async fn start_test_server_async(
         base_url,
         grpc_url,
         token,
-        table_fqn: format!("vala.bifrost.{table_name}"),
+        table_fqn: format!("bifrost.bifrost.{table_name}"),
         api_key: secrecy::ExposeSecret::expose_secret(&api_key).to_owned(),
         card_ref,
     })

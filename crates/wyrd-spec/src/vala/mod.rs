@@ -39,7 +39,9 @@ pub use audit_detail::{
     ForgeScribePromotionPhase, ForgeSnapshotExpirePhase, OracleTableProtectionPhase,
     RevocationReason, ScopeHash, StoragePath, audit_detail_canonical_json,
 };
-pub use error::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
+pub use error::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation, TableEditViolation};
 pub use managed_columns::{
-    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    ACT_PRINCIPAL_ID, DEPLOYMENT_ENVIRONMENT, RUN_ID, SERVICE_NAME, SERVICE_VERSION,
+    SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME, SUBJECT_VERSION,
+    WORKLOAD_CARD_UID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };

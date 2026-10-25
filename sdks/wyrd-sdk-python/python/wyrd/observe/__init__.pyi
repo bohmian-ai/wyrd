@@ -185,14 +185,14 @@ class Observe:
         ...
 
     def record(self, table: str, row: Mapping[str, Any] | Any) -> None:
-        """Emit one row into a registered ``vala.datasets.<name>`` table.
+        """Emit one row into a registered ``bifrost.datasets.<name>`` table.
 
         The first call for a table blocks to describe it; later calls reuse
         the cached schema and producer. Row values are checked against that
         schema when the queue seals a batch, not here.
 
         Args:
-            table: the registered ``"vala.datasets.<name>"`` table.
+            table: the registered ``"bifrost.datasets.<name>"`` table.
             row: a mapping with ``str`` keys, a dataclass instance, or a
                 Pydantic model instance, with any JSON values.
 
@@ -200,7 +200,7 @@ class Observe:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for a row of another
                 shape, a non-``str`` key, or a non-finite float;
                 ``WYRD_SDK_400_INVALID_OBSERVATION`` for a table outside
-                ``vala.datasets``; ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
+                ``bifrost.datasets``; ``WYRD_SDK_400_BIFROST_NOT_STARTED``,
                 ``WYRD_SDK_409_BIFROST_CLOSED``, or
                 ``WYRD_CLIENT_429_QUEUE_FULL``; and the server's error for a
                 table that is unknown, unauthorized, or unavailable.

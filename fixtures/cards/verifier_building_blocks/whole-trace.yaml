@@ -1,0 +1,15 @@
+# A trace check over every span of one trace, whichever workload wrote it:
+# the desk's own `retrieve` span, then another writer's `score` span.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: whole-trace
+  version: 1.0.0
+spec:
+  description: The trace retrieves, then another workload scores.
+  inputs:
+    trace: {type: trace}
+  requirements:
+    - id: retrieved-then-scored
+      statement: The trace's spans are retrieve, then score
+      check: {kind: trace, on: inputs.trace, span_selector: "$.spans[*].name", operator: equals, expected: [retrieve, score]}

@@ -182,7 +182,7 @@ mod tests {
     /// The canonical union a traces table resolves: managed floor plus the
     /// declaration-only correlation columns.
     fn declared_recipe() -> Vec<String> {
-        ["run_id", "card_uid", "trace_id", "span_id"]
+        ["run_id", "subject_card_uid", "trace_id", "span_id"]
             .into_iter()
             .map(str::to_owned)
             .collect()
@@ -193,12 +193,19 @@ mod tests {
     /// the per-lookup dictionary decode size, and off for the time column so
     /// `DELTA_BINARY_PACKED` is its real encoding rather than a post-overflow
     /// fallback.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a sampled column is not dictionary-eligible or pins an
+    /// encoding, the dictionary page limit differs from
+    /// `BIFROST_DICTIONARY_PAGE_BYTES`, or the time column keeps dictionary
+    /// encoding or is not `DELTA_BINARY_PACKED`.
     #[test]
     fn writer_recipe_encoding_contract() {
         let bloom_columns = declared_recipe();
         let properties = bifrost_writer_properties(TIME_COLUMN, &bloom_columns);
 
-        for column in ["service_name", "run_id", "message", "card_uid"] {
+        for column in ["service_name", "run_id", "message", "subject_card_uid"] {
             let path = ColumnPath::from(column);
             assert!(
                 properties.dictionary_enabled(&path),
@@ -301,9 +308,14 @@ mod tests {
     /// A column outside the resolved union never receives a Bloom filter, so a
     /// table that does not declare `trace_id` cannot inherit another table's
     /// footer recipe.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `subject_card_uid` or `run_id` lacks a Bloom filter, or
+    /// `trace_id`, `span_id`, or the time column receives one.
     #[test]
     fn writer_recipe_blooms_exactly_the_resolved_union() {
-        let floor = ["card_uid".to_owned(), "run_id".to_owned()];
+        let floor = ["subject_card_uid".to_owned(), "run_id".to_owned()];
         let properties = bifrost_writer_properties(TIME_COLUMN, &floor);
         for column in &floor {
             assert!(

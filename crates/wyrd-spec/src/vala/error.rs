@@ -340,7 +340,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
         status = 400,
         title = "Reserved system column name",
-        remediation = "Rename the column — run_id, card_uid, principal_id, wyrd_request_id, and wyrd_ingested_at are reserved."
+        remediation = "Rename the column — workload_card_uid, subject_card_uid, run_id, sub_principal_id, act_principal_id, and every wyrd_ name are reserved."
     )]
     ReservedColumn {
         /// The reserved column name that was supplied.
@@ -475,6 +475,41 @@ pub enum BifrostError {
         table: String,
         /// The table's current version, which a new batch must name.
         table_version: crate::vala::ids::TableVersion,
+    },
+
+    /// A table edit names a version the domain cannot advance past.
+    ///
+    /// The table is at the maximum version, so no further edit can commit;
+    /// nothing changed and versions never wrap.
+    #[error("table version exhausted for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_TABLE_VERSION_EXHAUSTED",
+        status = 409,
+        title = "Table version exhausted",
+        remediation = "The table is at version 9223372036854775807 and accepts no further edits. Register a new table for the changed definition."
+    )]
+    TableVersionExhausted {
+        /// Fully-qualified table name that cannot be edited.
+        table: String,
+    },
+
+    /// A table edit is outside the safe-edit contract or changes nothing.
+    ///
+    /// Reported before any durable change; the table keeps its version.
+    #[error("invalid table edit for table {table}: {violation:?}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_BIFROST_INVALID_TABLE_EDIT",
+        status = 400,
+        title = "Invalid Bifrost table edit",
+        remediation = "Describe the table and send at least one effective change: nullable top-level custom columns to add, existing top-level custom columns to rename to unused names, or partition, sort, and Bloom lists."
+    )]
+    InvalidTableEdit {
+        /// Canonical `<namespace>.<name>` of the table being edited.
+        table: String,
+        /// Why the edit was refused.
+        violation: TableEditViolation,
+        /// Offending column when the refusal names one.
+        column: Option<String>,
     },
 
     /// A batch with this ID was previously attempted but failed permanently.
@@ -904,6 +939,29 @@ pub enum BifrostError {
         /// Canonical `<namespace>.<name>` of the conflicting table.
         table: String,
     },
+}
+
+/// Why [`BifrostError::InvalidTableEdit`] refused an edit.
+///
+/// The set is closed so SDKs can branch on it without parsing prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TableEditViolation {
+    /// The edit would leave the definition exactly as it is.
+    NoEffectiveChange,
+    /// The column is a system, managed, or correlation column, or belongs to
+    /// a built-in table's canonical schema.
+    ProtectedColumn,
+    /// A rename names a column the table does not have at the top level.
+    UnknownColumn,
+    /// An added or renamed name is already used by another column.
+    NameCollision,
+    /// One column is renamed twice, or a rename's target is another rename's
+    /// source.
+    AmbiguousRename,
+    /// An added column is not nullable.
+    RequiredColumn,
 }
 
 /// Declaration slot named by [`BifrostError::InvalidPhysicalLayout`].

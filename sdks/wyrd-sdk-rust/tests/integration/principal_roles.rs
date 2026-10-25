@@ -23,7 +23,7 @@ use wyrd_testing::server::WyrdTestServer;
 use crate::support::{Deployment, declare, fixture, pull, runtime_account};
 
 /// A tenant-wide query over a built-in table, which `workload` permits.
-const TENANT_WIDE: &str = "SELECT COUNT(*) AS n FROM vala.drift.observations";
+const TENANT_WIDE: &str = "SELECT COUNT(*) AS n FROM bifrost.drift.observations";
 
 /// A Card only an author can register.
 const AUTHORED: &str = "cards/gateway_inference/ask-prompt.yaml";
@@ -235,11 +235,11 @@ const ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(35);
 /// Wait after which a cached token is inside the refresh skew.
 const PAST_REUSE_WINDOW: Duration = Duration::from_secs(6);
 
-/// One `vala.drift.observations` row's subject and run.
+/// One `bifrost.drift.observations` row's subject and run.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct Observed {
     /// The observed Card.
-    card_uid: String,
+    subject_card_uid: String,
     /// The run the sample belongs to.
     run_id: String,
 }
@@ -349,13 +349,13 @@ async fn stable_accounts_preserve_execution_identity() {
         let run_id = run.run_id().to_string();
         let rows: Vec<Observed> = bifrost
             .sql_as(
-                "SELECT card_uid, run_id FROM vala.drift.observations WHERE run_id = $1",
+                "SELECT subject_card_uid, run_id FROM bifrost.drift.observations WHERE run_id = $1",
                 &[QueryParam::String(run_id.clone())],
             )
             .await
             .expect("rows read back");
         let expected = Observed {
-            card_uid: model.clone(),
+            subject_card_uid: model.clone(),
             run_id,
         };
         assert_eq!(rows, [expected.clone(), expected]);

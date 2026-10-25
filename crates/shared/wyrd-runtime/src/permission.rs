@@ -1542,7 +1542,7 @@ mod tests {
             resource: Resource::BifrostQuery,
             action: Action::Read,
             scope: PermissionScope::Bifrost(BifrostPermissionScope::Schema(BifrostSchemaScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "logs".to_owned(),
             })),
         }
@@ -1554,7 +1554,7 @@ mod tests {
             resource: Resource::BifrostQuery,
             action: Action::Read,
             scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: schema.to_owned(),
                 table_uid: uid,
             })),
@@ -1630,6 +1630,10 @@ mod tests {
 
     /// Proves the persisted permission JSON is exactly the approved three-field
     /// projection for `all`, schema, and table scope, in both directions.
+    ///
+    /// # Panics
+    /// Panics when a permission fails to serialize or deserialize, or its
+    /// JSON or decoded value differs from the approved projection.
     #[test]
     fn scoped_permission_json_matches_the_approved_projection() {
         let uid = uuid::Uuid::from_u128(0x99);
@@ -1643,7 +1647,7 @@ mod tests {
                 json!({
                     "resource": "bifrost_query",
                     "action": "read",
-                    "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+                    "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
                 }),
             ),
             (
@@ -1652,7 +1656,7 @@ mod tests {
                     "resource": "bifrost_query",
                     "action": "read",
                     "scope": {"bifrost": {"table": {
-                        "catalog": "vala",
+                        "catalog": "bifrost",
                         "schema": "traces",
                         "table_uid": uid.to_string(),
                     }}}
@@ -1675,6 +1679,12 @@ mod tests {
     /// Proves Bifrost object scope applies to record writes as well as query
     /// reads, a table-scoped write covers only its own table, and the scope is
     /// still refused on any other resource or action pairing.
+    ///
+    /// # Panics
+    /// Panics when the table-scoped record write fails validation or its
+    /// round trip, covers another table or the unscoped requirement, is not
+    /// covered by the unscoped write, or validates on record read, query
+    /// write, or table write.
     #[test]
     fn bifrost_scope_applies_to_record_write_and_query_read_only() {
         let calls = uuid::Uuid::from_u128(0xca11);
@@ -1683,7 +1693,7 @@ mod tests {
             resource: Resource::BifrostRecord,
             action: Action::Write,
             scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "gateway".to_owned(),
                 table_uid: uid,
             })),
@@ -1732,13 +1742,17 @@ mod tests {
 
     /// Proves a Bifrost object scope only attaches to a resource that owns a
     /// Bifrost object; `cards` and `wildcard` both fail closed at decode.
+    ///
+    /// # Panics
+    /// Panics when a schema scope decodes on `cards` or `wildcard`, or the
+    /// decode error does not name the resource.
     #[test]
     fn bifrost_scope_is_rejected_on_an_unrelated_resource() {
         for resource in ["cards", "wildcard"] {
             let error = serde_json::from_value::<Permission>(json!({
                 "resource": resource,
                 "action": "read",
-                "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+                "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
             }))
             .expect_err("a Bifrost object scope needs a Bifrost object resource");
 
@@ -1751,6 +1765,11 @@ mod tests {
     /// Without this, persisted or signed JSON could carry a Bifrost scope on
     /// `wildcard`, which then covers the required read and turns corrupt role
     /// JSON into effective read authority instead of a decode failure.
+    ///
+    /// # Panics
+    /// Panics when a schema scope decodes on `write`, `wildcard`, or an
+    /// `any_of` action, a refusal does not name the action, or the exact
+    /// query read is refused.
     #[test]
     fn bifrost_scope_is_rejected_on_a_non_read_action() {
         for action in [
@@ -1761,7 +1780,7 @@ mod tests {
             let error = serde_json::from_value::<Permission>(json!({
                 "resource": "bifrost_query",
                 "action": action,
-                "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+                "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
             }))
             .expect_err("a Bifrost object scope only applies to an exact read");
 
@@ -1771,20 +1790,23 @@ mod tests {
         serde_json::from_value::<Permission>(json!({
             "resource": "bifrost_query",
             "action": "read",
-            "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+            "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}}
         }))
         .expect("exact query read stays valid for Bifrost scope");
     }
 
     /// Proves a structurally valid but empty object identity is not an object:
     /// malformed identities fail at decode, never at check time.
+    ///
+    /// # Panics
+    /// Panics when a schema scope with an empty schema segment decodes.
     #[test]
     fn malformed_scope_identity_is_rejected_at_decode() {
         assert!(
             serde_json::from_value::<Permission>(json!({
                 "resource": "bifrost_query",
                 "action": "read",
-                "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": ""}}}
+                "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": ""}}}
             }))
             .is_err(),
             "an empty schema segment is not an object identity"

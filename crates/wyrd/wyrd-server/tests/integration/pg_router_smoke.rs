@@ -1594,7 +1594,7 @@ async fn seed_ready_forge_task(
     let statement = "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,\
          namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,\
          estimated_bytes,state,ready_at,next_eligible_at,updated_at) \
-         VALUES ($1,$2,'wyrd-redux','vala.bifrost',$3,$4,4242,$5::jsonb,\
+         VALUES ($1,$2,'wyrd-redux','bifrost.bifrost',$3,$4,4242,$5::jsonb,\
          decode(repeat('33',32),'hex'),1,100,'ready',statement_timestamp()-interval '1 hour',\
          statement_timestamp()-interval '1 hour',statement_timestamp())";
     sqlx::query(statement)
@@ -1776,7 +1776,7 @@ async fn coordinator_object_store_failure_keeps_readiness() {
 
     register_forge_table(&server, table).await;
     server
-        .seed_bifrost_rows(&format!("vala.bifrost.{table}"), &[1, 2, 3])
+        .seed_bifrost_rows(&format!("bifrost.bifrost.{table}"), &[1, 2, 3])
         .await
         .expect("the table publishes a real snapshot");
     // The rows are hot until Scribe promotion publishes them, and the manifest

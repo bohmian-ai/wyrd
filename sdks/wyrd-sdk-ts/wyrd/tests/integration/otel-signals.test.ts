@@ -1,18 +1,22 @@
 // TypeScript's own OTel signals beyond the shared `otel_export` story: stock
-// log and metric exporters. Not mirrored.
+// log and metric exporters, plus the promotion and attribution story Python
+// mirrors.
+import { Metadata } from "@grpc/grpc-js";
 import { SeverityNumber } from "@opentelemetry/api-logs";
 import { ValueType, context, trace } from "@opentelemetry/api";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-grpc";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-grpc";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-grpc";
+import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BatchLogRecordProcessor, LoggerProvider } from "@opentelemetry/sdk-logs";
 import { MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
-import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
+import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { expect, vi } from "vitest";
 import { z } from "zod";
 
-import { Bifrost } from "wyrd-ai";
+import { Bifrost, Cards } from "wyrd-ai";
 
-import { serverTest } from "../support/server.js";
+import { declared, fixture, runtimeAccount, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -33,6 +37,42 @@ const MetricRow = z.object({
   double_value: z.number().nullable(),
   histogram_count: z.bigint().nullable(),
   histogram_sum: z.number().nullable(),
+});
+
+/** The shared dimensions and workload every signal row carries. */
+const DimensionRow = z.object({
+  service_name: z.string().nullable(),
+  service_version: z.string().nullable(),
+  deployment_environment: z.string().nullable(),
+  subject_kind: z.string().nullable(),
+  subject_name: z.string().nullable(),
+  subject_version: z.string().nullable(),
+  workload_card_uid: z.string().nullable(),
+});
+
+/** The exception columns a span or log record promotes. */
+const ExceptionRow = z.object({
+  exception_type: z.string().nullable(),
+  exception_message: z.string().nullable(),
+  is_exception: z.boolean(),
+});
+
+/** The URL and exception columns a span promotes from its attributes and events. */
+const SpanPromotionRow = ExceptionRow.extend({
+  http_request_method: z.string().nullable(),
+  url_full: z.string().nullable(),
+  url_path: z.string().nullable(),
+  url_query: z.string().nullable(),
+});
+
+const DIMENSIONS =
+  "service_name, service_version, deployment_environment, subject_kind, subject_name, subject_version, workload_card_uid";
+
+/** The application's own standard resource, with no Wyrd state behind it. */
+const OWNED = resourceFromAttributes({
+  "service.name": "checkout",
+  "service.version": "2.1.0",
+  "deployment.environment.name": "staging",
 });
 
 /**
@@ -69,7 +109,7 @@ test("stock log record reads back through bifrost", async ({ server, bifrost }) 
 
   const rows = await bifrost.sql(
     `SELECT severity_text, severity_number, trace_id, span_id
-       FROM vala.logs.records WHERE scope_name = 'wyrd.tests.otel.log'`,
+       FROM bifrost.logs.records WHERE scope_name = 'wyrd.tests.otel.log'`,
     [],
     LogRow,
   );
@@ -95,7 +135,7 @@ test("stock metric points read back through bifrost", async ({ server, bifrost }
 
   const rows = await bifrost.sql(
     `SELECT metric_name, metric_type, int_value, double_value, histogram_count, histogram_sum
-       FROM vala.metrics.points WHERE scope_name = 'wyrd.tests.otel.metric' ORDER BY metric_name`,
+       FROM bifrost.metrics.points WHERE scope_name = 'wyrd.tests.otel.metric' ORDER BY metric_name`,
     [],
     MetricRow,
   );
@@ -106,4 +146,103 @@ test("stock metric points read back through bifrost", async ({ server, bifrost }
     { ...point, metric_name: "queue.depth", metric_type: "gauge", double_value: 3.5 },
     { ...point, metric_name: "request.duration", metric_type: "histogram", histogram_count: 1n, histogram_sum: 12.5 },
   ]);
+});
+
+test("signal promotions and attribution read back through bifrost", async ({ server, bifrost }) => {
+  const cards = await Cards.connect();
+  const model = declared(await cards.declareFromPath(fixture("cards/observe_a_run/observed-model.yaml")));
+  const root = declared(await cards.declareFromPath(fixture("cards/observe_a_run/observed-service.yaml")));
+  const { key } = await runtimeAccount({ kind: "Service", name: "observed-service" });
+  const subject = { "wyrd.card_uid": model.uid };
+
+  const spans = new BasicTracerProvider({
+    resource: OWNED,
+    spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter())],
+  });
+  const checkout = spans.getTracer("wyrd.tests.otel.owned").startSpan("checkout", {
+    attributes: {
+      ...subject,
+      "http.request.method": "GET",
+      "url.full": "https://shop.test/cart?id=7",
+      "url.path": "/cart",
+      "url.query": "id=7",
+    },
+  });
+  checkout.recordException(new TypeError("sold out"));
+  checkout.end();
+  const logs = new LoggerProvider({
+    resource: OWNED,
+    processors: [new BatchLogRecordProcessor({ exporter: new OTLPLogExporter() })],
+  });
+  logs.getLogger("wyrd.tests.otel.owned").emit({
+    body: "checkout failed",
+    severityNumber: SeverityNumber.ERROR,
+    attributes: { ...subject, "exception.type": "TypeError", "exception.message": "sold out" },
+  });
+  const metrics = new MeterProvider({
+    resource: OWNED,
+    readers: [new PeriodicExportingMetricReader({ exporter: new OTLPMetricExporter(), exportIntervalMillis: 600_000 })],
+  });
+  metrics.getMeter("wyrd.tests.otel.owned").createCounter("orders.failed").add(1, subject);
+  const metadata = new Metadata();
+  metadata.set("x-wyrd-api-key", key);
+  metadata.set("x-wyrd-workload-uid", root.uid);
+  const rooted = new BasicTracerProvider({
+    resource: OWNED,
+    spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter({ metadata }))],
+  });
+  rooted.getTracer("wyrd.tests.otel.rooted").startSpan("checkout", { attributes: subject }).end();
+  await Promise.all([spans, logs, metrics, rooted].map((provider) => provider.shutdown()));
+  server.flushBifrost();
+
+  const observed = {
+    service_name: "checkout",
+    service_version: "2.1.0",
+    deployment_environment: "staging",
+    subject_kind: "Model",
+    subject_name: "observed-model",
+    subject_version: "1.0.0",
+    workload_card_uid: null,
+  };
+  for (const table of ["bifrost.traces.spans", "bifrost.logs.records", "bifrost.metrics.points"]) {
+    const rows = await bifrost.sql(
+      `SELECT ${DIMENSIONS} FROM ${table} WHERE scope_name = 'wyrd.tests.otel.owned'`,
+      [],
+      DimensionRow,
+    );
+    expect(rows, table).toEqual([observed]);
+  }
+  expect(
+    await bifrost.sql(
+      `SELECT ${DIMENSIONS} FROM bifrost.traces.spans WHERE scope_name = 'wyrd.tests.otel.rooted'`,
+      [],
+      DimensionRow,
+    ),
+  ).toEqual([{ ...observed, service_name: "observed-service", service_version: "1.0.0", workload_card_uid: root.uid }]);
+  expect(
+    await bifrost.sql(
+      `SELECT http_request_method, url_full, url_path, url_query, exception_type, exception_message, is_exception
+         FROM bifrost.traces.spans WHERE scope_name = 'wyrd.tests.otel.owned'`,
+      [],
+      SpanPromotionRow,
+    ),
+  ).toEqual([
+    {
+      http_request_method: "GET",
+      url_full: "https://shop.test/cart?id=7",
+      url_path: "/cart",
+      url_query: "id=7",
+      exception_type: "TypeError",
+      exception_message: "sold out",
+      is_exception: true,
+    },
+  ]);
+  expect(
+    await bifrost.sql(
+      `SELECT exception_type, exception_message, is_exception
+         FROM bifrost.logs.records WHERE scope_name = 'wyrd.tests.otel.owned'`,
+      [],
+      ExceptionRow,
+    ),
+  ).toEqual([{ exception_type: "TypeError", exception_message: "sold out", is_exception: true }]);
 });

@@ -6,7 +6,7 @@
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::error::WyrdError;
 
-/// Resolve a wire namespace string (e.g. `"vala.bifrost"`) to its engine enum.
+/// Resolve a wire namespace string (e.g. `"bifrost.bifrost"`) to its engine enum.
 ///
 /// Unknown namespaces are a client error rather than a silent default.
 pub fn namespace_from_wire(namespace: &str) -> Result<BifrostNamespace, WyrdError> {
@@ -26,10 +26,17 @@ mod tests {
     use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, PARQUET_FIELD_ID_KEY};
     use wyrd_types::{field_to_spec, spec_to_field};
 
+    /// Proves a known wire namespace resolves to its engine enum and an unknown
+    /// one is a 400 validation error rather than a silent default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `bifrost.bifrost` does not resolve to `BifrostNamespace::Bifrost`,
+    /// or `public` resolves or fails with a status other than 400.
     #[test]
     fn bifrost_tables_namespace_parse_rejects_unknown() {
         assert_eq!(
-            namespace_from_wire("vala.bifrost").expect("known"),
+            namespace_from_wire("bifrost.bifrost").expect("known"),
             BifrostNamespace::Bifrost
         );
         let err = namespace_from_wire("public").expect_err("unknown namespace rejected");

@@ -15,7 +15,7 @@ use wyrd_testing::server::WyrdTestServer;
 use super::pg_tests::service_client;
 
 /// The table the API requests are registered and written to.
-const API_REQUESTS: &str = "vala.datasets.api_requests";
+const API_REQUESTS: &str = "bifrost.datasets.api_requests";
 
 /// Which feature mattered most to one prediction.
 #[derive(Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

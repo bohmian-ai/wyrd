@@ -1,4 +1,4 @@
-//! The `vala.traces.spans` telemetry fixture: deterministic GenAI/HTTP spans
+//! The `bifrost.traces.spans` telemetry fixture: deterministic GenAI/HTTP spans
 //! sent through OTLP ingest.
 //!
 //! Like the events fixture, every value is a plain function of one span
@@ -24,7 +24,7 @@ use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 use crate::query::workload::{DAY_HOURS, DAY_START_MS, HOUR_MS, Rows, mix};
 
 /// The span table OTLP traces land in.
-pub const TABLE: &str = "vala.traces.spans";
+pub const TABLE: &str = "bifrost.traces.spans";
 
 /// Spans in every trace; the trace tree is [`Role::ALL`].
 pub const SPANS_PER_TRACE: i64 = 8;
@@ -363,7 +363,7 @@ pub(crate) fn attribute(key: &str, value: Value) -> KeyValue {
 /// One telemetry fixture size and every span derived from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Telemetry {
-    /// Spans written to `vala.traces.spans`; a multiple of [`SPANS_PER_TRACE`].
+    /// Spans written to `bifrost.traces.spans`; a multiple of [`SPANS_PER_TRACE`].
     pub spans: i64,
 }
 

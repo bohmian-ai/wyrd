@@ -127,7 +127,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
                 "Read and pull: wyrd get --kind Service --name <name> --version <version>, or cards.get here, reads one Card envelope. wyrd pull --kind Service --uid <root_uid> --output-dir .wyrd-bundle, or the SDK's Cards.pull, writes the complete bundle the application loads. A --metadata-only bundle is inspectable but not runnable.",
                 "Observe: install the Python SDK (uv add \"wyrd-ai[otel]\", plus agents or gateway for those integrations), the Rust wyrd-ai crate, or the TypeScript wyrd-ai package. Load the bundle with WyrdState.from_path, call start_bifrost and start_telemetry, open state.run() for each unit of work, write rows with run.observe.record(<table>, row) matching the declared schema, use run.for_card(<alias>) for a component's view, and call state.shutdown() before exit to flush buffered rows and spans. Recording buffers rows; a row becomes queryable only after the server publishes it.",
                 "Verify: run.observe.verify(<verifier>, <slot>=value) returns a judgment within the server deadline; a failed verdict is a result, not an error, and dispatches no Operator. run.observe.submit(...) queues the work and returns an execution; poll it from any process with verify.Execution.connect(execution_id).status() or verification.get_execution until it is completed, errored, or timed_out. Here, verification.execute and verification.enqueue take the same inline inputs and require verifier:run on the Verifier. A path on your machine is not server-readable; send file evidence from the SDK, such as verify.File. Drift Verifiers run only on their binding schedule.",
-                "Done means server evidence, not your own output: read the Service and its Verifier bindings with cards.get, query your custom table and vala.traces.spans by run_id with bifrost.query, and read each judgment from vala.verification.results. Use the cards, verification, and bifrost_sql topics for those reads. Report refusals, empty results, and failed queries as they are.",
+                "Done means server evidence, not your own output: read the Service and its Verifier bindings with cards.get, query your custom table and bifrost.traces.spans by run_id with bifrost.query, and read each judgment from bifrost.verification.results. Use the cards, verification, and bifrost_sql topics for those reads. Report refusals, empty results, and failed queries as they are.",
             ],
             vec![
                 example(
@@ -184,8 +184,8 @@ fn response(topic: GuideTopic) -> GuideResponse {
             vec![
                 "Read the owner Card's status.verification.binding_ids and call verification.get_binding for the exact owner, subject, Verifier, readiness, and last_execution_id.",
                 "Call verification.get_execution for execution status, its result, execution errors, and Operator dispatches. A failed judgment differs from an execution failure. Pending, errored, and timed-out executions do not establish a completed judgment. A just-enqueued execution may read as not found until the queue accepts it.",
-                "Persisted judgment history lives in Bifrost SQL: query vala.verification.results by result_id, or by exact card_uid or owner_card_uid within a suitable time window. Then inspect vala.drift.result_features by matching result_id.",
-                "card_uid identifies the Card verified and verifier_card_uid the Verifier; sub_principal_id and act_principal_id record who the work was for and who performed it. Verification details follow table query permission. Gateway request/response payload columns additionally require gateway_payload:read. Empty evidence is not proof of a passing judgment.",
+                "Persisted judgment history lives in Bifrost SQL: query bifrost.verification.results by result_id, or by exact subject_card_uid or workload_card_uid within a suitable time window. Then inspect bifrost.drift.result_features by matching result_id.",
+                "subject_card_uid identifies the Card verified, workload_card_uid the owner Service, and verifier_card_uid the Verifier; sub_principal_id and act_principal_id record who the work was for and who performed it. Verification details follow table query permission. Gateway request/response payload columns additionally require gateway_payload:read. Empty evidence is not proof of a passing judgment.",
                 "verification.execute and verification.enqueue require verifier:run on the Verifier and take the same inline inputs. verification.execute returns the judgment directly and dispatches no Operator. verification.enqueue accepts the work with 202 and an execution_id; poll verification.get_execution. File inputs are referenced by digest: verification.evidence plans their upload, and the SDK or HTTP client sends the bytes; a local path is not server-readable. Drift Verifiers judge windows and run only on their binding schedule.",
             ],
             vec![
@@ -201,7 +201,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
                 ),
                 sql_example(
                     "Find recent subject judgments",
-                    "SELECT result_id, verifier_card_uid, verdict, card_uid FROM vala.verification.results WHERE card_uid = '<card_uid>' AND ended_at >= TIMESTAMP '2026-01-01 00:00:00' AND ended_at < TIMESTAMP '2027-01-01 00:00:00' ORDER BY ended_at DESC LIMIT 20",
+                    "SELECT result_id, verifier_card_uid, verdict, subject_card_uid FROM bifrost.verification.results WHERE subject_card_uid = '<subject_card_uid>' AND ended_at >= TIMESTAMP '2026-01-01 00:00:00' AND ended_at < TIMESTAMP '2027-01-01 00:00:00' ORDER BY ended_at DESC LIMIT 20",
                 ),
             ],
         ),
@@ -211,7 +211,7 @@ fn response(topic: GuideTopic) -> GuideResponse {
                 "Use a single DataFusion SELECT with explicit projections, suitable time bounds, and LIMIT. bifrost.query accepts sql and optional deadline_ms, max_rows, max_bytes. Replace placeholders with discovered identifiers and adjust the example time windows.",
                 "Inspect columns once, map positional rows to their column order, and inspect terminal. Treat isError or a failed terminal as failure; do not use incomplete rows as a complete answer. Result ceilings refuse oversized results rather than truncating them.",
                 "Correlate telemetry using described trace_id/span_id and time columns. For verification, use exact subject/owner Card UIDs, then result_id to inspect Drift details. Use only tables and payload columns the caller is authorized to read.",
-                "The custom-table example assumes discovery describes id and value. A Service declares custom tables in vala.datasets; replace the qualified name and projection with the actual declared schema.",
+                "The custom-table example assumes discovery describes id and value. A Service declares custom tables in bifrost.datasets; replace the qualified name and projection with the actual declared schema.",
             ],
             vec![
                 example(
@@ -222,19 +222,19 @@ fn response(topic: GuideTopic) -> GuideResponse {
                 example(
                     "bifrost.describe_table",
                     "Read telemetry fields and types",
-                    json!({ "namespace": "vala.traces", "name": "spans" }),
+                    json!({ "namespace": "bifrost.traces", "name": "spans" }),
                 ),
                 sql_example(
                     "Correlate an error log to its trace span",
-                    "SELECT l.severity_text, l.event_name, s.name, s.status_code FROM vala.logs.records l JOIN vala.traces.spans s ON l.trace_id = s.trace_id AND l.span_id = s.span_id WHERE s.trace_id = X'<trace_id>' AND s.start_time_unix_nano >= TIMESTAMP '2026-01-01T00:00:00Z' AND s.start_time_unix_nano < TIMESTAMP '2027-01-01T00:00:00Z' LIMIT 20",
+                    "SELECT l.severity_text, l.event_name, s.name, s.status_code FROM bifrost.logs.records l JOIN bifrost.traces.spans s ON l.trace_id = s.trace_id AND l.span_id = s.span_id WHERE s.trace_id = X'<trace_id>' AND s.start_time_unix_nano >= TIMESTAMP '2026-01-01T00:00:00Z' AND s.start_time_unix_nano < TIMESTAMP '2027-01-01T00:00:00Z' LIMIT 20",
                 ),
                 sql_example(
                     "Read a completed judgment",
-                    "SELECT result_id, execution_id, execution_status, verdict, card_uid FROM vala.verification.results WHERE result_id = '<result_id>' LIMIT 20",
+                    "SELECT result_id, execution_id, execution_status, verdict, subject_card_uid FROM bifrost.verification.results WHERE result_id = '<result_id>' LIMIT 20",
                 ),
                 sql_example(
                     "Read scored Drift features",
-                    "SELECT result_id, feature, score, threshold, verdict FROM vala.drift.result_features WHERE result_id = '<result_id>' LIMIT 20",
+                    "SELECT result_id, feature, score, threshold, verdict FROM bifrost.drift.result_features WHERE result_id = '<result_id>' LIMIT 20",
                 ),
                 sql_example(
                     "Read a described custom table",

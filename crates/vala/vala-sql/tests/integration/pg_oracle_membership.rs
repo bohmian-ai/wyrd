@@ -369,7 +369,7 @@ mod pg_tests {
     use wyrd_spec::DataTenantId;
 
     /// Logical namespace every table in this module is registered under.
-    const NAMESPACE: &str = "vala.bifrost";
+    const NAMESPACE: &str = "bifrost.bifrost";
 
     /// Retention window every supersession assertion runs under.
     const RETENTION: std::time::Duration = std::time::Duration::from_hours(6);
@@ -420,6 +420,19 @@ mod pg_tests {
             .execute(&catalog)
             .await
             .expect("runtime catalog relation exists");
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS iceberg_catalog.iceberg_table_versions (
+                    catalog_name VARCHAR(255) NOT NULL,
+                    table_namespace VARCHAR(255) NOT NULL,
+                    table_name VARCHAR(255) NOT NULL,
+                    table_uuid VARCHAR(36) NOT NULL,
+                    table_version BIGINT NOT NULL CHECK (table_version > 0),
+                    metadata_location VARCHAR(1000) NOT NULL,
+                    PRIMARY KEY (catalog_name, table_uuid, table_version))",
+            )
+            .execute(&catalog)
+            .await
+            .expect("runtime version relation exists");
             Self {
                 fixture,
                 superuser,
@@ -480,7 +493,7 @@ mod pg_tests {
                  ON CONFLICT (catalog_name, table_namespace, table_name)
                  DO UPDATE SET metadata_location = EXCLUDED.metadata_location",
             )
-            .bind(format!("vala.tenants.{tenant}.bifrost"))
+            .bind(format!("bifrost.tenants.{tenant}.bifrost"))
             .bind(table)
             .bind(pointer)
             .execute(&self.catalog)
@@ -1009,5 +1022,142 @@ mod pg_tests {
             foreign[0].publication_revisions.is_empty(),
             "another tenant is independent"
         );
+    }
+
+    /// Proves the definition publication is a tenant-bound pointer swap and
+    /// version reference that commits or rolls back with the caller's
+    /// transaction.
+    ///
+    /// The tenant login cannot write the catalog directly. Through the
+    /// definer it cannot publish another tenant's table, an unregistered
+    /// table, another table identity, metadata outside the table's metadata
+    /// directory, a skipped version, or from a stale pointer; a rolled-back
+    /// publication leaves the pointer and references unchanged, and a
+    /// committed one moves the pointer and records exactly the next version.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any privilege, refusal, rollback, or commit assertion fails.
+    #[tokio::test]
+    async fn definition_publication_is_tenant_bound_and_transactional() {
+        use vala_sql::queries::olap_catalog::publish_definition;
+
+        const V1: &str = "s3://a/events/metadata/00001-a.metadata.json";
+        const V2: &str = "s3://a/events/metadata/00002-b.metadata.json";
+        const UUID: &str = "0b9a1c7e-6c3c-4d4c-9c11-6f7d6d0f2a01";
+        let reads = CutReads::start().await;
+        let definer = sqlx::query(
+            "SELECT p.prosecdef, p.proowner = n.nspowner AS owned_by_platform, p.proconfig \
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+              WHERE n.nspname = 'vala' AND p.proname = 'bifrost_publish_table_definition'",
+        )
+        .fetch_one(&reads.superuser)
+        .await
+        .expect("the publication definer exists");
+        assert!(definer.get::<bool, _>("prosecdef"));
+        assert!(definer.get::<bool, _>("owned_by_platform"));
+        assert_eq!(
+            definer.get::<Option<Vec<String>>, _>("proconfig"),
+            Some(vec!["search_path=\"\"".to_owned()])
+        );
+
+        let (tenant_a, tenant_b) = (reads.tenant().await, reads.tenant().await);
+        reads.register(tenant_a, "events", Some(V1)).await;
+        reads.register(tenant_a, "quiet", Some(V1)).await;
+        sqlx::query(
+            "INSERT INTO iceberg_catalog.iceberg_table_versions
+                 (catalog_name, table_namespace, table_name, table_uuid, table_version,
+                  metadata_location)
+             VALUES ('wyrd-redux', $1, 'events', $2, 1, $3)",
+        )
+        .bind(format!("bifrost.tenants.{tenant_a}.bifrost"))
+        .bind(UUID)
+        .bind(V1)
+        .execute(&reads.catalog)
+        .await
+        .expect("version 1 is retained");
+        let state = async || {
+            let pointer: String = sqlx::query_scalar(
+                "SELECT metadata_location FROM iceberg_catalog.iceberg_tables
+                  WHERE table_namespace = $1 AND table_name = 'events'",
+            )
+            .bind(format!("bifrost.tenants.{tenant_a}.bifrost"))
+            .fetch_one(&reads.catalog)
+            .await
+            .expect("pointer reads");
+            let versions: Vec<i64> = sqlx::query_scalar(
+                "SELECT table_version FROM iceberg_catalog.iceberg_table_versions
+                  ORDER BY table_version",
+            )
+            .fetch_all(&reads.catalog)
+            .await
+            .expect("versions read");
+            (pointer, versions)
+        };
+
+        let mut direct = reads.conn(tenant_a).await;
+        let denied =
+            sqlx::query("UPDATE iceberg_catalog.iceberg_tables SET metadata_location = ''")
+                .execute(&mut **direct.transaction())
+                .await
+                .expect_err("the request role cannot write the catalog directly");
+        assert!(denied.to_string().contains("permission denied"), "{denied}");
+        drop(direct);
+
+        let refused = [
+            (tenant_b, "events", UUID, 2, V1, V2),
+            (tenant_a, "quiet", UUID, 2, V1, V2),
+            (tenant_a, "events", "another-table", 2, V1, V2),
+            (
+                tenant_a,
+                "events",
+                UUID,
+                2,
+                V1,
+                "s3://b/events/metadata/00002-b.metadata.json",
+            ),
+        ];
+        for (tenant, table, uuid, version, expected, published) in refused {
+            let mut conn = reads.conn(tenant).await;
+            publish_definition(
+                &mut conn, NAMESPACE, table, uuid, version, expected, published,
+            )
+            .await
+            .expect_err("the publication is outside the caller's table");
+        }
+        for (version, expected) in [(3, V1), (2, V2)] {
+            let mut conn = reads.conn(tenant_a).await;
+            assert!(
+                !publish_definition(&mut conn, NAMESPACE, "events", UUID, version, expected, V2)
+                    .await
+                    .expect("a stale publication is a conflict"),
+            );
+        }
+        assert_eq!(state().await, (V1.to_owned(), vec![1]));
+
+        let mut rolled_back = reads.conn(tenant_a).await;
+        assert!(
+            publish_definition(&mut rolled_back, NAMESPACE, "events", UUID, 2, V1, V2)
+                .await
+                .expect("the publication stages")
+        );
+        rolled_back
+            .rollback()
+            .await
+            .expect("the transaction rolls back");
+        assert_eq!(
+            state().await,
+            (V1.to_owned(), vec![1]),
+            "rollback publishes nothing"
+        );
+
+        let mut committed = reads.conn(tenant_a).await;
+        assert!(
+            publish_definition(&mut committed, NAMESPACE, "events", UUID, 2, V1, V2)
+                .await
+                .expect("the publication stages")
+        );
+        committed.commit().await.expect("the transaction commits");
+        assert_eq!(state().await, (V2.to_owned(), vec![1, 2]));
     }
 }

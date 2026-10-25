@@ -335,12 +335,25 @@ mod tests {
             variant_cell_to_json(column(batch, "attributes"), 0).expect("attributes decode"),
             json!({"k": 1})
         );
-        for promoted in ["service_name", "service_version", "deployment_environment"] {
+        for promoted in [
+            "service_name",
+            "service_version",
+            "deployment_environment",
+            "service_namespace",
+            "service_instance_id",
+            "telemetry_sdk_name",
+            "telemetry_sdk_language",
+            "telemetry_sdk_version",
+            "subject_kind",
+            "subject_name",
+            "subject_version",
+        ] {
             assert!(
                 typed::<StringArray>(batch, promoted).is_null(0),
                 "{promoted} is null under an absent resource"
             );
         }
+        assert!(typed::<Int64Array>(batch, "process_pid").is_null(0));
     }
 
     /// Inconsistent point shapes are rejected one record at a time.
@@ -540,7 +553,7 @@ mod tests {
             "only the two defective points are lost"
         );
 
-        let card_uids = typed::<StringArray>(&batch, "card_uid");
+        let card_uids = typed::<StringArray>(&batch, "subject_card_uid");
         assert!(
             card_uids.is_null(0),
             "a missing wyrd.card_uid projects null"

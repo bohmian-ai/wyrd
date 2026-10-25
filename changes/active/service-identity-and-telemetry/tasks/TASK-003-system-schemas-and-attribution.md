@@ -2,7 +2,7 @@
 id: TASK-003
 spec: SPEC-service-identity-and-telemetry
 spec_revision: 16
-status: proposed
+status: approved
 kind: implementation
 depends_on: [TASK-009, TASK-004, TASK-005]
 requirements: [REQ-054, REQ-055, REQ-056, REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-021, REQ-022, REQ-023, REQ-024, REQ-025, REQ-026, REQ-027, REQ-028, REQ-031, REQ-032, REQ-034, REQ-035, REQ-036, REQ-039, REQ-040, REQ-042, REQ-044, REQ-048]
@@ -404,3 +404,81 @@ work to resolve using repository tooling, not permission to weaken proof.
   [implementation execution](../../../implementation-execution.md),
   [testing](../../../../TESTING.md), [agent guides](../../../../agent_docs/index.md),
   and the Python/TypeScript SDK directory rules.
+
+## Implementation Evidence
+
+### Diagnoses
+
+**Result Bloom floor.** Symptom:
+`verification_runtime::result_layout_partitions_blooms_and_prunes_by_result`
+failed with "bifrost.verification.results file … has no Bloom filter on
+sub_principal_id". Evidence: the journey hard-coded
+`[run_id, subject_card_uid, sub_principal_id, act_principal_id]` as the floor,
+while `tables/mod.rs::ATTRIBUTION_BLOOMS` and `attributed_layout` declare the
+revised ledger without principal Blooms (`bifrost-design.md`, "never a hidden
+validation floor"). Cause: a stale test expectation of the pre-revision floor.
+Fix site: the journey reads each table's `physical_layout().bloom_columns`. An
+independent read-only diagnostician confirmed the cause and found no other
+caller with the same hard-coded floor.
+
+**Observation batch fingerprint.** Symptom:
+`verification_runtime::two_bindings_share_one_client_observation` failed with
+`FingerprintMismatch { table: "resolved ingress table" }` from Gate
+`dispatch_native_frame` on `bifrost.drift.observations`. Evidence:
+`ObservationsTable::arrow_fields()` now wraps its authored fields in
+`with_shared_dimensions`, and `ConformPlan::build` refuses a registered column
+that is neither sent nor reserved; the journey's hand-built schema omitted the
+six dimensions. The SDK projection (`wyrd-client/src/observe/drift.rs`) already
+sends them null. Cause: a stale hand-built schema. Fix site: the journey builds
+its batch over `ObservationsTable::arrow_fields()`. The diagnostician found no
+other hand-built observation schema.
+
+**Lifecycle compaction.** The first run of the lifecycle journey matched the
+hot, recovered and published reads, but Forge planned no rewrite: each
+partition sealed one file. Cause: a single sealed file per partition leaves the
+small-files strategy nothing to rewrite. Fix site: the journey seeds two
+separately flushed datasets so each partition seals several files.
+
+### Decisions
+
+- Trusted outbox frames resolve the shared-dimension descriptors at delivery
+  (`CardRegistry::row_dimensions`), with no migration: a UID's descriptor never
+  changes, so a retried or recovered frame resolves exactly the context its
+  producer accepted.
+- A changed-content native batch replayed under the same `batch_id` is refused,
+  but as `WYRD_VALA_500_BIFROST_INTERNAL`; a 409 would change the error
+  catalog, so the refusal code is left as is.
+- Read proof runs in the Oracle cluster binary, beside the existing Forge
+  promotion/rewrite helpers:
+  `oracle distributed::canonical_signal_rows_survive_publication_recovery_and_compaction`.
+
+**MCP GenAI attributes.** Symptom:
+`wyrd-mcp query::pg_tests::agent_reads_canonical_trace_genai_logs_and_metrics_through_sql`
+expected the root span `attributes` Variant to hold only the two message keys;
+it read all eight `gen_ai.*` keys. Evidence: `1aaae2e2d` gave the shared
+canonical-signal fixture the source keys its promoted columns derive from, as
+`refuse_forged_span_derivations` (`tables/traces/projection.rs`) requires;
+REQ-023 and `bifrost-design.md` retain every source attribute. Cause: a stale
+test expectation. Fix site: `canonical_signals::root_span_attributes` owns the
+value and both MCP assertions read it. An independent read-only diagnostician
+confirmed the cause and found `builtin_variant_and_struct_payloads_are_queryable`
+as the only other affected caller.
+
+### Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Scenario 1, catalog resolution and grants agree (REQ-026,039–040; AC-008,014) | `e8483adba`, `250027567` | redux `catalog::table_ref::tests::canonical_catalog_has_no_alias`; server `query::canonical_catalog_queries_and_grants_agree`; MCP `query::pg_tests::agent_reads_canonical_trace_genai_logs_and_metrics_through_sql`; CLI `query_server_journey::{query_command_reads_seeded_table,query_command_denial_preserves_problem_without_read_decision}` | PASS |
+| Scenario 2, exact schemas and defaults on nine tables plus dynamic (REQ-022,025,028,034–036,042,044,048; AC-012,016,018,021) | `2dfe39609`, `04ea7dd8d`, `f54833deb` | redux `tables::tests::{verification_tables_match_their_approved_schemas,physical_layout_contract_all_builtins,canonical_signal_schemas_round_trip_arrow_parquet_and_iceberg}`, `managed_columns::tests::observation_policy_appends_every_managed_column_in_order`; server `verification_runtime::system_and_dynamic_tables_share_attribution` | PASS |
+| Scenario 3, promotions keep raw types (REQ-021–024; AC-007; INV-008) | `ffbe38247`, `7005f8f49` | redux `traces::tests::maximal_span_projection_is_lossless_and_identity_mapped`, `logs::tests::maximal_log_projection_preserves_body_context_and_presence`, `metrics::tests::all_pinned_metric_point_kinds_project_without_narrowing`, `tables::tests::resource_promotions_preserve_final_typed_values` | PASS |
+| Scenario 4, public ingress cannot forge attribution (AC-026; REQ-050–053) | `66cf01453`, `1aaae2e2d`, `89be1bb8d`, `1624eb36c`, `2165ee81d` | OTLP `trace_export`/`logs_export`/`metrics_export`/`negative` focused cases (4); server `verification_runtime::native_signal_values_and_attribution_are_validated_before_ack`; Python `test_signal_promotions_and_attribution_read_back_through_bifrost`; TS `signal promotions and attribution read back through bifrost` | PASS |
+| Scenario 5, trusted delivery keeps each origin (REQ-049–053; AC-024; INV-001–005,007) | `616c627a2`, `30efb5d90`, `18e725530`, `bifrost-design.md` stamping paragraph | server `verification_runtime::trusted_delivery_preserves_each_origin`, `audit_retention::subject_actor_decisions_preserve_trusted_identity`, `verification_runtime::runner_without_local_scribe_publishes_through_a_peer_scribe`; all 20 `verification_runtime::` journeys | PASS |
+| Scenario 6, lifecycle reads stay exact | `879e9ccdc` | oracle `distributed::canonical_signal_rows_survive_publication_recovery_and_compaction` (RED with stamping disabled); client `pg_bifrost_e2e::pg_tests::unified_client_registers_writes_swaps_and_reads_both_tables` | PASS |
+| Scenario 7, gateway headers become canonical rows (REQ-054–056; AC-025) | `5d69f2c3e` (`GatewayCallContext`, environment header, Batch HTTP context), `20b77dd2b`, `f786fc6d4`, `a779ac000` | gateway `compatible::configured_gateway_headers_are_authorized_and_captured` (RED with Batch `subject: None`); Python `test_client_http_auth.py::test_configured_gateway_calls_have_canonical_dimensions`; TS `state httpAuth supplies service and agent context`; gateway target 16/16 (vault through `test:gateway:vault:inner`); wyrd-server `gateway::` lib 61/61 | PASS |
+| Static and contract closure (REQ-027,031–032; AC-009–010; INV-006) | regenerated `card-types.ts`; `bifrost-design.md` | `fmt`, `lints`, `codegen:check`, `check:deps`, `check:tenant-isolation`, `docs:check`, `py:format`, `py:lints` (stub parity), `py:typecheck`, `ts:format`, `ts:lints`, `ts:typecheck`, `ts:napi:check`, `git diff --check` | PASS |
+
+Non-goals stayed excluded: no catalog alias or migration, no new writer,
+exporter API, readable identity header, batch-item correlation protocol, trace
+semantics, performance measurement or docsite change. No file outside the
+task's write set changed. Material risk: a changed-content native batch replay
+is refused as `WYRD_VALA_500_BIFROST_INTERNAL`, not a conflict code.

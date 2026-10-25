@@ -671,6 +671,13 @@ mod tests {
 
     /// A Parquet file is sized by the uncompressed bytes of the covered
     /// columns in the row groups the filters keep, never by compressed bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the footer schema does not convert, an unscoped scan is not the
+    /// sum of all four uncompressed chunks, the fixture's payload chunks do not
+    /// exceed its compressed size, or a bare or table-qualified `id > 150` filter
+    /// does not size to the second row group's `id` chunk alone.
     #[test]
     fn scan_sizer_counts_uncompressed_covered_kept_chunks() {
         use datafusion::logical_expr::{col, lit};
@@ -712,7 +719,7 @@ mod tests {
             columns: vec!["id".to_owned()],
             filters: vec![
                 datafusion::logical_expr::Expr::Column(datafusion::common::Column::new(
-                    Some("vala.bifrost.events"),
+                    Some("bifrost.bifrost.events"),
                     "id",
                 ))
                 .gt(lit(150_i64)),

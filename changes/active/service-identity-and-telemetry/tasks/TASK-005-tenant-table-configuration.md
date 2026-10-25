@@ -243,3 +243,75 @@ Run code generation from its source owner when needed before drift checks; never
   [root contributor rules](../../../../AGENTS.md), [Python rules](../../../../sdks/wyrd-sdk-python/AGENTS.md), [TypeScript rules](../../../../sdks/wyrd-sdk-ts/AGENTS.md).
 - [Spec-driven workflow](../../../spec-driven-development.md),
   [implementation execution](../../../implementation-execution.md), [testing](../../../../TESTING.md), [agent guide](../../../../agent_docs/index.md).
+
+## Remediation R1 Evidence
+
+Remediation: `review/TASK-005-6216c0641/TASK-005-R1-atomic-alteration-and-contract-closure.md`.
+Commits `ae00c0c03..b9129296e`.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-1 nested strictness | `wyrd-spec/src/vala/api.rs`: `deny_unknown_fields` on `DataTypeSpec`, `FieldSpec`, `SortKeyWire`; `present` on timestamp `tz`, `buckets`, `width`, `time_column` | `alter_table_request_decodes_strictly`; `describe::table_patch_http_contract_refuses_invalid_requests` | PASS |
+| FIND-2 own committed result | `BifrostCatalog::alter_table` projects from the committed metadata and re-read row before the tenant commit (`describe_metadata`) | `describe::an_edit_returns_its_own_committed_definition` (deterministic pause after publication) | PASS |
+| FIND-3 cache fencing | `catalog/cut_cache.rs::ListenedCache` (shared by the cut cache and the catalog's `CurrentEntries`); fills fenced by generation, served only while listening | `cut_cache_serves_only_fresh_listened_cuts` (stale fill vs invalidation, eviction, reset; disconnected fill); `scribe::accepted_retry::an_unheard_edit_still_governs_new_admission` (red with fencing disabled); `ensured_builtin_answers_from_the_registration_cache` | PASS |
+| FIND-4 atomic publication | Fallible projection values are derived before publication; the single transaction is not implemented | — | SPEC_REVISION_REQUIRED |
+| FIND-5 rustdoc | `announce`, describe.rs `pod`/`flush`/`CONFLICT`/`field_ids`, support.rs clients, OpenAPI and MCP tests, partial-progress contracts on catalog/service/client/blocking/napi/PyO3 `alter_table` | `mise run lints`, `ts:napi:check` | PASS |
+| FIND-6 native Python stub | `python/wyrd/_wyrd/__init__.pyi`, `_wyrd/bifrost.pyi` | `test_native_bifrost_stub_matches_runtime_signatures`; `py:lints`, `py:typecheck`; Python edit journey | PASS |
+| FIND-7 handler span | `wyrd-server/src/bifrost/routes.rs` `bifrost.table.alter`, `skip_all` | `mise run lints` | PASS |
+| FIND-8 defaulted inputs | `scripts/gen_ts_types.py` `SPLIT_REQUEST_ROOTS`; `FieldSpec2Input`, `DataTypeSpecInput` | `codegen:check`, `ts:typecheck`, TS edit journey omitting `nullable` | PASS |
+| FIND-9 orphan cursor oracle | `forge/production_routes.rs` uses `layout::forge_data_root` | exact traced selector | PASS |
+| Duplicate publisher removed | `wyrd-testing/src/bifrost/revisions.rs` helpers call `BifrostCatalog::alter_table` from the described version; `commit_table_revision` deleted | the six selectors below | PASS |
+
+Commands (each under `scripts/postgres/with-test-postgres.sh` after `db:migrate:inner` where Postgres is needed):
+
+- `cargo nextest run --locked -p vala-bifrost-redux -P journey --run-ignored=all -E 'test(cut_cache_serves_only_fresh_listened_cuts) | test(ensured_builtin_answers_from_the_registration_cache) | test(registration_cache_keeps_found_uids_only) | test(an_unheard_edit_still_governs_new_admission) | test(a_retry_the_current_layout_refuses_is_acknowledged_under_its_own)'`: 5 passed.
+- `cargo nextest run --locked -p wyrd-testing --test scribe --test forge --test oracle --test otlp -P journey --run-ignored=all` for `write_read::accepted_batch_revision_survives_alteration_and_restart`, `write_read::mixed_runtime_specifications_preserve_rows_and_pins`, `scribe_promotion::mixed_specifications_preserve_partition_and_sort_truth`, `distributed::bloom_policy_versions_answer_exactly_through_compaction`, `negative::pg_tests::otlp_replay_across_a_definition_edit_is_acknowledged_once`, `negative::pg_tests::otlp_replay_across_a_partition_edit_is_acknowledged_once`: 6 passed.
+- `cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'test(/^describe::/)'`: 7 passed, including persistence/restart.
+- `cargo nextest run --locked -p wyrd-mcp -P journey --run-ignored=all -E 'test(/::agent_discovers_only_authorized_tables_and_layout$/)'`: passed.
+- `pnpm exec vitest run tests/integration/register-a-table-from-a-model.test.ts -t "^table configuration preserves versions and values$"`: passed.
+- `uv run python -m pytest -q tests/integration/bifrost/test_register_a_table_from_a_model.py::test_table_configuration_preserves_versions_and_values`: passed.
+- `mise run test:bifrost:integration:redux`: 933 passed.
+- `mise run fmt`, `lints`, `check:deps`, `check:tenant-isolation`, `py:format`, `py:lints`, `py:typecheck`, `ts:format`, `ts:lints`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `git diff --check`: pass.
+
+Limits:
+
+- FIND-4 needs a spec revision. `architecture/wyrd-security-posture.md` bars the operator pool from handlers. Migration `20260619000000_iceberg_catalog.sql` grants the tenant login no access to `iceberg_catalog`; tenant work reaches a pointer only through the read-only definer `vala.oracle_catalog_metadata_location`. So the native pointer CAS on the catalog login and the TenantConn/RLS projection cannot share one transaction without a new security decision: either a write-capable definer, or tenant SQL on the catalog login. The partial-progress window is documented on every entry point.
+- Without a live listener, the registration and definition caches no longer serve. Admission then reads its authority uncached, as the cut cache already does.
+- Non-goals stayed excluded. No unrelated files changed.
+
+## Remediation R2 Evidence
+
+Remediation: `review/TASK-005-a9d1fd2c2/TASK-005-R2-tenant-bound-atomic-publication.md`. Commits `b39e4fb5e..1a34d4ded` on prior candidate `a9d1fd2c2`.
+
+Reuse: `BifrostCatalog::alter_table` stays the one publisher. It stages the edited metadata with public Iceberg APIs (`TableUpdate::apply`, `MetadataLocation`, `TableMetadata::write_to`). It then publishes inside its existing TenantConn transaction through one new narrow definer, `vala.bifrost_publish_table_definition`, which follows the `oracle_catalog_metadata_location` pattern. That definer is the only gap. Neither fork pin changed: the definer does the pointer CAS and records the retained version reference, and the unchanged fork still owns every other catalog commit.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-4 single commit/rollback | `alter_table`: definer swap + `upsert_table` + `announce_definition_change` + projection in one TenantConn; uncertain COMMIT resolved from the pointer | `catalog::bifrost_catalog::production_pin_tests::a_dropped_edit_publishes_nothing` (RED at a9d1fd2c2: described `TableVersion(2)` after the drop; GREEN after) | PASS |
+| FIND-4 committed edit, restart, peer refresh, accepted retry | unchanged R1 listener/cache owners | `describe::tenant_layout_overrides_survive_restart_and_refresh`, `describe::an_edit_returns_its_own_committed_definition`, `scribe::accepted_retry::an_unheard_edit_still_governs_new_admission` | PASS |
+| FIND-4 separate-login boundary and CAS | migration `20261026000000_bifrost_definition_publication.sql`; `olap_catalog::publish_definition` | `pg_oracle_membership::pg_tests::definition_publication_is_tenant_bound_and_transactional`: direct catalog write denied; refuses another tenant, an unregistered table, another identity, a foreign directory, a skipped version and a stale pointer; rollback publishes nothing; commit records exactly v2 | PASS |
+| FIND-4 concurrent data commits | bounded replan (`PUBLICATION_ATTEMPTS`) when the swap misses at an unchanged version | the six revision journeys and the describe suite (red before the replan, see diagnosis) | PASS |
+| FIND-5 helper contract | `revisions.rs::alter_table_from_current` "Repetition, cancellation, and retry" section, referenced by all 8 helpers; `alter_table` and `service.rs` cancellation prose matches the single commit | `mise run lints` | PASS |
+
+Diagnosis (unexpected journey failures after the first atomic cut):
+- **Symptom:** `describe::tenant_layout_overrides_survive_restart_and_refresh` and `write_read::mixed_runtime_specifications_preserve_rows_and_pins` failed with `TableVersionConflict` at the unchanged version 1.
+- **Evidence:** a `Forge commit notice recorded` line for the same table appears right before each failure. The definer's `metadata_location = p_expected_location` swap missed.
+- **Cause:** Forge promotion commits move the pointer without changing the definition. The old `Transaction::commit` path rebased the edit through the fork's `update_table`; the fixed-base swap did not.
+- **Fix site:** `BifrostCatalog::alter_table` replans from the moved pointer. All callers (server, SDKs, `revisions.rs`) route through it.
+- **Independent diagnostician:** same cause and fix site; no SQL change needed.
+
+A second red came from an inverted swap condition in the replan. Instrumentation showed the pointer unchanged after a "successful" edit. It was fixed in the same commit.
+
+Commands, each run under `scripts/postgres/with-test-postgres.sh` after `db:migrate:all:inner`:
+- `cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support -E 'test(/a_dropped_edit_publishes_nothing$/)'`: 1 passed.
+- `cargo nextest run --locked -p vala-sql --test integration`: 66 passed.
+- `cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'test(/^describe::/)'`: 7 passed.
+- The six revision journeys (R1 selectors, `test(/::name$/)` form): 6 passed.
+- `mise run test:bifrost:integration:redux`: 934 passed.
+- `mise run fmt`, `lints`, `check:deps`, `check:tenant-isolation`, `git diff --check`: pass.
+
+Limits:
+- The TS/Python edit journeys were not rerun. Client code is unchanged, and the server path is covered by the Rust/HTTP describe journeys.
+- No native or Python declaration changed, so codegen was not rerun.
+- An unreferenced staged metadata file is left behind on a dropped or replanned edit; storage cleanup is a non-goal.
+- Non-goals stayed excluded: no grants, no role, no operator transaction, no fork change, no journal, no public contract change.

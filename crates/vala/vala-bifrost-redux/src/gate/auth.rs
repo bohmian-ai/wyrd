@@ -19,10 +19,15 @@ use std::sync::Arc;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_verify::{TokenAudience, TokenVerifier, VerifiedToken};
-use wyrd_runtime::{DelegationStep, Principal, delegated_attribution, needs_root_resolution};
-use wyrd_spec::auth::{Attribution, WORKLOAD_UID_HEADER, workload_uid_selector};
+use wyrd_runtime::{
+    DelegationStep, Principal, delegated_attribution, needs_root_resolution, owning_root,
+};
+use wyrd_spec::auth::{
+    Attribution, DEPLOYMENT_ENVIRONMENT_HEADER, WORKLOAD_UID_HEADER,
+    deployment_environment_selector, workload_uid_selector,
+};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::ids::{CardUid, DataTenantId};
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::metadata::MetadataMap;
 
@@ -50,6 +55,10 @@ pub struct AuthContext {
     /// [`Self::principal`], while the chain travels with it so the operation's
     /// audit record can name who was acting for whom.
     pub delegation_chain: Vec<DelegationStep>,
+    /// The request's accepted `x-wyrd-deployment-environment`, stamped as
+    /// every admitted row's `deployment_environment`; `None` when the request
+    /// sent none, so telemetry keeps its resource environment.
+    pub deployment_environment: Option<String>,
 }
 
 impl AuthContext {
@@ -60,10 +69,24 @@ impl AuthContext {
     /// verified gRPC caller passes through here, so this also routes the
     /// current request's tenant span copies to that tenant and principal; a
     /// request that did not continue a sampled client trace is not routed.
-    /// It also activates the request's declared benchmark classification,
-    /// which only an authenticated caller's request selects.
-    #[must_use]
-    pub fn from_verified(verified: VerifiedToken, metadata: &MetadataMap) -> Self {
+    /// The deployment environment is read from `metadata` here too. Once the
+    /// request is accepted, this also activates its declared benchmark
+    /// classification, which only an authenticated caller's request selects.
+    ///
+    /// # Errors
+    /// Returns [`IngestError::RequestContext`] when the deployment environment
+    /// is repeated, empty, or not UTF-8.
+    pub fn from_verified(
+        verified: VerifiedToken,
+        metadata: &MetadataMap,
+    ) -> Result<Self, IngestError> {
+        let deployment_environment = deployment_environment_selector(
+            metadata
+                .get_all(DEPLOYMENT_ENVIRONMENT_HEADER)
+                .iter()
+                .map(wyrd_tonic::tonic::metadata::MetadataValue::as_bytes),
+        )
+        .map_err(IngestError::RequestContext)?;
         wyrd_telemetry::timing::activate_request(&tracing::Span::current());
         wyrd_telemetry::bind_tenant_route(wyrd_telemetry::TenantSpanRoute {
             tenant: verified.principal.tenant_id,
@@ -72,12 +95,13 @@ impl AuthContext {
                 &verified.delegation_chain,
             ),
         });
-        Self {
+        Ok(Self {
             tenant: verified.principal.tenant_id,
             principal: verified.principal,
             request_id: read_or_mint_request_id(metadata),
             delegation_chain: verified.delegation_chain,
-        }
+            deployment_environment,
+        })
     }
 
     /// The verified subject/actor pair Scribe stamps on this request's rows:
@@ -86,6 +110,18 @@ impl AuthContext {
     #[must_use]
     pub fn attribution(&self) -> Attribution {
         delegated_attribution(&self.principal, &self.delegation_chain)
+    }
+
+    /// The exact Service release that owns this request's accepted work.
+    ///
+    /// The one execution-owner selection for public ingest: the current
+    /// delegated actor's root, or the principal's own for direct work, by
+    /// [`wyrd_runtime::owning_root`]. Batch identity, descriptors, and the
+    /// stamped `workload_card_uid` all take it from here, so none rereads the
+    /// subject principal's root; `None` for rootless work.
+    #[must_use]
+    pub fn workload(&self) -> Option<&CardUid> {
+        owning_root(&self.principal, &self.delegation_chain)
     }
 }
 
@@ -162,8 +198,8 @@ pub fn read_or_mint_request_id(metadata: &MetadataMap) -> RequestId {
 /// # Errors
 /// Returns [`IngestError::Unauthenticated`] when the bearer is missing, does not
 /// name a tenant, or fails signature, issuer, audience, expiry, or tenant
-/// verification, and [`IngestError::WorkloadSelector`] for a malformed,
-/// mismatched, or unresolvable selector.
+/// verification, and [`IngestError::RequestContext`] for a malformed,
+/// mismatched, or unresolvable selector or a malformed deployment environment.
 pub fn authenticate(
     verifier: &TokenVerifier,
     metadata: &MetadataMap,
@@ -179,26 +215,24 @@ pub fn authenticate(
             .iter()
             .map(wyrd_tonic::tonic::metadata::MetadataValue::as_bytes),
     )
-    .map_err(IngestError::WorkloadSelector)?;
+    .map_err(IngestError::RequestContext)?;
     if let Some(root) = selector
         && needs_root_resolution(
             &verified_token.principal,
             &verified_token.delegation_chain,
             &root,
         )
-        .map_err(IngestError::WorkloadSelector)?
+        .map_err(IngestError::RequestContext)?
     {
-        return Err(IngestError::WorkloadSelector(
-            WyrdError::WorkloadUidRefused {
-                message: format!(
-                    "native Bifrost ingest selects workload root {root} only through a bearer \
+        return Err(IngestError::RequestContext(WyrdError::WorkloadUidRefused {
+            message: format!(
+                "native Bifrost ingest selects workload root {root} only through a bearer \
                  issued for it; exchange the credential with workload_uid"
-                ),
-                details: serde_json::json!({ "workload_uid": root }),
-            },
-        ));
+            ),
+            details: serde_json::json!({ "workload_uid": root }),
+        }));
     }
-    Ok(AuthContext::from_verified(verified_token, metadata))
+    AuthContext::from_verified(verified_token, metadata)
 }
 
 /// The Gate's handle on the shared tenant token verifier.

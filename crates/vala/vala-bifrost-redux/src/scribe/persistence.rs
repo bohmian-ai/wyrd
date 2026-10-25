@@ -3590,7 +3590,7 @@ mod tests {
             let rows = vec![file_list_writer::FileListArtifactInsert {
                 id: row_id,
                 data_tenant_id: tenant,
-                namespace: "vala.traces".to_owned(),
+                namespace: "bifrost.traces".to_owned(),
                 table_name: "spans".to_owned(),
                 file_path: object_key.clone(),
                 file_size: i64::try_from(length).expect("fixture length"),
@@ -3630,7 +3630,7 @@ mod tests {
                 .await
         }
 
-        /// Reads the actor node's `vala.traces.spans` revision row, if any.
+        /// Reads the actor node's `bifrost.traces.spans` revision row, if any.
         ///
         /// # Panics
         ///

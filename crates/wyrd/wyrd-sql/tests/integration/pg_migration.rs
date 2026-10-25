@@ -936,6 +936,13 @@ mod pg_tests {
     #[tokio::test]
     /// The full migration set applies to an empty database and applying it
     /// again is a no-op, so a redeploy cannot half-apply schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the owner pool cannot connect, either migration run fails, a
+    /// required relation is missing or a retired one exists, or the platform
+    /// resolver, `current_tenant` parallel safety, or `auth_%` and
+    /// `gateway_batch%` RLS metadata differ from the baseline.
     async fn migrations_apply_and_are_idempotent() {
         let Some(url) = database_url() else {
             return;
@@ -965,7 +972,7 @@ mod pg_tests {
         assert_regclass_exists(pool, "platform.credentials", true).await;
         assert_regclass_exists(pool, "platform.principal_grants", true).await;
         // The greenfield baseline has one audit authority: the tenant's
-        // retained Bifrost table `vala.system.audit_log`.
+        // retained Bifrost table `bifrost.system.audit_log`.
         assert_regclass_exists(pool, "platform.audit_log", false).await;
         assert_regclass_exists(pool, "wyrd.auth_users", true).await;
         assert_regclass_exists(pool, "wyrd.auth_user_identities", true).await;

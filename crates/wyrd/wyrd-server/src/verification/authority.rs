@@ -100,7 +100,7 @@ impl SystemReadAuthority {
                 .namespace
                 .as_str()
                 .split_once('.')
-                .unwrap_or(("vala", table.namespace.as_str()));
+                .unwrap_or(("bifrost", table.namespace.as_str()));
             grants.push(Permission {
                 resource: wyrd_runtime::Resource::BifrostQuery,
                 action: Action::Read,
@@ -324,7 +324,7 @@ mod tests {
             resource: wyrd_runtime::Resource::BifrostQuery,
             action: Action::Read,
             scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                catalog: "vala".to_owned(),
+                catalog: "bifrost".to_owned(),
                 schema: "drift".to_owned(),
                 table_uid: uuid::Uuid::now_v7(),
             })),

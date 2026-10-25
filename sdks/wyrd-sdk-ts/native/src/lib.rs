@@ -38,7 +38,7 @@ use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, QueryParam};
+use wyrd_spec::vala::api::{AlterTableRequest, BifrostQueryRequest, QueryParam};
 use wyrd_spec::vala::api::{CompactionTypeWire, PhysicalLayoutWire};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::{RunId, TraceId};
@@ -854,10 +854,10 @@ impl NativeBifrost {
         &self,
         env: Env,
         row: String,
-        card_uid: Option<String>,
+        subject_card_uid: Option<String>,
         run_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
-        let inserted = correlation(card_uid.as_deref(), run_id).and_then(|correlation| {
+        let inserted = correlation(subject_card_uid.as_deref(), run_id).and_then(|correlation| {
             crate::trace::traced(env, || self.client.insert(row.into_bytes(), correlation))
         });
         match inserted {
@@ -975,11 +975,11 @@ impl NativeBifrost {
         table: String,
         schema_json: String,
         row: String,
-        card_uid: Option<String>,
+        subject_card_uid: Option<String>,
         run_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
         let (schema, correlation) = match telemetry_schema(&schema_json)
-            .and_then(|schema| Ok((schema, correlation(card_uid.as_deref(), run_id)?)))
+            .and_then(|schema| Ok((schema, correlation(subject_card_uid.as_deref(), run_id)?)))
         {
             Ok(parsed) => parsed,
             Err(error) => return Ok(NativeLifecycleResult::failure(&error)),
@@ -1231,6 +1231,48 @@ impl NativeBifrost {
             }
         })
     }
+
+    /// Alters one registered table's definition at its observed table version
+    /// and resolves to the committed description.
+    ///
+    /// `request_json` is one serialized `AlterTableRequest`, decoded strictly
+    /// here; every edit decision belongs to the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// a malformed request and every Wyrd control failure are returned in
+    /// [`NativeLifecycleResult`].
+    ///
+    /// # Cancellation
+    ///
+    /// The edit runs to completion once started; a lost or abandoned result
+    /// may leave it committed, so describe the table before retrying.
+    #[napi]
+    pub fn alter_table<'env>(
+        &self,
+        env: &'env Env,
+        namespace: String,
+        name: String,
+        request_json: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let client = self.client.clone();
+        crate::trace::spawn(env, async move {
+            let altered = match serde_json::from_str::<AlterTableRequest>(&request_json) {
+                Ok(request) => client.alter_table(&namespace, &name, &request).await,
+                Err(error) => Err(validation_error(
+                    format!("invalid table edit request: {error}"),
+                    "request",
+                )),
+            };
+            match altered {
+                Ok(description) => NativeLifecycleResult::success(
+                    &serde_json::to_value(description).map_err(napi_error)?,
+                ),
+                Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+            }
+        })
+    }
 }
 
 impl NativeBifrostQueryStream {
@@ -1423,17 +1465,19 @@ fn telemetry_schema(schema_json: &str) -> StdResult<SchemaRef, BifrostClientErro
 ///
 /// # Errors
 ///
-/// Returns the shared validation refusal when `card_uid` is not one parsable
+/// Returns the shared validation refusal when `subject_card_uid` is not one parsable
 /// Card UID.
 fn correlation(
-    card_uid: Option<&str>,
+    subject_card_uid: Option<&str>,
     run_id: Option<String>,
 ) -> StdResult<Correlation, BifrostClientError> {
     Ok(Correlation {
-        card_uid: card_uid
+        subject_card_uid: subject_card_uid
             .map(str::parse)
             .transpose()
-            .map_err(|error| validation_error(format!("invalid cardUid: {error}"), "cardUid"))?,
+            .map_err(|error| {
+                validation_error(format!("invalid subjectCardUid: {error}"), "subjectCardUid")
+            })?,
         run_id: run_id.map(RunId::from_string),
     })
 }

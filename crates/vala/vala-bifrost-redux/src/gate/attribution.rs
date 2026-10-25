@@ -1,4 +1,5 @@
-//! Registry resolution of the Cards an unbound writer attributes evidence to.
+//! Registry resolution of the Cards an unbound writer attributes evidence to,
+//! and of the descriptors every admitted frame's shared dimensions carry.
 //!
 //! A principal with a selected root attributes only within its signed scope,
 //! which Scribe checks without IO. A rootless unrestricted principal may
@@ -17,9 +18,9 @@ use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::vala::CARD_UID;
+use wyrd_spec::vala::{SUBJECT_CARD_UID, WORKLOAD_CARD_UID};
 use wyrd_sql::WyrdPostgres;
-use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_sql::queries::cards::{get_card_by_uid, get_card_for_reconciliation};
 use wyrd_tonic::otlp::common::v1::KeyValue;
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics::v1::{Metric, metric};
@@ -29,6 +30,7 @@ use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 use super::auth::AuthContext;
 use super::error::IngestError;
 use crate::tables::signal::card_uid_text;
+use crate::tables::{CardDescriptor, FrameDimensions};
 
 /// Most distinct Cards one frame may attribute to through registry
 /// resolution.
@@ -38,22 +40,188 @@ use crate::tables::signal::card_uid_text;
 /// reads one frame can cause.
 pub const MAX_ATTRIBUTED_CARDS: usize = 32;
 
-/// Tenant registry reader resolving unbound writers' Card attribution.
+/// Most Card descriptors one process keeps resolved.
+const DESCRIPTOR_CACHE_ENTRIES: u64 = 16_384;
+
+/// Which registry rows a descriptor lookup may read.
+#[derive(Clone, Copy)]
+enum Lookup {
+    /// Only live Cards: a public action's Cards must still be registered.
+    Live,
+    /// Live Cards and retained deleted tombstones: a trusted row's Cards were
+    /// accepted when its producer admitted the action, and only their
+    /// immutable descriptor is projected now, so a later deletion cannot
+    /// refuse that accepted work.
+    Retained,
+}
+
+/// Tenant registry reader resolving unbound writers' Card attribution and the
+/// descriptors every admitted frame's shared dimensions are stamped from.
 ///
 /// Gate holds one per process; it is absent where no registry is composed,
 /// in which case an unbound writer's `card_uid` resolves to nothing and is
-/// refused exactly as an unauthorized reference.
+/// refused exactly as an unauthorized reference, and no frame carries
+/// descriptors.
 #[derive(Clone)]
 pub struct CardRegistry {
     /// The Wyrd registry database every lookup reads tenant-scoped.
     postgres: WyrdPostgres,
+    /// Descriptors already read, by tenant and UID. A UID never changes its
+    /// kind, name, or version, so an entry never goes stale; the bound only
+    /// limits memory.
+    descriptors: mini_moka::sync::Cache<(DataTenantId, CardUid), CardDescriptor>,
 }
 
 impl CardRegistry {
     /// Builds the reader over the Wyrd registry database.
     #[must_use]
-    pub const fn new(postgres: WyrdPostgres) -> Self {
-        Self { postgres }
+    pub fn new(postgres: WyrdPostgres) -> Self {
+        Self {
+            postgres,
+            descriptors: mini_moka::sync::Cache::new(DESCRIPTOR_CACHE_ENTRIES),
+        }
+    }
+
+    /// Resolves the shared-dimension context of one public frame.
+    ///
+    /// The accepted workload Service ([`AuthContext::workload`]) and every
+    /// Card in `subjects` are
+    /// described from the tenant registry, each distinct UID read at most
+    /// once per process; the request environment is carried unchanged. A UID
+    /// the registry does not hold is left out, so a row naming it as subject
+    /// cannot be stamped and is refused downstream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Internal`] when the tenant registry cannot be
+    /// read.
+    pub async fn frame_dimensions(
+        &self,
+        auth: &AuthContext,
+        subjects: &[CardUid],
+    ) -> Result<FrameDimensions, IngestError> {
+        let workload = auth.workload();
+        Ok(FrameDimensions {
+            environment: auth.deployment_environment.clone(),
+            cards: self
+                .described(
+                    auth.tenant,
+                    workload.into_iter().chain(subjects),
+                    Lookup::Live,
+                )
+                .await?,
+        })
+    }
+
+    /// Resolves the shared-dimension context of one trusted row-attributed
+    /// frame.
+    ///
+    /// The producer already validated and authorized each row's workload and
+    /// subject, so every distinct UID the frame's `workload_card_uid` and
+    /// `subject_card_uid` columns name is described, and each row keeps its
+    /// own carried environment. A UID never changes its descriptor, so a
+    /// retried or recovered frame resolves exactly the context its producer
+    /// accepted, also from a retained tombstone when the Card was deleted
+    /// after acceptance. This projects frozen identity and decides no
+    /// membership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Internal`] when the tenant registry cannot be
+    /// read.
+    pub async fn row_dimensions(
+        &self,
+        tenant: DataTenantId,
+        ipc: &[u8],
+    ) -> Result<FrameDimensions, IngestError> {
+        let uids = native_uids(ipc, WORKLOAD_CARD_UID);
+        Ok(FrameDimensions {
+            environment: None,
+            cards: self
+                .described(
+                    tenant,
+                    uids.iter().chain(&native_card_uids(ipc)),
+                    Lookup::Retained,
+                )
+                .await?,
+        })
+    }
+
+    /// Describes each distinct registered Card among `uids` that `lookup`
+    /// may read, reading only the UIDs this process has not described before.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Internal`] when the connection or a lookup fails
+    /// for any reason other than the Card being absent.
+    async fn described<'a>(
+        &self,
+        tenant: DataTenantId,
+        uids: impl IntoIterator<Item = &'a CardUid>,
+        lookup: Lookup,
+    ) -> Result<Vec<(CardUid, CardDescriptor)>, IngestError> {
+        let mut described = Vec::new();
+        let mut unread = Vec::new();
+        for uid in uids {
+            if described.iter().any(|(seen, _)| seen == uid) || unread.contains(uid) {
+                continue;
+            }
+            match self.descriptors.get(&(tenant, uid.clone())) {
+                Some(descriptor) => described.push((uid.clone(), descriptor)),
+                None => unread.push(uid.clone()),
+            }
+        }
+        if unread.is_empty() {
+            return Ok(described);
+        }
+        let mut conn = self
+            .postgres
+            .tenant_conn(tenant)
+            .await
+            .map_err(|error| registry_unavailable(&error))?;
+        for uid in unread {
+            if let Some(descriptor) = self
+                .read_descriptor(&mut conn, tenant, &uid, lookup)
+                .await?
+            {
+                described.push((uid, descriptor));
+            }
+        }
+        Ok(described)
+    }
+
+    /// Reads one Card's descriptor and remembers it; `None` when the tenant
+    /// registry holds no row for the UID that `lookup` may read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::Internal`] when the lookup fails for any reason
+    /// other than the Card being absent.
+    async fn read_descriptor(
+        &self,
+        conn: &mut wyrd_sql::TenantConn<'_>,
+        tenant: DataTenantId,
+        uid: &CardUid,
+        lookup: Lookup,
+    ) -> Result<Option<CardDescriptor>, IngestError> {
+        let row = match lookup {
+            Lookup::Live => get_card_by_uid(conn, uid).await,
+            Lookup::Retained => get_card_for_reconciliation(conn, uid).await,
+        };
+        match row {
+            Ok(row) => {
+                let descriptor = CardDescriptor {
+                    kind: row.kind,
+                    name: row.name.to_string(),
+                    version: row.version.to_string(),
+                };
+                self.descriptors
+                    .insert((tenant, uid.clone()), descriptor.clone());
+                Ok(Some(descriptor))
+            }
+            Err(WyrdError::RegistryCardNotFound { .. }) => Ok(None),
+            Err(error) => Err(registry_unavailable(&error)),
+        }
     }
 
     /// Resolves the Cards `auth` attributes a frame to, when it is unbound.
@@ -95,6 +263,9 @@ impl CardRegistry {
     /// Reads each Card by UID on one tenant-scoped connection, keeping the
     /// UIDs of observation targets.
     ///
+    /// Membership is always read fresh, so a Card removed from the registry
+    /// stops being attributable; each read also refreshes its descriptor.
+    ///
     /// # Errors
     ///
     /// Returns [`IngestError::Internal`] when the connection or a lookup fails
@@ -111,10 +282,12 @@ impl CardRegistry {
             .map_err(|error| registry_unavailable(&error))?;
         let mut members = Vec::with_capacity(cards.len());
         for uid in cards {
-            match get_card_by_uid(&mut conn, &uid).await {
-                Ok(row) if row.kind.is_observation_target() => members.push(uid),
-                Ok(_) | Err(WyrdError::RegistryCardNotFound { .. }) => {}
-                Err(error) => return Err(registry_unavailable(&error)),
+            if self
+                .read_descriptor(&mut conn, tenant, &uid, Lookup::Live)
+                .await?
+                .is_some_and(|descriptor| descriptor.kind.is_observation_target())
+            {
+                members.push(uid);
             }
         }
         Ok(members)
@@ -130,15 +303,21 @@ fn is_unbound(principal: &Principal) -> bool {
 /// Collects the distinct parseable UIDs of a native frame's `card_uid`
 /// column.
 ///
-/// Only the correlation column is projected out of the stream. A frame that
-/// does not decode, lacks the column, or carries non-UTF-8 values yields no
-/// UIDs here; Scribe's full decode refuses it on its own terms.
+/// A frame that does not decode, lacks the column, or carries non-UTF-8
+/// values yields no UIDs here; Scribe's full decode refuses it on its own
+/// terms.
 #[must_use]
 pub fn native_card_uids(ipc: &[u8]) -> Vec<CardUid> {
+    native_uids(ipc, SUBJECT_CARD_UID)
+}
+
+/// Collects the distinct parseable UIDs of a native frame's `column`,
+/// projecting only that column out of the stream.
+fn native_uids(ipc: &[u8], column: &str) -> Vec<CardUid> {
     let Ok(reader) = StreamReader::try_new(Cursor::new(ipc), None) else {
         return Vec::new();
     };
-    let Ok(column) = reader.schema().index_of(CARD_UID) else {
+    let Ok(column) = reader.schema().index_of(column) else {
         return Vec::new();
     };
     let Ok(reader) = StreamReader::try_new(Cursor::new(ipc), Some(vec![column])) else {
@@ -263,7 +442,7 @@ mod tests {
         let rows = cards.as_ref().map_or(1, Vec::len);
         let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1; rows]))];
         if let Some(cards) = cards {
-            fields.push(Field::new(CARD_UID, DataType::Utf8, true));
+            fields.push(Field::new(SUBJECT_CARD_UID, DataType::Utf8, true));
             columns.push(Arc::new(StringArray::from(cards)));
         }
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)

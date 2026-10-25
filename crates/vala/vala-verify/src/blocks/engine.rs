@@ -50,9 +50,11 @@ use crate::assertion::{Compared, evaluate_item_mode, evaluate_single};
 use crate::error::ExecError;
 use crate::jsonpath::extract_jsonpath_from;
 use crate::operators;
-use crate::trace_source::TraceSource;
 use crate::trace_source::project_spans;
+use crate::trace_source::{TraceSource, TraceUnavailable};
 use crate::walk::{Prepared, RunLedger, walk};
+use wyrd_spec::vala::ids::TraceId;
+use wyrd_spec::vala::trace::SpanRecord;
 
 /// Requirement reason of an `each` assertion whose selector matched nothing.
 const EMPTY_SELECTION: &str = "empty_selection";
@@ -192,8 +194,10 @@ pub enum EngineError {
     /// host's combined input-file bound. No block ran.
     #[error("the verification input is too large: {0}")]
     InputTooLarge(String),
-    /// The host cannot read the evidence metadata admission needs now. No
-    /// block ran, so the whole execution may run again later.
+    /// The host cannot read the evidence metadata admission needs now, or,
+    /// on an engine built [`VerificationEngine::with_unlanded_traces_deferred`],
+    /// a declared trace has not landed yet. No verdict exists, so the whole
+    /// execution may run again later.
     #[error("the verification evidence cannot be admitted now: {0}")]
     EvidenceUnavailable(String),
 }
@@ -219,7 +223,24 @@ pub struct VerificationEngine {
     evidence: Option<Arc<dyn EvidenceReader>>,
     /// Where every block's run interval is recorded.
     clock: BlockClock,
+    /// Whether a not-yet-landed trace stops the run with
+    /// [`EngineError::EvidenceUnavailable`] instead of an inconclusive check.
+    defer_unlanded: bool,
+    /// The current run's trace reads by trace ID; [`Self::run`] starts each
+    /// run with none, so every check naming one trace in that run judges the
+    /// same read and a later run reads afresh.
+    reads: TraceReads,
 }
+
+/// One run's read of each trace it names, shared by every check of that run.
+type TraceReads = Arc<
+    std::sync::Mutex<
+        HashMap<
+            TraceId,
+            Arc<tokio::sync::OnceCell<Result<Arc<Vec<SpanRecord>>, TraceUnavailable>>>,
+        >,
+    >,
+>;
 
 impl VerificationEngine {
     /// An engine running at most `concurrency` blocks at once, with no
@@ -242,7 +263,19 @@ impl VerificationEngine {
             permits: Arc::new(Semaphore::new(concurrency.get())),
             evidence: None,
             clock: BlockClock::default(),
+            defer_unlanded: false,
+            reads: TraceReads::default(),
         }
+    }
+
+    /// Stop a run whose declared trace has not landed yet with
+    /// [`EngineError::EvidenceUnavailable`], so a queued host can retry the
+    /// same execution once the evidence lands. Without it, such a trace check
+    /// is inconclusive. Every other trace failure stays an inconclusive check.
+    #[must_use]
+    pub const fn with_unlanded_traces_deferred(mut self) -> Self {
+        self.defer_unlanded = true;
+        self
     }
 
     /// Record every block's run interval on `clock`, the host's measure of
@@ -288,7 +321,8 @@ impl VerificationEngine {
     /// # Errors
     /// Returns [`EngineError::InputInvalid`] or [`EngineError::InputTooLarge`]
     /// for nonconforming evidence and [`EngineError::EvidenceUnavailable`]
-    /// when the host cannot admit it now, [`EngineError::Plan`] for an
+    /// when the host cannot admit it now or, on a deferring engine, a trace
+    /// has not landed yet, [`EngineError::Plan`] for an
     /// unplannable graph,
     /// [`EngineError::DeadlineExceeded`] when `deadline` is reached before
     /// the verdict, [`EngineError::Capture`] when an actual value cannot be
@@ -312,11 +346,15 @@ impl VerificationEngine {
         }
         conform(&spec, &evidence)?;
         let plan = spec.plan().map_err(EngineError::Plan)?;
+        let attempt = Self {
+            reads: TraceReads::default(),
+            ..self.clone()
+        };
         let ledger = timeout_at(deadline, async {
-            if let Some(reader) = &self.evidence {
+            if let Some(reader) = &attempt.evidence {
                 reader.admit(&spec.inputs, &evidence).await?;
             }
-            self.drive(&spec, &plan, &evidence, deadline).await
+            attempt.drive(&spec, &plan, &evidence, deadline).await
         })
         .await
         .map_err(|_| EngineError::DeadlineExceeded)??;
@@ -569,7 +607,9 @@ impl VerificationEngine {
     ///
     /// # Errors
     /// Returns [`EngineError::Busy`] when an Agent or code check is refused
-    /// process capacity, which is never judged.
+    /// process capacity, which is never judged, and
+    /// [`EngineError::EvidenceUnavailable`] when a deferring engine's trace
+    /// has not landed yet.
     #[tracing::instrument(
         name = "verification.block",
         level = "debug",
@@ -606,7 +646,15 @@ impl VerificationEngine {
                 let ok = compared.is_ok();
                 (Judged::compared(compared), ok)
             }
-            Check::Trace(trace) => self.trace(&requirement.id, trace, &inputs, deadline).await,
+            Check::Trace(trace) => {
+                match self.trace(&requirement.id, trace, &inputs, deadline).await {
+                    Ok(judged) => judged,
+                    Err(error) => {
+                        timer.finish(false);
+                        return Err(error);
+                    }
+                }
+            }
             Check::Agent(_) | Check::Code(_) => {
                 let sources: BTreeSet<SlotName> = inputs
                     .values()
@@ -641,37 +689,70 @@ impl VerificationEngine {
 
     /// Compare the selected span value of the declared trace.
     ///
-    /// A trace that is not supplied or cannot be read is inconclusive; a
-    /// selector matching nothing compares `null`. Returns the judgment and
-    /// whether the check judged (`false` when it could not read or compare).
+    /// The trace is read once per run, through [`Self::read`]. A trace that
+    /// is not supplied or cannot be read is inconclusive; a selector matching
+    /// nothing compares `null`. Returns the judgment and whether the check
+    /// judged (`false` when it could not read or compare).
+    ///
+    /// # Errors
+    /// Returns [`EngineError::EvidenceUnavailable`] when a deferring engine's
+    /// trace has not landed yet.
     async fn trace(
         &self,
         id: &TaskId,
         trace: &TraceCheck,
         inputs: &BTreeMap<String, CallInput>,
         deadline: Instant,
-    ) -> (Judged, bool) {
+    ) -> Result<(Judged, bool), EngineError> {
         let Some(CallValue::Evidence(InputDeclaration::Trace { trace_id })) =
             inputs.get("on").map(|input| &input.value)
         else {
-            return (
+            return Ok((
                 Judged::inconclusive(format!("`{}` supplied no trace", trace.on)),
                 false,
-            );
+            ));
         };
-        let wait = deadline.saturating_duration_since(Instant::now());
-        let spans = match self.traces.fetch(*trace_id, wait).await {
+        let spans = match self.read(*trace_id, deadline).await {
             Ok(spans) => spans,
+            Err(error @ TraceUnavailable::NotYetLanded { .. }) if self.defer_unlanded => {
+                return Err(EngineError::EvidenceUnavailable(error.to_string()));
+            }
             Err(error) => {
                 tracing::debug!(requirement = id.as_str(), %error, "trace evidence unreadable");
-                return (Judged::inconclusive(error.to_string()), false);
+                return Ok((Judged::inconclusive(error.to_string()), false));
             }
         };
         let document = project_spans(*trace_id, &spans);
         let compared = extract_jsonpath_from(&document, &trace.span_selector)
             .and_then(|observed| evaluate_single(id, &trace.operator, &trace.expected, &observed));
         let ok = compared.is_ok();
-        (Judged::compared(compared), ok)
+        Ok((Judged::compared(compared), ok))
+    }
+
+    /// The run's one read of `trace_id`: the first check naming it fetches
+    /// within `deadline` and every other check of the run, concurrent or
+    /// later, shares that result, failure included.
+    ///
+    /// # Errors
+    /// Returns the shared fetch's [`TraceUnavailable`].
+    async fn read(
+        &self,
+        trace_id: TraceId,
+        deadline: Instant,
+    ) -> Result<Arc<Vec<SpanRecord>>, TraceUnavailable> {
+        let cell = Arc::clone(
+            self.reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(trace_id)
+                .or_default(),
+        );
+        cell.get_or_init(|| async {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            self.traces.fetch(trace_id, wait).await
+        })
+        .await
+        .clone()
     }
 }
 

@@ -40,7 +40,7 @@ use wyrd_storage::tenant_path;
 
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::components::gateway::GatewayCallSubject;
+use crate::components::gateway::GatewayCallContext;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::http::middleware::metrics::RequestArrival;
@@ -197,7 +197,7 @@ impl<'a> VerificationControl<'a> {
     ///
     /// Authorizes and audits `cards:read` standalone, reads the status and
     /// both exact Cards in one tenant transaction, then — for a completed
-    /// execution — reads its result from `vala.verification.results` as the
+    /// execution — reads its result from `bifrost.verification.results` as the
     /// caller through the ordinary Bifrost query entry. A result Scribe has
     /// not yet published leaves `result` absent, so the caller polls again.
     ///
@@ -278,7 +278,7 @@ impl<'a> VerificationControl<'a> {
         let request = BifrostQueryRequest {
             params: Vec::new(),
             sql: format!(
-                "SELECT outcome, run_id FROM vala.verification.results \
+                "SELECT outcome, run_id FROM bifrost.verification.results \
                  WHERE result_id = '{result_id}' LIMIT 1"
             ),
             deadline_ms: None,
@@ -566,11 +566,17 @@ impl<'a> VerificationControl<'a> {
                 caller: &executor,
                 evidence: &request.inputs,
                 routes: &request.execution_route_overrides,
-                subject: GatewayCallSubject {
+                subject: GatewayCallContext {
+                    workload_card_uid: wyrd_runtime::owning_root(
+                        &caller.principal,
+                        &caller.delegation_chain,
+                    )
+                    .cloned(),
+                    subject_card_uid: Some(request.card_uid.clone()),
                     run_id: request.run_id.clone(),
-                    card_uid: Some(request.card_uid.clone()),
+                    deployment_environment: request.deployment_environment.clone(),
                 },
-                accepted_at: started_at,
+                defer_unlanded_traces: false,
                 drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                 clock: telemetry.clock(),
             },
@@ -778,7 +784,7 @@ impl<'a> VerificationControl<'a> {
     /// Both rows are staged on the slots `staged` reserved before the
     /// execution ran. The payload mints its own result identity and
     /// correlates with the execution through `execution_id`. Its rows name the subject
-    /// as `card_uid` and the exact Verifier as `verifier_card_uid`, are
+    /// as `subject_card_uid` and the exact Verifier as `verifier_card_uid`, are
     /// attributed to the caller, carry the caller's application Run, group,
     /// and authenticated owner Service, and have no binding or Trigger. The inputs row never queues work. The
     /// verdict is already decided, so an unbuildable payload is logged and

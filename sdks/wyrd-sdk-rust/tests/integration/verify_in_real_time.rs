@@ -229,7 +229,7 @@ impl Assistant {
             .to_string()
     }
 
-    /// Publish every captured row, then read each `vala.gateway.calls` row's
+    /// Publish every captured row, then read each `bifrost.gateway.calls` row's
     /// id, subject/actor pair, and Run and Card attribution.
     ///
     /// # Panics
@@ -244,8 +244,8 @@ impl Assistant {
             .await
             .expect("Bifrost connects")
             .sql_as(
-                "SELECT call_id, sub_principal_id, act_principal_id, run_id, card_uid \
-                 FROM vala.gateway.calls",
+                "SELECT call_id, sub_principal_id, act_principal_id, run_id, subject_card_uid \
+                 FROM bifrost.gateway.calls",
                 &[],
             )
             .await
@@ -268,8 +268,8 @@ impl Assistant {
                         r.act_principal_id AS result_actor, r.run_id AS result_run, \
                         c.sub_principal_id AS call_subject, \
                         c.act_principal_id AS call_actor, c.run_id AS call_run \
-                   FROM vala.verification.results r \
-                   JOIN vala.gateway.calls c ON c.card_uid = r.card_uid \
+                   FROM bifrost.verification.results r \
+                   JOIN bifrost.gateway.calls c ON c.subject_card_uid = r.subject_card_uid \
                   WHERE r.execution_id = $1",
                 &[QueryParam::String(execution_id.to_owned())],
             )
@@ -320,7 +320,7 @@ impl Assistant {
     }
 }
 
-/// One judge call's `vala.gateway.calls` identity and attribution.
+/// One judge call's `bifrost.gateway.calls` identity and attribution.
 #[derive(Debug, PartialEq, Deserialize)]
 struct JudgeCall {
     /// The call's UUID, which its gateway spans carry as `gateway_call_id`.
@@ -332,7 +332,7 @@ struct JudgeCall {
     /// The application Run the call is attributed to.
     run_id: Option<String>,
     /// The Card UID the call is attributed to.
-    card_uid: Option<String>,
+    subject_card_uid: Option<String>,
 }
 
 impl JudgeCall {
@@ -553,7 +553,7 @@ async fn judge_call_is_attributed_to_the_run_and_card() {
             .map(|call| (
                 call.sub_principal_id.as_str(),
                 call.run_id.as_deref(),
-                call.card_uid.clone()
+                call.subject_card_uid.clone()
             ))
             .collect::<Vec<_>>(),
         [(
@@ -601,7 +601,7 @@ async fn judge_call_without_a_run_joins_the_callers_trace_attributed_to_the_card
         (
             call.sub_principal_id.as_str(),
             call.run_id.as_deref(),
-            call.card_uid.clone()
+            call.subject_card_uid.clone()
         ),
         (
             principal.as_str(),
@@ -1097,7 +1097,7 @@ async fn retired_verification_contracts_are_refused() {
         .expect("Bifrost connects");
     let listed = bifrost.list_tables().await.expect("tables list");
     assert!(
-        listed.iter().all(|table| table.namespace != "vala.eval"),
+        listed.iter().all(|table| table.namespace != "bifrost.eval"),
         "retired tables are listed: {listed:?}"
     );
     // A retired name is refused exactly as a namespace that never existed.
@@ -1114,12 +1114,15 @@ async fn retired_verification_contracts_are_refused() {
         .map(|outcome| outcome.map_err(|error| WyrdError::from(error).code().to_owned()))
     };
     for name in ["result_items", "observations"] {
-        let retired = refusals("vala.eval", name).await;
+        let retired = refusals("bifrost.eval", name).await;
         assert!(retired.iter().all(Result::is_err), "{name}: {retired:?}");
-        assert_eq!(retired, refusals("vala.absent", name).await, "{name}");
+        assert_eq!(retired, refusals("bifrost.absent", name).await, "{name}");
     }
     bifrost
-        .sql("SELECT COUNT(*) AS n FROM vala.verification.results", &[])
+        .sql(
+            "SELECT COUNT(*) AS n FROM bifrost.verification.results",
+            &[],
+        )
         .await
         .expect("the current verification table answers");
     assistant.deployment.shutdown().await;
@@ -1648,7 +1651,7 @@ async fn grouped_support_resumes() {
     assistant.deployment.shutdown().await;
 }
 
-/// One retained `vala.verification.results` row of a group binding.
+/// One retained `bifrost.verification.results` row of a group binding.
 #[derive(Debug, Deserialize)]
 struct GroupResultRow {
     /// The execution the result settled.
@@ -1738,7 +1741,7 @@ async fn grouped_refund_changes_verdict() {
             .await
             .expect("Bifrost connects")
             .sql_as(
-                "SELECT execution_id, result_id, verdict FROM vala.verification.results \
+                "SELECT execution_id, result_id, verdict FROM bifrost.verification.results \
                  WHERE binding_id = $1 ORDER BY ended_at",
                 &[QueryParam::String(refund.binding.to_string())],
             )
@@ -1890,7 +1893,7 @@ async fn script_coding_judge(
         "call-spans",
         "bifrost.query",
         &json!({
-            "sql": format!("SELECT name FROM vala.traces.spans WHERE trace_id = decode('{trace}', 'hex') ORDER BY name"),
+            "sql": format!("SELECT name FROM bifrost.traces.spans WHERE trace_id = decode('{trace}', 'hex') ORDER BY name"),
             "max_rows": 10,
         }),
     );
@@ -2117,7 +2120,7 @@ async fn grouped_coding_uses_declared_sources() {
                 json!({
                     "resource": "bifrost_query",
                     "action": "read",
-                    "scope": { "bifrost": { "schema": { "catalog": "vala", "schema": "verification" } } },
+                    "scope": { "bifrost": { "schema": { "catalog": "bifrost", "schema": "verification" } } },
                 }),
             ],
         )
@@ -2655,7 +2658,7 @@ struct Grouping {
 /// # Panics
 /// Panics when a flush or the read fails.
 async fn group_executions(deployment: &Deployment, binding: &BindingId) -> Vec<ExecutionId> {
-    /// One `vala.verification.results` row's execution identity.
+    /// One `bifrost.verification.results` row's execution identity.
     #[derive(Deserialize)]
     struct Row {
         /// The group execution the result settled.
@@ -2670,7 +2673,7 @@ async fn group_executions(deployment: &Deployment, binding: &BindingId) -> Vec<E
         .await
         .expect("Bifrost connects")
         .sql_as(
-            "SELECT execution_id FROM vala.verification.results \
+            "SELECT execution_id FROM bifrost.verification.results \
              WHERE binding_id = $1 ORDER BY ended_at",
             &[QueryParam::String(binding.to_string())],
         )
@@ -2867,7 +2870,7 @@ async fn grouped_conversations_coexist_with_drift() {
         .await
         .expect("Bifrost connects")
         .sql_as(
-            "SELECT group_id FROM vala.verification.results WHERE execution_id = $1",
+            "SELECT group_id FROM bifrost.verification.results WHERE execution_id = $1",
             &[QueryParam::String(ungrouped.execution_id.to_string())],
         )
         .await
@@ -3056,7 +3059,7 @@ const JUDGE_DELAY: Duration = Duration::from_secs(15);
 /// Stable code of a call refused for this server's staging capacity.
 const STAGING_FULL: &str = "WYRD_VERIFICATION_429_STAGING_FULL";
 
-/// The count of one tenant's `vala.verification.execution_inputs` rows.
+/// The count of one tenant's `bifrost.verification.execution_inputs` rows.
 #[derive(Debug, Deserialize)]
 struct InputRows {
     /// Rows the tenant has recorded.
@@ -3233,7 +3236,7 @@ async fn verification_staging_refuses_and_recovers() {
         .await
         .expect("Bifrost connects")
         .sql_as::<InputRows>(
-            "SELECT count(*) AS rows FROM vala.verification.execution_inputs",
+            "SELECT count(*) AS rows FROM bifrost.verification.execution_inputs",
             &[],
         )
         .await

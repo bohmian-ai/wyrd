@@ -17,12 +17,12 @@ from .support import Count, QueryRow, client_of
 
 pytestmark = pytest.mark.integration
 
-LIVE_ROWS = "vala.datasets.live_query_rows"
+LIVE_ROWS = "bifrost.datasets.live_query_rows"
 
 
 @pytest.fixture(scope="module")
 def live_table(wyrd_server: WyrdTestServer) -> str:
-    """A ``vala.datasets`` table holding rows 1-3 that only Scribe's live tail serves.
+    """A ``bifrost.datasets`` table holding rows 1-3 that only Scribe's live tail serves.
 
     Rows 1 and 2 share one managed ``run_id`` and row 3 carries another.
     """
@@ -54,7 +54,7 @@ def test_unwritten_builtin_table_reads_as_empty() -> None:
     # A fresh server, since the session server's journeys write and publish Verifier results.
     with WyrdTestServer(mutate_env=False) as server:
         [counted] = Bifrost(client=client_of(server)).sql(
-            "SELECT COUNT(*) AS n FROM vala.drift.result_features", model=Count
+            "SELECT COUNT(*) AS n FROM bifrost.drift.result_features", model=Count
         )
     assert counted.n == 0
 
@@ -136,7 +136,7 @@ def test_live_table_subqueries_match_their_joins(
     [
         f"SELECT r.valeu FROM {LIVE_ROWS} r",
         f"SELECT r.valeu, r.valeu AS again FROM {LIVE_ROWS} r JOIN {LIVE_ROWS} s ON r.id = s.id "
-        "JOIN vala.verification.results v ON v.result_id = s.value",
+        "JOIN bifrost.verification.results v ON v.result_id = s.value",
         f"SELECT id FROM {LIVE_ROWS} WHERE id IN (SELECT r.valeu FROM {LIVE_ROWS} r)",
     ],
     ids=["single", "join", "subquery"],
@@ -179,7 +179,7 @@ def test_unauthorized_table_refusal_reveals_no_columns(
     datasets_only: dict[str, object] = {
         "resource": "bifrost_query",
         "action": "read",
-        "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "datasets"}}},
+        "scope": {"bifrost": {"schema": {"catalog": "bifrost", "schema": "datasets"}}},
     }
     reader = Bifrost(
         client=WyrdClient(credential=wyrd_server.scoped_api_key("datasets_reader", [datasets_only]))
@@ -189,7 +189,7 @@ def test_unauthorized_table_refusal_reveals_no_columns(
     with pytest.raises(WyrdError) as refused:
         reader.sql(
             f"SELECT q.id, v.verdcit FROM {live_table} q "
-            "JOIN vala.verification.results v ON v.result_id = q.value"
+            "JOIN bifrost.verification.results v ON v.result_id = q.value"
         )
     assert refused.value.code == "WYRD_VALA_403_QUERY_FORBIDDEN"
     assert "verdcit" not in refused.value.detail and "verdict" not in refused.value.detail

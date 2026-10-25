@@ -1595,7 +1595,7 @@ impl PromotionIntegrationFixture {
     ) -> TenantTableBinding {
         let segment = namespace
             .as_str()
-            .strip_prefix("vala.")
+            .strip_prefix("bifrost.")
             .expect("built-in namespaces are vala-qualified");
         let definition = vala_bifrost_redux::tables::builtin_table(segment, name)
             .expect("the built-in definition resolves");
@@ -3051,7 +3051,9 @@ fn ingress_batch(schema: &Arc<ArrowSchema>, file_number: i64) -> RecordBatch {
 /// Generates one batch of distinct rows for a built-in's authored fields.
 ///
 /// Every authored column is populated, including nullable ones, so a rewrite
-/// that mixed rows up would be visible in any column. Struct columns recurse
+/// that mixed rows up would be visible in any column. The shared dimensions
+/// stay null: Scribe stamps them from the accepted request context and
+/// refuses a batch that supplies them. Struct columns recurse
 /// into their children and Variant columns hold one distinct JSON object per
 /// row. Every timestamp column, the built-in's time column among them, places
 /// the whole batch at noon of the day `file_number` days before the fixture
@@ -3072,7 +3074,13 @@ fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> Record
     let offsets: Vec<i64> = (0..i64::try_from(rows).expect("bounded fixture rows")).collect();
     let columns: Vec<ArrayRef> = fields
         .iter()
-        .map(|field| fixture_column(field, file_number, noon, &offsets))
+        .map(|field| {
+            if vala_bifrost_redux::tables::SHARED_DIMENSIONS.contains(&field.name().as_str()) {
+                arrow::array::new_null_array(field.data_type(), rows)
+            } else {
+                fixture_column(field, file_number, noon, &offsets)
+            }
+        })
         .collect();
     RecordBatch::try_new(Arc::new(ArrowSchema::new(fields.to_vec())), columns)
         .expect("fixture built-in batch")
@@ -3355,12 +3363,38 @@ pub(crate) async fn ingest_unclaimed(
     batch: &RecordBatch,
 ) -> Result<vala_bifrost_redux::contracts::FrameAdmission, vala_bifrost_redux::contracts::ScribeError>
 {
+    ingest_at(scribe, catalog, tenant, binding, None, batch_id, batch).await
+}
+
+/// Drives one real native Scribe append claiming `table_version`, or the
+/// current version when `None`, as [`ingest_unclaimed`] does.
+///
+/// Every append for one tenant comes from that tenant's one fixture writer,
+/// so a retry under the same batch id carries the same accepted origin.
+///
+/// # Errors
+///
+/// Returns the Scribe refusal of the frame.
+///
+/// # Panics
+///
+/// Panics when the registration lookup fails.
+pub(crate) async fn ingest_at(
+    scribe: &ScribeImpl,
+    catalog: &BifrostCatalog,
+    tenant: DataTenantId,
+    binding: &TenantTableBinding,
+    table_version: Option<wyrd_spec::vala::ids::TableVersion>,
+    batch_id: Uuid,
+    batch: &RecordBatch,
+) -> Result<vala_bifrost_redux::contracts::FrameAdmission, vala_bifrost_redux::contracts::ScribeError>
+{
     let (fingerprint, _) = catalog
         .table_registration(&binding.table_ref, tenant)
         .await
         .expect("fixture table registration");
     let principal = wyrd_runtime::principal::Principal::new(
-        wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+        wyrd_spec::auth::PrincipalId::new(tenant.as_uuid()),
         wyrd_runtime::principal::PrincipalKind::User,
         tenant,
         Vec::new(),
@@ -3373,6 +3407,7 @@ pub(crate) async fn ingest_unclaimed(
             expected_schema_fingerprint: fingerprint,
             request_id: wyrd_spec::request_id::RequestId::now_v7(),
             batch_id,
+            table_version,
             payload: ingress_ipc(batch),
         })
         .await

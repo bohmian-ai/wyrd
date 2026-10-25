@@ -27,7 +27,7 @@ pub struct ServiceSpec {
     pub verified_by: Vec<VerificationBinding>,
     /// Bifrost dataset tables this Service writes.
     ///
-    /// Registration validates and ensures each one in `vala.datasets` before
+    /// Registration validates and ensures each one in `bifrost.datasets` before
     /// the Service becomes active; removing the Service never drops them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<ServiceTable>,
@@ -66,7 +66,7 @@ pub struct ServiceSpec {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ServiceTable {
-    /// Dataset table name inside `vala.datasets`.
+    /// Dataset table name inside `bifrost.datasets`.
     pub name: String,
     /// JSON Schema object describing the table's user fields, whose
     /// `properties` order is the table's column order.

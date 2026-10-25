@@ -129,7 +129,7 @@ impl TenantTableBinding {
         }
         let namespace = table_ref.namespace.as_str();
         let segment = namespace
-            .strip_prefix("vala.")
+            .strip_prefix("bifrost.")
             .filter(|value| !value.is_empty() && !value.contains('.'))
             .ok_or_else(|| TenantTableBindingError::InvalidPhysicalNamespace {
                 detail: format!("logical namespace `{namespace}` is not one segment"),
@@ -153,6 +153,13 @@ impl TenantTableBinding {
     ///
     /// Returns [`TenantTableBindingError::InvalidPhysicalNamespace`] if Iceberg
     /// rejects the already validated physical namespace components.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when `facts` were not produced by [`Self::facts`]:
+    /// `peak_bytes` must equal the 36-byte tenant string plus `binding_bytes` and
+    /// `file_prefix_bytes`, and `input_bytes` must cover at least the fixed
+    /// `4 + 7 + 36` namespace-component bytes that precede the segment.
     pub(crate) fn from_facts(
         facts: PhysicalBindingFacts<'_>,
     ) -> Result<Self, TenantTableBindingError> {
@@ -163,13 +170,13 @@ impl TenantTableBinding {
         debug_assert!(facts.input_bytes >= 4 + 7 + 36);
         let tenant_string = facts.tenant.to_string();
         let namespace = facts.table_ref.namespace.as_str();
-        let segment = namespace.strip_prefix("vala.").ok_or_else(|| {
+        let segment = namespace.strip_prefix("bifrost.").ok_or_else(|| {
             TenantTableBindingError::InvalidPhysicalNamespace {
                 detail: format!("logical namespace `{namespace}` is not one segment"),
             }
         })?;
         let iceberg_namespace =
-            NamespaceIdent::from_strs(["vala", "tenants", tenant_string.as_str(), segment])
+            NamespaceIdent::from_strs(["bifrost", "tenants", tenant_string.as_str(), segment])
                 .map_err(|error| TenantTableBindingError::InvalidPhysicalNamespace {
                     detail: error.to_string(),
                 })?;
@@ -271,6 +278,12 @@ mod tests {
     }
 
     /// Proves the checked binding formulas and exact-capacity construction agree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the facts are refused, any total differs from its formula for
+    /// `bifrost.traces.spans`, materialization fails, or the object prefix's length
+    /// or capacity differs from `output_bytes`.
     #[test]
     fn physical_binding_facts_match_materialized_capacities() {
         let tenant = DataTenantId::new_v7();
@@ -280,9 +293,9 @@ mod tests {
         assert_eq!(facts.output_bytes, 8 + 36 + 1 + 6 + 1 + 5);
         assert_eq!(
             facts.binding_bytes,
-            5 + 5 + "vala.traces".len() + facts.input_bytes + facts.output_bytes
+            5 + 5 + "bifrost.traces".len() + facts.input_bytes + facts.output_bytes
         );
-        assert_eq!(facts.file_prefix_bytes, "vala.traces".len() + 1 + 5);
+        assert_eq!(facts.file_prefix_bytes, "bifrost.traces".len() + 1 + 5);
         assert_eq!(
             facts.peak_bytes,
             36 + facts.binding_bytes + facts.file_prefix_bytes
@@ -303,6 +316,14 @@ mod tests {
         }
     }
 
+    /// Two organizations binding the same logical table get distinct Iceberg
+    /// namespaces and object prefixes, each qualified by its own tenant, while the
+    /// logical namespace stays tenant-free.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either binding is refused, the two physical identities collide,
+    /// or tenant A's namespace or prefix differs from its tenant-qualified form.
     #[test]
     fn tenant_table_binding_uses_authenticated_organization() {
         let table = table();
@@ -313,11 +334,11 @@ mod tests {
 
         assert_ne!(binding_a.iceberg_namespace, binding_b.iceberg_namespace);
         assert_ne!(binding_a.object_prefix, binding_b.object_prefix);
-        assert_eq!(binding_a.logical_namespace, "vala.traces");
-        assert_eq!(binding_b.logical_namespace, "vala.traces");
+        assert_eq!(binding_a.logical_namespace, "bifrost.traces");
+        assert_eq!(binding_b.logical_namespace, "bifrost.traces");
         assert_eq!(
             binding_a.iceberg_namespace.to_string(),
-            format!("vala.tenants.{tenant_a}.traces")
+            format!("bifrost.tenants.{tenant_a}.traces")
         );
         assert_eq!(
             binding_a.object_prefix,
@@ -407,6 +428,13 @@ mod tests {
         );
     }
 
+    /// A tenant id spelled inside a logical table name stays an opaque local name:
+    /// it is kept verbatim and never reinterpreted as the physical tenant component.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the binding is refused or its table name or logical namespace
+    /// is rewritten.
     #[test]
     fn tenant_table_binding_rejects_tenant_in_logical_name() {
         let tenant = DataTenantId::new_v7();
@@ -414,6 +442,6 @@ mod tests {
         let binding = TenantTableBinding::resolve((tenant, table)).expect("binding");
 
         assert_eq!(binding.table_name, format!("{tenant}_spans"));
-        assert_eq!(binding.logical_namespace, "vala.traces");
+        assert_eq!(binding.logical_namespace, "bifrost.traces");
     }
 }

@@ -2165,7 +2165,7 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
         arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
     ]));
     let journey_table = |name: &str| JourneyTable {
-        qualified: format!("vala.datasets.{name}"),
+        qualified: format!("bifrost.datasets.{name}"),
         name: name.to_owned(),
         binding: TenantTableBinding::resolve((
             tenant,
@@ -2213,8 +2213,6 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
             .expect("undeclared registration"),
         RegisterOutcome::Created
     );
-    enable_compaction(server, &declared.binding).await;
-    enable_compaction(server, &undeclared.binding).await;
     let described = |table: &JourneyTable| {
         let client = &client;
         let fqn = table.qualified.clone();
@@ -2288,6 +2286,10 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
         live_cut(&cluster, &declared.binding).await,
         live_cut(&cluster, &undeclared.binding).await,
     ];
+    server
+        .forge_clock()
+        .advance(chrono::Duration::hours(1))
+        .expect("the default compaction interval passes");
     await_committed_rewrites(
         &cluster,
         &observer,
@@ -2346,7 +2348,7 @@ async fn property_less_public_table_is_compacted_by_default() {
     let client = tenant_client(server, tenant).await;
     let name = unique_table("default_compaction");
     let table = JourneyTable {
-        qualified: format!("vala.datasets.{name}"),
+        qualified: format!("bifrost.datasets.{name}"),
         name: name.clone(),
         binding: TenantTableBinding::resolve((
             tenant,
@@ -2726,7 +2728,7 @@ async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
         arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
     ]));
     let journey_table = |name: &str| JourneyTable {
-        qualified: format!("vala.datasets.{name}"),
+        qualified: format!("bifrost.datasets.{name}"),
         name: name.to_owned(),
         binding: TenantTableBinding::resolve((
             tenant,
@@ -2905,7 +2907,6 @@ async fn failed_memory_attempt_retries_without_partial_publication() {
     let server = cluster.server(0).expect("the embedded pod is running");
     let tenant = cluster.data_tenant_id();
     let table = register_table(server, tenant, &unique_table("memory_retry")).await;
-    enable_compaction(server, &table.binding).await;
     let client = tenant_client(server, tenant).await;
     let mut expected = Vec::new();
     for half in 0..2_i64 {
@@ -2935,6 +2936,10 @@ async fn failed_memory_attempt_retries_without_partial_publication() {
         .and_then(vala_bifrost_redux::resources::BifrostRoleResources::forge)
         .expect("the embedded pod hosts Forge")
         .occupy_root_for_test();
+    server
+        .forge_clock()
+        .advance(chrono::Duration::hours(1))
+        .expect("the default compaction interval passes");
     let errors_before = observer.returned_errors().len();
     for _ in 0..DRAIN_PASS_BUDGET {
         if observer.returned_errors().len() > errors_before {

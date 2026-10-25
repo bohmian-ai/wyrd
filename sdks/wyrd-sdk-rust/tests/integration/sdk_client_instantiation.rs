@@ -28,10 +28,10 @@ use wyrd_testing::server::WyrdTestServer;
 use crate::support::Deployment;
 
 /// The user table the discovery story registers in the deployment's tenant.
-const EVENTS: &str = "vala.datasets.instantiation_events";
+const EVENTS: &str = "bifrost.datasets.instantiation_events";
 
 /// The table registered in another tenant that the listing must not show.
-const OTHER_TENANT_EVENTS: &str = "vala.datasets.other_tenant_events";
+const OTHER_TENANT_EVENTS: &str = "bifrost.datasets.other_tenant_events";
 
 /// Access-token lifetime of the renewal story: five seconds longer than the
 /// client's 30-second refresh skew, so a token is reused for five seconds and
@@ -322,7 +322,7 @@ async fn delegated_connect_uses_the_subject_principal() {
     Bifrost::connect_with(&to_bifrost, BifrostOptions::default())
         .await
         .expect("Bifrost connects")
-        .sql("SELECT COUNT(*) AS n FROM vala.system.audit_log", &[])
+        .sql("SELECT COUNT(*) AS n FROM bifrost.system.audit_log", &[])
         .await
         .expect("the subject queries");
     let principals = Principals::connect_with(&admin)
@@ -466,7 +466,7 @@ async fn bifrost_lists_tables_and_describes_on_demand() {
         .collect();
     assert!(listed.iter().any(|fqn| fqn == EVENTS), "{listed:?}");
     assert!(
-        listed.iter().any(|fqn| fqn == "vala.drift.observations"),
+        listed.iter().any(|fqn| fqn == "bifrost.drift.observations"),
         "{listed:?}"
     );
     assert!(
@@ -493,7 +493,7 @@ async fn bifrost_lists_tables_and_describes_on_demand() {
     );
 
     let described = bifrost
-        .describe_table("vala.datasets", "instantiation_events")
+        .describe_table("bifrost.datasets", "instantiation_events")
         .await
         .expect("the table describes");
     let fields: Vec<&str> = described

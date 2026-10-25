@@ -1,4 +1,4 @@
-//! Table-owned `OTLP` log projection for `vala.logs.records`.
+//! Table-owned `OTLP` log projection for `bifrost.logs.records`.
 //!
 //! [`project_resource_logs`] is the single deterministic, IO-free conversion
 //! from decoded `OTLP` resource logs into the canonical log row. A record
@@ -24,13 +24,66 @@ use crate::otlp_contract::LogsOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope,
-    any_value_variant, attributes_variant, bool_column, checked_i64, entity_refs_column,
-    fixed_binary_opt_column, fixed_row_bytes, i32_column, otlp_instant_column,
-    projected_signal_schema, span_id_bytes, trace_id_bytes, u32_as_i64_column, utf8_column,
-    utf8_opt_column, variant_column,
+    ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope,
+    ResourcePromotionColumns, ScopeEnvelope, any_value_variant, attributes_variant, bool_column,
+    checked_i64, entity_refs_column, fixed_binary_opt_column, fixed_row_bytes, i32_column,
+    otlp_instant_column, projected_signal_schema, refuse_forged, span_id_bytes, stored_attributes,
+    stored_text, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, variant_column,
 };
 use wyrd_spec::ids::CardUid;
+use wyrd_spec::vala::BifrostError;
+
+/// Refuse a native canonical log batch whose derived columns differ from
+/// what [`project_resource_logs`] derives from the same source fields.
+///
+/// The exception promotions and `is_exception` are re-derived from each row's
+/// `attributes`, and `body_text` from a string `body`, with the projection's
+/// own rules, so a native writer cannot store a filter value the projection
+/// would not.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] for a malformed source column or the
+/// first derived column that differs.
+pub(crate) fn refuse_forged_log_derivations(batch: &RecordBatch) -> Result<(), BifrostError> {
+    let column = |name: &str| {
+        batch
+            .column_by_name(name)
+            .ok_or_else(|| BifrostError::SchemaParse {
+                detail: format!("canonical batch is missing column {name}"),
+            })
+    };
+    let (attributes, body) = (column("attributes")?, column("body")?);
+    let mut exception = Vec::with_capacity(batch.num_rows());
+    let mut body_text = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        exception.push(ExceptionPromotions::from_attributes(&stored_attributes(
+            attributes.as_ref(),
+            row,
+        )?));
+        body_text.push(stored_text(body.as_ref(), row)?);
+    }
+    let text = |pick: fn(&ExceptionPromotions) -> &Option<String>| {
+        utf8_opt_column(
+            &exception
+                .iter()
+                .map(|row| pick(row).clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    [
+        ("exception_type", text(|row| &row.exception_type)),
+        ("exception_message", text(|row| &row.message)),
+        ("exception_stacktrace", text(|row| &row.stacktrace)),
+        ("body_text", utf8_opt_column(&body_text)),
+        (
+            "is_exception",
+            bool_column(exception.iter().map(ExceptionPromotions::any).collect()),
+        ),
+    ]
+    .iter()
+    .try_for_each(|(name, derived)| refuse_forged(batch, name, derived))
+}
 
 /// Largest accepted severity text, in bytes.
 const MAX_SEVERITY_TEXT_BYTES: usize = 64;
@@ -123,7 +176,7 @@ pub fn log_row_output_bytes() -> usize {
     *LOG_ROW_BYTES
 }
 
-/// Return the canonical user-column schema of `vala.logs.records`.
+/// Return the canonical user-column schema of `bifrost.logs.records`.
 #[must_use]
 pub fn canonical_log_schema() -> Arc<Schema> {
     Arc::new(Schema::new(canonical_arrow_fields(LOG_FIELDS)))
@@ -167,6 +220,8 @@ struct LogColumns {
     service_version: Vec<Option<String>>,
     /// Promoted `deployment.environment.name`, else `deployment.environment`.
     deployment_environment: Vec<Option<String>>,
+    /// The descriptive resource promotions and subject descriptors that follow.
+    resource_promotions: ResourcePromotionColumns,
     /// Promoted `exception.type` attribute string.
     exception_type: Vec<Option<String>>,
     /// Promoted `exception.message` attribute string.
@@ -175,6 +230,8 @@ struct LogColumns {
     exception_stacktrace: Vec<Option<String>>,
     /// The body when it is a string, else null.
     body_text: Vec<Option<String>>,
+    /// Whether any promoted exception string is present.
+    is_exception: Vec<bool>,
     card_uid: Vec<Option<String>>,
     run_id: Vec<Option<String>>,
 }
@@ -290,10 +347,14 @@ impl LogColumns {
             .push(scope.dropped_attributes_count);
         self.scope_schema_url.push(scope.schema_url.clone());
 
-        self.service_name.push(resource.service_name.clone());
-        self.service_version.push(resource.service_version.clone());
+        self.service_name
+            .push(resource.promotions.service_name.clone());
+        self.service_version
+            .push(resource.promotions.service_version.clone());
         self.deployment_environment
-            .push(resource.deployment_environment.clone());
+            .push(resource.promotions.deployment_environment.clone());
+        self.resource_promotions.push(&resource.promotions);
+        self.is_exception.push(exception.any());
         self.exception_type.push(exception.exception_type);
         self.exception_message.push(exception.message);
         self.exception_stacktrace.push(exception.stacktrace);
@@ -316,7 +377,7 @@ impl LogColumns {
     /// Returns [`TableError::Internal`] when a column cannot be built or the
     /// assembled columns do not match the canonical schema.
     fn finish(self) -> Result<RecordBatch, TableError> {
-        let columns: Vec<ArrayRef> = vec![
+        let mut columns: Vec<ArrayRef> = vec![
             otlp_instant_column(self.time_unix_nano),
             otlp_instant_column(self.observed_time_unix_nano),
             i32_column(self.severity_number),
@@ -342,13 +403,17 @@ impl LogColumns {
             utf8_opt_column(&self.service_name),
             utf8_opt_column(&self.service_version),
             utf8_opt_column(&self.deployment_environment),
+        ];
+        columns.extend(self.resource_promotions.finish());
+        columns.extend([
             utf8_opt_column(&self.exception_type),
             utf8_opt_column(&self.exception_message),
             utf8_opt_column(&self.exception_stacktrace),
             utf8_opt_column(&self.body_text),
+            bool_column(self.is_exception),
             utf8_opt_column(&self.card_uid),
             utf8_opt_column(&self.run_id),
-        ];
+        ]);
         RecordBatch::try_new(Arc::clone(&LOG_SCHEMA), columns)
             .map_err(|error| TableError::Internal(format!("canonical log batch: {error}")))
     }

@@ -94,7 +94,10 @@ mod pg_tests {
 
     /// A caller-owned table name in the namespace users may register into.
     fn owned_fqn(prefix: &str) -> String {
-        format!("vala.datasets.{prefix}_{}", uuid::Uuid::now_v7().simple())
+        format!(
+            "bifrost.datasets.{prefix}_{}",
+            uuid::Uuid::now_v7().simple()
+        )
     }
 
     /// One row of the `id`/`value` journey tables, as a caller declares it.
@@ -964,11 +967,11 @@ mod pg_tests {
             let anchor = 1_760_000_000_000_000_000_i64;
             for (fqn, build) in [
                 (
-                    "vala.traces.spans",
+                    "bifrost.traces.spans",
                     fixture::spans as fn(&SchemaRef, &str, i64) -> RecordBatch,
                 ),
-                ("vala.logs.records", fixture::logs),
-                ("vala.metrics.points", fixture::points),
+                ("bifrost.logs.records", fixture::logs),
+                ("bifrost.metrics.points", fixture::points),
             ] {
                 let described = TableConfig::describe_with(&client, fqn)
                     .await
@@ -1016,7 +1019,7 @@ mod pg_tests {
             .read(&format!(
                 "SELECT gen_ai_operation_name, status_code, \
                     CAST(CASE WHEN parent_span_id IS NULL THEN 1 ELSE 0 END AS BIGINT) AS is_root \
-                 FROM vala.traces.spans WHERE scope_name = '{scope}' \
+                 FROM bifrost.traces.spans WHERE scope_name = '{scope}' \
                  ORDER BY start_time_unix_nano"
             ))
             .await;
@@ -1039,7 +1042,7 @@ mod pg_tests {
             .read(&format!(
                 "SELECT CAST(SUM(gen_ai_usage_input_tokens) AS BIGINT) AS input_tokens, \
                     CAST(SUM(gen_ai_usage_output_tokens) AS BIGINT) AS output_tokens \
-                 FROM vala.traces.spans \
+                 FROM bifrost.traces.spans \
                  WHERE scope_name = '{scope}' AND gen_ai_request_model = '{model}'",
                 model = fixture::MODEL
             ))
@@ -1066,7 +1069,7 @@ mod pg_tests {
         let correlated = signals
             .read(&format!(
                 "SELECT l.severity_text, l.event_name, s.name AS span_name \
-                 FROM vala.logs.records l JOIN vala.traces.spans s \
+                 FROM bifrost.logs.records l JOIN bifrost.traces.spans s \
                    ON l.trace_id = s.trace_id AND l.span_id = s.span_id \
                  WHERE l.scope_name = '{}'",
                 signals.scope
@@ -1099,7 +1102,7 @@ mod pg_tests {
                     CAST(SUM(COALESCE(int_value, 0)) AS BIGINT) AS ints, \
                     CAST(SUM(COALESCE(double_value, 0.0)) AS DOUBLE) AS doubles, \
                     CAST(SUM(COALESCE(histogram_count, 0)) AS BIGINT) AS observations \
-                 FROM vala.metrics.points WHERE scope_name = '{}' \
+                 FROM bifrost.metrics.points WHERE scope_name = '{}' \
                  GROUP BY metric_type ORDER BY metric_type",
                 signals.scope
             ))
@@ -1150,7 +1153,7 @@ mod pg_tests {
                     "SELECT CAST(array_length(events) AS BIGINT) AS events, \
                      CAST(array_length(links) AS BIGINT) AS links, \
                      events[1]['name'] AS event_name, links[1]['trace_state'] AS link_state \
-                     FROM vala.traces.spans \
+                     FROM bifrost.traces.spans \
                      WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
                 ),
                 &[],
@@ -1178,7 +1181,7 @@ mod pg_tests {
         let messages = reader
             .sql(
                 &format!(
-                    "SELECT attributes FROM vala.traces.spans \
+                    "SELECT attributes FROM bifrost.traces.spans \
                      WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
                 ),
                 &[],

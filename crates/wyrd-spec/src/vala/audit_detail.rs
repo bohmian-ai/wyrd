@@ -1085,6 +1085,14 @@ mod tests {
         );
     }
 
+    /// An ingest detail carrying a validated origin, batch id, and table
+    /// survives a JSON round trip unchanged, so the audit log decodes what the
+    /// Scribe outbox staged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture commit or batch id is rejected, the detail fails
+    /// to serialize or deserialize, or the decoded detail differs.
     #[test]
     fn all_detail_variants_round_trip() {
         let origin = Origin {
@@ -1096,7 +1104,7 @@ mod tests {
         let detail = AuditDetail::Ingest {
             origin,
             batch_id: BatchId::new("batch-1").expect("valid batch id"),
-            table: BifrostTableName::new("vala.events"),
+            table: BifrostTableName::new("bifrost.events"),
             record_count: 2,
             outcome: AuditOutcome::Allowed,
         };
@@ -1289,6 +1297,14 @@ mod tests {
         assert!(unsorted.validate().is_err());
     }
 
+    /// Deserialization runs the same secret-like refusal as the constructors,
+    /// so a scope hash, storage path, or batch id carrying a credential cannot
+    /// enter an audit detail through JSON.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of the secret-bearing `card_scope_mint`, `storage`, or
+    /// `ingest` payloads decodes as an [`AuditDetail`].
     #[test]
     fn serde_cannot_bypass_secret_classification() {
         for (field, value) in [
@@ -1315,7 +1331,7 @@ mod tests {
                     "kind": "ingest",
                     "origin": {"repo": "github.com/bohmian-ai/wyrd", "commit": "0123456", "dirty": false},
                     "batch_id": value,
-                    "table": "vala.events",
+                    "table": "bifrost.events",
                     "record_count": 1,
                     "outcome": "allowed"
                 }),
@@ -1364,8 +1380,8 @@ mod tests {
                 r#"{"backend":"s3","error_code":null,"kind":"storage","operation":"complete","status_code":200,"storage_path":"cards/a","upload_id":null}"#,
             ),
             (
-                r#"{"record_count":2,"table":"vala.events","outcome":"allowed","batch_id":"batch-1","origin":{"dirty":false,"path":"cards/agent.yaml","commit":"0123456","repo":"github.com/bohmian-ai/wyrd"},"kind":"ingest"}"#,
-                r#"{"batch_id":"batch-1","kind":"ingest","origin":{"commit":"0123456","path":"cards/agent.yaml","repo":"github.com/bohmian-ai/wyrd"},"outcome":"allowed","record_count":2,"table":"vala.events"}"#,
+                r#"{"record_count":2,"table":"bifrost.events","outcome":"allowed","batch_id":"batch-1","origin":{"dirty":false,"path":"cards/agent.yaml","commit":"0123456","repo":"github.com/bohmian-ai/wyrd"},"kind":"ingest"}"#,
+                r#"{"batch_id":"batch-1","kind":"ingest","origin":{"commit":"0123456","path":"cards/agent.yaml","repo":"github.com/bohmian-ai/wyrd"},"outcome":"allowed","record_count":2,"table":"bifrost.events"}"#,
             ),
         ];
 
@@ -1375,13 +1391,22 @@ mod tests {
         }
     }
 
+    /// An audit event without detail omits the `detail` key entirely, while an
+    /// attached detail serializes under `detail` with its `kind` tag, keeping
+    /// detail-free rows byte-stable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either event fails to serialize, the detail-free event
+    /// emits a `detail` key, the fixture storage path is rejected, or the
+    /// attached detail's kind is not `storage`.
     #[test]
     fn audit_event_golden_shape_distinguishes_absent_and_present_detail() {
         let event = AuditEvent::new(
             RequestId::now_v7(),
             None,
             "bifrost.ingest".to_owned(),
-            "vala.events".to_owned(),
+            "bifrost.events".to_owned(),
             None,
             crate::auth::Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
             PrincipalKindTag::User,

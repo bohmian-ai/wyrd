@@ -153,15 +153,55 @@ pub(super) fn unique_table(prefix: &str) -> String {
 /// Every Scribe case drives ingest and query through the same public routes a
 /// real caller uses, so each tenant in a case needs its own service principal
 /// and API key rather than a shared fixture credential.
+///
+/// # Panics
+///
+/// Panics when the service cannot be bootstrapped or the client cannot be
+/// built, as [`endpoint_client`] documents.
 pub(super) async fn tenant_client(
     server: &WyrdTestServer,
     tenant: DataTenantId,
 ) -> wyrd_client::WyrdClient {
-    let bootstrap = server
+    endpoint_client(server, &tenant_key(server, tenant).await)
+}
+
+/// Mints one new service principal in `tenant` and returns its API key.
+///
+/// The principal pair is part of a batch's identity, so a case that resends
+/// an acknowledged batch, after a restart or through another pod, builds every
+/// client from one key with [`endpoint_client`]; a new principal's resend is a
+/// different batch.
+///
+/// # Panics
+///
+/// Panics when the service cannot be bootstrapped or returns no API key.
+pub(super) async fn tenant_key(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+) -> secrecy::SecretString {
+    server
         .bootstrap_service_in_tenant(tenant, &unique_table("scribe_client"), &["admin"])
         .await
-        .expect("tenant service bootstrap");
-    let api_key = bootstrap.api_key().expect("service API key").clone();
+        .expect("tenant service bootstrap")
+        .api_key()
+        .expect("service API key")
+        .clone()
+}
+
+/// Builds one public SDK client that reaches `server`'s endpoints with
+/// `api_key`.
+///
+/// One identity may serve through several pods, so a multi-pod case mints the
+/// key once and builds one client per pod endpoint.
+///
+/// # Panics
+///
+/// Panics when `server` has no bound gRPC or HTTP URL or the client
+/// configuration is refused.
+pub(super) fn endpoint_client(
+    server: &WyrdTestServer,
+    api_key: &secrecy::SecretString,
+) -> wyrd_client::WyrdClient {
     wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
         grpc: wyrd_client::transport::GrpcConfig {
             endpoint: server.grpc_url().expect("bound gRPC URL"),
@@ -172,7 +212,7 @@ pub(super) async fn tenant_client(
             base_url: server.base_url().expect("bound HTTP URL").to_owned(),
             ..wyrd_client::transport::HttpConfig::default()
         },
-        credential: Some(api_key),
+        credential: Some(api_key.clone()),
         ..wyrd_client::config::ClientConfig::default()
     })
     .expect("tenant SDK client")
@@ -504,7 +544,7 @@ where
     }
 }
 
-/// Builds one `vala.traces.spans` batch carrying `values` as `duration_nano`.
+/// Builds one `bifrost.traces.spans` batch carrying `values` as `duration_nano`.
 ///
 /// The rows come from the canonical `OTLP` span projection rather than
 /// hand-assembled columns, so this fixture tracks the ledger's field list
@@ -605,7 +645,7 @@ pub(super) fn hour_start(at: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<
 /// The inspected buckets this journey is answerable for.
 ///
 /// The server runs its own retained-audit publisher on a fixed interval, and it
-/// appends `vala.system.audit_log` through the same local Scribe as any other
+/// appends `bifrost.system.audit_log` through the same local Scribe as any other
 /// writer. Those buckets are live engine state owned by that publisher's
 /// schedule, not ownership left behind by the publication a journey drove, so a
 /// case proving it returned every byte it borrowed must read past them. Every

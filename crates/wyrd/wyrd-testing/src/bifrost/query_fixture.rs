@@ -54,7 +54,7 @@ pub async fn seed_query_fixture(
         safe_name,
         uuid::Uuid::now_v7().simple()
     );
-    let table = format!("vala.bifrost.{table_name}");
+    let table = format!("bifrost.bifrost.{table_name}");
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Utf8, false),
@@ -169,7 +169,7 @@ impl WyrdTestServer {
             .api_key()
             .ok_or_else(|| harness_error("Oracle fixture bootstrap did not return an API key"))?;
         let table_name = format!("python_oracle_{}", uuid::Uuid::now_v7().simple());
-        let table_fqn = format!("vala.bifrost.{table_name}");
+        let table_fqn = format!("bifrost.bifrost.{table_name}");
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Utf8, false),

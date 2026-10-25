@@ -380,7 +380,8 @@ pub struct Overload {
     /// What the overflow query observed: its error code, `answered`, or
     /// `queued` when it waited past [`OVERFLOW_WAIT`].
     pub overflow: String,
-    /// Seconds for the queue to empty after the waiters disconnected, or
+    /// Seconds for the queue to empty after the waiters disconnected and
+    /// the holders released their slots, or
     /// `None` when it did not within [`QUEUE_SETTLE`].
     pub drained_seconds: Option<f64>,
 }
@@ -490,7 +491,9 @@ impl Bench {
     /// Holders first occupy every execution slot with a streaming scan they
     /// stop reading; waiters then queue until `oracle_queries_queued` reaches
     /// [`QUEUE_PLACES`]; one more query must be refused as queue-full.
-    /// Disconnecting the waiters must empty the queue.
+    /// Once the waiters disconnect and the holders release their slots, the
+    /// load has stopped, and the queue, including whatever other clients
+    /// queued behind the holders meanwhile, must empty.
     ///
     /// # Errors
     ///
@@ -557,6 +560,7 @@ impl Bench {
         overload.overflow_refused = overload.overflow == QUEUE_FULL;
         waiters.abort_all();
         while waiters.join_next().await.is_some() {}
+        release.cancel();
         let draining = Instant::now();
         while draining.elapsed() < QUEUE_SETTLE {
             if queued(server).await? == 0 {
@@ -565,7 +569,6 @@ impl Bench {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        release.cancel();
         while holders.join_next().await.is_some() {}
         Ok(overload)
     }

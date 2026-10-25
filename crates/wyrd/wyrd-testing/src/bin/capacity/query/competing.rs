@@ -55,8 +55,8 @@ pub const QUERY_CLIENTS: usize = 32;
 /// 4,000-query and 200-scan floors.
 pub const QUERY_RATE: f64 = 12.0;
 
-/// How long after overload the SLOs must hold again; recovery is read only
-/// after it.
+/// How long after overload the SLOs must hold again, at most half of what
+/// remains of the window; recovery is read only after it.
 const RECOVERY_GRACE: Duration = Duration::from_secs(30);
 
 /// Pending ingest arrivals past which a scheduled arrival is missed rather
@@ -235,10 +235,18 @@ struct Phases {
 }
 
 impl Phases {
+    /// Where the recovery grace ends and recovery starts: [`RECOVERY_GRACE`]
+    /// after overload ends, or half of what then remains of the window when
+    /// that is shorter, so a short window still reads a recovery.
+    fn recovery(&self) -> Instant {
+        let remaining = self.end.saturating_duration_since(self.overloaded);
+        self.overloaded + RECOVERY_GRACE.min(remaining / 2)
+    }
+
     /// Whether a queue-full refusal at `at` is the declared one: from
     /// overload's start until the recovery grace ends.
     fn refusal_allowed(&self, at: Instant) -> bool {
-        at >= self.overload && at < self.overloaded + RECOVERY_GRACE
+        at >= self.overload && at < self.recovery()
     }
 }
 
@@ -340,7 +348,12 @@ impl Competing {
             let before = outstanding.load(Ordering::Relaxed);
             let overload = bench.overload_queue(server).await;
             let overloaded = Instant::now();
-            let _ = admitting.recovery.set(overloaded + RECOVERY_GRACE);
+            let phases = Phases {
+                overload: admitting.overload,
+                overloaded,
+                end,
+            };
+            let _ = admitting.recovery.set(phases.recovery());
             let backlog = outstanding.load(Ordering::Relaxed);
             (before, overload, overloaded, backlog)
         };
@@ -1080,8 +1093,8 @@ mod tests {
     use num_traits::ToPrimitive;
 
     use super::{
-        Acked, Asked, Case, Offered, Phases, QUERY_CLIENTS, QUERY_RATE, WRONG_RESULT, expected,
-        mixed_case, open_loop, read_ingest, read_queries,
+        Acked, Asked, Case, Offered, Phases, QUERY_CLIENTS, QUERY_RATE, RECOVERY_GRACE,
+        WRONG_RESULT, expected, mixed_case, open_loop, read_ingest, read_queries,
     };
 
     /// A successful `bifrost.query` series of `case` in `phase` with one
@@ -1100,6 +1113,32 @@ mod tests {
             out_of_range: 0,
             negative_residual: 0,
         }
+    }
+
+    /// Recovery starts [`RECOVERY_GRACE`] after overload in a full window and
+    /// halfway through what remains of a short one, and the declared
+    /// queue-full refusal window ends where recovery starts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the grace overruns a short window or shrinks a full one.
+    #[test]
+    fn recovery_grace_fits_the_window() {
+        let start = Instant::now();
+        let phases = |overloaded: u64, end: u64| Phases {
+            overload: start + Duration::from_secs(5),
+            overloaded: start + Duration::from_secs(overloaded),
+            end: start + Duration::from_secs(end),
+        };
+        let full = phases(160, 360);
+        assert_eq!(full.recovery(), full.overloaded + RECOVERY_GRACE);
+        let smoke = phases(16, 36);
+        assert_eq!(smoke.recovery(), start + Duration::from_secs(26));
+        assert!(smoke.refusal_allowed(start + Duration::from_secs(25)));
+        assert!(!smoke.refusal_allowed(start + Duration::from_secs(26)));
+        assert!(!smoke.refusal_allowed(start + Duration::from_secs(4)));
+        let late = phases(40, 36);
+        assert_eq!(late.recovery(), late.overloaded);
     }
 
     /// A slow capacity query that completes during overload stays in the

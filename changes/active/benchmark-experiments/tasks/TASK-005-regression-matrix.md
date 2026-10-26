@@ -825,3 +825,35 @@ No engine has a passing qualification suite. Declared absolute limits now block 
 - **Gateway:** overhead p99 at 64 clients and capture shedding.
 
 The SPEC_REVISION_REQUIRED verdict above covers all of these.
+
+### V6 evidence on `74b23897f`
+
+The three named `experiment::tests` selectors passed (3/3). `mise run fmt`, `mise run lints`, `mise run check:deps` and `git diff --check` were all clean.
+
+### V7 evidence: final implementation, clean `74b23897f`
+
+`mise run bench:build` ran first. Then the six V7 commands ran in order with no `--steps`, on a quiet host, with nothing else building or measuring. Each exited 0 with verdict PASS. Every record has mode `smoke`, `dirty: false`, no reasons, and every criterion verdict `null` (inapplicable in a smoke). Lowest available memory was 33.8 GB.
+
+| Command | Record under `target/benchmarks/smoke/` | Steps | Criteria | Timing phases |
+|---|---|---|---|---|
+| `bench:l1:bifrost -- --smoke` | `bifrost/writes-hot/20261026T081753Z-74b23897f.json` | 9 | 75 | warmup, repetition-1 |
+| | `bifrost/writes-parquet/20261026T081901Z-74b23897f.json` | 9 | 75 | warmup, repetition-1 |
+| | `bifrost/hot/20261026T082201Z-74b23897f.json` | 5 | 31 | warmup, repetition-1 |
+| | `bifrost/parquet/20261026T082248Z-74b23897f.json` | 10 | 74 | warmup, repetition-1 |
+| `bench:l1:verification -- --smoke` | `verification/direct-verify/20261026T082454Z-74b23897f.json` | 4 | 25 | warmup, repetition-1 |
+| `bench:l1:gateway -- --smoke` | `gateway/overhead/20261026T082542Z-74b23897f.json` | 12 | 136 | warmup, repetition-1 |
+| `bench:l2:bifrost -- --smoke` | `bifrost/competing/20261026T082705Z-74b23897f.json` | 1 | 30 | capacity, overload, recovery |
+| `bench:l2:verification -- --smoke` | `verification/competing/20261026T082921Z-74b23897f.json` | 1 | 12 | capacity, overload, recovery |
+| `bench:l2:gateway -- --smoke` | `gateway/capacity/20261026T083033Z-74b23897f.json` | 1 | 16 | capacity, overload, recovery |
+
+**Readback.**
+- **Report.** `target/profiling/release/capacity report <record.json>` exited 0 for all nine records. Each regenerated report appears verbatim, as one block, in the output its run printed.
+- **Timing evidence.**
+  - **Method.** For each measured repetition, I took the difference between the `after` and `before` snapshots in `timings/<step>/<phase>.json`, series by series and histogram by histogram (`elapsed`, `excluded`, `residual`). Then I recomputed, from those differences, every recorded reading that carries a rank.
+  - **Counts.** No bucket went negative. Every series' count difference equals its histogram population.
+  - **Rank readings.** All 264 rank-bearing readings (latency, overhead, upstream, verifier, max) reproduce exactly from their series:
+    - their sample count equals the series difference, and their value equals the bucket at the recorded rank;
+    - each `above` is the bucket's lower bound;
+    - L2 Bifrost `write_ack_p99_ms` is the merge of the per-phase `bifrost.otlp.traces`, `bifrost.otlp.logs` and `bifrost.gate.write` success series, as `read_ingest` declares.
+  - **Derived steps.** Scaling and peak steps (`point-scaling`, `span-trace-scaling`, `*-peak`) have status `derived`, no process and no timing file. Their readings come from their base steps.
+- **Production outcomes recorded without failing the smoke.** `direct-verify-c64` read p99 (1.467, 1.468] ms with 11,462 refusals, and the CPU/work operands are present: 64.53 server CPU-seconds, 123,623 verifications, 521.99 µs per verification.

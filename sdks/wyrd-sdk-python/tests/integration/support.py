@@ -119,23 +119,41 @@ class StandInModel(ModelInterface):
 
 
 def reset_telemetry_providers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unset OpenTelemetry's once-only global tracer, meter, and logger providers.
+    """Shut down and unset OpenTelemetry's once-only global tracer, meter, and logger providers.
 
     The API lets a process install each global provider once; ``monkeypatch``
     restores the module globals afterwards, so each telemetry test's install
-    stays its own.
+    stays its own. An installed SDK provider is shut down first, so its
+    periodic metric reader stops exporting instead of outliving its server.
     """
     from opentelemetry import trace
     from opentelemetry._logs import _internal as logs_internal
     from opentelemetry.metrics import _internal as metrics_internal
     from opentelemetry.util._once import Once
 
+    shut_down_telemetry_providers()
     monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
     monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
     monkeypatch.setattr(metrics_internal, "_METER_PROVIDER", None)
     monkeypatch.setattr(metrics_internal, "_METER_PROVIDER_SET_ONCE", Once())
     monkeypatch.setattr(logs_internal, "_LOGGER_PROVIDER", None)
     monkeypatch.setattr(logs_internal, "_LOGGER_PROVIDER_SET_ONCE", Once())
+
+
+def shut_down_telemetry_providers() -> None:
+    """Shut down the installed global SDK tracer, meter, and logger providers."""
+    from opentelemetry import _logs, metrics, trace
+    from opentelemetry.sdk._logs import LoggerProvider
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.trace import TracerProvider
+
+    for provider in (
+        trace.get_tracer_provider(),
+        metrics.get_meter_provider(),
+        _logs.get_logger_provider(),
+    ):
+        if isinstance(provider, (TracerProvider, MeterProvider, LoggerProvider)):
+            provider.shutdown()
 
 
 def client_of(

@@ -178,6 +178,7 @@ def closed(state: WyrdState) -> bool:
     return False
 
 
+@pytest.mark.usefixtures("fresh_telemetry_providers")
 def test_asgi_lifespan(
     observed_bundle: Path,
     observed_key: str,

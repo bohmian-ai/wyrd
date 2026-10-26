@@ -16,9 +16,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import openai
 import pytest
-from opentelemetry import _logs, metrics, trace
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry import metrics, trace
+from opentelemetry.sdk._logs import LoggingHandler
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -31,7 +30,15 @@ from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
 from .gateway.support import PROVIDER_KEY, Upstream, deploy
-from .support import Receiver, client_of, declare, pull, reset_telemetry_providers, service_key
+from .support import (
+    Receiver,
+    client_of,
+    declare,
+    pull,
+    reset_telemetry_providers,
+    service_key,
+    shut_down_telemetry_providers,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -84,20 +91,9 @@ def server(
                 {"mode": "metadata", "payload_fields": []}
             )
             yield running
-            shut_down_telemetry()
+            shut_down_telemetry_providers()
     finally:
         upstream.shutdown()
-
-
-def shut_down_telemetry() -> None:
-    """Shut down the global tracer, meter, and logger providers ``start_telemetry`` installed."""
-    for provider in (
-        trace.get_tracer_provider(),
-        metrics.get_meter_provider(),
-        _logs.get_logger_provider(),
-    ):
-        if isinstance(provider, (TracerProvider, MeterProvider, LoggerProvider)):
-            provider.shutdown()
 
 
 def configured_service(server: WyrdTestServer, tmp_path: Path) -> tuple[Path, str, str]:
@@ -145,7 +141,7 @@ def run_the_agent(state: WyrdState, server: WyrdTestServer) -> tuple[str, str, s
 
     logger.removeHandler(handler)
     state.shutdown()
-    shut_down_telemetry()
+    shut_down_telemetry_providers()
     return run.run_id, verified.execution_id, submitted.id
 
 

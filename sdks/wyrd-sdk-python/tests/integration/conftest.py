@@ -44,6 +44,7 @@ from .support import (
     pull,
     reset_telemetry_providers,
     service_key,
+    shut_down_telemetry_providers,
 )
 from .test_local_development import configure_gateway
 
@@ -258,9 +259,14 @@ def completion(body: dict) -> tuple[int, dict]:
 
 
 @pytest.fixture
-def fresh_telemetry_providers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unset OpenTelemetry's once-only global providers for one test."""
+def fresh_telemetry_providers(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """Unset OpenTelemetry's once-only global providers for one test, then shut down the ones it installed.
+
+    Request it before any state that starts telemetry, so the state shuts down first.
+    """
     reset_telemetry_providers(monkeypatch)
+    yield
+    shut_down_telemetry_providers()
 
 
 @contextmanager

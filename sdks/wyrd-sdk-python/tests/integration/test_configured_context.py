@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 from http.server import ThreadingHTTPServer
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 import openai
@@ -162,23 +162,12 @@ def contexts(server: WyrdTestServer, table: str, where: str) -> list[dict[str, A
     return query(server, f"SELECT DISTINCT {CONTEXT} FROM {table} WHERE {where}")
 
 
-def leave_data_in(server: WyrdTestServer, storage_state: str) -> None:
-    """Leave every written row in ``storage_state`` before the test queries it."""
-    if storage_state == "memtable":
-        server.settle_bifrost_outbox()
-        # Nothing is frozen, so every row is still in the writable memtable.
-        assert server.bifrost_hot_authorities() == []
-    elif storage_state == "staged":
-        server.settle_bifrost_outbox()
-        server.stage_bifrost()
-        assert set(server.bifrost_hot_authorities()) == {"staged_run"}
-    elif storage_state == "published":
-        server.flush_bifrost()
-
-
 @pytest.mark.parametrize("storage_state", ["memtable", "staged", "published"])
 def test_configure_stamps_every_table_and_each_context_column_finds_the_records(
-    server: WyrdTestServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage_state: str
+    server: WyrdTestServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    storage_state: Literal["memtable", "staged", "published"],
 ) -> None:
     bundle, key, _ = configured_service(server, tmp_path)
 
@@ -198,7 +187,7 @@ def test_configure_stamps_every_table_and_each_context_column_finds_the_records(
         deployment_environment="staging",
     )
     staging_run, staging_verified, staging_submitted = run_the_agent(staging, server)
-    leave_data_in(server, storage_state)
+    server.flush_bifrost(to=storage_state)
 
     service = str(prod.root_ref.uid)
     agent = str(prod.card_ref("agent").uid)

@@ -1,4 +1,5 @@
 import os
+from typing import Literal
 
 class WyrdTestServer:
     """Wyrd in-process test server context manager (testing feature only).
@@ -106,52 +107,25 @@ class WyrdTestServer:
         """
         ...
 
-    def flush_bifrost(self) -> None:
-        """Flush the server-owned Scribe so published rows become queryable.
+    def flush_bifrost(self, to: Literal["memtable", "staged", "published"] = "published") -> None:
+        """Move every accepted Bifrost row as far as ``to``, then confirm it is there.
 
-        Bounded: a Scribe that cannot settle its staged rows raises instead of
-        blocking the interpreter thread forever.
+        ``published`` publishes every row as a hot object. ``staged`` freezes
+        every row into a staged run and publishes nothing. ``memtable`` only
+        waits until the server's background writes reach Scribe, so every row
+        is still in the writable memtable. For ``staged`` and ``memtable`` the
+        harness refuses a state other than the one asked for, so a query that
+        follows really reads that state. Every step is bounded: a Scribe that
+        cannot settle raises instead of blocking the interpreter thread forever.
 
-        Raises:
-            WyrdError: Outside the context manager, when the Scribe cannot
-                commit its buffered rows, or when the flush does not settle
-                within the harness bound.
-        """
-        ...
-
-    def settle_bifrost_outbox(self) -> None:
-        """Wait until the server's staged Scribe writes reach Scribe, leaving them live.
-
-        Gateway calls and Verifier results are written to Scribe in the
-        background; after this returns they are queryable from the memtable,
-        and nothing is sealed or published.
+        Args:
+            to: Where the next query reads the rows from.
 
         Raises:
-            WyrdError: Outside the context manager, or when the staged writes
-                do not reach Scribe within the harness bound.
-        """
-        ...
-
-    def stage_bifrost(self) -> None:
-        """Freeze the memtable and wait until its rows are staged runs, without publishing them.
-
-        Raises:
-            WyrdError: Outside the context manager, when the server owns no
-                Scribe, or when a shard cannot freeze its generations.
-        """
-        ...
-
-    def bifrost_hot_authorities(self) -> list[str]:
-        """Where each generation the server's Scribe tracks is readable now.
-
-        Returns:
-            One label per frozen generation: ``memtable``, ``staged_run``, or
-            ``published``. Rows still accepting writes belong to no frozen
-            generation and are not listed.
-
-        Raises:
-            WyrdError: Outside the context manager, or when the server owns no
-                Scribe.
+            WyrdError: Outside the context manager, for an unknown ``to``, when
+                the rows are not in the requested state, when the Scribe cannot
+                commit its buffered rows, or when a step does not settle within
+                the harness bound.
         """
         ...
     def __enter__(self) -> WyrdTestServer: ...

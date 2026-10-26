@@ -354,23 +354,39 @@ typed columns:
   `http_response_status_code`, `url_full`, and the `exception_*` columns of the
   span's last `exception` event on spans; the record's own `exception_*`
   attributes and `body_text` (the body when it is a string) on logs.
-- `bifrost.verification.results` carries the generic outcome of one execution:
-  execution, Run, Verifier, subject, and binding identity, the verdict, and the
-  requirement, step, and provenance breakdown as the `outcome` Variant. The
-  pinned evidence is stored once, in `execution_inputs`, never repeated in the
-  outcome; a result read restores it from there by `execution_id`. A requirement's custom Verdict `data` stays inside that outcome,
-  with no column of its own. A drift requirement's typed detail lives in that outcome; its
-  per-feature method, score, threshold, and verdict are also projected one row
-  per feature into `bifrost.drift.result_features`, joined on `result_id` and
-  `requirement_id`.
-  Published correlation columns are `execution_id`, nullable `binding_id`,
-  and nullable application `run_id`; result timing remains `started_at` and
-  `ended_at`. A verification execution is never relabelled as an application
-  Run.
-- `bifrost.verification.execution_inputs` holds each execution's pinned input
-  declarations (JSON values, file digests, Artifact and trace references) and
-  its server-owned `queue_execution` marker: false for `verify`, true for
-  `submit`. Only a `true` record activates queued work.
+- Three tables hold each verification fact once. A result read assembles the
+  public `VerificationResult` from them: the verdict from `results`,
+  `requirements` and `steps` from `execution_outputs` by `result_id`, and
+  `evidence` from `execution_inputs` by `execution_id`. Detail is never
+  copied between them, and no other table projects drift detail.
+- `bifrost.verification.results` is the payload-free summary of one result:
+  result, execution, Run, Verifier, subject, binding, group, trigger, and
+  window identity, execution status, the verdict, and timing. It carries no
+  Variant. Published correlation columns are `execution_id`, nullable
+  `binding_id`, and nullable application `run_id`; result timing remains
+  `started_at` and `ended_at`. A verification execution is never relabelled
+  as an application Run.
+- `bifrost.verification.execution_outputs` holds one result's detailed
+  judgment, keyed by `result_id` with its `execution_id` and `ended_at`: the
+  sensitive `output` Variant holds exactly `requirements` and `steps`,
+  including scores, reasons, computed `actual` values, citations, check and
+  provenance detail, custom Verdict `data`, a drift requirement's per-feature
+  detail, and captured step outputs. It never holds the evidence map or a
+  second verdict. It is staged with its summary in one write, before it.
+- `bifrost.verification.execution_inputs` holds each execution's one input
+  record and its closed `origin`: `direct` (`verify`), `submitted`
+  (`submit`), `group`, or `schedule`. The `inputs` Variant holds the named
+  input declarations (JSON values, file digests, Artifact and trace
+  references) for `direct` and `submitted`, and an internal selector for
+  `group` and `schedule`. A group selector records its half-open
+  `wyrd_ingested_at` range and, per source slot, its authored reference and
+  ordered source execution IDs with each selected result ID or null; a
+  schedule selector records its `[previous boundary, due)` window and the
+  selected observation `record_id`s. Selectors reference live logical rows,
+  never copy their values, and are resolved on every execution, retry, and
+  read. The server-owned `queue_execution` marker is true only for
+  `submitted`, which alone activates queued work; its `activation` holds the
+  accepted route overrides, idempotency key, request digest, and authority.
   Its published input timestamp is `recorded_at`, the server-recorded input
   time, distinct from execution timing or sample/window time. It uses the
   same execution/binding/application-Run correlation names where applicable.
@@ -382,8 +398,8 @@ typed columns:
   SQL null for an absent Struct on hot and published data alike. Admission
   refuses a batch with a partial Struct before ACK with
   `WYRD_VALA_400_SCHEMA_PARSE` naming the row and child.
-- The `bifrost.verification.results` breakdown, the
-  `bifrost.verification.execution_inputs` declarations,
+- The `bifrost.verification.execution_outputs` output, the
+  `bifrost.verification.execution_inputs` inputs and activation,
   `bifrost.gateway.calls` `request_payload` and `response_payload`, and
   `bifrost.system.audit_log` `detail` are Variant.
 
@@ -1230,11 +1246,10 @@ date-range rather than recent-window queries, and retention measured in years
 rather than days.
 
 The four verification tables — `bifrost.drift.observations`,
-`bifrost.verification.execution_inputs`, `bifrost.verification.results`, and
-`bifrost.drift.result_features` — also partition by UTC day on each table's time
-column — `created_at` for observations, `ended_at` for results,
-`recorded_at` for execution inputs, and `wyrd_ingested_at` for result
-features —
+`bifrost.verification.execution_inputs`, `bifrost.verification.execution_outputs`,
+and `bifrost.verification.results` — also partition by UTC day on each table's
+time column — `created_at` for observations, `recorded_at` for execution
+inputs, and `ended_at` for execution outputs and results —
 never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
 not determine partition size.
 
@@ -1704,7 +1719,7 @@ Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
 `bifrost.gateway.calls` and the three verification tables
 (`bifrost.verification.results`, `bifrost.verification.execution_inputs`, and
-`bifrost.drift.result_features`) accept no public write at all: Gate refuses every
+`bifrost.verification.execution_outputs`) accept no public write at all: Gate refuses every
 principal. Only the server-internal capture writer writes them, together with
 the capture spans in `bifrost.traces.spans`, and the tenant copies of server
 spans join them there through the same outbox; result rows carry the verified
@@ -1718,7 +1733,12 @@ the tenant `System` principal as actor for a queued result. A `submit`
 creates its queued `wyrd.verifier_executions` row only after Scribe
 acknowledges its `execution_inputs` batch, through the existing batched
 request outbox; staged inputs not yet acknowledged are lost on abrupt process
-death, and the execution then never becomes visible. A pod without
+death, and the execution then never becomes visible. The row stores no input
+values: the runner resolves them, and the accepted routes, from that input
+record. A group or schedule execution's selector record is staged on a slot
+reserved before its PostgreSQL commit and is staged right after it; a runner
+claiming the execution before the record is readable retries it as evidence
+unavailable. A pod without
 Scribe submits through `ScribeCapturePeerService.IngestCapture` on the peer
 listener, which the same `wyrd-peer` mTLS admits; the request names its
 tenant and one of those five tables or `bifrost.system.audit_log` explicitly,

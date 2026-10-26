@@ -1,17 +1,18 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 13
+revision: 14
 status: approved
 ---
 
 # Benchmarks as experiments
 
-Revision 13 fixes how Verification meets its 64-client limit. Each direct
-verify stores its inputs once, in `bifrost.verification.execution_inputs`;
-the stored `outcome` in `bifrost.verification.results` no longer repeats them
-as `evidence`. Every API that returns a result still returns `evidence`, read
-from the inputs row. Stored values are encoded to Variant once, from the typed
-value. The maintainer approved this on 2026-10-26.
+Revision 14 fixes how Verification stores its records. Every execution has
+one input record in `bifrost.verification.execution_inputs`, every result one
+detailed output record in `bifrost.verification.execution_outputs`, and one
+payload-free summary in `bifrost.verification.results`. PostgreSQL coordinates
+work and stores no input values. Every API that returns a result assembles the
+same public result from those records. Stored values are encoded to Variant
+once, from the typed value. The maintainer approved this on 2026-10-26.
 
 Revision 12 removes the sampled-client `traceparent` driver option
 (`--client-trace-ratio`, formerly REQ-022) and its tenant-recording comparison.
@@ -822,10 +823,12 @@ written. TASK-005's runs on the reference host missed four of them, and this
 change optimizes the engines until each passes on that host:
 
 - Verification `direct-verify` at 64 clients: the per-request persistence
-  work that dominates server CPU. Inputs are stored only in
-  `execution_inputs`; the stored result `outcome` omits `evidence`, which
-  result-returning APIs restore from the inputs row. Each stored Variant is
-  encoded directly from its typed value, not through JSON text.
+  work that dominates server CPU. Each execution's inputs are stored once, in
+  `execution_inputs`; its Verifier's requirements and steps once, in
+  `execution_outputs`; and `results` keeps only the payload-free summary.
+  Result-returning APIs assemble `evidence` and the breakdown from those
+  records; PostgreSQL stores no input values. Each stored Variant is encoded
+  directly from its typed value, not through JSON text.
 - Bifrost point lookup, from both the memtable (`hot`) and Parquet (`parquet`):
   the projection cost that holds p99 above 5 ms at 64 clients.
 - Bifrost `writes-parquet` OTLP spans: the ≥30 MiB/CPU-s wire floor.
@@ -1101,6 +1104,15 @@ not a reason to invent a reference or weaken coverage.
   JSON text → re-parse → Variant. The maintainer decided: store inputs only in
   `execution_inputs`, keep `evidence` in API results by reading it from there,
   and encode Variants once. Approved by the maintainer on 2026-10-26.
+- Revision 14 — 2026-10-26: TASK-006-R1 found inputs still copied into
+  PostgreSQL and grouped snapshots, drift detail duplicated in
+  `bifrost.drift.result_features`, and readback unable to assemble executions
+  without an inputs row. The maintainer decided: three verification tables
+  (`execution_inputs` per execution, `execution_outputs` per result,
+  payload-free `results`), grouped and scheduled selectors recorded as input
+  references, cumulative grouped history through each settled cutoff,
+  PostgreSQL coordination only, and one result reader. Approved by the
+  maintainer on 2026-10-26.
 
 Authority (plain repository references):
 

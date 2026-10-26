@@ -190,6 +190,10 @@ and Verification's V8/V9 command until valid full L1 passes all unchanged limits
 **REFACTOR.** Reuse current execution and persistence ownership with no second
 runtime or benchmark-only fast path.
 
+Remediated by [TASK-006-R1](TASK-006-R1-simplify-verification-data-plumbing.md):
+the three verification tables and coordination-only PostgreSQL of spec
+revision 14 replace revision 13's two-table storage.
+
 ### Scenario 6 — Both Bifrost lookup storage states meet the point SLO
 
 **Behavior.** Exact point results retain schema projection, tenant isolation

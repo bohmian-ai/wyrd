@@ -247,6 +247,7 @@ pub fn declare(
 /// The metrics both levels read for direct `verify` and its work.
 fn work_metrics() -> Vec<Metric> {
     vec![
+        Metric::cores(),
         Metric::derived(
             "rate",
             "verifications/s",

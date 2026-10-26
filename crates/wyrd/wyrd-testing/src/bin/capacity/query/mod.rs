@@ -546,6 +546,7 @@ fn isolated_metrics() -> Vec<Metric> {
     let cpu_per = |(work, scale): (String, f64)| Derive::CpuPer { work, scale };
     let rate = |(work, scale): (String, f64)| Derive::Rate { work, scale };
     vec![
+        Metric::cores(),
         Metric::raw(
             "requests",
             "requests",

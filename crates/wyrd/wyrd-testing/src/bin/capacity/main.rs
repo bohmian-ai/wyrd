@@ -200,9 +200,9 @@ mod tests {
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
     use wyrd_testing::experiment::{
-        Arrivals, Declaration, Engine, ExperimentError, HostRecord, Level, Mode, Op, Options,
-        Phase, Reading, Record, Repetition, Rule, Source, Status, Step, StepKind, Timing, Verdict,
-        Workload, run,
+        Arrivals, Declaration, Derive, Engine, ExperimentError, HostRecord, Level, Mode, Op,
+        Options, Phase, Reading, Record, Repetition, Rule, Source, Status, Step, StepKind, Timing,
+        Verdict, Workload, run,
     };
     use wyrd_testing::release_server::{HostLoad, PEAK_SAMPLE_INTERVAL_MS};
 
@@ -979,6 +979,255 @@ mod tests {
             );
             let (record, _) = execute(declaration.clone(), Box::new(|_, _, _| {})).await;
             assert_eq!(record.verdict, Verdict::Pass, "{}", record.render());
+        }
+    }
+
+    /// V2: one representative case of every engine shape keeps server
+    /// latency, CPU-seconds, busy cores `C/T`, provisioned `P`, `W/T`,
+    /// `(W/T)/P`, `W/C`, `C/W`, peak memory and every outcome count, plus
+    /// write rows and uncompressed and OTLP wire bytes, query scan facts and
+    /// capture bytes; each derived value recomputes from its own operands,
+    /// the report row shows them, and a repetition without server CPU leaves
+    /// every CPU-derived metric missing with a reason and the run INVALID,
+    /// never a favourable zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a case loses a required metric or derives it wrongly.
+    #[tokio::test(start_paused = true)]
+    async fn engine_cases_preserve_latency_cpu_and_core_throughput() {
+        let root = repository();
+        let bifrost = |experiment: query::Experiment| {
+            declare(
+                Engine::Bifrost,
+                Level::One,
+                &[experiment.name()],
+                BASELINE_HOST,
+                &root,
+            )
+        };
+        let cases = [
+            (
+                bifrost(query::Experiment::WritesParquet),
+                "otlp-spans-c64",
+                "rows",
+                vec![
+                    "rows_per_s_per_vcpu",
+                    "rows_per_cpu_s",
+                    "cpu_us_per_row",
+                    "mib_per_s_per_vcpu",
+                    "mib_per_cpu_s",
+                    "wire_mib_per_s_per_vcpu",
+                    "wire_mib_per_cpu_s",
+                    "memory_per_mib_s",
+                ],
+                vec![
+                    "requests",
+                    "errors",
+                    "server_failures",
+                    "rows",
+                    "retained_mib",
+                    "wire_bytes",
+                    "published_files",
+                    "published_mib",
+                    "memtable_backlog_mib",
+                    "staged_backlog_mib",
+                ],
+            ),
+            (
+                bifrost(query::Experiment::WritesHot),
+                "native-write-c1",
+                "rows",
+                vec![
+                    "rows_per_s_per_vcpu",
+                    "rows_per_cpu_s",
+                    "cpu_us_per_row",
+                    "mib_per_cpu_s",
+                ],
+                vec![
+                    "requests",
+                    "errors",
+                    "server_failures",
+                    "rows",
+                    "retained_mib",
+                ],
+            ),
+            (
+                bifrost(query::Experiment::Parquet),
+                "point-c64",
+                "queries",
+                vec![
+                    "queries_per_s_per_vcpu",
+                    "queries_per_cpu_s",
+                    "cpu_ms_per_query",
+                ],
+                vec![
+                    "queries",
+                    "errors",
+                    "server_failures",
+                    "wrong_results",
+                    "scanned_rows_per_query",
+                    "scanned_bytes_per_query",
+                ],
+            ),
+            (
+                bifrost(query::Experiment::Hot),
+                "small-aggregate-c1",
+                "queries",
+                vec![
+                    "queries_per_s_per_vcpu",
+                    "queries_per_cpu_s",
+                    "cpu_ms_per_query",
+                ],
+                vec!["queries", "errors", "server_failures", "wrong_results"],
+            ),
+            (
+                declare(Engine::Verification, Level::One, &[], BASELINE_HOST, &root),
+                "direct-verify-c64",
+                "verifications",
+                vec![
+                    "verifications_per_s_per_vcpu",
+                    "verifications_per_cpu_s",
+                    "cpu_us_per_verification",
+                ],
+                vec![
+                    "verifications",
+                    "errors",
+                    "server_failures",
+                    "wrong",
+                    "overhead_p99_ms",
+                    "verifier_p99_ms",
+                ],
+            ),
+            (
+                declare(Engine::Gateway, Level::One, &[], BASELINE_HOST, &root),
+                "chat-capture.c64",
+                "requests",
+                vec![
+                    "requests_per_s_per_vcpu",
+                    "requests_per_cpu_s",
+                    "cpu_us_per_request",
+                    "capture_bytes_per_s_per_vcpu",
+                    "capture_bytes_per_cpu_s",
+                ],
+                vec![
+                    "requests",
+                    "arrivals",
+                    "errors",
+                    "server_failures",
+                    "overhead_p99_ms",
+                    "capture_staged",
+                    "capture_dropped",
+                    "capture_lost",
+                    "capture_bytes",
+                ],
+            ),
+        ];
+        for (declaration, case, work, derived, raw) in cases {
+            let name = format!("{} {case}", declaration.experiment);
+            let (record, _) = execute(declaration.clone(), Box::new(|_, _, _| {})).await;
+            let step = record
+                .steps
+                .iter()
+                .find(|step| step.id == case)
+                .unwrap_or_else(|| panic!("{name} is declared"));
+            assert_eq!(step.repetitions.len(), 3, "{name}");
+            for repetition in &step.repetitions {
+                let read = |id: &str| {
+                    repetition.reading(id).value.unwrap_or_else(|| {
+                        panic!("{name} keeps `{id}`: {:?}", repetition.reading(id))
+                    })
+                };
+                for id in ["p50_ms", "p95_ms", "p99_ms"].iter().chain(&raw) {
+                    read(id);
+                }
+                let cpu = repetition.server_cpu_seconds.expect("server CPU");
+                let vcpus = repetition.provisioned_vcpus.expect("provisioned vCPUs") as f64;
+                let w = read(work);
+                let t = repetition.seconds;
+                assert!(
+                    repetition.peak_memory_bytes.is_some(),
+                    "{name} samples peak memory"
+                );
+                assert!(
+                    repetition.driver_cpu_seconds.is_some(),
+                    "{name} reads driver CPU apart"
+                );
+                let close = |id: &str, expected: f64| {
+                    let got = read(id);
+                    assert!(
+                        (got - expected).abs() <= expected.abs() * 1e-9,
+                        "{name} `{id}` = {got}, recomputed {expected}"
+                    );
+                };
+                close("cores", cpu / t);
+                close("rate", w / t);
+                for id in &derived {
+                    let metric = declaration
+                        .metric(id)
+                        .unwrap_or_else(|| panic!("{name} declares `{id}`"));
+                    let operand = |work: &str| read(work);
+                    match metric.derive.as_ref().expect("derived") {
+                        Derive::PerVcpu { work, scale } => {
+                            close(id, operand(work) / t / vcpus * scale);
+                        }
+                        Derive::PerCpu { work, scale } => close(id, operand(work) / cpu * scale),
+                        Derive::CpuPer { work, scale } => close(id, cpu / operand(work) * scale),
+                        Derive::MemoryPer { work } => close(
+                            id,
+                            repetition.peak_memory_bytes.expect("memory") as f64
+                                / (operand(work) / t),
+                        ),
+                        other => panic!("{name} `{id}` derives {other:?}"),
+                    }
+                }
+            }
+            let report = record.render();
+            let row = report
+                .lines()
+                .find(|line| line.starts_with(&format!("| {case} |")))
+                .unwrap_or_else(|| panic!("{name} has a report row"));
+            for id in derived.iter().take(3) {
+                let unit = declaration.metric(id).expect("metric").unit.clone();
+                assert!(row.contains(&unit), "{name} row shows {unit}: {row}");
+            }
+            assert!(row.contains("cores used") && row.contains("vCPU"), "{row}");
+
+            let (unmeasured, _) = execute(
+                declaration.clone(),
+                Box::new(move |step, _, repetition| {
+                    if step.id == case {
+                        repetition.server_cpu_seconds = None;
+                    }
+                }),
+            )
+            .await;
+            let step = unmeasured
+                .steps
+                .iter()
+                .find(|step| step.id == case)
+                .expect("case");
+            for id in derived.iter().chain(&["cores"]) {
+                let reading = step.repetitions[0].reading(id);
+                if declaration.metric(id).is_some_and(|metric| {
+                    !matches!(
+                        metric.derive,
+                        Some(
+                            Derive::Rate { .. } | Derive::PerVcpu { .. } | Derive::MemoryPer { .. }
+                        )
+                    )
+                }) {
+                    assert!(
+                        reading.value.is_none()
+                            && reading
+                                .reason
+                                .as_deref()
+                                .is_some_and(|reason| reason.contains("CPU")),
+                        "{name} `{id}` without server CPU: {reading:?}"
+                    );
+                }
+            }
+            assert_eq!(unmeasured.verdict, Verdict::Invalid, "{name}");
         }
     }
 

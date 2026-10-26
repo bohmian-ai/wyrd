@@ -436,6 +436,20 @@ impl Metric {
         }
     }
 
+    /// `cores`: the window's mean busy server cores `C/T`, a descriptive
+    /// reading beside provisioned `P` that no criterion compares.
+    #[must_use]
+    pub fn cores() -> Self {
+        Self {
+            derive: Some(Derive::Cores),
+            ..Self::raw(
+                "cores",
+                "cores",
+                "C/T: server CPU-seconds of the declared processes per wall second of the window",
+            )
+        }
+    }
+
     /// A metric derived by `derive`, improving in `direction`.
     #[must_use]
     pub fn derived(
@@ -3353,7 +3367,9 @@ impl Record {
                 let normalized = self.criteria.metrics.iter().filter(|metric| {
                     matches!(
                         metric.derive,
-                        Some(Derive::PerVcpu { .. } | Derive::PerCpu { .. })
+                        Some(
+                            Derive::PerVcpu { .. } | Derive::PerCpu { .. } | Derive::CpuPer { .. }
+                        )
                     )
                 });
                 std::iter::once(rate.cell(&self.unit("rate")))

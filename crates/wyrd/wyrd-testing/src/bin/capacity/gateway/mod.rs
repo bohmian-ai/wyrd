@@ -457,6 +457,7 @@ fn latency_metrics(boundary: &str) -> Vec<Metric> {
 /// The derived rate and per-core metrics every Gateway repetition reports.
 fn efficiency_metrics() -> Vec<Metric> {
     vec![
+        Metric::cores(),
         Metric::derived(
             "rate",
             "requests/s",

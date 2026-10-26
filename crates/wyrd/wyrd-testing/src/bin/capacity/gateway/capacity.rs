@@ -1466,7 +1466,6 @@ mod tests {
             offset: Duration::from_secs(offset),
             timed: Timed {
                 sent: scheduled,
-                headers: None,
                 events,
                 done: at(done_ms),
                 outcome,

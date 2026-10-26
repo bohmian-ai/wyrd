@@ -40,6 +40,7 @@ use wyrd_testing::experiment::{
 use wyrd_testing::release_server::LocalServer;
 
 use crate::client_queue::{self, Emitted, LANES};
+
 use crate::query::isolated::{INSERTED, MIB, SUCCESS};
 use crate::query::run::{
     Admission, Bench, Overload, QUEUE_FULL, Sender, WRONG_RESULT, ask, micros,
@@ -107,8 +108,8 @@ struct Asked {
     phase: &'static str,
     /// What it asked.
     case: Case,
-    /// Its diagnostic client latency in microseconds, or its error code.
-    result: Result<u64, String>,
+    /// Whether it answered correctly, or its error code.
+    result: Result<(), String>,
 }
 
 /// One acknowledged or failed ingest request.
@@ -121,8 +122,8 @@ struct Acked {
     rows: u64,
     /// Encoded OTLP protobuf bytes it sent; zero for native writes.
     wire: u64,
-    /// Its diagnostic client latency in microseconds, or its error code.
-    result: Result<u64, String>,
+    /// Whether it was acknowledged, or its error code.
+    result: Result<(), String>,
 }
 
 /// What one open loop, an ingest path's or the mixed queries', scheduled,
@@ -448,7 +449,7 @@ fn expected(asked: &[Asked], offered: &[Offered<Acked>]) -> Vec<Expected<'static
                     asked
                         .result
                         .as_ref()
-                        .map_or_else(|code| code == WRONG_RESULT, |_| true)
+                        .map_or_else(|code| code == WRONG_RESULT, |()| true)
                 })
                 .count();
             expected.push(Expected {
@@ -506,14 +507,13 @@ async fn offer(
         let (sender, outstanding, probe) = (sender.clone(), Arc::clone(outstanding), probe.clone());
         outstanding.fetch_add(chunk, Ordering::Relaxed);
         async move {
-            let sent = std::time::Instant::now();
-            let sent_bytes =
+            let sent =
                 with_benchmark_labels(op.name(), phase, sender.send(first, first + chunk)).await;
-            let wire = *sent_bytes.as_ref().unwrap_or(&0);
-            let result = sent_bytes.map(|_| micros(sent));
+            let wire = *sent.as_ref().unwrap_or(&0);
+            let result = sent.map(|_| ());
             outstanding.fetch_sub(chunk, Ordering::Relaxed);
             let at = Instant::now();
-            if let (Ok(_), Some(probe)) = (&result, probe) {
+            if let (Ok(()), Some(probe)) = (&result, probe) {
                 let _ = probe.send((at, first + chunk - 1));
             }
             Acked {
@@ -580,10 +580,8 @@ async fn mixed(
         let (sql, expected) = bench.question(case, next);
         let queries = Arc::clone(&queries);
         async move {
-            let sent = std::time::Instant::now();
-            let result = with_benchmark_labels(case.label(), phase, ask(&queries, sql, &expected))
-                .await
-                .map(|()| micros(sent));
+            let result =
+                with_benchmark_labels(case.label(), phase, ask(&queries, sql, &expected)).await;
             Asked {
                 at: Instant::now(),
                 phase,
@@ -1194,8 +1192,8 @@ mod tests {
             result,
         };
         let asked = [
-            asked("capacity", Ok(1)),
-            asked("capacity", Ok(1)),
+            asked("capacity", Ok(())),
+            asked("capacity", Ok(())),
             asked("capacity", Err(WRONG_RESULT.to_owned())),
             asked("capacity", Err("WYRD_X".to_owned())),
         ];
@@ -1424,9 +1422,9 @@ mod tests {
             result,
         };
         let asked = [
-            asked(early, Case::TableAggregate, Ok(1)),
-            asked(end, Case::TableAggregate, Ok(1)),
-            asked(late, Case::Selective, Ok(1)),
+            asked(early, Case::TableAggregate, Ok(())),
+            asked(end, Case::TableAggregate, Ok(())),
+            asked(late, Case::Selective, Ok(())),
         ];
         let acked = |at, rows, result| Acked {
             at,
@@ -1437,8 +1435,8 @@ mod tests {
         };
         let offered = [Offered {
             acked: vec![
-                acked(early, 10, Ok(1)),
-                acked(late, 20, Ok(1)),
+                acked(early, 10, Ok(())),
+                acked(late, 20, Ok(())),
                 acked(late, 40, Err("WYRD_X".to_owned())),
             ],
             ..Offered::default()

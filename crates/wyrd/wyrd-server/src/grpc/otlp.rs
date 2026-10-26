@@ -217,11 +217,15 @@ where
 /// Boxes one export's service future and records its server time, from the
 /// service call through the built response, through
 /// [`wyrd_telemetry::record_timing`] at `boundary`: `success` when the
-/// response carries no error `grpc-status`, else `failed`.
+/// response carries no error `grpc-status`, else `failed`. Without benchmark
+/// timing it only boxes the future: no clock, span or status is read.
 fn timed(
     boundary: &'static str,
     export: impl Future<Output = Result<HttpResponse<TonicBody>, Infallible>> + Send + 'static,
 ) -> Pin<Box<dyn Future<Output = Result<HttpResponse<TonicBody>, Infallible>> + Send>> {
+    if !wyrd_telemetry::timing::enabled() {
+        return Box::pin(export);
+    }
     let started = std::time::Instant::now();
     let parent = tracing::Span::current();
     Box::pin(async move {
@@ -502,7 +506,7 @@ where
         let gate = Arc::clone(&self.gate);
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Metrics);
         let authentication = self.authentication.clone();
-        timed("bifrost.otlp.metrics", async move {
+        Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
             let auth = match authentication.authenticate(&metadata).await {
                 Ok(auth) => auth,

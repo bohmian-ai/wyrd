@@ -99,11 +99,17 @@ struct QueryTiming {
 
 impl QueryTiming {
     /// Starts the timing of a query that arrived at `arrival`, under the
-    /// current span.
+    /// current span; without benchmark timing it holds neither, so it
+    /// records nothing.
     fn new(arrival: Option<RequestArrival>) -> Self {
+        let enabled = wyrd_telemetry::timing::enabled();
         Self {
-            parent: tracing::Span::current(),
-            arrival: arrival.map(RequestArrival::instant),
+            parent: if enabled {
+                tracing::Span::current()
+            } else {
+                tracing::Span::none()
+            },
+            arrival: arrival.filter(|_| enabled).map(RequestArrival::instant),
             outcome: "cancelled",
         }
     }
@@ -963,6 +969,23 @@ mod tests {
             dropped.load(Ordering::Acquire),
             "transport body drop must release Oracle stream guards"
         );
+    }
+
+    /// Without benchmark timing a query's timing holds neither the request
+    /// span nor its arrival, so it clones no span and records nothing.
+    ///
+    /// # Panics
+    /// Panics when timing is on in this process or the timing holds either.
+    #[test]
+    fn query_timing_holds_nothing_while_benchmark_timing_is_off() {
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let span = tracing::info_span!("request");
+            let _entered = span.enter();
+            assert!(!wyrd_telemetry::timing::enabled());
+            let timing = QueryTiming::new(Some(RequestArrival(std::time::Instant::now())));
+            assert!(timing.parent.is_none(), "no span is cloned");
+            assert_eq!(timing.arrival, None, "no arrival is kept");
+        });
     }
 
     /// A query's `bifrost.query` observation spans its arrival through the

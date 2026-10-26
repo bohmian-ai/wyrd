@@ -206,10 +206,10 @@ impl ExecutionTelemetry {
     /// Emit the outcome families of [`finish`](Self::finish): each phase,
     /// the whole execution, the Verifier's block time, and the overhead.
     ///
-    /// The execution and block-union durations are also recorded through
-    /// [`wyrd_telemetry::record_timing`] under the current span's benchmark
-    /// classification at boundary `verification.direct` or
-    /// `verification.queued`.
+    /// A direct execution's duration and block union are also recorded
+    /// through [`wyrd_telemetry::record_timing`] under the current span's
+    /// benchmark classification at boundary `verification.direct`; no
+    /// benchmark reads a queued execution's, so it records none.
     fn emit(&self, outcome: &'static str, failed: bool) {
         let total = self.started.elapsed();
         let ledger = self.lock();
@@ -225,16 +225,15 @@ impl ExecutionTelemetry {
             }
         }
         let verifier = union(&self.clock.intervals());
-        wyrd_telemetry::record_timing(
-            &tracing::Span::current(),
-            match self.mode {
-                ExecutionMode::Direct => "verification.direct",
-                ExecutionMode::Queued => "verification.queued",
-            },
-            outcome,
-            total,
-            Some(verifier),
-        );
+        if self.mode == ExecutionMode::Direct {
+            wyrd_telemetry::record_timing(
+                &tracing::Span::current(),
+                "verification.direct",
+                outcome,
+                total,
+                Some(verifier),
+            );
+        }
         metrics::histogram!(VERIFICATION_VERIFIER_SECONDS, "mode" => mode, "outcome" => outcome)
             .record(verifier.as_secs_f64());
         metrics::histogram!(VERIFICATION_OVERHEAD_SECONDS, "mode" => mode, "outcome" => outcome)

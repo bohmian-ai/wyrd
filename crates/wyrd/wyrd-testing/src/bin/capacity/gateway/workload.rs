@@ -238,8 +238,6 @@ impl Outcome {
 pub struct Timed {
     /// Just before the request was sent.
     pub sent: Instant,
-    /// When the response headers arrived.
-    pub headers: Option<Instant>,
     /// When each complete stream data event carrying a choice arrived.
     pub events: Vec<Instant>,
     /// When the answer was complete and validated, or the call ended.
@@ -254,7 +252,6 @@ pub async fn call(http: &Client, key: &SecretString, shape: &Shape, body: Bytes)
     let sent = Instant::now();
     let mut timed = Timed {
         sent,
-        headers: None,
         events: Vec::new(),
         done: sent,
         outcome: Outcome::Answered,
@@ -296,7 +293,6 @@ async fn exchange(
         Err(error) if error.is_timeout() => return Outcome::TimedOut,
         Err(error) => return Outcome::Failed(format!("transport: {error}")),
     };
-    timed.headers = Some(Instant::now());
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();

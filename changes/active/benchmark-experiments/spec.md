@@ -347,7 +347,7 @@ aggregate runs three such experiments and therefore has a 15-minute upper
 bound. L1 measures 1 and 64 clients only on every engine. Measured windows are
 3 × 5 seconds after a 5-second warmup; a case keeps 3 × 10 seconds only when
 5 seconds cannot meet its declared sample floor, and the record names which
-cases did. The 15 Bifrost cases need about 6 minutes of warmup/repetition
+cases did. The 18 Bifrost cases need about 6 minutes of warmup/repetition
 windows in total, split across their three commands. Individual cases
 and experiments remain available for fast optimization feedback. Build binaries and prepare external prerequisites before
 starting the experiment clock; the clock includes quiet-host checking, server

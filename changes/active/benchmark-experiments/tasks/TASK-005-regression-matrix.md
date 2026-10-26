@@ -787,3 +787,11 @@ Not run, pending the spec decision:
 Verdict: SPEC_REVISION_REQUIRED. The decision for `$wyrd-spec`:
 - whether TASK-005 must first carry the engine optimizations for these two SLOs, which the spec currently leaves out of scope;
 - or whether the declared limits or coverage for `direct-verify-c64` and hot `point-c64` change on this reference host.
+
+**The full writes-hot suite does not fit this host's memory.**
+- `mise run bench:l1:bifrost:writes:hot -- --qualify-baseline` on clean `53b53f594` passed its smoke prepass. Its full run drove available memory down from 53 GB to 1.2 GB of 91 GiB (D7).
+- I stopped it then, before the host's out-of-memory killer acted, so no record was written.
+- Writes-parquet, parquet and Gateway were not reached.
+- Every row of the declared full work stays in the server's memtables: 2M-row fixture, 5 s warmup and 3 × 10 s windows at 64 clients.
+- Completing it on this host would take a smaller fixture, shorter windows or other memtable settings, which are changes to fixture or coverage. Running it on a larger host would make that host the reference host.
+- The spec decision above should cover this as well.

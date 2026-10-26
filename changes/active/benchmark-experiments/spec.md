@@ -831,6 +831,11 @@ change optimizes the engines until each passes on that host:
   directly from its typed value, not through JSON text. Staged rows are
   admitted by the memory they own, and different executions' writes drain
   through the producer outbox lanes concurrently, each execution's in order.
+  Staged verification and audit rows are built once into dense batches when
+  their lane drains; the local Scribe ingests them as server-built canonical
+  batches while peer IPC keeps full validation and the same batch identity;
+  stored Variants are validated without copying; and persistence sorting
+  gathers payload from its source batches instead of concatenating it first.
 - Bifrost point lookup, from both the memtable (`hot`) and Parquet (`parquet`):
   the projection cost that holds p99 above 5 ms at 64 clients.
 - Bifrost `writes-parquet` OTLP spans: the ≥30 MiB/CPU-s wire floor.

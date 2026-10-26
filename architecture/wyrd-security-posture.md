@@ -786,9 +786,14 @@ lane and one Verifier execution's inputs and result in one lane, so an
 execution's inputs commit no later than its result while different requests
 and executions are written concurrently; queued submissions sharing an
 idempotency key share a lane, so they are acknowledged in arrival order. It groups each lane's slice by
-destination, encodes Arrow frames with content-derived batch ids, and submits
-them to the local Scribe or over the mutually authenticated peer plane to a
-Scribe pod. Producer lanes are not Scribe shards: Scribe routes each admitted
+destination, builds each group's server-projected rows once, encodes Arrow
+frames with content-derived batch ids, and submits them to the local Scribe or
+over the mutually authenticated peer plane to a Scribe pod. Only the local
+Scribe takes those rows in-process as server-built canonical batches, whose
+values are not revalidated; the trust follows from the in-process call, never
+from a flag a caller can set. Peer and native Arrow IPC is a trust boundary
+and is validated in full, and both paths keep tenant, schema, reserved-column,
+managed-envelope, and admission checks. Producer lanes are not Scribe shards: Scribe routes each admitted
 frame to its own shard and durability owner whichever lane submitted it. A retryable failure is
 logged with its tenant, counted in `outbox_write_failures_total{outbox="scribe"}`,
 and resubmitted as the identical slice, which Scribe's durable batch-id fence

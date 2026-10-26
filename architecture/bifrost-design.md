@@ -709,7 +709,11 @@ ImmutableArrow
   -> Retired
 ```
 
-`ScribeHotStage` bounded-sorts a member into immutable local Parquet runs,
+`ScribeHotStage` bounded-sorts a member into immutable local Parquet runs:
+each bounded candidate's order is computed from its sort-key columns alone,
+and each payload column is gathered once from the candidate's source batches
+into the sorted output, so the unsorted payload is never concatenated first.
+It
 fsyncs the file, manifest, and directory, verifies checksum/schema/layout/footer,
 performs a bounded read preflight, and registers it as live-tail authority. The
 shared cohort WAL retires only after every member reaches that boundary.
@@ -1217,10 +1221,15 @@ Python, TypeScript, and MCP.
 `bifrost.system.audit_log` is the authoritative retained audit history. Every
 audit event is staged in memory on the process Scribe outbox, whose one
 background writer cuts each tenant's writes into producer lanes keyed by
-request, Verifier execution, or a queued submission's idempotency key, groups a lane's slice by destination, encodes one Arrow
-frame per group with a batch id derived from its content, and submits it to
-the local Scribe or, from a pod without Scribe, to a Scribe pod over the
-mutually authenticated peer plane. Audit frames are submitted under the
+request, Verifier execution, or a queued submission's idempotency key, groups a lane's slice by destination, and
+builds each group's rows once into dense Arrow batches from the owned values
+and encoded Variants each write staged, never one batch per write. Each frame
+is encoded as Arrow IPC, which sizes and splits it and derives its batch id
+from that content. The local Scribe receives the frame's rows in-process as
+server-built canonical batches under ordinary admission, without decoding or
+revalidating values the producer built; from a pod without Scribe, the IPC
+bytes travel to a Scribe pod over the mutually authenticated peer plane, which
+validates them in full. Both carry the same rows under the same batch id. Audit frames are submitted under the
 platform audit principal, the one principal Scribe admits for the reserved
 system owner's audit history. A retryable failure resubmits the identical
 slice, so Scribe's durable batch-id fence absorbs a write whose

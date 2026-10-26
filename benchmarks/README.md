@@ -21,6 +21,8 @@ mise run bench:l2:verification
 mise run bench:l2:gateway
 mise run bench:l1:gateway -- --profile --steps chat.c64
 mise run bench:l1:gateway -- --smoke # one plan at smoke scale
+mise run bench:l1:gateway -- --qualify-baseline   # a reference candidate
+target/profiling/release/capacity reference <a.json> <b.json>  # reviewed references
 ```
 
 `--smoke` runs a normal command's whole workflow (fixture loading and
@@ -79,7 +81,8 @@ configuration declares server limits.
   P vCPU`: cores used is measured, P is what the host offered. Only work
   completed before the window end counts as W, and later completions are
   reported apart. In L2, C is the server's total CPU, so every class's `W/C`
-  also pays for the competing work. Baselines compare `W/C`.
+  also pays for the competing work. References compare `W/C`,
+  `C/W`, and `(W/T)/P`.
 - **Bytes have declared sources.** Writes report rows, retained Arrow MiB
   (uncompressed), and encoded OTLP wire MiB. Queries report the mean scanned
   rows and bytes of each query's own executed plan, from the same snapshots. The L1
@@ -171,9 +174,10 @@ Flags:
 | `--profile` | every command | Adds optional samply captures under `target/benchmarks/` (see [Profiling](#profiling)). |
 | `--allow-dirty` | every command | Records a dirty source (see [Source](#source)). |
 | `--steps a,b` | engine commands | Runs a declared subset; the record lists every omitted step and never claims full coverage. |
+| `--qualify-baseline` | L1 commands | Records a reference candidate judged only by its limits (see [References](#references)). |
 
-`bench:l1` accepts only `--profile` and `--allow-dirty`, and passes them to
-every engine.
+`bench:l1` accepts only `--profile`, `--allow-dirty`, `--smoke`, and
+`--qualify-baseline`, and passes them to every engine.
 
 ## Verdicts
 
@@ -181,7 +185,7 @@ Every run ends with one verdict and exit code:
 
 - **PASS (0):** every applicable criterion holds.
 - **FAIL (1):** valid evidence missed a declared criterion: an SLO, a sanity
-  floor, a correctness or integrity check, or a baseline regression.
+  floor, a correctness or integrity check, or a reference regression.
 - **INVALID (2):** the evidence cannot answer the question, so the run does
   not count. Causes include:
   - a busy host, or a driver above 80% of its 8-core budget;
@@ -193,6 +197,8 @@ Every run ends with one verdict and exit code:
   - a missing or reset CPU reading;
   - an overrun budget, an interruption, or a failed workload;
   - a declared baseline that is missing or excluded;
+  - a full L1 case with no reviewed reference of the same method (see
+    [References](#references));
   - a dirty source without `--allow-dirty`.
 
 INVALID takes precedence over FAIL, and FAIL over PASS. A FAIL found in an
@@ -204,7 +210,8 @@ three repetitions. Correctness and integrity criteria judge every repetition.
 
 ## Records and reports
 
-Each run appends one JSON record, schema version 1:
+Each run appends one JSON record, schema version 2 (version 1 records still
+read back):
 
 ```text
 benchmarks/<engine>/<experiment>/YYYYMMDDTHHMMSSZ-<sha9>.json
@@ -218,7 +225,10 @@ a `-<n>` suffix. A record holds:
 - the declared controls and criteria, with baseline snapshots;
 - every repetition's metrics, units, sample counts, and server and driver
   CPU;
-- every reason, and the verdict.
+- every reason, and the verdict;
+- for a full L1 run, its regression coverage: `covered` when every case was
+  judged against a same-method reference, `uncovered` otherwise, and
+  `baseline-unavailable` for a qualification run.
 
 Raw evidence stays under `target/benchmarks/<engine>/<experiment>/`:
 the server log sits beside any profiles. The next run of that experiment replaces
@@ -240,34 +250,53 @@ INVALID. `--allow-dirty` measures it anyway and records the SHA-256 of
 
 ## Baselines
 
-`benchmarks/<engine>/baselines.toml` holds the historical references that
-criteria name by `id`. Each entry carries:
+`benchmarks/<engine>/baselines.toml` holds two kinds of entry that criteria
+name by `id`.
 
-- its value and unit, and the original operands;
-- its fixture, source report, and source commit;
-- its host fingerprint, and its limitations.
+Historical entries come from earlier reports. Each carries its value and
+unit, the original operands, its fixture, source report and commit, its host
+fingerprint, and its limitations. They predate method identity, so they
+never judge: an eligible one is advisory, and the record keeps both
+fingerprints. A missing, excluded, or unit-incompatible one makes the run
+INVALID. The Bifrost entries come from the clean pre-merge `cfe21dc90` runs
+on an AMD Ryzen 9 9950X Linux host; Verification and Gateway have none.
 
-A criterion's baseline is fixed when the run is declared:
+## References
 
-- An eligible entry from the same host fingerprint and fixture judges with
-  the noise-aware regression rule. Higher-is-better fails when the upper
-  repetition is below 90% of the baseline and the drop exceeds the spread.
-  Lower-is-better fails when the lower repetition is above 115% and the rise
-  exceeds the spread.
-- An eligible entry from another host, OS, or fixture is advisory. The
-  record keeps both fingerprints, and the entry never judges.
-- A missing, excluded, or unit-incompatible entry makes the run INVALID.
+Every full L1 case is judged against a reviewed reference
+`reference.<experiment>.<step>.<metric>` for its latency (the declared
+percentile; a full scan has none), CPU per unit of work, work per
+server CPU-second, and work per second per vCPU. A reference carries the
+median of six repetitions, the low and high bounds of a latency, and its
+method: a digest of the engine, experiment, level, mode, timing, validity,
+variables, controls, step, build, host, the `WYRD_*` configuration, and
+`--profile`. The commit and binaries are not part of it.
 
-Today's eligible entries are all Bifrost. They come from the clean pre-merge
-`cfe21dc90` runs, recorded on an AMD Ryzen 9 9950X Linux host. The 2026-10-21
-candidates stay excluded until their clean source is established. The L1
-native-write fixture (2M rows) differs from its 10M-row baseline, so native
-comparisons are advisory. Verification and Gateway have no eligible baseline,
-so their experiments judge only their declared limits. Their files list the
-excluded sources and the reasons for excluding them.
+- A reference of the same method judges with the noise-aware rule.
+  Higher-is-better fails when the upper repetition is below 90% of the
+  reference and the drop exceeds the spread; lower-is-better fails when the
+  lower repetition is above 115% and the rise exceeds the spread. A latency
+  compares bounds: it fails only when even its best bound fails against the
+  reference's worst, and an overlap that decides neither is INVALID.
+- A missing reference, or one of another method, makes the case INVALID.
+- A diagnostic run (`--profile`, an OTLP trace endpoint, sample ratio, or
+  export timeout, a trace filter, or `WYRD_LOG` other than `info`) only advises against a
+  reference of another method.
 
-A baseline changes only by editing `baselines.toml` in review. No run promotes
-itself.
+To establish references for a host:
+
+1. From clean committed source, run the full suite twice with
+   `--qualify-baseline`. Such a run judges only its declared limits, records
+   `baseline-unavailable`, and is refused (INVALID) for L2, a smoke, `--steps`,
+   a dirty source, or a diagnostic configuration.
+2. Run `capacity reference` over both records of each experiment. It checks
+   that every record qualified, that they share engine, experiment, and
+   method, and that each metric has at least six bounded repetitions, then
+   prints the `[[entries]]` TOML. It writes nothing.
+3. Review the TOML and commit it to `baselines.toml`.
+
+A reference changes only by editing `baselines.toml` in review. No run
+promotes itself.
 
 ## Profiling
 
@@ -275,4 +304,6 @@ itself.
 invocation on every platform, and saves the captures under the run's
 `target/benchmarks/` artifacts. A profile is diagnostic only. When samply is
 missing or a capture fails, the record carries a note instead, and the
-verdict is unchanged.
+verdict is unchanged. A profiled run is a diagnostic configuration: it
+never qualifies as a reference, and it only advises against a reference of
+another method.

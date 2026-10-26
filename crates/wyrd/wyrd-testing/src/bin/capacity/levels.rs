@@ -6,7 +6,7 @@
 //! production calls. This module fills the declaration's source, build, host,
 //! and invocation, applies `--steps`, `--allow-dirty`, `--profile`,
 //! `--smoke`, and `--qualify-baseline`, declares each step's relative
-//! comparisons against its reviewed references ([`compare`]), runs a full plan's smoke prepass ([`prepass`]), runs
+//! comparisons against its reviewed references ([`compare`]), runs
 //! [`wyrd_testing::experiment::run`], publishes the record under
 //! `benchmarks/<engine>/<experiment>/` (a smoke's under
 //! [`SMOKE_DIRECTORY`]), prints the report, and returns the verdict's exit
@@ -15,7 +15,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
 
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -23,8 +22,8 @@ use wyrd_testing::capacity::{
     binary_identity, release_binary, timer_resolution_ns, timing_declaration,
 };
 use wyrd_testing::experiment::{
-    Baselines, Declaration, Engine, HostRecord, Invocation, Level, Mode, Options, Prepass, Reason,
-    Record, SMOKE_DIRECTORY, Source, Validity, Verdict, Workload, run,
+    Baselines, Declaration, Engine, HostRecord, Invocation, Level, Mode, Options, Reason, Record,
+    SMOKE_DIRECTORY, Source, Validity, Verdict, Workload, run,
 };
 use wyrd_testing::profile::SAMPLY;
 use wyrd_testing::release_server::{Host, HostLoad};
@@ -185,7 +184,6 @@ pub fn assemble(
         host,
         refusals: Vec::new(),
         mode: Mode::Full,
-        prepass: None,
         references: Vec::new(),
         qualify: context
             .arguments
@@ -237,85 +235,6 @@ pub fn select(declaration: &mut Declaration, arguments: &[String]) -> Result<(),
 pub fn smoke(declaration: &mut Declaration) {
     declaration.mode = Mode::Smoke;
     declaration.timing = declaration.level.smoke_timing();
-}
-
-/// Runs the smoke of `declaration`'s exact command (`arguments`, program
-/// name first, without the level and engine) as a child under its own fresh
-/// Postgres, server, and storage ([`spawn`]), outside the full run's clock,
-/// and records it. `--profile` and `--qualify-baseline` are not forwarded;
-/// `--smoke` makes the child
-/// a smoke, so it never runs a prepass of its own. A [`reusable_smoke`]
-/// PASS stands in for the child and is linked instead.
-pub fn prepass(root: &Path, declaration: &Declaration, arguments: &[String]) -> Prepass {
-    let mut command = vec![
-        format!("l{}", u8::from(declaration.level)),
-        declaration.engine.name().to_owned(),
-    ];
-    command.extend(
-        arguments
-            .iter()
-            .skip(1)
-            .filter(|argument| *argument != "--profile" && *argument != "--qualify-baseline")
-            .cloned(),
-    );
-    command.push("--smoke".to_owned());
-    let records = root
-        .join(SMOKE_DIRECTORY)
-        .join(declaration.engine.name())
-        .join(&declaration.experiment);
-    let budget_seconds = declaration.level.smoke_timing().budget_seconds;
-    if let Some(reused) = reusable_smoke(&records, declaration) {
-        return Prepass {
-            command,
-            budget_seconds,
-            elapsed_seconds: 0.0,
-            exit_code: Verdict::Pass.exit_code(),
-            records: records.display().to_string(),
-            reused: Some(reused.display().to_string()),
-        };
-    }
-    let started = Instant::now();
-    let named: Vec<&str> = command.iter().map(String::as_str).collect();
-    let exit_code = spawn(root, &named, &[]);
-    Prepass {
-        command,
-        budget_seconds,
-        elapsed_seconds: started.elapsed().as_secs_f64(),
-        exit_code,
-        records: records.display().to_string(),
-        reused: None,
-    }
-}
-
-/// The smoke record under `records` that a full run of `declaration` may
-/// reuse as its prepass: the newest smoke of the same engine, level,
-/// experiment, clean commit and step selection, when that smoke passed.
-/// A dirty source, a newest matching smoke that is INVALID, or no
-/// readable match returns `None`, so the prepass runs.
-pub fn reusable_smoke(records: &Path, declaration: &Declaration) -> Option<PathBuf> {
-    if declaration.source.dirty {
-        return None;
-    }
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(records)
-        .ok()?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .collect();
-    paths.sort();
-    paths.into_iter().rev().find_map(|path| {
-        let record = Record::read(&path).ok()?;
-        let same = record.mode == Mode::Smoke
-            && record.engine == declaration.engine
-            && record.level == declaration.level
-            && record.experiment == declaration.experiment
-            && record.commit == declaration.source.commit
-            && !record.dirty
-            && record.controls.selection == declaration.selection;
-        same.then_some((record.verdict == Verdict::Pass).then_some(path))
-    })?
 }
 
 /// Runs a plan: seals its declaration, samples the host, runs the workload

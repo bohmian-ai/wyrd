@@ -32,13 +32,9 @@ smoke record is never a calibration or baseline wherever it is moved. A
 smoke judges no criterion: every reading, errors and target misses included,
 is recorded beside an inapplicable criterion, so a smoke is PASS or INVALID.
 It is INVALID only when the measurement itself is broken (a missing reading
-or counter, a mismatched population, zero CPU, a failed record). Every full
-command first runs its own smoke as a prepass under a fresh Postgres, outside
-its clock and recorded beside it (`prepass`), and is INVALID before full-size
-preparation when that smoke is INVALID. A clean full command instead links
-the newest smoke PASS of the same commit, experiment and `--steps` selection
-(`prepass.reused`); a dirty source, another selection, or a newest matching
-smoke that is INVALID runs the prepass again. `bench:smoke` runs every default plan's
+or counter, a mismatched population, zero CPU, a failed record); a busy
+driver does not invalidate a smoke. A full command never runs a smoke first:
+run `--smoke` on the same command, or `bench:smoke` for every default plan's
 smoke. Every L1 experiment takes up to 5 minutes: Verification, Gateway,
 and each of the three Bifrost experiments, so `bench:l1:bifrost` takes up to
 15 and `bench:l1` up to 25 in all. An L2 engine takes 20 to 30 minutes.

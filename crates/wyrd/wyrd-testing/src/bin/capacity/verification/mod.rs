@@ -640,7 +640,6 @@ mod tests {
             },
             refusals: Vec::new(),
             mode: Mode::Full,
-            prepass: None,
             references: Vec::new(),
             qualify: false,
         }

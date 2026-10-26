@@ -942,7 +942,6 @@ mod tests {
             host: HostRecord::new(&host, "test"),
             refusals: Vec::new(),
             mode: Mode::Full,
-            prepass: None,
             references: Vec::new(),
             qualify: false,
         }

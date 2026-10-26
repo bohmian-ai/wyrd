@@ -19,9 +19,8 @@
 //! runs the same plan at smoke scale under `target/benchmarks/smoke/`.
 //! `--qualify-baseline` runs a full clean L1 that omits relative criteria
 //! to qualify references, and `reference <record.json>...` prints the
-//! reviewed-reference TOML two such records establish. A
-//! full run first runs that smoke as an isolated prepass and stops when it
-//! fails; `mise run bench:smoke` runs every level's smoke.
+//! reviewed-reference TOML two such records establish. A full run never
+//! runs a smoke first; `mise run bench:smoke` runs every level's smoke.
 
 mod client_queue;
 mod flags;
@@ -145,9 +144,8 @@ fn engine(name: &str) -> Option<Engine> {
         .find(|engine| engine.name() == name)
 }
 
-/// Plans `engine` at `level` from `arguments` and runs it: a `--smoke`
-/// as its smoke, and anything else only after its smoke prepass, which a
-/// declaration already refused skips.
+/// Plans `engine` at `level` from `arguments` and runs it, as its smoke
+/// under `--smoke`.
 async fn level(level: Level, engine: Engine, arguments: &[String], root: &Path) -> u8 {
     let context = Context {
         level,
@@ -164,10 +162,6 @@ async fn level(level: Level, engine: Engine, arguments: &[String], root: &Path) 
                 levels::smoke(&mut plan.declaration);
             }
             levels::compare(&mut plan.declaration, root);
-            if !context.smoke() && plan.declaration.refusals().is_empty() {
-                plan.declaration.prepass =
-                    Some(levels::prepass(root, &plan.declaration, arguments));
-            }
             let profile = arguments.iter().any(|argument| argument == "--profile");
             Box::pin(levels::execute(plan, root, profile)).await
         }
@@ -985,88 +979,6 @@ mod tests {
             let (record, _) = execute(declaration.clone(), Box::new(|_, _, _| {})).await;
             assert_eq!(record.verdict, Verdict::Pass, "{}", record.render());
         }
-    }
-
-    /// V3: a full run links the newest smoke PASS of its own clean commit,
-    /// engine, experiment and selection as its prepass and spawns no smoke;
-    /// no smoke, a dirty source, another selection or commit, or a newer
-    /// INVALID smoke of the same identity runs the prepass instead.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a mismatched or failed smoke is reused, or a matching
-    /// PASS is not.
-    #[tokio::test(start_paused = true)]
-    async fn l1_reuses_only_matching_clean_smoke_pass() {
-        let root = tempfile::tempdir().expect("root");
-        let arguments = line(&[]);
-        let full = declare(
-            Engine::Verification,
-            Level::One,
-            &[],
-            BASELINE_HOST,
-            &repository(),
-        );
-        let smoke_of = |declaration: &Declaration| {
-            let mut smoke = declaration.clone();
-            levels::smoke(&mut smoke);
-            smoke
-        };
-        // The temporary root has no Postgres wrapper, so a prepass that is
-        // not reused fails to start its child and exits 2.
-        let ran = |declaration: &Declaration| {
-            let prepass = levels::prepass(root.path(), declaration, &arguments);
-            prepass.reused.is_none() && prepass.exit_code == 2
-        };
-        assert!(ran(&full), "without a smoke the prepass runs");
-
-        let (passed, _) = execute(smoke_of(&full), Box::new(|_, _, _| {})).await;
-        assert_eq!(passed.verdict, Verdict::Pass, "{}", passed.render());
-        let path = passed.publish(root.path()).expect("publish smoke");
-        let reused = levels::prepass(root.path(), &full, &arguments);
-        assert_eq!(reused.reused, Some(path.display().to_string()));
-        assert_eq!((reused.exit_code, reused.elapsed_seconds), (0, 0.0));
-        assert!(full.refusals().is_empty());
-        let mut linked = full.clone();
-        linked.prepass = Some(reused);
-        let (record, _) = execute(linked, Box::new(|_, _, _| {})).await;
-        assert!(
-            record.render().contains(&format!(
-                "smoke prepass: reused the same-commit smoke PASS {}",
-                path.display()
-            )),
-            "{}",
-            record.render()
-        );
-        let read =
-            Record::parse(&serde_json::to_string(&record).expect("json")).expect("read back");
-        assert_eq!(read.prepass, record.prepass, "the link persists");
-
-        let mut dirty = full.clone();
-        dirty.source = Source::from_diff(full.source.commit.clone(), b"a diff", true);
-        assert!(ran(&dirty), "a dirty source never reuses a smoke");
-        let mut other = full.clone();
-        other.source = Source::from_diff("f".repeat(40), b"", false);
-        assert!(ran(&other), "another commit's smoke is not this source's");
-        let selected = declare(
-            Engine::Verification,
-            Level::One,
-            &["--steps", "direct-verify-c64"],
-            BASELINE_HOST,
-            &repository(),
-        );
-        assert!(
-            ran(&selected),
-            "another selection's smoke covers other steps"
-        );
-
-        let mut broken = passed.clone();
-        broken.verdict = Verdict::Invalid;
-        broken.started_at += chrono::Duration::seconds(1);
-        broken
-            .publish(root.path())
-            .expect("publish newer invalid smoke");
-        assert!(ran(&full), "the newest matching smoke is INVALID");
     }
 
     /// V2: one representative case of every engine shape keeps server

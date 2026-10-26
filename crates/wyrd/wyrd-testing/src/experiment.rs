@@ -229,27 +229,6 @@ pub enum Mode {
     Smoke,
 }
 
-/// The automatic smoke a full run executed in its own process, fresh
-/// database, and clock before preparing any full-size fixture.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Prepass {
-    /// The smoke's command, as argument values.
-    pub command: Vec<String>,
-    /// The smoke's declared budget, seconds.
-    pub budget_seconds: u64,
-    /// Wall seconds it took, outside the full run's clock.
-    pub elapsed_seconds: f64,
-    /// Its exit code; only 0 admits the full run.
-    pub exit_code: u8,
-    /// Where its record and timing evidence live.
-    pub records: String,
-    /// The earlier smoke PASS record of the same clean commit, experiment
-    /// and selection that stood in for running the smoke again, or `None`
-    /// when this prepass ran.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reused: Option<String>,
-}
-
 /// The step parameter that declares a full run's longer repetition
 /// window, seconds, for a step the default window cannot give enough
 /// samples; see [`Declaration::step_timing`].
@@ -999,8 +978,6 @@ pub struct Declaration {
     pub refusals: Vec<Reason>,
     /// Full or smoke.
     pub mode: Mode,
-    /// The smoke a full run passed first, or `None` for a smoke.
-    pub prepass: Option<Prepass>,
     /// The relative comparisons the steps declare.
     #[serde(default)]
     pub references: Vec<Reference>,
@@ -1016,8 +993,8 @@ const REQUIRED_CONTROLS: [&str; 3] = ["fixture", "limits", "workload"];
 impl Declaration {
     /// The reasons this declaration cannot admit a workload: missing
     /// question, steps, controls, metrics, or source; criteria naming
-    /// undeclared metrics or steps; a dirty source without override; a
-    /// failed smoke prepass; and declaration-time refusals.
+    /// undeclared metrics or steps; a dirty source without override; and
+    /// declaration-time refusals.
     #[must_use]
     pub fn refusals(&self) -> Vec<Reason> {
         let mut reasons = self.refusals.clone();
@@ -1115,21 +1092,6 @@ impl Declaration {
             if let Some(diagnostic) = self.command.diagnostic() {
                 refuse(format!("needs the ordinary configuration: {diagnostic}"));
             }
-        }
-        if let Some(prepass) = self
-            .prepass
-            .as_ref()
-            .filter(|prepass| prepass.exit_code != 0)
-        {
-            refuse(
-                "prepass.failed",
-                format!(
-                    "the smoke prepass `{}` exited {}; its evidence is under {}",
-                    prepass.command.join(" "),
-                    prepass.exit_code,
-                    prepass.records
-                ),
-            );
         }
         reasons
     }
@@ -2032,9 +1994,6 @@ pub struct Record {
     /// Full or smoke; a record without one is a full run.
     #[serde(default)]
     pub mode: Mode,
-    /// The smoke prepass a full run passed before its clock started.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prepass: Option<Prepass>,
     /// Whether the run's references judged it for regression.
     #[serde(default)]
     pub regression_coverage: Coverage,
@@ -2303,7 +2262,6 @@ where
             profile,
         },
         mode: declaration.mode,
-        prepass: declaration.prepass.clone(),
     }
 }
 
@@ -2460,7 +2418,7 @@ fn judge(
             }
             for (index, repetition) in repetitions.iter().enumerate() {
                 reasons.extend(
-                    repetition_reasons(repetition, &declaration.validity)
+                    repetition_reasons(repetition, &declaration.validity, declaration.mode)
                         .into_iter()
                         .map(|reason| Reason {
                             message: format!("repetition {}: {}", index + 1, reason.message),
@@ -2638,8 +2596,10 @@ fn scaling(
 
 /// Why one repetition is invalid: workload reasons, process loss and
 /// missing or zero CPU, driver and collector saturation, and open-loop misses or
-/// lateness.
-fn repetition_reasons(repetition: &Repetition, validity: &Validity) -> Vec<Reason> {
+/// lateness. A smoke, which only shows the workflow runs, does not judge
+/// driver saturation: a busy driver changes measured latency, not whether
+/// the workflow works.
+fn repetition_reasons(repetition: &Repetition, validity: &Validity, mode: Mode) -> Vec<Reason> {
     let mut reasons: Vec<Reason> = repetition
         .invalid
         .iter()
@@ -2661,7 +2621,7 @@ fn repetition_reasons(repetition: &Repetition, validity: &Validity) -> Vec<Reaso
             "reading.missing",
             "driver CPU-seconds are unavailable",
         )),
-        Some(driver) if repetition.seconds > 0.0 => {
+        Some(driver) if mode == Mode::Full && repetition.seconds > 0.0 => {
             let cores = driver / repetition.seconds;
             let limit = validity.driver_cores * validity.driver_fraction;
             if cores > limit {
@@ -3211,22 +3171,6 @@ impl Record {
                 "regression coverage: {}\n",
                 self.regression_coverage == Coverage::Covered
             );
-        }
-        if let Some(prepass) = &self.prepass {
-            let _ = match &prepass.reused {
-                Some(record) => writeln!(
-                    out,
-                    "smoke prepass: reused the same-commit smoke PASS {record}\n"
-                ),
-                None => writeln!(
-                    out,
-                    "smoke prepass: exit {} in {:.1}s of its {}s budget, outside this run's clock; evidence under {}\n",
-                    prepass.exit_code,
-                    prepass.elapsed_seconds,
-                    prepass.budget_seconds,
-                    prepass.records
-                ),
-            };
         }
         if let Some(method) = self
             .controls
@@ -3984,7 +3928,7 @@ mod tests {
     use super::{
         Arrivals, Baselines, Coverage, Criterion, Declaration, Derive, Direction, Eligibility,
         Engine, ExperimentError, HostRecord, Invocation, Level, Metric, Mode, Op, Options, Phase,
-        Prepass, REPORT_HEADER, Reading, Record, Reference, Repetition, Rule, Source, Status, Step,
+        REPORT_HEADER, Reading, Record, Reference, Repetition, Rule, Source, Status, Step,
         Validity, Verdict, Workload, convert, regression, run,
     };
     use crate::capacity::{Histogram, Population, UNLABELLED};
@@ -4070,7 +4014,6 @@ mod tests {
             },
             refusals: Vec::new(),
             mode: Mode::Full,
-            prepass: None,
             references: Vec::new(),
             qualify: false,
         }
@@ -6185,15 +6128,14 @@ limitations = "excluded"
     /// and survive readback with their observed values, while an empty
     /// population and zero CPU stay INVALID; its record round-trips
     /// `mode: smoke` under `target/benchmarks/smoke/` and a failed write is
-    /// still a persistence error. A full run refuses before preparation when its prepass failed
-    /// and keeps a passing prepass beside its own clock; a record without a
-    /// mode reads as full.
+    /// still a persistence error; a saturated driver does not invalidate it.
+    /// A record without a mode reads as full.
     ///
     /// # Panics
     ///
     /// Panics when a smoke skips or repeats work, waives an integrity check,
-    /// judges a target, lands in history, or a failed prepass
-    /// admits preparation.
+    /// judges a target or driver saturation, lands in history, or a record without a mode does
+    /// not read as full.
     #[tokio::test(start_paused = true)]
     async fn smoke_runs_the_selected_workflow_and_stays_out_of_history() {
         let root = tempfile::tempdir().expect("root");
@@ -6296,6 +6238,22 @@ limitations = "excluded"
             );
         }
 
+        let mut busy = good();
+        busy.driver_cpu_seconds = Some(1_000.0);
+        let saturated = execute(
+            smoke.clone(),
+            &mut Scripted::always(&busy),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        assert_eq!(
+            saturated.verdict,
+            Verdict::Pass,
+            "a smoke does not judge driver saturation: {:?}",
+            saturated.reasons
+        );
+
         let mut empty = good();
         empty.set("p99_ms", Reading::missing("no timing observation"));
         let mut idle = good();
@@ -6332,45 +6290,14 @@ limitations = "excluded"
             Err(ExperimentError::Persist { .. })
         ));
 
-        let prepass = |exit_code| Prepass {
-            command: vec![
-                "l1".to_owned(),
-                "verification".to_owned(),
-                "--smoke".to_owned(),
-            ],
-            budget_seconds: 600,
-            elapsed_seconds: 42.0,
-            exit_code,
-            records: "target/benchmarks/smoke/verification/direct-verify".to_owned(),
-            reused: None,
-        };
-        let mut failed = declaration();
-        failed.prepass = Some(prepass(2));
-        let mut unprepared = Scripted::always(&good());
-        let refused = execute(
-            failed,
-            &mut unprepared,
-            [Some(quiet()), Some(quiet())],
-            &options,
-        )
-        .await;
-        assert_eq!(validity(&refused), ["prepass.failed"]);
-        {
-            let seen = unprepared.seen.lock().expect("seen");
-            assert!(!seen.prepared && seen.calls.is_empty());
-        }
-        let mut passed = declaration();
-        passed.prepass = Some(prepass(0));
         let admitted = execute(
-            passed,
+            declaration(),
             &mut Scripted::always(&good()),
             [Some(quiet()), Some(quiet())],
             &options,
         )
         .await;
         assert_eq!(admitted.verdict, Verdict::Pass, "{:?}", admitted.reasons);
-        assert_eq!(admitted.prepass, Some(prepass(0)));
-        assert!(admitted.render().contains("smoke prepass: exit 0 in 42.0s"));
 
         let mut legacy: serde_json::Value = serde_json::to_value(&admitted).expect("json");
         legacy.as_object_mut().expect("object").remove("mode");

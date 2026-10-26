@@ -1,10 +1,16 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 14
+revision: 15
 status: approved
 ---
 
 # Benchmarks as experiments
+
+Revision 15 decouples smoke from full runs. A full command runs only its full
+experiment; smoke runs only when asked, through `--smoke` on the same command
+or `mise run bench:smoke` for every default plan. A smoke does not judge driver
+saturation, which affects measured latency, not whether the workflow runs. The
+maintainer directed this on 2026-10-26.
 
 Revision 14 fixes how Verification stores its records. Every execution has
 one input record in `bifrost.verification.execution_inputs`, every result one
@@ -425,8 +431,8 @@ boundary and missing or inconsistent evidence.
 Smoke uses the shared runner, judgment entry and report machinery with production
 criteria explicitly inapplicable. Record all observed values and reasons,
 including dropped/refused calls, server errors, incorrect returned results,
-capture shedding and missed performance targets. Those observations alone do
-not fail smoke or its full-run prepass. For example, accurately accounting for
+capture shedding and missed performance targets. Those observations, and a
+saturated driver, do not fail smoke. For example, accurately accounting for
 10 dropped calls is successful plumbing; losing those 10 calls from the outcome
 totals is a reconciliation failure. Smoke is PASS/exit 0 when its plumbing works
 and INVALID/exit 2 when it does not; PASS never claims production criteria passed.
@@ -440,21 +446,13 @@ its observed value and exit 1, while invalidity retains precedence and exit 2.
 This proves judging without requiring live smoke workloads to meet production
 targets or changing the real benchmark's limits.
 
-Every normal full invocation first runs this same smoke-sized plan as a fail-fast
-pass, with its own record, isolated/reset fixture state and declared budget,
-unless a smoke PASS record already exists under `target/benchmarks/smoke/` for
-the same clean commit, experiment and selected steps. The full record then
-names that smoke record instead of repeating it; a dirty tree, different
-selection or missing/INVALID smoke record still runs the prepass.
-Only a smoke PASS permits full-size fixture preparation. A failed prepass leaves
-its evidence and reports that the full run did not start; it cannot fabricate a
-full-run result. Smoke mode does not recursively preflight itself. Build and
-external prerequisites remain outside both clocks. The full experiment clock
-starts after the smoke pass and includes its normal host checks, startup, loading,
-measurement and drain; report the prepass time separately so command wall time
-is not hidden. Smoke fixture/publication work must not pollute full-run counters
-or state. This costs a real small fixture load and settlement before a full run;
-it has no promise to finish as quickly as a handful of requests.
+A full invocation never runs a smoke first and never consults smoke records.
+Smoke runs only when invoked: `--smoke` on any L1/L2 command smokes that plan,
+and `mise run bench:smoke` smokes every default plan. Smoke mode does not
+recursively run itself. Build and external prerequisites remain outside the
+experiment clock, which includes normal host checks, startup, loading,
+measurement and drain. Smoke fixture/publication work must not pollute full-run
+counters or state.
 
 Smoke records, timing evidence and reports live only under
 `target/benchmarks/smoke/`, never committed benchmark history. New records declare
@@ -915,7 +913,7 @@ constraints; private implementation choices remain open.
    Smoke checks plumbing with production criteria explicitly inapplicable.
 
 8. **Smoke:** the actual experiment workflow with reduced declared controls,
-   automatic isolated prepass, explicit criterion applicability and local-only,
+   run only on request, explicit criterion applicability and local-only,
    permanently baseline-ineligible records. A separate probe runner is rejected
    because it cannot validate the measurement and evidence workflow and can drift.
 
@@ -935,7 +933,7 @@ MCP API that would require a new product-surface projection.
 
 | ID / situation and actor | Expected observable result / credible evidence | Obligations |
 |---|---|---|
-| AC-001 — Engineer runs one engine's L1 | Each engine command is exercised separately, and each Bifrost experiment (`writes-parquet`, `hot`, `parquet`) within its 5-minute budget, with a same-commit smoke PASS reused instead of a repeated prepass; `hot` reads show no staged or published rows and `parquet` reads show nothing left in a memtable, staging or claim. Within its budget the full matrix runs with discarded warmup and three repetitions. Engineer reads question, controls, units, per-step criteria and verdict; opens the printed JSON path and regenerates an identical report. Real Linux x86_64 release-process journey, record and report comparison. Recompute server latency bounds from retained interval histograms; changing client network delay, polling cadence or scheduled-time latency cannot change server latency judgment (driver send lateness still checks validity); verify exact values just below, equal to and above strict SLO limits, and reject missing/overflowed timing evidence and ambiguous threshold bounds; coarse monitoring buckets cannot judge latency. Operator export disabled or lossy cannot erase complete benchmark timing. | REQ-001, REQ-003, REQ-007, REQ-008, REQ-010, REQ-013, REQ-014 |
+| AC-001 — Engineer runs one engine's L1 | Each engine command is exercised separately, and each Bifrost experiment (`writes-parquet`, `hot`, `parquet`) within its 5-minute budget, without running a smoke first; `hot` reads show no staged or published rows and `parquet` reads show nothing left in a memtable, staging or claim. Within its budget the full matrix runs with discarded warmup and three repetitions. Engineer reads question, controls, units, per-step criteria and verdict; opens the printed JSON path and regenerates an identical report. Real Linux x86_64 release-process journey, record and report comparison. Recompute server latency bounds from retained interval histograms; changing client network delay, polling cadence or scheduled-time latency cannot change server latency judgment (driver send lateness still checks validity); verify exact values just below, equal to and above strict SLO limits, and reject missing/overflowed timing evidence and ambiguous threshold bounds; coarse monitoring buckets cannot judge latency. Operator export disabled or lossy cannot erase complete benchmark timing. | REQ-001, REQ-003, REQ-007, REQ-008, REQ-010, REQ-013, REQ-014 |
 | AC-002 — Engineer compares a valid regression with its baseline | W/C baseline 100, repetitions 75/80/85: criterion FAIL and exit 1; a CPU/operation case beyond +15% and spread also fails. Exact percentage boundaries pass. Deterministic judgment cases plus an eligible compatible replacement-baseline-to-run integration journey preserve operands and provenance. | REQ-011, REQ-012 |
 | AC-003 — Engineer encounters noisy results | Baseline 100, repetitions 70/85/100: regression criterion PASS with spread visible; another absolute SLO miss still makes the run FAIL. Shared-judgment cases prove noise cannot excuse latency/correctness. | REQ-004, REQ-012 |
 | AC-004 — Engineer cannot obtain valid evidence | Independently exercise busy preflight/post-run host (10-second samples, >10% non-benchmark CPU), driver above 80% budget, any missed arrival or p99 send lateness >5 ms, insufficient samples (<1,000 p99 / <200 p95), dirty source without override, missing/reset CPU and budget overrun: INVALID, exit 2, reasons and partial record, no fabricated successful step. Declared dirty override is visible. Combine an invalid step and valid failure: overall INVALID retains both. Injected resource/clock observations and runner integration; no synthetic host load. | REQ-002, REQ-004, REQ-006, INV-005, INV-007 |
@@ -946,7 +944,7 @@ MCP API that would require a new product-surface projection.
 | AC-009 — Maintainer checks migration and discoverability | README and TESTING explain invocation and records; coverage mapping has no lost workload; old tasks/aliases, dead thresholds/SloGate/load exports and duplicate code are gone. Every client-queue step judges criteria; Gateway has declared capacity SLO constants. Static consumer/task/docs inventory plus relevant existing correctness lanes; no benchmark added to CI/gates. | REQ-010, REQ-016 |
 | AC-010 — Operator checks preserved production guarantees | Wrong results and unexpected loss fail valid runs; tenant-negative journeys cannot expose data; acknowledged writes survive existing durability checks; audit stays non-blocking and accounted; fixture cleanup remains scoped and credentials never enter summaries. Existing security/storage journeys and focused record privacy/cancellation checks are credible evidence. | INV-001, INV-002, INV-003, INV-006 |
 | AC-011 — Operator changes logging/sampling or loses its backend | Production-initialized tests prove independent log/operator policies and SDK overflow/shutdown loss reporting and accurate failed-export-batch counters; real authenticated client → gateway → tenant timeline journeys retain catalog IDs/links at ratio zero/no endpoint, with tenant-negative readback. All shipped language surfaces retain their existing journeys at integrated review. | REQ-017, REQ-018, INV-010 |
-| AC-012 — Engineer smoke-tests the actual benchmark without trace export | Real release commands exercise every default L1/L2 plan for all engines, including all three Bifrost L1 experiments, through actual loading/publication, selected steps/phases, measured stop/drain, exact outcome reconciliation, record/full timing evidence and report. Read the record and regenerate its report; verify retained histograms reproduce recorded readings. Accurately recorded production errors, dropped/refused calls, capture shedding, wrong answers and target misses do not fail smoke. Missing measurements/counters, mismatched populations, zero CPU, missing applicable scan facts and failed evidence/report handling are plumbing failures. Production criteria remain explicitly inapplicable with observed values retained; smoke PASS claims plumbing only. A separate deterministic full-mode test proves a controlled criterion miss survives judgment, record/readback, report and exit 1, and invalidity retains precedence/exit 2. Selected-step and automatic isolated prepass proof remains; invalid plumbing stops full preparation. Mode round-trips, output stays outside history and smoke cannot become a baseline after relocation. Deterministic interval/quantization/overflow/reset/drain proof and bounded known-delay, known-CPU and instrumentation-cost calibration use the actual measurement path with independent references and justified tolerances, without synthetic host load or a side runner. Normal readout absence, non-loopback refusal and snapshot privacy remain. | REQ-007, REQ-008, REQ-013, REQ-015, INV-006, INV-010 |
+| AC-012 — Engineer smoke-tests the actual benchmark without trace export | Real release commands exercise every default L1/L2 plan for all engines, including all three Bifrost L1 experiments, through actual loading/publication, selected steps/phases, measured stop/drain, exact outcome reconciliation, record/full timing evidence and report. Read the record and regenerate its report; verify retained histograms reproduce recorded readings. Accurately recorded production errors, dropped/refused calls, capture shedding, wrong answers and target misses do not fail smoke. Missing measurements/counters, mismatched populations, zero CPU, missing applicable scan facts and failed evidence/report handling are plumbing failures. Production criteria remain explicitly inapplicable with observed values retained; smoke PASS claims plumbing only. A separate deterministic full-mode test proves a controlled criterion miss survives judgment, record/readback, report and exit 1, and invalidity retains precedence/exit 2. Selected-step proof remains; a saturated driver does not invalidate a smoke, and a full run runs no smoke. Mode round-trips, output stays outside history and smoke cannot become a baseline after relocation. Deterministic interval/quantization/overflow/reset/drain proof and bounded known-delay, known-CPU and instrumentation-cost calibration use the actual measurement path with independent references and justified tolerances, without synthetic host load or a side runner. Normal readout absence, non-loopback refusal and snapshot privacy remain. | REQ-007, REQ-008, REQ-013, REQ-015, INV-006, INV-010 |
 | AC-014 — Maintainer checks the engine limits | Clean full L1 on the reference host passes Verification 64-client latency, Bifrost hot and Parquet point-lookup p99 <5 ms at 64 clients, the OTLP spans ≥30 MiB/CPU-s floor and Gateway <500 µs overhead at 64 clients, with unchanged limits, exact results and existing tenancy/durability journeys green. Before/after records and the diagnostic run that located each cost. | REQ-021, INV-001, INV-002 |
 | AC-013 — Maintainer establishes regression evidence | Only after AC-014 passes, two clean full suites establish reviewed same-method references; latency/throughput-core/CPU-work regression cases fail correctly. The same-build export comparison quantifies overhead; diagnostic traces and profile reproduce the documented investigation workflow without becoming references. | REQ-011, REQ-012, REQ-019, REQ-020 |
 
@@ -990,8 +988,8 @@ The maintainer directed the real-path smoke correction into the existing
 That direction is separate from the four independently validated residual
 findings. The current smoke contract supersedes TASK-004/005
 instructions for request-only smoke, skipping fixture/publication work, accepting
-probe-only evidence or including the prepass inside the full experiment clock.
-REQ-008 instead declares and reports a separate prepass budget/time. Their
+probe-only evidence. Revision 15 removes the automatic prepass revision 9
+introduced. Their
 historical evidence remains intact. TASK-005 full-run
 qualification obligations remain; a small smoke PASS cannot close them.
 
@@ -1120,6 +1118,13 @@ not a reason to invent a reference or weaken coverage.
   references, cumulative grouped history through each settled cutoff,
   PostgreSQL coordination only, and one result reader. Approved by the
   maintainer on 2026-10-26.
+- Revision 15 — 2026-10-26: Smoke was coupled to every full run as an
+  automatic prepass and judged driver saturation, so a server speedup that
+  raised closed-loop driver CPU refused every full verification run before it
+  measured anything. The maintainer decided: remove the automatic prepass and
+  smoke-record reuse; smoke runs only through `--smoke` or `bench:smoke`; a
+  smoke does not judge driver saturation, which full runs still enforce.
+  Directed by the maintainer on 2026-10-26.
 
 Authority (plain repository references):
 

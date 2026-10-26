@@ -817,6 +817,11 @@ Verdict: SPEC_REVISION_REQUIRED. The decision for `$wyrd-spec`:
 |---|---|---|
 | `mise run bench:l1:bifrost:writes:parquet -- --qualify-baseline` (exit 1) | `benchmarks/bifrost/writes-parquet/20261026T073045Z-69f3a066d.json` | FAIL: `otlp-spans-peak-floor`, median 15.218 wire MiB per server CPU-second misses `≥ 30`. Lowest available memory 10.2 GB. |
 | `mise run bench:l1:bifrost:parquet -- --qualify-baseline` (exit 1) | `benchmarks/bifrost/parquet/20261026T073846Z-69f3a066d.json` | FAIL: `point-p99-slo` at `point-c64`, median (13.976, 13.984] ms misses `< 5`. |
-| `mise run bench:l1:gateway -- --qualify-baseline` | none | Stopped twice by the memory watchdog. See D8. |
+| `mise run bench:l1:gateway -- --qualify-baseline` on `2840dfbf6`, after D8 (exit 1) | `benchmarks/gateway/overhead/20261026T080639Z-2840dfbf6.json` | FAIL on two criteria. **`overhead-p99`:** `chat.c64` median (0.638, 0.638] ms and `chat-capture.c64` (4.342, 4.346] ms both miss `< 0.5`. **`capture-shed`:** captures were shed at the outbox limit, 265 at `chat.c64`, 8785 at `chat-capture.c4`, 135671 at `chat-capture.c16` and 177609 at `chat-capture.c64`. The driver peaked at 307 MB RSS, against more than 21 GB before D8. |
 
-Absolute limits now block reference qualification on every Bifrost experiment and on Verification.
+No engine has a passing qualification suite. Declared absolute limits now block reference qualification on all three engines:
+- **Bifrost:** hot and parquet point p99, the writes-parquet OTLP spans floor, and the writes-hot memory fit;
+- **Verification:** overhead p99 and staging refusals at 64 clients;
+- **Gateway:** overhead p99 at 64 clients and capture shedding.
+
+The SPEC_REVISION_REQUIRED verdict above covers all of these.

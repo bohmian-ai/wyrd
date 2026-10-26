@@ -42,6 +42,7 @@ from .support import (
     declare,
     hydrated,
     pull,
+    reset_telemetry_providers,
     service_key,
 )
 from .test_local_development import configure_gateway
@@ -257,17 +258,9 @@ def completion(body: dict) -> tuple[int, dict]:
 
 
 @pytest.fixture
-def fresh_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unset OpenTelemetry's once-only global tracer provider for one test.
-
-    The API lets a process install its global provider once; restoring the two
-    module globals afterwards keeps each telemetry test's install its own.
-    """
-    from opentelemetry import trace
-    from opentelemetry.util._once import Once
-
-    monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
-    monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
+def fresh_telemetry_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset OpenTelemetry's once-only global providers for one test."""
+    reset_telemetry_providers(monkeypatch)
 
 
 @contextmanager

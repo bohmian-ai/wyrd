@@ -735,15 +735,27 @@ UNREACHABLE = "http://127.0.0.1:9"
 
 @pytest.fixture
 def unset_global_provider(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Unset OpenTelemetry's once-only global provider, and shut down what a test installs."""
+    """Unset OpenTelemetry's once-only global providers, and shut down what a test installs."""
+    from opentelemetry._logs import _internal as logs_internal
+    from opentelemetry.metrics import _internal as metrics_internal
+    from opentelemetry.sdk._logs import LoggerProvider
+    from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.util._once import Once
 
     monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
     monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
+    monkeypatch.setattr(metrics_internal, "_METER_PROVIDER", None)
+    monkeypatch.setattr(metrics_internal, "_METER_PROVIDER_SET_ONCE", Once())
+    monkeypatch.setattr(logs_internal, "_LOGGER_PROVIDER", None)
+    monkeypatch.setattr(logs_internal, "_LOGGER_PROVIDER_SET_ONCE", Once())
     yield
-    installed = trace._TRACER_PROVIDER
-    if isinstance(installed, TracerProvider):
-        installed.shutdown()
+    for installed in (
+        trace._TRACER_PROVIDER,
+        metrics_internal._METER_PROVIDER,
+        logs_internal._LOGGER_PROVIDER,
+    ):
+        if isinstance(installed, (TracerProvider, MeterProvider, LoggerProvider)):
+            installed.shutdown()
 
 
 @pytest.fixture
@@ -760,7 +772,9 @@ def _second_state(complete_bundle: Path, interfaces: dict[str, Any]) -> WyrdStat
 
 
 @pytest.mark.usefixtures("unset_global_provider")
-@pytest.mark.parametrize("case", ["repeat", "overlap", "other_state", "application", "lost_race"])
+@pytest.mark.parametrize(
+    "case", ["repeat", "overlap", "other_state", "application", "application_meter", "lost_race"]
+)
 def test_telemetry_setup(
     case: str,
     client_state: WyrdState,
@@ -783,13 +797,13 @@ def test_telemetry_setup(
         entered: list[object] = []
         second = threading.Event()
 
-        def installing(client: Any) -> Any:
+        def installing(client: Any, *resource: Any) -> Any:
             entered.append(client)
             if len(entered) == 1:
                 second.wait(1)
             else:
                 second.set()
-            return install(client)
+            return install(client, *resource)
 
         monkeypatch.setattr(wyrd.otel, "_start_telemetry", installing)
         failures: list[BaseException] = []
@@ -813,6 +827,11 @@ def test_telemetry_setup(
         _second_state(complete_bundle, interfaces).start_telemetry()
     elif case == "application":
         trace.set_tracer_provider(TracerProvider())
+    elif case == "application_meter":
+        from opentelemetry import metrics
+        from opentelemetry.sdk.metrics import MeterProvider
+
+        metrics.set_meter_provider(MeterProvider())
     else:
         # Another installer wins between the check and the install; the losing
         # provider must be released rather than left exporting in the background.

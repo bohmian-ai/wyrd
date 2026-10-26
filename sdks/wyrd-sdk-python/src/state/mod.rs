@@ -75,7 +75,7 @@ pub struct PyWyrdState {
     models: BTreeMap<String, Py<ModelCard>>,
     /// Loaded Data holders by exact `CardRef`.
     data: BTreeMap<String, Py<DataCard>>,
-    /// The `wyrd.otel._ManagedTelemetry` handle over the tracer provider
+    /// The `wyrd.otel._ManagedTelemetry` handle over the providers
     /// `start_telemetry` installed, flushed by `flush` and `shutdown`.
     telemetry: OnceLock<Py<PyAny>>,
     /// Serializes `start_telemetry`'s check, install, and publication, so a
@@ -199,20 +199,23 @@ impl PyWyrdState {
         Self::hydrated(py, inner, interfaces, load_kwargs, trusted_artifact_hashes)
     }
 
-    /// Install the global OpenTelemetry tracer provider exporting spans to
-    /// this state's server as the state's client.
+    /// Install the global OpenTelemetry tracer, meter, and logger providers
+    /// exporting spans, metrics, and logs to this state's server as the
+    /// state's client.
     ///
-    /// Delegates to `wyrd.otel._start_telemetry`: the stock OTLP/HTTP span
-    /// exporter refreshes the client's token on every export, and spans
-    /// started inside `with state.run(...)` carry that Run and Card. A second
-    /// call is idempotent, including one made while the first is installing,
-    /// which waits for it; `shutdown` flushes only this provider. A failed
-    /// call installs nothing and can be retried.
+    /// Delegates to `wyrd.otel._start_telemetry`: the providers share one
+    /// Resource naming this state's Service release and configured deployment
+    /// environment, which fixes the state's configuration. The stock
+    /// OTLP/HTTP exporters refresh the client's token on every export, and
+    /// spans started inside `with state.run(...)` carry that Run and Card. A
+    /// second call is idempotent, including one made while the first is
+    /// installing, which waits for it; `shutdown` flushes only these
+    /// providers. A failed call installs nothing and can be retried.
     ///
     /// # Errors
     ///
     /// Raises `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when the application
-    /// already installed its own tracer provider, `ImportError` naming the
+    /// already installed its own tracer, meter, or logger provider, `ImportError` naming the
     /// `otel` extra when it is not installed, and the credential error when
     /// the state's client cannot resolve.
     fn start_telemetry(&self, py: Python<'_>) -> PyResult<()> {
@@ -232,12 +235,19 @@ impl PyWyrdState {
             PyWyrdClient::from_native(self.inner.client().map_err(WyrdPyError::from)?.clone());
         // A Python failure, such as the ImportError naming the `otel` extra,
         // propagates unchanged rather than as a generic boundary error.
-        let provider = py
-            .import("wyrd.otel")?
-            .call_method1("_start_telemetry", (client,))?;
+        let service = self.inner.root_ref();
+        let provider = py.import("wyrd.otel")?.call_method1(
+            "_start_telemetry",
+            (
+                client,
+                service.name.as_str(),
+                service.version.as_str(),
+                self.inner.deployment_environment(),
+            ),
+        )?;
         if provider.is_none() {
             return Err(WyrdPyError::from(WyrdError::SdkTelemetryProviderExists {
-                message: "an OpenTelemetry tracer provider is already installed".to_owned(),
+                message: "an OpenTelemetry provider is already installed".to_owned(),
                 details: serde_json::json!({}),
             })
             .into());
@@ -361,8 +371,9 @@ impl PyWyrdState {
         Ok(PyRun::new(run, self.token))
     }
 
-    /// Export completed spans from the provider `start_telemetry` installed,
-    /// then drain every producer of this state's writer without closing it.
+    /// Export completed spans, logs, and metrics from the providers
+    /// `start_telemetry` installed, then drain every producer of this state's
+    /// writer without closing it.
     ///
     /// The provider flush runs first, waiting at most the OpenTelemetry SDK's
     /// default flush bound, and leaves active spans active. The native drain is
@@ -389,8 +400,8 @@ impl PyWyrdState {
     /// observation: queue admission is not a durable acknowledgement, so an
     /// abrupt exit before this returns can lose pending rows. After an ambiguous
     /// failure, retry `shutdown()` on the same state rather than replacing the
-    /// writer. A tracer provider `start_telemetry` installed is flushed first
-    /// but stays installed and usable; an application's own provider is never
+    /// writer. The providers `start_telemetry` installed are flushed first
+    /// but stay installed and usable; an application's own provider is never
     /// touched. The drain is attempted even when the provider flush fails.
     ///
     /// # Errors
@@ -612,7 +623,7 @@ impl PyWyrdState {
         })
     }
 
-    /// Flush completed spans from the provider `start_telemetry` installed.
+    /// Flush completed telemetry from the providers `start_telemetry` installed.
     ///
     /// Calls the managed handle's `force_flush`, which waits at most the SDK's
     /// default flush bound even when the stock processor ignores it. A

@@ -36,7 +36,7 @@ def server() -> Iterator[WyrdTestServer]:
 
 
 @pytest.mark.identity
-@pytest.mark.usefixtures("fresh_tracer_provider")
+@pytest.mark.usefixtures("fresh_telemetry_providers")
 def test_saved_login_completes_the_workflow_past_token_expiry(
     server: WyrdTestServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

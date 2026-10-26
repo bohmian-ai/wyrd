@@ -13,7 +13,9 @@ the ``otel`` extra (``uv add 'wyrd-ai[otel]'``).
 optional and fail-open: without ``opentelemetry-api`` it is a no-op.
 
 ``WyrdState.start_telemetry`` delegates to ``_start_telemetry``, which installs
-one global SDK tracer provider exporting through ``span_exporter``.
+the global SDK tracer, meter, and logger providers, exporting through these
+exporters and sharing one Resource naming the state's Service and deployment
+environment.
 
 ``WyrdAgentsTraceProcessor`` is an OpenAI Agents SDK trace processor the
 application passes to ``agents.set_trace_processors``; Wyrd never registers it.
@@ -236,8 +238,6 @@ def _session(client: WyrdClient, workload_uid: str | None) -> Any:
         request.headers["x-wyrd-access-token"] = f"Bearer {client.access_token()}"
         if client.workload_uid is not None:
             request.headers["x-wyrd-workload-uid"] = client.workload_uid
-        if client.deployment_environment is not None:
-            request.headers["x-wyrd-deployment-environment"] = client.deployment_environment
         return request
 
     session = requests.Session()
@@ -251,32 +251,32 @@ def _endpoint(client: WyrdClient, signal: str) -> str:
 
 
 _FLUSH_TIMEOUT_MILLIS = 30000
-"""How long a state waits for its managed provider to flush: the SDK's ``force_flush`` default."""
+"""How long a state waits for its managed providers to flush: the SDK's ``force_flush`` default."""
 
 
 class _ManagedTelemetry:
-    """The tracer provider a state installed, flushed within a real bound.
+    """The providers a state installed, flushed together within a real bound.
 
-    The stock batch processor ignores ``force_flush``'s timeout and exports
+    The stock batch processors ignore ``force_flush``'s timeout and export
     synchronously, so the flush runs on a daemon thread and the caller waits at
     most ``_FLUSH_TIMEOUT_MILLIS``. A flush that overruns finishes in the
-    background. At most one runs per provider: a call that finds an earlier
+    background. At most one runs at a time: a call that finds an earlier
     flush still running waits for it, then starts its own, because the earlier
-    one may have drained the queue before this call's spans ended. Both waits
-    share the call's one deadline.
+    one may have drained the queues before this call's records ended. Both
+    waits share the call's one deadline.
     """
 
-    def __init__(self, provider: Any) -> None:
-        self.provider = provider
+    def __init__(self, *providers: Any) -> None:
+        self.providers = providers
         self._lock = threading.Lock()
         self._attempt: Future[bool] | None = None
         # How many flushes have started; one numbered after a call's entry covers it.
         self._started = 0
 
     def force_flush(self) -> bool:
-        """Flush the provider, raising ``TimeoutError`` when the bound expires first.
+        """Flush every provider, raising ``TimeoutError`` when the bound expires first.
 
-        Any other failure of the provider's own flush is re-raised unchanged.
+        Any other failure of a provider's own flush is re-raised unchanged.
         """
         deadline = time.monotonic() + _FLUSH_TIMEOUT_MILLIS / 1000
         with self._lock:
@@ -301,46 +301,85 @@ class _ManagedTelemetry:
                 raise TimeoutError("an earlier flush did not finish in time")
 
     def _flush(self, attempt: Future[bool]) -> None:
-        """Run the provider's flush and settle ``attempt`` with its outcome."""
+        """Flush each provider in turn and settle ``attempt`` with whether all succeeded."""
         try:
-            attempt.set_result(self.provider.force_flush(_FLUSH_TIMEOUT_MILLIS))
+            flushed = [provider.force_flush(_FLUSH_TIMEOUT_MILLIS) for provider in self.providers]
+            attempt.set_result(all(flushed))
         except BaseException as error:  # settled on the caller's thread
             attempt.set_exception(error)
 
 
-def _start_telemetry(client: WyrdClient) -> Any:
-    """Install the global tracer provider exporting spans as ``client``, and
-    the W3C trace-context propagator for outbound context.
+def _start_telemetry(
+    client: WyrdClient,
+    service_name: str,
+    service_version: str,
+    deployment_environment: str | None,
+) -> Any:
+    """Install the global tracer, meter, and logger providers exporting as
+    ``client``, and the W3C trace-context propagator for outbound context.
 
-    Returns the installed provider wrapped for bounded flushing, which the
-    calling state keeps so a repeated start is idempotent and its shutdown
-    flushes it. Returns ``None`` when a
-    global provider is already installed; the caller refuses with the catalog
-    error.
+    All three share one Resource: ``service.name``, ``service.version``, and,
+    when configured, ``deployment.environment.name``, over the SDK defaults
+    and ``OTEL_RESOURCE_ATTRIBUTES``. Returns the providers wrapped for
+    bounded flushing, which the calling state keeps so a repeated start is
+    idempotent and its shutdown flushes them. Returns ``None``, installing
+    nothing, when any global provider is already installed; the caller
+    refuses with the catalog error.
 
     Raises:
         ImportError: naming the ``otel`` extra when the SDK or exporter is absent.
     """
     try:
+        from opentelemetry import _logs, metrics
         from opentelemetry.propagate import set_global_textmap
+        from opentelemetry.sdk._logs import LoggerProvider
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+        from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
         from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
     except ImportError as missing:
         raise ImportError(_EXPORTER_EXTRA) from missing
-    if not isinstance(_otel_trace.get_tracer_provider(), _otel_trace.ProxyTracerProvider):
+    from opentelemetry._logs._internal import ProxyLoggerProvider
+    from opentelemetry.metrics._internal import _ProxyMeterProvider
+
+    if not (
+        isinstance(_otel_trace.get_tracer_provider(), _otel_trace.ProxyTracerProvider)
+        and isinstance(metrics.get_meter_provider(), _ProxyMeterProvider)
+        and isinstance(_logs.get_logger_provider(), ProxyLoggerProvider)
+    ):
         return None
-    provider = TracerProvider()
-    provider.add_span_processor(BatchSpanProcessor(span_exporter(client)))
-    install_run_correlation(provider)
-    _otel_trace.set_tracer_provider(provider)
-    if _otel_trace.get_tracer_provider() is not provider:
-        # Another provider won the once-only global install: release this one's
-        # export thread and leave the winner untouched.
-        provider.shutdown()
+    attributes = {"service.name": service_name, "service.version": service_version}
+    if deployment_environment is not None:
+        attributes["deployment.environment.name"] = deployment_environment
+    resource = Resource.create(attributes)
+    tracer_provider = TracerProvider(resource=resource)
+    tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter(client)))
+    install_run_correlation(tracer_provider)
+    meter_provider = MeterProvider(
+        resource=resource,
+        metric_readers=[PeriodicExportingMetricReader(metric_exporter(client))],
+    )
+    logger_provider = LoggerProvider(resource=resource)
+    logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter(client)))
+    _otel_trace.set_tracer_provider(tracer_provider)
+    metrics.set_meter_provider(meter_provider)
+    _logs.set_logger_provider(logger_provider)
+    installed = (
+        _otel_trace.get_tracer_provider() is tracer_provider
+        and metrics.get_meter_provider() is meter_provider
+        and _logs.get_logger_provider() is logger_provider
+    )
+    if not installed:
+        # Another installer won a once-only global install between the check
+        # and here: release these providers' export threads and refuse.
+        for provider in (tracer_provider, meter_provider, logger_provider):
+            provider.shutdown()
         return None
     set_global_textmap(TraceContextTextMapPropagator())
-    return _ManagedTelemetry(provider)
+    return _ManagedTelemetry(tracer_provider, meter_provider, logger_provider)
 
 
 def span_exporter(client: WyrdClient, *, workload_uid: str | None = None) -> OTLPSpanExporter:

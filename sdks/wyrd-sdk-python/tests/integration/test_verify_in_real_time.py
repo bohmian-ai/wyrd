@@ -644,7 +644,7 @@ def test_grouped_coding_uses_declared_sources(
     cards: Cards,
     receiver: Receiver,
     tmp_path: Path,
-    fresh_tracer_provider: None,
+    fresh_telemetry_providers: None,
 ) -> None:
     registered = declare(cards, "cards/verify_in_real_time/coding.yaml")
     bundle = pull(cards, "coding", tmp_path)

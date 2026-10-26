@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 from pydantic import BaseModel
 from wyrd import verify
 from wyrd.auth import Principals
@@ -115,6 +116,26 @@ class StandInModel(ModelInterface):
     def load(self, path: Path, load_kwargs: dict[str, object] | None = None) -> None:
         """Read nothing and publish an identity function as the loaded model."""
         self.model = lambda value: value
+
+
+def reset_telemetry_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset OpenTelemetry's once-only global tracer, meter, and logger providers.
+
+    The API lets a process install each global provider once; ``monkeypatch``
+    restores the module globals afterwards, so each telemetry test's install
+    stays its own.
+    """
+    from opentelemetry import trace
+    from opentelemetry._logs import _internal as logs_internal
+    from opentelemetry.metrics import _internal as metrics_internal
+    from opentelemetry.util._once import Once
+
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
+    monkeypatch.setattr(metrics_internal, "_METER_PROVIDER", None)
+    monkeypatch.setattr(metrics_internal, "_METER_PROVIDER_SET_ONCE", Once())
+    monkeypatch.setattr(logs_internal, "_LOGGER_PROVIDER", None)
+    monkeypatch.setattr(logs_internal, "_LOGGER_PROVIDER_SET_ONCE", Once())
 
 
 def client_of(

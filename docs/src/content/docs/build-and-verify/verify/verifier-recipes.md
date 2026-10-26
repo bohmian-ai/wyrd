@@ -103,7 +103,7 @@ from opentelemetry import trace
 from wyrd import WyrdState
 
 state = WyrdState.declare("support-reply.yaml")
-state.start_telemetry()  # export OpenTelemetry spans to Wyrd
+state.start_telemetry()  # export OpenTelemetry spans, logs, and metrics to Wyrd
 tracer = trace.get_tracer("support")
 
 # Your code's real work, traced as it runs.

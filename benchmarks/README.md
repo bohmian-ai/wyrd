@@ -8,10 +8,8 @@ an append-only record in this directory. They are not part of any test lane,
 ```bash
 mise run bench:smoke                 # every default plan at smoke scale
 mise run bench:l1                    # Level 1, all three engines in order
-mise run bench:l1:bifrost            # Level 1 Bifrost: writes-hot, writes-parquet, hot, parquet
-mise run bench:l1:bifrost:writes     # both write configurations
-mise run bench:l1:bifrost:writes:hot # one Bifrost experiment
-mise run bench:l1:bifrost:writes:parquet
+mise run bench:l1:bifrost            # Level 1 Bifrost: writes-parquet, hot, parquet
+mise run bench:l1:bifrost:writes     # one Bifrost experiment: writes-parquet
 mise run bench:l1:bifrost:hot
 mise run bench:l1:bifrost:parquet
 mise run bench:l1:verification
@@ -38,10 +36,9 @@ or counter, a mismatched population, zero CPU, a failed record). Every full
 command first runs its own smoke as a prepass under a fresh Postgres, outside
 its clock and recorded beside it (`prepass`), and is INVALID before full-size
 preparation when that smoke is INVALID. `bench:smoke` runs every default plan's
-smoke. Verification and
-Gateway L1 take up to 15 minutes each. The Bifrost L1 experiments take up to
-8 (`writes-hot`), 8 (`writes-parquet`), 5 (`hot`), and 9 (`parquet`)
-minutes, and `bench:l1` up to 60 in all. An L2 engine takes 20 to 30 minutes.
+smoke. Every L1 experiment takes up to 5 minutes: Verification, Gateway,
+and each of the three Bifrost experiments, so `bench:l1:bifrost` takes up to
+15 and `bench:l1` up to 25 in all. An L2 engine takes 20 to 30 minutes.
 
 ## Prerequisites
 
@@ -101,17 +98,15 @@ run is discarded.
 
 | Level | Shape | Windows | Budget |
 |---|---|---|---|
-| L1 | Isolated closed-loop work: a client sweep (1/4/16/64; Bifrost 1/64) per operation | 5 s warmup, then 3 × 10 s per step | 900 s; Bifrost 480/300/540 s |
+| L1 | Isolated closed-loop work at 1 and 64 clients per operation | 5 s warmup, then 3 × 5 s per step; 3 × 10 s for a step whose 5 s window cannot meet its sample floor, declared in its `window_seconds` | 300 s per experiment |
 | L2 | Competing open-loop work: every repetition runs capacity → overload → recovery from equivalent state | 120 s warmup, then 3 × 360 s | 1,800 s, at least 1,200 s |
 
 What each engine covers:
 
 - **Bifrost.**
-  - L1 is four experiments at 1 and 64 clients, each with its own record:
-    - `writes-hot`: 2M-row OTLP spans, OTLP logs, and native writes under
-      the hot Scribe settings, complete at their durable acknowledgement.
-      Rows stay in memtables, so each window measures ingest alone.
-    - `writes-parquet`: the same writes under the production rotation and
+  - L1 is three experiments at 1 and 64 clients, each with its own record:
+    - `writes-parquet`: 2M-row OTLP spans, OTLP logs, and native writes
+      under the production rotation and
       a 30 s retention, complete at their durable acknowledgement with no
       wait for publication. Each path after the first starts once every
       earlier row has published, outside every window, so no path's server
@@ -147,13 +142,13 @@ What each engine covers:
     limits.
     Without such a record, L2 is INVALID before any work.
 - **Verification.**
-  - L1 `direct-verify` runs direct verify at 1/4/16/64 clients. Server
+  - L1 `direct-verify` runs direct verify at 1 and 64 clients. Server
     overhead p99 must be below 500 µs at 64.
   - L2 `competing` overlaps direct and background verification with their
     evidence writes.
 - **Gateway.**
   - L1 `overhead` runs buffered, streamed, and 64 KiB capture calls at
-    1/4/16/64 clients. Added overhead p99 must be below 500 µs at 64.
+    1 and 64 clients. Added overhead p99 must be below 500 µs at 64.
   - L2 `capacity` runs four contending tenants. Default p99 limits:
     completion ≤ 200 ms, first token ≤ 350 ms, full stream ≤ 1,100 ms.
     Override them with `--max-*-ms`. Inter-chunk lag is diagnostic only.

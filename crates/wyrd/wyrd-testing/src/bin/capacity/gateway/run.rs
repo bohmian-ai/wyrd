@@ -344,7 +344,7 @@ impl Observed {
             answer,
             SUCCEEDED,
             true,
-            &[("overhead_p99_ms", 0.99)],
+            &[("overhead_p50_ms", 0.5), ("overhead_p99_ms", 0.99)],
         );
         repetition.set(
             "upstream_p99_ms",
@@ -364,17 +364,19 @@ impl Observed {
                 STREAM_END,
                 SUCCEEDED,
                 true,
-                &[("overhead_end_p99_ms", 0.99)],
+                &[("overhead_end_p50_ms", 0.5), ("overhead_end_p99_ms", 0.99)],
             );
             repetition.set(
                 "first_event_p99_ms",
                 Reading::percentile(&samples.first_event_us, 0.99, 1e3),
             );
         } else {
-            repetition.set(
-                "overhead_end_p99_ms",
-                Reading::missing("inapplicable: a buffered call has no final stream frame"),
-            );
+            for metric in ["overhead_end_p50_ms", "overhead_end_p99_ms"] {
+                repetition.set(
+                    metric,
+                    Reading::missing("inapplicable: a buffered call has no final stream frame"),
+                );
+            }
             repetition.set(
                 "first_event_p99_ms",
                 Reading::missing("inapplicable: a buffered call has no stream events"),

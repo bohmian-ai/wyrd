@@ -9,11 +9,10 @@
 //! write resolves at its durable acknowledgement. Evidence comes from client
 //! timings, `/metrics`, and the OS's readings of the server process.
 //!
-//! - **L1** ([`isolated`]), four experiments at 1 and 64 closed-loop
-//!   clients ([`Experiment`]): `writes-hot` and `writes-parquet` sweep
-//!   native Arrow, OTLP spans, and OTLP logs writes under the hot and the
-//!   Parquet Scribe settings, each repetition a full window of fresh
-//!   identities; `hot` reads 10M events and 1M spans held in memtables;
+//! - **L1** ([`isolated`]), three experiments at 1 and 64 closed-loop
+//!   clients ([`Experiment`]): `writes-parquet` sweeps native Arrow, OTLP
+//!   spans, and OTLP logs writes under the Parquet Scribe settings, each
+//!   repetition a full window of fresh identities; `hot` reads 10M events and 1M spans held in memtables;
 //!   `parquet` reads them published as Parquet, with span Bloom, shredding,
 //!   and pruning checks and each write path's storage ratio.
 //! - **L2, `competing`** ([`competing`]): the heavy 100M-row fixture with
@@ -39,7 +38,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::{GlobalConfig, WyrdClient};
 use wyrd_testing::experiment::{
     Baselines, Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Mode, Op, Reason,
-    Record, Reference, Status, Step, Verdict,
+    Record, Reference, Status, Step, Verdict, WINDOW_SECONDS,
 };
 use wyrd_testing::release_server::{LocalServer, SERVER_URL};
 
@@ -136,21 +135,21 @@ const PARQUET_ENV: [(&str, &str); 1] = [("WYRD_MAX_FILE_RETENTION_TIME", "30")];
 
 /// Scribe's operator settings that keep every row in a memtable: 16,384 MB
 /// memtable and on-disk rotation sizes and a 24-hour retention, so nothing
-/// stages or publishes.
+/// stages or publishes. Only the `hot` reads use them, over a fixture
+/// loaded once that never grows; a write workload under them would hold
+/// every row it writes in memory.
 const HOT_ENV: [(&str, &str); 3] = [
     ("WYRD_MAX_FILE_SIZE_IN_MEMORY", "16384"),
     ("WYRD_MAX_FILE_SIZE_ON_DISK", "16384"),
     ("WYRD_MAX_FILE_RETENTION_TIME", "86400"),
 ];
 
-/// The four Bifrost L1 experiments, each its own record, verdict, and
-/// budget.
+/// The three Bifrost L1 experiments, each its own record, verdict, and
+/// L1 budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Experiment {
-    /// Native, OTLP spans, and OTLP logs writes under the `hot` Scribe
-    /// settings, so nothing stages or publishes.
-    WritesHot,
-    /// The same writes under the `parquet` Scribe settings, whose windows
+    /// Native, OTLP spans, and OTLP logs writes under the `parquet` Scribe
+    /// settings, whose windows
     /// pay for the staging and publication they cause; nothing waits for
     /// publication inside a window.
     WritesParquet,
@@ -162,21 +161,12 @@ pub enum Experiment {
 
 impl Experiment {
     /// Every experiment, in the order `l1 bifrost` runs them.
-    pub const ALL: [Self; 4] = [
-        Self::WritesHot,
-        Self::WritesParquet,
-        Self::Hot,
-        Self::Parquet,
-    ];
-
-    /// The two write configurations `l1 bifrost writes` runs in order.
-    pub const WRITES: [Self; 2] = [Self::WritesHot, Self::WritesParquet];
+    pub const ALL: [Self; 3] = [Self::WritesParquet, Self::Hot, Self::Parquet];
 
     /// The experiment id: its command word and record directory.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::WritesHot => "writes-hot",
             Self::WritesParquet => "writes-parquet",
             Self::Hot => "hot",
             Self::Parquet => "parquet",
@@ -194,24 +184,15 @@ impl Experiment {
     /// Whether the experiment measures writes rather than reads.
     #[must_use]
     pub const fn writes(self) -> bool {
-        matches!(self, Self::WritesHot | Self::WritesParquet)
+        matches!(self, Self::WritesParquet)
     }
 
     /// The storage state its rows are held in: `hot` memtables or
     /// published `parquet`.
     const fn tier(self) -> &'static str {
         match self {
-            Self::WritesHot | Self::Hot => "hot",
+            Self::Hot => "hot",
             Self::WritesParquet | Self::Parquet => "parquet",
-        }
-    }
-
-    /// The hard budget, seconds.
-    const fn budget_seconds(self) -> u64 {
-        match self {
-            Self::WritesHot | Self::WritesParquet => 8 * 60,
-            Self::Hot => 5 * 60,
-            Self::Parquet => 9 * 60,
         }
     }
 
@@ -219,14 +200,14 @@ impl Experiment {
     const fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::WritesParquet | Self::Parquet => &PARQUET_ENV,
-            Self::WritesHot | Self::Hot => &HOT_ENV,
+            Self::Hot => &HOT_ENV,
         }
     }
 
     /// The read steps: each op, what it asks, and its client counts.
     const fn reads(self) -> &'static [(&'static str, Read, &'static [u64])] {
         match self {
-            Self::WritesHot | Self::WritesParquet => &[],
+            Self::WritesParquet => &[],
             Self::Hot => &HOT_READS,
             Self::Parquet => &PARQUET_READS,
         }
@@ -783,11 +764,7 @@ fn l1_declaration(
     baselines: Option<&Baselines>,
 ) -> Declaration {
     experiment.name().clone_into(&mut base.experiment);
-    base.timing.budget_seconds = experiment.budget_seconds();
     base.question = String::from(match experiment {
-        Experiment::WritesHot => {
-            "With every row held in a memtable, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, and do the native and OTLP write peaks clear their sanity floors?"
-        }
         Experiment::WritesParquet => {
             "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?"
         }
@@ -802,7 +779,7 @@ fn l1_declaration(
     base.controls.insert(
         "fixture".to_owned(),
         match experiment {
-            Experiment::WritesHot | Experiment::WritesParquet => write_fixture(),
+            Experiment::WritesParquet => write_fixture(),
             Experiment::Hot => read_fixture("hot"),
             Experiment::Parquet => read_fixture("parquet"),
         },
@@ -812,7 +789,7 @@ fn l1_declaration(
     base.controls.insert(
         "workload".to_owned(),
         json!(match experiment {
-            Experiment::WritesHot | Experiment::WritesParquet => "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
+            Experiment::WritesParquet => "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
             Experiment::Hot | Experiment::Parquet => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
         }),
     );
@@ -828,8 +805,11 @@ fn l1_declaration(
     for (op, _, clients) in experiment.reads() {
         for clients in *clients {
             let id = format!("{op}-c{clients}");
-            base.steps
-                .push(Step::measured(&id, json!({ "op": op, "clients": clients })));
+            base.steps.push(windowed(
+                experiment,
+                &id,
+                json!({ "op": op, "clients": clients }),
+            ));
             reads.push(id);
         }
     }
@@ -852,7 +832,8 @@ fn l1_declaration(
                 .map(|clients| format!("{}-c{clients}", op.name()))
                 .collect();
             for (id, clients) in sweep.iter().zip(PAIR) {
-                base.steps.push(Step::measured(
+                base.steps.push(windowed(
+                    experiment,
                     id,
                     json!({ "op": op.name(), "clients": clients }),
                 ));
@@ -1019,6 +1000,26 @@ fn l1_declaration(
     }
     base.references = references(experiment);
     base
+}
+
+/// The measured step `id` of `experiment` with `params`, declaring the
+/// 10 s window of a step whose 5 s L1 window would leave under 1.25 times
+/// its latency reference's sample floor at TASK-005's observed rates:
+/// Parquet c1 aggregates (~930 per 5 s against 1,000) and span trace
+/// lookups (~930), c1 native and OTLP spans writes (~150 and ~190 against
+/// 200), and c64 native writes (~1,090 against 1,000).
+fn windowed(experiment: Experiment, id: &str, mut params: Value) -> Step {
+    let long = match experiment {
+        Experiment::Parquet => matches!(id, "small-aggregate-c1" | "span-trace-c1"),
+        Experiment::WritesParquet => {
+            matches!(id, "native-write-c1" | "otlp-spans-c1" | "native-write-c64")
+        }
+        Experiment::Hot => false,
+    };
+    if long {
+        params[WINDOW_SECONDS] = json!(10);
+    }
+    Step::measured(id, params)
 }
 
 /// Each measured step's relative comparisons: server latency at the

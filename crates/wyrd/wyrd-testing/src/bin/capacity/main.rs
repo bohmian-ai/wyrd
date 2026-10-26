@@ -4,9 +4,8 @@
 //!   `verification` ([`verification`]), or `gateway` ([`gateway`]), through
 //!   `mise run bench:l1:<engine>`; `l1` alone runs all three in order,
 //!   through `mise run bench:l1`. `l1 bifrost
-//!   <writes-hot|writes-parquet|hot|parquet>` runs one Bifrost experiment,
-//!   `l1 bifrost writes` both write configurations in order, and `l1
-//!   bifrost` alone all four in order.
+//!   <writes-parquet|hot|parquet>` runs one Bifrost experiment and `l1
+//!   bifrost` alone all three in order.
 //! - `l2 <engine>`: competing open-loop work through capacity, overload, and
 //!   recovery, through `mise run bench:l2:<engine>`.
 //! - `report <record.json>`: regenerates a persisted record's report.
@@ -77,7 +76,6 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
     };
     let group = match arguments.get(3).map(String::as_str) {
         _ if bare(3) => Some((3, query::Experiment::ALL.to_vec())),
-        Some("writes") => Some((4, query::Experiment::WRITES.to_vec())),
         _ => None,
     };
     match (command, engine, group) {
@@ -132,7 +130,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
         }
         _ => {
             eprintln!(
-                "capacity: expected `l1 [bifrost [writes|writes-hot|writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, or `reference <record.json>...`, got {:?}",
+                "capacity: expected `l1 [bifrost [writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, or `reference <record.json>...`, got {:?}",
                 &arguments[1.min(arguments.len())..]
             );
             2
@@ -203,8 +201,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use wyrd_testing::experiment::{
         Arrivals, Declaration, Derive, Engine, ExperimentError, HostRecord, Level, Mode, Op,
-        Options, Phase, Reading, Record, Repetition, Rule, Source, Status, Step, StepKind, Timing,
-        Verdict, Workload, run,
+        Options, Phase, Reading, Record, Repetition, Rule, Source, Status, Step, StepKind, Verdict,
+        Workload, run,
     };
     use wyrd_testing::release_server::{HostLoad, PEAK_SAMPLE_INTERVAL_MS};
 
@@ -499,7 +497,7 @@ mod tests {
                 timing.repetitions,
                 timing.budget_seconds
             ),
-            (5, 10, 3, 900)
+            (5, 5, 3, 300)
         );
 
         let experiment = |experiment: query::Experiment, rest: &[&str], host: &str| {
@@ -510,27 +508,20 @@ mod tests {
         };
         assert_eq!(
             query::Experiment::ALL.map(query::Experiment::name),
-            ["writes-hot", "writes-parquet", "hot", "parquet"],
-            "a complete Bifrost L1 suite is four records"
+            ["writes-parquet", "hot", "parquet"],
+            "a complete Bifrost L1 suite is three records"
         );
-        let writes_hot = experiment(query::Experiment::WritesHot, &[], BASELINE_HOST);
+        assert_eq!(
+            query::Experiment::parse("writes-hot"),
+            None,
+            "the retired hot-write experiment has no alias"
+        );
         let writes = experiment(query::Experiment::WritesParquet, &[], BASELINE_HOST);
         let hot = experiment(query::Experiment::Hot, &[], BASELINE_HOST);
         let parquet = experiment(query::Experiment::Parquet, &[], BASELINE_HOST);
-        for (bifrost, budget) in [
-            (&writes_hot, 480),
-            (&writes, 480),
-            (&hot, 300),
-            (&parquet, 540),
-        ] {
+        for bifrost in [&writes, &hot, &parquet] {
             assert!(bifrost.refusals().is_empty(), "{:?}", bifrost.refusals());
-            assert_eq!(
-                bifrost.timing,
-                Timing {
-                    budget_seconds: budget,
-                    ..timing
-                }
-            );
+            assert_eq!(bifrost.timing, timing, "every L1 experiment fits 5 minutes");
             for control in ["fixture", "limits", "workload", "timing"] {
                 assert!(bifrost.controls.contains_key(control), "{control}");
             }
@@ -559,7 +550,6 @@ mod tests {
             "staged_backlog_mib",
         ] {
             assert!(writes.metric(metric).is_some(), "{metric}");
-            assert!(writes_hot.metric(metric).is_some(), "{metric}");
         }
         for metric in [
             "queries_per_s_per_vcpu",
@@ -573,14 +563,42 @@ mod tests {
         for op in query::WriteOp::ALL {
             measured.extend(sweep(op.name(), "-", &query::PAIR));
         }
-        for writes in [&writes_hot, &writes] {
-            assert_eq!(steps(writes, true), measured);
-            assert_eq!(
-                steps(writes, false),
-                ["otlp-spans-peak", "otlp-logs-peak", "native-write-peak"]
-            );
-            assert_eq!(writes.controls["fixture"], writes_hot.controls["fixture"]);
-        }
+        assert_eq!(steps(&writes, true), measured);
+        assert_eq!(
+            steps(&writes, false),
+            ["otlp-spans-peak", "otlp-logs-peak", "native-write-peak"]
+        );
+        let windows = |declaration: &Declaration| -> Vec<(String, u64)> {
+            declaration
+                .steps
+                .iter()
+                .filter(|step| step.kind == StepKind::Measured)
+                .map(|step| {
+                    (
+                        step.id.clone(),
+                        declaration.step_timing(step).repetition_seconds,
+                    )
+                })
+                .filter(|(_, seconds)| *seconds != timing.repetition_seconds)
+                .collect()
+        };
+        assert_eq!(
+            windows(&writes),
+            [
+                ("otlp-spans-c1".to_owned(), 10),
+                ("native-write-c1".to_owned(), 10),
+                ("native-write-c64".to_owned(), 10)
+            ],
+            "only steps a 5 s window leaves short of their sample floor declare 10 s"
+        );
+        assert!(windows(&hot).is_empty());
+        assert_eq!(
+            windows(&parquet),
+            [
+                ("small-aggregate-c1".to_owned(), 10),
+                ("span-trace-c1".to_owned(), 10)
+            ]
+        );
         assert_eq!(
             steps(&hot, true),
             [
@@ -611,12 +629,7 @@ mod tests {
                 .as_str()
                 .is_some_and(|fixture| fixture.starts_with("native-2m"))
         );
-        for (declaration, hot_settings) in [
-            (&writes_hot, true),
-            (&hot, true),
-            (&writes, false),
-            (&parquet, false),
-        ] {
+        for (declaration, hot_settings) in [(&hot, true), (&writes, false), (&parquet, false)] {
             assert_eq!(
                 declaration.controls["limits"]
                     .as_str()
@@ -733,7 +746,7 @@ mod tests {
                 })
                 .collect()
         };
-        for declaration in [&writes, &writes_hot, &hot, &parquet] {
+        for declaration in [&writes, &hot, &parquet] {
             for step in declaration
                 .steps
                 .iter()
@@ -798,17 +811,7 @@ mod tests {
             measured.len() * 4,
             "a warmup and three repetitions per step"
         );
-        let (hot_record, hot_calls) = execute(writes_hot.clone(), bifrost_script(4.9)).await;
-        assert!(
-            hot_record.validity.reasons.is_empty(),
-            "{:?}",
-            hot_record.validity.reasons
-        );
-        assert_eq!(
-            hot_calls, calls,
-            "both write configurations run the same cases"
-        );
-        assert!(record.elapsed_seconds <= 480.0);
+        assert!(record.elapsed_seconds <= 300.0);
         let peak = record
             .steps
             .iter()
@@ -915,7 +918,7 @@ mod tests {
             applies(&verification, "no-errors"),
             sweep("direct-verify", "-", &verification::CLIENTS)
         );
-        assert_eq!(applies(&verification, "correct-verdicts").len(), 4);
+        assert_eq!(applies(&verification, "correct-verdicts").len(), 2);
         for metric in [
             "verifications_per_s_per_vcpu",
             "verifications_per_cpu_s",
@@ -948,7 +951,7 @@ mod tests {
             "capture-per-arrival",
             "no-errors",
         ] {
-            assert_eq!(applies(&gateway, every).len(), 12, "{every}");
+            assert_eq!(applies(&gateway, every).len(), 6, "{every}");
         }
         for metric in [
             "requests_per_s_per_vcpu",
@@ -962,12 +965,12 @@ mod tests {
 
         assert_eq!(
             verification.references.len(),
-            4 * 4,
+            2 * 4,
             "each client count compares overhead p99, CPU per verification, verifications per CPU-second and per vCPU"
         );
         assert_eq!(
             gateway.references.len(),
-            12 * 4 + 4 + 4 * 2,
+            6 * 4 + 2 + 2 * 2,
             "every case compares overhead p99, CPU, work and throughput; streams add end overhead, capture adds capture bytes"
         );
         for declaration in [&verification, &gateway] {
@@ -1037,7 +1040,7 @@ mod tests {
                 ],
             ),
             (
-                bifrost(query::Experiment::WritesHot),
+                bifrost(query::Experiment::WritesParquet),
                 "native-write-c1",
                 "rows",
                 vec![
@@ -1287,17 +1290,6 @@ mod tests {
             &repository(),
         );
         let (l1, _) = execute(writes.clone(), bifrost_script(4.9)).await;
-        let (hot_writes, _) = execute(
-            declare(
-                Engine::Bifrost,
-                Level::One,
-                &["writes-hot"],
-                BASELINE_HOST,
-                &repository(),
-            ),
-            bifrost_script(4.9),
-        )
-        .await;
         let (elsewhere, _) = execute(
             declare(
                 Engine::Bifrost,
@@ -1319,10 +1311,6 @@ mod tests {
         assert!(
             query::calibrate(std::slice::from_ref(&elsewhere), &base).is_err(),
             "another host never calibrates"
-        );
-        assert!(
-            query::calibrate(std::slice::from_ref(&hot_writes), &base).is_err(),
-            "a hot-write capacity never calibrates the Parquet workload"
         );
         let calibration =
             query::calibrate(&[elsewhere, l1.clone()], &base).expect("compatible record");
@@ -1657,7 +1645,7 @@ mod tests {
         let mut records = Vec::new();
         for engine in levels::ENGINES {
             let rest: &[&str] = if engine == Engine::Bifrost {
-                &["writes-hot"]
+                &["writes-parquet"]
             } else {
                 &[]
             };

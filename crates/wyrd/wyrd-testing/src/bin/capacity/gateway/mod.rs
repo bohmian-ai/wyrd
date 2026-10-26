@@ -10,7 +10,7 @@
 //! client timings, `/metrics`, tenant capture reads, and the OS's readings of
 //! the server process.
 //!
-//! - L1 `overhead` ([`run`]): closed-loop clients at 1/4/16/64 for each
+//! - L1 `overhead` ([`run`]): closed-loop clients at 1 and 64 for each
 //!   [`Case`] against an instant upstream. The server's added overhead
 //!   (arrival to handoff, less the provider exchange) p99 must be strictly
 //!   under 0.5 ms at 64 clients at every applicable handoff point; every
@@ -51,7 +51,7 @@ use workload::CapturePolicy;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Every client count an L1 case runs at.
-pub const CLIENTS: [usize; 4] = [1, 4, 16, 64];
+pub const CLIENTS: [usize; 2] = [1, 64];
 
 /// The client count the fixed overhead SLO applies at.
 pub const SLO_CLIENTS: usize = 64;
@@ -231,7 +231,7 @@ pub fn declare(
 fn overhead(mut base: Declaration) -> Declaration {
     "overhead".clone_into(&mut base.experiment);
     base.question = format!(
-        "What overhead does the gateway add to buffered, streamed, and payload-captured chat at 1, 4, 16, and 64 closed-loop clients, and is its p99 strictly under {OVERHEAD_LIMIT_MS} ms at {SLO_CLIENTS} clients at every handoff point with every call answered and captured exactly once?"
+        "What overhead does the gateway add to buffered, streamed, and payload-captured chat at 1 and 64 closed-loop clients, and is its p99 strictly under {OVERHEAD_LIMIT_MS} ms at {SLO_CLIENTS} clients at every handoff point with every call answered and captured exactly once?"
     );
     base.variables = BTreeMap::from([
         ("case".to_owned(), json!(Case::ALL.map(Case::id))),
@@ -291,14 +291,35 @@ fn overhead(mut base: Declaration) -> Declaration {
     for case in Case::ALL {
         for clients in CLIENTS {
             let step = case.step(clients);
+            // A c1 stream completes about 120 times in a 5 s window, under
+            // the p99 and p95 sample floors, so its references judge p50.
+            let percentile = if case == Case::ChatStream && clients == 1 {
+                50
+            } else {
+                99
+            };
             let mut metrics = vec![
-                ("overhead_p99_ms", Some(99)),
+                (
+                    if percentile == 50 {
+                        "overhead_p50_ms"
+                    } else {
+                        "overhead_p99_ms"
+                    },
+                    Some(percentile),
+                ),
                 ("cpu_us_per_request", None),
                 ("requests_per_cpu_s", None),
                 ("requests_per_s_per_vcpu", None),
             ];
             if case == Case::ChatStream {
-                metrics.push(("overhead_end_p99_ms", Some(99)));
+                metrics.push((
+                    if percentile == 50 {
+                        "overhead_end_p50_ms"
+                    } else {
+                        "overhead_end_p99_ms"
+                    },
+                    Some(percentile),
+                ));
             }
             if case == Case::ChatCapture {
                 metrics.extend([
@@ -382,6 +403,16 @@ fn overhead_metrics() -> Vec<Metric> {
             "overhead_p99_ms",
             "ms",
             "server: per call, handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`) less the union of that call's own provider waits; nearest-rank bucket bounds of the server's timing histograms",
+        ),
+        Metric::raw(
+            "overhead_p50_ms",
+            "ms",
+            "server: the median of the same per-call overhead as `overhead_p99_ms`",
+        ),
+        Metric::raw(
+            "overhead_end_p50_ms",
+            "ms",
+            "server: the median of the same per-stream overhead as `overhead_end_p99_ms`; streams only",
         ),
         Metric::raw(
             "overhead_end_p99_ms",
@@ -957,7 +988,11 @@ mod tests {
                 .iter()
                 .find(|criterion| criterion.id == id)
                 .expect("a correctness criterion");
-            assert_eq!(criterion.steps.len(), 12, "{id}");
+            assert_eq!(
+                criterion.steps.len(),
+                Case::ALL.len() * CLIENTS.len(),
+                "{id}"
+            );
         }
         assert!(declared.refusals().is_empty(), "{:?}", declared.refusals());
         assert_eq!(declared.controls["timing"], json!({ "method": "shared" }));

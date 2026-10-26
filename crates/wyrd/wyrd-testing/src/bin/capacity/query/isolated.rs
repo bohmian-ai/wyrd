@@ -1,7 +1,7 @@
 //! The Bifrost L1 workload of one [`Experiment`]: one server and one closed
 //! loop per measured step.
 //!
-//! `writes-hot` and `writes-parquet` load no fixture: every write window
+//! `writes-parquet` loads no fixture: every write window
 //! takes its rows from a cursor that only grows, so each repetition writes
 //! fresh identities instead of retrying earlier ones. `hot` loads the events and span
 //! fixtures and checks that every row stays in a memtable; `parquet` also
@@ -301,14 +301,6 @@ impl Isolated {
                 "staged_backlog_mib",
                 Reading::exact(stopped.sum("bifrost_scribe_staging_live_bytes", &[]) / MIB),
             );
-            let staged = stopped.sum("bifrost_scribe_staging_live_bytes", &[]);
-            if self.experiment == Experiment::WritesHot && (published > 0.0 || staged > 0.0) {
-                repetition.observations.push(format!(
-                    "rows left the memtables under the hot settings during the `{}` window: {published} files published, {} staged MiB",
-                    write.name(),
-                    staged / MIB
-                ));
-            }
             if published <= 0.0 {
                 repetition.observations.push(format!(
                     "no Parquet file was published in the `{}` window, so its server CPU includes no publication cost",

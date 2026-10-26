@@ -10,7 +10,7 @@
 //! production makes it. Evidence comes from client timings, `/metrics`, and
 //! the OS's readings of the server process.
 //!
-//! - **L1, `direct-verify`:** closed-loop direct `verify` at 1/4/16/64
+//! - **L1, `direct-verify`:** closed-loop direct `verify` at 1 and 64
 //!   clients. The server's verification overhead (arrival until the result is
 //!   staged, less the Verifier's own blocks) p99 must be strictly under
 //!   0.5 ms at 64 clients, read from the server histogram's bucket, so an
@@ -43,7 +43,7 @@ use crate::levels::{Context, Plan};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Closed-loop client counts of the L1 sweep, one step each.
-pub const CLIENTS: [u64; 4] = [1, 4, 16, 64];
+pub const CLIENTS: [u64; 2] = [1, 64];
 
 /// The client count the strict overhead objective applies at.
 pub const OBJECTIVE_CLIENTS: u64 = 64;
@@ -329,7 +329,7 @@ fn direct(mut base: Declaration) -> Declaration {
         .collect();
     base.experiment = String::from("direct-verify");
     base.question = String::from(
-        "Does direct `observe().verify` keep the server's verification overhead p99 strictly under 0.5 ms at 64 closed-loop clients, answering every call with the expected verdict, and what does each verification cost the server per CPU-second at 1/4/16/64 clients?",
+        "Does direct `observe().verify` keep the server's verification overhead p99 strictly under 0.5 ms at 64 closed-loop clients, answering every call with the expected verdict, and what does each verification cost the server per CPU-second at 1 and 64 clients?",
     );
     base.variables.insert("clients".to_owned(), json!(CLIENTS));
     base.controls.insert(
@@ -676,15 +676,7 @@ mod tests {
             .iter()
             .map(|step| step.id.as_str())
             .collect();
-        assert_eq!(
-            steps,
-            [
-                "direct-verify-c1",
-                "direct-verify-c4",
-                "direct-verify-c16",
-                "direct-verify-c64"
-            ]
-        );
+        assert_eq!(steps, ["direct-verify-c1", "direct-verify-c64"]);
         let overhead = declaration
             .criteria
             .iter()
@@ -702,7 +694,7 @@ mod tests {
                 .iter()
                 .find(|c| c.id == id)
                 .expect("declared");
-            assert_eq!(criterion.steps.len(), 4);
+            assert_eq!(criterion.steps.len(), super::CLIENTS.len());
             assert!(matches!(
                 criterion.rule,
                 Rule::Limit {

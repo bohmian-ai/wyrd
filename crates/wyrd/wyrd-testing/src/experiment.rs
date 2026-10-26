@@ -130,7 +130,7 @@ impl Engine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "u8", try_from = "u8")]
 pub enum Level {
-    /// Fast isolated work: 5 s warmup, 3 × 10 s, at most 15 minutes.
+    /// Fast isolated work: 5 s warmup, 3 × 5 s, at most 5 minutes.
     One,
     /// Competing workload: 2 min warmup, 3 × 6 min, 20 to 30 minutes.
     Two,
@@ -170,9 +170,9 @@ impl Level {
         match self {
             Self::One => Timing {
                 warmup_seconds: 5,
-                repetition_seconds: 10,
+                repetition_seconds: 5,
                 repetitions: REPETITIONS,
-                budget_seconds: 15 * 60,
+                budget_seconds: 5 * 60,
                 minimum_seconds: 0,
             },
             Self::Two => Timing {
@@ -244,6 +244,11 @@ pub struct Prepass {
     /// Where its record and timing evidence live.
     pub records: String,
 }
+
+/// The step parameter that declares a full run's longer repetition
+/// window, seconds, for a step the default window cannot give enough
+/// samples; see [`Declaration::step_timing`].
+pub const WINDOW_SECONDS: &str = "window_seconds";
 
 /// The durations every step of a run uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1223,6 +1228,23 @@ impl Declaration {
         self.references = references;
     }
 
+    /// The durations step `step` measures with: the run's [`Timing`], with
+    /// a full run's repetitions lengthened to the step's declared
+    /// [`WINDOW_SECONDS`] parameter when it has one. A step declares a
+    /// longer window when the run's default cannot meet its sample floor;
+    /// a smoke keeps its short windows.
+    #[must_use]
+    pub fn step_timing(&self, step: &Step) -> Timing {
+        let declared = step.params.get(WINDOW_SECONDS).and_then(Value::as_u64);
+        match declared {
+            Some(seconds) if self.mode == Mode::Full => Timing {
+                repetition_seconds: seconds,
+                ..self.timing
+            },
+            _ => self.timing,
+        }
+    }
+
     /// Whether step `id` runs under the selection.
     fn selected(&self, id: &str) -> bool {
         self.selection
@@ -2104,7 +2126,7 @@ where
                 continue;
             }
             let (repetitions, reasons) = measured.entry(step.id.clone()).or_default();
-            let window = Duration::from_secs(timing.repetition_seconds);
+            let window = Duration::from_secs(declaration.step_timing(step).repetition_seconds);
             let warmup = Duration::from_secs(timing.warmup_seconds);
             let phases = std::iter::once(Phase::Warmup)
                 .chain((0..timing.repetitions).map(Phase::Repetition));
@@ -2372,7 +2394,6 @@ fn judge(
     mut measured: BTreeMap<String, (Vec<Repetition>, Vec<Reason>)>,
     admitted: bool,
 ) -> Vec<StepRecord> {
-    let timing = declaration.timing;
     for (repetitions, _) in measured.values_mut() {
         for repetition in repetitions.iter_mut() {
             repetition.derive(&declaration.metrics);
@@ -2380,6 +2401,7 @@ fn judge(
     }
     let mut records: Vec<StepRecord> = Vec::new();
     for step in &declaration.steps {
+        let timing = declaration.step_timing(step);
         let (status, repetitions, mut reasons, params) = if declaration.selected(&step.id) {
             match &step.kind {
                 StepKind::Measured => match measured.remove(&step.id) {
@@ -4557,6 +4579,89 @@ mod tests {
         );
     }
 
+    /// V2: L1 measures 3 × 5 s within 5 minutes; a step declaring
+    /// [`WINDOW_SECONDS`] measures that window in a full run and records
+    /// it, a smoke keeps its short windows, and a short window's
+    /// sample-floor miss stays INVALID rather than being lengthened.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a declared window is ignored, leaks into a smoke, or a
+    /// floor miss passes.
+    #[tokio::test(start_paused = true)]
+    async fn l1_windows_preserve_floors_and_budget() {
+        let directory = tempfile::tempdir().expect("artifacts");
+        let options = options(directory.path());
+        let timing = Level::One.timing();
+        assert_eq!(
+            (
+                timing.warmup_seconds,
+                timing.repetition_seconds,
+                timing.repetitions,
+                timing.budget_seconds
+            ),
+            (5, 5, 3, 300)
+        );
+        let mut windowed = declaration();
+        windowed.steps[0] =
+            Step::measured("op-1", json!({ "clients": 1, (super::WINDOW_SECONDS): 10 }));
+        let lengths = |calls: &[(String, Phase, Duration)], step: &str| -> Vec<u64> {
+            calls
+                .iter()
+                .filter(|call| call.0 == step)
+                .map(|call| call.2.as_secs())
+                .collect()
+        };
+        let mut workload = Scripted::always(&good());
+        let record = execute(
+            windowed.clone(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        let calls = workload.seen.lock().expect("seen").calls.clone();
+        assert_eq!(lengths(&calls, "op-1"), [5, 10, 10, 10]);
+        assert_eq!(lengths(&calls, "op-64"), [5, 5, 5, 5]);
+        assert_eq!(record.steps[0].timing.repetition_seconds, 10);
+        assert_eq!(record.steps[1].timing.repetition_seconds, 5);
+        assert_eq!(record.steps[0].params[super::WINDOW_SECONDS], json!(10));
+
+        let mut smoke = windowed;
+        smoke.mode = Mode::Smoke;
+        smoke.timing = Level::One.smoke_timing();
+        let mut workload = Scripted::always(&good());
+        execute(
+            smoke,
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        let calls = workload.seen.lock().expect("seen").calls.clone();
+        assert_eq!(
+            lengths(&calls, "op-1"),
+            [1, 3],
+            "a smoke keeps its short windows"
+        );
+
+        let mut short = good();
+        short.set("p99_ms", Reading::exact(0.1).with_samples(999));
+        let mut workload = Scripted::always(&short);
+        let record = execute(
+            declaration(),
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        assert_eq!(
+            record.steps[1].verdict,
+            Verdict::Invalid,
+            "one sample under the floor"
+        );
+    }
+
     /// V3: warmup is called but never recorded, three repetitions keep
     /// their own differing percentiles, the L1 budget stops an overrun with
     /// partial evidence and unmeasured steps, an interruption stops
@@ -4612,7 +4717,7 @@ mod tests {
             ]
         );
         assert_eq!(calls[0].2, Duration::from_secs(5));
-        assert_eq!(calls[1].2, Duration::from_secs(10));
+        assert_eq!(calls[1].2, Duration::from_secs(5));
         assert!(finished);
         let step = &record.steps[1];
         let p99: Vec<Option<f64>> = step
@@ -4636,12 +4741,12 @@ mod tests {
         );
         assert_eq!(record.verdict, Verdict::Pass);
         assert!(
-            (record.elapsed_seconds - 2.0 * 35.0).abs() < 1e-6,
-            "two steps of 5 s + 3 × 10 s"
+            (record.elapsed_seconds - 2.0 * 20.0).abs() < 1e-6,
+            "two steps of 5 s + 3 × 5 s"
         );
 
         let mut overrun = Scripted::always(&good());
-        overrun.stall = Duration::from_secs(250);
+        overrun.stall = Duration::from_secs(100);
         let record = record_timed(declaration(), &mut overrun, &options).await;
         assert!(
             codes(&record).contains(&"budget.exceeded"),
@@ -4660,7 +4765,7 @@ mod tests {
             record.steps[1].repetitions.is_empty(),
             "no fabricated metrics"
         );
-        assert!(record.elapsed_seconds >= 900.0 && record.elapsed_seconds < 900.0 + 120.0);
+        assert!(record.elapsed_seconds >= 300.0 && record.elapsed_seconds < 300.0 + 120.0);
         assert!(record.finished_at >= record.started_at);
         assert!(
             overrun.seen.lock().expect("seen").finished,

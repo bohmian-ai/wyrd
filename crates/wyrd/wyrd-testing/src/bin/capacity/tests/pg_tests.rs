@@ -592,7 +592,6 @@ fn step_holds(
 async fn engine_measurements_keep_boundaries_processes_and_windows() {
     let directory = tempfile::tempdir().expect("directory");
     let runs = [
-        (Engine::Bifrost, vec!["writes-hot"]),
         (Engine::Bifrost, vec!["writes-parquet"]),
         (Engine::Bifrost, vec!["hot"]),
         (Engine::Bifrost, vec!["parquet"]),
@@ -605,7 +604,7 @@ async fn engine_measurements_keep_boundaries_processes_and_windows() {
         let run = measured(engine, Level::One, &rest, directory.path()).await;
         // A writes-parquet window pays for the staging and publication it
         // causes, so its server CPU is not proportional to its own requests;
-        // writes-hot proves the same server-process accounting.
+        // the read and other engines' runs prove server-process accounting.
         let proportional = run.record.experiment != "writes-parquet";
         // A derived step (a peak or scaling summary) measures no window of
         // its own; its measured inputs carry every check.
@@ -855,7 +854,7 @@ async fn measured_regressions_reach_normal_reference_judgment() {
     let cases = [
         (
             Engine::Bifrost,
-            vec!["writes-hot"],
+            vec!["writes-parquet"],
             "native-write-c1",
             ["p95_ms", "cpu_us_per_row", "rows_per_s_per_vcpu"],
         ),

@@ -9,12 +9,13 @@
 //! write resolves at its durable acknowledgement. Evidence comes from client
 //! timings, `/metrics`, and the OS's readings of the server process.
 //!
-//! - **L1** ([`isolated`]), three experiments at 1 and 64 closed-loop
-//!   clients ([`Experiment`]): `writes` sweeps native Arrow, OTLP spans, and
-//!   OTLP logs writes, each repetition a full window of fresh identities;
-//!   `hot` reads 10M events and 1M spans held in memtables; `parquet` reads
-//!   them published as Parquet, with span Bloom, shredding, and pruning
-//!   checks and each write path's storage ratio.
+//! - **L1** ([`isolated`]), four experiments at 1 and 64 closed-loop
+//!   clients ([`Experiment`]): `writes-hot` and `writes-parquet` sweep
+//!   native Arrow, OTLP spans, and OTLP logs writes under the hot and the
+//!   Parquet Scribe settings, each repetition a full window of fresh
+//!   identities; `hot` reads 10M events and 1M spans held in memtables;
+//!   `parquet` reads them published as Parquet, with span Bloom, shredding,
+//!   and pruning checks and each write path's storage ratio.
 //! - **L2, `competing`** ([`competing`]): the heavy 100M-row fixture with
 //!   Forge compaction on, one stateful step whose every repetition runs open
 //!   loop mixed ingest at a rate calibrated from the newest compatible L1
@@ -142,13 +143,17 @@ const HOT_ENV: [(&str, &str); 3] = [
     ("WYRD_MAX_FILE_RETENTION_TIME", "86400"),
 ];
 
-/// The three Bifrost L1 experiments, each its own record, verdict, and
+/// The four Bifrost L1 experiments, each its own record, verdict, and
 /// budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Experiment {
-    /// Native, OTLP spans, and OTLP logs writes; nothing waits for
-    /// publication.
-    Writes,
+    /// Native, OTLP spans, and OTLP logs writes under the `hot` Scribe
+    /// settings, so nothing stages or publishes.
+    WritesHot,
+    /// The same writes under the `parquet` Scribe settings, whose windows
+    /// pay for the staging and publication they cause; nothing waits for
+    /// publication inside a window.
+    WritesParquet,
     /// Reads while every row stays in a memtable.
     Hot,
     /// Reads after every row is published as Parquet.
@@ -157,13 +162,22 @@ pub enum Experiment {
 
 impl Experiment {
     /// Every experiment, in the order `l1 bifrost` runs them.
-    pub const ALL: [Self; 3] = [Self::Writes, Self::Hot, Self::Parquet];
+    pub const ALL: [Self; 4] = [
+        Self::WritesHot,
+        Self::WritesParquet,
+        Self::Hot,
+        Self::Parquet,
+    ];
+
+    /// The two write configurations `l1 bifrost writes` runs in order.
+    pub const WRITES: [Self; 2] = [Self::WritesHot, Self::WritesParquet];
 
     /// The experiment id: its command word and record directory.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Writes => "writes",
+            Self::WritesHot => "writes-hot",
+            Self::WritesParquet => "writes-parquet",
             Self::Hot => "hot",
             Self::Parquet => "parquet",
         }
@@ -177,10 +191,25 @@ impl Experiment {
             .find(|experiment| experiment.name() == name)
     }
 
+    /// Whether the experiment measures writes rather than reads.
+    #[must_use]
+    pub const fn writes(self) -> bool {
+        matches!(self, Self::WritesHot | Self::WritesParquet)
+    }
+
+    /// The storage state its rows are held in: `hot` memtables or
+    /// published `parquet`.
+    const fn tier(self) -> &'static str {
+        match self {
+            Self::WritesHot | Self::Hot => "hot",
+            Self::WritesParquet | Self::Parquet => "parquet",
+        }
+    }
+
     /// The hard budget, seconds.
     const fn budget_seconds(self) -> u64 {
         match self {
-            Self::Writes => 8 * 60,
+            Self::WritesHot | Self::WritesParquet => 8 * 60,
             Self::Hot => 5 * 60,
             Self::Parquet => 9 * 60,
         }
@@ -189,15 +218,15 @@ impl Experiment {
     /// The Scribe settings the server runs with.
     const fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Writes | Self::Parquet => &PARQUET_ENV,
-            Self::Hot => &HOT_ENV,
+            Self::WritesParquet | Self::Parquet => &PARQUET_ENV,
+            Self::WritesHot | Self::Hot => &HOT_ENV,
         }
     }
 
     /// The read steps: each op, what it asks, and its client counts.
     const fn reads(self) -> &'static [(&'static str, Read, &'static [u64])] {
         match self {
-            Self::Writes => &[],
+            Self::WritesHot | Self::WritesParquet => &[],
             Self::Hot => &HOT_READS,
             Self::Parquet => &PARQUET_READS,
         }
@@ -398,7 +427,8 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
 /// `None`, reading `--server-cores` and `--smoke` from `arguments` (program
 /// name first),
 /// the baselines under `root`, and, at L2, the L1 records under
-/// `root/benchmarks/bifrost/writes/`. Pure otherwise: it starts nothing.
+/// `root/benchmarks/bifrost/writes-parquet/`. Pure otherwise: it starts
+/// nothing.
 ///
 /// A missing or unusable calibration is a declaration refusal
 /// (`calibration.missing`), never a substituted rate; a smoke declares
@@ -454,13 +484,13 @@ fn server_cores(arguments: &[String]) -> std::result::Result<f64, String> {
         .ok_or_else(|| "--server-cores takes a positive number of cores".to_owned())
 }
 
-/// Every readable record under `root/benchmarks/bifrost/writes/`; an
-/// unreadable one is skipped, since calibration only needs a valid one.
+/// Every readable record under `root/benchmarks/bifrost/writes-parquet/`;
+/// an unreadable one is skipped, since calibration only needs a valid one.
 fn l1_records(root: &Path) -> Vec<Record> {
     let directory = root
         .join("benchmarks")
         .join(Engine::Bifrost.name())
-        .join(Experiment::Writes.name());
+        .join(Experiment::WritesParquet.name());
     std::fs::read_dir(directory)
         .into_iter()
         .flatten()
@@ -474,8 +504,8 @@ fn l1_records(root: &Path) -> Vec<Record> {
         .collect()
 }
 
-/// The fixture control every `writes` record declares, which a
-/// calibrating L2 must match.
+/// The fixture control every write record declares, which a calibrating
+/// L2 must match.
 fn write_fixture() -> Value {
     json!({
         "native": format!("native-2m: events rows into bifrost.datasets.events_ingest, {WRITE_FIXTURE_ROWS} rows per day, fresh ids every window"),
@@ -565,6 +595,26 @@ fn isolated_metrics() -> Vec<Metric> {
             "encoded OTLP protobuf bytes of acknowledged exports, before framing and compression; OTLP steps only",
         ),
         Metric::raw(
+            "published_files",
+            "files",
+            "Parquet files Scribe published (`bifrost_scribe_publication_files_total`) between the window open and its measured stop, the CPU interval: the publication the window's server CPU paid for, zero when none ran; write steps only",
+        ),
+        Metric::raw(
+            "published_mib",
+            "MiB",
+            "Parquet MiB Scribe published (`bifrost_scribe_publication_bytes_total`) between the window open and its measured stop, 2^20 bytes; write steps only",
+        ),
+        Metric::raw(
+            "memtable_backlog_mib",
+            "MiB",
+            "Arrow MiB still in active and immutable memtables (`bifrost_scribe_active_memtable_bytes`, `bifrost_scribe_immutable_memtable_bytes`) at the measured stop, 2^20 bytes; write steps only",
+        ),
+        Metric::raw(
+            "staged_backlog_mib",
+            "MiB",
+            "staged MiB not yet published (`bifrost_scribe_staging_live_bytes`) at the measured stop, 2^20 bytes; write steps only",
+        ),
+        Metric::raw(
             "visibility_p99_ms",
             "ms",
             "acknowledgement until the rows are queryable",
@@ -632,6 +682,15 @@ fn isolated_metrics() -> Vec<Metric> {
             "server CPU per durably acknowledged row",
             Direction::Lower,
             cpu_per(work("rows", 1e6)),
+        ),
+        derived(
+            "memory_per_mib_s",
+            "B/(MiB/s)",
+            "sampled peak server resident bytes per retained Arrow MiB/s achieved; a sampled peak, not an exact OS high-water mark",
+            Direction::Lower,
+            Derive::MemoryPer {
+                work: "retained_mib".to_owned(),
+            },
         ),
         derived(
             "mib_per_s_per_vcpu",
@@ -725,8 +784,11 @@ fn l1_declaration(
     experiment.name().clone_into(&mut base.experiment);
     base.timing.budget_seconds = experiment.budget_seconds();
     base.question = String::from(match experiment {
-        Experiment::Writes => {
-            "What does each native, OTLP spans, and OTLP logs write cost the server per CPU-second at 1 and 64 closed-loop clients, with no error, and do the native and OTLP write peaks clear their sanity floors?"
+        Experiment::WritesHot => {
+            "With every row held in a memtable, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, and do the native and OTLP write peaks clear their sanity floors?"
+        }
+        Experiment::WritesParquet => {
+            "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?"
         }
         Experiment::Hot => {
             "With 10M events rows and 1M spans held in memtables, does a point lookup keep p99 strictly under 5 ms at 64 closed-loop clients with every answer exact, and what does each hot read cost the server per CPU-second?"
@@ -739,7 +801,7 @@ fn l1_declaration(
     base.controls.insert(
         "fixture".to_owned(),
         match experiment {
-            Experiment::Writes => write_fixture(),
+            Experiment::WritesHot | Experiment::WritesParquet => write_fixture(),
             Experiment::Hot => read_fixture("hot"),
             Experiment::Parquet => read_fixture("parquet"),
         },
@@ -749,7 +811,7 @@ fn l1_declaration(
     base.controls.insert(
         "workload".to_owned(),
         json!(match experiment {
-            Experiment::Writes => "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
+            Experiment::WritesHot | Experiment::WritesParquet => "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer",
             Experiment::Hot | Experiment::Parquet => "closed-loop public-client clients, each sending its next query once the last answers, every answer checked exactly: Bifrost SQL events point lookups, 100k-row aggregates, and full scans; span `trace_id` lookups and `attributes ->>` filters on a shredded and a long-tail key",
         }),
     );
@@ -782,7 +844,7 @@ fn l1_declaration(
         }
     }
     let mut writes = Vec::new();
-    if experiment == Experiment::Writes {
+    if experiment.writes() {
         for op in WriteOp::ALL {
             let sweep: Vec<String> = PAIR
                 .iter()
@@ -810,7 +872,7 @@ fn l1_declaration(
         Op::Le,
         0.0,
     )];
-    if experiment == Experiment::Writes {
+    if experiment.writes() {
         for (id, metric, step, floor) in [
             (
                 "native-peak-floor",
@@ -896,10 +958,7 @@ fn l1_declaration(
             base.criteria.push(criterion);
         }
     };
-    let tier = match experiment {
-        Experiment::Hot => "hot",
-        Experiment::Writes | Experiment::Parquet => "parquet",
-    };
+    let tier = experiment.tier();
     for (op, read, clients) in experiment.reads() {
         let Read::Events(case) = read else {
             continue;
@@ -922,7 +981,7 @@ fn l1_declaration(
             );
         }
     }
-    if experiment == Experiment::Writes {
+    if experiment.writes() {
         for op in WriteOp::ALL {
             let (prefix, fixture) = op.baseline();
             for clients in PAIR {
@@ -994,7 +1053,7 @@ impl Calibration {
 }
 
 /// The calibration the newest compatible valid L1 record gives `base`: a
-/// Bifrost level-1 `isolated` record from the same host fingerprint and
+/// Bifrost level-1 `writes-parquet` record from the same host fingerprint and
 /// build profile, flags, and compiler, with the current L1 fixture and
 /// limits controls, no validity reason, full (never smoke) mode wherever
 /// the record now lives, and a measured non-INVALID sweep step of every
@@ -1014,7 +1073,7 @@ pub fn calibrate(
         .filter(|record| {
             record.engine == Engine::Bifrost
                 && record.level == Level::One
-                && record.experiment == Experiment::Writes.name()
+                && record.experiment == Experiment::WritesParquet.name()
                 && record.host.fingerprint == base.host.fingerprint
                 && ["profile", "rustflags", "compiler"]
                     .iter()
@@ -1057,7 +1116,7 @@ pub fn calibrate(
         })
         .ok_or_else(|| {
             format!(
-                "no compatible valid L1 `writes` record measures every write path: {} records read, {} compatible; run `mise run bench:l1:bifrost:writes` on this host and build first",
+                "no compatible valid L1 `writes-parquet` record measures every write path: {} records read, {} compatible; run `mise run bench:l1:bifrost:writes:parquet` (or `bench:l1:bifrost:writes`) on this host and build first",
                 records.len(),
                 compatible.len()
             )

@@ -8,8 +8,10 @@ an append-only record in this directory. They are not part of any test lane,
 ```bash
 mise run bench:smoke                 # every default plan at smoke scale
 mise run bench:l1                    # Level 1, all three engines in order
-mise run bench:l1:bifrost            # Level 1 Bifrost: writes, hot, parquet
-mise run bench:l1:bifrost:writes     # one Bifrost experiment
+mise run bench:l1:bifrost            # Level 1 Bifrost: writes-hot, writes-parquet, hot, parquet
+mise run bench:l1:bifrost:writes     # both write configurations
+mise run bench:l1:bifrost:writes:hot # one Bifrost experiment
+mise run bench:l1:bifrost:writes:parquet
 mise run bench:l1:bifrost:hot
 mise run bench:l1:bifrost:parquet
 mise run bench:l1:verification
@@ -36,8 +38,8 @@ its clock and recorded beside it (`prepass`), and is INVALID before full-size
 preparation when that smoke is INVALID. `bench:smoke` runs every default plan's
 smoke. Verification and
 Gateway L1 take up to 15 minutes each. The Bifrost L1 experiments take up to
-8 (`writes`), 5 (`hot`), and 9 (`parquet`) minutes, and `bench:l1` up to 52
-in all. An L2 engine takes 20 to 30 minutes.
+8 (`writes-hot`), 8 (`writes-parquet`), 5 (`hot`), and 9 (`parquet`)
+minutes, and `bench:l1` up to 60 in all. An L2 engine takes 20 to 30 minutes.
 
 ## Prerequisites
 
@@ -102,12 +104,18 @@ run is discarded.
 What each engine covers:
 
 - **Bifrost.**
-  - L1 is three experiments at 1 and 64 clients, each with its own record:
-    - `writes`: 2M-row OTLP spans, OTLP logs, and native writes, complete
-      at their durable acknowledgement with no wait for publication. Each
-      path after the first starts once every earlier row has published,
-      outside every window, so no path's server CPU pays another path's
-      backlog; native runs last because its backlog is the largest.
+  - L1 is four experiments at 1 and 64 clients, each with its own record:
+    - `writes-hot`: 2M-row OTLP spans, OTLP logs, and native writes under
+      the hot Scribe settings, complete at their durable acknowledgement.
+      Rows stay in memtables, so each window measures ingest alone.
+    - `writes-parquet`: the same writes under the production rotation and
+      a 30 s retention, complete at their durable acknowledgement with no
+      wait for publication. Each path after the first starts once every
+      earlier row has published, outside every window, so no path's server
+      CPU pays another path's backlog; native runs last because its backlog
+      is the largest. Each window records the files and MiB it published
+      and the memtable and staged backlog at its stop; it is not a
+      publication-latency or sustained-throughput measurement.
     - `hot`: 10M events rows and 1M spans held in memtables (a staged or
       published row is INVALID); point lookups at 1/64, with p99 below 5 ms
       at 64, a small aggregate and a shredded-attribute span filter at 1.
@@ -132,7 +140,7 @@ What each engine covers:
     samples per repetition.
   - The L2 ingest rate is 70% of the mixed capacity `1/Σ(f_i/r_i)` times
     `--server-cores` (default 8). It is calibrated from the newest valid
-    `bench:l1:bifrost:writes` record with the same host, build, fixture, and
+    `writes-parquet` record with the same host, build, fixture, and
     limits.
     Without such a record, L2 is INVALID before any work.
 - **Verification.**

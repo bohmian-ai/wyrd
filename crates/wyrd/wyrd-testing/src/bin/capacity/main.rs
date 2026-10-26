@@ -3,8 +3,10 @@
 //! - `l1 <engine>`: isolated closed-loop work for `bifrost` ([`query`]),
 //!   `verification` ([`verification`]), or `gateway` ([`gateway`]), through
 //!   `mise run bench:l1:<engine>`; `l1` alone runs all three in order,
-//!   through `mise run bench:l1`. `l1 bifrost <writes|hot|parquet>` runs one
-//!   Bifrost experiment; `l1 bifrost` alone runs all three in order.
+//!   through `mise run bench:l1`. `l1 bifrost
+//!   <writes-hot|writes-parquet|hot|parquet>` runs one Bifrost experiment,
+//!   `l1 bifrost writes` both write configurations in order, and `l1
+//!   bifrost` alone all four in order.
 //! - `l2 <engine>`: competing open-loop work through capacity, overload, and
 //!   recovery, through `mise run bench:l2:<engine>`.
 //! - `report <record.json>`: regenerates a persisted record's report.
@@ -70,25 +72,30 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
             .get(index)
             .is_none_or(|next| next.starts_with("--"))
     };
-    match (command, engine) {
-        (Some("l1"), Some(Engine::Bifrost)) if bare(3) => {
-            let shared = rest(3);
+    let group = match arguments.get(3).map(String::as_str) {
+        _ if bare(3) => Some((3, query::Experiment::ALL.to_vec())),
+        Some("writes") => Some((4, query::Experiment::WRITES.to_vec())),
+        _ => None,
+    };
+    match (command, engine, group) {
+        (Some("l1"), Some(Engine::Bifrost), Some((skip, experiments))) => {
+            let shared = rest(skip);
             if let Err(message) = flags::known(&shared, &levels::VALUED[..0], &levels::SWITCHES) {
                 eprintln!(
-                    "capacity l1 bifrost: {message}; running every experiment takes only --profile and --allow-dirty"
+                    "capacity l1 bifrost: {message}; running several experiments takes only --profile, --allow-dirty and --smoke"
                 );
                 return 2;
             }
             let forwarded: Vec<String> = shared.into_iter().skip(1).collect();
-            levels::spawn_engine(root, Engine::Bifrost, &forwarded)
+            levels::spawn_experiments(root, &experiments, &forwarded)
         }
-        (Some("l1"), Some(engine)) => Box::pin(level(Level::One, engine, &rest(3), root)).await,
-        (Some("l2"), Some(engine)) => Box::pin(level(Level::Two, engine, &rest(3), root)).await,
-        (Some("l1"), None) if bare(2) => {
+        (Some("l1"), Some(engine), _) => Box::pin(level(Level::One, engine, &rest(3), root)).await,
+        (Some("l2"), Some(engine), _) => Box::pin(level(Level::Two, engine, &rest(3), root)).await,
+        (Some("l1"), None, _) if bare(2) => {
             let shared = rest(2);
             if let Err(message) = flags::known(&shared, &levels::VALUED[..0], &levels::SWITCHES) {
                 eprintln!(
-                    "capacity l1: {message}; the aggregate takes only --profile and --allow-dirty"
+                    "capacity l1: {message}; the aggregate takes only --profile, --allow-dirty and --smoke"
                 );
                 return 2;
             }
@@ -96,7 +103,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
                 levels::spawn_engine(root, engine, forwarded)
             })
         }
-        (Some("report"), _) if arguments.len() == 3 => {
+        (Some("report"), _, _) if arguments.len() == 3 => {
             match levels::report(Path::new(&arguments[2])) {
                 Ok(report) => {
                     println!("{report}");
@@ -110,7 +117,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
         }
         _ => {
             eprintln!(
-                "capacity: expected `l1 [bifrost [writes|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, or `report <record.json>`, got {:?}",
+                "capacity: expected `l1 [bifrost [writes|writes-hot|writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, or `report <record.json>`, got {:?}",
                 &arguments[1.min(arguments.len())..]
             );
             2
@@ -482,10 +489,21 @@ mod tests {
                 .collect();
             declare(Engine::Bifrost, Level::One, &rest, host, &root)
         };
-        let writes = experiment(query::Experiment::Writes, &[], BASELINE_HOST);
+        assert_eq!(
+            query::Experiment::ALL.map(query::Experiment::name),
+            ["writes-hot", "writes-parquet", "hot", "parquet"],
+            "a complete Bifrost L1 suite is four records"
+        );
+        let writes_hot = experiment(query::Experiment::WritesHot, &[], BASELINE_HOST);
+        let writes = experiment(query::Experiment::WritesParquet, &[], BASELINE_HOST);
         let hot = experiment(query::Experiment::Hot, &[], BASELINE_HOST);
         let parquet = experiment(query::Experiment::Parquet, &[], BASELINE_HOST);
-        for (bifrost, budget) in [(&writes, 480), (&hot, 300), (&parquet, 540)] {
+        for (bifrost, budget) in [
+            (&writes_hot, 480),
+            (&writes, 480),
+            (&hot, 300),
+            (&parquet, 540),
+        ] {
             assert!(bifrost.refusals().is_empty(), "{:?}", bifrost.refusals());
             assert_eq!(
                 bifrost.timing,
@@ -516,8 +534,13 @@ mod tests {
             "rows_per_cpu_s",
             "mib_per_s_per_vcpu",
             "mib_per_cpu_s",
+            "memory_per_mib_s",
+            "published_files",
+            "memtable_backlog_mib",
+            "staged_backlog_mib",
         ] {
             assert!(writes.metric(metric).is_some(), "{metric}");
+            assert!(writes_hot.metric(metric).is_some(), "{metric}");
         }
         for metric in [
             "queries_per_s_per_vcpu",
@@ -531,11 +554,14 @@ mod tests {
         for op in query::WriteOp::ALL {
             measured.extend(sweep(op.name(), "-", &query::PAIR));
         }
-        assert_eq!(steps(&writes, true), measured);
-        assert_eq!(
-            steps(&writes, false),
-            ["otlp-spans-peak", "otlp-logs-peak", "native-write-peak"]
-        );
+        for writes in [&writes_hot, &writes] {
+            assert_eq!(steps(writes, true), measured);
+            assert_eq!(
+                steps(writes, false),
+                ["otlp-spans-peak", "otlp-logs-peak", "native-write-peak"]
+            );
+            assert_eq!(writes.controls["fixture"], writes_hot.controls["fixture"]);
+        }
         assert_eq!(
             steps(&hot, true),
             [
@@ -566,11 +592,26 @@ mod tests {
                 .as_str()
                 .is_some_and(|fixture| fixture.starts_with("native-2m"))
         );
+        for (declaration, hot_settings) in [
+            (&writes_hot, true),
+            (&hot, true),
+            (&writes, false),
+            (&parquet, false),
+        ] {
+            assert_eq!(
+                declaration.controls["limits"]
+                    .as_str()
+                    .is_some_and(|limits| limits.contains("WYRD_MAX_FILE_SIZE_IN_MEMORY=16384")),
+                hot_settings,
+                "{} keeps every row in a memtable only under the hot settings",
+                declaration.experiment
+            );
+        }
         assert!(
-            hot.controls["limits"]
+            writes.controls["limits"]
                 .as_str()
-                .is_some_and(|limits| limits.contains("WYRD_MAX_FILE_SIZE_IN_MEMORY=16384")),
-            "hot keeps every row in a memtable"
+                .is_some_and(|limits| limits.contains("WYRD_MAX_FILE_RETENTION_TIME=30")),
+            "writes-parquet runs the production rotation with a 30 s retention"
         );
         assert!(applies(&writes, "point-p99-slo").is_empty());
         for bifrost in [&hot, &parquet] {
@@ -678,6 +719,16 @@ mod tests {
             calls.len(),
             measured.len() * 4,
             "a warmup and three repetitions per step"
+        );
+        let (hot_record, hot_calls) = execute(writes_hot.clone(), bifrost_script(4.9)).await;
+        assert!(
+            hot_record.validity.reasons.is_empty(),
+            "{:?}",
+            hot_record.validity.reasons
+        );
+        assert_eq!(
+            hot_calls, calls,
+            "both write configurations run the same cases"
         );
         assert!(record.elapsed_seconds <= 480.0);
         let peak = record
@@ -894,16 +945,27 @@ mod tests {
         let writes = declare(
             Engine::Bifrost,
             Level::One,
-            &["writes"],
+            &["writes-parquet"],
             BASELINE_HOST,
             &repository(),
         );
         let (l1, _) = execute(writes.clone(), bifrost_script(4.9)).await;
+        let (hot_writes, _) = execute(
+            declare(
+                Engine::Bifrost,
+                Level::One,
+                &["writes-hot"],
+                BASELINE_HOST,
+                &repository(),
+            ),
+            bifrost_script(4.9),
+        )
+        .await;
         let (elsewhere, _) = execute(
             declare(
                 Engine::Bifrost,
                 Level::One,
-                &["writes"],
+                &["writes-parquet"],
                 OTHER_HOST,
                 &repository(),
             ),
@@ -921,6 +983,10 @@ mod tests {
             query::calibrate(std::slice::from_ref(&elsewhere), &base).is_err(),
             "another host never calibrates"
         );
+        assert!(
+            query::calibrate(std::slice::from_ref(&hot_writes), &base).is_err(),
+            "a hot-write capacity never calibrates the Parquet workload"
+        );
         let calibration =
             query::calibrate(&[elsewhere, l1.clone()], &base).expect("compatible record");
         assert_eq!(
@@ -935,7 +1001,7 @@ mod tests {
         smoked.mode = Mode::Smoke;
         let relocated = tempfile::tempdir().expect("relocated");
         let smoke_path = smoked.publish(relocated.path()).expect("publish smoke");
-        let history = relocated.path().join("benchmarks/bifrost/writes");
+        let history = relocated.path().join("benchmarks/bifrost/writes-parquet");
         std::fs::create_dir_all(&history).expect("history");
         std::fs::rename(&smoke_path, history.join("moved.json")).expect("relocate");
         let relocated_l2 = declare(
@@ -1254,7 +1320,7 @@ mod tests {
         let mut records = Vec::new();
         for engine in levels::ENGINES {
             let rest: &[&str] = if engine == Engine::Bifrost {
-                &["writes"]
+                &["writes-hot"]
             } else {
                 &[]
             };
@@ -1300,6 +1366,7 @@ mod tests {
             &["l2", "nosuch"],
             &["l1", "bifrost", "nosuch"],
             &["l1", "bifrost", "--clients", "4"],
+            &["l1", "bifrost", "writes", "--steps", "native-write-c1"],
             &["smoke", "l1", "bifrost"],
             &[],
         ] {

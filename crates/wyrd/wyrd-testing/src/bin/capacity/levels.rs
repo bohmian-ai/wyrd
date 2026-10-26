@@ -325,16 +325,31 @@ pub fn aggregate(arguments: &[String], mut run_engine: impl FnMut(Engine, &[Stri
 
 /// Runs one engine's `l1` as a child of this binary under the repository's
 /// test Postgres wrapper, so each engine starts from a fresh database;
-/// Bifrost runs each of its experiments in order as its own child and
-/// combines their exit codes by precedence, never stopping early.
+/// Bifrost runs every experiment through [`spawn_experiments`].
 pub fn spawn_engine(root: &Path, engine: Engine, forwarded: &[String]) -> u8 {
-    if engine != Engine::Bifrost {
-        return spawn(root, &["l1", engine.name()], forwarded);
+    if engine == Engine::Bifrost {
+        spawn_experiments(root, &crate::query::Experiment::ALL, forwarded)
+    } else {
+        spawn(root, &["l1", engine.name()], forwarded)
     }
-    let codes: Vec<u8> = crate::query::Experiment::ALL
+}
+
+/// Runs each Bifrost L1 experiment of `experiments` in order as its own
+/// child under a fresh database ([`spawn`]) and combines their exit codes
+/// by precedence, never stopping early.
+pub fn spawn_experiments(
+    root: &Path,
+    experiments: &[crate::query::Experiment],
+    forwarded: &[String],
+) -> u8 {
+    let codes: Vec<u8> = experiments
         .iter()
         .map(|experiment| {
-            let code = spawn(root, &["l1", engine.name(), experiment.name()], forwarded);
+            let code = spawn(
+                root,
+                &["l1", Engine::Bifrost.name(), experiment.name()],
+                forwarded,
+            );
             eprintln!("l1 bifrost {}: exit {code}", experiment.name());
             code
         })

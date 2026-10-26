@@ -1,9 +1,9 @@
 //! The Bifrost L1 workload of one [`Experiment`]: one server and one closed
 //! loop per measured step.
 //!
-//! `writes` loads no fixture: every write window takes its rows from a
-//! cursor that only grows, so each repetition writes fresh identities
-//! instead of retrying earlier ones. `hot` loads the events and span
+//! `writes-hot` and `writes-parquet` load no fixture: every write window
+//! takes its rows from a cursor that only grows, so each repetition writes
+//! fresh identities instead of retrying earlier ones. `hot` loads the events and span
 //! fixtures and checks that every row stays in a memtable; `parquet` also
 //! loads each write path's storage sample, settles everything once, and
 //! reads the settled-state facts before any window.
@@ -91,11 +91,13 @@ impl Isolated {
     /// its stop, and its work, seconds, and CPU stop there while requests
     /// then in flight drain, counted late. Every request the server answered
     /// must have exactly one successful server timing in its cohort; the
-    /// judged percentiles are that whole cohort's, late ones included. Each write
-    /// path after the first waits, before its first warmup, for every
-    /// earlier row to publish, so no path's server CPU pays for another
-    /// path's backlog; a path's 64-client step still carries its own
-    /// 1-client backlog.
+    /// judged percentiles are that whole cohort's, late ones included. In
+    /// `writes-parquet` each write path after the first waits, before its
+    /// first warmup, for every earlier row to publish, so no path's server
+    /// CPU pays for another path's backlog; a path's 64-client step still
+    /// carries its own 1-client backlog. Each write window reads the
+    /// publication its CPU interval paid for and the backlog left at its
+    /// stop.
     ///
     /// # Errors
     ///
@@ -118,7 +120,8 @@ impl Isolated {
             .ok_or_else(|| {
                 ExperimentError::workload(format!("step `{}` declares no clients", step.id))
             })?;
-        if phase == Phase::Warmup
+        if self.experiment == Experiment::WritesParquet
+            && phase == Phase::Warmup
             && step.number("clients") == Some(PAIR[0])
             && WriteOp::parse(op).is_some_and(|write| write != WriteOp::ALL[0])
         {
@@ -279,13 +282,49 @@ impl Isolated {
             repetition.set(
                 "storage_ratio",
                 Reading::missing(
-                    "measured by the `parquet` experiment after its settlement; `writes` never waits for publication",
+                    "measured by the `parquet` experiment after its settlement; a write window never waits for publication",
                 ),
             );
+            let grew = |family: &str| stopped.sum(family, &[]) - before.sum(family, &[]);
+            let published = grew(PUBLISHED_FILES);
+            repetition.set("published_files", Reading::exact(published));
+            repetition.set("published_mib", Reading::exact(grew(PUBLISHED_BYTES) / MIB));
+            repetition.set(
+                "memtable_backlog_mib",
+                Reading::exact(
+                    (stopped.sum("bifrost_scribe_active_memtable_bytes", &[])
+                        + stopped.sum("bifrost_scribe_immutable_memtable_bytes", &[]))
+                        / MIB,
+                ),
+            );
+            repetition.set(
+                "staged_backlog_mib",
+                Reading::exact(stopped.sum("bifrost_scribe_staging_live_bytes", &[]) / MIB),
+            );
+            let staged = stopped.sum("bifrost_scribe_staging_live_bytes", &[]);
+            if self.experiment == Experiment::WritesHot && (published > 0.0 || staged > 0.0) {
+                repetition.observations.push(format!(
+                    "rows left the memtables under the hot settings during the `{}` window: {published} files published, {} staged MiB",
+                    write.name(),
+                    staged / MIB
+                ));
+            }
+            if published <= 0.0 {
+                repetition.observations.push(format!(
+                    "no Parquet file was published in the `{}` window, so its server CPU includes no publication cost",
+                    write.name()
+                ));
+            }
         }
         Ok(repetition)
     }
 }
+
+/// Scribe's counter of Parquet files published.
+const PUBLISHED_FILES: &str = "bifrost_scribe_publication_files_total";
+
+/// Scribe's counter of Parquet bytes published.
+const PUBLISHED_BYTES: &str = "bifrost_scribe_publication_bytes_total";
 
 /// Bytes per MiB.
 pub const MIB: f64 = 1_048_576.0;
@@ -431,8 +470,8 @@ async fn settled(
 #[async_trait]
 impl Workload for Isolated {
     /// Starts the server, registers each write path, then loads the
-    /// experiment's fixtures and computes the exact answers; `writes` loads
-    /// nothing more.
+    /// experiment's fixtures and computes the exact answers; a write
+    /// experiment loads nothing more.
     ///
     /// Each read experiment loads [`Scale::spans`] spans, then the standard
     /// events fixture of [`Scale::standard`] rows. `hot` then requires every
@@ -461,7 +500,7 @@ impl Workload for Isolated {
         };
         self.server = Some(server);
         self.senders = senders.map_err(ExperimentError::workload)?;
-        if self.experiment == Experiment::Writes {
+        if self.experiment.writes() {
             return Ok(());
         }
         let server = self

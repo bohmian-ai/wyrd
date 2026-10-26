@@ -66,11 +66,13 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }
+glob = { workspace = true }
 jsonwebtoken = { workspace = true }
 lru = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 rand = { workspace = true }
+regex = { workspace = true }
 rustix = { workspace = true }
 secrecy = { workspace = true, features = ["serde"] }
 serde = { workspace = true }

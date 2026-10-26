@@ -1,11 +1,12 @@
-//! Workspaces stay inside their directory, inside their limits, and serve
-//! the same locators extraction produces.
+//! Workspaces stay inside their directory, inside their limits, serve the
+//! actual lines of their files, and extract only on request.
 
 use std::io::Write as _;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde_json::json;
+use wyrd_spec::verification::execution::Locator;
 use zip::write::SimpleFileOptions;
 
 use super::*;
@@ -49,6 +50,26 @@ fn loc(locator: Locator) -> Value {
     serde_json::to_value(locator).expect("locator serializes")
 }
 
+/// A literal, case-insensitive `fs.search` for `query` over every file.
+fn query(query: &str) -> Search {
+    Search {
+        query: query.to_owned(),
+        ..Search::default()
+    }
+}
+
+/// The fixture document bytes of `name`.
+///
+/// # Panics
+/// Panics when the fixture is missing.
+fn sample(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/../../../fixtures/cards/verifier_building_blocks/samples/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("fixture")
+}
+
 /// Materialize `files` under default limits.
 ///
 /// # Errors
@@ -82,30 +103,20 @@ fn targz(entries: &[(&[u8], tar::EntryType, &[u8])]) -> Vec<u8> {
         .expect("finish gzip")
 }
 
-/// `fs.read` and `fs.search` return extraction's locators and keep each
-/// file's original slots.
+/// `fs.read` serves a file's actual lines unparsed, refuses directories
+/// and binary documents, and `fs.extract` writes the extraction to a new
+/// `/work` file that `fs.read` then serves, never overwriting one.
 ///
 /// # Panics
-/// Panics when a locator or source differs from extraction.
+/// Panics when a file is parsed on read, a refusal is accepted, or an
+/// extraction output is lost or overwritten.
 #[test]
-fn workspace_reads_and_searches_located_units() {
+fn workspace_reads_lines_and_extracts_on_request() {
     let workspace = open(vec![
-        staged(
-            "/inputs/deck.pdf",
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../../fixtures/cards/verifier_building_blocks/samples/sample.pdf"
-            ))
-            .to_vec(),
-            MediaFormat::Pdf,
-        ),
+        staged("/inputs/deck.pdf", sample("sample.pdf"), MediaFormat::Pdf),
         staged(
             "/inputs/memo.docx",
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../../fixtures/cards/verifier_building_blocks/samples/sample.docx"
-            ))
-            .to_vec(),
+            sample("sample.docx"),
             MediaFormat::Docx,
         ),
         staged(
@@ -113,49 +124,198 @@ fn workspace_reads_and_searches_located_units() {
             br#"{"total": 42}"#.to_vec(),
             MediaFormat::Json,
         ),
+        staged(
+            "/inputs/policy/refunds.md",
+            b"# Refunds\nwithin 30 days\n".to_vec(),
+            MediaFormat::Markdown,
+        ),
     ])
     .expect("materializes");
 
-    let read = workspace.read("/inputs/deck.pdf", 0).expect("pdf reads");
     assert_eq!(
-        read["units"],
-        json!([{"locator": loc(Locator::Page(1)), "text": "Refunds"}])
-    );
-    let found = workspace.search("refunds").expect("search");
-    assert_eq!(
-        found["matches"],
-        json!([{"path": "/inputs/deck.pdf", "locator": loc(Locator::Page(1)), "snippet": "Refunds", "sources": ["evidence"]}])
+        workspace.read("/inputs/data.json", 0).expect("json")["units"],
+        json!([{"locator": loc(Locator::Lines { start: 1, end: 1 }), "text": r#"{"total": 42}"#}])
     );
     assert_eq!(
-        workspace.read("/inputs/data.json", 0).expect("json")["units"][0]["locator"],
-        loc(Locator::JsonPointer("/total".to_owned()))
+        workspace
+            .read("/inputs/policy/refunds.md", 1)
+            .expect("markdown")["units"],
+        json!([{"locator": loc(Locator::Lines { start: 2, end: 2 }), "text": "within 30 days"}])
+    );
+    for refused in ["/inputs/memo.docx", "/inputs/policy", "/inputs", "/work"] {
+        assert!(workspace.read(refused, 0).is_err(), "{refused}");
+    }
+
+    let extracted = workspace
+        .extract("/inputs/deck.pdf", "/work/deck.json")
+        .expect("pdf extracts");
+    assert_eq!(
+        extracted,
+        json!({"output_path": "/work/deck.json", "sources": ["evidence"], "extractor_version": EXTRACT_VERSION})
+    );
+    let output: Value = serde_json::from_slice(
+        &std::fs::read(workspace.work_dir().join("deck.json")).expect("output"),
+    )
+    .expect("output is JSON");
+    assert_eq!(output["pages"][0]["text"], "Refunds");
+    assert!(
+        workspace.read("/work/deck.json", 0).expect("output reads")["units"]
+            .as_array()
+            .is_some_and(|units| !units.is_empty())
     );
     assert!(
         workspace
-            .sources("/inputs/memo.docx")
-            .is_some_and(|slots| slots.len() == 1)
+            .extract("/inputs/memo.docx", "/work/nested/memo.json")
+            .is_ok()
     );
+    for (path, output) in [
+        ("/inputs/deck.pdf", "/work/deck.json"),
+        ("/inputs/deck.pdf", "/inputs/deck.json"),
+        ("/inputs/deck.pdf", "/work/../deck.json"),
+        ("/inputs/policy", "/work/policy.json"),
+        ("/inputs/missing.pdf", "/work/missing.json"),
+    ] {
+        assert!(
+            workspace.extract(path, output).is_err(),
+            "{path} -> {output}"
+        );
+    }
+    let mut corrupt = staged(
+        "/inputs/bad.pdf",
+        b"%PDF-1.4 truncated".to_vec(),
+        MediaFormat::Pdf,
+    );
+    corrupt.format = None;
+    let workspace = open(vec![corrupt]).expect("materializes");
+    assert!(
+        workspace
+            .extract("/inputs/bad.pdf", "/work/bad.json")
+            .is_err()
+    );
+    assert!(!workspace.work_dir().join("bad.json").exists());
+    assert_eq!(
+        std::fs::read_dir(workspace.root.path())
+            .expect("root")
+            .count(),
+        2,
+        "a refused extraction leaves no temporary file"
+    );
+}
 
-    std::fs::write(
-        workspace.work_dir().join("notes.txt"),
-        "draft\nrefunds noted\n",
-    )
-    .expect("write work");
-    assert_eq!(
-        workspace.read("/work/notes.txt", 1).expect("work reads")["units"][0]["text"],
-        "refunds noted"
-    );
-    assert_eq!(
-        workspace.search("refunds").expect("search")["matches"]
+/// `fs.search` returns one hit per matching line in path then line order,
+/// literal and case-insensitive by default, with regex, case, path, and
+/// glob controls; hidden files are searched and binary ones skipped.
+///
+/// # Panics
+/// Panics when a hit is missing, extra, misordered, or a bad pattern is
+/// accepted.
+#[test]
+fn workspace_search_matches_lines() {
+    let workspace = open(vec![
+        staged(
+            "/inputs/policy/refunds.md",
+            b"Refunds within 30 days\nno refund after 60 days\n".to_vec(),
+            MediaFormat::Markdown,
+        ),
+        staged(
+            "/inputs/policy/.hidden.txt",
+            b"REFUND hidden".to_vec(),
+            MediaFormat::Text,
+        ),
+        staged(
+            "/inputs/other/refunds.md",
+            b"refund elsewhere".to_vec(),
+            MediaFormat::Markdown,
+        ),
+        staged(
+            "/inputs/memo.docx",
+            zipped(&[("refund.txt", "refund")]),
+            MediaFormat::Docx,
+        ),
+    ])
+    .expect("materializes");
+    let hits = |search: Search| {
+        workspace.search(&search).expect("search")["matches"]
             .as_array()
-            .map(Vec::len),
-        Some(2)
-    );
-    let listed = workspace.list("/work").expect("list");
+            .expect("matches")
+            .iter()
+            .map(|hit| {
+                format!(
+                    "{}:{}",
+                    hit["path"].as_str().expect("path"),
+                    hit["locator"]["lines"]["start"]
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        listed["files"],
-        json!([{"path": "/work/notes.txt", "size_bytes": 20, "sources": []}])
+        hits(query("refund")),
+        [
+            "/inputs/other/refunds.md:1",
+            "/inputs/policy/.hidden.txt:1",
+            "/inputs/policy/refunds.md:1",
+            "/inputs/policy/refunds.md:2",
+        ]
     );
+    let found = workspace.search(&query("after")).expect("search");
+    assert_eq!(
+        found["matches"],
+        json!([{
+            "path": "/inputs/policy/refunds.md",
+            "locator": loc(Locator::Lines { start: 2, end: 2 }),
+            "snippet": "no refund after 60 days",
+            "sources": ["evidence"],
+        }])
+    );
+    let exact = Search {
+        case_sensitive: true,
+        ..query("Refund")
+    };
+    assert_eq!(hits(exact), ["/inputs/policy/refunds.md:1"]);
+    let pattern = Search {
+        regex: true,
+        ..query(r"\d+ days$")
+    };
+    assert_eq!(
+        hits(pattern),
+        ["/inputs/policy/refunds.md:1", "/inputs/policy/refunds.md:2"]
+    );
+    assert_eq!(hits(query("d+ days")), Vec::<String>::new());
+    let scoped = |path: &str, glob: Option<&str>| Search {
+        path: Some(path.to_owned()),
+        glob: glob.map(str::to_owned),
+        ..query("refund")
+    };
+    assert_eq!(hits(scoped("/inputs/policy", None)).len(), 3);
+    assert_eq!(hits(scoped("/inputs/policy/refunds.md", None)).len(), 2);
+    assert_eq!(hits(scoped("/inputs", Some("*.md"))).len(), 3);
+    assert_eq!(hits(scoped("/inputs", Some("policy/*.md"))).len(), 2);
+    assert_eq!(hits(scoped("/inputs", Some("**/*.txt"))).len(), 1);
+    assert_eq!(hits(scoped("/inputs", Some("*/refunds.md"))).len(), 3);
+    assert!(hits(scoped("/inputs", Some("inputs/*.md"))).is_empty());
+    let rooted = Search {
+        glob: Some("inputs/other/*".to_owned()),
+        ..query("refund")
+    };
+    assert_eq!(hits(rooted), ["/inputs/other/refunds.md:1"]);
+    for refused in [
+        Search {
+            regex: true,
+            ..query("(")
+        },
+        Search {
+            glob: Some("/inputs/*".to_owned()),
+            ..query("refund")
+        },
+        Search {
+            glob: Some("../*".to_owned()),
+            ..query("refund")
+        },
+        scoped("/inputs/missing", None),
+        query(""),
+    ] {
+        assert!(workspace.search(&refused).is_err(), "{refused:?}");
+    }
 }
 
 /// Tool output names the original slot behind an `/inputs` file even when
@@ -182,7 +342,7 @@ fn workspace_tools_name_original_slots() {
         workspace.list("/inputs").expect("list")["files"][0]["sources"],
         json!(["policy"])
     );
-    let found = workspace.search("refunds").expect("search");
+    let found = workspace.search(&query("refunds")).expect("search");
     assert_eq!(found["matches"][0]["sources"], json!(["policy"]));
     assert_eq!(found["matches"][1]["sources"], json!([]));
     assert_eq!(
@@ -281,7 +441,7 @@ fn workspace_results_stop_at_the_limit() {
     }
     for result in [
         workspace.list("/work").expect("list"),
-        workspace.search("needle").expect("search"),
+        workspace.search(&query("needle")).expect("search"),
     ] {
         assert!(result.to_string().len() <= max);
         assert_eq!(result["truncated"], true);
@@ -306,6 +466,14 @@ fn workspace_unpacks_archives_safely() {
             .expect("md")["units"][0]["text"],
         "# Title"
     );
+    let mut fixed = staged(
+        "/inputs/kept.zip",
+        zipped(&[("a.txt", "a")]),
+        MediaFormat::Zip,
+    );
+    fixed.format = None;
+    let workspace = open(vec![fixed]).expect("fixed archive");
+    assert!(workspace.inputs_dir().join("kept.zip").is_file());
     let tar = targz(&[(b"a/notes.txt", tar::EntryType::Regular, b"hello")]);
     let workspace = open(vec![staged("/inputs/b.tar.gz", tar, MediaFormat::TarGz)]).expect("tar");
     assert!(

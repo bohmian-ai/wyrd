@@ -1595,8 +1595,10 @@ fn validate_request(request: &DeclareCardRequest) -> Result<(), WyrdError> {
         if let Some(error) = spec_binding_errors(&spec).into_iter().next() {
             return Err(error);
         }
-        if let Spec::Verifier(verifier) = &spec {
-            verifier.validate()?;
+        match &spec {
+            Spec::Verifier(verifier) => verifier.validate()?,
+            Spec::Artifact(artifact) => artifact.validate()?,
+            _ => {}
         }
         validate_artifact_manifest(&submission.artifacts)?;
         let computed = canonical_artifact_manifest_hash(&submission.artifacts)?;

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 pub use diagnose::{Diagnostic, Severity, SourceSpan, emit_json};
 pub use error::LoadError;
 pub use extract::{
-    EXTRACT_VERSION, ExtractError, ExtractLimits, Extraction, locates, units, zip_guard,
+    EXTRACT_VERSION, ExtractError, ExtractLimits, Extraction, lines, locates, units, zip_guard,
 };
 pub use manifest::{ArtifactManifest, build_artifact_manifest};
 pub use parse::AuthoredCard;

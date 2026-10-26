@@ -61,7 +61,9 @@ pub use query::{FieldRef, MetadataQuery, Operator, Predicate, QueryFieldErrorDet
 #[cfg(any(test, feature = "test-utils"))]
 pub use security::InlineSecret;
 pub use security::{SecretRef, SecretRefError, TlsConfig};
-pub use skald_spec::{MediaFormat, MessageNum, Prompt, ProviderRequest, ProviderResponse, ResponseType};
+pub use skald_spec::{
+    MediaFormat, MessageNum, Prompt, ProviderRequest, ProviderResponse, ResponseType,
+};
 
 #[cfg(test)]
 mod foundation_contracts_tests {

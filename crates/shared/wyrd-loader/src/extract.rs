@@ -1,5 +1,5 @@
-//! The one format extraction path behind `extract` actions and the
-//! filesystem tools.
+//! The one format extraction path behind `extract` actions, `fs.extract`,
+//! citation validation, and client-side Artifact extraction.
 //!
 //! [`Extraction::run`] turns pinned original bytes into the locked
 //! [`ExtractOutput`] shape. PDF text comes from `lopdf`, XLSX cells from
@@ -7,8 +7,9 @@
 //! `zip` and `quick-xml`. Every OOXML container first passes [`zip_guard`],
 //! which streams each entry under the archive byte, entry, and ratio limits
 //! so no parser sees an archive bomb. [`units`] projects an output into the
-//! located text units that `fs.read`, `fs.search`, and citation validation
-//! share. Extraction is text and structure only.
+//! located text units citation validation checks, and [`lines`] numbers the
+//! actual lines `fs.read` and `fs.search` serve. Extraction is text and
+//! structure only.
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
@@ -511,8 +512,8 @@ pub fn zip_guard(bytes: &[u8], limits: &ExtractLimits) -> Result<(), ExtractErro
     Ok(())
 }
 
-/// Located text units of `output`, shared by `fs.read`, `fs.search`, and
-/// citation validation.
+/// Located text units of `output`, the locations citation validation
+/// accepts.
 ///
 /// PDF pages and PPTX slides are page and slide units; DOCX and XLSX text
 /// fields are JSON-pointer units into the canonical output; JSON leaves are
@@ -554,21 +555,27 @@ pub fn units(output: &ExtractOutput, source: &[u8]) -> Vec<(Locator, String)> {
         ExtractOutput::Csv { .. }
         | ExtractOutput::Text { .. }
         | ExtractOutput::Markdown { .. }
-        | ExtractOutput::Html { .. } => String::from_utf8_lossy(source)
-            .lines()
-            .enumerate()
-            .map(|(index, line)| {
-                let number = u32::try_from(index + 1).unwrap_or(u32::MAX);
-                (
-                    Locator::Lines {
-                        start: number,
-                        end: number,
-                    },
-                    line.to_owned(),
-                )
-            })
-            .collect(),
+        | ExtractOutput::Html { .. } => lines(&String::from_utf8_lossy(source)),
     }
+}
+
+/// One-line units of `text`, numbered from 1: the locators `fs.read`,
+/// `fs.search`, and citations of ordinary text files share.
+#[must_use]
+pub fn lines(text: &str) -> Vec<(Locator, String)> {
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let number = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            (
+                Locator::Lines {
+                    start: number,
+                    end: number,
+                },
+                line.to_owned(),
+            )
+        })
+        .collect()
 }
 
 /// Whether `locator` names a location in `units`.

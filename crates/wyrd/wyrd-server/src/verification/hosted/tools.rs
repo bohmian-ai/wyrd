@@ -36,7 +36,7 @@ use wyrd_spec::verification::TaskId;
 use super::HostedLimits;
 use super::evidence::TenantEvidence;
 use super::sandbox::Sandbox;
-use super::workspace::{Workspace, Workspaces};
+use super::workspace::{Search, Workspace, Workspaces};
 use crate::AppState;
 use crate::audit;
 use crate::bifrost::service;
@@ -241,13 +241,27 @@ impl Invocation {
                     .await
                     .map_err(|error| structured(&error))
             }
-            BuiltinTool::FsList | BuiltinTool::FsRead | BuiltinTool::FsSearch => {
+            BuiltinTool::FsSearch => {
+                let workspace = Arc::clone(self.workspace()?);
+                let mut search: Search = parse(args)?;
+                search.path = search.path.filter(|path| !path.is_empty());
+                tokio::task::spawn_blocking(move || workspace.search(&search))
+                    .await
+                    .map_err(|error| invocation(error.to_string()))?
+                    .map_err(|error| invocation(error.to_string()))
+            }
+            BuiltinTool::FsList | BuiltinTool::FsRead | BuiltinTool::FsExtract => {
                 let workspace = Arc::clone(self.workspace()?);
                 let args: FsArgs = parse(args)?;
+                let held = Arc::clone(&workspace);
+                let _writer = match tool {
+                    BuiltinTool::FsExtract => Some(held.writer().await),
+                    _ => None,
+                };
                 tokio::task::spawn_blocking(move || match tool {
                     BuiltinTool::FsList => workspace.list(&args.path),
                     BuiltinTool::FsRead => workspace.read(&args.path, args.start),
-                    _ => workspace.search(&args.query),
+                    _ => workspace.extract(&args.path, &args.output_path),
                 })
                 .await
                 .map_err(|error| invocation(error.to_string()))?
@@ -452,19 +466,20 @@ impl AgentTool for Builtin {
 #[serde(deny_unknown_fields)]
 struct Empty {}
 
-/// Arguments of the filesystem tools; each reads only its own fields.
+/// Arguments of `fs.list`, `fs.read`, and `fs.extract`; each reads only
+/// its own fields.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FsArgs {
-    /// Workspace path for `fs.list` and `fs.read`.
+    /// Workspace path the tool lists, reads, or extracts.
     #[serde(default)]
     path: String,
-    /// First unit `fs.read` returns.
+    /// First piece `fs.read` returns.
     #[serde(default)]
     start: usize,
-    /// Case-insensitive text `fs.search` looks for.
+    /// New `/work` file `fs.extract` writes.
     #[serde(default)]
-    query: String,
+    output_path: String,
 }
 
 /// Arguments of `code.run`.
@@ -491,16 +506,38 @@ fn descriptor(tool: BuiltinTool) -> (String, Value) {
             json!({"type": "object", "properties": {"path": path}, "required": ["path"], "additionalProperties": false}),
         ),
         BuiltinTool::FsRead => (
-            "Read a workspace file as located text units (page, slide, line, or JSON pointer), \
-             starting at unit `start`; follow `next` to continue, since long units arrive in \
-             pieces sharing one locator. Cite an /inputs file by one of its `sources` slots \
-             with the unit's locator.",
+            "Read a UTF-8 workspace file as its actual lines, each with a `lines` locator, \
+             starting at piece `start`; follow `next` to continue, since long lines arrive in \
+             pieces sharing one locator. Nothing is parsed: directories and binary files are \
+             refused, so run fs.extract on a document first. Cite an /inputs file by one of its \
+             `sources` slots with the line's locator.",
             json!({"type": "object", "properties": {"path": path, "start": {"type": "integer", "minimum": 0}}, "required": ["path"], "additionalProperties": false}),
         ),
         BuiltinTool::FsSearch => (
-            "Search every workspace file for text, case-insensitively, returning each match's path, \
-             locator, and the original input slots (`sources`) of /inputs files.",
-            json!({"type": "object", "properties": {"query": {"type": "string", "minLength": 1}}, "required": ["query"], "additionalProperties": false}),
+            "Search the UTF-8 lines of workspace files, returning one match per line with its \
+             path, `lines` locator, snippet, and the original input slots (`sources`) of /inputs \
+             files. `query` is literal text unless `regex` is true (Rust regex syntax); case is \
+             ignored unless `case_sensitive`. `path` limits the search to one file or directory; \
+             `glob` keeps files whose basename (no `/` in the pattern) or path relative to that \
+             directory matches, `*` within one segment and `**` across them. Binary files are \
+             skipped.",
+            json!({"type": "object", "properties": {
+                "query": {"type": "string", "minLength": 1},
+                "regex": {"type": "boolean", "default": false},
+                "case_sensitive": {"type": "boolean", "default": false},
+                "path": path,
+                "glob": {"type": "string", "minLength": 1}
+            }, "required": ["query"], "additionalProperties": false}),
+        ),
+        BuiltinTool::FsExtract => (
+            "Extract a workspace document (PDF, DOCX, XLSX, PPTX, CSV, JSON, text, Markdown, or \
+             HTML) with Wyrd's extractor and write the extraction JSON to a new file under /work. \
+             Returns `output_path`, the document's `sources`, and `extractor_version`; read the \
+             output with fs.read. An existing output path is refused.",
+            json!({"type": "object", "properties": {
+                "path": path,
+                "output_path": {"type": "string", "description": "New file path under /work."}
+            }, "required": ["path", "output_path"], "additionalProperties": false}),
         ),
         BuiltinTool::CodeRun => (
             "Run sandboxed Python with /inputs read-only and /work writable; returns printed output \

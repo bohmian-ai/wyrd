@@ -438,22 +438,14 @@ impl VerifierRunner {
             return outcome;
         }
         let (drift, evidence, routes, run_id) = match &run.input {
-            ExecutionInput::Scheduled { window } => {
+            ExecutionInput::Scheduled { .. } => {
                 let selected = self
                     .recorded(tenant, run, system, async |_, row| row.schedule().map(Some))
                     .await;
                 let checks = match selected {
                     Ok(selected) => {
                         self.drift
-                            .checks(
-                                tenant,
-                                run,
-                                system,
-                                spec,
-                                window,
-                                &selected.record_ids,
-                                telemetry,
-                            )
+                            .checks(tenant, run, system, spec, &selected, telemetry)
                             .await
                     }
                     Err(outcome) => Err(outcome),
@@ -973,7 +965,7 @@ fn result(
     let (run_id, window) = match &run.input {
         ExecutionInput::Scheduled { window, .. } => (None, Some(window)),
         ExecutionInput::Submitted { run_id, .. } => (run_id.as_ref(), None),
-        ExecutionInput::Grouped { .. } => (None, None),
+        ExecutionInput::Grouped => (None, None),
     };
     let built = ResultPayloadBuilder::new(
         ResultRun {

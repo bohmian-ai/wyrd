@@ -306,9 +306,10 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
 ///
 /// The Scribe-only node composes the runtime over its own Scribe. A due
 /// monthly binding's Custom Verifier reads its `score` samples under the
-/// binding owner's recovered authority with SYSTEM as actor; the read is
-/// forwarded to a peer Oracle, which records one audited read decision, and
-/// the execution completes with a published result on its first attempt.
+/// binding owner's recovered authority with SYSTEM as actor; its three reads
+/// (the frozen population selection, the input record, and the window) are
+/// forwarded to a peer Oracle, which records one audited read decision for
+/// each, and the execution completes with a published result on its first attempt.
 /// The registered table is empty for the subject, so the result is
 /// inconclusive.
 ///
@@ -364,8 +365,12 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
     }
     cluster.await_audit_retained().await?;
     let after = audit_rows(scribe, tenant, "bifrost.query.read_decision").await?;
-    if after != reads + 1 {
-        return Err(format!("expected one audited peer read, counted {}", after - reads).into());
+    if after != reads + 3 {
+        return Err(format!(
+            "expected three audited peer reads, counted {}",
+            after - reads
+        )
+        .into());
     }
     cluster.shutdown().await?;
     Ok(())
@@ -7174,10 +7179,12 @@ async fn settle_all(
 /// days ago. Two queued trace executions of one Verifier and subject judge
 /// different traces, one passing and one failing. While they are pending,
 /// each status carries no result and costs no Oracle read. The runtime then
-/// collects each trace once. After publication each status, read through the
-/// Rust SDK, returns its own verdict and execution with one Oracle statement
-/// that scans no more files than the day-partitioned result table holds
-/// results for that execution; another execution's result never substitutes.
+/// reads each execution's input record and collects its trace once. After
+/// publication each status, read through the Rust SDK, returns its own
+/// verdict and execution with one Oracle statement joining the summary,
+/// output, and input records that scans one file per table, so the older
+/// day-partitioned results are pruned; another execution's result never
+/// substitutes.
 /// Another tenant's caller and an unknown execution are refused as not found.
 ///
 /// # Errors
@@ -7257,8 +7264,11 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
     {
         return Err(format!("both executions complete on attempt one: {rows:?}").into());
     }
-    if !ScanEvidence::is(collection.queries, 2) {
-        return Err(format!("each execution collects its trace once: {collection:?}").into());
+    if !ScanEvidence::is(collection.queries, 4) {
+        return Err(format!(
+            "each execution reads its input record and collects its trace once: {collection:?}"
+        )
+        .into());
     }
     server.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
@@ -7278,8 +7288,11 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
         if result.execution_id != *execution || read["verdict"] != verdict {
             return Err(format!("{execution} read another result: {read}").into());
         }
-        if !ScanEvidence::is(work.queries, 1) || work.files > 1.0 {
-            return Err(format!("one exact result read scans one file: {work:?}").into());
+        if !ScanEvidence::is(work.queries, 1) || work.files > 3.0 {
+            return Err(format!(
+                "one exact result read scans one file per verification table: {work:?}"
+            )
+            .into());
         }
     }
 
@@ -7459,8 +7472,8 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
 }
 
 /// Interleaved support conversations each form their own group snapshot of
-/// exactly their turns, in recorded order, with one Oracle statement per
-/// group (REQ-026, REQ-040; AC-008, AC-014).
+/// exactly their turns, in recorded order, with a fixed Oracle statement
+/// count per turn and per group (REQ-026, REQ-040; AC-008, AC-014).
 ///
 /// The `support` Service declares a per-turn `turn-check` and a `group_end`
 /// `conversation-verifier` whose `turns` slot reads turn inputs and whose
@@ -7469,8 +7482,10 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
 /// (`z`). The production runtime judges the four turns, then hands each
 /// expired group off once: `long` lists its three turns in order under both
 /// slots and fails on the blank turn, `short` lists only its turn and
-/// passes, and the whole runtime pass costs one statement per group, since
-/// the turns read no warehouse evidence.
+/// passes. The turns read no warehouse evidence, so the whole runtime pass
+/// costs one input-record read per turn, then per group a snapshot read, an
+/// ordering read of its turn inputs, its own input-record read, and the
+/// execution's reads of its turn inputs and selected outputs.
 ///
 /// # Errors
 /// Returns cluster, declaration, credential, route, runtime, or SDK
@@ -7555,8 +7570,8 @@ async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourney
     if rows.iter().any(|row| row.status != "completed") {
         return Err(format!("every execution completes: {rows:?}").into());
     }
-    if !ScanEvidence::is(work.queries, 2) {
-        return Err(format!("each group is read by one statement: {work:?}").into());
+    if !ScanEvidence::is(work.queries, 4 + 2 * 5) {
+        return Err(format!("each turn reads once and each group five times: {work:?}").into());
     }
     let mut groups = BTreeMap::new();
     for execution in seed.executions().await? {

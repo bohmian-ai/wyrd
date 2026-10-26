@@ -281,8 +281,9 @@ impl<'q> InputResolver<'q> {
     /// source in list order: a JSON input unwraps to its value, a trace
     /// input to its trace ID, a file or Artifact input is its declaration,
     /// and an outcome is the named requirement's outcome in the selected
-    /// result, null when the source has none. `None` while any source's input
-    /// record or selected output is not visible.
+    /// result, null when the source has none. Output records are read only
+    /// when a slot names an outcome. `None` while any source's input record,
+    /// or a needed selected output, is not visible.
     ///
     /// # Errors
     /// Returns the query refusal or failure, and an internal error when a
@@ -295,6 +296,12 @@ impl<'q> InputResolver<'q> {
             .values()
             .flat_map(|slot| slot.executions.iter().copied())
             .collect();
+        let outcomes = slots.values().any(|slot| {
+            matches!(
+                slot.reference.parse().map(|reference| reference.field),
+                Ok(SourceField::Outcome(_))
+            )
+        });
         let mut payloads = Payloads::default();
         if !sources.is_empty() {
             // ponytail: one IN list per resolution, growing with the group;
@@ -316,6 +323,7 @@ impl<'q> InputResolver<'q> {
             }
             let selected: BTreeMap<VerificationResultId, ExecutionId> = sources
                 .iter()
+                .filter(|_| outcomes)
                 .filter_map(|source| Some((source.result_id?, source.execution_id)))
                 .collect();
             if !selected.is_empty() {

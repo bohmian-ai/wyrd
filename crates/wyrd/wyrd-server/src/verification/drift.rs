@@ -70,6 +70,7 @@ use wyrd_sql::queries::verifier_executions::{
 
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::engines::EngineOutcome;
+use super::inputs::ScheduleSelector;
 use super::telemetry::{ExecutionTelemetry, Phase};
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::ScribeSink;
@@ -773,8 +774,8 @@ impl DriftEngine {
         self.state.bifrost.scribe_outbox().reserve(1)
     }
 
-    /// Score every drift requirement of `spec` over its scheduled `window`
-    /// for `tenant`, reading only the frozen `records`.
+    /// Score every drift requirement of `spec` over the scheduled window of
+    /// `selected` for `tenant`, reading only its frozen records.
     ///
     /// The exact Verifier is the only source of samples: each drift check
     /// reads its declared measurements for the subject, and no requirement is
@@ -797,17 +798,17 @@ impl DriftEngine {
         run: &ClaimedExecution,
         system: PrincipalId,
         spec: &VerifierSpec,
-        window: &DriftWindow,
-        records: &[String],
+        selected: &ScheduleSelector,
         telemetry: &ExecutionTelemetry,
     ) -> Result<DriftChecks, EngineOutcome> {
+        let window = &selected.window;
         let reader = Reader {
             engine: self,
             tenant,
             system,
             run,
             telemetry,
-            observations: ObservationWindow::new(&run.card_uid, window).of(records),
+            observations: ObservationWindow::new(&run.card_uid, window).of(&selected.record_ids),
         };
         let mut checks = DriftChecks::new(Some(*window), BTreeMap::new(), BTreeMap::new());
         for (requirement, check) in spec.drift_checks() {

@@ -1150,6 +1150,51 @@ mod tests {
         assert_eq!(answered, 1);
     }
 
+    /// Dropping the scheduler mid-window, as a budget overrun or an
+    /// interrupt drops a repetition, admits nothing more and aborts every
+    /// call it sent, so no tally changes after the stop.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an arrival is admitted after the stop or a call outlives
+    /// it.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_arrivals_admit_nothing_and_abort_their_calls() {
+        let schedule = Schedule {
+            window: Duration::from_secs(12),
+            direct_rate: 1.0,
+            submit_rate: 1.0,
+            overload_factor: 2.0,
+        };
+        let sequence = Arc::new(AtomicU64::new(0));
+        let live = Arc::new(());
+        let driving = arrivals(
+            Op::Verify,
+            schedule,
+            tokio::time::Instant::now(),
+            |_| {
+                let held = Arc::clone(&live);
+                Some(async move {
+                    std::future::pending::<()>().await;
+                    drop(held);
+                    Ok(true)
+                })
+            },
+            Arc::default(),
+            Arc::default(),
+            Arc::clone(&sequence),
+        );
+        let cut = tokio::time::timeout(Duration::from_millis(2_500), driving).await;
+        assert!(cut.is_err(), "the schedule outlasts the cut");
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(
+            sequence.load(Ordering::SeqCst),
+            3,
+            "arrivals at 0, 1, and 2 s only"
+        );
+        assert_eq!(Arc::strong_count(&live), 1, "no call outlives the stop");
+    }
+
     /// Arrivals keep their schedule phase's cohort except recovery's first
     /// 30 s (half of a recovery shorter than 60 s), which join overload's,
     /// so recovery is judged after its grace however late each call

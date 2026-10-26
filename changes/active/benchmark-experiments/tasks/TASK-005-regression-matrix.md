@@ -431,10 +431,11 @@ new public CLI. Complete measurement-integrity checks and each engine's L1 smoke
 before its V8 qualification; run L2 smoke before V9 once the required L1
 calibration exists. No builds or independent tests run beside measurements.
 
-### V4 — Owned sustained workload lifecycle (planned)
+### V4 — Owned sustained workload lifecycle (corrected selectors)
 
 ```bash
-mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=tests::sustained_work_stops_admission_and_reconciles_drain)'
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=query::competing::tests::sustained_work_stops_admission_and_reconciles_drain) | test(=verification::run::tests::cancelled_arrivals_admit_nothing_and_abort_their_calls) | test(=gateway::capacity::tests::cancelled_scheduler_launches_nothing_and_its_calls_are_joined)'
+mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::profile_saving_never_delays_drain_or_budget)'
 ```
 
 ### V5 — Qualification/promotion exclusions (planned)

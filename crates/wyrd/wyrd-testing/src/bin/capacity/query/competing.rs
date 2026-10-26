@@ -24,6 +24,7 @@ use secrecy::ExposeSecret as _;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tokio_util::task::AbortOnDropHandle;
 use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::transport::trace::with_benchmark_labels;
@@ -199,6 +200,24 @@ where
     offered
 }
 
+/// Runs each of `tasks` as its own Tokio task and joins them in order. The
+/// returned future owns every task: dropping it, as a budget overrun or an
+/// interrupt drops a repetition, aborts each one still running, so no lane
+/// keeps emitting after measurement stopped.
+fn owned<T, Fut>(
+    tasks: impl IntoIterator<Item = Fut>,
+) -> impl Future<Output = Vec<Result<T, tokio::task::JoinError>>>
+where
+    T: Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+{
+    futures_util::future::join_all(
+        tasks
+            .into_iter()
+            .map(|task| AbortOnDropHandle::new(tokio::spawn(task))),
+    )
+}
+
 /// The admission phases a repetition labels its offered requests with:
 /// capacity until overload starts, overload until its recovery grace ends,
 /// and recovery after; only capacity and recovery are judged.
@@ -345,9 +364,9 @@ impl Competing {
         // Each lane is its own task: its WyrdState load and submissions are
         // synchronous work that, polled beside the open-loop schedulers,
         // would make their arrivals late.
-        let lanes = futures_util::future::join_all((0..LANES.len()).map(|index| {
+        let lanes = owned((0..LANES.len()).map(|index| {
             let tenant = Arc::clone(tenant);
-            tokio::spawn(async move { LANES[index].run(&tenant, end).await })
+            async move { LANES[index].run(&tenant, end).await }
         }));
         let overload = async {
             tokio::time::sleep_until(admitting.overload).await;
@@ -1089,6 +1108,8 @@ impl Workload for Competing {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use tokio::time::Instant;
@@ -1102,7 +1123,7 @@ mod tests {
 
     use super::{
         Acked, Asked, Case, Offered, Phases, QUERY_CLIENTS, QUERY_RATE, RECOVERY_GRACE,
-        WRONG_RESULT, expected, mixed_case, open_loop, read_ingest, read_queries,
+        WRONG_RESULT, expected, mixed_case, open_loop, owned, read_ingest, read_queries,
     };
 
     /// A successful `bifrost.query` series of `case` in `phase` with one
@@ -1259,6 +1280,85 @@ mod tests {
         assert!(
             offered >= 4_000 && scans >= 200,
             "{offered} queries, {scans} scans"
+        );
+    }
+
+    /// Every arrival a complete repetition schedules is sent or missed and
+    /// every sent one answers before the drain instant; dropping the
+    /// repetition mid-window, as a budget overrun or interrupt does, admits
+    /// nothing more and aborts the scheduler's calls and every lane, so no
+    /// work outlives the stop.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an arrival is unaccounted for, is admitted after the
+    /// stop, or a call or lane outlives it.
+    #[tokio::test(start_paused = true)]
+    async fn sustained_work_stops_admission_and_reconciles_drain() {
+        let start = Instant::now();
+        let slow = || tokio::time::sleep(Duration::from_millis(250));
+        let complete = open_loop(
+            start,
+            start + Duration::from_secs(1),
+            Duration::from_millis(100),
+            2,
+            slow,
+        )
+        .await;
+        assert_eq!(complete.scheduled, complete.sent + complete.missed);
+        assert!(complete.missed > 0, "the bound refuses some arrivals");
+        assert_eq!(complete.acked.len().to_u64(), Some(complete.sent));
+        assert!(
+            complete
+                .drained
+                .is_some_and(|drained| drained >= start + Duration::from_millis(900))
+        );
+
+        let launched = Arc::new(AtomicU64::new(0));
+        let live = Arc::new(());
+        let start = Instant::now();
+        let driving = open_loop(
+            start,
+            start + Duration::from_secs(1),
+            Duration::from_millis(100),
+            QUERY_CLIENTS,
+            || {
+                launched.fetch_add(1, Ordering::Relaxed);
+                let held = Arc::clone(&live);
+                async move {
+                    std::future::pending::<()>().await;
+                    drop(held);
+                }
+            },
+        );
+        let cut = tokio::time::timeout(Duration::from_millis(250), driving).await;
+        assert!(cut.is_err(), "the schedule outlasts the cut");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            launched.load(Ordering::Relaxed),
+            3,
+            "arrivals at 0, 100, and 200 ms only"
+        );
+        assert_eq!(Arc::strong_count(&live), 1, "no call outlives the stop");
+
+        let emitted = Arc::new(AtomicU64::new(0));
+        let lanes = owned((0..2).map(|_| {
+            let emitted = Arc::clone(&emitted);
+            async move {
+                for _ in 0..100 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    emitted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+        let cut = tokio::time::timeout(Duration::from_millis(250), lanes).await;
+        assert!(cut.is_err(), "the lanes outlast the cut");
+        let at_stop = emitted.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            emitted.load(Ordering::Relaxed),
+            at_stop,
+            "no lane emits after the stop"
         );
     }
 

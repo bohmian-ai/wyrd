@@ -12,6 +12,7 @@ use std::time::Duration;
 use num_traits::ToPrimitive;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use wyrd_client::QueueConfig;
 use wyrd_client::state::WyrdState;
 
@@ -119,7 +120,8 @@ impl Lane {
             .await?;
         let model = state.run_for_card("model")?;
         let stop = CancellationToken::new();
-        let sampler = tokio::spawn(sample(state.clone(), stop.clone()));
+        // Owned, so a cancelled lane leaves no sampler polling its state.
+        let sampler = AbortOnDropHandle::new(tokio::spawn(sample(state.clone(), stop.clone())));
 
         let mut features: serde_json::Map<String, serde_json::Value> = (0..FEATURES)
             .map(|feature| (format!("f{feature}"), 0.0.into()))

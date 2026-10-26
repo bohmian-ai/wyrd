@@ -59,16 +59,21 @@ pub struct Tenant {
 }
 
 impl Tenant {
-    /// Configures `setup`'s tenant against `upstream`: one deployment per
-    /// [`PREFIXES`] entry and `keys` invoking principals.
+    /// Configures `setup`'s tenant: one deployment per [`PREFIXES`] entry,
+    /// each against the upstream base URL at the same position in
+    /// `upstreams`, and `keys` invoking principals.
     ///
     /// # Errors
     ///
     /// Returns a client, administration, or principal failure.
-    pub async fn provision(setup: &SetupTenant, upstream: &str, keys: usize) -> Result<Self> {
+    pub async fn provision(
+        setup: &SetupTenant,
+        upstreams: [&str; PREFIXES.len()],
+        keys: usize,
+    ) -> Result<Self> {
         let admin = connect(&setup.api_key)?;
         let gateway = Gateway::connect_with(&admin).await?;
-        for prefix in PREFIXES {
+        for (prefix, upstream) in PREFIXES.into_iter().zip(upstreams) {
             let deployment = serde_json::from_value(json!({
                 "name": format!("bench-{prefix}"),
                 "adapter": {"openai_compatible": {"base_url": format!("{upstream}/{prefix}/v1")}},

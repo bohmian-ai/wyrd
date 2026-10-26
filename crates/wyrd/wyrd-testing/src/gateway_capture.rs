@@ -426,6 +426,14 @@ impl Paced {
     }
 }
 
+/// Waits `delay`, or not at all when it is zero, so an instant answer
+/// costs no timer tick.
+async fn pause(delay: Duration) {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+}
+
 /// Answers one chat completion as [`PacedUpstream`] documents; a body that
 /// is not a JSON chat request is refused with `400`.
 async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
@@ -438,17 +446,17 @@ async fn answer(State(paced): State<Paced>, body: Bytes) -> Response {
         .to_owned();
     let pacing = paced.pacing;
     if request["stream"] != Value::Bool(true) {
-        tokio::time::sleep(pacing.buffered_delay).await;
+        pause(pacing.buffered_delay).await;
         let completion = GatewayCapture::sized_completion(pacing.buffered_bytes).to_string();
         paced.record(&marker);
         return ([(CONTENT_TYPE, "application/json")], completion).into_response();
     }
-    tokio::time::sleep(pacing.stream_delay).await;
+    pause(pacing.stream_delay).await;
     let frames = GatewayCapture::chat_event_frames(&marker, pacing.chunks);
     let events = async_stream::stream! {
         for (index, frame) in frames.into_iter().enumerate() {
             if index > 0 && index < pacing.chunks {
-                tokio::time::sleep(pacing.chunk_interval).await;
+                pause(pacing.chunk_interval).await;
             }
             if index < pacing.chunks {
                 paced.record(&marker);

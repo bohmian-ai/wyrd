@@ -22,17 +22,17 @@ use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
 use tokio::task::JoinSet;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::transport::trace::with_benchmark_labels;
 use wyrd_testing::capacity::{
     Expected, NANOS_PER_MS, Population, Selection, Usage, Window, release_binary,
 };
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
-use wyrd_testing::gateway_capture::GatewayCapture;
+use wyrd_testing::gateway_capture::{PacedUpstream, Pacing};
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
-use crate::gateway::workload::{CapturePolicy, Outcome, Shape, Tenant, Timed, call, http};
+use crate::gateway::workload::{
+    CapturePolicy, Outcome, PREFIXES, Shape, Tenant, Timed, call, http,
+};
 use crate::gateway::{
     CLIENTS, Case, LARGE_BYTES, PROCESS, Result, SMALL_BYTES, STREAM_CHUNKS, shutdown,
 };
@@ -430,8 +430,8 @@ impl Observed {
 pub struct Overhead {
     /// The server, once prepared.
     server: Option<LocalServer>,
-    /// The instant upstream, once prepared; held so it keeps answering.
-    upstream: Option<MockServer>,
+    /// The instant upstreams, once prepared; held so they keep answering.
+    upstream: Option<[PacedUpstream; 2]>,
     /// The provisioned tenant, once prepared.
     tenant: Option<Tenant>,
     /// The capture policy the tenant has now.
@@ -465,10 +465,18 @@ impl Overhead {
         let [setup] = server.tenants() else {
             return Err("setup provisioned one tenant".into());
         };
-        let upstream = upstream().await;
+        let [small, large] = upstreams().await?;
+        let (small_uri, large_uri) = (small.uri(), large.uri());
+        let bases = PREFIXES.map(|prefix| {
+            if prefix == Case::ChatCapture.prefix() {
+                large_uri.as_str()
+            } else {
+                small_uri.as_str()
+            }
+        });
         let keys = CLIENTS.iter().copied().max().unwrap_or(1);
-        self.tenant = Some(Tenant::provision(setup, &upstream.uri(), keys).await?);
-        self.upstream = Some(upstream);
+        self.tenant = Some(Tenant::provision(setup, bases, keys).await?);
+        self.upstream = Some([small, large]);
         self.server = Some(server);
         Ok(())
     }
@@ -625,39 +633,26 @@ async fn drive(
     Ok(total)
 }
 
-/// The instant L1 upstream: one route per [`Case::prefix`], answering its
-/// case's buffered answer or whole stream, recording no requests so its
-/// memory stays bounded.
-async fn upstream() -> MockServer {
-    let upstream = MockServer::builder()
-        .disable_request_recording()
-        .start()
-        .await;
-    let answers = [
-        (
-            Case::Chat.prefix(),
-            ResponseTemplate::new(200).set_body_json(GatewayCapture::sized_completion(SMALL_BYTES)),
-        ),
-        (
-            Case::ChatStream.prefix(),
-            ResponseTemplate::new(200).set_body_raw(
-                GatewayCapture::chat_events("chatcmpl-bench", STREAM_CHUNKS),
-                "text/event-stream",
-            ),
-        ),
-        (
-            Case::ChatCapture.prefix(),
-            ResponseTemplate::new(200).set_body_json(GatewayCapture::sized_completion(LARGE_BYTES)),
-        ),
-    ];
-    for (prefix, answer) in answers {
-        Mock::given(method("POST"))
-            .and(path(format!("/{prefix}/v1/chat/completions")))
-            .respond_with(answer)
-            .mount(&upstream)
-            .await;
-    }
-    upstream
+/// The instant L1 upstreams: one answering 1 KiB completions and whole
+/// streams of [`STREAM_CHUNKS`] events, one answering 64 KiB completions,
+/// both with no delay and recording no call, so their memory stays bounded
+/// however many calls a run makes.
+///
+/// # Errors
+///
+/// Returns a bind failure.
+async fn upstreams() -> std::io::Result<[PacedUpstream; 2]> {
+    let instant = |buffered_bytes| Pacing {
+        buffered_delay: Duration::ZERO,
+        buffered_bytes,
+        stream_delay: Duration::ZERO,
+        chunks: STREAM_CHUNKS,
+        chunk_interval: Duration::ZERO,
+    };
+    Ok([
+        PacedUpstream::start(instant(SMALL_BYTES), 0).await?,
+        PacedUpstream::start(instant(LARGE_BYTES), 0).await?,
+    ])
 }
 
 #[cfg(test)]

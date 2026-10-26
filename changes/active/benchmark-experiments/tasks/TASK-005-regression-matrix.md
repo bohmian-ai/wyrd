@@ -702,6 +702,21 @@ invalid baselines or treat absent evidence as a passing regression check.
 - **Cause.** Under the hot settings every row stays in a memtable. At 64 clients the full L1 timing, a 5 s warmup and three 10 s windows at about 3.5 M rows/s, holds tens of GiB.
 - **Fix site.** None in the test, which now judges `native-write-c1`; run 6 held at least 46 GB available. This is the same full L1 that V8 runs: a writes-hot suite on this 91 GiB host is close to the memory limit, and V8 must run with no other memory load.
 
+**D8: the Gateway L1 driver kept every upstream request**
+
+- **Symptom.** `mise run bench:l1:gateway -- --qualify-baseline` was stopped twice by the memory watchdog.
+- **Evidence.** A 2 s sampler of process RSS showed the following:
+  - The smoke child's `capacity` grew to 18.4 GB in about 40 s.
+  - In the full run, the parent `capacity` grew from 0.6 GB to 21.7 GB in 2 min, from the first chat steps onwards.
+  - `wyrd-server` stayed at 1–2 GB.
+  - Memory returned as soon as the driver exited.
+- **Cause.** The L1 upstream was a wiremock 0.6.5 `MockServer`. `MountedMock::matches` (`mounted_mock.rs:53-58`) pushes `request.clone()` for every matched request, whether or not recording is on; `disable_request_recording` turns off only the server-wide list. Each retained request also pins hyper's read buffer through its header bytes. That is about 10–35 KiB per 1 KiB chat call and hundreds of KiB per 64 KiB capture call, never freed during a run.
+- **Diagnostician.** A fresh read-only diagnostician, given only the command, the trace and the diff, found the same cause from source. It confirmed that no other engine driver uses wiremock, and named the existing bounded `PacedUpstream` as the fix site.
+- **Fix site.**
+  - `gateway/run.rs` now serves the L1 cases from two `PacedUpstream`s with zero delays and `bound` 0: one answers 1 KiB completions and streams, the other 64 KiB completions.
+  - `Tenant::provision` takes one base URL per deployment prefix. L2 passes its one upstream for all three.
+  - `PacedUpstream` skips zero waits, so an instant answer costs no timer tick. L2's nonzero pacing is unchanged.
+
 ### V2a evidence
 
 The V2a command above, run after `mise run bench:build` on a quiet host, gave PASS in 772.6 s. 40 measured L1 cases held (4+4+12+8+6+6):

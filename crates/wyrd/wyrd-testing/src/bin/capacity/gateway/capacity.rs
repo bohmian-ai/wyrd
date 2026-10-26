@@ -944,8 +944,9 @@ impl Capacity {
         let binary = release_binary()?;
         let server = LocalServer::start(&binary, &TENANTS, &[]).await?;
         let upstream = Arc::new(PacedUpstream::start(PACING, MAX_IN_FLIGHT).await?);
+        let uri = upstream.uri();
         for setup in server.tenants() {
-            let tenant = Tenant::provision(setup, &upstream.uri(), KEYS_PER_TENANT).await?;
+            let tenant = Tenant::provision(setup, [uri.as_str(); 3], KEYS_PER_TENANT).await?;
             tenant.capture(CapturePolicy::Metadata).await?;
             self.tenants.push(tenant);
         }

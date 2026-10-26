@@ -759,3 +759,31 @@ The test uses `#[tokio::test(flavor = "multi_thread")]`, the CLI's runtime. D2's
 - **Bifrost writes-hot c64** needs about 59 GB of server memory (D7).
 
 These are measured product behavior, not defects in V3a. They are left for V8 to report and route, with no limit changed.
+
+### V8 stop: two engines cannot qualify references at their declared limits
+
+The first V8 suite was run with the task's own commands, on clean source `5174ad862`, after `mise run bench:build` on a quiet host. Each smoke prepass passed. Both full runs FAILed on unchanged absolute limits, so neither record can qualify a reference (`qualification_refusals`: verdict FAIL).
+
+| Command | Record (untracked) | Failed criteria |
+|---|---|---|
+| `mise run bench:l1:verification -- --qualify-baseline` (exit 1) | `benchmarks/verification/direct-verify/20261026T071425Z-5174ad862.json` | `overhead-p99`, `direct-verify-c64`: median (1.365, 1.366] ms misses `< 0.5`. `no-errors`: 69087 `WYRD_VERIFICATION_429_STAGING_FULL` refusals in repetition 1. |
+| `mise run bench:l1:bifrost:hot -- --qualify-baseline` (exit 1) | `benchmarks/bifrost/hot/20261026T071805Z-5174ad862.json` | `point-p99-slo`, `point-c64`: median (7.41, 7.414] ms misses `< 5`. |
+
+These repeat the V3a observations: (1.346, 1.347] ms with 50630–78677 refusals per window, and (7.496, 7.5] ms.
+
+Material Stop Conditions apply. Making either case PASS would take one of two things:
+- an engine optimization: Verification staging admission and overhead at 64 clients, and the hot point-lookup tail;
+- a changed limit or coverage, which this task forbids ("never change measured work or limits to obtain PASS"; "do not delete failing cases, widen thresholds").
+
+Without two passing suites there are no Verification or hot references. The normal L1 for those engines therefore stays INVALID (no reviewed reference) or FAIL (limits).
+
+Not run, pending the spec decision:
+- V7 on the final implementation;
+- the second V8 suite and the remaining V8 commands (Bifrost writes and parquet, Gateway);
+- promotion, normal L1, the telemetry comparisons and diagnostics;
+- V9;
+- the V6 count update.
+
+Verdict: SPEC_REVISION_REQUIRED. The decision for `$wyrd-spec`:
+- whether TASK-005 must first carry the engine optimizations for these two SLOs, which the spec currently leaves out of scope;
+- or whether the declared limits or coverage for `direct-verify-c64` and hot `point-c64` change on this reference host.

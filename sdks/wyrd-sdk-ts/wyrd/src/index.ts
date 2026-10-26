@@ -3176,9 +3176,12 @@ export class WyrdState {
    * inside {@link Run.scope} carry that run and Card. Node's `AsyncLocalStorage`
    * context manager is registered unless the application registered one. A
    * second call is idempotent, and {@link WyrdState.shutdown} flushes only
-   * this provider. Needs the optional `@opentelemetry/api`,
-   * `@opentelemetry/context-async-hooks`, `@opentelemetry/sdk-trace-base`, and
-   * `@opentelemetry/exporter-trace-otlp-proto` peers.
+   * this provider. The provider's resource names the root Service's name and
+   * version and the configured `deployment.environment.name`, so every span
+   * carries the state's environment. Needs the optional `@opentelemetry/api`,
+   * `@opentelemetry/context-async-hooks`, `@opentelemetry/resources`,
+   * `@opentelemetry/sdk-trace-base`, and `@opentelemetry/exporter-trace-otlp-proto`
+   * peers.
    *
    * @throws a {@link WyrdError}: `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when
    * a global tracer provider is already registered (add `spanExporter` to it
@@ -3195,7 +3198,7 @@ export class WyrdState {
     if (this.#telemetry !== undefined) {
       return;
     }
-    const provider = startTelemetry(client);
+    const provider = startTelemetry(client, this.rootRef, this.deploymentEnvironment);
     if (provider === undefined) {
       throw projectedError(telemetryProviderExists());
     }

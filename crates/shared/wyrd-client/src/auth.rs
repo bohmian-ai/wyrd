@@ -668,9 +668,10 @@ pub struct AuthMiddleware {
     ///
     /// [`WORKLOAD_UID_HEADER`]: wyrd_spec::auth::WORKLOAD_UID_HEADER
     workload_uid: Option<CardUid>,
-    /// The configured deployment environment every request carries on
-    /// [`DEPLOYMENT_ENVIRONMENT_HEADER`], or `None` when unknown. Descriptive
-    /// context only: it never enters a grant, so renewal cannot change it.
+    /// The configured deployment environment native Bifrost writes and
+    /// gateway calls carry on [`DEPLOYMENT_ENVIRONMENT_HEADER`], or `None` when
+    /// unknown. Descriptive context only: it never enters a grant, so renewal
+    /// cannot change it.
     ///
     /// [`DEPLOYMENT_ENVIRONMENT_HEADER`]: wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER
     deployment_environment: Option<String>,
@@ -894,7 +895,8 @@ impl AuthMiddleware {
         })
     }
 
-    /// The configured deployment environment requests carry on
+    /// The configured deployment environment native Bifrost writes and
+    /// gateway calls carry on
     /// [`DEPLOYMENT_ENVIRONMENT_HEADER`](wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER),
     /// or `None` when unknown.
     #[must_use]

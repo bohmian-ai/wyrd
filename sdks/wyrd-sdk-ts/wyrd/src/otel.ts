@@ -18,8 +18,10 @@ import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-proto";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BasicTracerProvider, BatchSpanProcessor, type Span, type SpanProcessor } from "@opentelemetry/sdk-trace-base";
 
+import type { CardRef } from "./card-types.js";
 import type { WyrdClient } from "./index.js";
 
 /**
@@ -33,13 +35,11 @@ export type ExporterOptions = { readonly workloadUid?: string };
 function config(client: WyrdClient, signal: "traces" | "logs" | "metrics", options: ExporterOptions) {
   const rooted = options.workloadUid === undefined ? client : client.forWorkload(options.workloadUid);
   const workloadUid = rooted.workloadUid;
-  const environment = rooted.deploymentEnvironment;
   return {
     url: `${rooted.serverUrl.replace(/\/+$/, "")}/v1/${signal}`,
     headers: async (): Promise<Record<string, string>> => ({
       "x-wyrd-access-token": `Bearer ${await rooted.accessToken()}`,
       ...(workloadUid === undefined ? {} : { "x-wyrd-workload-uid": workloadUid }),
-      ...(environment === undefined ? {} : { "x-wyrd-deployment-environment": environment }),
     }),
   };
 }
@@ -103,13 +103,24 @@ export function runCorrelationProcessor(): SpanProcessor {
  * @internal `WyrdState.startTelemetry`: install the global tracer provider
  * exporting through {@link spanExporter} and stamping `Run.scope`, Node's
  * `AsyncLocalStorage` context manager, and the W3C trace-context propagator,
- * unless the application registered a tracer provider.
+ * unless the application registered a tracer provider. The provider's
+ * resource names `service`'s name and version and, when configured, the
+ * `deployment.environment.name`.
  *
  * @returns The installed provider, or `undefined` when a global tracer
  * provider is already registered.
  */
-export function startTelemetry(client: WyrdClient): BasicTracerProvider | undefined {
+export function startTelemetry(
+  client: WyrdClient,
+  service: CardRef,
+  environment: string | undefined,
+): BasicTracerProvider | undefined {
   const provider = new BasicTracerProvider({
+    resource: resourceFromAttributes({
+      "service.name": service.name,
+      "service.version": service.version,
+      ...(environment === undefined ? {} : { "deployment.environment.name": environment }),
+    }),
     spanProcessors: [runCorrelation, new BatchSpanProcessor(spanExporter(client))],
   });
   if (!trace.setGlobalTracerProvider(provider)) {

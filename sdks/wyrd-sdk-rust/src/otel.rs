@@ -24,6 +24,7 @@ use opentelemetry_otlp::{
     ExporterBuildError, LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig as _,
     WithHttpConfig as _,
 };
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SdkTracerProvider, Span, SpanData, SpanProcessor};
 use serde_json::json;
@@ -76,8 +77,11 @@ impl Telemetry {
 /// The subscriber carries one `tracing-opentelemetry` layer over an SDK
 /// provider whose batch exporter is [`span_exporter`], so every export asks
 /// the client for a fresh access token, plus a processor stamping spans
-/// started inside `Run::scope` with that Run and Card. Only INFO-and-above
-/// spans export, and only tracing is installed. The W3C trace-context
+/// started inside `Run::scope` with that Run and Card. The provider's resource
+/// names the root Service's name and version and the configured
+/// `deployment.environment.name`, so every span carries the state's
+/// environment. Only INFO-and-above spans export, and only tracing is
+/// installed. The W3C trace-context
 /// propagator becomes the global propagator, so standard HTTP and gRPC
 /// instrumentation carries the caller's trace to the next service. A later
 /// call for the same state, or a clone of it, returns the installed pipeline.
@@ -108,7 +112,21 @@ pub fn start_telemetry(state: &WyrdState) -> Result<Telemetry, WyrdError> {
         message: format!("the telemetry span exporter cannot be built: {error}"),
         details: json!({ "field": "telemetry" }),
     })?;
+    let service = state.root_ref();
+    let resource = Resource::builder()
+        .with_service_name(service.name.to_string())
+        .with_attributes(
+            std::iter::once(KeyValue::new(
+                "service.version",
+                service.version.to_string(),
+            ))
+            .chain(state.deployment_environment().map(|environment| {
+                KeyValue::new("deployment.environment.name", environment.to_owned())
+            })),
+        )
+        .build();
     let provider = SdkTracerProvider::builder()
+        .with_resource(resource)
         .with_span_processor(RunCorrelation)
         .with_batch_exporter(exporter)
         .build();
@@ -265,12 +283,6 @@ impl TokenHttpClient {
             request.headers_mut().insert(
                 wyrd_spec::auth::WORKLOAD_UID_HEADER,
                 uid.as_str().try_into()?,
-            );
-        }
-        if let Some(environment) = client.deployment_environment() {
-            request.headers_mut().insert(
-                wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER,
-                environment.try_into()?,
             );
         }
         let response = http.execute(reqwest::Request::try_from(request)?).await?;

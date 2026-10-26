@@ -469,8 +469,9 @@ this draft alone.
 - **REQ-053** Direct and queued verification capture one context
   {service_name, service_version, deployment_environment} at acceptance. Queued
   work stores it with the accepted execution; both paths write it unchanged to
-  the result and inputs rows. Nothing else reads it. HTTP/OTLP/gRPC carry
-  `x-wyrd-deployment-environment`; typed/MCP calls use
+  the result and inputs rows. Nothing else reads it. Gateway calls and native
+  Bifrost gRPC writes carry `x-wyrd-deployment-environment`; OTLP carries the
+  `deployment.environment.name` resource attribute; typed/MCP calls use
   `deployment_environment`. Missing environment is not auth failure.
   Do not change schedule fanout, group identities,
   whole-trace evidence selection, direct/queued deadlines or authority.

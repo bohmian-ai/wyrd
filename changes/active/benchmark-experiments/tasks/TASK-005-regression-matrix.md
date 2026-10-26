@@ -795,3 +795,13 @@ Verdict: SPEC_REVISION_REQUIRED. The decision for `$wyrd-spec`:
 - Every row of the declared full work stays in the server's memtables: 2M-row fixture, 5 s warmup and 3 × 10 s windows at 64 clients.
 - Completing it on this host would take a smaller fixture, shorter windows or other memtable settings, which are changes to fixture or coverage. Running it on a larger host would make that host the reference host.
 - The spec decision above should cover this as well.
+
+**The rest of the first V8 suite, on clean `69f3a066d`.** Each smoke prepass passed.
+
+| Command | Record (untracked) | Result |
+|---|---|---|
+| `mise run bench:l1:bifrost:writes:parquet -- --qualify-baseline` (exit 1) | `benchmarks/bifrost/writes-parquet/20261026T073045Z-69f3a066d.json` | FAIL: `otlp-spans-peak-floor`, median 15.218 wire MiB per server CPU-second misses `≥ 30`. Lowest available memory 10.2 GB. |
+| `mise run bench:l1:bifrost:parquet -- --qualify-baseline` (exit 1) | `benchmarks/bifrost/parquet/20261026T073846Z-69f3a066d.json` | FAIL: `point-p99-slo` at `point-c64`, median (13.976, 13.984] ms misses `< 5`. |
+| `mise run bench:l1:gateway -- --qualify-baseline` | none | Stopped twice by the memory watchdog. See D8. |
+
+Absolute limits now block reference qualification on every Bifrost experiment and on Verification.

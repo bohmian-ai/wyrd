@@ -1738,7 +1738,8 @@ Provenance records code hash and runtime, extraction version, Agent and Prompt
 versions, effective routes, drift baselines and windows, and input digests.
 `bifrost.verification.results` is the canonical analytical result surface and
 `bifrost.verification.execution_inputs` holds pinned input declarations and
-queued activation context.
+queued activation context. The pinned evidence is stored only in
+`execution_inputs`; a returned `VerificationResult` reads it from there.
 
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a

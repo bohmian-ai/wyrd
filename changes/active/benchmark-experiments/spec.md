@@ -1,10 +1,17 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 12
+revision: 13
 status: approved
 ---
 
 # Benchmarks as experiments
+
+Revision 13 fixes how Verification meets its 64-client limit. Each direct
+verify stores its inputs once, in `bifrost.verification.execution_inputs`;
+the stored `outcome` in `bifrost.verification.results` no longer repeats them
+as `evidence`. Every API that returns a result still returns `evidence`, read
+from the inputs row. Stored values are encoded to Variant once, from the typed
+value. The maintainer approved this on 2026-10-26.
 
 Revision 12 removes the sampled-client `traceparent` driver option
 (`--client-trace-ratio`, formerly REQ-022) and its tenant-recording comparison.
@@ -814,8 +821,11 @@ Rust/Python/TypeScript timeline behavior and tenant-negative coverage.
 written. TASK-005's runs on the reference host missed four of them, and this
 change optimizes the engines until each passes on that host:
 
-- Verification `direct-verify` at 64 clients: the engine wait that dominates
-  server latency.
+- Verification `direct-verify` at 64 clients: the per-request persistence
+  work that dominates server CPU. Inputs are stored only in
+  `execution_inputs`; the stored result `outcome` omits `evidence`, which
+  result-returning APIs restore from the inputs row. Each stored Variant is
+  encoded directly from its typed value, not through JSON text.
 - Bifrost point lookup, from both the memtable (`hot`) and Parquet (`parquet`):
   the projection cost that holds p99 above 5 ms at 64 clients.
 - Bifrost `writes-parquet` OTLP spans: the ≥30 MiB/CPU-s wire floor.
@@ -1085,6 +1095,12 @@ not a reason to invent a reference or weaken coverage.
   (REQ-022) and the sampled-client tenant-recording comparison from REQ-020
   and AC-013; that cost is not needed now. Approved by the maintainer's
   direction on 2026-10-26.
+- Revision 13 — 2026-10-26: TASK-006 profiling at 64 clients showed most
+  direct-verify CPU in persistence: the 2 KiB inputs were stored twice (inputs
+  row and the result `outcome.evidence`) and every Variant went typed value →
+  JSON text → re-parse → Variant. The maintainer decided: store inputs only in
+  `execution_inputs`, keep `evidence` in API results by reading it from there,
+  and encode Variants once. Approved by the maintainer on 2026-10-26.
 
 Authority (plain repository references):
 

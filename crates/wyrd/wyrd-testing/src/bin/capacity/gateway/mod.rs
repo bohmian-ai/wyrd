@@ -36,7 +36,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use wyrd_testing::experiment::{
-    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Step,
+    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reference, Step,
 };
 use wyrd_testing::release_server::LocalServer;
 
@@ -197,8 +197,9 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
 
 /// Fills `base` with the Gateway experiment at `level`: its id, question,
 /// sweep, controls, metrics, criteria, and steps. Pure: it reads only
-/// `arguments`, so tests judge the real declaration without a server. No
-/// eligible Gateway baseline exists, so no criterion compares one.
+/// `arguments`, so tests judge the real declaration without a server. L1
+/// steps declare their relative comparisons as references, resolved
+/// against the reviewed baselines once the declaration is final.
 ///
 /// # Errors
 ///
@@ -285,6 +286,31 @@ fn overhead(mut base: Declaration) -> Declaration {
                     "request_bytes": shape.request_bytes,
                 }),
             ));
+        }
+    }
+    for case in Case::ALL {
+        for clients in CLIENTS {
+            let step = case.step(clients);
+            let mut metrics = vec![
+                ("overhead_p99_ms", Some(99)),
+                ("cpu_us_per_request", None),
+                ("requests_per_cpu_s", None),
+                ("requests_per_s_per_vcpu", None),
+            ];
+            if case == Case::ChatStream {
+                metrics.push(("overhead_end_p99_ms", Some(99)));
+            }
+            if case == Case::ChatCapture {
+                metrics.extend([
+                    ("capture_bytes_per_cpu_s", None),
+                    ("capture_bytes_per_s_per_vcpu", None),
+                ]);
+            }
+            base.references.extend(
+                metrics
+                    .into_iter()
+                    .map(|(metric, percentile)| Reference::new(&step, metric, percentile)),
+            );
         }
     }
     let every: Vec<String> = steps.iter().map(|step| step.id.clone()).collect();
@@ -885,6 +911,8 @@ mod tests {
             refusals: Vec::new(),
             mode: Mode::Full,
             prepass: None,
+            references: Vec::new(),
+            qualify: false,
         }
     }
 

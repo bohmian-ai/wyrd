@@ -4,8 +4,9 @@
 //! An engine contributes only a [`Plan`]: its declaration (question, sweep,
 //! controls, metrics, criteria, steps) and the [`Workload`] that drives its
 //! production calls. This module fills the declaration's source, build, host,
-//! and invocation, applies `--steps`, `--allow-dirty`, `--profile`, and
-//! `--smoke`, runs a full plan's smoke prepass ([`prepass`]), runs
+//! and invocation, applies `--steps`, `--allow-dirty`, `--profile`,
+//! `--smoke`, and `--qualify-baseline`, declares each step's relative
+//! comparisons against its reviewed references ([`compare`]), runs a full plan's smoke prepass ([`prepass`]), runs
 //! [`wyrd_testing::experiment::run`], publishes the record under
 //! `benchmarks/<engine>/<experiment>/` (a smoke's under
 //! [`SMOKE_DIRECTORY`]), prints the report, and returns the verdict's exit
@@ -22,8 +23,8 @@ use wyrd_testing::capacity::{
     binary_identity, release_binary, timer_resolution_ns, timing_declaration,
 };
 use wyrd_testing::experiment::{
-    Declaration, Engine, HostRecord, Invocation, Level, Mode, Options, Prepass, Record,
-    SMOKE_DIRECTORY, Source, Validity, Verdict, Workload, run,
+    Baselines, Declaration, Engine, HostRecord, Invocation, Level, Mode, Options, Prepass, Reason,
+    Record, SMOKE_DIRECTORY, Source, Validity, Verdict, Workload, run,
 };
 use wyrd_testing::profile::SAMPLY;
 use wyrd_testing::release_server::{Host, HostLoad};
@@ -31,7 +32,12 @@ use wyrd_testing::release_server::{Host, HostLoad};
 use crate::flags;
 
 /// Switches every level command accepts.
-pub const SWITCHES: [&str; 3] = ["--profile", "--allow-dirty", "--smoke"];
+pub const SWITCHES: [&str; 4] = [
+    "--profile",
+    "--allow-dirty",
+    "--smoke",
+    "--qualify-baseline",
+];
 
 /// Valued flags every level command accepts.
 pub const VALUED: [&str; 1] = ["--steps"];
@@ -142,8 +148,9 @@ pub fn base(engine: Engine, context: &Context<'_>) -> Result<Declaration, String
 /// validity thresholds, the server timing method with this host's measured
 /// timer resolution as the `timing` control, and the measured `source`,
 /// `build`, `host`, and invocation with its `WYRD_*` `config`. The engine fills the experiment
-/// id, question, sweep, controls, metrics, criteria, and steps; a
-/// declaration it leaves incomplete is refused before any work.
+/// id, question, sweep, controls, metrics, criteria, references, and steps;
+/// a declaration it leaves incomplete is refused before any work.
+/// `--qualify-baseline` declares a reference qualification run.
 pub fn assemble(
     engine: Engine,
     context: &Context<'_>,
@@ -179,6 +186,29 @@ pub fn assemble(
         refusals: Vec::new(),
         mode: Mode::Full,
         prepass: None,
+        references: Vec::new(),
+        qualify: context
+            .arguments
+            .iter()
+            .any(|argument| argument == "--qualify-baseline"),
+    }
+}
+
+/// Declares `declaration`'s relative comparisons against the reviewed
+/// references in `root/benchmarks/<engine>/baselines.toml`
+/// ([`Declaration::compare`]) once its selection and mode are final. An
+/// unreadable baselines file is a declaration refusal, not a missing
+/// reference.
+pub fn compare(declaration: &mut Declaration, root: &Path) {
+    match Baselines::load(root, declaration.engine) {
+        Ok(baselines) => declaration.compare(&baselines),
+        Err(error) => {
+            if declaration.qualify || !declaration.references.is_empty() {
+                declaration
+                    .refusals
+                    .push(Reason::new("declaration.missing", error.to_string()));
+            }
+        }
     }
 }
 
@@ -212,7 +242,8 @@ pub fn smoke(declaration: &mut Declaration) {
 /// Runs the smoke of `declaration`'s exact command (`arguments`, program
 /// name first, without the level and engine) as a child under its own fresh
 /// Postgres, server, and storage ([`spawn`]), outside the full run's clock,
-/// and records it. `--profile` is not forwarded; `--smoke` makes the child
+/// and records it. `--profile` and `--qualify-baseline` are not forwarded;
+/// `--smoke` makes the child
 /// a smoke, so it never runs a prepass of its own.
 pub fn prepass(root: &Path, declaration: &Declaration, arguments: &[String]) -> Prepass {
     let mut command = vec![
@@ -223,7 +254,7 @@ pub fn prepass(root: &Path, declaration: &Declaration, arguments: &[String]) -> 
         arguments
             .iter()
             .skip(1)
-            .filter(|argument| *argument != "--profile")
+            .filter(|argument| *argument != "--profile" && *argument != "--qualify-baseline")
             .cloned(),
     );
     command.push("--smoke".to_owned());
@@ -392,4 +423,26 @@ pub fn report(path: &Path) -> Result<String, String> {
     Record::read(path)
         .map(|record| record.render())
         .map_err(|error| error.to_string())
+}
+
+/// Reads two or more `--qualify-baseline` records and returns the
+/// reviewed-reference TOML they establish ([`Baselines::promote`]), for an
+/// engineer to review and commit to the engine's `baselines.toml`. It
+/// writes nothing.
+///
+/// # Errors
+///
+/// Returns a message naming every unreadable record and every reason the
+/// records cannot establish references.
+pub fn references(paths: &[String]) -> Result<String, String> {
+    let records = paths
+        .iter()
+        .map(|path| {
+            Record::read(Path::new(path))
+                .map(|record| (path.clone(), record))
+                .map_err(|error| format!("{path}: {error}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let baselines = Baselines::promote(&records).map_err(|reasons| reasons.join("; "))?;
+    toml::to_string(&baselines).map_err(|error| error.to_string())
 }

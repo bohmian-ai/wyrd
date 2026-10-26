@@ -486,6 +486,17 @@ pub struct Snapshot {
     pub fixture: String,
     /// The original operands the value was derived from.
     pub operands: String,
+    /// Which way the metric improves; `None` in records that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Direction>,
+    /// The method identity ([`Declaration::method`]) the reference was
+    /// measured with; `None` for a historical entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// The reference value's `[low, high]` bounds in the metric's unit: a
+    /// latency reference's quantization interval; `None` when exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<[f64; 2]>,
 }
 
 /// How a criterion judges.
@@ -501,14 +512,15 @@ pub enum Rule {
         /// Which repetitions it judges.
         over: Over,
     },
-    /// The noise-aware regression rule against an eligible same-host
-    /// baseline.
+    /// The noise-aware regression rule against an eligible reference of
+    /// the same method identity.
     Regression {
         /// The baseline fixed at declaration.
         baseline: Snapshot,
     },
-    /// A comparison against an eligible baseline from another host or
-    /// fixture, recorded with both fingerprints; it never judges.
+    /// A comparison against a historical entry, an entry from another host
+    /// or fixture, or a reference a diagnostic run cannot match, recorded
+    /// with its reason; it never judges.
     Advisory {
         /// The baseline fixed at declaration.
         baseline: Snapshot,
@@ -516,7 +528,7 @@ pub enum Rule {
         reason: String,
     },
     /// A declared baseline comparison whose reference is missing, excluded,
-    /// or unit-incompatible; it judges INVALID.
+    /// unit-incompatible, or of another method; it judges INVALID.
     Unusable {
         /// The baseline entry id named.
         baseline: String,
@@ -610,6 +622,47 @@ impl Criterion {
             }
             Rule::Unusable { baseline, .. } => format!("{} vs {baseline}", self.metric),
         }
+    }
+}
+
+/// One relative comparison a measured step declares: its latency at the
+/// declared percentile, CPU per work, work per CPU-second, or throughput
+/// per provisioned vCPU against the reviewed reference
+/// `reference.<experiment>.<step>.<metric>` of the same method.
+/// [`Declaration::compare`] turns each into a criterion once the
+/// declaration is complete; a `--qualify-baseline` run keeps the list and
+/// declares none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reference {
+    /// The measured step.
+    pub step: String,
+    /// The metric compared.
+    pub metric: String,
+    /// The latency percentile the metric reads, which sets its sample
+    /// floor; `None` for a CPU or throughput metric.
+    pub percentile: Option<u8>,
+    /// The step's method identity, filled by [`Declaration::compare`].
+    #[serde(default)]
+    pub method: String,
+}
+
+impl Reference {
+    /// A comparison of `metric` on `step`, reading `percentile` when it is
+    /// a latency.
+    #[must_use]
+    pub fn new(step: &str, metric: &str, percentile: Option<u8>) -> Self {
+        Self {
+            step: step.to_owned(),
+            metric: metric.to_owned(),
+            percentile,
+            method: String::new(),
+        }
+    }
+
+    /// The reference entry id for `experiment`.
+    #[must_use]
+    pub fn id(&self, experiment: &str) -> String {
+        format!("reference.{experiment}.{}.{}", self.step, self.metric)
     }
 }
 
@@ -849,6 +902,35 @@ impl Invocation {
                 .collect(),
         }
     }
+
+    /// Why this invocation is a diagnostic rather than an ordinary
+    /// measurement: `--profile`, an operator trace export endpoint, sample
+    /// ratio, trace filter or export timeout, or a server log filter other
+    /// than `info`. `None` for the ordinary configuration references are
+    /// qualified with.
+    #[must_use]
+    pub fn diagnostic(&self) -> Option<String> {
+        const TELEMETRY: [&str; 4] = [
+            "WYRD_OTLP_ENDPOINT",
+            "WYRD_OTLP_SAMPLE_RATIO",
+            "WYRD_TRACE_FILTER",
+            "WYRD_OTLP_EXPORT_TIMEOUT_MS",
+        ];
+        let mut causes: Vec<String> = Vec::new();
+        if self.args.iter().any(|argument| argument == "--profile") {
+            causes.push("--profile".to_owned());
+        }
+        causes.extend(
+            TELEMETRY
+                .iter()
+                .filter(|name| self.config.contains_key(**name))
+                .map(|name| format!("{name} is set")),
+        );
+        if let Some(log) = self.config.get("WYRD_LOG").filter(|log| *log != "info") {
+            causes.push(format!("WYRD_LOG={log}"));
+        }
+        (!causes.is_empty()).then(|| causes.join(", "))
+    }
 }
 
 /// Everything fixed before measurement. [`Declaration::seal`] freezes it;
@@ -895,6 +977,13 @@ pub struct Declaration {
     pub mode: Mode,
     /// The smoke a full run passed first, or `None` for a smoke.
     pub prepass: Option<Prepass>,
+    /// The relative comparisons the steps declare.
+    #[serde(default)]
+    pub references: Vec<Reference>,
+    /// Whether `--qualify-baseline` declared a reference qualification run:
+    /// full, clean, ordinary L1 that omits every relative criterion.
+    #[serde(default)]
+    pub qualify: bool,
 }
 
 /// Controls every declaration names.
@@ -978,6 +1067,31 @@ impl Declaration {
                 "tracked files differ from HEAD; commit them or declare --allow-dirty".to_owned(),
             );
         }
+        if self.qualify {
+            let mut refuse = |message: String| {
+                refuse(
+                    "qualification.refused",
+                    format!("--qualify-baseline {message}"),
+                );
+            };
+            if self.level != Level::One {
+                refuse("qualifies L1 references only".to_owned());
+            }
+            if self.mode == Mode::Smoke {
+                refuse("cannot qualify a smoke".to_owned());
+            }
+            if let Some(selection) = &self.selection {
+                refuse(format!(
+                    "needs full default coverage, not the selection {selection:?}"
+                ));
+            }
+            if self.source.dirty || self.source.dirty_override {
+                refuse("needs a clean source without --allow-dirty".to_owned());
+            }
+            if let Some(diagnostic) = self.command.diagnostic() {
+                refuse(format!("needs the ordinary configuration: {diagnostic}"));
+            }
+        }
         if let Some(prepass) = self
             .prepass
             .as_ref()
@@ -1006,6 +1120,93 @@ impl Declaration {
     #[must_use]
     pub fn metric(&self, id: &str) -> Option<&Metric> {
         self.metrics.iter().find(|metric| metric.id == id)
+    }
+
+    /// Step `step`'s method identity: a digest of everything a compatible
+    /// reference must share with this run, namely the engine, experiment,
+    /// level, mode, timing, validity, sweep, step parameters, fixed controls
+    /// (fixture, limits, workload, timing method and range), build profile,
+    /// flags and compiler, host (OS, architecture, CPU model, logical CPUs,
+    /// memory, storage), every `WYRD_*` configuration value (telemetry
+    /// policy included) and whether `--profile` ran. It leaves out what a
+    /// rerun of the same method changes: source commit, binary identities,
+    /// OS version, the baselines note and the measured timer resolution.
+    #[must_use]
+    pub fn method(&self, step: &str) -> String {
+        let mut controls = self.controls.clone();
+        controls.remove("baselines");
+        if let Some(Value::Object(timing)) = controls.get_mut("timing") {
+            timing.remove("timer_resolution_ns");
+        }
+        let build = |field: &str| self.build.get(field).cloned().unwrap_or(Value::Null);
+        let identity = serde_json::json!({
+            "engine": self.engine,
+            "experiment": self.experiment,
+            "level": self.level,
+            "mode": self.mode,
+            "timing": self.timing,
+            "validity": self.validity,
+            "variables": self.variables,
+            "controls": controls,
+            "step": self.steps.iter().find(|declared| declared.id == step),
+            "build": [build("profile"), build("rustflags"), build("debug"), build("compiler")],
+            "host": [
+                &self.host.os,
+                &self.host.arch,
+                &self.host.cpu_model,
+                &self.host.logical_cpus.to_string(),
+                &self.host.memory_bytes.to_string(),
+                &self.host.storage,
+                &self.host.fingerprint,
+            ],
+            "config": self.command.config,
+            "profile": self.command.args.iter().any(|argument| argument == "--profile"),
+        });
+        let digest = Sha256::digest(identity.to_string().as_bytes());
+        format!("sha256:{}", &hex(&digest)[..16])
+    }
+
+    /// Fills each reference's method identity and, outside a
+    /// `--qualify-baseline` run, declares its relative criterion against
+    /// `baselines` ([`Baselines::reference`]). A qualification run instead
+    /// drops every relative criterion and notes the baseline unavailable.
+    /// Call it once the declaration's steps, controls, selection and mode
+    /// are final.
+    pub fn compare(&mut self, baselines: &Baselines) {
+        let mut references = std::mem::take(&mut self.references);
+        for reference in &mut references {
+            reference.method = self.method(&reference.step);
+        }
+        if self.qualify {
+            self.criteria
+                .retain(|criterion| matches!(criterion.rule, Rule::Limit { .. }));
+            self.controls.insert(
+                "baselines".to_owned(),
+                Value::String("baseline-unavailable: --qualify-baseline omits every relative criterion, so the record claims no regression coverage".to_owned()),
+            );
+        } else {
+            let diagnostic = self.command.diagnostic();
+            for reference in &references {
+                let id = reference.id(&self.experiment);
+                let rule = match self.metric(&reference.metric) {
+                    Some(metric) => {
+                        baselines.reference(&id, metric, reference, diagnostic.as_deref())
+                    }
+                    None => Rule::Unusable {
+                        baseline: id.clone(),
+                        reason: format!("metric `{}` is not declared", reference.metric),
+                    },
+                };
+                self.criteria.push(Criterion {
+                    id,
+                    metric: reference.metric.clone(),
+                    steps: vec![reference.step.clone()],
+                    rule,
+                    percentile: reference.percentile,
+                });
+            }
+        }
+        self.references = references;
     }
 
     /// Whether step `id` runs under the selection.
@@ -1729,6 +1930,11 @@ pub struct CriteriaRecord {
     pub metrics: Vec<Metric>,
     /// Every declared criterion.
     pub criteria: Vec<Criterion>,
+    /// Every declared relative comparison with its method identity, kept
+    /// by a `--qualify-baseline` run too so its repetitions can establish
+    /// references.
+    #[serde(default)]
+    pub references: Vec<Reference>,
 }
 
 /// One persisted experiment record: schema version [`SCHEMA_VERSION`] when
@@ -1788,6 +1994,26 @@ pub struct Record {
     /// The smoke prepass a full run passed before its clock started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepass: Option<Prepass>,
+    /// Whether the run's references judged it for regression.
+    #[serde(default)]
+    pub regression_coverage: Coverage,
+}
+
+/// A record's regression coverage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Coverage {
+    /// Every declared reference judged this full, unselected run by the
+    /// regression rule.
+    Covered,
+    /// No regression coverage: a smoke, a selection, no references, or a
+    /// comparison that was advisory, unusable or unjudged. Records without
+    /// the field claim none.
+    #[default]
+    Uncovered,
+    /// A `--qualify-baseline` run: relative criteria omitted, baseline
+    /// unavailable, regression coverage false.
+    BaselineUnavailable,
 }
 
 /// Runs a sealed declaration's workload and returns its record.
@@ -2024,7 +2250,9 @@ where
         criteria: CriteriaRecord {
             metrics: declaration.metrics.clone(),
             criteria: declaration.criteria.clone(),
+            references: declaration.references.clone(),
         },
+        regression_coverage: coverage(&declaration, &steps),
         steps,
         validity: validity_record,
         verdict,
@@ -2035,6 +2263,44 @@ where
         },
         mode: declaration.mode,
         prepass: declaration.prepass.clone(),
+    }
+}
+
+/// The regression coverage `steps` show for `declaration`: baseline
+/// unavailable for a qualification run; covered for a full, unselected
+/// run declaring references whose every relative criterion judged PASS or
+/// FAIL by the regression rule; otherwise uncovered.
+fn coverage(declaration: &Declaration, steps: &[StepRecord]) -> Coverage {
+    if declaration.qualify {
+        return Coverage::BaselineUnavailable;
+    }
+    let relative: Vec<&Criterion> = declaration
+        .criteria
+        .iter()
+        .filter(|criterion| !matches!(criterion.rule, Rule::Limit { .. }))
+        .collect();
+    let covered = declaration.mode == Mode::Full
+        && declaration.selection.is_none()
+        && !declaration.references.is_empty()
+        && relative.iter().all(|criterion| {
+            matches!(criterion.rule, Rule::Regression { .. })
+                && criterion.steps.iter().all(|id| {
+                    steps.iter().any(|step| {
+                        step.id == *id
+                            && step.criteria.iter().any(|judgment| {
+                                judgment.criterion == criterion.id
+                                    && matches!(
+                                        judgment.verdict,
+                                        Some(Verdict::Pass | Verdict::Fail)
+                                    )
+                            })
+                    })
+                })
+        });
+    if covered {
+        Coverage::Covered
+    } else {
+        Coverage::Uncovered
     }
 }
 
@@ -2476,7 +2742,11 @@ fn judge_criterion(
     if let Rule::Advisory { baseline, reason } = &criterion.rule {
         judgment.verdict = None;
         judgment.reason = Some(reason.clone());
-        judgment.operands = regression_operands(&values, baseline.converted);
+        judgment.operands = regression_operands(
+            &values,
+            baseline.converted,
+            criterion_direction(criterion, baseline).unwrap_or(Direction::Higher),
+        );
         return judgment;
     }
     if let Rule::Unusable { baseline, reason } = &criterion.rule {
@@ -2599,23 +2869,64 @@ fn judge_criterion(
                 judgment.reason = Some("the metric declares no direction".to_owned());
                 return judgment;
             };
-            let Some(exact) = values
+            let Some(intervals) = values
                 .iter()
-                .map(Reading::exact_value)
-                .collect::<Option<Vec<f64>>>()
+                .map(Reading::interval)
+                .collect::<Option<Vec<_>>>()
             else {
-                judgment.reason = Some("a regression needs exact values".to_owned());
+                judgment.reason = Some("a regression needs every repetition's value".to_owned());
                 return judgment;
             };
-            let (failed, operands) = regression(&exact, baseline.converted, direction);
-            judgment.operands = Some(operands);
-            judgment.verdict = Some(if failed { Verdict::Fail } else { Verdict::Pass });
-            if failed {
-                judgment.reason = Some(format!(
-                    "regressed against {} = {}",
-                    baseline.id,
-                    number(baseline.converted)
-                ));
+            // Judge both extremes of the quantization intervals: the run at
+            // its best against the reference at its worst proves a FAIL, the
+            // run at its worst against the reference at its best proves a
+            // PASS, and anything between is a precision ambiguity.
+            let [reference_low, reference_high] =
+                baseline.bounds.unwrap_or([baseline.converted; 2]);
+            let lows: Vec<f64> = intervals.iter().map(|(low, _, _)| *low).collect();
+            let highs: Option<Vec<f64>> = intervals.iter().map(|(_, _, high)| *high).collect();
+            let (best, worst) = match direction {
+                Direction::Lower => (
+                    Some((lows, reference_high)),
+                    highs.map(|highs| (highs, reference_low)),
+                ),
+                Direction::Higher => (
+                    highs.map(|highs| (highs, reference_low)),
+                    Some((lows, reference_high)),
+                ),
+            };
+            let judge = |extreme: Option<(Vec<f64>, f64)>| {
+                extreme.map(|(values, reference)| regression(&values, reference, direction))
+            };
+            let (best, worst) = (judge(best), judge(worst));
+            let exact = intervals
+                .iter()
+                .all(|(low, open, high)| !open && *high == Some(*low))
+                && baseline.bounds.is_none();
+            judgment.operands = if exact {
+                best.as_ref().map(|(_, operands)| operands.clone())
+            } else {
+                Some(serde_json::json!({
+                    "best": best.as_ref().map(|(_, operands)| operands),
+                    "worst": worst.as_ref().map(|(_, operands)| operands),
+                }))
+            };
+            match (best, worst) {
+                (Some((true, _)), _) => {
+                    judgment.verdict = Some(Verdict::Fail);
+                    judgment.reason = Some(format!(
+                        "regressed against {} = {}",
+                        baseline.id,
+                        number(baseline.converted)
+                    ));
+                }
+                (_, Some((false, _))) => judgment.verdict = Some(Verdict::Pass),
+                _ => {
+                    judgment.reason = Some(format!(
+                        "quantization ambiguity against {}: the comparison passes at one end of the value bounds and fails at the other",
+                        baseline.id
+                    ));
+                }
             }
         }
         Rule::Advisory { .. } | Rule::Unusable { .. } => {}
@@ -2623,11 +2934,14 @@ fn judge_criterion(
     judgment
 }
 
-/// The direction stored with a regression criterion's snapshot unit:
-/// per-CPU units improve upward, per-operation CPU downward.
+/// The direction a regression criterion's snapshot stores, or for a record
+/// that predates it, its unit's: per-CPU units improve upward,
+/// per-operation CPU downward.
 fn criterion_direction(criterion: &Criterion, baseline: &Snapshot) -> Option<Direction> {
     let _ = criterion;
-    if baseline.unit.contains("/cpu-s") {
+    if baseline.direction.is_some() {
+        baseline.direction
+    } else if baseline.unit.contains("/cpu-s") {
         Some(Direction::Higher)
     } else if baseline.unit.starts_with("µs/") || baseline.unit.starts_with("ms/") {
         Some(Direction::Lower)
@@ -2668,15 +2982,49 @@ pub fn regression(values: &[f64], b: f64, direction: Direction) -> (bool, Value)
     (failed, operands)
 }
 
-/// Advisory operands: the same comparison, never judged.
-fn regression_operands(values: &[Reading], b: f64) -> Option<Value> {
+/// Advisory operands: the same comparison in `direction`, never judged.
+fn regression_operands(values: &[Reading], b: f64, direction: Direction) -> Option<Value> {
     let exact: Option<Vec<f64>> = values.iter().map(Reading::exact_value).collect();
     exact
         .filter(|values| !values.is_empty())
-        .map(|values| regression(&values, b, Direction::Higher).1)
+        .map(|values| regression(&values, b, direction).1)
 }
 
 impl Record {
+    /// Why this record cannot establish references: anything but a clean,
+    /// full, passing `--qualify-baseline` L1 run of default coverage with
+    /// the ordinary configuration and no profile. A smoke is refused by its
+    /// recorded mode, wherever the file was moved.
+    #[must_use]
+    pub fn qualification_refusals(&self) -> Vec<String> {
+        let mut refusals = Vec::new();
+        if self.mode == Mode::Smoke {
+            refusals.push("a smoke is never a reference".to_owned());
+        }
+        if self.regression_coverage != Coverage::BaselineUnavailable {
+            refusals.push("not a --qualify-baseline run".to_owned());
+        }
+        if self.level != Level::One {
+            refusals.push("not an L1 run".to_owned());
+        }
+        if self.verdict != Verdict::Pass {
+            refusals.push(format!("verdict {}", self.verdict.label()));
+        }
+        if self.controls.selection.is_some() {
+            refusals.push("a partial selection".to_owned());
+        }
+        if self.dirty || self.dirty_override {
+            refusals.push("a dirty source".to_owned());
+        }
+        if self.artifacts.profile.requested {
+            refusals.push("a profiled run".to_owned());
+        }
+        if let Some(diagnostic) = self.command.diagnostic() {
+            refusals.push(format!("a diagnostic configuration: {diagnostic}"));
+        }
+        refusals
+    }
+
     /// The record's file name for collision number `n` (1 is the first):
     /// `YYYYMMDDTHHMMSSZ-<sha9>.json`, then `-2`, `-3`, ...
     #[must_use]
@@ -2813,6 +3161,15 @@ impl Record {
         );
         if self.mode == Mode::Smoke {
             out.push_str("SMOKE: functional pipeline evidence at reduced controls, never a performance qualification or reference.\n\n");
+        }
+        if self.regression_coverage == Coverage::BaselineUnavailable {
+            out.push_str("BASELINE QUALIFICATION: relative criteria omitted; baseline unavailable; regression coverage false. A PASS is qualification evidence, not proof against regression.\n\n");
+        } else if self.mode == Mode::Full && self.level == Level::One {
+            let _ = writeln!(
+                out,
+                "regression coverage: {}\n",
+                self.regression_coverage == Coverage::Covered
+            );
         }
         if let Some(prepass) = &self.prepass {
             let _ = writeln!(
@@ -3164,6 +3521,51 @@ pub struct BaselineEntry {
     pub build: String,
     /// Known limitations.
     pub limitations: String,
+    /// The method identity ([`Declaration::method`]) a reviewed reference
+    /// was measured with; a historical entry has none and only advises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// A latency reference's lower value bound, in `unit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low: Option<f64>,
+    /// A latency reference's upper value bound, in `unit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high: Option<f64>,
+}
+
+impl BaselineEntry {
+    /// The entry fixed for a criterion on `metric`, converted to its unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the entry cannot judge: excluded, or a unit that cannot
+    /// convert.
+    fn snapshot(&self, metric: &Metric) -> Result<Snapshot, String> {
+        if self.status == Eligibility::Excluded {
+            return Err(format!("excluded: {}", self.reason));
+        }
+        let to = |value: f64| convert(value, &self.unit, &metric.unit);
+        let converted = to(self.value)
+            .ok_or_else(|| format!("unit {} cannot convert to {}", self.unit, metric.unit))?;
+        let bounds = match (self.low, self.high) {
+            (Some(low), Some(high)) => Some([to(low).unwrap_or(low), to(high).unwrap_or(high)]),
+            _ => None,
+        };
+        Ok(Snapshot {
+            id: self.id.clone(),
+            value: self.value,
+            unit: self.unit.clone(),
+            converted,
+            source_report: self.source_report.clone(),
+            source_commit: self.source_commit.clone(),
+            host: self.host.clone(),
+            fixture: self.fixture.clone(),
+            operands: self.operands.clone(),
+            direction: Some(self.direction),
+            method: self.method.clone(),
+            bounds,
+        })
+    }
 }
 
 /// One engine's baselines file.
@@ -3203,12 +3605,12 @@ impl Baselines {
         toml::from_str(text).map_err(|error| error.to_string())
     }
 
-    /// Declares a baseline criterion `id` on `metric` for `step` against
-    /// entry `baseline`, chosen before measurement: an eligible entry from
-    /// the same host fingerprint and fixture judges; an eligible entry from
-    /// another host or fixture is advisory with both fingerprints; a
-    /// missing, excluded, or unit-incompatible entry is unusable and judges
-    /// INVALID.
+    /// Declares a historical comparison `id` on `metric` for `step`
+    /// against entry `baseline`, chosen before measurement. A historical
+    /// entry carries no method identity, so its methodology compatibility
+    /// is not demonstrated: an eligible one is advisory, naming both host
+    /// fingerprints or fixtures when those differ too. A missing, excluded,
+    /// or unit-incompatible entry is unusable and judges INVALID.
     #[must_use]
     pub fn criterion(
         &self,
@@ -3219,52 +3621,30 @@ impl Baselines {
         host: &str,
         fixture: &str,
     ) -> Criterion {
+        let unusable = |reason: String| Rule::Unusable {
+            baseline: baseline.to_owned(),
+            reason,
+        };
         let rule = match self.baseline.iter().find(|entry| entry.id == baseline) {
-            None => Rule::Unusable {
-                baseline: baseline.to_owned(),
-                reason: "no such entry in baselines.toml".to_owned(),
-            },
-            Some(entry) if entry.status == Eligibility::Excluded => Rule::Unusable {
-                baseline: baseline.to_owned(),
-                reason: format!("excluded: {}", entry.reason),
-            },
-            Some(entry) => match convert(entry.value, &entry.unit, &metric.unit) {
-                None => Rule::Unusable {
-                    baseline: baseline.to_owned(),
-                    reason: format!("unit {} cannot convert to {}", entry.unit, metric.unit),
-                },
-                Some(converted) => {
-                    let snapshot = Snapshot {
-                        id: entry.id.clone(),
-                        value: entry.value,
-                        unit: entry.unit.clone(),
-                        converted,
-                        source_report: entry.source_report.clone(),
-                        source_commit: entry.source_commit.clone(),
-                        host: entry.host.clone(),
-                        fixture: entry.fixture.clone(),
-                        operands: entry.operands.clone(),
-                    };
-                    if entry.host != host {
-                        Rule::Advisory {
-                            baseline: snapshot,
-                            reason: format!(
-                                "cross-host: baseline host `{}`, this host `{host}`",
-                                entry.host
-                            ),
-                        }
+            None => unusable("no such entry in baselines.toml".to_owned()),
+            Some(entry) => match entry.snapshot(metric) {
+                Err(reason) => unusable(reason),
+                Ok(snapshot) => Rule::Advisory {
+                    reason: if entry.host != host {
+                        format!(
+                            "cross-host: baseline host `{}`, this host `{host}`",
+                            entry.host
+                        )
                     } else if entry.fixture != fixture {
-                        Rule::Advisory {
-                            baseline: snapshot,
-                            reason: format!(
-                                "fixture differs: baseline `{}`, this run `{fixture}`",
-                                entry.fixture
-                            ),
-                        }
+                        format!(
+                            "fixture differs: baseline `{}`, this run `{fixture}`",
+                            entry.fixture
+                        )
                     } else {
-                        Rule::Regression { baseline: snapshot }
-                    }
-                }
+                        "historical reference: it has no method identity, so its methodology compatibility is not demonstrated".to_owned()
+                    },
+                    baseline: snapshot,
+                },
             },
         };
         Criterion {
@@ -3273,6 +3653,236 @@ impl Baselines {
             steps: vec![step.to_owned()],
             rule,
             percentile: None,
+        }
+    }
+
+    /// The rule for `reference` (entry `id`) on `metric`: the eligible
+    /// entry with `id` and the reference's method identity judges by the
+    /// noise-aware regression rule. Without one, an ordinary run's
+    /// comparison is unusable and judges INVALID, so a normal L1 cannot
+    /// pass without its references; a `diagnostic` run's comparison with an
+    /// entry of another method is advisory, since a profile or trace export
+    /// changes the method.
+    #[must_use]
+    pub fn reference(
+        &self,
+        id: &str,
+        metric: &Metric,
+        reference: &Reference,
+        diagnostic: Option<&str>,
+    ) -> Rule {
+        let unusable = |reason: String| Rule::Unusable {
+            baseline: id.to_owned(),
+            reason,
+        };
+        let candidates: Vec<&BaselineEntry> = self
+            .baseline
+            .iter()
+            .filter(|entry| entry.id == id)
+            .collect();
+        let same = candidates
+            .iter()
+            .find(|entry| entry.method.as_deref() == Some(reference.method.as_str()));
+        match (same, candidates.first(), diagnostic) {
+            (Some(entry), _, _) => match entry.snapshot(metric) {
+                Ok(baseline) => Rule::Regression { baseline },
+                Err(reason) => unusable(reason),
+            },
+            (None, None, _) => unusable(
+                "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)".to_owned(),
+            ),
+            (None, Some(entry), Some(diagnostic)) => match entry.snapshot(metric) {
+                Ok(baseline) => Rule::Advisory {
+                    baseline,
+                    reason: format!(
+                        "diagnostic run ({diagnostic}): method {} differs from the reference's, so it never judges",
+                        reference.method
+                    ),
+                },
+                Err(reason) => unusable(reason),
+            },
+            (None, Some(_), None) => unusable(format!(
+                "no reference has this run's method {}; references exist for {}",
+                reference.method,
+                candidates
+                    .iter()
+                    .map(|entry| entry.method.as_deref().unwrap_or("no method"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// The reference entries two or more `records` (each with its path)
+    /// establish, for review and an explicit TOML commit: each declared
+    /// reference's value is the median of every repetition (the mean of
+    /// the two central values for an even count), and a latency keeps the
+    /// medians of its lower and upper bounds. Nothing is written; reference
+    /// promotion stays a reviewed change.
+    ///
+    /// # Errors
+    ///
+    /// Returns every reason the records cannot qualify: fewer than two,
+    /// another engine or experiment, a record that is not a clean full
+    /// passing `--qualify-baseline` L1 run of default coverage with the
+    /// ordinary configuration and no profile (a smoke stays ineligible
+    /// wherever it is stored), references that differ, method identities
+    /// that differ, or a missing repetition value.
+    pub fn promote(records: &[(String, Record)]) -> Result<Self, Vec<String>> {
+        let mut refusals: Vec<String> = Vec::new();
+        if records.len() < 2 {
+            refusals.push(format!(
+                "{} records: references need two qualification suites",
+                records.len()
+            ));
+        }
+        for (path, record) in records {
+            refusals.extend(
+                record
+                    .qualification_refusals()
+                    .into_iter()
+                    .map(|reason| format!("{path}: {reason}")),
+            );
+        }
+        let Some((_, first)) = records.first() else {
+            return Err(refusals);
+        };
+        for (path, record) in &records[1..] {
+            if (record.engine, &record.experiment) != (first.engine, &first.experiment) {
+                refusals.push(format!(
+                    "{path}: {} {} is not {} {}",
+                    record.engine.name(),
+                    record.experiment,
+                    first.engine.name(),
+                    first.experiment
+                ));
+            } else if record.criteria.references != first.criteria.references {
+                refusals.push(format!(
+                    "{path}: its references or method identities differ from the first record's"
+                ));
+            }
+        }
+        let mut baseline = Vec::new();
+        for reference in &first.criteria.references {
+            let id = reference.id(&first.experiment);
+            let Some(metric) = first
+                .criteria
+                .metrics
+                .iter()
+                .find(|metric| metric.id == reference.metric)
+            else {
+                refusals.push(format!(
+                    "{id}: metric `{}` is not declared",
+                    reference.metric
+                ));
+                continue;
+            };
+            let mut readings = Vec::new();
+            for (path, record) in records {
+                let step = record.steps.iter().find(|step| step.id == reference.step);
+                readings.extend(step.into_iter().flat_map(|step| {
+                    step.repetitions
+                        .iter()
+                        .map(|repetition| (path.as_str(), repetition.reading(&metric.id)))
+                }));
+            }
+            let intervals: Option<Vec<(f64, f64)>> = readings
+                .iter()
+                .map(|(_, reading)| {
+                    reading
+                        .interval()
+                        .and_then(|(low, _, high)| high.map(|high| (low, high)))
+                })
+                .collect();
+            let Some(intervals) = intervals.filter(|intervals| intervals.len() >= 6) else {
+                refusals.push(format!(
+                    "{id}: {} repetitions have a bounded value, not six or more",
+                    readings
+                        .iter()
+                        .filter(|(_, reading)| reading.is_present())
+                        .count()
+                ));
+                continue;
+            };
+            let median = |values: Vec<f64>| {
+                let mut sorted = values;
+                sorted.sort_by(f64::total_cmp);
+                let middle = sorted.len() / 2;
+                if sorted.len().is_multiple_of(2) {
+                    f64::midpoint(sorted[middle - 1], sorted[middle])
+                } else {
+                    sorted[middle]
+                }
+            };
+            let exact = intervals
+                .iter()
+                .all(|(low, high)| low.total_cmp(high).is_eq());
+            let low = median(intervals.iter().map(|interval| interval.0).collect());
+            let high = median(intervals.iter().map(|interval| interval.1).collect());
+            let value = median(
+                intervals
+                    .iter()
+                    .map(|(low, high)| f64::midpoint(*low, *high))
+                    .collect(),
+            );
+            let operands = intervals
+                .iter()
+                .map(|(low, high)| {
+                    if low.total_cmp(high).is_eq() {
+                        number(*low)
+                    } else {
+                        format!("({}, {}]", number(*low), number(*high))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let step = first.steps.iter().find(|step| step.id == reference.step);
+            baseline.push(BaselineEntry {
+                id,
+                status: Eligibility::Eligible,
+                reason: format!(
+                    "median of {} repetitions from {} clean --qualify-baseline suites",
+                    intervals.len(),
+                    records.len()
+                ),
+                step: reference.step.clone(),
+                clients: step
+                    .and_then(|step| step.params.get("clients"))
+                    .and_then(Value::as_u64),
+                metric: metric.id.clone(),
+                unit: metric.unit.clone(),
+                direction: metric.direction.unwrap_or(Direction::Lower),
+                value,
+                operands: format!("repetitions: {operands}"),
+                fixture: first.experiment.clone(),
+                source_report: records
+                    .iter()
+                    .map(|(path, _)| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                source_commit: records
+                    .iter()
+                    .map(|(_, record)| record.commit.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                host: first.host.fingerprint.clone(),
+                build: ["profile", "rustflags", "compiler"]
+                    .iter()
+                    .filter_map(|field| first.build.get(*field).and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                limitations: reference.percentile.map_or_else(String::new, |percentile| {
+                    format!("server p{percentile}; judged on its quantization bounds")
+                }),
+                method: Some(reference.method.clone()),
+                low: (!exact).then_some(low),
+                high: (!exact).then_some(high),
+            });
+        }
+        if refusals.is_empty() {
+            Ok(Self { baseline })
+        } else {
+            Err(refusals)
         }
     }
 }
@@ -3320,10 +3930,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        Arrivals, Baselines, Criterion, Declaration, Derive, Direction, Eligibility, Engine,
-        ExperimentError, HostRecord, Invocation, Level, Metric, Mode, Op, Options, Phase, Prepass,
-        REPORT_HEADER, Reading, Record, Repetition, Rule, Source, Status, Step, Validity, Verdict,
-        Workload, convert, regression, run,
+        Arrivals, Baselines, Coverage, Criterion, Declaration, Derive, Direction, Eligibility,
+        Engine, ExperimentError, HostRecord, Invocation, Level, Metric, Mode, Op, Options, Phase,
+        Prepass, REPORT_HEADER, Reading, Record, Reference, Repetition, Rule, Source, Status, Step,
+        Validity, Verdict, Workload, convert, regression, run,
     };
     use crate::capacity::{Histogram, Population, UNLABELLED};
     use crate::release_server::HostLoad;
@@ -3409,6 +4019,8 @@ mod tests {
             refusals: Vec::new(),
             mode: Mode::Full,
             prepass: None,
+            references: Vec::new(),
+            qualify: false,
         }
     }
 
@@ -4663,11 +5275,11 @@ build = "release"
 limitations = "excluded"
 "#;
 
-    /// V6: selection happens at declaration: an eligible same-host entry
-    /// judges after unit conversion, a cross-host entry is advisory with
-    /// both fingerprints and never fails the run, and missing, excluded, and
-    /// unit-incompatible entries are INVALID; the record keeps every
-    /// snapshot.
+    /// V6: selection happens at declaration: an eligible same-host
+    /// historical entry has no method identity, so it advises after unit
+    /// conversion; a cross-host entry is advisory with both fingerprints;
+    /// neither fails the run; missing, excluded, and unit-incompatible
+    /// entries are INVALID; the record keeps every snapshot.
     ///
     /// # Panics
     ///
@@ -4704,9 +5316,10 @@ limitations = "excluded"
             &host,
             "standard-10m",
         );
-        let Rule::Regression { baseline } = &judging.rule else {
+        let Rule::Advisory { baseline, reason } = &judging.rule else {
             panic!("{:?}", judging.rule)
         };
+        assert!(reason.contains("no method identity"), "{reason}");
         assert!(
             (baseline.converted - 2.0).abs() < 1e-12,
             "2000 µs/query is 2 ms/query"
@@ -4763,12 +5376,25 @@ limitations = "excluded"
         assert_eq!(record.verdict, Verdict::Pass, "{:?}", record.reasons);
         let judged = &record.steps[0].criteria;
         assert_eq!(
-            judged[1].verdict,
-            Some(Verdict::Pass),
-            "2 CPU-s per 1,000 ops is 2 ms/query"
+            (judged[1].verdict, judged[2].verdict),
+            (None, None),
+            "advisory never judges"
         );
-        assert!(judged[1].operands.is_some());
-        assert_eq!(judged[2].verdict, None, "advisory never judges");
+        assert_eq!(
+            judged[1]
+                .operands
+                .as_ref()
+                .map(|operands| operands["median"].clone()),
+            Some(json!(2.0)),
+            "2 CPU-s per 1,000 ops is 2 ms/query, compared lower-is-better"
+        );
+        assert_eq!(
+            judged[1]
+                .operands
+                .as_ref()
+                .map(|operands| operands["percentage_limit_missed"].clone()),
+            Some(json!(false))
+        );
         assert_eq!(
             record.criteria.criteria, declared.criteria,
             "snapshots recorded as declared"
@@ -4822,6 +5448,478 @@ limitations = "excluded"
                 engine.name()
             );
         }
+    }
+
+    /// The representative declaration with step `op-1` comparing server
+    /// p99, CPU per operation, operations per CPU-second and operations per
+    /// second per provisioned vCPU against its references.
+    fn compared() -> Declaration {
+        let mut declared = declaration();
+        declared.metrics.extend([
+            Metric::derived(
+                "cpu_us_per_op",
+                "µs/op",
+                "C/W",
+                Direction::Lower,
+                Derive::CpuPer {
+                    work: "ops".to_owned(),
+                    scale: 1e6,
+                },
+            ),
+            Metric::derived(
+                "ops_per_s_per_vcpu",
+                "ops/s/vCPU",
+                "(W/T)/P",
+                Direction::Higher,
+                Derive::PerVcpu {
+                    work: "ops".to_owned(),
+                    scale: 1.0,
+                },
+            ),
+        ]);
+        declared.references = vec![
+            Reference::new("op-1", "p99_ms", Some(99)),
+            Reference::new("op-1", "cpu_us_per_op", None),
+            Reference::new("op-1", "ops_per_cpu_s", None),
+            Reference::new("op-1", "ops_per_s_per_vcpu", None),
+        ];
+        declared
+    }
+
+    /// Reviewed references for [`compared`] measured with `method`: p99
+    /// `p99` ms (within `bounds` when given), 2,000 µs/op, 500 ops/cpu-s,
+    /// and 100 ops/s over this host's provisioned vCPUs, as their TOML.
+    fn references(method: &str, p99: f64, bounds: Option<[f64; 2]>) -> Baselines {
+        let vcpus = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
+        let entry = |metric: &str, unit: &str, direction: &str, value: f64| {
+            let bounds = if metric == "p99_ms" {
+                bounds.map_or_else(String::new, |[low, high]| {
+                    format!("low = {low}\nhigh = {high}\n")
+                })
+            } else {
+                String::new()
+            };
+            format!(
+                "[[baseline]]\nid = \"reference.direct-verify.op-1.{metric}\"\nstatus = \"eligible\"\nreason = \"two qualification suites\"\nstep = \"op-1\"\nclients = 1\nmetric = \"{metric}\"\nunit = \"{unit}\"\ndirection = \"{direction}\"\nvalue = {value:?}\noperands = \"six repetitions\"\nfixture = \"direct-verify\"\nsource_report = \"a.json, b.json\"\nsource_commit = \"0123456\"\nhost = \"test cpu, 32 CPU / 16 GiB, linux\"\nbuild = \"release\"\nlimitations = \"\"\nmethod = \"{method}\"\n{bounds}\n"
+            )
+        };
+        let text = [
+            entry("p99_ms", "ms", "lower", p99),
+            entry("cpu_us_per_op", "µs/op", "lower", 2_000.0),
+            entry("ops_per_cpu_s", "ops/cpu-s", "higher", 500.0),
+            entry("ops_per_s_per_vcpu", "ops/s/vCPU", "higher", 100.0 / vcpus),
+        ]
+        .concat();
+        Baselines::parse(&text).expect("references parse")
+    }
+
+    /// Runs `declared` against `baselines` with `op-1` repetitions shaped
+    /// by `shape` (given the repetition index) and every other step good.
+    async fn compare_run(
+        mut declared: Declaration,
+        baselines: &Baselines,
+        shape: impl Fn(usize, &mut Repetition),
+    ) -> Record {
+        declared.compare(baselines);
+        let mut script = vec![Ok(good())];
+        for index in 0..3 {
+            let mut repetition = good();
+            shape(index, &mut repetition);
+            script.push(Ok(repetition));
+        }
+        script.extend(std::iter::repeat_n(Ok(good()), 4));
+        let mut workload = Scripted::always(&good());
+        workload.script = script.into();
+        let directory = tempfile::tempdir().expect("artifacts");
+        execute(
+            declared,
+            &mut workload,
+            [Some(quiet()), Some(quiet())],
+            &options(directory.path()),
+        )
+        .await
+    }
+
+    /// The verdict of `criterion` on step `op-1` of `record`.
+    fn op_verdict(record: &Record, criterion: &str) -> Option<Verdict> {
+        record.steps[0]
+            .criteria
+            .iter()
+            .find(|judgment| judgment.criterion == criterion)
+            .and_then(|judgment| judgment.verdict)
+    }
+
+    /// V3: a same-method reference judges server latency, CPU per work,
+    /// work per CPU-second and throughput per provisioned vCPU by the
+    /// noise-aware rule through the real runner: an unperturbed control
+    /// passes with regression coverage; a latency, a CPU and a throughput
+    /// regression each fail with exit 1; spread excuses a shift it covers;
+    /// a latency interval wholly beyond its bounded reference fails, one
+    /// within passes, and one straddling it is INVALID; and a missing first
+    /// reference, another method or host is INVALID while a diagnostic
+    /// run's comparison only advises.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a comparison judges against the rule.
+    #[tokio::test(start_paused = true)]
+    async fn compatible_histogram_baselines_judge_all_regression_dimensions() {
+        let method = compared().method("op-1");
+        assert_eq!(method, compared().method("op-1"), "deterministic");
+        assert_ne!(method, compared().method("op-64"), "per step");
+        let baselines = references(&method, 0.3, None);
+        let id = |metric: &str| format!("reference.direct-verify.op-1.{metric}");
+
+        let control = compare_run(compared(), &baselines, |_, _| {}).await;
+        assert_eq!(control.verdict, Verdict::Pass, "{}", control.render());
+        assert_eq!(
+            control.regression_coverage,
+            Coverage::Covered,
+            "every reference judged"
+        );
+        for metric in [
+            "p99_ms",
+            "cpu_us_per_op",
+            "ops_per_cpu_s",
+            "ops_per_s_per_vcpu",
+        ] {
+            assert_eq!(
+                op_verdict(&control, &id(metric)),
+                Some(Verdict::Pass),
+                "{metric}"
+            );
+        }
+        assert!(control.render().contains("regression coverage: true"));
+
+        let slower = compare_run(compared(), &baselines, |_, repetition| {
+            repetition.set("p99_ms", Reading::exact(0.4).with_samples(2_000));
+        })
+        .await;
+        assert_eq!((slower.verdict, slower.exit_code()), (Verdict::Fail, 1));
+        assert_eq!(op_verdict(&slower, &id("p99_ms")), Some(Verdict::Fail));
+        assert_eq!(
+            op_verdict(&slower, &id("cpu_us_per_op")),
+            Some(Verdict::Pass)
+        );
+
+        let costlier = compare_run(compared(), &baselines, |_, repetition| {
+            repetition.server_cpu_seconds = Some(2.5);
+        })
+        .await;
+        assert_eq!(costlier.exit_code(), 1);
+        assert_eq!(
+            op_verdict(&costlier, &id("cpu_us_per_op")),
+            Some(Verdict::Fail)
+        );
+        assert_eq!(
+            op_verdict(&costlier, &id("ops_per_cpu_s")),
+            Some(Verdict::Fail)
+        );
+        assert_eq!(
+            op_verdict(&costlier, &id("ops_per_s_per_vcpu")),
+            Some(Verdict::Pass),
+            "throughput per core is independent of CPU used"
+        );
+
+        let fewer = compare_run(compared(), &baselines, |_, repetition| {
+            repetition.set("ops", Reading::exact(850.0));
+            repetition.server_cpu_seconds = Some(1.7);
+        })
+        .await;
+        assert_eq!(fewer.exit_code(), 1);
+        assert_eq!(
+            op_verdict(&fewer, &id("ops_per_s_per_vcpu")),
+            Some(Verdict::Fail)
+        );
+        assert_eq!(
+            op_verdict(&fewer, &id("ops_per_cpu_s")),
+            Some(Verdict::Pass),
+            "work per CPU-second is unchanged"
+        );
+
+        let noisy = compare_run(compared(), &baselines, |index, repetition| {
+            let p99 = [0.3, 0.36, 0.5][index];
+            repetition.set("p99_ms", Reading::exact(p99).with_samples(2_000));
+        })
+        .await;
+        assert_eq!(
+            op_verdict(&noisy, &id("p99_ms")),
+            Some(Verdict::Pass),
+            "spread covers the shift"
+        );
+
+        let bounded = references(&method, 0.3, Some([0.299, 0.301]));
+        let interval = |low: f64, high: f64| {
+            move |_: usize, repetition: &mut Repetition| {
+                repetition.set(
+                    "p99_ms",
+                    Reading::bounded(low, high, 1e6).with_samples(2_000),
+                );
+            }
+        };
+        let beyond = compare_run(compared(), &bounded, interval(400_001.0, 410_000.0)).await;
+        assert_eq!(op_verdict(&beyond, &id("p99_ms")), Some(Verdict::Fail));
+        let within = compare_run(compared(), &bounded, interval(300_001.0, 310_000.0)).await;
+        assert_eq!(op_verdict(&within, &id("p99_ms")), Some(Verdict::Pass));
+        let straddling = compare_run(compared(), &bounded, interval(330_001.0, 360_000.0)).await;
+        assert_eq!(straddling.verdict, Verdict::Invalid);
+        let judgment = straddling.steps[0]
+            .criteria
+            .iter()
+            .find(|judgment| judgment.criterion == id("p99_ms"))
+            .expect("latency judgment");
+        assert_eq!(judgment.verdict, Some(Verdict::Invalid));
+        assert!(
+            judgment
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("quantization ambiguity")),
+            "{judgment:?}"
+        );
+        let operands = judgment.operands.as_ref().expect("operands");
+        assert_eq!(operands["best"]["percentage_limit_missed"], false);
+        assert_eq!(operands["worst"]["percentage_limit_missed"], true);
+
+        let first = compare_run(compared(), &Baselines::default(), |_, _| {}).await;
+        assert_eq!((first.verdict, first.exit_code()), (Verdict::Invalid, 2));
+        assert_eq!(first.regression_coverage, Coverage::Uncovered);
+        assert!(first.render().contains("regression coverage: false"));
+        let other = compare_run(
+            compared(),
+            &references("sha256:0000000000000000", 0.3, None),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(other.verdict, Verdict::Invalid);
+        let mut elsewhere = compared();
+        elsewhere.host.fingerprint = "Apple M4 Max, 16 CPU / 64 GiB, macos".to_owned();
+        let moved = compare_run(elsewhere, &baselines, |_, _| {}).await;
+        assert_eq!(
+            moved.verdict,
+            Verdict::Invalid,
+            "a reference from another host never judges"
+        );
+        let mut traced = compared();
+        traced.command = Invocation::new(
+            &["l1".to_owned(), "verification".to_owned()],
+            &[("WYRD_TRACE_FILTER", "debug")],
+        );
+        let diagnostic = compare_run(traced, &baselines, |_, repetition| {
+            repetition.set("p99_ms", Reading::exact(0.4).with_samples(2_000));
+        })
+        .await;
+        assert_eq!(diagnostic.verdict, Verdict::Pass, "{}", diagnostic.render());
+        assert_eq!(diagnostic.regression_coverage, Coverage::Uncovered);
+        assert!(
+            diagnostic
+                .criteria
+                .criteria
+                .iter()
+                .any(|criterion| matches!(
+                    &criterion.rule,
+                    Rule::Advisory { reason, .. } if reason.contains("WYRD_TRACE_FILTER")
+                ))
+        );
+    }
+
+    /// V5: a `--qualify-baseline` run omits every relative criterion and
+    /// records baseline-unavailable and no regression coverage, yet passes
+    /// its absolute and correctness criteria; it refuses L2, smoke, partial,
+    /// dirty, profiled and diagnostic configurations. Two qualifying records
+    /// promote the median of their six repetitions with method identity and
+    /// latency bounds, which then judges a normal run; a single record, a
+    /// smoke even moved into history, a non-qualification, partial,
+    /// profiled, failed or differently configured record never promotes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a qualification or promotion admits the wrong record.
+    #[tokio::test(start_paused = true)]
+    async fn reference_qualification_rejects_partial_and_diagnostic_runs() {
+        let mut qualifying = compared();
+        qualifying.qualify = true;
+        qualifying.criteria.push(Criterion::limit(
+            "never-declared",
+            "ops_per_cpu_s",
+            &["op-1".to_owned()],
+            Op::Ge,
+            0.0,
+        ));
+        let historical = Baselines::parse(BASELINES).expect("historical");
+        qualifying.criteria.push(historical.criterion(
+            "baseline.point-1-cpu",
+            &qualifying.metrics[0],
+            "op-1",
+            "point-1-cpu",
+            "test cpu, 32 CPU / 16 GiB, linux",
+            "standard-10m",
+        ));
+        let suite = |values: [f64; 3]| {
+            let declared = qualifying.clone();
+            async move {
+                compare_run(declared, &Baselines::default(), |index, repetition| {
+                    repetition.set(
+                        "p99_ms",
+                        Reading::bounded(values[index] * 1e6 - 999.0, values[index] * 1e6, 1e6)
+                            .with_samples(2_000),
+                    );
+                })
+                .await
+            }
+        };
+        let a = suite([0.30, 0.31, 0.32]).await;
+        assert_eq!(a.verdict, Verdict::Pass, "{}", a.render());
+        assert_eq!(a.regression_coverage, Coverage::BaselineUnavailable);
+        assert!(
+            a.criteria
+                .criteria
+                .iter()
+                .all(|criterion| matches!(criterion.rule, Rule::Limit { .. }))
+        );
+        assert_eq!(a.criteria.references.len(), 4);
+        assert!(
+            a.criteria
+                .references
+                .iter()
+                .all(|reference| reference.method == qualifying.method("op-1"))
+        );
+        assert!(
+            a.controls.values["baselines"]
+                .as_str()
+                .is_some_and(|note| note.starts_with("baseline-unavailable")),
+            "{:?}",
+            a.controls.values["baselines"]
+        );
+        assert!(a.render().contains("BASELINE QUALIFICATION"));
+        let b = suite([0.33, 0.34, 0.35]).await;
+
+        let refused = |mutate: &dyn Fn(&mut Declaration)| {
+            let mut declared = qualifying.clone();
+            mutate(&mut declared);
+            declared
+                .refusals()
+                .into_iter()
+                .filter(|reason| reason.code == "qualification.refused")
+                .count()
+        };
+        assert_eq!(refused(&|_| {}), 0);
+        assert_eq!(refused(&|declared| declared.level = Level::Two), 1);
+        assert_eq!(refused(&|declared| declared.mode = Mode::Smoke), 1);
+        assert_eq!(
+            refused(&|declared| declared.selection = Some(vec!["op-1".to_owned()])),
+            1
+        );
+        assert_eq!(
+            refused(
+                &|declared| declared.source = Source::from_diff("0123".to_owned(), b"diff", true)
+            ),
+            1
+        );
+        for (args, config) in [
+            (vec!["l1", "verification", "--profile"], vec![]),
+            (
+                vec!["l1", "verification"],
+                vec![("WYRD_OTLP_ENDPOINT", "http://collector")],
+            ),
+            (vec!["l1", "verification"], vec![("WYRD_LOG", "debug")]),
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert_eq!(
+                refused(&|declared| declared.command = Invocation::new(&args, &config)),
+                1,
+                "{args:?} {config:?}"
+            );
+        }
+        let mut partial = qualifying.clone();
+        partial.selection = Some(vec!["op-1".to_owned()]);
+        let partial = compare_run(partial, &Baselines::default(), |_, _| {}).await;
+        assert_eq!(
+            partial.verdict,
+            Verdict::Invalid,
+            "a partial qualification is refused before work"
+        );
+
+        let path = |name: &str| format!("benchmarks/verification/direct-verify/{name}.json");
+        let promoted = Baselines::promote(&[(path("a"), a.clone()), (path("b"), b.clone())])
+            .expect("two clean qualification suites promote");
+        assert_eq!(promoted.baseline.len(), 4);
+        let latency = promoted
+            .baseline
+            .iter()
+            .find(|entry| entry.metric == "p99_ms")
+            .expect("latency reference");
+        assert_eq!(latency.id, "reference.direct-verify.op-1.p99_ms");
+        assert_eq!(
+            latency.method.as_deref(),
+            Some(qualifying.method("op-1").as_str())
+        );
+        let (low, high) = (latency.low.expect("low"), latency.high.expect("high"));
+        assert!(
+            (high - 0.325).abs() < 1e-9,
+            "the mean of the two central upper bounds: {high}"
+        );
+        assert!(
+            low < high && (high - low - 0.001).abs() < 1e-6,
+            "{low} {high}"
+        );
+        assert_eq!(
+            latency.source_report,
+            format!("{}, {}", path("a"), path("b"))
+        );
+        let toml = toml::to_string(&promoted).expect("toml");
+        let reviewed = Baselines::parse(&toml).expect("the printed TOML parses back");
+        assert_eq!(reviewed, promoted);
+        let judged = compare_run(compared(), &reviewed, |index, repetition| {
+            let value = [0.32, 0.33, 0.34][index];
+            repetition.set(
+                "p99_ms",
+                Reading::bounded(value * 1e6 - 999.0, value * 1e6, 1e6).with_samples(2_000),
+            );
+        })
+        .await;
+        assert!(
+            judged
+                .criteria
+                .criteria
+                .iter()
+                .filter(|criterion| matches!(criterion.rule, Rule::Regression { .. }))
+                .count()
+                == 4,
+            "the promoted references judge a normal run"
+        );
+        assert_eq!(
+            op_verdict(&judged, "reference.direct-verify.op-1.p99_ms"),
+            Some(Verdict::Pass)
+        );
+
+        let promote = |records: Vec<Record>| {
+            let named: Vec<(String, Record)> = records
+                .into_iter()
+                .enumerate()
+                .map(|(index, record)| (path(&index.to_string()), record))
+                .collect();
+            Baselines::promote(&named).expect_err("refused").join("; ")
+        };
+        assert!(promote(vec![a.clone()]).contains("two qualification suites"));
+        let mut smoke = b.clone();
+        smoke.mode = Mode::Smoke;
+        assert!(promote(vec![a.clone(), smoke]).contains("a smoke is never a reference"));
+        let mut profiled = b.clone();
+        profiled.artifacts.profile.requested = true;
+        assert!(promote(vec![a.clone(), profiled]).contains("a profiled run"));
+        assert!(promote(vec![a.clone(), partial]).contains("a partial selection"));
+        assert!(promote(vec![a.clone(), judged]).contains("not a --qualify-baseline run"));
+        let mut failed = b.clone();
+        failed.verdict = Verdict::Fail;
+        assert!(promote(vec![a.clone(), failed]).contains("verdict FAIL"));
+        let mut dirty = b.clone();
+        dirty.dirty_override = true;
+        assert!(promote(vec![a.clone(), dirty]).contains("a dirty source"));
+        let mut other = qualifying.clone();
+        other.command = Invocation::new(&["l1".to_owned()], &[("WYRD_DB_MAX_CONNECTIONS", "16")]);
+        let other = compare_run(other, &Baselines::default(), |_, _| {}).await;
+        assert_eq!(other.verdict, Verdict::Pass);
+        assert!(promote(vec![a, other]).contains("method identities differ"));
     }
 
     /// V7: records round-trip, publish append-only with collision suffixes

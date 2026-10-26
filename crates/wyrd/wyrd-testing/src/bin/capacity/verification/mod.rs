@@ -34,7 +34,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use wyrd_testing::experiment::{
     Baselines, Criterion, Declaration, Derive, Direction, Eligibility, Engine, Level, Metric, Op,
-    Reading, Step,
+    Reading, Reference, Step,
 };
 
 use crate::levels::{Context, Plan};
@@ -220,7 +220,7 @@ pub fn declare(
     };
     let baselines = match Baselines::load(root, Engine::Verification) {
         Ok(baselines) => format!(
-            "none: {} historical entries, {} eligible; no baseline criterion is declared",
+            "{} entries loaded, {} eligible; L1 compares reviewed `reference.*` entries only",
             baselines.baseline.len(),
             baselines
                 .baseline
@@ -228,7 +228,7 @@ pub fn declare(
                 .filter(|entry| entry.status == Eligibility::Eligible)
                 .count()
         ),
-        Err(error) => format!("none: {error}; no baseline criterion is declared"),
+        Err(error) => format!("unavailable: {error}"),
     };
     declaration
         .controls
@@ -339,6 +339,17 @@ fn direct(mut base: Declaration) -> Declaration {
         .iter()
         .zip(&steps)
         .map(|(clients, id)| Step::measured(id, json!({ "clients": clients, "op": "verify" })))
+        .collect();
+    base.references = steps
+        .iter()
+        .flat_map(|step| {
+            [
+                Reference::new(step, "overhead_p99_ms", Some(99)),
+                Reference::new(step, "cpu_us_per_verification", None),
+                Reference::new(step, "verifications_per_cpu_s", None),
+                Reference::new(step, "verifications_per_s_per_vcpu", None),
+            ]
+        })
         .collect();
     base.metrics = work_metrics();
     base.metrics
@@ -629,6 +640,8 @@ mod tests {
             refusals: Vec::new(),
             mode: Mode::Full,
             prepass: None,
+            references: Vec::new(),
+            qualify: false,
         }
     }
 

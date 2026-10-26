@@ -39,7 +39,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::{GlobalConfig, WyrdClient};
 use wyrd_testing::experiment::{
     Baselines, Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Mode, Op, Reason,
-    Record, Status, Step, Verdict,
+    Record, Reference, Status, Step, Verdict,
 };
 use wyrd_testing::release_server::{LocalServer, SERVER_URL};
 
@@ -1016,7 +1016,75 @@ fn l1_declaration(
             }
         }
     }
+    base.references = references(experiment);
     base
+}
+
+/// Each measured step's relative comparisons: server latency at the
+/// highest percentile its window clears the sample floor for (p99 at 64
+/// clients and for point, trace and aggregate reads; p95 for a shredded
+/// Parquet filter and the c1 native and OTLP spans writes; p50 for the
+/// other attribute filters and c1 OTLP logs writes, which complete near or
+/// under 200 times per window), and CPU per work, work per
+/// CPU-second and throughput per provisioned vCPU in rows, uncompressed
+/// MiB and, for OTLP, wire MiB. Full-scan latency stays descriptive.
+fn references(experiment: Experiment) -> Vec<Reference> {
+    let mut references = Vec::new();
+    for (op, _, clients) in experiment.reads() {
+        for clients in *clients {
+            let step = format!("{op}-c{clients}");
+            let latency = match (*op, *clients, experiment) {
+                ("full-scan", _, _) => None,
+                (_, 64, _) | ("point" | "span-trace" | "small-aggregate", _, _) => Some(99),
+                ("span-shredded", _, Experiment::Parquet) => Some(95),
+                _ => Some(50),
+            };
+            references.extend(latency.map(|percentile| {
+                Reference::new(&step, &format!("p{percentile}_ms"), Some(percentile))
+            }));
+            references.extend(
+                [
+                    "cpu_ms_per_query",
+                    "queries_per_cpu_s",
+                    "queries_per_s_per_vcpu",
+                ]
+                .map(|metric| Reference::new(&step, metric, None)),
+            );
+        }
+    }
+    if experiment.writes() {
+        for op in WriteOp::ALL {
+            for clients in PAIR {
+                let step = format!("{}-c{clients}", op.name());
+                let percentile = match (op, clients) {
+                    (_, 64) => 99,
+                    (WriteOp::Logs, _) => 50,
+                    _ => 95,
+                };
+                references.push(Reference::new(
+                    &step,
+                    &format!("p{percentile}_ms"),
+                    Some(percentile),
+                ));
+                let mut metrics = vec![
+                    "cpu_us_per_row",
+                    "rows_per_cpu_s",
+                    "rows_per_s_per_vcpu",
+                    "mib_per_cpu_s",
+                    "mib_per_s_per_vcpu",
+                ];
+                if op != WriteOp::Native {
+                    metrics.extend(["wire_mib_per_cpu_s", "wire_mib_per_s_per_vcpu"]);
+                }
+                references.extend(
+                    metrics
+                        .into_iter()
+                        .map(|metric| Reference::new(&step, metric, None)),
+                );
+            }
+        }
+    }
+    references
 }
 
 /// The per-signal rows per server CPU-second an L2 rate is calibrated from,

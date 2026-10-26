@@ -17,7 +17,10 @@
 //! `benchmarks/<engine>/<experiment>/`, and exit 0 (PASS), 1 (FAIL), or 2
 //! (INVALID). `--profile` adds optional samply captures, `--allow-dirty`
 //! records a dirty source, `--steps` selects declared steps, and `--smoke`
-//! runs the same plan at smoke scale under `target/benchmarks/smoke/`. A
+//! runs the same plan at smoke scale under `target/benchmarks/smoke/`.
+//! `--qualify-baseline` runs a full clean L1 that omits relative criteria
+//! to qualify references, and `reference <record.json>...` prints the
+//! reviewed-reference TOML two such records establish. A
 //! full run first runs that smoke as an isolated prepass and stops when it
 //! fails; `mise run bench:smoke` runs every level's smoke.
 
@@ -82,7 +85,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
             let shared = rest(skip);
             if let Err(message) = flags::known(&shared, &levels::VALUED[..0], &levels::SWITCHES) {
                 eprintln!(
-                    "capacity l1 bifrost: {message}; running several experiments takes only --profile, --allow-dirty and --smoke"
+                    "capacity l1 bifrost: {message}; running several experiments takes only --profile, --allow-dirty, --smoke and --qualify-baseline"
                 );
                 return 2;
             }
@@ -95,13 +98,25 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
             let shared = rest(2);
             if let Err(message) = flags::known(&shared, &levels::VALUED[..0], &levels::SWITCHES) {
                 eprintln!(
-                    "capacity l1: {message}; the aggregate takes only --profile, --allow-dirty and --smoke"
+                    "capacity l1: {message}; the aggregate takes only --profile, --allow-dirty, --smoke and --qualify-baseline"
                 );
                 return 2;
             }
             levels::aggregate(&shared, |engine, forwarded| {
                 levels::spawn_engine(root, engine, forwarded)
             })
+        }
+        (Some("reference"), _, _) if arguments.len() >= 3 => {
+            match levels::references(&arguments[2..]) {
+                Ok(toml) => {
+                    print!("{toml}");
+                    0
+                }
+                Err(message) => {
+                    eprintln!("capacity reference: {message}");
+                    2
+                }
+            }
         }
         (Some("report"), _, _) if arguments.len() == 3 => {
             match levels::report(Path::new(&arguments[2])) {
@@ -117,7 +132,7 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
         }
         _ => {
             eprintln!(
-                "capacity: expected `l1 [bifrost [writes|writes-hot|writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, or `report <record.json>`, got {:?}",
+                "capacity: expected `l1 [bifrost [writes|writes-hot|writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, or `reference <record.json>...`, got {:?}",
                 &arguments[1.min(arguments.len())..]
             );
             2
@@ -149,7 +164,9 @@ async fn level(level: Level, engine: Engine, arguments: &[String], root: &Path) 
         Ok(mut plan) => {
             if context.smoke() {
                 levels::smoke(&mut plan.declaration);
-            } else if plan.declaration.refusals().is_empty() {
+            }
+            levels::compare(&mut plan.declaration, root);
+            if !context.smoke() && plan.declaration.refusals().is_empty() {
                 plan.declaration.prepass =
                     Some(levels::prepass(root, &plan.declaration, arguments));
             }
@@ -664,15 +681,16 @@ mod tests {
                 .map(|criterion| criterion.rule.clone())
         };
         match baseline(&parquet, "standard-parquet.selective.c64.cpu-us-per-query") {
-            Some(Rule::Regression { baseline }) => {
+            Some(Rule::Advisory { baseline, reason }) => {
                 assert!((baseline.value - 3_416.199).abs() < 1e-9);
                 assert!(
                     (baseline.converted - 3.416_199).abs() < 1e-9,
                     "µs/query in ms/query"
                 );
                 assert_eq!(baseline.fixture, "standard-10m-parquet");
+                assert!(reason.contains("no method identity"), "{reason}");
             }
-            other => panic!("same-host same-fixture baseline judges: {other:?}"),
+            other => panic!("a same-host historical baseline only advises: {other:?}"),
         }
         assert!(baseline(&hot, "standard-hot.small-aggregate.c1.queries-per-cpu-s").is_some());
         assert!(
@@ -690,13 +708,71 @@ mod tests {
             ),
             "the 10M native baseline cannot judge the 2M fixture"
         );
-        assert!(matches!(
-            baseline(
-                &writes,
-                "otlp-spans-writes.otlp-spans.c64.otlp-wire-mib-per-cpu-s"
+        assert!(
+            matches!(
+                baseline(
+                    &writes,
+                    "otlp-spans-writes.otlp-spans.c64.otlp-wire-mib-per-cpu-s"
+                ),
+                Some(Rule::Advisory { .. })
             ),
-            Some(Rule::Regression { .. })
-        ));
+            "historical write baselines predate the method identity"
+        );
+        let compared = |declaration: &Declaration| -> Vec<(String, String, Option<u8>)> {
+            declaration
+                .references
+                .iter()
+                .map(|reference| {
+                    (
+                        reference.step.clone(),
+                        reference.metric.clone(),
+                        reference.percentile,
+                    )
+                })
+                .collect()
+        };
+        for declaration in [&writes, &writes_hot, &hot, &parquet] {
+            for step in declaration
+                .steps
+                .iter()
+                .filter(|step| step.kind == StepKind::Measured)
+            {
+                let metrics: Vec<(String, Option<u8>)> = compared(declaration)
+                    .into_iter()
+                    .filter(|(id, _, _)| *id == step.id)
+                    .map(|(_, metric, percentile)| (metric, percentile))
+                    .collect();
+                let latency = metrics
+                    .iter()
+                    .filter(|(_, percentile)| percentile.is_some());
+                assert_eq!(
+                    latency.count(),
+                    usize::from(step.id != "full-scan-c1"),
+                    "{} declares one latency reference; full-scan latency stays descriptive",
+                    step.id
+                );
+                for prefix in ["cpu_", "_per_cpu_s", "_per_s_per_vcpu"] {
+                    assert!(
+                        metrics
+                            .iter()
+                            .any(|(metric, _)| metric.starts_with(prefix)
+                                || metric.ends_with(prefix)),
+                        "{} compares {prefix}",
+                        step.id
+                    );
+                }
+            }
+        }
+        assert!(compared(&writes).contains(&(
+            "otlp-logs-c1".to_owned(),
+            "p50_ms".to_owned(),
+            Some(50)
+        )));
+        assert!(compared(&parquet).contains(&(
+            "point-c64".to_owned(),
+            "p99_ms".to_owned(),
+            Some(99)
+        )));
         let elsewhere = experiment(query::Experiment::Parquet, &[], OTHER_HOST);
         assert!(
             matches!(
@@ -882,13 +958,23 @@ mod tests {
             assert!(gateway.metric(metric).is_some(), "{metric}");
         }
 
+        assert_eq!(
+            verification.references.len(),
+            4 * 4,
+            "each client count compares overhead p99, CPU per verification, verifications per CPU-second and per vCPU"
+        );
+        assert_eq!(
+            gateway.references.len(),
+            12 * 4 + 4 + 4 * 2,
+            "every case compares overhead p99, CPU, work and throughput; streams add end overhead, capture adds capture bytes"
+        );
         for declaration in [&verification, &gateway] {
             assert!(
                 declaration
                     .criteria
                     .iter()
                     .all(|criterion| matches!(criterion.rule, Rule::Limit { .. })),
-                "no {} baseline is eligible, so none is declared",
+                "{} references resolve only once the declaration is final",
                 declaration.engine.name()
             );
             let (record, _) = execute(declaration.clone(), Box::new(|_, _, _| {})).await;

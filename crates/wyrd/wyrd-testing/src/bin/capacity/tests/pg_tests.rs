@@ -737,11 +737,11 @@ impl Workload for Stormed {
 }
 
 /// Runs `engine`'s ordinary full L1 plan from `rest` with `--qualify-baseline`
-/// when `qualify` holds, its declaration trimmed to measured step `step`
-/// and that step's criteria and references, compared against `baselines`
-/// as a CLI run compares against its committed file, through the shared
-/// runner from a [`fresh_database`]; publishes the record under `directory`
-/// and reads it back with its path.
+/// when `qualify` holds, its declaration trimmed to measured step `step`,
+/// the criteria judging it narrowed to it, and its references, compared
+/// against `baselines` as a CLI run compares against its committed file,
+/// through the shared runner from a [`fresh_database`]; publishes the
+/// record under `directory` and reads it back with its path.
 ///
 /// # Panics
 ///
@@ -782,9 +782,10 @@ async fn judged(
         "{step} is not declared"
     );
     declaration.steps.retain(|declared| declared.id == step);
-    declaration
-        .criteria
-        .retain(|criterion| criterion.steps.iter().all(|judged| judged == step));
+    declaration.criteria.retain_mut(|criterion| {
+        criterion.steps.retain(|judged| judged == step);
+        !criterion.steps.is_empty()
+    });
     declaration
         .references
         .retain(|reference| reference.step == step);

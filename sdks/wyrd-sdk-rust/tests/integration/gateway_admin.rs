@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use wyrd_ai::cli;
-use wyrd_ai::gateway::{
+use wyrd_ai::gateway_admin::{
     CredentialBindingName, DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite,
     GatewayOperation, GatewayPayloadField, ModelId, ProviderAdapter, ProviderAuth,
     ProviderCredentialName, ProviderCredentialState, ProviderCredentialView,

@@ -14,7 +14,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::BifrostOptions;
 use wyrd_ai::cards::{CardRef, DeclarationReceipt};
 use wyrd_ai::cli;
-use wyrd_ai::gateway::{
+use wyrd_ai::gateway_admin::{
     DeploymentAccess, GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayOperation,
     ProviderAdapter, ProviderAuth, ProviderAuthHeader, ProviderCredentialName,
     ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,

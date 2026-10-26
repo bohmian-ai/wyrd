@@ -19,7 +19,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::auth::Principals;
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cards::{CardKind, CardRef, CardSelector, Cards, DeclarationReceipt};
-use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
+use wyrd_ai::gateway_admin::{GatewayCaptureMode, GatewayCapturePolicyWrite};
 use wyrd_ai::state::WyrdState;
 use wyrd_ai::verify::{Execution, File, Input, Inputs, Submission};
 use wyrd_ai::{

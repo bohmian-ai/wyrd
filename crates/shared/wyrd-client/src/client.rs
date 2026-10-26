@@ -618,7 +618,7 @@ mod tests {
     use crate::auth::AuthMiddleware;
     use crate::cards::Cards;
     use crate::config::{ClientConfig, TokenCacheMode};
-    use crate::gateway::Gateway;
+    use crate::gateway_admin::Gateway;
     use crate::operator_connections::OperatorConnections;
     use crate::platform::Platform;
     use crate::principals::Principals;

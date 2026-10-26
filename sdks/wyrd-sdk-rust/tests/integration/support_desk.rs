@@ -11,7 +11,7 @@ use wyrd_ai::bifrost::BifrostOptions;
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_ai::gateway::{
+use wyrd_ai::gateway_admin::{
     DeploymentAccess, GatewayOperation, ProviderAdapter, ProviderAuth, ProviderDeployment,
     ProviderDeploymentName,
 };

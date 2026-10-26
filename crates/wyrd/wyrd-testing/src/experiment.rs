@@ -243,6 +243,11 @@ pub struct Prepass {
     pub exit_code: u8,
     /// Where its record and timing evidence live.
     pub records: String,
+    /// The earlier smoke PASS record of the same clean commit, experiment
+    /// and selection that stood in for running the smoke again, or `None`
+    /// when this prepass ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused: Option<String>,
 }
 
 /// The step parameter that declares a full run's longer repetition
@@ -3208,11 +3213,20 @@ impl Record {
             );
         }
         if let Some(prepass) = &self.prepass {
-            let _ = writeln!(
-                out,
-                "smoke prepass: exit {} in {:.1}s of its {}s budget, outside this run's clock; evidence under {}\n",
-                prepass.exit_code, prepass.elapsed_seconds, prepass.budget_seconds, prepass.records
-            );
+            let _ = match &prepass.reused {
+                Some(record) => writeln!(
+                    out,
+                    "smoke prepass: reused the same-commit smoke PASS {record}\n"
+                ),
+                None => writeln!(
+                    out,
+                    "smoke prepass: exit {} in {:.1}s of its {}s budget, outside this run's clock; evidence under {}\n",
+                    prepass.exit_code,
+                    prepass.elapsed_seconds,
+                    prepass.budget_seconds,
+                    prepass.records
+                ),
+            };
         }
         if let Some(method) = self
             .controls
@@ -6328,6 +6342,7 @@ limitations = "excluded"
             elapsed_seconds: 42.0,
             exit_code,
             records: "target/benchmarks/smoke/verification/direct-verify".to_owned(),
+            reused: None,
         };
         let mut failed = declaration();
         failed.prepass = Some(prepass(2));

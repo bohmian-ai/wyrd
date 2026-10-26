@@ -1,10 +1,14 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 11
+revision: 12
 status: approved
 ---
 
 # Benchmarks as experiments
+
+Revision 12 removes the sampled-client `traceparent` driver option
+(`--client-trace-ratio`, formerly REQ-022) and its tenant-recording comparison.
+The maintainer directed and approved the removal on 2026-10-26.
 
 Revision 11 applies five maintainer decisions from TASK-005's real runs: drop
 `writes-hot`, make each L1 experiment command finish within 5 minutes, bring
@@ -825,19 +829,9 @@ under the normal configuration. References are qualified only after every L1
 limit passes; a limit that still misses blocks qualification instead of being
 relaxed or recorded as accepted.
 
-**REQ-022 — Sampled-client trace option.** The benchmark driver accepts
-`--client-trace-ratio <f>`, validated in [0,1], default 0. On that fraction of
-requests, chosen deterministically from the run seed, it sends a W3C
-`traceparent` with the sampled flag set, exercising tenant trace recording
-through the production path. A nonzero ratio is recorded as a control and
-makes the record a diagnostic configuration, ineligible as a reference. It
-never changes operator export (REQ-017).
-
 **REQ-020 — Qualification and discoverability.** Before baseline promotion,
 measure the same clean build with operator endpoint absent versus ordinary
-1% export, and separately with sampled-client tenant recording using
-`--client-trace-ratio` (REQ-022). Use identical
-workload/fixtures and record the configurations; report the observed CPU,
+1% export. Use identical workload/fixtures and record the configurations; report the observed CPU,
 latency and throughput difference without subtracting it. Run each engine's
 full L1 separately and report after each. Establish compatible references and
 prove injected/controlled regressions in latency, throughput/core and CPU/work
@@ -934,7 +928,7 @@ MCP API that would require a new product-surface projection.
 | AC-011 — Operator changes logging/sampling or loses its backend | Production-initialized tests prove independent log/operator policies and SDK overflow/shutdown loss reporting and accurate failed-export-batch counters; real authenticated client → gateway → tenant timeline journeys retain catalog IDs/links at ratio zero/no endpoint, with tenant-negative readback. All shipped language surfaces retain their existing journeys at integrated review. | REQ-017, REQ-018, INV-010 |
 | AC-012 — Engineer smoke-tests the actual benchmark without trace export | Real release commands exercise every default L1/L2 plan for all engines, including all three Bifrost L1 experiments, through actual loading/publication, selected steps/phases, measured stop/drain, exact outcome reconciliation, record/full timing evidence and report. Read the record and regenerate its report; verify retained histograms reproduce recorded readings. Accurately recorded production errors, dropped/refused calls, capture shedding, wrong answers and target misses do not fail smoke. Missing measurements/counters, mismatched populations, zero CPU, missing applicable scan facts and failed evidence/report handling are plumbing failures. Production criteria remain explicitly inapplicable with observed values retained; smoke PASS claims plumbing only. A separate deterministic full-mode test proves a controlled criterion miss survives judgment, record/readback, report and exit 1, and invalidity retains precedence/exit 2. Selected-step and automatic isolated prepass proof remains; invalid plumbing stops full preparation. Mode round-trips, output stays outside history and smoke cannot become a baseline after relocation. Deterministic interval/quantization/overflow/reset/drain proof and bounded known-delay, known-CPU and instrumentation-cost calibration use the actual measurement path with independent references and justified tolerances, without synthetic host load or a side runner. Normal readout absence, non-loopback refusal and snapshot privacy remain. | REQ-007, REQ-008, REQ-013, REQ-015, INV-006, INV-010 |
 | AC-014 — Maintainer checks the engine limits | Clean full L1 on the reference host passes Verification 64-client latency, Bifrost hot and Parquet point-lookup p99 <5 ms at 64 clients, the OTLP spans ≥30 MiB/CPU-s floor and Gateway <500 µs overhead at 64 clients, with unchanged limits, exact results and existing tenancy/durability journeys green. Before/after records and the diagnostic run that located each cost. | REQ-021, INV-001, INV-002 |
-| AC-013 — Maintainer establishes regression evidence | Only after AC-014 passes, two clean full suites establish reviewed same-method references; latency/throughput-core/CPU-work regression cases fail correctly. Same-build export and `--client-trace-ratio` tenant-recording comparisons quantify overhead, and a nonzero ratio record is refused as a reference; diagnostic traces and profile reproduce the documented investigation workflow without becoming references. | REQ-011, REQ-012, REQ-019, REQ-020, REQ-022 |
+| AC-013 — Maintainer establishes regression evidence | Only after AC-014 passes, two clean full suites establish reviewed same-method references; latency/throughput-core/CPU-work regression cases fail correctly. The same-build export comparison quantifies overhead; diagnostic traces and profile reproduce the documented investigation workflow without becoming references. | REQ-011, REQ-012, REQ-019, REQ-020 |
 
 Implementation planning must select exact focused commands and evidence under
 these decisions; a proposed task is not a claim that its tests already pass.
@@ -949,7 +943,7 @@ proposal. The proposed dependency order is:
 3. [TASK-005: complete regression suite](tasks/TASK-005-regression-matrix.md).
 
 Revision 11 adds one revision task after TASK-005. It drops `writes-hot`,
-applies the L1 turnaround, smoke reuse and `--client-trace-ratio` changes,
+applies the L1 turnaround and smoke reuse changes,
 makes the REQ-021 optimizations, and runs only L1: the limit checks, the
 telemetry comparison and reference qualification. The contended L2
 calibration and the full L2 runs follow in a later task; the revision task
@@ -1087,6 +1081,10 @@ not a reason to invent a reference or weaken coverage.
   and optimize the engines in this change (REQ-021); calibrate L2 under
   contention; add `--client-trace-ratio` (REQ-022). Approved by the
   maintainer on 2026-10-26.
+- Revision 12 — 2026-10-26: the maintainer removed `--client-trace-ratio`
+  (REQ-022) and the sampled-client tenant-recording comparison from REQ-020
+  and AC-013; that cost is not needed now. Approved by the maintainer's
+  direction on 2026-10-26.
 
 Authority (plain repository references):
 

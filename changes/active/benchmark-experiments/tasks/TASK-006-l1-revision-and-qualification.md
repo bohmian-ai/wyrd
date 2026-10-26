@@ -4,7 +4,7 @@ kind: implementation
 status: proposed
 spec: SPEC-benchmark-experiments
 spec_revision: 11
-requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, INV-009, INV-010, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-008, AC-009, AC-010, AC-011, AC-012, AC-013, AC-014]
+requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, INV-009, INV-010, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-008, AC-009, AC-010, AC-011, AC-012, AC-013, AC-014]
 depends_on: [TASK-005]
 ---
 
@@ -15,7 +15,7 @@ depends_on: [TASK-005]
 An engineer can run any one L1 experiment within five minutes and obtain a
 valid comparison of server latency, CPU/work and throughput/core. This task
 removes the unbounded hot-write experiment, reduces L1 to its useful unloaded
-and 64-client cases, implements sampled-client tracing for diagnosis, and fixes
+and 64-client cases, and fixes
 the measured engine costs until the existing limits pass on the reference host.
 Only then can two clean suites establish reviewed references.
 
@@ -60,12 +60,6 @@ measurement and regression proofs needed to trust those results.
   A dirty tree, different selection/commit/experiment, absent or INVALID smoke
   requires the normal isolated prepass. A failed prepass blocks full preparation.
   Smoke still tests plumbing and records production failures without judging them.
-- Add `--client-trace-ratio <f>` with finite values in [0,1], default 0,
-  deterministic request selection from the run seed and sampled W3C
-  `traceparent`. Apply it at actual outbound request boundaries, including SDK,
-  OTLP and Gateway HTTP paths. Record the control; nonzero runs are diagnostic
-  and reference-ineligible. Preserve independent operator export and tenant
-  authorization, scrubbing, linkage and nonblocking delivery.
 - Fold in TASK-005 Scenario 2a audit findings 1–3 and 5: remove unread registry
   series and driver timers, gate benchmark-only work, and correct label-activation
   comments. Keep shared production clocks, metrics and correctness timers.
@@ -100,8 +94,7 @@ new runner, telemetry provider, benchmark CI/gate wiring or baseline migration.
    records as history and identify which evidence source changes invalidate.
 2. Close commands, declarations, docs and test consumers over the reduced L1
    matrix, timings and smoke reuse, using the shared runner.
-3. Add deterministic sampled-client context through existing request transports
-   and reference eligibility; prove real tenant recording and negative access.
+3. Removed by spec revision 12.
 4. Apply the bounded instrumentation audit and rerun affected integrity proof.
 5. Use TASK-005's traces/profiles to optimize each existing engine owner; keep
    correctness/tenancy/durability regression proof green and diagnose remaining
@@ -152,29 +145,9 @@ negative paths and smoke production-criterion inapplicability. Run V3 and V1/V2.
 
 **REFACTOR.** Reuse persisted smoke records; no new cache, index or lifecycle owner.
 
-### Scenario 3 — Sampled-client requests exercise authorized tenant tracing
+### Scenario 3 — Removed
 
-**Behavior.** Missing ratio equals 0; 0 sends no sampled context, 1 samples all
-requests, and an intermediate ratio yields reproducible choices for a fixed
-seed. Missing values, malformed/nonfinite and out-of-range inputs refuse before
-startup. SDK HTTP/gRPC, direct OTLP and Gateway requests carry valid sampled
-context when selected. Tenant traces remain authorized and linked when operator
-export is absent; another tenant cannot read them. Nonzero records remain
-reference-ineligible after persistence/readback or relocation; operator policy
-never changes as a side effect.
-
-**RED.** Planned [V4](#v4--sampled-client-controls-and-tenant-journey) covers parsing,
-seed determinism, actual outgoing headers and the real authenticated request →
-tenant readback/negative journey. Extend V5's existing qualification exclusions
-for nonzero ratios. Existing transports support caller context, but the driver
-cannot select or declare sampled requests.
-
-**GREEN.** Extend shared driver controls and existing transport context paths,
-including raw HTTP/OTLP consumers. Retain benchmark case/phase headers. Persist
-the ratio and diagnostic status; run V4/V5 and prior scenarios.
-
-**REFACTOR.** Reuse caller trace context and the production tracer; no alternate
-exporter, tenant recording implementation or SDK API redesign.
+Spec revision 12 removed `--client-trace-ratio`; no work remains here.
 
 ### Scenario 4 — Instrumentation keeps consumed observations with a cheap disabled path
 
@@ -279,10 +252,9 @@ no capture disabling, smaller payload, new queue or measurement-boundary change.
 | REQ-001/003/008/010/016; AC-001/009 | Existing plans/dispatch/mise/docs: V1/V2 and V8/V9 show three Bifrost experiments (18 measured cases), two Verification cases, six Gateway cases, only c1/c64, declared durations/exceptions and ≤300 s per experiment. Removed commands refuse; no active writes-hot coverage or alias remains. |
 | REQ-002/004/005/006/007/013/014; INV-004/005/007/008/009; AC-004/005/006/012 (L1 portions) | Shared runner/timing/recorder: V2/V5/V7 and real L1 readback retain sample floors, exact populations, per-repetition operands and interval bounds, portable disjoint accounting, partial evidence and INVALID precedence. Build/host-load contamination, ambiguous histograms or budget overrun cannot PASS. |
 | REQ-008/015; AC-008/012 (L1) | Existing prepass/records: V3 plus V8/V9 prove eligible smoke reuse, mismatches rerunning, failure before full preparation, isolated state and report linkage; smoke production failures are observations, not performance qualification. |
-| REQ-017/018/022; INV-006/010; AC-011/013 (affected tracing portions) | Existing driver/transports/tenant trace owner: V4/V5 prove ratio validation/determinism, sampled headers on each transport, actual tenant recording/negative readback, operator independence and nonzero reference exclusion. |
 | REQ-007/015; TASK-005 audit findings 1–3/5 | Existing timing and driver owners: V6/V7/V8 plus updated audit inventory prove consumed measurements survive, disabled benchmark work is gated, unread hooks/timers are removed and comments describe labeling at span opening. Finding 4 stays deferred with L2. |
 | REQ-021; INV-001/002/003; AC-010/014 | Existing engine owners: Scenarios 5–8, V6–V9 show all unchanged limits pass with exact results, authentication, tenancy, nonblocking audit, admission and durable ACK/capture semantics preserved; diagnostic records locate each cost. No missing limit or invalid run substitutes for a passing result. |
-| REQ-011/012/019/020; AC-002/003/013 (L1) | Existing judgment/reference owner: V5/V7/V9/V10 establish two clean complete same-method suites, explicit reviewed references, normal L1 against them, independent regression dimensions, noise/exact-boundary rules and matched three-configuration telemetry costs without subtraction. Failed, invalid, partial, dirty, smoke or diagnostic records never qualify. |
+| REQ-011/012/019/020; AC-002/003/013 (L1) | Existing judgment/reference owner: V5/V7/V9/V10 establish two clean complete same-method suites, explicit reviewed references, normal L1 against them, independent regression dimensions, noise/exact-boundary rules and matched two-configuration telemetry costs without subtraction. Failed, invalid, partial, dirty, smoke or diagnostic records never qualify. |
 
 ## Implementation Reference
 
@@ -367,20 +339,9 @@ assert recorded controls, overrun cancellation and INVALID evidence, not host lo
 mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=tests::l1_reuses_only_matching_clean_smoke_pass)'
 ```
 
-### V4 — Sampled-client controls and tenant journey
+### V4 — Removed
 
-Planned focused parsing/header/determinism test:
-
-```bash
-mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(=tests::client_trace_ratio_preserves_transport_and_policy)'
-```
-
-Planned real authenticated tenant trace journey, using the existing release-server
-Postgres setup; cover SDK, OTLP and Gateway outbound paths and negative readback:
-
-```bash
-RUSTFLAGS='-C force-frame-pointers=yes' CARGO_PROFILE_RELEASE_DEBUG=line-tables-only mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked --release --target-dir target/profiling -p wyrd-testing --bin capacity --run-ignored=only --no-capture -E 'test(=tests::pg_tests::sampled_client_requests_retain_authorized_tenant_traces)'
-```
+Removed with Scenario 3 by spec revision 12.
 
 ### V5 — Existing qualification, arithmetic and history regression checks
 
@@ -388,7 +349,7 @@ RUSTFLAGS='-C force-frame-pointers=yes' CARGO_PROFILE_RELEASE_DEBUG=line-tables-
 mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::reference_qualification_rejects_partial_and_diagnostic_runs) | test(=experiment::tests::compatible_histogram_baselines_judge_all_regression_dimensions) | test(=experiment::tests::criteria_distinguish_regression_noise_and_invalidity) | test(=experiment::tests::baseline_selection_preserves_eligibility) | test(=experiment::tests::metrics_preserve_process_scope_and_units)'
 ```
 
-Extend exclusions for ratio >0. Rerun after reviewed reference TOML changes and
+Rerun after reviewed reference TOML changes and
 update exact expected counts/identities without rewriting historical provenance.
 
 ### V6 — Instrumentation and engine regression tests
@@ -442,7 +403,7 @@ reuse of earlier smoke records.
 ### V9 — Limits, telemetry costs, reference qualification and normal L1
 
 On the same quiet reference Linux x86_64 host, final clean source and ordinary
-telemetry (endpoint absent, ratio 0, unprofiled), run the following **twice** as
+telemetry (endpoint absent, unprofiled), run the following **twice** as
 two complete qualification suites, sequentially. Report each engine immediately.
 Each command must reuse its matching V8 smoke PASS and finish within 300 s.
 
@@ -462,16 +423,15 @@ records for each optimization. Only caller-authorized commits may establish a
 clean candidate; do not automatically stage/commit records or source.
 
 Before promotion, compare the same clean build/workload/fixtures with (a)
-operator endpoint absent, (b) ordinary 1% operator export, and separately (c)
-sampled-client tenant recording, using the owning L1 command above with
-`--client-trace-ratio 0.01`. For the export configuration set the existing
+operator endpoint absent and (b) ordinary 1% operator export, using the owning
+L1 command above. For the export configuration set the existing
 `WYRD_OTLP_ENDPOINT` to the local collector and
 `WYRD_OTLP_SAMPLE_RATIO=0.01`, as in TASK-005's Scenario 2a diagnostic
-commands; keep endpoint absent for the separate tenant-recording comparison.
+commands.
 Record exact expanded invocations, seed, configuration and raw paths when run.
 Use matched cases for every engine; compare CPU/work, latency and throughput
 without subtraction and report repetition spread and observed recording/export.
-Diagnostic/profiled/nonzero-ratio records cannot be any of the two ordinary
+Diagnostic/profiled records cannot be any of the two ordinary
 qualification suites. Rerun profiling only where changed code invalidates the
 existing investigation; missing profiling never fabricates CPU evidence.
 
@@ -507,7 +467,7 @@ mise exec -- git diff --check
 ```
 
 Inspect command/docs/coverage consumers for active removed-experiment references,
-old client counts/budgets, smoke reuse, trace-ratio usage, qualification and
+old client counts/budgets, smoke reuse, qualification and
 recovery instructions. Preserve historical mentions as evidence. Inspect portable
 accounting/commands for all three supported platforms; real macOS/arm64 runs are
 optional, not a substitute for Linux evidence. Add only owner lanes justified
@@ -530,9 +490,8 @@ suite. Record commands once and link scenario evidence here.
 
 ## Authority Links
 
-- [Spec revision 11, approved 2026-10-26](../spec.md), especially
-  Delivery and supersession, fast L1, comparable baselines, engine limits and
-  sampled-client tracing. Current user direction limits execution to L1.
+- [Spec revision 12, approved 2026-10-26](../spec.md), especially
+  Delivery and supersession, fast L1, comparable baselines and engine limits. Current user direction limits execution to L1.
 - [TASK-005 evidence](TASK-005-regression-matrix.md): V6–V9, Scenario 2a case
   mapping/instrumentation audit, spec revision request and maintainer decisions.
 - [Spec-driven development](../../../spec-driven-development.md) and

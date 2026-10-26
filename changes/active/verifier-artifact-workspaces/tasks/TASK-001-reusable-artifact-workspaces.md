@@ -551,3 +551,66 @@ material blocker.
 - [Wyrd design](../../../../architecture/wyrd-design.md)
 - [Security posture](../../../../architecture/wyrd-security-posture.md)
 - [Repository rules](../../../../AGENTS.md)
+
+## Implementation Evidence
+
+Commits: `cc88623ab` (shared extractor), `30dcd5204` (selected mounts, raw
+`fs.*`, `fs.extract`, check tools), `9e40b04a8` (upload helper, CLI, SDK
+projections, caller migration), `37fb21cc2`/`db2ece461`/`ef1e37348`
+(Python, Rust, TypeScript journeys), `a2a410c1b` (owner docs), `45040c65d`
+(example migration, PyO3 argument limit).
+
+Python journeys run as
+`mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m integration tests/integration/test_verifier_building_blocks.py::<name>'`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-001–003; AC-001 | `crates/shared/wyrd-loader/src/upload.rs` (`ArtifactUpload::prepare` over `manifest_of`), `wyrd-client` `Cards::upload_artifact`/`list_artifacts`, `wyrd-cli` `artifact upload`/`files`, Python/TS projections, `ArtifactSpec::validate` | `test_artifact_upload_preserves_files_and_versions` (basename, nested bytes via pull, `card.json` kept, active phase, unchanged = same ref, changed pin → 409, bump → 1.0.1, blank kind/symlink/missing/empty refused with no Card); `upload::tests::*`; `artifact::tests::artifact_kind_must_name_something` | PASS |
+| REQ-009–010, REQ-012; AC-008 | `ArtifactUpload::prepare` extraction branch, `metadata.extraction` report; one parser in `wyrd-loader/src/extract.rs` used by server and clients | `test_artifact_upload_extracts_before_registration` (generated paths, report incl. skipped, source untouched, pulled JSON equals extractor output, corrupt PDF and output collision fail with no Card, real CLI upload/files and a conflicting raw re-upload); `cargo nextest run --offline -p wyrd-loader` (51) | PASS |
+| REQ-004–005; INV-001; AC-002 | `WorkspaceSource`/`ArtifactSelection` (`wyrd-spec`), engine `attach`/`mount`, `EvidenceReader::select` | `test_artifact_workspace_selects_files_and_directories` (file, directory, raw PDF, opaque bin; sibling `docs-old` and unselected file absent; 1.0.1 never retargets the pin); handbook journeys reuse one pinned version from two Verifiers; `vala-verify` engine tests | PASS |
+| REQ-007–008; AC-006, AC-010 | `Workspace::read`/`search` serve `wyrd_loader::lines`; `evidence.rs` `located` adds raw lines | `test_agent_file_tools_read_without_extraction` (raw JSON lines, `next` pagination resumes, directory/binary refused, PDF bytes read raw, search skips binary); `workspace_reads_lines_and_extracts_on_request`; hosted tests (23) | PASS |
+| REQ-006, REQ-011; AC-009 | `BuiltinTool::FsExtract`, `Workspace::extract` (`persist_noclobber` under `/work`), check-position tools in `vala-verify` | `test_agent_extract_tool_writes_explicit_output` (real JSON, sources and version, overwrite/malformed/unsupported/directory/`/inputs`/`..` refused, only one `/work` file); `test_policy_review_runs_every_action_and_check_kind` in Python, Rust and TS | PASS |
+| REQ-013; AC-011 | `Search` (regex, case, path scope, glob via `glob::Pattern`) | `test_agent_file_search_supports_regex_across_files` (literal/regex/case, metacharacters, file and subtree scope, basename and recursive glob, invalid regex/glob/scope, no match, hidden, binary skipped, truncated, scratch hit with empty sources, then `fs.read`); `workspace_search_matches_lines` | PASS |
+| AC-003–004 | `fixtures/cards/uploaded_artifacts/*`, mock `handbook_verdict` that reads the real tool message | `test_uploaded_artifacts_are_reused_by_service_judges`; `verifier_building_blocks::uploaded_artifacts_are_reused_by_service_judges` (Rust, `-P journey`); TS `uploaded artifacts are reused by service judges`. The marker reaches the model only through `fs.read`; both judges cite an `attachment_<n>` `lines` locator; only `fs_read` is offered and nothing is extracted on the server | PASS |
+| INV-002–003; AC-005 | Existing admission, inventory, tool grants and digest checks applied to the new paths | `test_artifact_workspace_refusals_preserve_authority` (wrong kind, missing Card, `/work` destination, overlapping mounts, unknown field, other tenant refused at declaration or read; a missing prefix refused before any model call; ungranted declared tools denied; undeclared tool fails the step; the protected line never reaches the model); `pg_hosted_artifacts::*` (8) | PASS, with limits below |
+| INV-004; AC-007 | Thin projections over `ArtifactUpload`; `gen_ts_types.py` `SUPPORTED_KINDS` += Artifact; regenerated `card-types.ts`/`index.d.ts`; `.pyi` stubs incl. `fs.extract` | `codegen:check`, `ts:napi:check`, `ts:typecheck`, `py:typecheck`, `fmt:check`, `lints`, `py:format:check`, `py:lints`, `ts:format:check`, `ts:lints`, `check:deps`, `docs:check`, `git diff --check`; `test_support_desk.py` (3) after the example migration | PASS |
+
+Material limits:
+- These journeys were written after the production code, so each was GREEN on
+  its first valid run. There is no RED-first transcript; the failures seen
+  were test-side and are diagnosed below.
+- No journey lowers the server's file limit to show that an unselected
+  oversized file is never staged. The selection test proves only that such a
+  file is not mounted. The combined-limit admission is covered by
+  `pg_hosted_artifacts::artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit`.
+- Opaque mounted bytes are not exercised through `code.run`.
+- The multi-turn search sequence is search, extract, search, read; it has no
+  `bifrost.query` turn.
+- Audit rows and cleanup are not asserted anew; they still run through the
+  existing `audit::authorize` and workspace owners.
+- Dependency: `glob = "0.3"` was already in `Cargo.lock` transitively, with no
+  dependencies of its own. Its `Pattern` with `require_literal_separator`
+  gives standard `*`/`**` semantics with no hand-written translator. Moving
+  `tempfile` into `wyrd-loader`'s dependencies gives preparation a scratch
+  directory that never writes the source tree. `check:deps` passes.
+- Non-goals stayed excluded: no new endpoint, receipt, cache, result field,
+  shell or native grep, or server-side upload transformation.
+
+Diagnoses:
+- **Symptom:** the handbook judge returned no Verdict, so the check was
+  inconclusive. **Evidence:** the recorded tool message was
+  `WYRD_PERMISSION_403_DENIED_RBAC … lacks Tool/Invoke`. **Cause:** the
+  journey ran as the Service runtime key, which holds only `workload`. Tool
+  calls need an explicit `tool:invoke` grant (`tools.rs` `Invocation::call`).
+  **Fix site:** the journey setup, which now acts as a key granted
+  `{"tool": "fs.read"}` as the tool-grant journeys do. Product authorization
+  is unchanged.
+- **Symptom:** a reading-refusal assertion failed on `policy.pdf`.
+  **Evidence:** `fs.read` returned two `lines` units. **Cause:** the corrupt
+  fixture is valid UTF-8, and raw reads serve any UTF-8 file without parsing
+  it, as REQ-007 requires. **Fix site:** the assertion now expects the raw
+  lines.
+- **Symptom:** `mise run lints` reported `too_many_arguments` on the PyO3
+  `upload_artifact`. **Cause:** `&self` plus `py` plus six parameters is
+  eight arguments. **Fix site:** the binding takes `slf: &Bound<'_, Self>`,
+  with no `#[allow]`.

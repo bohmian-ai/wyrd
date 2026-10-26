@@ -168,6 +168,11 @@ impl StagedRow {
     ///
     /// [`Self::new`] checked every cell against its field, so a column's
     /// cells are all of the kind its first row's is.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `rows` is empty or a row has no cell at `index`; callers
+    /// pass a non-empty run of one schema's rows.
     fn column(rows: &[Self], index: usize, data_type: &DataType) -> ArrayRef {
         let cells = rows.iter().map(|row| &row.cells[index]);
         match &rows[0].cells[index] {

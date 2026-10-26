@@ -696,6 +696,10 @@ mod tests {
     }
 
     /// The one-row batch `row` builds into.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the row does not build.
     fn project(row: &ResultRow) -> RecordBatch {
         StagedRow::project(std::slice::from_ref(&row.row)).expect("row projects")
     }

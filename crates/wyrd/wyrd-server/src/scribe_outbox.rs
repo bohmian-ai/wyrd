@@ -268,13 +268,14 @@ impl Part {
     /// The one batch holding `parts`' rows in order, which share one schema.
     ///
     /// A run of staged rows is built straight into one dense batch, each
-    /// column allocated once; a lone batch is shared, and only a mix is
-    /// concatenated.
+    /// column allocated once; a lone batch is shared, and several batches
+    /// are concatenated. Staged-row and batch destinations never overlap, so
+    /// a frame never mixes the two.
     ///
     /// # Errors
     ///
-    /// Returns the Arrow error when the rows cannot be built or
-    /// concatenated.
+    /// Returns the Arrow error when the rows cannot be built, the batches
+    /// cannot be concatenated, or staged rows are mixed with batches.
     fn dense(parts: &[Self]) -> Result<RecordBatch, arrow::error::ArrowError> {
         let staged = parts
             .iter()
@@ -292,7 +293,9 @@ impl Part {
         let batches = parts
             .iter()
             .map(|part| match part {
-                Self::Row(row) => StagedRow::project(std::slice::from_ref(row)),
+                Self::Row(_) => Err(arrow::error::ArrowError::InvalidArgumentError(
+                    "a frame mixes staged rows with batches".to_owned(),
+                )),
                 Self::Batch(batch) => Ok(batch.clone()),
             })
             .collect::<Result<Vec<_>, _>>()?;

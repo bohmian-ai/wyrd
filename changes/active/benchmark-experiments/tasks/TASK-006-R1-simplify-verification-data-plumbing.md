@@ -1493,7 +1493,7 @@ runtime proof, benchmark execution or performance PASS is claimed here.
 
 ### Approved revision execution evidence — Steps 1–5
 
-Commits: `e39c9d4e5` (Step 1), `cd26d66d3` (design owners), `c5d0ed5ad`
+Commits: `b47082554` (Step 1), `cd26d66d3` (design owners), `c5d0ed5ad`
 (Steps 2–3; also carries the maintainer's earlier uncommitted
 `tables/audit/projection.rs` detail edit), `f50fdd9fb` (Step 4). Shards 1,
 writer/lane/frame/outbox bounds, fail-fast admission, frame identity and the
@@ -1503,15 +1503,18 @@ three tables are unchanged.
 |---|---|---|---|
 | Step 1 / P1 validation-only Variant | `wyrd-queue/src/variant.rs::EncodedVariant::validate_bytes`; `tables::validate_variant_values` delegates to it | `variant::tests::validation_only_matches_owned_validation`; `tables::` 47/47; `wyrd-queue --lib` 61/61 | PASS |
 | Step 2 / P2 dense producer batches | `tables/staged.rs::{Cell, StagedRow}` (`project` with exactly sized builders); `stage_audit_event`; `verification/results.rs::ResultRow`; `scribe_outbox.rs::Part::dense` builds one batch per destination at drain | `scribe_outbox::tests::dense_projection_preserves_records_and_attribution`; `tables::staged::tests::staged_rows_project_into_one_dense_batch`; `scribe_outbox::tests::staged_writes_charge_their_owned_memory` | PASS |
-| Step 3 / P3 local canonical, peer IPC | `FramePayload::{Ipc, Rows}`; local route submits `IngressPayload::Canonical` with IPC-derived `batch_id` and wire bytes; peer route keeps IPC validation (`grpc/capture_peer.rs`) | `scribe_outbox::tests::local_canonical_and_peer_ipc_preserve_frames_and_replay` (same batch-id→rows map on both routes, lost-ACK replay); `scribe::tests::scribe_persistence_path::canonical_nested_batches_share_one_managed_wal_path` extended with dense audit rows canonical and as IPC, and a corrupt Variant stream refused; `gate::attribution::tests::batch_card_uids_match_the_encoded_stream` | PASS |
+| Step 3 / P3 local canonical, peer IPC | `FramePayload::{Ipc, Rows}`; local route submits `IngressPayload::Canonical` with IPC-derived `batch_id` and wire bytes; peer route keeps IPC validation (`grpc/capture_peer.rs`) | `scribe_outbox::tests::local_canonical_and_peer_ipc_preserve_frames_and_replay` (same batch-id→rows map on both routes, lost-ACK replay); `scribe::scribe_persistence_path::canonical_nested_batches_share_one_managed_wal_path` extended with dense audit rows canonical and as IPC, and a corrupt Variant stream refused; `gate::attribution::tests::batch_card_uids_match_the_encoded_stream` | PASS |
 | Step 4 / P4 gathered sort | `scribe/parquet_writer.rs::ParquetBatchEncoder::prepare_sorted_candidate`: key-only `concat` + `lexsort_to_indices` + `interleave_record_batch`; one `Persistence` lease for keys, positions and output before building; `sort_batch` removed, comparator kept as `sort_keys` | `gathered_sort_matches_concatenated_reference` (4 source batches, equal keys, nulls in two keys, desc/nulls-first, hour boundary, Variant + list payloads, five candidate ranges, explicit expected keys); `gathered_sort_respects_persistence_admission` (RED: fails with the reservation removed; GREEN); existing 3 + `sort_batch_uses_one_key_for_every_table` 6/6; `scribe::` lib 379/379 with Postgres; `wyrd-testing --test scribe` `cross_shard` + `source_boundary` 2/2 | PASS |
 | Carry-forward V1/V6/V7, RV1/RV2 | — | `wyrd-server --features test-support --lib` 580/580; V6 68/68; V1+V7 `wyrd-ai` 5/5; `vala-bifrost-redux` `tables::|audit|execution_lanes` 91; `wyrd-runtime` RV selectors 4/4 | PASS |
 | Boundaries | — | `fmt`, `lints`, `docs:check`, `check:deps`, `check:tenant-isolation`, `git diff --check` exit 0 | PASS |
 | Step 5 / P5 all L1 criteria | — | clean records on `f50fdd9fb` below | FAIL |
 
 Test replacement mapping: `a_one_row_text_column_holds_about_its_value`
-(sized one-row text) → `staged_rows_project_into_one_dense_batch` (asserts
-exactly sized builder capacity) and `StagedRow::owned_bytes`;
+(verification one-row text sized to its value) and the audit
+`text_columns_hold_about_their_values` (every audit text column under 256 B)
+→ `staged_rows_project_into_one_dense_batch` (asserts a projected text
+buffer under 256 B), with both producers now building text through
+`StagedRow::project`, and `StagedRow::owned_bytes`;
 `shared_buffer_charges_preserve_owned_memory` (charge equals owned bytes, large
 output charged above its value) → `staged_writes_charge_their_owned_memory`
 (same two assertions over staged rows). No assertion was weakened.
@@ -1557,3 +1560,12 @@ Commands: P1–P4 exact selectors as listed in the reuse map;
 `mise run bench:l1:verification` (twice), `bench:l1:gateway`,
 `bench:l1:bifrost:writes`, `bench:l1:bifrost:hot`, `bench:l1:bifrost:parquet`,
 sequential with no overlapping builds.
+
+Review `TASK-006-R1-batch-once-c9794a0b0` remediation: FIND-006R1B-2
+`Part::dense` refuses a frame mixing staged rows and batches instead of
+rebuilding one-row batches; FIND-006R1B-3 `# Panics` added to
+`StagedRow::column` and the `results.rs` test helper `project`;
+FIND-006R1B-4 corrected above. FIND-006R1B-1 (per-step profile, allocation
+and retained-memory evidence) remains open: profiled verification L1 runs on
+the candidate commits stop at the same `driver.saturated` smoke prepass, so
+they need the maintainer's P5 decision first.

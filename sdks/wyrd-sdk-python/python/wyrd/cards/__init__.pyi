@@ -1,3 +1,4 @@
+import builtins
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
@@ -556,7 +557,7 @@ class Cards:
         """
         ...
 
-    def list_artifacts(self, card_ref: CardRef) -> list[dict[str, object]]:
+    def list_artifacts(self, card_ref: CardRef) -> builtins.list[dict[str, object]]:
         """List the files a declared Card holds, from the server inventory.
 
         Args:

@@ -72,7 +72,7 @@ A step's result is `steps.<id>.output`.
 | `code` | `runtime` (`python`, default), `entrypoint`, `source`, `inputs` | The function's return value, as JSON |
 
 - `extract` reads `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, and `pptx`, choosing the extractor by format.
-- `agent` is a path such as `./reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference; a placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps paths under `/inputs/` to references. Tools are in [Agent tools and authorization](/reference/agent-tools-and-authorization/).
+- `agent` is a path such as `./reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference; a placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps paths under `/inputs/` to a reference such as `inputs.policy`, or to `{artifact: {card: {kind: Artifact, name, version}, path}}`, which mounts one file, a directory, or (without `path`) every file of an uploaded Artifact version, unchanged and pinned with the Verifier. Tools are in [Agent tools and authorization](/reference/agent-tools-and-authorization/).
 - `code` calls the function `entrypoint` with `inputs` as keyword arguments. `source` is `{inline: "<python>"}` or `{artifact: {card, path?}}`, where `card` names an Artifact Card.
 
 ## Requirements
@@ -91,7 +91,7 @@ A requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`.
 | --- | --- | --- |
 | `assert` | `path` or `each`, `operator`, `expected` | Comparing a value; `each` with `[*]` requires every item to pass |
 | `trace` | `on`, `span_selector`, `operator`, `expected` | Comparing values selected from trace spans |
-| `agent` | `agent`, `inputs` | An Agent with no workspace and no tool but `bifrost.query`, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema |
+| `agent` | `agent`, `inputs`, `workspace` | An Agent, with its declared tools and optional workspace as in a step, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema |
 | `code` | `runtime`, `source`, `entrypoint`, `inputs`, optional `response_format` | A Python function that returns a verdict |
 | `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline |
 
@@ -166,7 +166,7 @@ An `agent` or `code` check returns a verdict:
 | `{json_pointer: "/path"}` | JSON inputs and DOCX or XLSX extraction output |
 | `{region: {page, x, y, width, height}}` | A rectangle on a page, in page coordinates |
 
-A citation names the original slot, never an extract step. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/reference/extraction-output/#citations).
+A citation names the original slot, or the `attachment_<n>` slot a fixed workspace file reports in `sources`, never an extract step or `/work` file. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/reference/extraction-output/#citations).
 
 ### Custom data
 

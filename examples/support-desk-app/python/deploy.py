@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 
 from desk import BUNDLE, SERVICE
 

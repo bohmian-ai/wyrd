@@ -20,7 +20,7 @@ from wyrd.auth import Principals
 from wyrd.bifrost import AsyncBifrost, Bifrost, TableConfig
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.operators import OperatorConnections
 from wyrd.testing import WyrdTestServer
 

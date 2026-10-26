@@ -12,7 +12,7 @@ from typing import Any
 
 import openai
 import pytest
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.testing import WyrdTestServer
 
 from ..support import Receiver, client_of

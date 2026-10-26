@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 from wyrd import WyrdError
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway, ProviderDeployment
+from wyrd.gateway_admin import Gateway, ProviderDeployment
 from wyrd.testing import WyrdTestServer, cli
 
 pytestmark = pytest.mark.integration

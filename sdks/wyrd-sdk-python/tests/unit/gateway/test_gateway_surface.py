@@ -16,7 +16,7 @@ def test_gateway_offers_no_provider_credential_mutation():
     methods do not exist on the native class, so no dict a caller builds at
     runtime can reach a managed-secret write from Python.
     """
-    from wyrd.gateway import Gateway
+    from wyrd.gateway_admin import Gateway
 
     for name in MUTATIONS:
         assert not hasattr(Gateway, name), name
@@ -32,7 +32,7 @@ def test_gateway_invalid_body_raises_validation_without_echoing_it():
     """
     from wyrd import WyrdError
     from wyrd.client import WyrdClient
-    from wyrd.gateway import Gateway
+    from wyrd.gateway_admin import Gateway
 
     gateway = Gateway(WyrdClient(server_url="http://127.0.0.1:9", credential="unused"))
     with pytest.raises(WyrdError) as captured:

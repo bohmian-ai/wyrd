@@ -24,7 +24,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from wyrd import verify
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.otel import span_exporter
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer

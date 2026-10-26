@@ -11,7 +11,7 @@ mod cli;
 #[cfg(feature = "python")]
 mod client;
 #[cfg(feature = "python")]
-mod gateway;
+mod gateway_admin;
 #[cfg(feature = "python")]
 mod observe;
 #[cfg(feature = "python")]
@@ -109,10 +109,10 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&bifrost)?;
     register_submodule(py, "wyrd._wyrd.bifrost", &bifrost)?;
 
-    let gateway = PyModule::new(py, "gateway")?;
-    gateway::register_gateway(&gateway)?;
-    m.add_submodule(&gateway)?;
-    register_submodule(py, "wyrd._wyrd.gateway", &gateway)?;
+    let gateway_admin = PyModule::new(py, "gateway_admin")?;
+    gateway_admin::register_gateway_admin(&gateway_admin)?;
+    m.add_submodule(&gateway_admin)?;
+    register_submodule(py, "wyrd._wyrd.gateway_admin", &gateway_admin)?;
 
     let observe = PyModule::new(py, "observe")?;
     bifrost::register_observe(&observe)?;

@@ -25,7 +25,7 @@ use wyrd_spec::gateway::ProviderCredentialWrite;
 use wyrd_utils::py::WyrdPyResult;
 
 use crate::client::PyWyrdClient;
-use crate::gateway::{PyGateway, decode};
+use crate::gateway_admin::{PyGateway, decode};
 use crate::state::{PyCardEnvelope, PyDeclarationReceipt, PyPullSummary};
 
 /// Run one shared command future on the Wyrd runtime with the GIL released.

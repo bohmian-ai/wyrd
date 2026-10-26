@@ -46,7 +46,7 @@ from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
 from wyrd.errors import WyrdError
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.observe import Run
 from wyrd.state import WyrdState
 from wyrd.testing import UnmigratedDatabase, WyrdTestServer, cli

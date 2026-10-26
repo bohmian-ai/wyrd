@@ -19,7 +19,7 @@ import httpx
 import openai
 import pytest
 from openai.types.chat import ChatCompletionMessageParam
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.testing import WyrdTestServer, cli
 
 from .support import Delivery, Receiver, client_of

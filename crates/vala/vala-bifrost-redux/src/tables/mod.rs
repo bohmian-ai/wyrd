@@ -525,8 +525,7 @@ fn validate_variant_values(
         let (Some(metadata), Some(value)) = (child("metadata"), child("value")) else {
             return Err(malformed());
         };
-        return EncodedVariant::from_bytes(metadata, value)
-            .map(drop)
+        return EncodedVariant::validate_bytes(metadata, value)
             .map_err(|violation| violation.into_error(label, row));
     }
     match declared.data_type() {

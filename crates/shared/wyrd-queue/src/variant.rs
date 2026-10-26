@@ -294,6 +294,19 @@ impl EncodedVariant {
         })
     }
 
+    /// Check already-encoded Variant bytes after full validation, keeping no
+    /// copy of them.
+    ///
+    /// Boundary validators that only accept or refuse a stored value use this
+    /// instead of [`Self::from_bytes`], whose owned buffers they would drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same violations, in the same order, as [`Self::from_bytes`].
+    pub fn validate_bytes(metadata: &[u8], value: &[u8]) -> Result<(), VariantViolation> {
+        Self::validate(metadata, value).map(drop)
+    }
+
     /// Check borrowed Variant bytes against every Bifrost rule without copying
     /// and return the validated upstream value.
     ///
@@ -1772,6 +1785,46 @@ mod tests {
                 path: String::new()
             })
         );
+    }
+
+    /// Validation-only checks accept and refuse exactly the raw values owned
+    /// construction does, with the same violation, path, and precedence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the two entry points disagree on any fixture.
+    #[test]
+    fn validation_only_matches_owned_validation() {
+        let valid = EncodedVariant::from_json(&json!({"a": [1, {"b": "c"}], "d": null}))
+            .expect("valid fixture");
+        let mut numeric = VariantBuilder::new();
+        let mut object = numeric.new_object();
+        object.insert(
+            "n",
+            parquet_variant::VariantDecimal16::try_new(i128::from(u64::MAX) + 1, 0)
+                .expect("decimal"),
+        );
+        object.finish();
+        let (numeric_metadata, numeric_value) = numeric.finish();
+        let oversized = vec![0x00; usize::try_from(VARIANT_MAX_ENCODED_BYTES).expect("fits") + 1];
+        let fixtures: [(&[u8], &[u8]); 7] = [
+            (valid.metadata(), valid.value()),
+            (EMPTY_METADATA, &[0x7c]),
+            (&[0xff], &[0x0f, 1, 0xff]),
+            (EMPTY_METADATA, &oversized),
+            (EMPTY_METADATA, &nest(vec![0x00], 70)),
+            (EMPTY_METADATA, &list(&[nest(vec![0x00], 70), vec![0x7c]])),
+            (&numeric_metadata, &numeric_value),
+        ];
+        for (index, (metadata, value)) in fixtures.into_iter().enumerate() {
+            assert_eq!(
+                EncodedVariant::validate_bytes(metadata, value),
+                EncodedVariant::from_bytes(metadata, value).map(drop),
+                "fixture {index}"
+            );
+        }
+        assert!(EncodedVariant::validate_bytes(&numeric_metadata, &numeric_value).is_err());
+        assert!(EncodedVariant::validate_bytes(valid.metadata(), valid.value()).is_ok());
     }
 
     /// Variant metadata with an empty field-name dictionary.

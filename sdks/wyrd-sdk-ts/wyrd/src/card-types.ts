@@ -33,9 +33,10 @@ export interface ActionAgent {
   readonly inputs?: Readonly<Record<string, Reference>>;
   readonly kind: "agent";
   /**
-   * Files under `/inputs/...` for the Agent's tools; step position only.
+   * Files under `/inputs/...` for the Agent's tools, keyed by mount
+   * destination, in step and check position alike.
    */
-  readonly workspace?: Readonly<Record<string, Reference>>;
+  readonly workspace?: Readonly<Record<string, WorkspaceSource>>;
 }
 
 /**
@@ -176,6 +177,73 @@ export interface ArrowMeta {
    * Installed pyarrow version inferred by the Python boundary.
    */
   readonly framework_version: string;
+}
+
+/**
+ * Stored artifact inventory response.
+ */
+export interface ArtifactInventoryResponse {
+  /**
+   * Stored artifacts.
+   */
+  readonly artifacts: readonly StoredArtifactEntry[];
+}
+
+/**
+ * Files of one Artifact Card version mounted into a workspace.
+ */
+export interface ArtifactSelection {
+  /**
+   * The Artifact Card; registration pins it to an exact version and UID.
+   */
+  readonly card: Ref;
+  /**
+   * An inventory file, or a directory prefix matched on `/` boundaries;
+   * omitted, the whole collection.
+   */
+  readonly path?: string | null;
+}
+
+/**
+ * Versioned artifact descriptor.
+ */
+export interface ArtifactSpec {
+  /**
+   * Artifact kind.
+   */
+  readonly artifact_kind: string;
+  /**
+   * Artifact URIs.
+   */
+  readonly artifact_uris?: readonly string[];
+  /**
+   * MIME content type.
+   */
+  readonly content_type?: string | null;
+  /**
+   * External URI.
+   */
+  readonly external_uri?: string | null;
+  /**
+   * Framework adapter metadata for runtime loaders.
+   */
+  readonly framework_adapter?: FrameworkAdapterRef | null;
+  /**
+   * Integrity digest.
+   */
+  readonly integrity?: string | null;
+  /**
+   * Artifact metadata.
+   */
+  readonly metadata?: Readonly<Record<string, NonSecretValue>>;
+  /**
+   * Schema Card reference.
+   */
+  readonly schema_ref?: Ref | null;
+  /**
+   * Size in bytes.
+   */
+  readonly size_bytes?: number | null;
 }
 
 /**
@@ -340,7 +408,7 @@ export type BlockSource = string | MediaSource;
  * may be scoped to. Registration and authorization share this one
  * vocabulary, so a name is either a built-in everywhere or nowhere.
  */
-export type BuiltinTool = "cards.list" | "cards.get" | "bifrost.list_tables" | "bifrost.describe_table" | "bifrost.query" | "fs.list" | "fs.read" | "fs.search" | "code.run";
+export type BuiltinTool = "cards.list" | "cards.get" | "bifrost.list_tables" | "bifrost.describe_table" | "bifrost.query" | "fs.list" | "fs.read" | "fs.search" | "fs.extract" | "code.run";
 
 /**
  * What executed one Agent, code, extract, or drift block.
@@ -587,9 +655,10 @@ export interface CheckAgent {
   readonly inputs?: Readonly<Record<string, Reference>>;
   readonly kind: "agent";
   /**
-   * Files under `/inputs/...` for the Agent's tools; step position only.
+   * Files under `/inputs/...` for the Agent's tools, keyed by mount
+   * destination, in step and check position alike.
    */
-  readonly workspace?: Readonly<Record<string, Reference>>;
+  readonly workspace?: Readonly<Record<string, WorkspaceSource>>;
 }
 
 /**
@@ -2044,6 +2113,24 @@ export interface FieldSpec2Input {
    * Whether the column is nullable. Defaults to `true`.
    */
   readonly nullable?: boolean;
+}
+
+/**
+ * Framework adapter reference for loading or invoking artifacts.
+ */
+export interface FrameworkAdapterRef {
+  /**
+   * Non-secret adapter configuration.
+   */
+  readonly config?: Readonly<Record<string, NonSecretValue>>;
+  /**
+   * Adapter name.
+   */
+  readonly name: string;
+  /**
+   * Adapter version or version range.
+   */
+  readonly version: string;
 }
 
 /**
@@ -4626,7 +4713,7 @@ export interface RegisteredAgentCard {
 }
 
 /**
- * Registered `Artifact` Card envelope; its spec is not typed yet.
+ * Registered `Artifact` Card envelope.
  */
 export interface RegisteredArtifactCard {
   /**
@@ -4648,7 +4735,7 @@ export interface RegisteredArtifactCard {
   /**
    * Kind-specific spec payload.
    */
-  readonly spec: Readonly<Record<string, JsonValue>>;
+  readonly spec: ArtifactSpec;
   /**
    * Optional server-derived status.
    */
@@ -4688,7 +4775,7 @@ export interface RegisteredAuditCard {
 /**
  * One registered Card envelope as `cards.get` returns it, discriminated by `kind`.
  */
-export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredVerifierCard | RegisteredServiceCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredUntypedCard;
+export type RegisteredCard = RegisteredDataCard | RegisteredModelCard | RegisteredArtifactCard | RegisteredPromptCard | RegisteredAgentCard | RegisteredVerifierCard | RegisteredServiceCard | RegisteredTriggerCard | RegisteredOperatorCard | RegisteredUntypedCard;
 
 /**
  * Registered `Data` Card envelope.
@@ -4993,7 +5080,7 @@ export interface RegisteredTriggerCard {
 /**
  * Registered Card envelope of a kind whose spec is not typed yet.
  */
-export type RegisteredUntypedCard = RegisteredExperimentCard | RegisteredPolicyCard | RegisteredMcpCard | RegisteredAuditCard | RegisteredArtifactCard | RegisteredSourceCard;
+export type RegisteredUntypedCard = RegisteredExperimentCard | RegisteredPolicyCard | RegisteredMcpCard | RegisteredAuditCard | RegisteredSourceCard;
 
 /**
  * Registered `Verifier` Card envelope.
@@ -5046,6 +5133,11 @@ export interface Relationships {
    */
   readonly outbound_refs?: readonly CardRelationship[];
 }
+
+/**
+ * A validated relative path inside a card's artifact manifest.
+ */
+export type RelativeArtifactPath = string;
 
 /**
  * Request correlation ID; required to be a UUID v7.
@@ -6000,6 +6092,28 @@ export interface StepResult {
 export type StepStatus = "succeeded" | "failed" | "skipped";
 
 /**
+ * One stored artifact.
+ */
+export interface StoredArtifactEntry {
+  /**
+   * Optional MIME type.
+   */
+  readonly content_type?: string | null;
+  /**
+   * Relative artifact path.
+   */
+  readonly relative_path: RelativeArtifactPath;
+  /**
+   * Base64-encoded SHA-256.
+   */
+  readonly sha256: string;
+  /**
+   * Stored byte length.
+   */
+  readonly size_bytes: number;
+}
+
+/**
  * Lifecycle status of a registered Bifrost table.
  */
 export type TableStatus = "Active" | "Deprecated" | "Quarantined";
@@ -6189,7 +6303,7 @@ export interface TriggerSpecSchedule {
 /**
  * Card kinds whose `spec` and `status` `cards.get` types.
  */
-export type TypedCardKind = "Data" | "Model" | "Prompt" | "Agent" | "Verifier" | "Service" | "Trigger" | "Operator";
+export type TypedCardKind = "Data" | "Model" | "Artifact" | "Prompt" | "Agent" | "Verifier" | "Service" | "Trigger" | "Operator";
 
 /**
  * One named evidence slot. Slots are required unless `required: false`;
@@ -6663,6 +6777,26 @@ export interface WorkloadRestrictionFamily {
  */
 export interface WorkloadRestrictionUnrestricted {
   readonly mode: "unrestricted";
+}
+
+/**
+ * What one Agent workspace destination mounts.
+ *
+ * A string is an execution-scope [`Reference`], resolved per call like any
+ * other binding. An `artifact` object mounts fixed files of an exact
+ * Artifact Card version, pinned by the Verifier version itself: callers
+ * cannot replace them through execution input.
+ */
+export type WorkspaceSource = Reference | WorkspaceSourceArtifact;
+
+/**
+ * Fixed files of an Artifact Card version.
+ */
+export interface WorkspaceSourceArtifact {
+  /**
+   * The selected files.
+   */
+  readonly artifact: ArtifactSelection;
 }
 
 /**

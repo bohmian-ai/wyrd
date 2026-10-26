@@ -7,7 +7,7 @@
 //! `verify_in_real_time`.
 //!
 //! The local upstream stands in for the model provider: the refund reader
-//! first calls `fs.read` on its workspace copy of the policy and then answers
+//! first calls `fs.extract` on its workspace copy of the policy and then answers
 //! a 100-dollar limit, the judge passes every answer with a citation unless
 //! the answer names a scripted case, and the `tool-review` investigator
 //! calls the Card, Bifrost, and code tools at once and then finishes. Scripted
@@ -307,8 +307,8 @@ impl PolicyDesk {
                     "id": "call-read-policy",
                     "type": "function",
                     "function": {
-                        "name": "fs_read",
-                        "arguments": "{\"path\":\"/inputs/policy.pdf\"}",
+                        "name": "fs_extract",
+                        "arguments": "{\"path\":\"/inputs/policy.pdf\",\"output_path\":\"/work/policy.json\"}",
                     },
                 }],
             })))
@@ -555,7 +555,7 @@ async fn policy_review_runs_every_action_and_check_kind() {
         .iter()
         .map(|call| serde_json::to_value(call.tool).expect("the tool serializes"))
         .collect();
-    assert_eq!(tools, [json!("fs.read")]);
+    assert_eq!(tools, [json!("fs.extract")]);
     let facts = step(&result, "answer-facts");
     assert_eq!(
         (facts.status, facts.output.as_ref()),

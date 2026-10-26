@@ -517,6 +517,60 @@ class Cards:
         """
         ...
 
+    def upload_artifact(
+        self,
+        source: str | PathLike[str],
+        *,
+        name: str,
+        version: str | None = None,
+        version_bump: VersionBump | None = None,
+        artifact_kind: str = "file",
+        extract: bool = False,
+    ) -> CardRef:
+        """Publish one file or directory as an Artifact Card.
+
+        A file keeps its basename; a directory keeps every regular file at
+        its relative path. Nothing is parsed unless ``extract`` is set: then
+        each supported document ``P`` (PDF, DOCX, XLSX, PPTX, CSV, JSON, text,
+        Markdown, HTML) is extracted locally and published beside its
+        original as ``extracted/P.json``, and ``spec.metadata.extraction``
+        records the extractor version, the source/output pairs, and the
+        skipped paths. The source tree is never written.
+
+        Args:
+            source: The regular file or directory to publish.
+            name: The Artifact Card name.
+            version: An exact version or version scope; omitted, the server
+                assigns one.
+            version_bump: How the server bumps the latest version.
+            artifact_kind: The Artifact kind; must not be blank.
+            extract: Prepare extraction outputs before declaring.
+
+        Returns:
+            The exact Active reference, UID included.
+
+        Raises:
+            WyrdError: For a blank kind, an invalid source, a symlink, an
+                output path that collides with a source, a document the
+                extractor refuses, or a failed declaration.
+        """
+        ...
+
+    def list_artifacts(self, card_ref: CardRef) -> list[dict[str, object]]:
+        """List the files a declared Card holds, from the server inventory.
+
+        Args:
+            card_ref: Exact reference of the Card.
+
+        Returns:
+            One dict per file with ``relative_path``, ``size_bytes``, base64
+            ``sha256``, and ``content_type``.
+
+        Raises:
+            WyrdError: When the Card is absent or unauthorized.
+        """
+        ...
+
     def get(self, card_ref: CardRef) -> CardEnvelope:
         """Fetch one declared Card by exact reference as its complete envelope.
 

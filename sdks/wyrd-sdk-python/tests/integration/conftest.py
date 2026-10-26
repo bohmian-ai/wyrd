@@ -105,11 +105,14 @@ READ_POLICY = {
         {
             "id": "call-read-policy",
             "type": "function",
-            "function": {"name": "fs_read", "arguments": '{"path":"/inputs/policy.pdf"}'},
+            "function": {
+                "name": "fs_extract",
+                "arguments": '{"path":"/inputs/policy.pdf","output_path":"/work/policy.json"}',
+            },
         }
     ],
 }
-"""The refund reader's first turn: read its workspace copy of the policy as ``fs_read``."""
+"""The refund reader's first turn: extract its workspace copy of the policy as ``fs_extract``."""
 
 
 INVESTIGATE = {
@@ -200,7 +203,7 @@ def completion(body: dict) -> tuple[int, dict]:
 
     The refund reader fails its provider on ``PROVIDER-DOWN``, breaks its
     schema on ``OFF-SCHEMA``, and answers after ``SLOW_SECONDS`` on
-    ``SLOW-READER``; otherwise it first calls ``fs.read`` and, once the tool
+    ``SLOW-READER``; otherwise it first calls ``fs.extract`` and, once the tool
     result is back, answers a 100-dollar limit. The investigator calls each
     of its tools once and finishes once the results are back. The coding
     judge reads the trace's spans live through ``bifrost_query`` and passes,

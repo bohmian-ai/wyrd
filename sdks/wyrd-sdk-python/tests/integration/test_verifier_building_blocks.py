@@ -9,7 +9,7 @@ locked output. Drift checks run on schedules in
 ``test_verify_in_real_time``.
 
 The session's local model provider stands in for the gateway's upstream: the
-refund reader first calls ``fs.read`` on its workspace copy of the policy and
+refund reader first calls ``fs.extract`` on its workspace copy of the policy and
 then answers a 100-dollar limit, the policy judge passes every answer with a
 citation unless the answer names a scripted case, and the ``tool-review``
 investigator calls the Card, Bifrost, and code tools at once and then
@@ -392,7 +392,7 @@ def test_policy_review_runs_every_action_and_check_kind(
     assert text["provenance"]["kind"] == "extract"
     rules = step(result, "refund-rules")
     assert (rules["status"], rules["output"]) == ("succeeded", {"max_refund": 100})
-    assert [call["tool"] for call in rules["tool_calls"]] == ["fs.read"]
+    assert [call["tool"] for call in rules["tool_calls"]] == ["fs.extract"]
     facts = step(result, "answer-facts")
     assert (facts["status"], facts["output"]) == ("succeeded", {"within_limit": True})
     assert facts["provenance"]["kind"] == "code"

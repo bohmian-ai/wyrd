@@ -7,7 +7,7 @@
 // judges every span of a trace, whichever workload wrote it.
 //
 // The local upstream stands in for the model provider: the refund reader first
-// calls `fs.read` on its workspace copy of the policy and then answers a
+// calls `fs.extract` on its workspace copy of the policy and then answers a
 // 100-dollar limit, the judge passes every answer with a citation unless the
 // answer names a scripted case, and the `tool-review` investigator calls the
 // Card, Bifrost, and code tools at once and then finishes. Scripted answer
@@ -107,7 +107,7 @@ const POLICY = resolve(import.meta.dirname, "../../../../../examples/support-des
 
 /**
  * The local model upstream. The refund reader fails by the scripted failure
- * its answer names; otherwise its first turn calls `fs.read` on the workspace
+ * its answer names; otherwise its first turn calls `fs.extract` on the workspace
  * policy and its turn with the tool result answers the limit. The investigator
  * calls every tool at once and finishes once it holds their results; the judge
  * answers by the scripted case its claim names.
@@ -123,7 +123,9 @@ function upstream(request: ReceivedRequest): Reply {
     if (toolResults) {
       return judgeReply('{"max_refund":100}');
     }
-    return toolTurn([toolCall("call-read-policy", "fs.read", { path: "/inputs/policy.pdf" })]);
+    return toolTurn([
+      toolCall("call-read-policy", "fs.extract", { path: "/inputs/policy.pdf", output_path: "/work/policy.json" }),
+    ]);
   }
   if (body.includes("INVESTIGATE")) {
     return toolResults ? judgeReply('{"done":true}') : toolTurn(INVESTIGATION);
@@ -345,7 +347,7 @@ test("policy review runs every action and check kind", async ({ server, provider
   expect(text.provenance?.kind).toBe("extract");
   const rules = step(result, "refund-rules");
   expect([rules.status, rules.output]).toEqual(["succeeded", { max_refund: 100 }]);
-  expect(rules.tool_calls?.map((call) => call.tool)).toEqual(["fs.read"]);
+  expect(rules.tool_calls?.map((call) => call.tool)).toEqual(["fs.extract"]);
   const facts = step(result, "answer-facts");
   expect([facts.status, facts.output]).toEqual(["succeeded", { within_limit: true }]);
   expect(facts.provenance?.kind).toBe("code");

@@ -6,6 +6,8 @@ import { createRequire } from "node:module";
 import type { WyrdErrorCode } from "./error-codes.js";
 import type {
   AlterTableRequest as AlterTableRequestWire,
+  ArtifactInventoryResponse,
+  ArtifactSpec,
   BifrostTableDescription as TableDescriptionWire,
   BifrostTableEntry as TableEntry,
   CancelRunningQueryResponse,
@@ -42,6 +44,7 @@ import type {
   JsonValue,
   ListCardsRequest,
   ListCardsResponse,
+  Metadata,
   ModelRef,
   OperatorConnectionStatus,
   OperatorConnectionView,
@@ -147,6 +150,7 @@ export interface CancelRunningQueryResult {
 export type { WyrdErrorCode } from "./error-codes.js";
 /** Wire contracts generated from the `wyrd-spec` Rust types, under their SDK names. */
 export type {
+  ArtifactInventoryResponse,
   CardDeclarationOutcome,
   CardSummary,
   ColumnRename,
@@ -209,6 +213,8 @@ export type {
 };
 export type {
   AgentSpec,
+  ArtifactSelection,
+  ArtifactSpec,
   CardKind,
   CardRef,
   DataSpec,
@@ -220,6 +226,7 @@ export type {
   OperatorSpec,
   PromptSpec,
   RegisteredAgentCard,
+  RegisteredArtifactCard,
   RegisteredCard,
   RegisteredDataCard,
   RegisteredModelCard,
@@ -1791,6 +1798,54 @@ export class Cards {
    */
   async declareFromPath(path: string): Promise<DeclarationReceipt> {
     return lifecycleValue<DeclarationReceipt>(await this.#native.declareFromPath(path));
+  }
+
+  /**
+   * Publish one file or directory as an Artifact Card.
+   *
+   * A file keeps its basename; a directory keeps every regular file at its
+   * relative path. Nothing is parsed unless `extract` is set: then each
+   * supported document `P` is extracted locally and published beside its
+   * original as `extracted/P.json`, and `spec.metadata.extraction` records
+   * the extractor version, the source/output pairs, and the skipped paths.
+   *
+   * @param source - The regular file or directory to publish.
+   * @param options - The Card `metadata` (name, version, bump), the
+   * Artifact `spec` (defaults to `{ artifact_kind: "file" }`), and `extract`.
+   * @returns The exact Active reference, carrying its `uid`.
+   * @throws {@link WyrdError} for a blank kind, an invalid source, a symlink,
+   * an output path that collides with a source, a document the extractor
+   * refuses, or the registry's refusal.
+   */
+  async uploadArtifact(
+    source: string,
+    options: {
+      readonly metadata: Metadata;
+      readonly spec?: ArtifactSpec;
+      readonly extract?: boolean;
+    },
+  ): Promise<CardRef> {
+    const spec: ArtifactSpec = options.spec ?? { artifact_kind: "file" };
+    return lifecycleValue<CardRef>(
+      await this.#native.uploadArtifact(
+        source,
+        JSON.stringify(options.metadata),
+        JSON.stringify(spec),
+        options.extract ?? false,
+      ),
+    );
+  }
+
+  /**
+   * List the files one declared Card holds, from the server inventory.
+   *
+   * @param ref - A Card reference, or its text form.
+   * @returns Each file's path, size, base64 SHA-256, and content type.
+   * @throws {@link WyrdError} for a malformed reference, an unknown Card, or
+   * a transport or authorization failure.
+   */
+  async listArtifacts(ref: CardRef | string): Promise<ArtifactInventoryResponse> {
+    return lifecycleValue<ArtifactInventoryResponse>(await this.#native.listArtifacts(cardRefText(ref)));
   }
 
   /**

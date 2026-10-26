@@ -275,6 +275,65 @@ impl Cards {
             .map_err(Into::into)
     }
 
+    /// Publish one file or directory as an Artifact Card and return its
+    /// exact Active reference, UID included.
+    ///
+    /// A file keeps its basename; a directory keeps every regular file at its
+    /// relative path. With `extract`, each supported document `P` is
+    /// extracted locally first and published beside its original as
+    /// `extracted/P.json`, and `spec.metadata.extraction` records the report;
+    /// [`wyrd_loader::ArtifactUpload`] owns that preparation. Versioning,
+    /// transfer, integrity, and activation are the ordinary declaration's.
+    ///
+    /// # Arguments
+    /// * `source` - The regular file or directory to publish.
+    /// * `metadata` - The Artifact's name and version or bump.
+    /// * `spec` - The Artifact spec; `artifact_kind` must not be blank.
+    /// * `extract` - Prepare extraction outputs before declaring.
+    ///
+    /// # Errors
+    /// Returns [`wyrd_loader::ArtifactUpload::prepare`]'s refusals and the
+    /// declaration's errors.
+    pub async fn upload_artifact(
+        &self,
+        source: impl AsRef<Path>,
+        metadata: crate::cards::Metadata,
+        spec: crate::cards::ArtifactSpec,
+        extract: bool,
+    ) -> Result<CardRef, WyrdError> {
+        let source = source.as_ref().to_path_buf();
+        let upload = tokio::task::spawn_blocking(move || {
+            wyrd_loader::ArtifactUpload::prepare(&source, metadata, spec, extract)
+        })
+        .await
+        .map_err(|error| WyrdError::internal(format!("artifact preparation stopped: {error}")))??;
+        Ok(self.declare(&upload.input).await?.root)
+    }
+
+    /// The server-authoritative file inventory of one Card: each file's
+    /// path, length, digest, and content type.
+    ///
+    /// # Arguments
+    /// * `selector` - The Card whose files to list; a named selector without
+    ///   a version reads the latest Active version.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the Card is absent or unauthorized or the
+    /// server request fails.
+    pub async fn list_artifacts(
+        &self,
+        selector: CardSelector,
+    ) -> Result<crate::cards::ArtifactInventoryResponse, WyrdError> {
+        let card = self.get(selector).await?;
+        let uid = card
+            .metadata
+            .uid
+            .ok_or_else(|| WyrdError::internal("the server returned a Card without a UID"))?;
+        reads::list_artifacts(&self.engine.client, &uid)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Declare a loader-produced composite input and forward typed progress
     /// events to the caller while the saga runs.
     ///

@@ -31,15 +31,25 @@ pub fn build_artifact_manifest(
 ) -> Result<ArtifactManifest, LoadError> {
     let mut files = Vec::new();
     collect_files(root, &mut files)?;
-    files.sort();
-
     let envelope = root.join(envelope_name);
+    files.retain(|path| *path != envelope);
+    manifest_of(root, files)
+}
+
+/// The sorted manifest of exactly `files`, each a regular file below
+/// `root`, with streamed hashes; nothing else under `root` is read.
+///
+/// # Errors
+/// Returns a diagnostic for a path outside `root`, an invalid artifact
+/// path, or an unreadable file.
+pub(crate) fn manifest_of(
+    root: &Path,
+    mut files: Vec<PathBuf>,
+) -> Result<ArtifactManifest, LoadError> {
+    files.sort();
     let mut entries = Vec::new();
     let mut sources = std::collections::BTreeMap::new();
     for path in files {
-        if path == envelope {
-            continue;
-        }
         let relative = path.strip_prefix(root).map_err(|error| {
             LoadError::single(Diagnostic::invalid_envelope(
                 path.clone(),
@@ -66,7 +76,12 @@ pub fn build_artifact_manifest(
     Ok(ArtifactManifest { entries, sources })
 }
 
-fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), LoadError> {
+/// Every regular file below `root`, recursively.
+///
+/// # Errors
+/// Returns a diagnostic for an unreadable directory or a link or other
+/// non-regular entry.
+pub(crate) fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), LoadError> {
     let entries = fs::read_dir(root)
         .map_err(|error| LoadError::single(Diagnostic::io(root.to_path_buf(), &error)))?;
     for entry in entries {

@@ -2000,6 +2000,83 @@ impl PyCards {
             .map_err(WyrdPyError::from)
     }
 
+    /// Publish one file or directory as an Artifact Card.
+    ///
+    /// Thin projection of the shared Rust `Cards::upload_artifact`, run with
+    /// the GIL released: a file keeps its basename, a directory keeps every
+    /// regular file at its relative path, and `extract=True` also publishes
+    /// `extracted/P.json` for each supported document `P` and records
+    /// `spec.metadata.extraction`.
+    ///
+    /// # Arguments
+    /// * `source` - The regular file or directory to publish.
+    /// * `name` - The Artifact Card name.
+    /// * `version` - An exact version or version scope, or `None` to let the
+    ///   server assign one.
+    /// * `version_bump` - A `VersionBump` the server applies, or `None`.
+    /// * `artifact_kind` - The Artifact kind; must not be blank.
+    /// * `extract` - Prepare extraction outputs before declaring.
+    ///
+    /// # Returns
+    /// The exact Active `CardRef`, UID included.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error for an invalid name, version, kind, or source, a
+    /// refused extraction, or a failed declaration.
+    #[pyo3(signature = (source, *, name, version=None, version_bump=None, artifact_kind="file", extract=false))]
+    fn upload_artifact(
+        &self,
+        py: Python<'_>,
+        source: PathBuf,
+        name: &str,
+        version: Option<&str>,
+        version_bump: Option<&Bound<'_, PyAny>>,
+        artifact_kind: &str,
+        extract: bool,
+    ) -> CardPyResult<CardRefPy> {
+        let mut metadata: Metadata = serde_json::from_value(serde_json::json!({ "name": name }))?;
+        metadata.version = version
+            .map(str::parse::<VersionSpec>)
+            .transpose()
+            .map_err(|error| WyrdError::Validation {
+                message: format!("version: {error}"),
+                details: serde_json::json!({ "rule": "version", "path": "version" }),
+            })?;
+        metadata.bump = version_bump.map(parse_version_bump).transpose()?;
+        let spec = wyrd_spec::card::artifact::ArtifactSpec {
+            artifact_kind: artifact_kind.to_owned(),
+            ..wyrd_spec::card::artifact::ArtifactSpec::default()
+        };
+        let cards = self.cards(py)?;
+        crate::trace::block_on(py, cards.upload_artifact(&source, metadata, spec, extract))
+            .map(CardRefPy)
+            .map_err(WyrdPyError::from)
+    }
+
+    /// List the files one declared Card holds, from the server inventory.
+    ///
+    /// # Arguments
+    /// * `card_ref` - Exact `CardRef` carrying its kind, name, and version.
+    ///
+    /// # Returns
+    /// One dict per file with `relative_path`, `size_bytes`, base64
+    /// `sha256`, and `content_type`, in path order.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the Card is absent or unauthorized or the
+    /// server request fails.
+    #[pyo3(signature = (card_ref))]
+    fn list_artifacts(
+        &self,
+        py: Python<'_>,
+        card_ref: PyRef<'_, CardRefPy>,
+    ) -> CardPyResult<Py<PyAny>> {
+        let selector = CardSelector::exact(card_ref.0.clone());
+        let inventory = crate::trace::block_on(py, self.cards(py)?.list_artifacts(selector))
+            .map_err(WyrdPyError::from)?;
+        json_to_py(py, &serde_json::to_value(inventory.artifacts)?)
+    }
+
     /// Fetch one declared Card by exact reference as its complete envelope.
     ///
     /// The shared Rust `Cards::get` reads the envelope while the GIL is

@@ -31,6 +31,7 @@ TS_OUT = ROOT / "sdks/wyrd-sdk-ts/wyrd/src/card-types.ts"
 SUPPORTED_KINDS = [
     "Data",
     "Model",
+    "Artifact",
     "Prompt",
     "Agent",
     "Verifier",
@@ -44,6 +45,7 @@ SUPPORTED_KINDS = [
 # re-exports them under their public SDK names.
 WIRE_ROOTS = [
     # Registry.
+    "ArtifactInventoryResponse",
     "CardDeclarationOutcome",
     "CardSummary",
     "ListCardsRequest",

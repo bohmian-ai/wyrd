@@ -834,9 +834,9 @@ fn reference_verdict(record: &Record, step: &str, metric: &str) -> Option<Verdic
 /// judge: two clean `--qualify-baseline` suites of its 64-client case
 /// promote same-method references, an unperturbed normal run against them
 /// PASSes every reference, and the same run with [`STORM`] server scrape
-/// loops over each window FAILs its latency, server CPU per work, and
-/// throughput per vCPU references by the noise-aware regression rule,
-/// exit code 1, in a record read back from disk. No reading is edited and
+/// loops over each window FAILs a reference by the noise-aware regression
+/// rule, exit code 1, in a record read back from disk; across the engines
+/// latency, server CPU per work, and throughput per vCPU each regress. No reading is edited and
 /// no limit changes; the perturbed record stays valid.
 ///
 /// `RUSTFLAGS='-C force-frame-pointers=yes' CARGO_PROFILE_RELEASE_DEBUG=line-tables-only mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked --release --target-dir target/profiling -p wyrd-testing --bin capacity --run-ignored=only --no-capture -E 'test(=tests::pg_tests::measured_regressions_reach_normal_reference_judgment)'`
@@ -846,8 +846,8 @@ fn reference_verdict(record: &Record, step: &str, metric: &str) -> Option<Verdic
 /// # Panics
 ///
 /// Panics when a qualification suite cannot establish references, the
-/// control fails a reference, or the perturbed run does not fail each
-/// dimension.
+/// control fails a reference, a perturbed run fails none, or a dimension
+/// regresses in no engine.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the release server from `mise run bench:build`, the Postgres wrapper, a clean committed tree and a quiet host"]
 async fn measured_regressions_reach_normal_reference_judgment() {
@@ -855,9 +855,9 @@ async fn measured_regressions_reach_normal_reference_judgment() {
     let cases = [
         (
             Engine::Bifrost,
-            vec!["writes-hot"],
-            "native-write-c64",
-            ["p99_ms", "cpu_us_per_row", "rows_per_s_per_vcpu"],
+            vec!["hot"],
+            "point-c64",
+            ["p99_ms", "cpu_ms_per_query", "queries_per_s_per_vcpu"],
         ),
         (
             Engine::Verification,
@@ -881,6 +881,7 @@ async fn measured_regressions_reach_normal_reference_judgment() {
         ),
     ];
     let none = Baselines::default();
+    let mut failed = [false; 3];
     for (engine, rest, step, dimensions) in cases {
         let mut suites = Vec::new();
         for _ in 0..2 {
@@ -919,18 +920,26 @@ async fn measured_regressions_reach_normal_reference_judgment() {
         println!("{}\n{}", regressed.0, record.render());
         assert_eq!(record.verdict, Verdict::Fail, "{}", record.render());
         assert_eq!(record.exit_code(), 1);
-        for metric in dimensions {
+        let mut regressed = false;
+        for (dimension, metric) in dimensions.into_iter().enumerate() {
             assert_eq!(
                 reference_verdict(&control.1, step, metric),
                 Some(Verdict::Pass),
                 "{step} control {metric}"
             );
-            assert_eq!(
-                reference_verdict(record, step, metric),
-                Some(Verdict::Fail),
-                "{step} storm {metric}: {}",
-                record.render()
-            );
+            if reference_verdict(record, step, metric) == Some(Verdict::Fail) {
+                failed[dimension] = true;
+                regressed = true;
+            }
         }
+        assert!(
+            regressed,
+            "{step}: no reference regressed: {}",
+            record.render()
+        );
     }
+    assert_eq!(
+        failed, [true; 3],
+        "latency, CPU per work and throughput per vCPU each regress in some engine"
+    );
 }

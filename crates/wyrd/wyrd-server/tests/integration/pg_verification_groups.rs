@@ -424,14 +424,18 @@ impl Support {
         value.clone()
     }
 
-    /// The group snapshot of the group execution `outcome` created.
+    /// The group snapshot of the group execution `outcome` created, read
+    /// once its selector record, staged after the handoff commits, is
+    /// published.
     ///
     /// # Panics
-    /// Panics when `outcome` created nothing or the execution has no group.
+    /// Panics when `outcome` created nothing, Bifrost does not flush, or the
+    /// execution has no group.
     async fn snapshot(&self, outcome: &GroupHandoff) -> Value {
         let GroupHandoff::Enqueued(execution) = outcome else {
             panic!("the poll did not create a group execution: {outcome:?}");
         };
+        self.server.flush_bifrost().await.expect("Bifrost flushes");
         let execution = self.execution(*execution).await;
         execution["group"].clone()
     }

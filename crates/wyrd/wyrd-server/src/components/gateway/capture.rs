@@ -1569,7 +1569,7 @@ pub(crate) mod recording {
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::vala::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID};
 
-    use crate::scribe_outbox::{ScribeSink, ScribeTable};
+    use crate::scribe_outbox::{ScribeSink, ScribeTable, payload_ipc};
     use crate::state::AppState;
 
     /// One authorization decision the recording Scribe acknowledged on
@@ -1617,10 +1617,14 @@ pub(crate) mod recording {
         pub(crate) card_scope: Vec<CardUid>,
         /// Fully qualified destination table.
         pub(crate) table: String,
-        /// Rows the frame's IPC stream carries.
+        /// Rows the frame carries.
         pub(crate) rows: usize,
-        /// The frame's IPC stream.
+        /// The frame's rows as one IPC stream: the stream it carried, or its
+        /// canonical batches encoded.
         pub(crate) ipc: Bytes,
+        /// Whether the frame carried canonical batches rather than an IPC
+        /// stream for Scribe to decode.
+        pub(crate) canonical: bool,
         /// Batch identity the frame was submitted under.
         pub(crate) batch_id: uuid::Uuid,
     }
@@ -1640,6 +1644,7 @@ pub(crate) mod recording {
                 table: frame.table.fqn(),
                 rows,
                 ipc,
+                canonical: matches!(frame.payload, IngressPayload::Canonical(_)),
                 batch_id: frame.batch_id,
             }
         }
@@ -1894,12 +1899,10 @@ pub(crate) mod recording {
         ///
         /// # Panics
         ///
-        /// Panics when the frame is not one Arrow IPC stream of the audit
-        /// content columns or the audit lock is poisoned.
+        /// Panics when the frame does not hold the audit content columns or
+        /// the audit lock is poisoned.
         fn acknowledge_audit(&self, frame: &ScribeIngressFrame) -> FrameAdmission {
-            let IngressPayload::ArrowIpc(ipc) = &frame.payload else {
-                panic!("audit submits Arrow IPC");
-            };
+            let ipc = &payload_ipc(&frame.payload);
             let decisions: Vec<AuditDecision> =
                 StreamReader::try_new(std::io::Cursor::new(ipc.clone()), None)
                     .expect("the audit stream opens")
@@ -1937,8 +1940,8 @@ pub(crate) mod recording {
         ///
         /// # Panics
         ///
-        /// Panics when the frame is not one readable Arrow IPC stream or a
-        /// lock is poisoned.
+        /// Panics when the frame's rows do not encode and decode or a lock
+        /// is poisoned.
         async fn ingest_frame(
             &self,
             frame: ScribeIngressFrame,
@@ -1953,10 +1956,7 @@ pub(crate) mod recording {
             if let Some(error) = self.refusals.lock().expect("refusals").pop_front() {
                 return Err(error);
             }
-            let IngressPayload::ArrowIpc(ipc) = &frame.payload else {
-                panic!("capture submits Arrow IPC");
-            };
-            let ipc = ipc.clone();
+            let ipc = payload_ipc(&frame.payload);
             let rows = StreamReader::try_new(std::io::Cursor::new(ipc.clone()), None)
                 .expect("the capture stream opens")
                 .map(|batch| batch.expect("the capture batch decodes").num_rows())

@@ -18,24 +18,22 @@ use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{ArrayRef, BooleanArray, StringBuilder, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
-use arrow::record_batch::RecordBatch;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Error as JsonError;
 use vala_bifrost_redux::tables::DomainTable;
+use vala_bifrost_redux::tables::staged::{Cell, StagedRow};
 use vala_bifrost_redux::tables::verification::{
     ACTIVATION, ExecutionInputsTable, ExecutionOutputsTable, INPUTS, OUTPUT, ResultsTable,
 };
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+use wyrd_queue::variant::EncodedVariant;
 use wyrd_runtime::request_context::AcceptedAuthority;
 use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, VerificationResultId};
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::api::UTC_TIME_ZONE;
 use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::vala::managed_columns::{
     DEPLOYMENT_ENVIRONMENT, RUN_ID, SERVICE_NAME, SERVICE_VERSION, SUBJECT_CARD_UID, SUBJECT_KIND,
@@ -62,8 +60,8 @@ pub enum ResultPayloadError {
     /// An outcome value exceeds a Variant limit and cannot be stored.
     #[error("result Variant value refused")]
     Variant(#[from] BifrostError),
-    /// The mapped columns did not form a valid batch.
-    #[error("result batch assembly failed")]
+    /// The mapped values did not fill the table's schema.
+    #[error("result row assembly failed")]
     Arrow(#[from] ArrowError),
     /// The authored columns do not name each table field exactly once.
     ///
@@ -78,24 +76,29 @@ pub enum ResultPayloadError {
     },
 }
 
-/// One authored result column: the table field name it fills and its values.
+/// One authored result value: the table field name it fills and its value.
 ///
-/// The name, not the position, binds the values to the destination table's
+/// The name, not the position, binds the value to the destination table's
 /// field, so a reordered table declaration cannot relabel evidence.
-type NamedColumn = (&'static str, ArrayRef);
+type NamedColumn = (&'static str, Cell);
 
-/// The one schema every row of each result table shares: the table's fields
-/// followed by the [`CORRELATION`] columns, keyed by its table type.
+/// The one schema every row of each result table shares, the table's fields
+/// followed by the [`CORRELATION`] columns, and the table's fully qualified
+/// name, keyed by its table type.
 ///
-/// Each result row is its own batch until the Scribe outbox concatenates a
-/// slice of them, so one shared schema lets the outbox group rows by pointer
-/// and spares every row its own field allocations.
-static SCHEMAS: LazyLock<[(TypeId, SchemaRef); 3]> = LazyLock::new(|| {
-    /// `T`'s fields followed by the correlation columns, keyed by `T`.
-    fn schema<T: DomainTable + 'static>() -> (TypeId, SchemaRef) {
+/// Each result row is staged on its own until the Scribe outbox builds a
+/// slice of them into one batch, so one shared schema lets the outbox group
+/// rows by pointer and spares every row its own field allocations.
+static SCHEMAS: LazyLock<[(TypeId, String, SchemaRef); 3]> = LazyLock::new(|| {
+    /// `T`'s name and fields followed by the correlation columns, keyed by `T`.
+    fn schema<T: DomainTable + 'static>() -> (TypeId, String, SchemaRef) {
         let mut fields = T::arrow_fields();
         fields.extend(CORRELATION.map(|name| Field::new(name, DataType::Utf8, true)));
-        (TypeId::of::<T>(), Arc::new(Schema::new(fields)))
+        (
+            TypeId::of::<T>(),
+            format!("bifrost.{}.{}", T::NAMESPACE, T::NAME),
+            Arc::new(Schema::new(fields)),
+        )
     }
     [
         schema::<ResultsTable>(),
@@ -108,31 +111,25 @@ static SCHEMAS: LazyLock<[(TypeId, SchemaRef); 3]> = LazyLock::new(|| {
 /// fields, in this order.
 const CORRELATION: [&str; 3] = [WORKLOAD_CARD_UID, SUBJECT_CARD_UID, RUN_ID];
 
-/// One sealed-ready batch and the table it is written to.
+/// One staged result row and the table it is written to.
 #[derive(Debug, Clone)]
-pub struct ResultBatch {
+pub struct ResultRow {
     /// Fully qualified destination table, such as `bifrost.verification.results`.
-    pub table: String,
-    /// The rows, including the correlation columns.
-    pub batch: RecordBatch,
+    pub table: &'static str,
+    /// The row's values, including the correlation columns.
+    pub row: StagedRow,
 }
 
-impl ResultBatch {
-    /// Arrow memory this batch owns while it is staged: every column's
-    /// buffers except the process-wide null column one-row batches share,
-    /// which stays resident once however many batches point at it.
+impl ResultRow {
+    /// Memory this row holds while it is staged, as
+    /// [`StagedRow::owned_bytes`].
     #[must_use]
     pub fn owned_bytes(&self) -> usize {
-        self.batch
-            .columns()
-            .iter()
-            .filter(|column| !Arc::ptr_eq(column, &ONE_NULL_TEXT))
-            .map(|column| column.get_array_memory_size())
-            .sum()
+        self.row.owned_bytes()
     }
 }
 
-/// Every batch of one result, in required write order.
+/// Every row of one result, in required write order.
 ///
 /// The output record precedes the summary. Built once and staged on the
 /// Scribe outbox, which resends identical rows on every retry.
@@ -143,7 +140,7 @@ pub struct ResultPayload {
     /// The overall verdict the summary records.
     verdict: VerificationVerdict,
     /// The output record, then the summary.
-    batches: Vec<ResultBatch>,
+    rows: Vec<ResultRow>,
 }
 
 impl ResultPayload {
@@ -159,16 +156,12 @@ impl ResultPayload {
         self.verdict
     }
 
-    /// Every batch in write order: the output, then the summary.
+    /// Every row in write order: the output, then the summary.
     #[must_use]
-    pub fn batches(&self) -> &[ResultBatch] {
-        &self.batches
+    pub fn rows(&self) -> &[ResultRow] {
+        &self.rows
     }
 }
-
-/// A one-row null text column, shared by every single-row batch's unset
-/// dimension columns.
-static ONE_NULL_TEXT: LazyLock<ArrayRef> = LazyLock::new(|| text([None::<&str>]));
 
 /// The stored `output` Variant: a [`VerificationOutcome`]'s requirements and
 /// steps, without the verdict the summary records or the `evidence` only the
@@ -244,7 +237,7 @@ pub struct ResultRun<'a> {
     pub window: Option<&'a DriftWindow>,
 }
 
-/// Maps one completed execution's outcome onto its result batches.
+/// Maps one completed execution's outcome onto its result rows.
 ///
 /// Owns the identities every row repeats — result, execution, Verifier,
 /// subject, owner, binding — plus the execution interval, so each table
@@ -278,7 +271,7 @@ impl<'a> ResultPayloadBuilder<'a> {
         }
     }
 
-    /// Map `outcome` to its ordered batches under a newly minted result
+    /// Map `outcome` to its ordered rows under a newly minted result
     /// identity.
     ///
     /// Each call produces a distinct [`VerificationResultId`], carried by
@@ -303,29 +296,22 @@ impl<'a> ResultPayloadBuilder<'a> {
             requirements: &outcome.requirements,
             steps: &outcome.steps,
         };
-        let batches = vec![
+        let rows = vec![
             self.finish::<ExecutionOutputsTable>(vec![
-                ("result_id", text([Some(result_id.to_string())])),
+                ("result_id", Cell::text(Some(result_id.to_string()))),
                 (
                     "execution_id",
-                    text([Some(self.run.execution_id.to_string())]),
+                    Cell::text(Some(self.run.execution_id.to_string())),
                 ),
-                ("ended_at", timestamps([Some(self.ended_at)])),
-                (
-                    OUTPUT,
-                    VariantColumnBuilder::encode(
-                        OUTPUT,
-                        [Some(&output)],
-                        EncodedVariant::from_serialize,
-                    )?,
-                ),
+                ("ended_at", time(Some(self.ended_at))),
+                (OUTPUT, variant(OUTPUT, Some(&output))?),
             ])?,
             self.finish::<ResultsTable>(self.summary(result_id, outcome)?)?,
         ];
         Ok(ResultPayload {
             result_id,
             verdict: outcome.verdict,
-            batches,
+            rows,
         })
     }
 
@@ -344,28 +330,28 @@ impl<'a> ResultPayloadBuilder<'a> {
         let verdict: &'static str = outcome.verdict.into();
         let window = self.run.window;
         Ok(vec![
-            ("result_id", text([Some(result_id.to_string())])),
+            ("result_id", Cell::text(Some(result_id.to_string()))),
             (
                 "execution_id",
-                text([Some(self.run.execution_id.to_string())]),
+                Cell::text(Some(self.run.execution_id.to_string())),
             ),
-            ("execution_status", text([Some("completed")])),
-            ("verdict", text([Some(verdict)])),
-            ("verifier_version", text([Some(self.run.verifier_version)])),
+            ("execution_status", Cell::text(Some("completed"))),
+            ("verdict", Cell::text(Some(verdict))),
+            (
+                "verifier_version",
+                Cell::text(Some(self.run.verifier_version)),
+            ),
             (
                 "verifier_card_uid",
-                text([Some(self.verifier_uid.as_str())]),
+                Cell::text(Some(self.verifier_uid.as_str())),
             ),
-            ("binding_id", text([self.binding()])),
-            ("group_id", text([self.group()])),
-            ("trigger_identity", text([trigger])),
-            (
-                "window_start",
-                timestamps([window.map(|window| window.start)]),
-            ),
-            ("window_end", timestamps([window.map(|window| window.end)])),
-            ("started_at", timestamps([Some(self.started_at)])),
-            ("ended_at", timestamps([Some(self.ended_at)])),
+            ("binding_id", Cell::text(self.binding())),
+            ("group_id", Cell::text(self.group())),
+            ("trigger_identity", Cell::text(trigger)),
+            ("window_start", time(window.map(|window| window.start))),
+            ("window_end", time(window.map(|window| window.end))),
+            ("started_at", time(Some(self.started_at))),
+            ("ended_at", time(Some(self.ended_at))),
         ])
     }
 
@@ -382,14 +368,10 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// # Errors
     /// Returns a Variant error when the inputs or activation cannot be
     /// encoded, and the [`Self::finish`] errors.
-    pub fn inputs(&self, record: InputRecord<'_>) -> Result<ResultBatch, ResultPayloadError> {
-        /// One-row `inputs` Variant column of `value`.
-        fn encoded<T: Serialize>(value: &T) -> Result<ArrayRef, ResultPayloadError> {
-            Ok(VariantColumnBuilder::encode(
-                INPUTS,
-                [Some(value)],
-                EncodedVariant::from_serialize,
-            )?)
+    pub fn inputs(&self, record: InputRecord<'_>) -> Result<ResultRow, ResultPayloadError> {
+        /// The `inputs` Variant cell of `value`.
+        fn encoded<T: Serialize>(value: &T) -> Result<Cell, ResultPayloadError> {
+            variant(INPUTS, Some(value))
         }
         let (origin, inputs, submission) = match record {
             InputRecord::Direct(inputs) => (InputOrigin::Direct, encoded(inputs)?, None),
@@ -413,42 +395,32 @@ impl<'a> ResultPayloadBuilder<'a> {
         self.finish::<ExecutionInputsTable>(vec![
             (
                 "execution_id",
-                text([Some(self.run.execution_id.to_string())]),
+                Cell::text(Some(self.run.execution_id.to_string())),
             ),
             (
                 "verifier_card_uid",
-                text([Some(self.verifier_uid.as_str())]),
+                Cell::text(Some(self.verifier_uid.as_str())),
             ),
-            ("binding_id", text([self.binding()])),
-            ("group_id", text([self.group()])),
-            ("origin", text([Some(origin.as_str())])),
-            (
-                "queue_execution",
-                Arc::new(BooleanArray::from(vec![submission.is_some()])),
-            ),
+            ("binding_id", Cell::text(self.binding())),
+            ("group_id", Cell::text(self.group())),
+            ("origin", Cell::text(Some(origin.as_str()))),
+            ("queue_execution", Cell::Flag(submission.is_some())),
             (INPUTS, inputs),
-            (
-                ACTIVATION,
-                VariantColumnBuilder::encode(
-                    ACTIVATION,
-                    [activation.as_ref()],
-                    EncodedVariant::from_serialize,
-                )?,
-            ),
-            ("recorded_at", timestamps([Some(self.started_at)])),
+            (ACTIVATION, variant(ACTIVATION, activation.as_ref())?),
+            ("recorded_at", time(Some(self.started_at))),
         ])
     }
 
-    /// Assemble table `T`'s batch from its named authored columns.
+    /// Assemble table `T`'s row from its named authored values.
     ///
-    /// `T::arrow_fields()` is the only schema authority: the columns are
+    /// `T::arrow_fields()` is the only schema authority: the values are
     /// ordered by its field names (see [`Self::assemble`]) under `T`'s shared
-    /// schema in [`SCHEMAS`], and the batch is addressed to the table's fully
+    /// schema in [`SCHEMAS`], and the row is addressed to the table's fully
     /// qualified name.
     ///
     /// # Errors
-    /// Returns [`ResultPayloadError::ColumnMismatch`] when the columns do not
-    /// name each field exactly once, or an Arrow error when a column does not
+    /// Returns [`ResultPayloadError::ColumnMismatch`] when the values do not
+    /// name each field exactly once, or an Arrow error when a value does not
     /// match its field.
     ///
     /// # Panics
@@ -457,42 +429,39 @@ impl<'a> ResultPayloadBuilder<'a> {
     fn finish<T: DomainTable + 'static>(
         &self,
         columns: Vec<NamedColumn>,
-    ) -> Result<ResultBatch, ResultPayloadError> {
-        let schema = SCHEMAS
+    ) -> Result<ResultRow, ResultPayloadError> {
+        let (_, table, schema) = SCHEMAS
             .iter()
-            .find(|(table, _)| *table == TypeId::of::<T>())
-            .map(|(_, schema)| Arc::clone(schema))
+            .find(|(table, _, _)| *table == TypeId::of::<T>())
             .expect("every result table has a shared schema");
-        Ok(ResultBatch {
-            table: format!("bifrost.{}.{}", T::NAMESPACE, T::NAME),
-            batch: self.assemble(schema, columns)?,
+        Ok(ResultRow {
+            table,
+            row: self.assemble(Arc::clone(schema), columns)?,
         })
     }
 
-    /// Order named columns by `schema`'s table fields, then append the
-    /// correlation columns.
+    /// Order named values by `schema`'s table fields, then append the
+    /// correlation values.
     ///
     /// `schema` is a table's fields followed by the [`CORRELATION`] columns.
-    /// Every authored column must fill exactly one table field by name; the
-    /// arrays are placed in field order, never in authoring order, so a
+    /// Every authored value must fill exactly one table field by name; the
+    /// values are placed in field order, never in authoring order, so a
     /// reordered declaration keeps each value under its own name. The shared
-    /// dimensions and correlation columns repeat the run's context for the
-    /// authored row count.
+    /// dimensions and correlation columns carry the run's context.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::ColumnMismatch`] with problem
     /// `duplicate` when a name is authored twice, `missing` when a field has
-    /// no column, or `unexpected` when a column names no field; returns an
-    /// Arrow error when a column does not match its field's type or length.
+    /// no value, or `unexpected` when a value names no field; returns an
+    /// Arrow error when a value does not match its field's type.
     fn assemble(
         &self,
         schema: SchemaRef,
         columns: Vec<NamedColumn>,
-    ) -> Result<RecordBatch, ResultPayloadError> {
-        let rows = columns.first().map_or(0, |(_, array)| array.len());
-        let mut named: HashMap<&'static str, ArrayRef> = HashMap::with_capacity(columns.len());
-        for (name, array) in columns {
-            if named.insert(name, array).is_some() {
+    ) -> Result<StagedRow, ResultPayloadError> {
+        let mut named: HashMap<&'static str, Cell> = HashMap::with_capacity(columns.len());
+        for (name, cell) in columns {
+            if named.insert(name, cell).is_some() {
                 return Err(ResultPayloadError::ColumnMismatch {
                     column: name.to_owned(),
                     problem: "duplicate",
@@ -508,24 +477,18 @@ impl<'a> ResultPayloadBuilder<'a> {
                 (SUBJECT_NAME, None),
                 (SUBJECT_VERSION, None),
             ]
-            .map(|(name, value)| {
-                let column = match (value, rows) {
-                    (None, 1) => Arc::clone(&ONE_NULL_TEXT),
-                    (value, rows) => text(std::iter::repeat_n(value, rows)),
-                };
-                (name, column)
-            }),
+            .map(|(name, value)| (name, Cell::text(value))),
         );
         let fields = schema.fields();
-        let mut arrays = Vec::with_capacity(fields.len());
+        let mut cells = Vec::with_capacity(fields.len());
         for field in &fields[..fields.len().saturating_sub(CORRELATION.len())] {
-            let array = named.remove(field.name().as_str()).ok_or_else(|| {
+            let cell = named.remove(field.name().as_str()).ok_or_else(|| {
                 ResultPayloadError::ColumnMismatch {
                     column: field.name().clone(),
                     problem: "missing",
                 }
             })?;
-            arrays.push(array);
+            cells.push(cell);
         }
         if let Some(name) = named.into_keys().next() {
             return Err(ResultPayloadError::ColumnMismatch {
@@ -533,16 +496,12 @@ impl<'a> ResultPayloadBuilder<'a> {
                 problem: "unexpected",
             });
         }
-        arrays.push(text(std::iter::repeat_n(self.owner(), rows)));
-        arrays.push(text(std::iter::repeat_n(
-            Some(self.run.card_uid.as_str()),
-            rows,
-        )));
-        arrays.push(text(std::iter::repeat_n(
-            self.run.run_id.map(RunId::as_str),
-            rows,
-        )));
-        Ok(RecordBatch::try_new(schema, arrays)?)
+        cells.extend([
+            Cell::text(self.owner()),
+            Cell::text(Some(self.run.card_uid.as_str())),
+            Cell::text(self.run.run_id.map(RunId::as_str)),
+        ]);
+        Ok(StagedRow::new(schema, cells)?)
     }
 
     /// The binding owner Card UID, null for an execution with no binding.
@@ -572,34 +531,24 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<String, JsonError> {
     serde_jcs::to_string(&serde_json::to_value(value)?)
 }
 
-/// Build a nullable UTF-8 column sized to its values.
+/// The Variant cell of `value`, encoded and validated now, named `field` in
+/// a refusal.
 ///
-/// [`arrow::array::StringArray::from_iter`] reserves a kilobyte of value
-/// bytes whatever it holds, which a one-row result column would carry while
-/// it is staged.
-fn text<S: AsRef<str>>(values: impl IntoIterator<Item = Option<S>>) -> ArrayRef {
-    let values: Vec<Option<S>> = values.into_iter().collect();
-    let bytes = values
-        .iter()
-        .flatten()
-        .map(|value| value.as_ref().len())
-        .sum();
-    let mut builder = StringBuilder::with_capacity(values.len(), bytes);
-    builder.extend(values);
-    Arc::new(builder.finish())
+/// # Errors
+/// Returns [`ResultPayloadError::Variant`] when `value` exceeds a Variant
+/// limit.
+fn variant<T: Serialize>(field: &str, value: Option<&T>) -> Result<Cell, ResultPayloadError> {
+    let encoded = value
+        .map(EncodedVariant::from_serialize)
+        .transpose()
+        .map_err(|violation| violation.into_error(field, 0))?;
+    Ok(Cell::Variant(encoded))
 }
 
-/// Build a nullable microsecond timestamp column in the stored
-/// [`UTC_TIME_ZONE`] spelling every built-in result table declares.
-fn timestamps(values: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> ArrayRef {
-    Arc::new(
-        TimestampMicrosecondArray::from_iter(
-            values
-                .into_iter()
-                .map(|value| value.map(|at| at.timestamp_micros())),
-        )
-        .with_timezone(UTC_TIME_ZONE),
-    )
+/// The microsecond timestamp cell of `value`, stored in the UTC spelling
+/// every built-in result table declares.
+fn time(value: Option<DateTime<Utc>>) -> Cell {
+    Cell::Micros(value.map(|at| at.timestamp_micros()))
 }
 
 #[cfg(test)]
@@ -609,6 +558,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use arrow::array::{Array, AsArray};
+    use arrow::record_batch::RecordBatch;
     use chrono::TimeZone;
     use serde_json::Value;
     use wyrd_spec::card::drift::DriftMethod;
@@ -745,6 +695,11 @@ mod tests {
         }
     }
 
+    /// The one-row batch `row` builds into.
+    fn project(row: &ResultRow) -> RecordBatch {
+        StagedRow::project(std::slice::from_ref(&row.row)).expect("row projects")
+    }
+
     /// Read one UTF-8 cell.
     fn cell(batch: &RecordBatch, column: &str, row: usize) -> Option<String> {
         let array = batch
@@ -766,13 +721,14 @@ mod tests {
         let run = TestRun::new();
         let outcome = outcome();
         let payload = run.builder().build(&outcome).expect("outcome maps");
-        let [output, summary] = payload.batches() else {
+        let [output, summary] = payload.rows() else {
             panic!("output then summary");
         };
         assert_eq!(output.table, "bifrost.verification.execution_outputs");
         assert_eq!(summary.table, "bifrost.verification.results");
         let execution = run.execution_id.to_string();
-        for batch in [&output.batch, &summary.batch] {
+        let (output, summary) = (project(output), project(summary));
+        for batch in [&output, &summary] {
             assert_eq!(batch.num_rows(), 1);
             assert_eq!(
                 cell(batch, "result_id", 0),
@@ -780,7 +736,7 @@ mod tests {
             );
             assert_eq!(cell(batch, "execution_id", 0).as_ref(), Some(&execution));
         }
-        let summary = &summary.batch;
+        let summary = &summary;
         assert_eq!(cell(summary, "verdict", 0).as_deref(), Some("failed"));
         assert_eq!(
             cell(summary, RUN_ID, 0).as_deref(),
@@ -789,7 +745,6 @@ mod tests {
         assert!(summary.column_by_name(OUTPUT).is_none());
         let stored = wyrd_queue::variant::variant_cell_to_json(
             output
-                .batch
                 .column_by_name(OUTPUT)
                 .expect("output column")
                 .as_ref(),
@@ -820,16 +775,13 @@ mod tests {
         let second = run.builder().build(&outcome).expect("outcome maps");
         assert_ne!(first.result_id(), second.result_id());
         let execution = |payload: &ResultPayload| {
-            let summary = payload.batches().last().expect("a summary batch");
-            cell(&summary.batch, "execution_id", 0)
+            let summary = payload.rows().last().expect("a summary row");
+            cell(&project(summary), "execution_id", 0)
         };
         assert_eq!(execution(&first), Some(run.execution_id.to_string()));
         assert_eq!(execution(&first), execution(&second));
-        for (ours, theirs) in first.batches().iter().zip(second.batches()) {
-            assert!(Arc::ptr_eq(
-                ours.batch.schema_ref(),
-                theirs.batch.schema_ref()
-            ));
+        for (ours, theirs) in first.rows().iter().zip(second.rows()) {
+            assert!(Arc::ptr_eq(ours.row.schema(), theirs.row.schema()));
         }
     }
 
@@ -883,12 +835,12 @@ mod tests {
             ),
             (
                 "duplicate",
-                |columns| columns.push(("verdict", text([Some("passed")]))),
+                |columns| columns.push(("verdict", Cell::text(Some("passed")))),
                 "verdict",
             ),
             (
                 "unexpected",
-                |columns| columns.push(("bogus", text([Some("x")]))),
+                |columns| columns.push(("bogus", Cell::text(Some("x")))),
                 "bogus",
             ),
         ];
@@ -908,29 +860,6 @@ mod tests {
                 ),
                 "{expected_problem}: got {error:?}"
             );
-        }
-    }
-
-    /// Proves a one-row text column holds memory near its value's length,
-    /// not a builder's default reservation, since every staged result row
-    /// is admitted to the Scribe outbox by the memory it holds, and that a
-    /// null, empty, or multi-byte value keeps its exact representation.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a column holds 256 bytes or more, or a value changes.
-    #[test]
-    fn a_one_row_text_column_holds_about_its_value() {
-        let execution = ExecutionId::new_v7().to_string();
-        for value in [Some(execution.as_str()), None, Some(""), Some("vérifié ✓")] {
-            let column = text([value]);
-            assert!(
-                column.get_array_memory_size() < 256,
-                "{value:?} holds {} bytes",
-                column.get_array_memory_size()
-            );
-            let column = column.as_string::<i32>();
-            assert_eq!(column.is_valid(0).then(|| column.value(0)), value);
         }
     }
 }

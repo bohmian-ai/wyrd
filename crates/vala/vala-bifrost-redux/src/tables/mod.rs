@@ -33,6 +33,7 @@ pub mod logs;
 pub mod managed_columns;
 pub mod metrics;
 pub mod signal;
+pub mod staged;
 pub mod traces;
 pub mod verification;
 

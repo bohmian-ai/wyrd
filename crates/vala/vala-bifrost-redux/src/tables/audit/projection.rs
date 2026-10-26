@@ -1,20 +1,19 @@
-//! Pure projection of one staged audit decision into one row-attributed
-//! audit batch.
+//! Pure projection of one staged audit decision into one owned
+//! row-attributed audit row.
 
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{ArrayRef, RecordBatch, StringBuilder, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
-use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+use wyrd_queue::variant::EncodedVariant;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
-use wyrd_spec::vala::audit_detail_canonical_json;
 use wyrd_spec::vala::managed_columns::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID, WYRD_REQUEST_ID};
 
 use super::{AuditLogTable, DETAIL};
+use crate::tables::staged::{Cell, StagedRow};
 use crate::tables::{DomainTable, SHARED_DIMENSIONS};
 
 /// The `audit_log` content schema followed by the decision's carried pair
@@ -42,70 +41,63 @@ pub enum AuditProjectionError {
     Arrow(#[from] ArrowError),
 }
 
-/// Projects `event`, decided at `decided_at`, into one `audit_log` row.
+/// Stages `event`, decided at `decided_at`, as one `audit_log` row.
 ///
-/// Column order follows [`AuditLogTable::arrow_fields`], whose shared
+/// Cell order follows [`AuditLogTable::arrow_fields`], whose shared
 /// dimensions are null, then the decision's `sub_principal_id`,
 /// `act_principal_id`, and `wyrd_request_id`, which Scribe carries into the
-/// managed envelope of a row-attributed frame. The detail is its canonical
-/// JSON encoded as a Variant, the outcome and subject kind their stable
-/// snake-case tags, and the decision instant is the `created_at` time column,
-/// so a retained row partitions by when the boundary decided rather than when
-/// it was written.
+/// managed envelope of a row-attributed frame. The detail is encoded
+/// directly as a Variant when staged, the outcome and subject kind their
+/// stable snake-case tags, and the decision instant is the `created_at` time
+/// column, so a retained row partitions by when the boundary decided rather
+/// than when it was written. The Scribe outbox builds a slice's staged rows
+/// into one batch with [`StagedRow::project`].
 ///
 /// # Errors
 ///
-/// Returns [`AuditProjectionError::InvalidDetail`] when the canonical detail
-/// exceeds a Variant limit, and [`AuditProjectionError::Arrow`] when the batch
-/// cannot be assembled.
-pub fn project_audit_event(
+/// Returns [`AuditProjectionError::InvalidDetail`] when the detail exceeds a
+/// Variant limit, and [`AuditProjectionError::Arrow`] when the cells do not
+/// fill the audit schema.
+pub fn stage_audit_event(
     event: &AuditEvent,
     decided_at: DateTime<Utc>,
-) -> Result<RecordBatch, AuditProjectionError> {
-    // Sized to the value: `StringArray::from` reserves a kilobyte per column,
-    // which the staged row would hold until Scribe acknowledges it.
-    let text = |value: Option<String>| {
-        let mut column = StringBuilder::with_capacity(1, value.as_ref().map_or(0, String::len));
-        column.append_option(value);
-        Arc::new(column.finish()) as ArrayRef
+) -> Result<StagedRow, AuditProjectionError> {
+    let detail = event
+        .detail
+        .as_ref()
+        .map(EncodedVariant::from_serialize)
+        .transpose()
+        .map_err(|violation| {
+            AuditProjectionError::InvalidDetail(violation.into_error(DETAIL, 0))
+        })?;
+    let outcome = match event.outcome {
+        AuditOutcome::Allowed => "allowed",
+        AuditOutcome::Denied => "denied",
     };
-    let detail = event.detail.as_ref().map(audit_detail_canonical_json);
-    let detail =
-        VariantColumnBuilder::encode(DETAIL, [detail.as_deref()], EncodedVariant::from_json_text)
-            .map_err(AuditProjectionError::InvalidDetail)?;
-    let mut columns = vec![
-        text(event.trace_id.clone()),
-        text(Some(event.operation.clone())),
-        text(Some(event.resource.clone())),
-        text(event.card_ref.as_ref().map(ToString::to_string)),
-        text(Some(event.sub_principal_kind.as_str().to_owned())),
-        text(Some(event.permission.clone())),
-        text(Some(
-            match event.outcome {
-                AuditOutcome::Allowed => "allowed",
-                AuditOutcome::Denied => "denied",
-            }
-            .to_owned(),
-        )),
-        detail,
-        text(event.credential_id.map(|id| id.to_string())),
-        Arc::new(
-            TimestampMicrosecondArray::from(vec![decided_at.timestamp_micros()])
-                .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
-        ),
+    let mut cells = vec![
+        Cell::text(event.trace_id.as_deref()),
+        Cell::text(Some(event.operation.as_str())),
+        Cell::text(Some(event.resource.as_str())),
+        Cell::text(event.card_ref.as_ref().map(ToString::to_string)),
+        Cell::text(Some(event.sub_principal_kind.as_str())),
+        Cell::text(Some(event.permission.as_str())),
+        Cell::text(Some(outcome)),
+        Cell::Variant(detail),
+        Cell::text(event.credential_id.map(|id| id.to_string())),
+        Cell::Micros(Some(decided_at.timestamp_micros())),
     ];
-    columns.extend(SHARED_DIMENSIONS.map(|_| text(None)));
-    columns.extend([
-        text(Some(event.sub_principal_id.to_string())),
-        text(Some(event.act_principal_id.to_string())),
-        text(Some(event.request_id.as_str().to_owned())),
+    cells.extend(SHARED_DIMENSIONS.map(|_| Cell::Text(None)));
+    cells.extend([
+        Cell::text(Some(event.sub_principal_id.to_string())),
+        Cell::text(Some(event.act_principal_id.to_string())),
+        Cell::text(Some(event.request_id.as_str())),
     ]);
-    Ok(RecordBatch::try_new(Arc::clone(&AUDIT_SCHEMA), columns)?)
+    Ok(StagedRow::new(Arc::clone(&AUDIT_SCHEMA), cells)?)
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Array, StringArray};
+    use arrow::array::{Array, RecordBatch, StringArray, TimestampMicrosecondArray};
     use chrono::TimeZone;
     use uuid::Uuid;
     use wyrd_queue::variant::variant_cell_to_json;
@@ -115,6 +107,16 @@ mod tests {
 
     use super::*;
     use crate::tables::audit::{CREATED_AT, CREDENTIAL_ID};
+
+    /// `event` staged at `decided_at` and built as a one-row batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the decision cannot be staged or built.
+    fn project(event: &AuditEvent, decided_at: DateTime<Utc>) -> RecordBatch {
+        let row = stage_audit_event(event, decided_at).expect("valid projection");
+        StagedRow::project(&[row]).expect("one row builds")
+    }
 
     /// Builds one denied system decision for the projection tests.
     fn event() -> AuditEvent {
@@ -149,7 +151,7 @@ mod tests {
             .single()
             .expect("valid test timestamp");
 
-        let row = project_audit_event(&event, decided_at).expect("valid projection");
+        let row = project(&event, decided_at);
 
         assert_eq!(row.num_rows(), 1);
         assert_eq!(row.num_columns(), 19);
@@ -204,35 +206,14 @@ mod tests {
             analytical_slots: 4,
             total_slots: 7,
         });
-        let canonical = audit_detail_canonical_json(event.detail.as_ref().expect("detail"));
+        let canonical =
+            wyrd_spec::vala::audit_detail_canonical_json(event.detail.as_ref().expect("detail"));
 
-        let row = project_audit_event(&event, Utc::now()).expect("valid projection");
+        let row = project(&event, Utc::now());
 
         assert_eq!(
             variant_cell_to_json(row.column(7).as_ref(), 0).expect("decodes"),
             serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical JSON")
         );
-    }
-
-    /// Every text column of a projected decision holds memory near its
-    /// value's length, not a builder's default reservation, since the
-    /// staged row is admitted to the Scribe outbox by the memory it holds.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a text column holds 256 bytes or more.
-    #[test]
-    fn text_columns_hold_about_their_values() {
-        let row = project_audit_event(&event(), Utc::now()).expect("valid projection");
-        for (field, column) in row.schema().fields().iter().zip(row.columns()) {
-            if field.data_type() == &DataType::Utf8 {
-                assert!(
-                    column.get_array_memory_size() < 256,
-                    "{} holds {} bytes",
-                    field.name(),
-                    column.get_array_memory_size()
-                );
-            }
-        }
     }
 }

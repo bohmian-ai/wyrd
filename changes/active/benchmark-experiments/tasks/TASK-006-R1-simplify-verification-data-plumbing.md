@@ -1490,3 +1490,70 @@ selector labels and all seven named existing selectors. An independent
 read-only comprehension pass over the full task and current spec found no
 material ambiguity or contradiction in this revision. No implementation,
 runtime proof, benchmark execution or performance PASS is claimed here.
+
+### Approved revision execution evidence — Steps 1–5
+
+Commits: `e39c9d4e5` (Step 1), `cd26d66d3` (design owners), `c5d0ed5ad`
+(Steps 2–3; also carries the maintainer's earlier uncommitted
+`tables/audit/projection.rs` detail edit), `f50fdd9fb` (Step 4). Shards 1,
+writer/lane/frame/outbox bounds, fail-fast admission, frame identity and the
+three tables are unchanged.
+
+| Obligation | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Step 1 / P1 validation-only Variant | `wyrd-queue/src/variant.rs::EncodedVariant::validate_bytes`; `tables::validate_variant_values` delegates to it | `variant::tests::validation_only_matches_owned_validation`; `tables::` 47/47; `wyrd-queue --lib` 61/61 | PASS |
+| Step 2 / P2 dense producer batches | `tables/staged.rs::{Cell, StagedRow}` (`project` with exactly sized builders); `stage_audit_event`; `verification/results.rs::ResultRow`; `scribe_outbox.rs::Part::dense` builds one batch per destination at drain | `scribe_outbox::tests::dense_projection_preserves_records_and_attribution`; `tables::staged::tests::staged_rows_project_into_one_dense_batch`; `scribe_outbox::tests::staged_writes_charge_their_owned_memory` | PASS |
+| Step 3 / P3 local canonical, peer IPC | `FramePayload::{Ipc, Rows}`; local route submits `IngressPayload::Canonical` with IPC-derived `batch_id` and wire bytes; peer route keeps IPC validation (`grpc/capture_peer.rs`) | `scribe_outbox::tests::local_canonical_and_peer_ipc_preserve_frames_and_replay` (same batch-id→rows map on both routes, lost-ACK replay); `scribe::tests::scribe_persistence_path::canonical_nested_batches_share_one_managed_wal_path` extended with dense audit rows canonical and as IPC, and a corrupt Variant stream refused; `gate::attribution::tests::batch_card_uids_match_the_encoded_stream` | PASS |
+| Step 4 / P4 gathered sort | `scribe/parquet_writer.rs::ParquetBatchEncoder::prepare_sorted_candidate`: key-only `concat` + `lexsort_to_indices` + `interleave_record_batch`; one `Persistence` lease for keys, positions and output before building; `sort_batch` removed, comparator kept as `sort_keys` | `gathered_sort_matches_concatenated_reference` (4 source batches, equal keys, nulls in two keys, desc/nulls-first, hour boundary, Variant + list payloads, five candidate ranges, explicit expected keys); `gathered_sort_respects_persistence_admission` (RED: fails with the reservation removed; GREEN); existing 3 + `sort_batch_uses_one_key_for_every_table` 6/6; `scribe::` lib 379/379 with Postgres; `wyrd-testing --test scribe` `cross_shard` + `source_boundary` 2/2 | PASS |
+| Carry-forward V1/V6/V7, RV1/RV2 | — | `wyrd-server --features test-support --lib` 580/580; V6 68/68; V1+V7 `wyrd-ai` 5/5; `vala-bifrost-redux` `tables::|audit|execution_lanes` 91; `wyrd-runtime` RV selectors 4/4 | PASS |
+| Boundaries | — | `fmt`, `lints`, `docs:check`, `check:deps`, `check:tenant-isolation`, `git diff --check` exit 0 | PASS |
+| Step 5 / P5 all L1 criteria | — | clean records on `f50fdd9fb` below | FAIL |
+
+Test replacement mapping: `a_one_row_text_column_holds_about_its_value`
+(sized one-row text) → `staged_rows_project_into_one_dense_batch` (asserts
+exactly sized builder capacity) and `StagedRow::owned_bytes`;
+`shared_buffer_charges_preserve_owned_memory` (charge equals owned bytes, large
+output charged above its value) → `staged_writes_charge_their_owned_memory`
+(same two assertions over staged rows). No assertion was weakened.
+
+Diagnosis — `pg_verification_groups::available_rows_form_expiring_group_snapshots`:
+
+- **Symptom:** 2 of 5 runs panicked at the `next` snapshot assertion with `group: null`.
+- **Evidence:** an independent read-only diagnostician traced the scheduler staging the selector record after the Postgres commit; `get_execution` reads the group from Bifrost, which had not yet published it. Reproduced on HEAD before this revision.
+- **Cause:** the test read a Bifrost projection without flushing the write it depends on.
+- **Fix site:** test `Support::snapshot` calls `server.flush_bifrost()` before reading; production read semantics unchanged. 68/68 afterwards.
+
+P5 records (clean, unprofiled, `f50fdd9fb`, same host and configuration as
+the earlier records: 1 shard, `SCRIBE_WRITERS` 4, `SCRIBE_LANES` 4,
+`FRAMES_IN_FLIGHT` 8, outbox 65,536 items / 1 GiB):
+
+| Experiment | Record | Verdict | Red criteria | Prior record |
+|---|---|---|---|---|
+| verification | `20261026T215213Z`, `20261026T215339Z` | INVALID | smoke prepass `driver.saturated` c64: 6.96 and 6.74 cores > 6.40; full run not admitted | `193658Z-415082a72` c64 p99 1.169 ms |
+| gateway | `20261026T215452Z` | INVALID | chat-capture c64 p99 4.514 ms, capture-shed; chat c64 p99 0.517 ms, capture-shed | `095850Z-300c60a1d` chat-capture c64 4.432 ms, capture-shed |
+| bifrost writes-parquet | `20261026T220142Z` | INVALID | `budget.exceeded` 311.8 s > 300 s; c64 native 2 of 3 reps | `073045Z-69f3a066d` 351.4 s, OTLP spans floor 15.2 < 30 |
+| bifrost hot | `20261026T220746Z` | INVALID | point-c64 p99 8.0 ms ≥ 5 | `095656Z-300c60a1d` 9.62 ms |
+| bifrost parquet | `20261026T221256Z` | INVALID | point-c64 p99 13.13 ms ≥ 5 | `073846Z-69f3a066d` 13.98 ms |
+
+Diagnosis — verification smoke `driver.saturated`:
+
+- **Symptom:** both prepasses INVALID on driver CPU; no full run admitted.
+- **Evidence:** smoke c64 completed 200,645 verifications (vs 166,274 in the `415082a72` smoke PASS) with driver CPU 20.9 s vs 16.5 s, about 104 vs 99 µs per request; smoke c64 overhead p99 0.740 ms vs 0.985 ms.
+- **Cause:** server-side cost per verification fell, so the closed-loop 64-client driver issues more requests at an unchanged per-request driver cost and crosses its 80%-of-8-cores guard.
+- **Fix site:** the capacity driver's budget or per-request cost — a benchmark criterion/driver change outside this approval. Smoke p99 0.74 ms also remains above 0.5 ms.
+
+Gateway capture, Bifrost writes budget and Bifrost point-c64 failures were
+present at earlier commits; Steps 1–4 do not touch the Gateway capture
+handoff or the query paths.
+
+Remaining limitation: P5 is red. Verification c64 is not measurable under the
+current driver guard and its smoke p99 misses 0.5 ms; Gateway and Bifrost
+retain their prior red criteria. The task is not complete. Maintainer
+direction is required on the driver budget/efficiency and on the Gateway and
+Bifrost criteria, which this revision does not authorize changing.
+
+Commands: P1–P4 exact selectors as listed in the reuse map;
+`mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/^scribe::/)'"`;
+`mise run bench:l1:verification` (twice), `bench:l1:gateway`,
+`bench:l1:bifrost:writes`, `bench:l1:bifrost:hot`, `bench:l1:bifrost:parquet`,
+sequential with no overlapping builds.

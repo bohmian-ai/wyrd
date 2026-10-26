@@ -570,6 +570,54 @@ impl WyrdTestServer {
             .map_err(py_error)
     }
 
+    /// Wait until the server's staged Scribe writes reach Scribe, leaving them live.
+    ///
+    /// Gateway calls and Verifier results are written to Scribe in the
+    /// background; after this returns they are queryable from the memtable,
+    /// and nothing is sealed or published.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive or the
+    /// staged writes do not reach Scribe within the harness bound.
+    fn settle_bifrost_outbox(&self) -> WyrdPyResult<()> {
+        let server = self.started()?;
+        wyrd_runtime::runtime()
+            .block_on(server.settle_bifrost_outbox())
+            .map_err(py_error)
+    }
+
+    /// Freeze the memtable and wait until its rows are staged runs, without publishing them.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive, the
+    /// server owns no Scribe, or a shard cannot freeze its generations.
+    fn stage_bifrost(&self) -> WyrdPyResult<()> {
+        let server = self.started()?;
+        wyrd_runtime::runtime()
+            .block_on(server.stage_bifrost_writable_for_test())
+            .map_err(py_error)
+    }
+
+    /// Where each generation this server's Scribe tracks is readable now.
+    ///
+    /// Returns one label per frozen generation: `memtable`, `staged_run`, or
+    /// `published`. Rows still accepting writes belong to no frozen
+    /// generation and are not listed.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive or the
+    /// server owns no Scribe.
+    fn bifrost_hot_authorities(&self) -> WyrdPyResult<Vec<&'static str>> {
+        let server = self.started()?;
+        let authorities = server
+            .bifrost_live_authorities_for_test()
+            .map_err(py_error)?;
+        Ok(authorities
+            .iter()
+            .map(|live| live.authority.label())
+            .collect())
+    }
+
     /// Bring a binding's schedule cursor to database time, so the
     /// verification runtime schedules its next occurrence now.
     ///

@@ -1216,6 +1216,32 @@ impl WyrdTestServer {
         usize::from(self.serve_handle.is_some())
     }
 
+    /// Wait until every write staged on the server's Scribe outbox has reached Scribe.
+    ///
+    /// Audit decisions, gateway captures, and Verifier results are staged on
+    /// the outbox and written to Scribe in the background. After this returns,
+    /// the writes staged before the call are in Scribe's memtable and
+    /// queryable, and nothing has been sealed or published, so a journey can
+    /// query rows that are still live.
+    ///
+    /// # Errors
+    /// Returns an error when staged writes do not reach Scribe within the bound.
+    pub async fn settle_bifrost_outbox(&self) -> Result<(), WyrdTestServerError> {
+        let unwritten = self
+            .inner
+            .state
+            .bifrost
+            .scribe_outbox()
+            .settle(std::time::Instant::now() + FLUSH_BIFROST_BOUND)
+            .await;
+        if unwritten != 0 {
+            return Err(WyrdTestServerError::Flush(format!(
+                "{unwritten} staged Scribe writes did not settle within {FLUSH_BIFROST_BOUND:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Flush the server-owned Scribe through its staged and claim lifecycle.
     ///
     /// The server's Scribe outbox settles first, so audit decisions, gateway
@@ -1230,18 +1256,7 @@ impl WyrdTestServer {
     /// does not settle within the bound, the server has no Scribe, or a
     /// residue claim cannot publish.
     pub async fn flush_bifrost(&self) -> Result<(), WyrdTestServerError> {
-        let unwritten = self
-            .inner
-            .state
-            .bifrost
-            .scribe_outbox()
-            .settle(std::time::Instant::now() + FLUSH_BIFROST_BOUND)
-            .await;
-        if unwritten != 0 {
-            return Err(WyrdTestServerError::Flush(format!(
-                "{unwritten} staged Scribe writes did not settle within {FLUSH_BIFROST_BOUND:?}"
-            )));
-        }
+        self.settle_bifrost_outbox().await?;
         tokio::time::timeout(
             FLUSH_BIFROST_BOUND,
             self.inner.state.flush_scribe_for_test(),
@@ -1276,6 +1291,26 @@ impl WyrdTestServer {
         self.bifrost_scribe()
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))?
             .flush_writable_for_test()
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+    }
+
+    /// Freeze every writable generation and wait until each is a staged run.
+    ///
+    /// Unlike [`seal_bifrost_writable_for_test`](Self::seal_bifrost_writable_for_test),
+    /// which returns once the freeze is queued, this returns once the frozen
+    /// rows are durable staged runs, and nothing has published them. It is the
+    /// first half of [`flush_bifrost`](Self::flush_bifrost), so a journey can
+    /// query rows that staged runs serve.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server owns no Scribe, or when a shard cannot
+    /// freeze its writable generations.
+    pub async fn stage_bifrost_writable_for_test(&self) -> Result<(), WyrdTestServerError> {
+        self.bifrost_scribe()
+            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))?
+            .stage_writable_for_test()
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }

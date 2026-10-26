@@ -118,6 +118,42 @@ class WyrdTestServer:
                 within the harness bound.
         """
         ...
+
+    def settle_bifrost_outbox(self) -> None:
+        """Wait until the server's staged Scribe writes reach Scribe, leaving them live.
+
+        Gateway calls and Verifier results are written to Scribe in the
+        background; after this returns they are queryable from the memtable,
+        and nothing is sealed or published.
+
+        Raises:
+            WyrdError: Outside the context manager, or when the staged writes
+                do not reach Scribe within the harness bound.
+        """
+        ...
+
+    def stage_bifrost(self) -> None:
+        """Freeze the memtable and wait until its rows are staged runs, without publishing them.
+
+        Raises:
+            WyrdError: Outside the context manager, when the server owns no
+                Scribe, or when a shard cannot freeze its generations.
+        """
+        ...
+
+    def bifrost_hot_authorities(self) -> list[str]:
+        """Where each generation the server's Scribe tracks is readable now.
+
+        Returns:
+            One label per frozen generation: ``memtable``, ``staged_run``, or
+            ``published``. Rows still accepting writes belong to no frozen
+            generation and are not listed.
+
+        Raises:
+            WyrdError: Outside the context manager, or when the server owns no
+                Scribe.
+        """
+        ...
     def __enter__(self) -> WyrdTestServer: ...
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool: ...
     @property

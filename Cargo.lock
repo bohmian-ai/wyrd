@@ -10334,6 +10334,10 @@ name = "wyrd-loader"
 version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
+ "calamine",
+ "csv",
+ "lopdf",
+ "quick-xml",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -10345,6 +10349,7 @@ dependencies = [
  "wyrd-config",
  "wyrd-semver",
  "wyrd-spec",
+ "zip",
 ]
 
 [[package]]
@@ -10536,11 +10541,9 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bytes",
- "calamine",
  "chrono",
  "clap",
  "crc32c",
- "csv",
  "datafusion",
  "flate2",
  "futures-util",
@@ -10551,7 +10554,6 @@ dependencies = [
  "insta",
  "jsonschema",
  "jsonwebtoken",
- "lopdf",
  "lru",
  "metrics",
  "metrics-exporter-prometheus",
@@ -10563,7 +10565,6 @@ dependencies = [
  "oauth2",
  "object_store",
  "opentelemetry",
- "quick-xml",
  "rand 0.9.5",
  "reqwest 0.13.4",
  "rmcp",

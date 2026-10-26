@@ -8,6 +8,7 @@
 mod config;
 mod diagnose;
 mod error;
+mod extract;
 mod manifest;
 mod order;
 mod parse;
@@ -20,6 +21,9 @@ use std::path::{Path, PathBuf};
 
 pub use diagnose::{Diagnostic, Severity, SourceSpan, emit_json};
 pub use error::LoadError;
+pub use extract::{
+    EXTRACT_VERSION, ExtractError, ExtractLimits, Extraction, locates, units, zip_guard,
+};
 pub use manifest::{ArtifactManifest, build_artifact_manifest};
 pub use parse::AuthoredCard;
 pub use wyrd_spec::registry::{CardSubmission, RelativeArtifactPath};

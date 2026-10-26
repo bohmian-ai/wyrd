@@ -25,9 +25,9 @@ use vala_verify::blocks::{BlockError, CallInput, CallValue};
 use wyrd_spec::ids::SlotName;
 use wyrd_spec::verification::execution::Locator;
 
-use super::HostedLimits;
 use super::evidence::TenantEvidence;
-use super::extract::{Extraction, units, zip_guard};
+use super::{HostedLimits, extract_refused};
+use wyrd_loader::{Extraction, units, zip_guard};
 
 /// Process-wide admission of scratch workspaces.
 pub struct Workspaces {
@@ -215,7 +215,9 @@ impl Workspace {
         });
         let units = match format {
             Some(format) if format.is_extractable() => {
-                let output = Extraction::new(&self.limits).run(&bytes, format)?;
+                let output = Extraction::new(&self.limits.extract())
+                    .run(&bytes, format)
+                    .map_err(extract_refused)?;
                 Some(units(&output, &bytes))
             }
             _ => None,
@@ -241,7 +243,7 @@ impl Workspace {
     /// Returns [`BlockError::Terminal`] for a guarded limit, an entry that is
     /// a link or escapes the archive, or a file over the file limit.
     fn unzip(&mut self, file: &Staged, scratch: &mut u64) -> Result<(), BlockError> {
-        zip_guard(&file.bytes, &self.limits)?;
+        zip_guard(&file.bytes, &self.limits.extract()).map_err(extract_refused)?;
         let mut archive = zip::ZipArchive::new(Cursor::new(file.bytes.as_slice()))
             .map_err(|error| terminal(format!("{}: {error}", file.path)))?;
         for index in 0..archive.len() {
@@ -607,7 +609,9 @@ impl Workspace {
             return Err(terminal(format!("{path} exceeds the work budget")));
         }
         let bytes = std::fs::read(&host).map_err(io)?;
-        let output = Extraction::new(&self.limits).run(&bytes, MediaFormat::Text)?;
+        let output = Extraction::new(&self.limits.extract())
+            .run(&bytes, MediaFormat::Text)
+            .map_err(extract_refused)?;
         Ok(units(&output, &bytes))
     }
 }

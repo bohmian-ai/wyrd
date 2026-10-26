@@ -13,6 +13,10 @@ path = "src/lib.rs"
 
 [dependencies]
 base64 = { workspace = true }
+calamine = { workspace = true }
+csv = { workspace = true }
+lopdf = { workspace = true }
+quick-xml = { workspace = true }
 schemars = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -21,6 +25,7 @@ serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 wyrd-config = { workspace = true }
 wyrd-spec = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true

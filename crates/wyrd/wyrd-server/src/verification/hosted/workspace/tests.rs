@@ -1,12 +1,32 @@
 //! Workspaces stay inside their directory, inside their limits, and serve
 //! the same locators extraction produces.
 
+use std::io::Write as _;
+
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde_json::json;
+use zip::write::SimpleFileOptions;
 
-use super::super::extract::tests::{docx, ooxml, pdf};
 use super::*;
+
+/// A stored zip archive holding `parts`.
+///
+/// # Panics
+/// Panics when the in-memory zip cannot be written.
+fn zipped(parts: &[(&str, &str)]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, body) in parts {
+        writer
+            .start_file(
+                *name,
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .expect("start entry");
+        writer.write_all(body.as_bytes()).expect("write entry");
+    }
+    writer.finish().expect("finish zip").into_inner()
+}
 
 /// One staged file at `path`, sourced from the `evidence` slot.
 ///
@@ -72,10 +92,22 @@ fn workspace_reads_and_searches_located_units() {
     let workspace = open(vec![
         staged(
             "/inputs/deck.pdf",
-            pdf(&["Revenue grew", "Costs fell"]),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../fixtures/cards/verifier_building_blocks/samples/sample.pdf"
+            ))
+            .to_vec(),
             MediaFormat::Pdf,
         ),
-        staged("/inputs/memo.docx", docx(), MediaFormat::Docx),
+        staged(
+            "/inputs/memo.docx",
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../fixtures/cards/verifier_building_blocks/samples/sample.docx"
+            ))
+            .to_vec(),
+            MediaFormat::Docx,
+        ),
         staged(
             "/inputs/data.json",
             br#"{"total": 42}"#.to_vec(),
@@ -84,15 +116,15 @@ fn workspace_reads_and_searches_located_units() {
     ])
     .expect("materializes");
 
-    let read = workspace.read("/inputs/deck.pdf", 1).expect("pdf reads");
+    let read = workspace.read("/inputs/deck.pdf", 0).expect("pdf reads");
     assert_eq!(
         read["units"],
-        json!([{"locator": loc(Locator::Page(2)), "text": "Costs fell"}])
+        json!([{"locator": loc(Locator::Page(1)), "text": "Refunds"}])
     );
-    let found = workspace.search("costs").expect("search");
+    let found = workspace.search("refunds").expect("search");
     assert_eq!(
         found["matches"],
-        json!([{"path": "/inputs/deck.pdf", "locator": loc(Locator::Page(2)), "snippet": "Costs fell", "sources": ["evidence"]}])
+        json!([{"path": "/inputs/deck.pdf", "locator": loc(Locator::Page(1)), "snippet": "Refunds", "sources": ["evidence"]}])
     );
     assert_eq!(
         workspace.read("/inputs/data.json", 0).expect("json")["units"][0]["locator"],
@@ -106,15 +138,15 @@ fn workspace_reads_and_searches_located_units() {
 
     std::fs::write(
         workspace.work_dir().join("notes.txt"),
-        "draft\ncosts noted\n",
+        "draft\nrefunds noted\n",
     )
     .expect("write work");
     assert_eq!(
         workspace.read("/work/notes.txt", 1).expect("work reads")["units"][0]["text"],
-        "costs noted"
+        "refunds noted"
     );
     assert_eq!(
-        workspace.search("costs").expect("search")["matches"]
+        workspace.search("refunds").expect("search")["matches"]
             .as_array()
             .map(Vec::len),
         Some(2)
@@ -122,7 +154,7 @@ fn workspace_reads_and_searches_located_units() {
     let listed = workspace.list("/work").expect("list");
     assert_eq!(
         listed["files"],
-        json!([{"path": "/work/notes.txt", "size_bytes": 18, "sources": []}])
+        json!([{"path": "/work/notes.txt", "size_bytes": 20, "sources": []}])
     );
 }
 
@@ -263,7 +295,7 @@ fn workspace_results_stop_at_the_limit() {
 /// Panics when an unsafe archive materializes.
 #[test]
 fn workspace_unpacks_archives_safely() {
-    let zip = ooxml(&[
+    let zip = zipped(&[
         ("docs/readme.md", "# Title\nbody"),
         ("raw.bin", "\u{0}\u{1}"),
     ]);
@@ -286,7 +318,7 @@ fn workspace_unpacks_archives_safely() {
     let refused = [
         staged(
             "/inputs/x.zip",
-            ooxml(&[("../evil.txt", "x")]),
+            zipped(&[("../evil.txt", "x")]),
             MediaFormat::Zip,
         ),
         staged(

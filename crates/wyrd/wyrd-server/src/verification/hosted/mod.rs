@@ -12,7 +12,6 @@ use std::time::Duration;
 
 pub mod blocks;
 pub mod evidence;
-pub mod extract;
 pub mod registry;
 pub mod sandbox;
 pub mod tools;
@@ -35,6 +34,11 @@ pub(crate) fn statement_caller(
         request_id: wyrd_spec::request_id::RequestId::now_v7(),
         ..caller.clone()
     }
+}
+
+/// An extractor refusal as the terminal block error it always is.
+pub(crate) fn extract_refused(error: wyrd_loader::ExtractError) -> vala_verify::blocks::BlockError {
+    vala_verify::blocks::BlockError::Terminal { reason: error.0 }
 }
 
 /// The Deployment limits the hosted capabilities enforce.
@@ -87,6 +91,18 @@ pub struct HostedLimits {
 }
 
 impl HostedLimits {
+    /// The archive and extraction limits shared with client-side extraction.
+    #[must_use]
+    pub const fn extract(&self) -> wyrd_loader::ExtractLimits {
+        wyrd_loader::ExtractLimits {
+            archive_max_bytes: self.archive_max_bytes,
+            archive_max_entries: self.archive_max_entries,
+            archive_max_ratio: self.archive_max_ratio,
+            extract_max_pages: self.extract_max_pages,
+            extract_text_max_bytes: self.extract_text_max_bytes,
+        }
+    }
+
     /// Most live workers the memory ceilings allow: `monty_max_workers`,
     /// lowered until every live worker's process ceiling fits the pool
     /// ceiling together.

@@ -20,6 +20,7 @@ use skald_spec::{MediaFormat, MediaRef, MediaSource};
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EngineError, EvidenceReader,
 };
+use wyrd_loader::{EXTRACT_VERSION, Extraction, locates, units};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
@@ -29,9 +30,8 @@ use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclarat
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 
-use super::HostedLimits;
-use super::extract::{EXTRACT_VERSION, Extraction, locates, units};
 use super::registry::refusal;
+use super::{HostedLimits, extract_refused};
 use crate::components::auth::Caller;
 use crate::components::cards::routes::get_card_by_ref_for;
 use crate::components::cards::service::list_card_artifacts;
@@ -96,7 +96,7 @@ impl TenantEvidence {
         if format.native_kind() == Some(skald_spec::MediaKind::Image) {
             return Ok(Some(vec![(Locator::Page(1), String::new())]));
         }
-        let limits = self.limits;
+        let limits = self.limits.extract();
         let extracted = tokio::task::spawn_blocking(move || {
             Extraction::new(&limits)
                 .run(&bytes, format)
@@ -465,13 +465,14 @@ impl ActionExecutor for TenantEvidence {
             return Err(terminal("extract reads only media evidence"));
         };
         let (bytes, format) = self.read(declaration).await?;
-        let limits = self.limits;
+        let limits = self.limits.extract();
         let output =
             tokio::task::spawn_blocking(move || Extraction::new(&limits).run(&bytes, format))
                 .await
                 .map_err(|error| BlockError::Retryable {
                     reason: format!("extraction stopped: {error}"),
-                })??;
+                })?
+                .map_err(extract_refused)?;
         Ok(ActionOutput {
             output: serde_json::to_value(output).map_err(|error| BlockError::Terminal {
                 reason: format!("extraction output does not serialize: {error}"),
@@ -745,12 +746,20 @@ mod pg_tests {
             for (slot, bytes, format) in [
                 (
                     "deck",
-                    super::super::extract::tests::pdf(&["one", "two"]),
+                    include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../../fixtures/cards/verifier_building_blocks/samples/sample.pdf"
+                    ))
+                    .to_vec(),
                     MediaFormat::Pdf,
                 ),
                 (
                     "memo",
-                    super::super::extract::tests::docx(),
+                    include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../../fixtures/cards/verifier_building_blocks/samples/sample.docx"
+                    ))
+                    .to_vec(),
                     MediaFormat::Docx,
                 ),
                 ("notes", b"alpha\nbeta\ngamma".to_vec(), MediaFormat::Text),
@@ -773,7 +782,7 @@ mod pg_tests {
                 locator,
             };
             let valid = vec![
-                cite("deck", Locator::Page(2)),
+                cite("deck", Locator::Page(1)),
                 cite(
                     "deck",
                     Locator::Region {
@@ -790,7 +799,7 @@ mod pg_tests {
                 cite("memo", Locator::JsonPointer("/blocks/0/text".to_owned())),
             ];
             let invalid = vec![
-                cite("deck", Locator::Page(3)),
+                cite("deck", Locator::Page(2)),
                 cite("deck", Locator::Slide(1)),
                 cite("notes", Locator::Lines { start: 3, end: 4 }),
                 cite("notes", Locator::Lines { start: 0, end: 1 }),

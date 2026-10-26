@@ -1067,3 +1067,22 @@ Blocked until these are decided:
 - the second qualification suite;
 - reference promotion and the V6 committed baseline count update;
 - normal L1 against references.
+
+### Maintainer decisions on the spec revision request (2026-10-26)
+
+1. **writes-hot:** drop the experiment. writes-parquet covers writes at the default rotation. The 16,384 MB / 86,400 s override stays only for the bounded `hot` read experiment.
+2. **L1 turnaround:** at most 5 min per engine command.
+   - Measure only 1 and 64 clients at L1.
+   - Use 3 × 5 s repetitions where every case keeps its sample floors.
+   - Skip the smoke prepass when a passing smoke exists for the same commit.
+3. **Unmet limits:** keep the declared limits and bring engine optimization into this change. The targets are:
+   - the Verification engine wait at 64 clients;
+   - Bifrost point-lookup projection, for both memtable and Parquet;
+   - the writes-parquet OTLP spans floor;
+   - Gateway overhead and the double canonical-JSON capture.
+
+   References are qualified only after the limits pass.
+4. **Bifrost L2 calibration:** calibrate under contention. Before measuring, L2 finds the ingest rate the server sustains with competing queries and compaction running, then measures at the declared headroom of that rate.
+5. **Sampled-client tenant recording:** add a driver option that sends a sampled `traceparent` on a fraction of requests, and measure that configuration in the telemetry comparison.
+
+These go to `$wyrd-spec` as a draft revision for approval.

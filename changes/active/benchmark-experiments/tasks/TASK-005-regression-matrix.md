@@ -969,6 +969,72 @@ The third configuration, sampled-client tenant recording, was **not run**:
 
 These runs show that the artifacts are usable for investigation. They don't sample every request, and they don't give exact per-case CPU.
 
+### Scenario 2a appendices: case mapping and instrumentation audit at `a7d2d3438`
+
+I inspected source read-only. Path aliases:
+- `D/` is `crates/wyrd/wyrd-testing/src/bin/capacity/`
+- `T/` is `crates/wyrd/wyrd-testing/src/`
+- `S/` is `crates/wyrd/wyrd-server/src/`
+- `tm` is `crates/shared/wyrd-telemetry/src/timing.rs`
+- `gate` is `crates/vala/vala-bifrost-redux/src/gate/mod.rs`
+
+Shared plumbing:
+- **Labels.** The driver attaches `x-wyrd-benchmark-case` and `x-wyrd-benchmark-phase` through `with_benchmark_labels` or `benchmark_headers` (`crates/shared/wyrd-client/src/transport/trace.rs:72-79, 143-167`; `D/query/run.rs:685-700`; `D/gateway/workload.rs:285-288`). The server reads them in `label_request` (`tm:173-198`) when it opens the request span: HTTP at `S/http/router.rs:207`, gRPC at `crates/wyrd/wyrd-tonic/src/server/mod.rs:251`.
+- **Windows.** Windows difference `server.timings()` (`T/release_server.rs:361-364`) through `Population::collect`, `expect` and `validate` (`T/capacity.rs:619-692, 850-866`). The residual histogram is elapsed − excluded, computed per request at `tm:351-392`.
+- **CPU and memory.** These come from `Window` and `ResourceWindow` (`T/capacity.rs:333-516`). Per-work figures come from `Repetition::derive` (`T/experiment.rs:1643-1700`).
+
+**Case mapping**
+
+| Experiment / steps | Driver operation | Server boundary (where recorded) | `case` label | Reading conversion | Reconciliation |
+|---|---|---|---|---|---|
+| writes-hot, writes-parquet `native-write-c1/-c64`; L2 Bifrost native share | `Bifrost::write_batch`, gRPC (`D/query/run.rs:270-283`) | `bifrost.gate.write`, `GateRequestLifecycle` (`gate:1210, 199-212, 74-93`) | `native-write` (`D/query/mod.rs:314-320`) | elapsed p50/p95/p99, rows, retained and published MiB (`D/query/isolated.rs:213-300`), CPU and memory per row (`D/query/mod.rs:654-690`); L2 merged `write_ack_p99_ms` (`competing.rs:715-747`) | success count = answered (`isolated.rs:214-221`); L2 per phase = acked Ok (`competing.rs:461-477`) |
+| `otlp-spans-c1/-c64`; L2 spans | `TraceServiceClient::export` (`run.rs:284-297`) | `bifrost.otlp.traces`, `timed()` (`S/grpc/otlp.rs:197, 221-238`) | `otlp-spans` | as native, plus encoded wire bytes (`isolated.rs:268-275`) | as native; wire bytes > 0; `partial_success` counts as an error |
+| `otlp-logs-c1/-c64`; L2 logs | `LogsServiceClient::export` (`run.rs:298-311`) | `bifrost.otlp.logs` (`S/grpc/otlp.rs:683`) | `otlp-logs` | as spans | as spans |
+| hot and parquet reads (point, aggregates, full scan, span trace, shredded, long-tail); L2 mixed queries | `Bifrost::query`, HTTP stream, exact row checks (`run.rs:598-631`) | `bifrost.query`, `QueryTiming` drop (`S/query/routes.rs:128-140, 356`); scans via `record_scan` (`oracle/mod.rs:579`) | `Case::label()` (`D/query/workload.rs:196-203`) | elapsed percentiles, scanned rows and bytes per query (`T/capacity.rs:913-950`), CPU per query (`D/query/mod.rs:633-653`); L2 per cohort (`competing.rs:600-690`) | success count = answered, including wrong results; scan count = success count; parquet INVALID without scan facts |
+| `direct-verify-c1/4/16/64`; L2 direct verify | `observe.verify` (`D/verification/run.rs:1008-1018`) | `verification.direct` (`S/components/verification/service.rs:480-486` → `S/verification/telemetry.rs:214-255`); excluded = Verifier block intervals (`crates/vala/vala-verify/src/blocks/engine.rs:122-140`) | `direct-verify` (`run.rs:79`) | elapsed, residual `overhead_*`, excluded `verifier_*` (`run.rs:343-374`); L2 `{stage}.direct_overhead_p99_ms` and recovery (`:540-573`) | completed = acknowledged, late included; L2 = admitted verify Ok |
+| L2 background submit | `observe.submit` (`run.rs:1003-1007`) | no registry boundary: Prometheus `wyrd_verification_submit_seconds` (`S/verification/telemetry.rs:283-288`) | `queued-verify` sent but unused | `submit_mean_ms` and `queue_wait_mean_ms` from `/metrics` deltas (`run.rs:522-529`) | backlog drain only (mean, no count reconciliation) |
+| Gateway `chat.c*`, `chat-capture.c*` | POST `/v1/chat/completions` (`D/gateway/workload.rs:253-300`) | `gateway.buffered` (`S/components/gateway/telemetry.rs:185-232` via `invocation.rs:498`); excluded = upstream (`crates/wyrd/wyrd-gateway/src/engine.rs:431-480`); capture runs after the answer, outside elapsed (`invocation.rs:1296-1297`) | `buffered-metadata` / `buffered-payload` (`D/gateway/mod.rs:131-137`) | elapsed, residual overhead, excluded upstream, capture integrity from Prometheus (`D/gateway/run.rs:155-216, 298-420`) | succeeded = client completions (`run.rs:525-535`); capture staged = arrivals |
+| Gateway `chat-stream.c*` | same call, SSE timed (`workload.rs:316`) | `gateway.stream.head` and `gateway.stream.end` (`telemetry.rs:160-170`, `invocation.rs:1404`) | `streamed-metadata` | head percentiles and overhead; end residual (`run.rs:361-372`) | head count = end count = completions |
+| L2 Gateway `contention` | open-loop multi-tenant call (`D/gateway/capacity.rs:818-860`) | as above | mode × period (`capacity.rs:253-266, 836`) | completion, first token and stream p99, chunk lag, overhead (`capacity.rs:505-706`) | per period × mode × boundary = answered (`capacity.rs:1031-1051`) |
+
+**Instrumentation audit**
+
+| Location | Purpose | Consumer | Gating | Decision |
+|---|---|---|---|---|
+| `tm:117-134` (`enable`/`enabled`) | process switch | all registry recorders | set only by `metrics_router` (`S/app/metrics.rs:373-383`) under `WYRD_METRICS_BENCHMARK_SNAPSHOT=1` on a loopback bind (`S/config.rs:3234, 3419-3427`); the registry is allocated only on enable | retain |
+| `tm:173-198` `label_request` | case and phase onto the request span | registry keys | `!enabled()` first: one atomic load, no header parsing | retain |
+| `wyrd-telemetry/src/lib.rs:367-375` → `tm:214-231` `record_timing` | record a value | benchmark record | returns before labels, lock or HDR when disabled (`tm:221`) | retain |
+| `tm:236-247` `record_scan` (`oracle/mod.rs:579`) | scan facts | scanned per query | gated `tm:242`; the facts are already computed for Prometheus | retain |
+| `S/http/middleware/metrics.rs:39-60` `RequestArrival` | arrival instant | production `/metrics`; arrival reused by `bifrost.query`, `verification.direct`, `gateway.*` | always on | reuse, already the single arrival clock |
+| `gate:74-93` (write) | `bifrost.gate.write` | benchmark and production histogram, one clock | eager `Span::current()` (`gate:76`) | retain |
+| `gate:74-93` (query, `gate:788`) | `bifrost.gate.query` | production histogram; **no driver reads the registry series** | same | remove the registry record for query |
+| `S/query/routes.rs:91-140` `QueryTiming` | `bifrost.query` | benchmark only | **ungated**: span clone and arrival read even when disabled (`:103-107, 128-140`) | retain; gate on `timing::enabled()` |
+| `S/grpc/otlp.rs:221-238` `timed()` for traces and logs | OTLP boundaries | benchmark only | **ungated**: `Instant::now`, span clone and `grpc-status` lookup when disabled | retain; short-circuit when disabled |
+| `S/grpc/otlp.rs:505` | `bifrost.otlp.metrics` | **none** | as above | remove |
+| `S/verification/telemetry.rs:214-255` (direct) | `verification.direct` | benchmark and production, one clock | eager `Span::current()` (`:229`) | retain |
+| same `emit`, queued (`S/verification/runner.rs:835`) | `verification.queued` | **none in the driver**; it lands unlabelled | same | remove the registry record for queued |
+| `vala-verify/src/blocks/engine.rs:122-140` | Verifier block intervals | excluded wait, production histograms | always on | retain |
+| `S/verification/telemetry.rs:283-288` | submit latency | production; L2 mean | always on | retain |
+| `wyrd-sql/src/queries/verifier_executions.rs:695-708` | queue SQL durations | production; driver breakdown (`D/verification/run.rs:100-110`) | always on | retain |
+| `S/components/gateway/telemetry.rs:95-114, 185-232` | ingress phases, Gateway points | production and benchmark, one clock | always on; eager `Span::current()` (`:199`) | retain |
+| `wyrd-gateway/src/engine.rs:431-480`, `skald-providers/src/exchange.rs:66-101` | provider wait (excluded) | Gateway excluded, upstream histogram | always on | retain |
+| `S/http/middleware/edge_timeout.rs:51-62` | deadline handoff | correctness | n/a | retain (not instrumentation) |
+| `wyrd-client/src/transport/trace.rs` | benchmark headers | server labels | `test-support` feature only | retain |
+| `T/capacity.rs:333-516`, `T/release_server/os.rs:69-82, 164-220` | wall time, CPU, 10 ms peak RSS | every record | driver only | retain |
+| `D/query/run.rs:344, 477`; `D/verification/run.rs:881-975`; `D/gateway/workload.rs:254, 271, 316` | client latency, lateness, first event | `client_p*`, arrivals, chunk lag | driver only | retain |
+| `D/query/competing.rs:509-513, 583-586` | client latency in `Acked`/`Asked` | **none**: only `is_ok()`/`err()` is read | driver only | remove |
+| `D/gateway/workload.rs:299` `timed.headers` | response-headers instant | **none** | driver only | remove |
+
+**Findings, verified against source:**
+1. **Unread registry series.** `bifrost.gate.query`, `verification.queued` and `bifrost.otlp.metrics` are recorded but no driver reads them. In benchmark mode they still take series slots.
+2. **Ungated benchmark-only work.** `QueryTiming::new` clones the current span, and OTLP `timed()` reads the clock, clones the span and inspects `grpc-status`, all with timing disabled. Production pays this per request, though it records nothing.
+3. **Unread driver timers.** L2 Bifrost client latency (`Acked`/`Asked.result`) and Gateway `timed.headers` are written but never read.
+4. **L2 submit evidence.** It uses a Prometheus mean with no count reconciliation. The `queued-verify` label is sent but never keyed.
+5. **Doc drift.** The comments at `S/http/router.rs:183-184` and `wyrd-tonic/src/server/mod.rs:227-228`, and the declaration text at `T/capacity.rs:573`, say labels are "activated" only after authentication. In fact `label_request` attaches them when the span opens.
+6. **Not duplicates.** Gateway, Verification and Gate-write timings each read one duration and send it to both the registry and Prometheus.
+
+Remediation for the replanned task: findings 1–3 and 5 are retain/reuse/remove decisions inside the existing owners. They change server code, so they need V2a and V7 to rerun. They are listed here and not applied, so they land with the other source changes after the spec revision instead of invalidating the V7 and V9 evidence above.
+
 ### Spec revision request for `$wyrd-spec`
 
 Verdict: SPEC_REVISION_REQUIRED. Each item below changes approved measured work, limits, coverage or capability, so this task cannot resolve it. They are listed in priority order.

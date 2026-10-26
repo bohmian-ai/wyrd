@@ -862,7 +862,7 @@ async fn measured_regressions_reach_normal_reference_judgment() {
         (
             Engine::Verification,
             vec![],
-            "direct-verify-c64",
+            "direct-verify-c1",
             [
                 "overhead_p99_ms",
                 "cpu_us_per_verification",
@@ -872,7 +872,7 @@ async fn measured_regressions_reach_normal_reference_judgment() {
         (
             Engine::Gateway,
             vec![],
-            "chat.c64",
+            "chat.c1",
             [
                 "overhead_p99_ms",
                 "cpu_us_per_request",

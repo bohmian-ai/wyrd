@@ -26,12 +26,14 @@ publication waits, every selected step and phase, measured stop, drain,
 exact reconciliation, judgment, record, timing evidence and report) at
 smoke-scale fixtures with one short warmup and one repetition per step. It
 records `"mode": "smoke"` under `target/benchmarks/smoke/`, never here, and a
-smoke record is never a calibration or baseline wherever it is moved. Only
-percentiles below their sample floor and baseline comparisons are
-inapplicable to it; every integrity check still holds. Every full command
-first runs its own smoke as a prepass under a fresh Postgres, outside its
-clock and recorded beside it (`prepass`), and is INVALID before full-size
-preparation when that smoke fails. `bench:smoke` runs every default plan's
+smoke record is never a calibration or baseline wherever it is moved. A
+smoke judges no criterion: every reading, errors and target misses included,
+is recorded beside an inapplicable criterion, so a smoke is PASS or INVALID.
+It is INVALID only when the measurement itself is broken (a missing reading
+or counter, a mismatched population, zero CPU, a failed record). Every full
+command first runs its own smoke as a prepass under a fresh Postgres, outside
+its clock and recorded beside it (`prepass`), and is INVALID before full-size
+preparation when that smoke is INVALID. `bench:smoke` runs every default plan's
 smoke. Verification and
 Gateway L1 take up to 15 minutes each. The Bifrost L1 experiments take up to
 8 (`writes`), 5 (`hot`), and 9 (`parquet`) minutes, and `bench:l1` up to 52

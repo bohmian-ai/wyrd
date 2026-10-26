@@ -1616,9 +1616,9 @@ pub struct Judgment {
     pub verdict: Option<Verdict>,
     /// Why it failed, was invalid, is advisory, or is inapplicable.
     pub reason: Option<String>,
-    /// Whether the criterion could be judged at the run's controls: false
-    /// only in a smoke, for a percentile under its sample floor or a
-    /// full-run reference comparison. Records without it were judged.
+    /// Whether the criterion was judged: false only in a smoke, which
+    /// judges no criterion once its evidence is present. Records without it
+    /// were judged.
     #[serde(default = "judged")]
     pub applicable: bool,
 }
@@ -4948,7 +4948,8 @@ limitations = "excluded"
 
     /// A smoke runs the same lifecycle over the selected steps with one
     /// short warmup and one repetition each: it judges no target, so a
-    /// short percentile and a missed limit are inapplicable, while an empty
+    /// short percentile, a missed limit and recorded errors are inapplicable
+    /// and survive readback with their observed values, while an empty
     /// population and zero CPU stay INVALID; its record round-trips
     /// `mode: smoke` under `target/benchmarks/smoke/` and a failed write is
     /// still a persistence error. A full run refuses before preparation when its prepass failed
@@ -5025,6 +5026,7 @@ limitations = "excluded"
         );
         let mut slow = good();
         slow.set("p99_ms", Reading::exact(9.0).with_samples(2_000));
+        slow.set("errors", Reading::count(10));
         let missed = execute(
             smoke.clone(),
             &mut Scripted::always(&slow),
@@ -5038,6 +5040,28 @@ limitations = "excluded"
             "a smoke judges no target: {:?}",
             missed.reasons
         );
+        let path = missed.publish(root.path()).expect("publish");
+        let read = Record::read(&path).expect("read back");
+        assert_eq!(read.render(), missed.render());
+        let step = read
+            .steps
+            .iter()
+            .find(|step| step.id == "op-64")
+            .expect("selected step");
+        assert_eq!(step.repetitions[0].reading("errors").value, Some(10.0));
+        for (criterion, observed) in [("overhead-slo", 9.0), ("no-errors", 10.0)] {
+            let judgment = step
+                .criteria
+                .iter()
+                .find(|judgment| judgment.criterion == criterion)
+                .expect("judgment");
+            assert!(!judgment.applicable && judgment.verdict.is_none());
+            assert_eq!(judgment.observed.value, Some(observed));
+            assert_eq!(
+                judgment.reason.as_deref(),
+                Some("not judged in a smoke: a smoke only shows the workflow runs")
+            );
+        }
 
         let mut empty = good();
         empty.set("p99_ms", Reading::missing("no timing observation"));
@@ -5359,11 +5383,14 @@ limitations = "excluded"
     /// V8: a persisted multi-criterion record renders the exact common
     /// header, values with units, spread, reasons, and every verdict, and
     /// re-reading it after its raw artifacts are deleted renders the same
-    /// report.
+    /// report. A full run's limit miss reads back FAIL with its observed
+    /// value and exit 1, a pass exit 0, and a busy host INVALID with exit 2,
+    /// which takes precedence over a miss the record still keeps.
     ///
     /// # Panics
     ///
-    /// Panics when the header, a cell, or the regenerated report differs.
+    /// Panics when the header, a cell, a read-back verdict or exit code, or
+    /// the regenerated report differs.
     #[tokio::test(start_paused = true)]
     async fn reports_regenerate_from_persisted_records() {
         let root = tempfile::tempdir().expect("root");
@@ -5375,7 +5402,7 @@ limitations = "excluded"
         slow.set("p99_ms", Reading::exact(0.7).with_samples(2_000));
         let mut workload = Scripted::always(&good());
         workload.script = std::iter::repeat_n(Ok(good()), 4)
-            .chain(std::iter::repeat_n(Ok(slow), 4))
+            .chain(std::iter::repeat_n(Ok(slow.clone()), 4))
             .collect();
         let failed = execute(
             declaration(),
@@ -5400,22 +5427,54 @@ limitations = "excluded"
             &options,
         )
         .await;
+        let mut workload = Scripted::always(&good());
+        workload.script = std::iter::repeat_n(Ok(good()), 4)
+            .chain(std::iter::repeat_n(Ok(slow.clone()), 4))
+            .collect();
+        let failed_on_busy_host = execute(
+            declaration(),
+            &mut workload,
+            [Some(quiet()), Some(loaded(10.0))],
+            &options,
+        )
+        .await;
 
-        for (record, label) in [(&failed, "FAIL"), (&passed, "PASS"), (&invalid, "INVALID")] {
+        for (record, verdict, exit) in [
+            (&failed, Verdict::Fail, 1),
+            (&passed, Verdict::Pass, 0),
+            (&invalid, Verdict::Invalid, 2),
+            (&failed_on_busy_host, Verdict::Invalid, 2),
+        ] {
+            std::fs::create_dir_all(&artifacts).expect("artifacts");
             let console = record.render();
             let path = record.publish(root.path()).expect("publish");
             std::fs::remove_dir_all(&artifacts).ok();
-            let regenerated = Record::read(&path).expect("read").render();
+            let read = Record::read(&path).expect("read");
+            assert_eq!((read.verdict, read.exit_code()), (verdict, exit));
             assert_eq!(
-                console, regenerated,
+                console,
+                read.render(),
                 "report regenerates from history alone"
             );
             assert!(
                 console.lines().any(|line| line == REPORT_HEADER),
                 "exact header"
             );
-            assert!(console.contains(&format!("verdict: {label} (exit {})", record.exit_code())));
+            assert!(console.contains(&format!("verdict: {} (exit {exit})", verdict.label())));
         }
+        let missed = |record: &Record| {
+            record.steps[1]
+                .criteria
+                .iter()
+                .find(|judgment| judgment.criterion == "overhead-slo")
+                .map(|judgment| (judgment.verdict, judgment.observed.value))
+        };
+        assert_eq!(missed(&failed), Some((Some(Verdict::Fail), Some(0.7))));
+        assert_eq!(
+            missed(&failed_on_busy_host).map(|(_, observed)| observed),
+            Some(Some(0.7)),
+            "the miss is kept under the invalidity that takes precedence"
+        );
         let report = failed.render();
         assert!(
             report.contains("| op-64 | clients=64 | 100 ops/s; 500 ops/cpu-s | — / — / 0.7 |"),

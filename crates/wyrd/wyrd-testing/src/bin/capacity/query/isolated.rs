@@ -485,12 +485,13 @@ impl Workload for Isolated {
     ///
     /// # Errors
     ///
-    /// Returns a workload error for a server or registration failure, a
-    /// scrape failure, a fixture that loaded short or with errors, a `hot`
+    /// Returns a workload error for an uncreatable log directory, a server
+    /// or registration failure, a scrape failure, a fixture that loaded short or with errors, a `hot`
     /// row that left its memtable, or rows not published within the settle
     /// timeout. A started server is kept so [`Workload::finish`] stops it;
     /// rows already written stay in the server; nothing is retried.
     async fn prepare(&mut self) -> Result<(), ExperimentError> {
+        std::fs::create_dir_all(&self.logs).map_err(ExperimentError::workload)?;
         let server = start(self.experiment.env())
             .await
             .map_err(ExperimentError::workload)?;
@@ -609,8 +610,8 @@ impl Workload for Isolated {
     }
 
     /// Drops the senders and queries, then stops the server and keeps its
-    /// log. The stop runs synchronously inside this future: `SIGTERM`, a
-    /// bounded wait for a clean exit, and the log copy.
+    /// log. The stop runs inside this future: `SIGTERM`, a bounded
+    /// wait that yields while the server drains, and the log copy.
     ///
     /// # Errors
     ///
@@ -625,6 +626,7 @@ impl Workload for Isolated {
         };
         server
             .stop(&self.logs.join("server.log"))
+            .await
             .map(|_| ())
             .map_err(ExperimentError::workload)
     }

@@ -656,9 +656,9 @@ impl Workload for Bench {
     }
 
     /// Drops the application states, then stops the server and keeps its
-    /// log beside the tenant's files. The stop runs synchronously inside
-    /// this future: `SIGTERM`, a bounded wait for a clean exit, and the log
-    /// copy.
+    /// log beside the tenant's files. The stop runs inside
+    /// this future: `SIGTERM`, a bounded wait that yields while the server
+    /// drains, and the log copy.
     ///
     /// # Errors
     ///
@@ -672,6 +672,7 @@ impl Workload for Bench {
         };
         server
             .stop(&self.logs.join("server.log"))
+            .await
             .map(|_| ())
             .map_err(ExperimentError::workload)
     }
@@ -1269,6 +1270,7 @@ mod tests {
         };
         use wyrd_testing::release_server::HostLoad;
 
+        use crate::tests::pg_tests::burn;
         use crate::verification::declare;
         use crate::verification::run::{Bench, SELECTION, drive};
         use crate::verification::tests::{base, root};
@@ -1345,19 +1347,6 @@ mod tests {
 
             async fn finish(&mut self) -> Result<(), ExperimentError> {
                 Ok(())
-            }
-        }
-
-        /// Computes on this thread for `length`.
-        fn burn(length: Duration) {
-            let started = std::time::Instant::now();
-            let mut state = 0_u64;
-            while started.elapsed() < length {
-                state = std::hint::black_box(
-                    state
-                        .wrapping_mul(6_364_136_223_846_793_005)
-                        .wrapping_add(1),
-                );
             }
         }
 

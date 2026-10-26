@@ -37,7 +37,7 @@ use tempfile::TempDir;
 pub const SERVER_URL: &str = "http://127.0.0.1:8080";
 
 /// The server's default metrics listener address, one port above HTTP.
-const METRICS_PORT: u16 = 8081;
+pub const METRICS_PORT: u16 = 8081;
 
 /// The machine a benchmark ran on, which labels its report: results are
 /// comparable only between reports whose hosts match.
@@ -265,7 +265,7 @@ impl LocalServer {
     /// outlives its grace, or the new one cannot spawn, exits, or never
     /// becomes ready.
     pub async fn restart(&mut self, binary: &Path, env: &[(&str, &str)]) -> Result<()> {
-        self.terminate()?;
+        self.terminate().await?;
         let storage_url = format!("file://{}", self.storage_dir().display());
         self.launch(binary, &storage_url, env).await
     }
@@ -378,15 +378,16 @@ impl LocalServer {
 
     /// Sends `SIGTERM`, as `Ctrl-C` in the guide does, waits for a clean
     /// exit, and copies the server log to `log`. Returns the seconds the exit
-    /// took.
+    /// took. The wait yields, so the caller's client connections keep being
+    /// driven and close while the server drains them, on any runtime.
     ///
     /// # Errors
     ///
     /// Returns an error when the process exits unsuccessfully or outlives
     /// [`STOP_GRACE`] (it is then killed), or the log cannot be copied.
-    pub fn stop(mut self, log: &Path) -> Result<f64> {
+    pub async fn stop(mut self, log: &Path) -> Result<f64> {
         let started = Instant::now();
-        let result = self.terminate();
+        let result = self.terminate().await;
         std::fs::copy(self.root.path().join("server.log"), log)?;
         result.map(|()| started.elapsed().as_secs_f64())
     }
@@ -396,7 +397,7 @@ impl LocalServer {
     /// # Errors
     ///
     /// Returns an error for an unsuccessful exit or a kill after the grace.
-    fn terminate(&mut self) -> Result<()> {
+    async fn terminate(&mut self) -> Result<()> {
         let Some(mut child) = self.child.take() else {
             return Ok(());
         };
@@ -412,7 +413,7 @@ impl LocalServer {
                     Err(format!("wyrd-server exited with {status}").into())
                 };
             }
-            std::thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         child.kill()?;
         child.wait()?;

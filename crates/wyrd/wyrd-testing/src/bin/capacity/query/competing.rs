@@ -1101,6 +1101,7 @@ impl Workload for Competing {
         };
         server
             .stop(&self.logs.join("server.log"))
+            .await
             .map(|_| ())
             .map_err(ExperimentError::workload)
     }

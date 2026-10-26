@@ -836,7 +836,7 @@ pub async fn shutdown(server: LocalServer, log: &Path) -> Result<()> {
             "{lost} outbox items lost other than shed over the run"
         ));
     }
-    if let Err(error) = server.stop(log) {
+    if let Err(error) = server.stop(log).await {
         problems.push(format!("unclean exit: {error}"));
     }
     match std::fs::read_to_string(log) {

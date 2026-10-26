@@ -408,7 +408,7 @@ mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(
 mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::compatible_histogram_baselines_judge_all_regression_dimensions)'
 ```
 
-### V2a / V3a — Real measurement integrity and controlled regression proof (planned)
+### V2a / V3a — Real measurement integrity and controlled regression proof (corrected selectors)
 
 These planned selectors belong to Postgres tests in the existing capacity binary,
 using actual engine plans and the shared experiment runner. Confirm actual names
@@ -418,9 +418,11 @@ not the paused clock used by declaration-only tests. Build the release server
 and driver with `mise run bench:build` and provision repository prerequisites
 before these manual checks; they are not new CI performance gates.
 
+Both are `#[ignore]`d real-server proofs, like the TASK-004-R2 calibration, built in release with frame pointers:
+
 ```bash
-mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-testing --bin capacity --test-threads=1 -E 'test(=tests::pg_tests::engine_measurements_keep_boundaries_processes_and_windows)'
-mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-testing --bin capacity --test-threads=1 -E 'test(=tests::pg_tests::measured_regressions_reach_normal_reference_judgment)'
+RUSTFLAGS='-C force-frame-pointers=yes' CARGO_PROFILE_RELEASE_DEBUG=line-tables-only mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked --release --target-dir target/profiling -p wyrd-testing --bin capacity --run-ignored=only --no-capture -E 'test(=tests::pg_tests::engine_measurements_keep_boundaries_processes_and_windows)'
+RUSTFLAGS='-C force-frame-pointers=yes' CARGO_PROFILE_RELEASE_DEBUG=line-tables-only mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked --release --target-dir target/profiling -p wyrd-testing --bin capacity --run-ignored=only --no-capture -E 'test(=tests::pg_tests::measured_regressions_reach_normal_reference_judgment)'
 ```
 
 V2a keeps expected/observed operands and predeclared tolerances for Scenario 2a.
@@ -611,3 +613,101 @@ invalid baselines or treat absent evidence as a passing regression check.
 - [Testing](../../../../TESTING.md).
 - [Bifrost authority](../../../../architecture/bifrost-design.md).
 - [Trace-context authority](../../../../architecture/wyrd-design.md#trace-context--w3c-traceparent-and-tracestate).
+
+## Implementation Evidence
+
+### Diagnoses
+
+**D1: the Isolated workload never created its log directory**
+
+- **Symptom.** The first V2a run was INVALID: "drain or stop failed: No such file or directory".
+- **Evidence.** `query/isolated.rs`, `Isolated::finish`, copies `server.log` into `self.logs`, and no code path creates that directory. A CLI run works only because the runner's `keep_timings` creates the experiment directory as a side effect.
+- **Cause.** `Isolated::prepare` never creates its log directory, unlike `Competing` and Verification `Bench`.
+- **Fix site.** `Isolated::prepare` now calls `create_dir_all` on `self.logs`. Gateway creates its directory in `shutdown`.
+
+**D2: the release server stop blocked the runtime that drives client connections**
+
+- **Symptom.** The second V2a run of writes-hot was INVALID. The server exited with status 70: "Bifrost shutdown deadline elapsed before role drain; shutdown was triggered by: hosted Verifier sandbox did not settle before the shutdown deadline". The CLI smoke of the same experiment passes.
+- **Evidence.** With `WYRD_LOG=info,wyrd_server=debug`:
+  - at `04:16:22.42`, every supervised task logs `task drained` except `id=Grpc`;
+  - at `04:16:57.42` the log reads `drain deadline exceeded; aborting remaining tasks`, exactly the 35 s drain budget later;
+  - `close_hosted` then runs past the deadline and is the first check to report false, so the sandbox reason in the error is a consequence, not the cause (`wyrd-server/src/app/server.rs`, around lines 776–861).
+- **Cause.**
+  - `LocalServer::stop` and `terminate` in `release_server.rs` polled `try_wait` with `std::thread::sleep`.
+  - Each async `finish` dropped its OTLP `Channel` and then called `stop` without yielding.
+  - On the test's current-thread runtime, the tonic connection task could not run, so the client never closed its connection or answered the server's graceful GOAWAY. `serve_grpc_with_listener` therefore never completed.
+  - The CLI's multi-thread runtime hid this, because other workers drove the connection; even there, `stop` still blocked a worker for up to 45 s.
+- **Diagnostician.** A fresh read-only diagnostician, given only the failing command, the trace and the diff, reached the same cause and fix site independently. It named the multi-thread test flavor as a stopgap that would hide the problem.
+- **Fix site.**
+  - `LocalServer::stop`, `terminate` and `restart` now wait with `tokio::time::sleep(..).await`.
+  - The callers checked and updated are:
+    - `query/isolated.rs` `Isolated::finish`
+    - `query/competing.rs` `Competing::finish`
+    - `verification/run.rs` `Bench::finish`
+    - `gateway/mod.rs` `shutdown`
+  - `Drop` keeps its synchronous kill for abnormal exits.
+
+**D3: six release servers shared one wrapper database**
+
+- **Symptom.** Once D2 was fixed, writes-parquet was INVALID at boot. The server reported "built-in tables could not be ensured … the location is outside the active warehouse", and the location it named was the previous run's storage root.
+- **Evidence.** The Iceberg catalog rows in `wyrd` still pointed at writes-hot's warehouse. `LocalServer::start` documents that "a retry starts from a fresh database". The CLI gets one by running each experiment under its own `with-test-postgres.sh` (`levels::spawn`).
+- **Cause.** The test starts all six engine runs under one wrapper invocation and one database.
+- **Fix site.** In the test, `tests::pg_tests::fresh_database` recreates `wyrd` before each run as the wrapper hands it over: owned by `wyrd_platform`, with the same `scripts/postgres/test-database-setup.sql`. Production code, the four engine plans and the CLI are unchanged.
+
+**D4: three test references were wrong, not the measurements**
+
+- **Symptom.** With D3 fixed, every experiment ran. Three reference failures remained.
+- **Diagnostician.** A fresh read-only diagnostician, working from source, confirmed every cause and verdict below.
+- **Server rows above client rows.**
+  - Evidence: the server rows counter read exactly `rows + late_rows + requests`. For example, otlp-spans-c1 read 53352 against 53248 = 104 × 512, and native-write-c64 read 13697860 against 13697024 = 836 × 16384.
+  - Cause: every authorized write stages one `bifrost.system.audit_log` row on the Scribe outbox (`gate/mod.rs` `stage_write_decision`). The row reaches the unlabelled memtable counter, and `retained_mib` declares that it includes server-internal rows. The audit row is written after the request answers, so a later run read up to 64 rows short at the last scrape.
+  - Reference now used:
+    - the wrapper reads its before and after snapshots only once `outbox_pending{outbox="scribe"}` is zero, within a 10 s deadline;
+    - the exact reference is `rows + late_rows + requests + late_requests`;
+    - the check requires `errors == 0`, because a failed request still stages its audit row.
+- **Gateway `chat-stream`.**
+  - Evidence: `recorded` read exactly 2 × (requests + late_requests).
+  - Cause: a stream records two boundaries, `gateway.stream.head` and `gateway.stream.end`.
+  - Reference now used: each boundary's recorded sum equals the calls.
+- **Derived steps (`*-peak`, `*-scaling`).**
+  - Cause: these have `Status::Derived`. The runner never measures them and keeps no timing file for them.
+  - Reference now used: the test checks only `Status::Measured` steps, so a measured step that never ran still fails.
+
+**D5: writes-parquet server CPU does not follow a window's own requests**
+
+- **Symptom.** In three consecutive runs, writes-parquet `native-write-c1` failed the server side of the spin control. Spun server CPU per work read 0.0196, 0.0223 and 0.0176, against a ±25 % reference on the plain rate of about 0.013. Every other case held. The same native path held in writes-hot.
+- **Evidence.**
+  - In one run the server CPU of the plain, spun and scraped windows was 1.35, 1.74 and 5.66 s for equal work. `published_files` read 0, 0 and 1. `staged_backlog_mib` at each stop read 41.4, 82.8 and 41.4.
+  - So one default-size memtable staged inside the spun window, and the scraped window published.
+  - A one-client native writer reaches the same rotation point in the same window on every run, which is why the failure was deterministic.
+- **Cause.** Under `PARQUET_ENV` (default sizes), a window pays for the staging and publication it causes, as the declaration states. Its server CPU is therefore not proportional to its own requests. The server-side checks compare windows at the plain window's CPU per unit of work, so on writes-parquet the spin check fails falsely and the scrape check passes vacuously. The burn runs in the driver process and cannot enter the server PID's counter.
+- **Fix site.**
+  - `step_holds` runs the server-side spin and scrape checks only where server CPU is proportional, which is every case except writes-parquet.
+  - The driver side of the spin check and every negative control still run there.
+  - writes-hot proves the same server-process accounting: the same `LocalServer::cpu_usec` owner, the same transports and the same conversion.
+
+### V2a evidence
+
+The V2a command above, run after `mise run bench:build` on a quiet host, gave PASS in 772.6 s. 40 measured L1 cases held (4+4+12+8+6+6):
+- writes-hot 6
+- writes-parquet 6
+- hot 4
+- parquet 8
+- direct-verify 4
+- overhead 12 (`chat`, `chat-capture`, `chat-stream` at c1, c4, c16 and c64)
+
+| Measurement | Independent reference (fixed before execution) | Result |
+|---|---|---|
+| Window | 3 s real clock, ±0.05 s | PASS, all cases |
+| Latency boundary | client p50 round trip ≥ server boundary p50 (upper bound) | PASS, all cases |
+| Population | each timing boundary's Σ `recorded` = completions in and after the window | PASS, including both boundaries of a stream |
+| Rows | server memtable rows Δ, after the Scribe outbox settles = `rows + late_rows + requests + late_requests` (one audit row per authorized request), with `errors = 0`; exact | PASS, every write window |
+| Bytes | native writes have no wire bytes; OTLP wire bytes and retained Arrow bytes are both positive and distinct | PASS |
+| Driver CPU | a 1 s blocking burn in the driver moves driver CPU by [0.8 s, 1 s + 0.02 s + 25 % of plain] | PASS, all one-client cases |
+| Server CPU | after the burn, server CPU per work stays within ±25 % of plain; a sequential `/metrics` scrape loop adds ≥ 30 % of its busy time as server CPU at the plain rate, and less driver CPU than server CPU | PASS wherever server CPU is proportional (D5) |
+| Negative controls | window read as ms; driver and server CPU swapped; client p50 / 1e3; another case's reconciliation; a plain window as the scraped one | every substitution trips its check |
+
+Fast lanes after the change:
+- `cargo nextest run --locked -p wyrd-testing --bin capacity`: 44 passed.
+- `-p wyrd-testing --lib -E 'test(/release_server/) | test(/experiment::/)'`: 20 passed.
+- `mise run lints` and `git diff --check`: clean.

@@ -192,6 +192,8 @@ fn plan(engine: Engine, context: &Context<'_>) -> Result<Plan, String> {
 
 #[cfg(test)]
 mod tests {
+    pub mod pg_tests;
+
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;

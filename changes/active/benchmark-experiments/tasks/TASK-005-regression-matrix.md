@@ -857,3 +857,49 @@ The three named `experiment::tests` selectors passed (3/3). `mise run fmt`, `mis
     - L2 Bifrost `write_ack_p99_ms` is the merge of the per-phase `bifrost.otlp.traces`, `bifrost.otlp.logs` and `bifrost.gate.write` success series, as `read_ingest` declares.
   - **Derived steps.** Scaling and peak steps (`point-scaling`, `span-trace-scaling`, `*-peak`) have status `derived`, no process and no timing file. Their readings come from their base steps.
 - **Production outcomes recorded without failing the smoke.** `direct-verify-c64` read p99 (1.467, 1.468] ms with 11,462 refusals, and the CPU/work operands are present: 64.53 server CPU-seconds, 123,623 verifications, 521.99 µs per verification.
+
+### V9 evidence: full L2 on clean `02f55beb8`
+
+The three V9 commands ran in order on a quiet host, each with its smoke prepass (all PASS). Each record is mode `full`, `dirty: false`, 3 × 360 s repetitions. Lowest available memory was 21.7 GB.
+
+| Command | Record (untracked) | Verdict | Elapsed |
+|---|---|---|---|
+| `mise run bench:l2:bifrost` (exit 2) | `benchmarks/bifrost/competing/20261026T083728Z-02f55beb8.json` | INVALID | 1567 s |
+| `mise run bench:l2:verification` (exit 0) | `benchmarks/verification/competing/20261026T090451Z-02f55beb8.json` | PASS | 1229 s |
+| `mise run bench:l2:gateway` (exit 0) | `benchmarks/gateway/capacity/20261026T092636Z-02f55beb8.json` | PASS | 1232 s |
+
+**Readback.** It used the same method as V7, from each record's `artifacts.directory`.
+- **Report.** `capacity report` exited 0 for each record and reproduced its printed report verbatim.
+- **Timing evidence.**
+  - All 105 rank readings reproduce from the timing snapshot differences, with no negative bucket. That is 48 for Bifrost, 21 for Verification and 36 for Gateway.
+  - Bifrost `write_ack_p99_ms` reproduces from the merged per-phase write series in every repetition.
+  - Every repetition's scheduled, sent and completed arrivals are recorded.
+
+**Verification L2: PASS.**
+- Direct overhead p99 was (0.395, 0.396] ms at capacity, (0.409, 0.409] in overload and (0.398, 0.399] in recovery.
+- Backlog growth was at most 0.11 s, drain took 0.116 s, and there were 0 errors.
+- All 270,000 scheduled arrivals per repetition were sent and completed.
+
+**Gateway L2: PASS.**
+- Overhead p99 was (0.332, 0.366] ms.
+- Completion p99 was (102.1, 102.3] ms, first-token p99 (252.2, 252.3] ms and stream p99 (907.0, 908.1] ms.
+- Every limit was met, with only the declared refusals.
+
+**Bifrost L2: INVALID, honestly reported and not fixed.**
+- **Calibration.** It calibrated from the newest compatible writes-parquet record, the FAIL qualification record at `69f3a066d`: 57,313 mixed rows per CPU-second × 0.7 headroom × 8 server cores = 320,955 rows/s offered.
+- **What the server delivered.** Under competing queries and Forge compaction it delivered 11,884 rows per server CPU-second, about 4.8× less than the isolated calibration. It used 20.1 of 32 cores and peaked at 19.3 GiB.
+- **Validity.** The driver reached its 4,096-pending bound and missed 35,022–38,083 of 181,947 scheduled ingest arrivals per repetition. Send-lateness p99 was 8.4–8.9 ms against a 5 ms limit. These make the run INVALID.
+- **Failed limits:**
+  - write-ack p99 (6530.5, 6534.7] ms at capacity and (6291.5, 6295.7] ms in recovery, against ≤ 100;
+  - point p99 (111.3, 111.3] ms and (105.5, 105.6] ms, against < 5;
+  - backlog 12.3 s, against ≤ 1;
+  - 13,249 errors;
+  - queue refusals: headroom 256,780, ack-delay 107,616, in-flight 86,567;
+  - ack-delay drain 62.0 s, against ≤ 60.
+- **Too few samples.** `million-p95` and `scan-p95` had 90–180 samples behind p95, against the required 200.
+- **Cause.** The calibration takes isolated L1 capacity as the basis for 70% of contended capacity. On this host the contended server cannot absorb that rate.
+- **What it would take to fix.** Making it valid would take one of three things:
+  - a different calibration basis or headroom, which is a change to the measured work;
+  - engine optimization of ingest under query and compaction contention;
+  - a different `--server-cores` declaration.
+- **Routing.** All three route to the spec decision below, not to a local fix.

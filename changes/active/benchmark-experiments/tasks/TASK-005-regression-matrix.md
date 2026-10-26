@@ -968,3 +968,36 @@ The third configuration, sampled-client tenant recording, was **not run**:
   - **Interpretation.** Each capture serializes and validates the 64 KiB body as canonical JSON twice. This is the CPU behind the capture overhead and the capture-outbox shedding seen in V8.
 
 These runs show that the artifacts are usable for investigation. They don't sample every request, and they don't give exact per-case CPU.
+
+### Spec revision request for `$wyrd-spec`
+
+Verdict: SPEC_REVISION_REQUIRED. Each item below changes approved measured work, limits, coverage or capability, so this task cannot resolve it. They are listed in priority order.
+
+1. **writes-hot runs under a configuration no deployment uses.**
+   - Spec rows `spec.md:351` and `HOT_ENV` (`crates/wyrd/wyrd-testing/src/bin/capacity/query/mod.rs:139-144`) start the server with 16,384 MB memtable and WAL rotation and 86,400 s retention.
+   - Production defaults are 512 MB, 512 MB and 600 s (`crates/wyrd/wyrd-server/src/config.rs:352-365`).
+   - With rotation effectively off, writes-hot at 64 clients held up to 45 GiB of memtables and 59 GB of server RSS, and nearly exhausted the 91 GiB host (D7). Its write throughput has no production meaning.
+   - Requested decision: drop writes-hot, or run it at the production rotation defaults. writes-parquet already measures writes at default sizes with a 30 s retention.
+   - The `hot` read experiment can keep the override: its fixture is bounded at 10M events rows and 1M spans, and it peaked well inside memory.
+2. **L1 is not fast turnaround.**
+   - One engine command measured 2.8–7.6 min of run plus a 1–2 min smoke prepass. `bench:l1` has a 60 min budget.
+   - The cost is fixed per step: 5 s warmup plus 3 × 10 s windows. Gateway has 12 steps, so its run is 7.0 min of pure measuring.
+   - Requested decisions:
+     - an explicit L1 turnaround target, for example at most 5 min per engine command;
+     - L1 client coverage of 1 and 64, with 4 and 16 moved to an opt-in sweep;
+     - 3 × 5 s repetitions where every case keeps at least 1,000 samples behind p99;
+     - a way to skip the smoke prepass when a passing smoke exists for the same commit.
+3. **Declared limits that no engine meets on the reference host.** The V8 records show:
+   - Verification `direct-verify-c64`: p99 1.33–1.37 ms against < 0.5 ms, plus staging 429s;
+   - hot and parquet `point-c64`: p99 7.4 ms and 14.0 ms against < 5 ms;
+   - writes-parquet OTLP spans: 15.2 MiB per CPU-second against a floor of ≥ 30;
+   - Gateway `chat.c64`: overhead 0.64 ms against < 0.5 ms; `chat-capture.c64`: 4.34 ms, plus capture shedding.
+
+   Requested decision: engine optimization in scope (the V8 diagnostics name the expensive stages), revised limits or coverage, or a different reference host.
+4. **Bifrost L2 calibration.** 70% of isolated writes-parquet capacity × 8 cores overloads the contended server. It delivered about 4.8× fewer rows per CPU-second under contention, making the run INVALID. Requested decision: a different calibration basis, headroom or `--server-cores`.
+5. **Sampled-client tenant recording.** REQ-020's third telemetry configuration needs the driver to send sampled `traceparent`, and no existing option does this. Requested decision: approve that driver capability, or drop the comparison.
+
+Blocked until these are decided:
+- the second qualification suite;
+- reference promotion and the V6 committed baseline count update;
+- normal L1 against references.

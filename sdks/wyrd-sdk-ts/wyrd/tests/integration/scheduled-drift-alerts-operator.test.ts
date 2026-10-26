@@ -6,6 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { expect, vi } from "vitest";
 
 import {
+  Bifrost,
   Cards,
   OperatorConnections,
   type DeclarationReceipt,
@@ -15,6 +16,7 @@ import {
   WyrdState,
 } from "wyrd-ai";
 import type { NativeWyrdTestServer } from "@wyrd/testing";
+import { z } from "zod";
 
 import { Receiver } from "../support/http-receiver.js";
 import { binding, fixture, declared, runtimeAccount, scheduledResult, serverTest } from "../support/server.js";
@@ -182,6 +184,14 @@ test("passing window alerts no one", async ({ server, hooks, cards, watch }) => 
   const result = await judge(server, cards, watch);
 
   expect(result.outcome.verdict).toBe("passed");
+  const [requirement] = result.outcome.requirements;
+  expect(requirement?.detail?.drift.features.latency?.score).toEqual(expect.any(Number));
+  const records = await (await Bifrost.connect()).sql(
+    "SELECT origin FROM bifrost.verification.execution_inputs WHERE execution_id = $1",
+    [result.execution_id],
+    z.object({ origin: z.string() }),
+  );
+  expect(records.map((record) => record.origin)).toEqual(["schedule"]);
   await assertQuiet(hooks);
 });
 

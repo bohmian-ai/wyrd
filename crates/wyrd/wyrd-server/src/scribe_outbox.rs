@@ -71,7 +71,8 @@ use vala_bifrost_redux::tables::audit::projection::project_audit_event;
 use vala_bifrost_redux::tables::gateway::CallsTable;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
-    AuditLogTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, SpansTable,
+    AuditLogTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable,
+    SpansTable,
 };
 use wyrd_runtime::outbox::{LossReason, Outbox, OutboxLimits, OutboxSink, Reservation, count_lost};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
@@ -159,15 +160,15 @@ pub enum ScribeWrite {
     /// One gateway call's validated analytical record, its objects already
     /// persisted.
     Capture(Box<CallCapture>),
-    /// One Verifier judgment's summary and detail rows.
+    /// One Verifier judgment's output and summary rows.
     Result {
-        /// The result's rows, details before the summary, each naming the
+        /// The result's rows, output before the summary, each naming the
         /// Card verified as its `subject_card_uid`.
         payload: ResultPayload,
         /// The run's subject and actor, which Scribe stamps on every row.
         attribution: Attribution,
     },
-    /// One Verifier execution's pinned inputs row.
+    /// One Verifier execution's input record.
     ExecutionInputs {
         /// The `bifrost.verification.execution_inputs` row.
         row: ResultBatch,
@@ -175,7 +176,8 @@ pub enum ScribeWrite {
         attribution: Attribution,
         /// A submitted execution and its reserved slot on the outbox that
         /// queues it once Scribe acknowledges the row, so the handoff is never
-        /// refused; `None` for a direct execution.
+        /// refused; `None` for every other origin. The handed-off submission
+        /// carries no input values: the runner reads them from the row.
         queued: Option<(Reservation<SubmissionSink>, Box<Submission>)>,
     },
     /// One server span's tenant copy, attributed to the operation that
@@ -286,12 +288,19 @@ impl ScribeWrite {
     }
 
     /// The grouped source activity this write records: the owner, subject,
-    /// Verifier, and group of an inputs row or a result's summary row, or
-    /// `None` when the write is no grouped Verifier evidence or names no
-    /// owner.
+    /// Verifier, and group of a supplied input record or a result's summary
+    /// row, or `None` when the write is no grouped Verifier evidence or names
+    /// no owner. A group execution's own selector record is not new source
+    /// activity; its result is.
     fn group_activity(&self) -> Option<GroupActivity> {
         let batch = match self {
-            Self::ExecutionInputs { row, .. } => &row.batch,
+            Self::ExecutionInputs { row, .. } => {
+                let origin = row.batch.column_by_name("origin")?.as_string_opt::<i32>()?;
+                if origin.is_valid(0) && origin.value(0) == "group" {
+                    return None;
+                }
+                &row.batch
+            }
             Self::Result { payload, .. } => payload
                 .batches()
                 .iter()
@@ -314,8 +323,7 @@ impl ScribeWrite {
 }
 
 /// The destinations the Scribe outbox writes: retained audit history, the two
-/// gateway capture tables, the two Verifier result tables, and the execution
-/// inputs table.
+/// gateway capture tables, and the three Verifier tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeTable {
     /// `bifrost.system.audit_log`, one row per authorization decision.
@@ -326,8 +334,9 @@ pub enum ScribeTable {
     Spans,
     /// `bifrost.verification.results`, one canonical summary row per judgment.
     Results,
-    /// `bifrost.drift.result_features`, a result's drift feature rows.
-    DriftFeatures,
+    /// `bifrost.verification.execution_outputs`, one detailed output per
+    /// judgment.
+    ExecutionOutputs,
     /// `bifrost.verification.execution_inputs`, one row per execution's inputs.
     ExecutionInputs,
 }
@@ -339,7 +348,7 @@ impl ScribeTable {
         Self::Calls,
         Self::Spans,
         Self::Results,
-        Self::DriftFeatures,
+        Self::ExecutionOutputs,
         Self::ExecutionInputs,
     ];
 
@@ -351,7 +360,7 @@ impl ScribeTable {
             Self::Calls => "bifrost.gateway.calls",
             Self::Spans => "bifrost.traces.spans",
             Self::Results => "bifrost.verification.results",
-            Self::DriftFeatures => "bifrost.drift.result_features",
+            Self::ExecutionOutputs => "bifrost.verification.execution_outputs",
             Self::ExecutionInputs => "bifrost.verification.execution_inputs",
         }
     }
@@ -364,7 +373,7 @@ impl ScribeTable {
 
     /// Whether this destination is a Verifier result table.
     pub(crate) const fn is_result(self) -> bool {
-        matches!(self, Self::Results | Self::DriftFeatures)
+        matches!(self, Self::Results | Self::ExecutionOutputs)
     }
 
     /// Logical Bifrost table this destination names.
@@ -374,8 +383,8 @@ impl ScribeTable {
             Self::Calls => TableRef::new(BifrostNamespace::Gateway, CallsTable::NAME),
             Self::Spans => TableRef::new(BifrostNamespace::Traces, SpansTable::NAME),
             Self::Results => TableRef::new(BifrostNamespace::Verification, ResultsTable::NAME),
-            Self::DriftFeatures => {
-                TableRef::new(BifrostNamespace::Drift, ResultFeaturesTable::NAME)
+            Self::ExecutionOutputs => {
+                TableRef::new(BifrostNamespace::Verification, ExecutionOutputsTable::NAME)
             }
             Self::ExecutionInputs => {
                 TableRef::new(BifrostNamespace::Verification, ExecutionInputsTable::NAME)
@@ -1530,8 +1539,6 @@ mod tests {
     /// and gives a reason of `reason_bytes` characters, attributed to
     /// `attribution`.
     ///
-    /// With no features the judgment writes its summary row only.
-    ///
     /// # Panics
     ///
     /// Panics when the payload does not build.
@@ -1669,16 +1676,20 @@ mod tests {
             .iter()
             .map(|frame| (frame.table.as_str(), frame.rows))
             .collect::<Vec<_>>();
-        frames[..2].sort_unstable();
+        frames[..3].sort_unstable();
         assert_eq!(
             frames,
             [
                 ("bifrost.gateway.calls", 2),
                 ("bifrost.traces.spans", 2),
+                ("bifrost.verification.execution_outputs", 3),
                 ("bifrost.verification.results", 3),
             ]
         );
-        for frame in &received[..2] {
+        let (judgments, captures): (Vec<_>, Vec<_>) = received
+            .iter()
+            .partition(|frame| frame.table.starts_with("bifrost.verification."));
+        for frame in captures {
             assert_eq!(frame.pairs, callers, "{}", frame.table);
             assert!(frame.card_scope.is_empty());
         }
@@ -1688,11 +1699,13 @@ mod tests {
             .map(|row| row["request_id"].as_str().expect("request_id").to_owned())
             .collect::<HashSet<_>>();
         assert_eq!(requests.len(), 2, "each row names its own request");
-        assert_eq!(received[2].pairs, [attribution; 3]);
-        assert_eq!(
-            received[2].card_scope.iter().collect::<HashSet<_>>(),
-            subjects.iter().collect::<HashSet<_>>()
-        );
+        for frame in judgments {
+            assert_eq!(frame.pairs, [attribution; 3], "{}", frame.table);
+            assert_eq!(
+                frame.card_scope.iter().collect::<HashSet<_>>(),
+                subjects.iter().collect::<HashSet<_>>()
+            );
+        }
         assert!(received.iter().all(|frame| frame.tenant == tenant));
         assert!(
             received
@@ -2072,13 +2085,24 @@ mod tests {
         every_permit_returns(&spans).await;
     }
 
-    /// A Scribe request ceiling well below the default, so a modest drift
-    /// detail payload needs several frames.
+    /// A Scribe request ceiling well below the default, so a modest set of
+    /// verification outputs needs several frames.
     const SMALL_REQUEST_BYTES: usize = 64 * 1024;
 
-    /// Features scored by the drift judgment whose detail splits into
-    /// several frames under [`SMALL_REQUEST_BYTES`] while its summary fits.
-    const DETAIL_FEATURES: usize = 128;
+    /// Judgments whose output rows together split into several frames under
+    /// [`SMALL_REQUEST_BYTES`] while each row fits.
+    const DETAIL_RESULTS: usize = 8;
+
+    /// Reason length of each [`detail`] judgment's one requirement.
+    const DETAIL_REASON_BYTES: usize = 4096;
+
+    /// [`DETAIL_RESULTS`] judgments attributed to `attribution`, whose
+    /// output rows split into several frames under [`SMALL_REQUEST_BYTES`].
+    fn detail(attribution: Attribution) -> Vec<ScribeWrite> {
+        (0..DETAIL_RESULTS)
+            .map(|_| drift_result(&uid(), attribution, 1, DETAIL_REASON_BYTES))
+            .collect()
+    }
 
     /// Starts an outbox submitting along `route` under a `request_bytes`
     /// Scribe ceiling.
@@ -2105,23 +2129,23 @@ mod tests {
             .collect()
     }
 
-    /// The feature of every drift detail row in `frames`, in order.
+    /// The result ID of every output row in `frames`, in order.
     ///
     /// # Panics
     ///
     /// Panics when an item frame does not decode.
-    fn detail_features(frames: &[Received]) -> Vec<String> {
+    fn output_results(frames: &[Received]) -> Vec<String> {
         frames
             .iter()
-            .filter(|frame| frame.table == "bifrost.drift.result_features")
+            .filter(|frame| frame.table == "bifrost.verification.execution_outputs")
             .flat_map(|frame| {
                 StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
                     .expect("an item frame opens")
                     .flat_map(|batch| {
                         let batch = batch.expect("an item batch decodes");
                         let ids = batch
-                            .column_by_name("feature")
-                            .expect("feature column")
+                            .column_by_name("result_id")
+                            .expect("result_id column")
                             .as_string::<i32>()
                             .clone();
                         (0..ids.len())
@@ -2133,31 +2157,37 @@ mod tests {
             .collect()
     }
 
-    /// Asserts `frames` carry every one of `features` item rows exactly once,
-    /// in more than one item frame within the small ceiling's budget, and end
-    /// with the one summary. Item frames are in flight together, so rows are
-    /// compared without order.
+    /// Asserts `frames` carry `results` output rows, each result once, in
+    /// more than one frame within the small ceiling's budget, and that every
+    /// output frame precedes every summary frame. Output frames are in flight
+    /// together, so rows are compared without order.
     ///
     /// # Panics
     ///
     /// Panics when a row is missing or repeated, a frame is over budget, or
-    /// the summary is not last.
-    fn assert_bounded_detail(frames: &[Received], features: usize) {
+    /// a summary precedes an output.
+    fn assert_bounded_detail(frames: &[Received], results: usize) {
         let tables = frames
             .iter()
             .map(|frame| frame.table.as_str())
             .collect::<Vec<_>>();
-        let (summary, items) = tables.split_last().expect("frames were written");
-        assert_eq!(
-            *summary, "bifrost.verification.results",
-            "the summary is last"
+        let split = tables
+            .iter()
+            .position(|table| *table == "bifrost.verification.results")
+            .expect("summaries were written");
+        let (items, summaries) = tables.split_at(split);
+        assert!(
+            summaries
+                .iter()
+                .all(|table| *table == "bifrost.verification.results"),
+            "every summary follows every output: {tables:?}"
         );
         assert!(
             items.len() > 1
                 && items
                     .iter()
-                    .all(|table| *table == "bifrost.drift.result_features"),
-            "the detail splits into several item frames before the summary: {tables:?}"
+                    .all(|table| *table == "bifrost.verification.execution_outputs"),
+            "the outputs split into several frames before the summaries: {tables:?}"
         );
         let budget = frame_budget(SMALL_REQUEST_BYTES);
         assert!(
@@ -2168,12 +2198,13 @@ mod tests {
                 .map(|frame| (frame.table.as_str(), frame.ipc.len()))
                 .collect::<Vec<_>>()
         );
-        let expected = (0..features)
-            .map(|feature| format!("f{feature:04}"))
-            .collect::<Vec<_>>();
-        let mut features = detail_features(frames);
-        features.sort_unstable();
-        assert_eq!(features, expected, "every row once");
+        let rows = output_results(frames);
+        assert_eq!(rows.len(), results, "every output row once");
+        assert_eq!(
+            rows.iter().collect::<HashSet<_>>().len(),
+            results,
+            "no output row repeats"
+        );
     }
 
     /// A Scribe that acknowledges through `inner` but reports the
@@ -2226,9 +2257,9 @@ mod tests {
         }
     }
 
-    /// Proves a multi-row verification detail larger than one frame under a lowered
-    /// Scribe ceiling reaches the local Scribe as bounded frames carrying
-    /// every row once before the summary, and that after a lost
+    /// Proves verification outputs larger than one frame under a lowered
+    /// Scribe ceiling reach the local Scribe as bounded frames carrying
+    /// every row once before the summaries, and that after a lost
     /// ACK the identical slice resubmits identical frame ids.
     ///
     /// # Panics
@@ -2247,24 +2278,27 @@ mod tests {
             ScribeRoute::Local(Arc::new(scribe), None),
             SMALL_REQUEST_BYTES,
         );
-        outbox.stage(
-            DataTenantId::new_v7(),
-            drift_result(&uid(), background(), DETAIL_FEATURES, 0),
-        );
+        let tenant = DataTenantId::new_v7();
+        for write in detail(background()) {
+            outbox.stage(tenant, write);
+        }
         settle(&outbox).await;
 
         let submitted = recording.submitted();
-        let (mut first, mut retry) = (submitted[..2].to_vec(), submitted[2..4].to_vec());
-        first.sort_unstable();
-        retry.sort_unstable();
-        assert_eq!(retry, first, "the retry resubmits the identical frames");
         let frames = retained(recording.received());
-        assert_eq!(
-            frames.len(),
-            submitted.len() - 2,
-            "every frame after the retry is new"
+        assert!(
+            submitted.len() > frames.len(),
+            "the lost ACK is retried: {submitted:?}"
         );
-        assert_bounded_detail(&frames, DETAIL_FEATURES);
+        assert_eq!(
+            submitted.iter().collect::<HashSet<_>>(),
+            frames
+                .iter()
+                .map(|frame| &frame.batch_id)
+                .collect::<HashSet<_>>(),
+            "the retry resubmits only identical frame ids"
+        );
+        assert_bounded_detail(&frames, DETAIL_RESULTS);
     }
 
     /// A Scribe that acknowledges through `inner` after yielding, recording
@@ -2330,7 +2364,7 @@ mod tests {
     /// the budget, lose a row, or a summary precedes a detail frame.
     #[tokio::test]
     async fn a_slice_keeps_a_bounded_number_of_frames_in_flight() {
-        const JUDGMENTS: usize = 8;
+        const ROUNDS: usize = 4;
         let scribe = Arc::new(Overlapping::default());
         let outbox = route_outbox(
             ScribeRoute::Local(Arc::clone(&scribe) as _, None),
@@ -2338,11 +2372,8 @@ mod tests {
         );
         let tenant = DataTenantId::new_v7();
         let attribution = background();
-        for _ in 0..JUDGMENTS {
-            outbox.stage(
-                tenant,
-                drift_result(&uid(), attribution, DETAIL_FEATURES, 0),
-            );
+        for write in (0..ROUNDS).flat_map(|_| detail(attribution)) {
+            outbox.stage(tenant, write);
         }
         settle(&outbox).await;
 
@@ -2374,18 +2405,21 @@ mod tests {
             frames[summaries..]
                 .iter()
                 .all(|frame| frame.table == "bifrost.verification.results"),
-            "every summary follows every detail frame"
+            "every summary follows every output frame"
         );
         assert_eq!(
-            rows("bifrost.drift.result_features"),
-            JUDGMENTS * DETAIL_FEATURES
+            rows("bifrost.verification.execution_outputs"),
+            ROUNDS * DETAIL_RESULTS
         );
-        assert_eq!(rows("bifrost.verification.results"), JUDGMENTS);
+        assert_eq!(
+            rows("bifrost.verification.results"),
+            ROUNDS * DETAIL_RESULTS
+        );
     }
 
-    /// Proves a single row larger than the budget is still submitted alone
-    /// and whole, and a terminal Scribe size refusal consumes it without
-    /// retry.
+    /// Proves a single output row larger than the budget is still submitted
+    /// alone and whole, and a terminal Scribe size refusal consumes it
+    /// without retry while its summary is still written.
     ///
     /// # Panics
     ///
@@ -2409,10 +2443,18 @@ mod tests {
 
         assert_eq!(
             scribe.attempts(),
-            1,
-            "the summary row is submitted once, whole"
+            2,
+            "the output and summary rows are each submitted once, whole"
         );
-        assert!(scribe.received().is_empty(), "the refused row is consumed");
+        let received = scribe.received();
+        assert_eq!(
+            received
+                .iter()
+                .map(|frame| frame.table.as_str())
+                .collect::<Vec<_>>(),
+            ["bifrost.verification.results"],
+            "the refused output row is consumed"
+        );
     }
 
     /// A peer Scribe that accepts every capture call and never answers,
@@ -2556,10 +2598,9 @@ mod tests {
         let outbox = route_outbox(ScribeRoute::Peer(peers), SMALL_REQUEST_BYTES);
         let tenant = DataTenantId::new_v7();
         let other = DataTenantId::new_v7();
-        outbox.stage(
-            tenant,
-            drift_result(&uid(), background(), DETAIL_FEATURES, 0),
-        );
+        for write in detail(background()) {
+            outbox.stage(tenant, write);
+        }
         outbox.stage(other, capture(other));
         settle(&outbox).await;
 
@@ -2577,7 +2618,7 @@ mod tests {
         let (mine, others): (Vec<_>, Vec<_>) = retained(received)
             .into_iter()
             .partition(|frame| frame.tenant == tenant);
-        assert_bounded_detail(&mine, DETAIL_FEATURES);
+        assert_bounded_detail(&mine, DETAIL_RESULTS);
         let mut others = others
             .iter()
             .map(|frame| frame.table.as_str())

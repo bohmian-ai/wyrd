@@ -690,8 +690,6 @@ async fn scheduled_and_submitted_executions_freeze_their_inputs() {
         direct_claim.input,
         ExecutionInput::Submitted {
             run_id: direct_request.run_id,
-            inputs: direct_request.inputs,
-            route_overrides: BTreeMap::new(),
         }
     );
     assert_eq!(direct_claim.attribution, Attribution::direct(actor.id));
@@ -2584,19 +2582,9 @@ fn pinned(
     executions: &[(ExecutionId, Option<VerificationResultId>)],
 ) -> PinnedGroup {
     let slot = SlotName::new("turns").expect("valid slot name");
-    let values: Vec<Value> = executions
-        .iter()
-        .map(|(_, result)| result.map_or(Value::Null, |_| json!("passed")))
-        .collect();
     PinnedGroup::new(
         binding,
         GroupId::new(group).expect("valid group id"),
-        BTreeMap::from([(
-            slot.clone(),
-            InputDeclaration::Json {
-                value: Value::Array(values),
-            },
-        )]),
         BTreeMap::from([(
             slot,
             GroupSelection {
@@ -2620,7 +2608,8 @@ fn source_text() -> SourceText {
 /// Acknowledged source activity schedules one pending row per matching
 /// binding and group, due exactly `after` past database time — a one-year
 /// `after` included, and `1d` equal to `24h` across a session time zone's
-/// daylight-time change — and consumed by its claim; the same snapshot content
+/// daylight-time change — reported overdue by its claim only more than five
+/// minutes past due, and consumed by its claim; the same snapshot content
 /// enqueues once whatever its status, while distinct snapshots overlap;
 /// group verdicts are compared in settlement order — baseline, unchanged,
 /// changed — and a replay never recompares. A group refused before
@@ -2816,10 +2805,26 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
             &due.group_id,
             &due.settings,
             due.owner,
-            due.active
+            due.active,
+            due.overdue
         ),
-        (binding, &group, &settings, Some(principal), true)
+        (binding, &group, &settings, Some(principal), true, false)
     );
+    sqlx::query(
+        "UPDATE wyrd.verification_group_pending
+            SET due_at = statement_timestamp() - INTERVAL '301 seconds'
+          WHERE binding_id = $1",
+    )
+    .bind(binding.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("row ages past the incomplete-snapshot bound");
+    let due = queue
+        .claim_due_group(&mut conn)
+        .await
+        .expect("claim")
+        .expect("an expired group is due");
+    assert!(due.overdue, "more than five minutes past due is overdue");
     queue
         .consume_group(&mut conn, &due)
         .await
@@ -2872,13 +2877,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     assert_eq!(claimed_later.lease.execution_id, overlapping);
     assert_eq!(claimed_earlier.origin, ExecutionOrigin::Group);
     assert_eq!(claimed_earlier.group_id.as_ref(), Some(&group));
-    assert_eq!(
-        claimed_earlier.input,
-        ExecutionInput::Grouped {
-            inputs: first.inputs.clone(),
-            snapshot: first.snapshot.clone(),
-        }
-    );
+    assert_eq!(claimed_earlier.input, ExecutionInput::Grouped);
     let complete =
         async |conn: &mut TenantConn<'_>, claimed: &ClaimedExecution, result, verdict| {
             queue
@@ -2942,7 +2941,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         .expect("execution exists");
     assert_eq!(status.state.group_id.as_ref(), Some(&group));
     assert_eq!(status.state.owner_card_uid.as_ref(), Some(&owner));
-    assert_eq!(status.state.group.as_ref(), Some(&third.snapshot));
+    assert_eq!(status.state.group, None, "the selector lives in Bifrost");
     assert_eq!(status.state.dispatches.len(), 1);
     let contexts: Vec<Value> = sqlx::query_scalar(
         "SELECT failure_context FROM wyrd.operator_dispatches WHERE execution_id = $1",
@@ -3003,9 +3002,9 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
         .consume_group(&mut conn, &due)
         .await
         .expect("row consumed");
-    let shape: (String, bool, bool, bool, bool, bool, bool, bool, i32) = sqlx::query_as(
-        "SELECT status, authority IS NULL, inputs IS NULL, group_snapshot_sha256 IS NULL,
-                group_sources IS NULL, result_id IS NULL, settled_at IS NOT NULL,
+    let shape: (String, bool, bool, bool, bool, bool, i32) = sqlx::query_as(
+        "SELECT status, authority IS NULL, group_snapshot_sha256 IS NULL,
+                result_id IS NULL, settled_at IS NOT NULL,
                 lease_token IS NULL AND next_attempt_at IS NULL, attempts
            FROM wyrd.verifier_executions WHERE execution_id = $1",
     )
@@ -3015,17 +3014,7 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
     .expect("the refusal reads");
     assert_eq!(
         shape,
-        (
-            "errored".to_owned(),
-            true,
-            true,
-            true,
-            true,
-            true,
-            true,
-            true,
-            0
-        ),
+        ("errored".to_owned(), true, true, true, true, true, 0),
         "terminal, authority-free, unpinned, and unleased"
     );
     let status = queue
@@ -3068,8 +3057,6 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
                 next_attempt_at = statement_timestamp()
           WHERE execution_id = $1",
         "UPDATE wyrd.verifier_executions
-            SET inputs = '{}', route_overrides = '{}' WHERE execution_id = $1",
-        "UPDATE wyrd.verifier_executions
             SET window_start = statement_timestamp() - INTERVAL '1 hour',
                 window_end = statement_timestamp()
           WHERE execution_id = $1",
@@ -3078,8 +3065,6 @@ async fn group_snapshots_are_idempotent_and_react_in_settlement_order() {
           WHERE execution_id = $1",
         "UPDATE wyrd.verifier_executions
             SET group_snapshot_sha256 = '\\x00' WHERE execution_id = $1",
-        "UPDATE wyrd.verifier_executions
-            SET group_sources = '[]' WHERE execution_id = $1",
     ] {
         let mut attempt = sqlx::Connection::begin(&mut **conn.transaction())
             .await

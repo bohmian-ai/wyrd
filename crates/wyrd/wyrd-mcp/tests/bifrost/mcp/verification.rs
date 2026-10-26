@@ -895,6 +895,98 @@ mod pg_tests {
         Ok(())
     }
 
+    /// An agent reads a scheduled drift execution back by its ID: an empty
+    /// window settles `inconclusive` through `verification.get_execution`
+    /// with its drift report, and `bifrost.query` shows its one `schedule`
+    /// input record freezing an empty population and its one output record
+    /// carrying that requirement detail under the summary's result ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, fixture, bootstrap, MCP transport, or
+    /// tool-call failures, or an error when no execution appears or settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the status, input record, or output record differs.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn scheduled_drift_execution_reads_its_inputs_and_output() -> Result<(), McpJourneyError>
+    {
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_verification_runtime_for_test()
+                .start_bound(),
+        )
+        .await?;
+        let seed = server.verification_fixture().await?;
+        let verifier = seed
+            .custom_drift_verifier("mcp-window", "latency", 100.0, 10.0)
+            .await?;
+        let (owner, principal) = seed.service("mcp-window-owner").await?;
+        let binding = seed
+            .bind_schedule(&owner, &owner, &verifier, "0 2 * * *", Vec::new())
+            .await?;
+        seed.activate(principal, &owner).await?;
+        seed.make_binding_due(binding).await?;
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        let execution_id = loop {
+            if let Some(execution) = seed.executions().await?.into_iter().next() {
+                break execution.to_string();
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("the due schedule never created an execution".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        let agent = server
+            .bootstrap_service("mcp-window-agent", &["admin"])
+            .await?;
+        let client = connect(&server, &agent).await?;
+        let state = settle(&client, &execution_id).await?;
+        assert_eq!(state["status"], "completed", "{state}");
+        assert_eq!(
+            state["result"]["outcome"]["verdict"], "inconclusive",
+            "{state}"
+        );
+        let detail = &state["result"]["outcome"]["requirements"][0]["detail"];
+        assert!(detail["drift"].is_object(), "{state}");
+        server.flush_bifrost().await?;
+
+        let inputs = rows(
+            &client,
+            format!(
+                "SELECT origin, inputs FROM bifrost.verification.execution_inputs \
+                 WHERE execution_id = '{execution_id}'"
+            ),
+        )
+        .await?;
+        assert_eq!(inputs[0][0], "schedule", "{inputs}");
+        assert_eq!(
+            (inputs.as_array().map(Vec::len), &inputs[0][1]["record_ids"]),
+            (Some(1), &serde_json::json!([])),
+            "one record freezing the empty window: {inputs}"
+        );
+        let outputs = rows(
+            &client,
+            format!(
+                "SELECT o.output FROM bifrost.verification.results r \
+                 JOIN bifrost.verification.execution_outputs o ON o.result_id = r.result_id \
+                 WHERE r.execution_id = '{execution_id}'"
+            ),
+        )
+        .await?;
+        assert_eq!(outputs.as_array().map(Vec::len), Some(1), "{outputs}");
+        assert_eq!(
+            &outputs[0][0]["requirements"][0]["detail"], detail,
+            "the output holds the detail the status read returns"
+        );
+        client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// A code-check Verifier whose check declares a numeric `score` as its
     /// custom Verdict data and returns a score its schema refuses for `BAD`.
     const SCORED: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: mcp-scored\n  version: 1.0.0\nspec:\n  inputs:\n    answer: {type: json}\n  requirements:\n    - id: scored\n      statement: The answer is scored\n      check:\n        kind: code\n        entrypoint: check\n        inputs: {answer: inputs.answer}\n        response_format:\n          kind: verdict\n          data:\n            type: object\n            properties: {score: {type: number}}\n            required: [score]\n            additionalProperties: false\n        source:\n          inline: |\n            def check(answer):\n                score = \"high\" if answer == \"BAD\" else 0.5\n                return {\"outcome\": \"failed\", \"reason\": \"scored\", \"citations\": [{\"slot\": \"answer\", \"locator\": {\"json_pointer\": \"\"}}], \"data\": {\"score\": score}}\n";
@@ -2515,13 +2607,10 @@ mod pg_tests {
             &[(1, "retrieve"), (2, "rank")],
         )
         .await?;
-        wyrd_testing::verification::VerificationFixture::provision(
-            server.state().postgres.wyrd(),
-            tenant,
-        )
-        .await?
-        .make_retry_due(execution_id.parse()?)
-        .await?;
+        wyrd_testing::verification::VerificationFixture::provision(server.state(), tenant)
+            .await?
+            .make_retry_due(execution_id.parse()?)
+            .await?;
         let state = settle(&agent_client, &execution_id).await?;
         assert_eq!(state["status"], "completed", "{state}");
         assert_eq!(text(&state, "/result/execution_id")?, execution_id);

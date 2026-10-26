@@ -1,5 +1,5 @@
-//! `bifrost.verification.execution_inputs` — the pinned inputs of one Verifier
-//! execution.
+//! `bifrost.verification.execution_inputs` — the one input record of a
+//! Verifier execution.
 //!
 //! Owns the table's authored schema and physical layout only; the server
 //! stages its rows through Scribe and reads them back to run queued work.
@@ -16,9 +16,12 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 
 /// `bifrost.verification.execution_inputs` — one row per Verifier execution's inputs.
 ///
-/// `inputs` holds the execution's named, pinned input declarations as one
-/// Variant; uploaded file bytes stay in tenant object storage and are named
-/// only by digest. `queue_execution` is true only for a submitted execution,
+/// `origin` is how the execution was created: `direct`, `submitted`, `group`,
+/// or `schedule`. `inputs` holds a `direct` or `submitted` execution's named
+/// input declarations as one Variant, and a `group` or `schedule`
+/// execution's internal selector of the source records it reads; uploaded
+/// file bytes stay in tenant object storage and are named only by digest.
+/// `queue_execution` is true only for a submitted execution,
 /// whose acknowledged row the server hands to the batched queue writer; a
 /// direct execution records its inputs with it false so it can never queue
 /// work. `activation` holds a queued execution's accepted request context —
@@ -57,6 +60,7 @@ impl DomainTable for ExecutionInputsTable {
             utf8("verifier_card_uid", false),
             utf8("binding_id", true),
             utf8("group_id", true),
+            utf8("origin", false),
             boolean("queue_execution", false),
             variant_field(INPUTS, false),
             variant_field(ACTIVATION, true),

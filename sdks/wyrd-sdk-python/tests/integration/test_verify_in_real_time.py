@@ -136,7 +136,9 @@ def verify_over_http(server: WyrdTestServer, cards: Cards, traceparent: str) -> 
     return result["execution_id"]
 
 
-def test_agent_answer_passes_its_verifier(assistant: WyrdState) -> None:
+def test_agent_answer_passes_its_verifier(
+    assistant: WyrdState, wyrd_server: WyrdTestServer
+) -> None:
     run = assistant.run("agent")
 
     result = run.observe.verify("answer-check", "yes")
@@ -147,6 +149,16 @@ def test_agent_answer_passes_its_verifier(assistant: WyrdState) -> None:
     assert result.run_id == run.run_id
     [requirement] = result.requirements
     assert (requirement["id"], requirement["outcome"]) == ("says-yes", "passed")
+    wyrd_server.flush_bifrost()
+    resumed = verify.Execution.connect(result.execution_id, client_of(wyrd_server)).wait(
+        WAIT_SECONDS
+    )
+    assert (resumed.execution_id, resumed.verdict, resumed.requirements, resumed.evidence) == (
+        result.execution_id,
+        result.verdict,
+        result.requirements,
+        result.evidence,
+    )
 
 
 def test_agent_answer_fails_its_verifier(assistant: WyrdState) -> None:

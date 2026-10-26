@@ -101,6 +101,14 @@ impl HostedBlocks {
         self.sandbox.shutdown(deadline).await
     }
 
+    /// The process-wide Python sandbox pool, so a test can hold one of its
+    /// admissions while a queued execution runs.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn sandbox(&self) -> &Arc<Sandbox> {
+        &self.sandbox
+    }
+
     /// The Deployment limits in force.
     #[must_use]
     pub const fn limits(&self) -> &HostedLimits {

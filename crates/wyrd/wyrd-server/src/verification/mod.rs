@@ -21,6 +21,7 @@ pub mod fitter;
 pub mod groups;
 pub mod health;
 pub mod hosted;
+pub mod inputs;
 mod leases;
 pub mod operators;
 pub mod permits;
@@ -48,6 +49,7 @@ use self::hosted::blocks::HostedBlocks;
 use self::submissions::{SubmissionOutbox, SubmissionSink};
 
 use self::authority::BackgroundAuthority;
+use self::drift::DriftEngine;
 #[cfg(feature = "test-support")]
 use self::fault::PublicationFault;
 use self::fitter::BaselineFitter;
@@ -498,6 +500,7 @@ impl VerificationRuntimeBuilder<'_> {
                     .auth
                     .tenant_issuer(self.state.bifrost.scribe_outbox()),
             ),
+            DriftEngine::new(self.state.clone(), self.limits.execution_timeout),
             self.limits.poll_interval,
         );
         let scheduler = match self.state.verification.blocks() {

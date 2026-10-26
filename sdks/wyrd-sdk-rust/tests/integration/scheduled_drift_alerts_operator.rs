@@ -241,19 +241,70 @@ async fn failed_schedule_alerts_its_operator_on_the_connection_origin() {
 }
 
 /// A window spread like the healthy baseline's 0 to 99 ms passes its
-/// scheduled run, and the failure Operator is never invoked.
+/// scheduled run, and the failure Operator is never invoked. The execution's
+/// input record is its frozen selection of the submitted observations, and
+/// its read-back result carries the drift report its output record holds.
 ///
 /// # Panics
-/// Panics when a step fails, the verdict differs, or an alert arrives.
+/// Panics when a step fails, the verdict, selection, or report differs, or
+/// an alert arrives.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn passing_window_alerts_no_one() {
+    /// One `bifrost.verification.execution_inputs` row.
+    #[derive(serde::Deserialize)]
+    struct Recorded {
+        /// How the execution was created.
+        origin: String,
+        /// The recorded selector.
+        inputs: Value,
+    }
     let mut watch = Watch::start().await;
     watch.submit((0..100).map(|row| (row * 37) % 100)).await;
 
     let result = watch.judge().await;
 
     assert_eq!(result.outcome.verdict, VerificationVerdict::Passed);
+    let [requirement] = &result.outcome.requirements[..] else {
+        panic!("one requirement: {:?}", result.outcome.requirements);
+    };
+    let Some(RequirementDetail::Drift(report)) = &requirement.detail else {
+        panic!("a drift requirement carries its report: {requirement:?}");
+    };
+    assert!(
+        report
+            .features
+            .values()
+            .any(|feature| feature.score.is_some()),
+        "{report:?}"
+    );
+    let bifrost = wyrd_ai::Bifrost::connect_with(
+        &watch.deployment.admin(),
+        wyrd_ai::bifrost::BifrostOptions::default(),
+    )
+    .await
+    .expect("Bifrost connects");
+    let records: Vec<Recorded> = bifrost
+        .sql_as(
+            "SELECT origin, inputs FROM bifrost.verification.execution_inputs \
+             WHERE execution_id = $1",
+            &[wyrd_ai::bifrost::QueryParam::String(
+                result.execution_id.to_string(),
+            )],
+        )
+        .await
+        .expect("the input record reads back");
+    let [record] = &records[..] else {
+        panic!("one input record per execution");
+    };
+    assert_eq!(record.origin, "schedule");
+    assert!(
+        record.inputs["record_ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty()),
+        "the window freezes the submitted observations: {}",
+        record.inputs
+    );
     watch.hooks.assert_quiet(QUIET).await;
     watch.deployment.shutdown().await;
 }

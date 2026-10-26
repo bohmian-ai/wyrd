@@ -4,14 +4,14 @@
 //! way its result can reach Bifrost is the gateway capture writer's peer
 //! ingest RPC to the Scribe node. The journey schedules one
 //! binding-created run, lets the runtime execute and publish a non-empty Drift
-//! result, and reads the summary and its feature rows back through the
+//! result, and reads the summary and its output row back through the
 //! server's own query entry, asserting every identity they carry. A second
 //! journey runs the production Drift engine on the Scribe-only node, which
 //! hosts no Oracle, so its observation read must be forwarded to a peer
 //! Oracle under the tenant's tokenless SYSTEM read authority and audited
 //! there. A third
-//! journey proves every built-in typed payload — verification summaries, drift
-//! features, gateway payloads, and audit detail — reads back as the producer's
+//! journey proves every built-in typed payload — verification outputs,
+//! gateway payloads, and audit detail — reads back as the producer's
 //! native JSON. A fourth journey sends raw Arrow IPC with malformed Variant
 //! columns to built-ins and proves each is refused before any ACK.
 
@@ -51,7 +51,7 @@ use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::hosted::HostedLimits;
-use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
+use wyrd_server::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId, PrincipalKindTag};
@@ -173,7 +173,7 @@ async fn first_settled(
 
 /// A runner on a node without local Scribe publishes a binding-created Drift
 /// result through the Scribe outbox's peer ingest RPC and completes
-/// the run. Its summary and both feature rows are queryable through the
+/// the run. Its summary and output rows are queryable through the
 /// Oracle and carry the exact tenant SYSTEM principal, Verifier, subject,
 /// owner, binding, run, result, and one shared event time, with the owner
 /// Service and subject described by name and version by the peer that
@@ -197,7 +197,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
         return Err("the runner node must have no local ingest".into());
     }
 
-    let seed = VerificationFixture::provision(oracle.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(oracle.state(), tenant).await?;
     let (subject, _) = seed.service("remote-subject").await?;
     let (owner, owner_principal) = seed.service("remote-owner").await?;
     let verifier = seed.drift_verifier("remote-drift").await?;
@@ -271,22 +271,25 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
         ),
         (
             format!(
-                "SELECT result_id FROM bifrost.drift.result_features WHERE result_id = '{result}'"
+                "SELECT result_id FROM bifrost.verification.execution_outputs WHERE result_id = '{result}'"
             ),
-            2,
-            "two published feature rows for the run",
+            1,
+            "one published output row for the run",
         ),
         (
             format!(
-                "SELECT f.result_id FROM bifrost.drift.result_features f \
+                "SELECT o.result_id FROM bifrost.verification.execution_outputs o \
                  JOIN bifrost.verification.results r \
-                   ON f.result_id = r.result_id \
-                  AND f.{ACT_PRINCIPAL_ID} = r.{ACT_PRINCIPAL_ID} AND f.{SUBJECT_CARD_UID} = r.{SUBJECT_CARD_UID} \
-                 WHERE {}",
-                identity("f.")
+                   ON o.result_id = r.result_id AND o.execution_id = r.execution_id \
+                  AND o.{ACT_PRINCIPAL_ID} = r.{ACT_PRINCIPAL_ID} AND o.{SUBJECT_CARD_UID} = r.{SUBJECT_CARD_UID} \
+                 WHERE {} AND o.{RUN_ID} IS NULL AND o.{WORKLOAD_CARD_UID} = '{owner}' \
+                   AND o.service_name = 'remote-owner' AND o.service_version = '1.0.0' \
+                   AND o.subject_kind = 'Service' AND o.subject_name = 'remote-subject' \
+                   AND o.subject_version = '1.0.0'",
+                identity("r.")
             ),
-            2,
-            "every feature joins its summary on result, run, writer, and Verifier",
+            1,
+            "the output carries its summary's identities and joins it on result, execution, writer, and subject",
         ),
     ];
     for (sql, expected, what) in checks {
@@ -329,7 +332,7 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
         return Err("the runner node must host no Oracle".into());
     }
 
-    let seed = VerificationFixture::provision(scribe.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(scribe.state(), tenant).await?;
     let (subject, _) = seed.service("forwarded-subject").await?;
     let (owner, owner_principal) = seed.service("forwarded-owner").await?;
     let verifier = seed
@@ -431,7 +434,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         .servers()
         .find(|server| server.bifrost_scribe().is_some())
         .ok_or("the cluster composed no Scribe")?;
-    let seed = VerificationFixture::provision(oracle.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(oracle.state(), tenant).await?;
     let subject_ref = scribe
         .bootstrap_service_in_tenant(tenant, "shared-subject", &[])
         .await?
@@ -659,13 +662,13 @@ fn observation_batch(
 ///
 /// The tenant SYSTEM writer publishes three results through the public
 /// Bifrost facade, flushing after each so every result is its own file: a
-/// Drift result whose feature rows are acknowledged on one receipt day and
+/// Drift result whose output row is acknowledged on one receipt day and
 /// whose summary is acknowledged on the next, a Drift result whose event time
-/// is the previous UTC day, and an unscored result that writes its summary
-/// only. Each result's details are
-/// retrieved by `result_id` alone from both daily partitions; the straddling
-/// result's summary partitions on its `ended_at` while its details partition
-/// on a `wyrd_ingested_at` that falls on a different day. Every published Parquet file of
+/// is the previous UTC day, and an unscored result. Each result's one output
+/// row is retrieved by `result_id` alone from both daily partitions; the
+/// straddling result's summary and output each partition on their own
+/// `ended_at` though their `wyrd_ingested_at` receipts fall on different
+/// days. Every published Parquet file of
 /// the two tables carries a physical Bloom filter for every default Bloom
 /// column of its table's layout, and Oracle's scan metrics show a day-range
 /// predicate dropping the previous day's file and a `result_id` lookup
@@ -686,32 +689,23 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     let unscored = journey.publish(now, Report::Unscored, false).await?;
     cluster.refresh_oracle_snapshots().await?;
 
-    for (result, expected) in [(&straddling, 2), (&previous_day, 2)] {
-        let features = journey
+    for result in [&straddling, &previous_day, &unscored] {
+        let outputs = journey
             .texts(format!(
-                "SELECT feature FROM bifrost.drift.result_features WHERE result_id = '{result}'"
+                "SELECT result_id FROM bifrost.verification.execution_outputs \
+                 WHERE result_id = '{result}'"
             ))
             .await?;
-        if features.len() != expected {
+        if outputs.len() != 1 {
             return Err(format!(
-                "result {result} must retrieve its {expected} feature rows by result_id, \
-                 saw {features:?}"
+                "result {result} must retrieve its one output row by result_id, saw {outputs:?}"
             )
             .into());
         }
     }
-    let none = journey
-        .texts(format!(
-            "SELECT feature FROM bifrost.drift.result_features WHERE result_id = '{unscored}'"
-        ))
-        .await?;
-    if !none.is_empty() {
-        return Err(format!("the unscored result wrote feature rows: {none:?}").into());
-    }
 
-    // The summary's time column is `ended_at`; the details declare none, so
-    // they partition on their own receipt instant. Each projects its time
-    // column first and its receipt instant second.
+    // Both tables' time column is `ended_at`. Each projects its time column
+    // first and its receipt instant second.
     let times = |time_column: &str, table: &str| {
         format!(
             "SELECT CAST({time_column} AS BIGINT) AS time, \
@@ -723,7 +717,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
         .texts(times("ended_at", "bifrost.verification.results"))
         .await?;
     let details = journey
-        .texts(times(WYRD_INGESTED_AT, "bifrost.drift.result_features"))
+        .texts(times("ended_at", "bifrost.verification.execution_outputs"))
         .await?;
     let micros = |value: &Option<String>| -> Result<i64, ServerJourneyError> {
         Ok(value.as_deref().ok_or("null timestamp")?.parse()?)
@@ -738,14 +732,21 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
         )
         .into());
     }
-    for detail in &details {
-        if day(micros(&detail[1])?) == day(micros(&summary[1])?) {
-            return Err(format!(
-                "the details and summary ACKs must fall on different receipt days: \
-                 {summary:?} {details:?}"
-            )
-            .into());
-        }
+    let [detail] = details.as_slice() else {
+        return Err(format!("one straddling output expected, saw {details:?}").into());
+    };
+    if micros(&detail[0])? != now.timestamp_micros() {
+        return Err(format!(
+            "the output must partition on its own ended_at: {detail:?} ended {now}"
+        )
+        .into());
+    }
+    if day(micros(&detail[1])?) == day(micros(&summary[1])?) {
+        return Err(format!(
+            "the output and summary ACKs must fall on different receipt days: \
+             {summary:?} {detail:?}"
+        )
+        .into());
     }
 
     journey.assert_blooms()?;
@@ -802,7 +803,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
 enum Report {
     /// A two-feature Drift outcome over a Drift window.
     Drift,
-    /// An unscored Drift outcome, which publishes its summary only.
+    /// An unscored Drift outcome, whose output holds no feature detail.
     Unscored,
 }
 
@@ -926,11 +927,14 @@ impl<'a> ResultLayoutJourney<'a> {
     async fn start(cluster: &'a WyrdTestCluster) -> Result<Self, ServerJourneyError> {
         let tenant = cluster.data_tenant_id();
         let server = cluster.server(0).ok_or("missing mixed node")?;
-        let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+        let seed = VerificationFixture::provision(server.state(), tenant).await?;
         let (subject, _) = seed.service("layout-subject").await?;
         let uid = seed.drift_verifier("layout-drift").await?;
         let verifier: CardRef = format!("Verifier/layout-drift@1.0.0#{uid}").parse()?;
-        for (namespace, name) in [("verification", "results"), ("drift", "result_features")] {
+        for (namespace, name) in [
+            ("verification", "results"),
+            ("verification", "execution_outputs"),
+        ] {
             server
                 .ensure_builtin_table_for_test(tenant, namespace, name)
                 .await?;
@@ -951,7 +955,7 @@ impl<'a> ResultLayoutJourney<'a> {
     /// names its partition.
     ///
     /// With `straddle`, Scribe's receipt clock moves one day ahead after the
-    /// detail batch is acknowledged and before the summary is sent, so the
+    /// output batch is acknowledged and before the summary is sent, so the
     /// two ACKs fall on different UTC receipt days; the shift is cleared
     /// before returning.
     ///
@@ -1051,15 +1055,15 @@ impl<'a> ResultLayoutJourney<'a> {
     /// result table's own layout, in every published file of the two tables.
     ///
     /// Files are found under the cluster's storage root and classified by a
-    /// column only their table carries; each table must have at least one.
+    /// column, by leaf name or dotted path, only their table carries; each
+    /// table must have at least one.
     ///
     /// # Errors
     /// Returns a filesystem or Parquet error, or names the first table with
     /// no file or the first column chunk without a Bloom filter.
     fn assert_blooms(&self) -> Result<(), ServerJourneyError> {
         use vala_bifrost_redux::tables::DomainTable;
-        use vala_bifrost_redux::tables::drift::ResultFeaturesTable;
-        use vala_bifrost_redux::tables::verification::ResultsTable;
+        use vala_bifrost_redux::tables::verification::{ExecutionOutputsTable, ResultsTable};
 
         let tables = [
             (
@@ -1068,9 +1072,9 @@ impl<'a> ResultLayoutJourney<'a> {
                 ResultsTable::physical_layout().bloom_columns,
             ),
             (
-                "bifrost.drift.result_features",
-                "feature",
-                ResultFeaturesTable::physical_layout().bloom_columns,
+                "bifrost.verification.execution_outputs",
+                "output.metadata",
+                ExecutionOutputsTable::physical_layout().bloom_columns,
             ),
         ];
         let mut found = [0_usize; 2];
@@ -1091,7 +1095,11 @@ impl<'a> ResultLayoutJourney<'a> {
                 let reader = SerializedFileReader::new(std::fs::File::open(&path)?)?;
                 let metadata = reader.metadata();
                 let columns = metadata.file_metadata().schema_descr().columns().to_vec();
-                let has = |name: &str| columns.iter().any(|column| column.name() == name);
+                let has = |name: &str| {
+                    columns
+                        .iter()
+                        .any(|column| column.name() == name || column.path().string() == name)
+                };
                 let Some(index) = tables.iter().position(|(_, marker, _)| has(marker)) else {
                     continue;
                 };
@@ -1125,7 +1133,7 @@ impl<'a> ResultLayoutJourney<'a> {
 }
 
 /// Scribe decorator that moves the receipt clock one day ahead just before
-/// the summary frame, so a straddling result's detail and summary ACKs fall
+/// the summary frame, so a straddling result's output and summary ACKs fall
 /// on different UTC receipt days.
 struct StraddleScribe {
     /// The mixed node's real Scribe.
@@ -1247,9 +1255,10 @@ async fn query_rows(
 /// Drift outcome as the tenant SYSTEM writer; a real gateway call is captured
 /// with its request and response payloads; and an audit decision with a
 /// structured detail is staged on the Scribe outbox and retained. Each
-/// summary's `outcome` Variant decodes to the producer's native outcome JSON
-/// both before and after the flush, and its `verdict` column names the
-/// outcome's verdict. A second gateway call the upstream refuses is captured
+/// result's `execution_outputs` `output` Variant, joined to its summary by
+/// `result_id`, decodes to the producer's native requirements and steps
+/// JSON both before and after the flush, and the summary's `verdict` column
+/// names the outcome's verdict. A second gateway call the upstream refuses is captured
 /// with no resolved model: hot and published, both its `resolved_model`
 /// children read SQL null while the resolved call's read its provider and
 /// model. The retained audit row's detail decodes to the decision's canonical
@@ -1267,8 +1276,9 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     let call = journey.gateway.capture_call().await?;
     let decision = journey.stage_audit_decision().await?;
     let outcomes_sql = format!(
-        "SELECT result_id, verdict, outcome FROM bifrost.verification.results \
-         WHERE result_id IN ('{}', '{}') ORDER BY result_id",
+        "SELECT r.result_id, r.verdict, o.output FROM bifrost.verification.results r \
+         JOIN bifrost.verification.execution_outputs o ON o.result_id = r.result_id \
+         WHERE r.result_id IN ('{}', '{}') ORDER BY r.result_id",
         results.scored_drift.0, results.unscored_drift.0
     );
     let mut expected_outcomes = [&results.scored_drift, &results.unscored_drift]
@@ -1276,7 +1286,10 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
             Ok::<_, ServerJourneyError>(vec![
                 json!(result.to_string()),
                 json!(<&'static str>::from(outcome.verdict)),
-                serde_json::to_value(outcome)?,
+                json!({
+                    "requirements": outcome.requirements,
+                    "steps": outcome.steps,
+                }),
             ])
         })
         .into_iter()
@@ -1571,7 +1584,7 @@ async fn system_and_dynamic_tables_share_attribution() -> Result<(), ServerJourn
 /// same shared Agent component with one Drift Verifier. Each stages its
 /// pinned inputs row and its result through the production payload builder
 /// on the process outbox before one flush, so their rows travel together.
-/// Every retained `execution_inputs`, `results`, and `result_features` row
+/// Every retained `execution_inputs`, `results`, and `execution_outputs` row
 /// names its own owning Service as workload and by name and version, its own
 /// account pair and environment, and the shared Agent by UID, kind, name,
 /// and version; no row takes another producer's or the delivering worker's
@@ -1591,7 +1604,7 @@ async fn trusted_delivery_preserves_each_origin() -> Result<(), ServerJourneyErr
     let journey = TypedPayloadJourney::start().await?;
     let server = &journey.gateway.server;
     let tenant = journey.gateway.tenant;
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     seed.declare(
         "Prompt",
         "origin-prompt",
@@ -1616,7 +1629,7 @@ async fn trusted_delivery_preserves_each_origin() -> Result<(), ServerJourneyErr
     for (namespace, name) in [
         ("verification", "execution_inputs"),
         ("verification", "results"),
-        ("drift", "result_features"),
+        ("verification", "execution_outputs"),
     ] {
         server
             .ensure_builtin_table_for_test(tenant, namespace, name)
@@ -1655,7 +1668,7 @@ async fn trusted_delivery_preserves_each_origin() -> Result<(), ServerJourneyErr
         outbox.stage(
             tenant,
             ScribeWrite::ExecutionInputs {
-                row: builder.inputs(&BTreeMap::new(), None)?,
+                row: builder.inputs(InputRecord::Direct(&BTreeMap::new()))?,
                 attribution,
                 queued: None,
             },
@@ -1686,10 +1699,13 @@ async fn trusted_delivery_preserves_each_origin() -> Result<(), ServerJourneyErr
     }
     server.flush_bifrost().await?;
 
-    for table in [
-        "bifrost.verification.execution_inputs",
-        "bifrost.verification.results",
-        "bifrost.drift.result_features",
+    let judged = format!("verifier_card_uid = '{verifier}'");
+    let output =
+        format!("result_id IN (SELECT result_id FROM bifrost.verification.results WHERE {judged})");
+    for (table, predicate) in [
+        ("bifrost.verification.execution_inputs", &judged),
+        ("bifrost.verification.results", &judged),
+        ("bifrost.verification.execution_outputs", &output),
     ] {
         expect_eq(
             &format!("{table} origins"),
@@ -1698,7 +1714,7 @@ async fn trusted_delivery_preserves_each_origin() -> Result<(), ServerJourneyErr
                     "SELECT DISTINCT {WORKLOAD_CARD_UID}, {SUBJECT_CARD_UID}, \
                      {SUB_PRINCIPAL_ID}, {ACT_PRINCIPAL_ID}, service_name, service_version, \
                      deployment_environment, subject_kind, subject_name, subject_version \
-                     FROM {table} WHERE verifier_card_uid = '{verifier}' ORDER BY service_name"
+                     FROM {table} WHERE {predicate} ORDER BY service_name"
                 ))
                 .await?,
             &expected,
@@ -2904,14 +2920,14 @@ impl TypedPayloadJourney {
     /// # Errors
     /// Returns a seeding, payload, or flush error.
     async fn publish_results(&self) -> Result<PublishedResults, ServerJourneyError> {
-        let seed = VerificationFixture::provision(
-            self.gateway.server.state().postgres.wyrd(),
-            self.gateway.tenant,
-        )
-        .await?;
+        let seed = VerificationFixture::provision(self.gateway.server.state(), self.gateway.tenant)
+            .await?;
         let (subject, _) = seed.service("typed-subject").await?;
         let uid = seed.drift_verifier("typed-drift").await?;
-        for (namespace, name) in [("verification", "results"), ("drift", "result_features")] {
+        for (namespace, name) in [
+            ("verification", "results"),
+            ("verification", "execution_outputs"),
+        ] {
             self.gateway
                 .server
                 .ensure_builtin_table_for_test(self.gateway.tenant, namespace, name)
@@ -3032,12 +3048,23 @@ impl TypedPayloadJourney {
             AuthMethod::Internal,
             permission,
         )?;
-        let mut batches = Vec::new();
-        ScheduledQueryCaller::new(
-            self.gateway.server.state().clone(),
-            context,
-            CancellationToken::new(),
-        )
+        query_json(&self.gateway.server, context, sql).await
+    }
+}
+
+/// Run `sql` through `server`'s scheduled query entry under `context`
+/// against published data and return every row with each cell as JSON, a
+/// Variant cell as its JSON value.
+///
+/// # Errors
+/// Returns the query or decode error.
+async fn query_json(
+    server: &WyrdTestServer,
+    context: AuthorizedQueryContext,
+    sql: String,
+) -> Result<Vec<Vec<Value>>, ServerJourneyError> {
+    let mut batches = Vec::new();
+    ScheduledQueryCaller::new(server.state().clone(), context, CancellationToken::new())
         .run_with(
             BifrostQueryRequest {
                 sql,
@@ -3050,31 +3077,30 @@ impl TypedPayloadJourney {
             },
         )
         .await?;
-        let Some(schema) = batches.first().map(RecordBatch::schema) else {
-            return Ok(Vec::new());
-        };
-        let mut bytes = Vec::new();
-        let mut writer = WriterBuilder::new()
-            .with_explicit_nulls(true)
-            .with_encoder_factory(Arc::new(WyrdJsonEncoderFactory))
-            .build::<_, JsonArray>(&mut bytes);
-        for batch in &batches {
-            writer.write(batch)?;
-        }
-        writer.finish()?;
-        drop(writer);
-        let objects: Vec<serde_json::Map<String, Value>> = serde_json::from_slice(&bytes)?;
-        Ok(objects
-            .into_iter()
-            .map(|mut object| {
-                schema
-                    .fields()
-                    .iter()
-                    .map(|field| object.remove(field.name()).unwrap_or(Value::Null))
-                    .collect()
-            })
-            .collect())
+    let Some(schema) = batches.first().map(RecordBatch::schema) else {
+        return Ok(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    let mut writer = WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .with_encoder_factory(Arc::new(WyrdJsonEncoderFactory))
+        .build::<_, JsonArray>(&mut bytes);
+    for batch in &batches {
+        writer.write(batch)?;
     }
+    writer.finish()?;
+    drop(writer);
+    let objects: Vec<serde_json::Map<String, Value>> = serde_json::from_slice(&bytes)?;
+    Ok(objects
+        .into_iter()
+        .map(|mut object| {
+            schema
+                .fields()
+                .iter()
+                .map(|field| object.remove(field.name()).unwrap_or(Value::Null))
+                .collect()
+        })
+        .collect())
 }
 
 /// Register a Verifier whose one requirement asserts its `x` JSON input is
@@ -3165,7 +3191,7 @@ const QUEUED_SUBJECT_ONLY: &str = "queued_subject_only";
 async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourneyError> {
     let server = WyrdTestServer::builder().start_bound().await?;
     let tenant = server.data_tenant_id();
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     let (subject, _) = seed.service("queued-subject").await?;
     let verifier = assert_verifier(&seed, "queued-assert").await?;
     server
@@ -3342,7 +3368,7 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
 async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> {
     let server = WyrdTestServer::builder().start_bound().await?;
     let tenant = server.data_tenant_id();
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     let (subject, _) = seed.service("history-subject").await?;
     let verifier = seed
         .verifier(
@@ -3477,7 +3503,7 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
 async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyError> {
     let server = WyrdTestServer::builder().start_bound().await?;
     let tenant = server.data_tenant_id();
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     let (subject, _) = seed.service("scheduled-subject").await?;
     let (owner, owner_principal) = seed.service("scheduled-owner").await?;
     let verifier = seed
@@ -3628,7 +3654,7 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
     )
     .await?;
     let tenant = server.data_tenant_id();
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     let (subject, _) = seed.service("widen-subject").await?;
     let verifier = assert_verifier(&seed, "widen-assert").await?;
     server
@@ -3905,8 +3931,7 @@ async fn shared_startup_uses_complete_injected_engines() -> Result<(), ServerJou
         return Err(format!("an oversized body answered {}", oversized.status()).into());
     }
 
-    let seed =
-        VerificationFixture::provision(state.postgres.wyrd(), server.data_tenant_id()).await?;
+    let seed = VerificationFixture::provision(state, server.data_tenant_id()).await?;
     let (subject, _) = seed.service("startup-subject").await?;
     let verifier = assert_verifier(&seed, "startup-assert").await?;
     let execution = seed
@@ -4800,11 +4825,9 @@ async fn shared_shutdown_drains_producers_workers_and_acknowledgements()
     else {
         return Err("the enqueuer bootstraps a user".into());
     };
-    let seed = VerificationFixture::provision(
-        journey.server.state().postgres.wyrd(),
-        journey.server.data_tenant_id(),
-    )
-    .await?;
+    let seed =
+        VerificationFixture::provision(journey.server.state(), journey.server.data_tenant_id())
+            .await?;
     let (subject, _) = seed.service("drain-subject").await?;
     let verifier = assert_verifier(&seed, "drain-assert").await?;
 
@@ -5913,7 +5936,7 @@ async fn visible_trace_spans_preserve_binding_ownership() -> Result<(), ServerJo
     server
         .ensure_builtin_table_for_test(tenant, "traces", "spans")
         .await?;
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     let (checkout, _) = seed.service("checkout").await?;
     let (fraud, _) = seed.service("fraud").await?;
     let (admin, schema) = span_writer(&server).await?;
@@ -6110,7 +6133,7 @@ async fn late_trace_spans_require_new_verification() -> Result<(), ServerJourney
     server
         .ensure_builtin_table_for_test(tenant, "traces", "spans")
         .await?;
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     let (checkout, _) = seed.service("checkout").await?;
     let (admin, schema) = span_writer(&server).await?;
     let verifier = seed
@@ -6246,8 +6269,8 @@ const EXPLORED: [Explored; 9] = [
         grows: false,
     },
     Explored {
-        table: "bifrost.drift.result_features",
-        time: WYRD_INGESTED_AT,
+        table: "bifrost.verification.execution_outputs",
+        time: "ended_at",
         grows: false,
     },
     Explored {
@@ -6448,7 +6471,7 @@ struct Release {
 /// two concurrent releases and environments and one Service is low-volume.
 /// Each round observes a shared Agent and a Model of the same name, so Card
 /// kinds stay apart. Spans, logs, metric points, drift observations,
-/// execution inputs, results, and result features carry the accepted
+/// execution inputs, results, and execution outputs carry the accepted
 /// attribution, and each release's runtime account calls the gateway once
 /// per subject under its release root, so captured calls carry it too. The
 /// audit log holds the permission decisions all of that made, attributed
@@ -6525,7 +6548,7 @@ async fn exploration_filters_keep_exact_populations() -> Result<(), ServerJourne
     if !captured.status().is_success() {
         return Err(format!("the capture policy was refused: {}", captured.status()).into());
     }
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     seed.declare(
         "Prompt",
         "lookup-prompt",
@@ -6743,7 +6766,7 @@ async fn exploration_filters_keep_exact_populations() -> Result<(), ServerJourne
             outbox.stage(
                 tenant,
                 ScribeWrite::ExecutionInputs {
-                    row: builder.inputs(&BTreeMap::new(), None)?,
+                    row: builder.inputs(InputRecord::Direct(&BTreeMap::new()))?,
                     attribution,
                     queued: None,
                 },
@@ -7032,7 +7055,7 @@ async fn exploration_filters_keep_exact_populations() -> Result<(), ServerJourne
             &cluster,
             &label,
             texts(format!(
-                "SELECT outcome FROM bifrost.verification.results WHERE {predicate}"
+                "SELECT verdict FROM bifrost.verification.results WHERE {predicate}"
             )),
         )
         .await?;
@@ -7178,7 +7201,7 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
             .publish(now - chrono::Duration::days(days), Report::Drift, false)
             .await?;
     }
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     let (checkout, _) = seed.service("result-checkout").await?;
     let (admin, schema) = span_writer(server).await?;
     let verifier = seed
@@ -7298,8 +7321,9 @@ async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourne
 /// and an hour after the due end; `other` writes 50 in the window; `empty`
 /// writes nothing. Every record also carries a `latency` series. The
 /// production runtime then scores `inside` at 4 and `other` at 50, while
-/// `empty` stays unscored with no feature row, and the three executions cost
-/// three Oracle statements.
+/// `empty` stays unscored with no scored feature, and each of the three
+/// executions costs three Oracle statements: its frozen population selection,
+/// its input-record read, and its one window statement.
 ///
 /// # Errors
 /// Returns cluster, seeding, client, runtime, or query errors, or the first
@@ -7313,7 +7337,7 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
     server
         .ensure_builtin_table_for_test(tenant, "drift", "observations")
         .await?;
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     let verifier = seed
         .custom_drift_verifier("window-mean", "score", 0.0, 1000.0)
         .await?;
@@ -7388,8 +7412,8 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
     {
         return Err(format!("every window completes with a result: {rows:?}").into());
     }
-    if !ScanEvidence::is(work.queries, 3) {
-        return Err(format!("each window is one statement: {work:?}").into());
+    if !ScanEvidence::is(work.queries, 9) {
+        return Err(format!("each window costs three statements: {work:?}").into());
     }
     let unwritten = server
         .state()
@@ -7402,21 +7426,31 @@ async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> 
     }
     server.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
-    for (binding, expected) in bindings.iter().zip([Some("4.0"), Some("50.0"), None]) {
-        let scores = query_texts(
+    for (binding, expected) in bindings.iter().zip([Some(4.0), Some(50.0), None]) {
+        let outputs = query_json(
             server,
-            tenant,
+            scheduled_context(tenant)?,
             format!(
-                "SELECT CAST(score AS VARCHAR) FROM bifrost.drift.result_features \
-                 WHERE binding_id = '{binding}' AND feature = 'score'"
+                "SELECT o.output FROM bifrost.verification.results r \
+                 JOIN bifrost.verification.execution_outputs o ON o.result_id = r.result_id \
+                 WHERE r.binding_id = '{binding}'"
             ),
         )
         .await?;
-        let scored: Vec<_> = expected
-            .map(|score| vec![Some(score.to_owned())])
-            .into_iter()
+        let scores: Vec<_> = outputs
+            .iter()
+            .flat_map(|row| {
+                row[0]["requirements"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|requirement| {
+                requirement["detail"]["drift"]["features"]["score"]["score"].as_f64()
+            })
             .collect();
-        if scores != scored {
+        let scored: Vec<_> = expected.into_iter().collect();
+        if outputs.len() != 1 || scores != scored {
             return Err(format!("binding {binding} scored {scores:?}, not {expected:?}").into());
         }
     }
@@ -7454,7 +7488,7 @@ async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourney
             .ensure_builtin_table_for_test(tenant, "verification", table)
             .await?;
     }
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let seed = VerificationFixture::provision(server.state(), tenant).await?;
     let admin = server.bootstrap_service("group-admin", &["admin"]).await?;
     let admin = native_client(
         server,

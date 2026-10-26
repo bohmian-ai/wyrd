@@ -44,6 +44,8 @@ use wyrd_spec::vala::api::{VARIANT_MAX_DEPTH, VARIANT_MAX_ENCODED_BYTES};
 use wyrd_types::timestamp::{TimestampKind, TimestampTz};
 use wyrd_types::variant::{is_variant, variant_storage_fields};
 
+mod serialize;
+
 /// Why one Variant value cannot be stored.
 ///
 /// The violation names where inside the value it failed; the caller supplies
@@ -194,6 +196,41 @@ impl EncodedVariant {
         } else {
             Self::from_json_text(&value.to_string())
         }
+    }
+
+    /// Encode a typed value under the Bifrost Variant rules in one pass.
+    ///
+    /// The value's `Serialize` drives the Variant builders directly, so no
+    /// JSON text is written or parsed. The stored value renders as the
+    /// value's `serde_json` text encoded by [`Self::from_json_text`] does:
+    /// the same integer widths, doubles, explicit nulls, and object fields.
+    /// A value the direct encoder cannot store exactly (a container past the
+    /// depth limit, an integer outside the 64-bit ranges, a non-string map
+    /// key, or a `Serialize` error) is encoded through its `serde_json` text
+    /// instead, so every refusal and its pointer come from that one walk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VariantViolation::TooLarge`] when the encoding exceeds the
+    /// size limit, [`VariantViolation::InvalidJson`] at the root when the
+    /// value does not serialize to JSON, and the other violations of
+    /// [`Self::from_json_text`] for a value that falls back to it.
+    pub fn from_serialize<T: serde::Serialize + ?Sized>(
+        value: &T,
+    ) -> Result<Self, VariantViolation> {
+        let mut builder = VariantBuilder::new();
+        let direct = value.serialize(serialize::Encoder {
+            builder: &mut builder,
+            depth: 0,
+        });
+        if direct.is_ok()
+            && let Ok((metadata, value)) = builder.try_finish()
+        {
+            Self::within_size_limit(metadata.len() + value.len())?;
+            return Ok(Self { metadata, value });
+        }
+        let text = serde_json::to_string(value).map_err(|_| invalid(&JsonPointer::default()))?;
+        Self::from_json_text(&text)
     }
 
     /// Parse JSON text and encode it under the Bifrost Variant rules.
@@ -1349,6 +1386,95 @@ mod tests {
                 path: String::new()
             })
         );
+    }
+
+    /// A typed value encodes directly to what its `serde_json` text encodes
+    /// to, and a value the direct encoder cannot hold falls back to the same
+    /// refusal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the direct encoding renders differently from the text
+    /// encoding, fails full validation, or refuses differently.
+    #[test]
+    fn typed_values_encode_as_their_json_text() {
+        #[derive(serde::Serialize)]
+        enum Shape {
+            Unit,
+            Newtype(u8),
+            Tuple(i32, Option<bool>),
+            Struct { side: f32, gone: Option<u8> },
+        }
+        #[derive(serde::Serialize)]
+        struct Typed {
+            small: i8,
+            big: i64,
+            huge: u64,
+            wide: u128,
+            ratio: f64,
+            single: f32,
+            infinite: f64,
+            letter: char,
+            gone: Option<String>,
+            unit: (),
+            list: Vec<Shape>,
+            map: BTreeMap<String, Vec<u16>>,
+            tuple: (u8, &'static str),
+        }
+        let typed = Typed {
+            small: -7,
+            big: 9_007_199_254_740_993,
+            huge: u64::MAX,
+            wide: u128::from(u64::MAX),
+            ratio: 0.1,
+            single: 0.1,
+            infinite: f64::INFINITY,
+            letter: 'é',
+            gone: None,
+            unit: (),
+            list: vec![
+                Shape::Unit,
+                Shape::Newtype(3),
+                Shape::Tuple(-40_000, None),
+                Shape::Struct {
+                    side: 2.5,
+                    gone: None,
+                },
+            ],
+            map: BTreeMap::from([("z".to_owned(), vec![1, 300]), ("a".to_owned(), vec![])]),
+            tuple: (1, "x"),
+        };
+        let render = |encoded: &EncodedVariant| {
+            EncodedVariant::from_bytes(encoded.metadata(), encoded.value()).expect("valid bytes");
+            variant_bytes_to_json(encoded.metadata(), encoded.value()).expect("json")
+        };
+        let text = serde_json::to_string(&typed).expect("serializes");
+        let direct = EncodedVariant::from_serialize(&typed).expect("encodes");
+        let walked = EncodedVariant::from_json_text(&text).expect("encodes");
+        assert_eq!(render(&direct), render(&walked));
+        let variant = Variant::try_new(direct.metadata(), direct.value()).expect("valid");
+        let object = variant.as_object().expect("object");
+        assert_eq!(object.get("small"), Some(Variant::Int8(-7)));
+        assert_eq!(object.get("gone"), Some(Variant::Null));
+        assert!(matches!(object.get("huge"), Some(Variant::Decimal16(_))));
+
+        let mut deep = json!(1);
+        for _ in 0..=VARIANT_MAX_DEPTH {
+            deep = json!([deep]);
+        }
+        assert_eq!(
+            EncodedVariant::from_serialize(&deep),
+            EncodedVariant::from_json_text(&deep.to_string())
+        );
+        let past = BTreeMap::from([("n", u128::from(u64::MAX) + 1)]);
+        assert_eq!(
+            EncodedVariant::from_serialize(&past),
+            EncodedVariant::from_json_text(&serde_json::to_string(&past).expect("serializes"))
+        );
+        assert!(matches!(
+            EncodedVariant::from_serialize(&past),
+            Err(VariantViolation::NumericOutOfRange { .. })
+        ));
     }
 
     /// JSON text classifies integers by the 64-bit ranges and keeps the final

@@ -174,7 +174,7 @@ mod tests {
             (tenant, "bifrost.gateway.calls"),
             (tenant, "bifrost.traces.spans"),
             (tenant, "bifrost.verification.results"),
-            (tenant, "bifrost.drift.result_features"),
+            (tenant, "bifrost.verification.execution_outputs"),
             (tenant, "bifrost.verification.execution_inputs"),
         ] {
             let batch = ScribeCapturePeerGrpc::batch(request(tenant, table)).expect("accepted");

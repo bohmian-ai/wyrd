@@ -65,8 +65,8 @@ const WAIT: Duration = Duration::from_mins(1);
 /// Summary table every completed result ends with.
 const RESULTS: &str = "bifrost.verification.results";
 
-/// Drift detail table.
-const FEATURES: &str = "bifrost.drift.result_features";
+/// Output table every completed result's summary follows.
+const OUTPUTS: &str = "bifrost.verification.execution_outputs";
 
 /// One bound server, one seeded tenant, and the controls a runtime is built with.
 struct Harness {
@@ -512,7 +512,7 @@ async fn seed_tenant(
             .await
             .expect("tenant receives every built-in table");
     }
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant)
+    let seed = VerificationFixture::provision(server.state(), tenant)
         .await
         .expect("tenant provisions");
     let (subject, _) = seed.service("svc").await.expect("subject registers");
@@ -599,8 +599,7 @@ fn drift_outcome(
     }
 }
 
-/// A failed Drift outcome over two scored features, one drifting, so the
-/// execution writes two feature rows before its summary.
+/// A failed Drift outcome over two scored features, one drifting.
 ///
 /// # Panics
 /// Panics when a static feature name is invalid.
@@ -635,8 +634,7 @@ fn drifting_report() -> VerificationOutcome {
     )
 }
 
-/// An inconclusive Drift outcome that scored no feature, so the execution
-/// writes its summary only.
+/// An inconclusive Drift outcome that scored no feature.
 ///
 /// # Panics
 /// Panics when the static drift check is invalid.
@@ -676,7 +674,7 @@ async fn sent_to(fault: &PublicationFault, table: &str) -> Vec<SentBatch> {
         .collect()
 }
 
-/// A completed Drift run writes its feature details and then its summary
+/// A completed Drift run writes its output and then its summary
 /// through the internal result writer, completes with a result, stages no
 /// audit, and records the runtime metrics.
 ///
@@ -701,7 +699,7 @@ async fn completed_run_publishes_details_then_summary_and_records_metrics() {
     assert_eq!(row.error_code, None);
     assert_eq!(
         harness.writes().await,
-        vec![FEATURES.to_owned(), RESULTS.to_owned()]
+        vec![OUTPUTS.to_owned(), RESULTS.to_owned()]
     );
     assert_eq!(
         harness.audit_operations().await,
@@ -990,12 +988,13 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
     }
 }
 
-/// An unscored Drift execution publishes only its summary.
+/// An unscored Drift execution still publishes its output, then its summary.
 ///
 /// # Panics
-/// Panics when the run does not complete or anything but one summary is written.
+/// Panics when the run does not complete or anything but one output and one
+/// summary is written.
 #[tokio::test]
-async fn unscored_drift_publishes_only_the_summary() {
+async fn unscored_drift_publishes_its_output_then_summary() {
     let harness = Harness::start().await;
     let script = EngineScript::default();
     script.push(EngineOutcome::Completed(unscored_report()));
@@ -1003,8 +1002,198 @@ async fn unscored_drift_publishes_only_the_summary() {
     let run = harness.submit().await;
 
     harness.wait_execution(run, status("completed")).await;
-    assert_eq!(harness.writes().await, vec![RESULTS.to_owned()]);
+    assert_eq!(
+        harness.writes().await,
+        vec![OUTPUTS.to_owned(), RESULTS.to_owned()]
+    );
     runtime.stop().await;
+}
+
+/// Every execution origin publishes each fact once: one input record, one
+/// output record, and one payload-free summary, with no input payload in
+/// PostgreSQL.
+///
+/// A direct execution records its supplied declaration, a submission its
+/// accepted declarations, and a scheduled drift window its frozen selector,
+/// here an empty population. Each output names its summary's result ID, and
+/// the status read reassembles every completed result, including the direct
+/// execution, which has no queue row and resolves through its records.
+///
+/// # Panics
+/// Panics when an execution does not complete, a table holds other than one
+/// record per execution, a record's origin or payload differs, the queue
+/// keeps an input column, or a status read does not return the result.
+#[tokio::test]
+async fn verification_records_have_one_payload_owner() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    script.push(EngineOutcome::Completed(drifting_report()));
+    script.push(EngineOutcome::Completed(drifting_report()));
+    let runtime = harness.spawn(&Harness::limits(), &script);
+    let assertion = harness
+        .seed
+        .verifier("records-assertion", &assertion_spec())
+        .await
+        .expect("assertion Verifier registers");
+    let wyrd_testing::Bootstrap::User { jwt, .. } = harness
+        .server
+        .bootstrap_user("records-writer", &["admin"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a machine principal");
+    };
+    let call = async |method: axum::http::Method, uri: String, body: serde_json::Value| {
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request builds");
+        let response = harness
+            .server
+            .oneshot_authenticated(&jwt, request)
+            .await
+            .expect("request responds");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("body is JSON");
+        (status, body)
+    };
+    let (code, executed) = call(
+        axum::http::Method::POST,
+        "/v1/verification/execute".to_owned(),
+        serde_json::json!({
+            "verifier_card_uid": assertion,
+            "card_uid": harness.subject,
+            "inputs": { "x": { "kind": "json", "value": 1 } },
+        }),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{executed}");
+    let direct = executed["execution_id"]
+        .as_str()
+        .expect("a direct execution ID")
+        .to_owned();
+    let submitted = harness.submit().await;
+    harness.wait_execution(submitted, status("completed")).await;
+    let scheduled = harness.schedule("records-owner", &harness.verifier).await;
+    harness.wait_execution(scheduled, status("completed")).await;
+    runtime.stop().await;
+    harness
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Scribe flushes");
+
+    let tenant = harness.server.pg_fixture().data_tenant_id();
+    let ids = [direct.clone(), submitted.to_string(), scheduled.to_string()];
+    let listed = ids.map(|id| format!("'{id}'")).join(", ");
+    let rows = async |sql: String| {
+        harness
+            .server
+            .retained_records(tenant, sql)
+            .await
+            .expect("records read")
+    };
+    let inputs = rows(format!(
+        "SELECT CAST(execution_id AS VARCHAR) AS execution, origin, inputs \
+         FROM bifrost.verification.execution_inputs WHERE execution_id IN ({listed}) \
+         ORDER BY origin"
+    ))
+    .await;
+    let origins: Vec<_> = inputs
+        .iter()
+        .map(|row| {
+            (
+                row[0].clone().unwrap_or_default(),
+                row[1].clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        origins,
+        [
+            (direct.clone(), "direct".to_owned()),
+            (scheduled.to_string(), "schedule".to_owned()),
+            (submitted.to_string(), "submitted".to_owned()),
+        ],
+        "one input record per execution"
+    );
+    let payload = |row: &Vec<Option<String>>| -> serde_json::Value {
+        serde_json::from_str(row[2].as_deref().expect("a non-null inputs record"))
+            .expect("inputs are JSON")
+    };
+    assert_eq!(payload(&inputs[0])["x"]["value"], 1, "{inputs:?}");
+    assert_eq!(
+        payload(&inputs[1])["record_ids"],
+        serde_json::json!([]),
+        "an empty window freezes an empty population: {inputs:?}"
+    );
+    let outputs = rows(format!(
+        "SELECT CAST(o.execution_id AS VARCHAR) AS execution, \
+         CAST(o.result_id AS VARCHAR) AS output, CAST(r.result_id AS VARCHAR) AS summary \
+         FROM bifrost.verification.execution_outputs o \
+         LEFT JOIN bifrost.verification.results r ON r.result_id = o.result_id \
+         WHERE o.execution_id IN ({listed})"
+    ))
+    .await;
+    assert_eq!(outputs.len(), 3, "one output per execution: {outputs:?}");
+    assert!(
+        outputs
+            .iter()
+            .all(|row| row[1].is_some() && row[1] == row[2]),
+        "each output names its one summary: {outputs:?}"
+    );
+    let summaries = rows(format!(
+        "SELECT CAST(result_id AS VARCHAR) FROM bifrost.verification.results \
+         WHERE execution_id IN ({listed})"
+    ))
+    .await;
+    assert_eq!(
+        summaries.len(),
+        3,
+        "one summary per execution: {summaries:?}"
+    );
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns \
+         WHERE table_schema = 'wyrd' AND table_name = 'verifier_executions' \
+           AND column_name IN ('inputs', 'route_overrides', 'group_sources')",
+    )
+    .fetch_all(&harness.assertion)
+    .await
+    .expect("columns read");
+    assert_eq!(
+        columns,
+        Vec::<String>::new(),
+        "the queue keeps no input payload"
+    );
+
+    for (id, verdict) in [
+        (direct, "passed"),
+        (submitted.to_string(), "failed"),
+        (scheduled.to_string(), "failed"),
+    ] {
+        let (code, state) = call(
+            axum::http::Method::GET,
+            format!("/v1/verification/executions/{id}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{id}: {state}");
+        assert_eq!(state["status"], "completed", "{id}: {state}");
+        assert_eq!(
+            state["result"]["outcome"]["verdict"], verdict,
+            "{id}: {state}"
+        );
+        assert!(
+            state["result"]["outcome"]["requirements"][0]["check"].is_object(),
+            "the output reassembles its requirement detail: {id}: {state}"
+        );
+    }
 }
 
 /// Without a scripted outcome the real Drift engine refuses a scheduled
@@ -1030,14 +1219,14 @@ async fn unscorable_verifier_errors_without_publishing() {
 }
 
 /// A result batch Scribe durably accepted but whose acknowledgement was lost
-/// makes the outbox resend the identical slice: the detail and summary frames
+/// makes the outbox resend the identical slice: the output and summary frames
 /// are resubmitted with the same table, batch ID, and Arrow bytes, and Scribe
 /// acknowledges each replay without a second row. The run completes on its
 /// first attempt once its result is staged.
 ///
 /// # Panics
 /// Panics when the run retries or fails, a replay differs from its original
-/// batch, or Scribe keeps a duplicate summary or detail row.
+/// batch, or Scribe keeps a duplicate summary or output row.
 #[tokio::test]
 async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplicates() {
     let harness = Harness::start().await;
@@ -1065,20 +1254,20 @@ async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplica
         summaries[0], summaries[1],
         "the replay carries the identical table, batch ID, and sealed bytes"
     );
-    let details = sent_to(fault, FEATURES).await;
+    let details = sent_to(fault, OUTPUTS).await;
     assert_eq!(
         details.len(),
         2,
-        "the retried slice resends its acknowledged detail frame"
+        "the retried slice resends its acknowledged output frame"
     );
-    assert_eq!(details[0], details[1], "the detail replay is identical");
+    assert_eq!(details[0], details[1], "the output replay is identical");
     assert_ne!(details[0].batch_id, summaries[0].batch_id);
     assert_eq!(
         harness.writes().await,
         vec![
-            FEATURES.to_owned(),
+            OUTPUTS.to_owned(),
             RESULTS.to_owned(),
-            FEATURES.to_owned(),
+            OUTPUTS.to_owned(),
             RESULTS.to_owned()
         ],
         "each submission, replay included, is recorded in slice order"
@@ -1090,7 +1279,11 @@ async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplica
         Some(&1),
         "Scribe deduplicated the replayed summary: {rows:?}"
     );
-    assert_eq!(rows.get(FEATURES), Some(&2), "{rows:?}");
+    assert_eq!(
+        rows.get(OUTPUTS),
+        Some(&1),
+        "Scribe deduplicated the replayed output: {rows:?}"
+    );
 }
 
 /// Retryable engine failures back off and exhaust the attempt budget into
@@ -1529,7 +1722,7 @@ async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
     stale.stop().await;
     assert_eq!(
         harness.writes().await,
-        vec![RESULTS.to_owned()],
+        vec![OUTPUTS.to_owned(), RESULTS.to_owned()],
         "only the fresh claimant's result reaches Bifrost"
     );
     assert_eq!(
@@ -1576,7 +1769,7 @@ fn sent_values(sent: &SentBatch, column: &str) -> std::collections::BTreeSet<Str
 /// An attempt whose result was staged but whose settlement never commits
 /// loses to the reclaiming attempt: each produced result carries its own
 /// identity, the execution selects the winner's, and its status read returns
-/// the winner's verdict and none of the abandoned attempt's drift detail.
+/// the winner's verdict, never the abandoned attempt's output.
 ///
 /// A test-only deferred constraint trigger fails every completing commit made
 /// under the first attempt's lease token, so its result reaches Scribe while
@@ -1640,10 +1833,11 @@ async fn reclaimed_attempt_after_a_failed_settlement_selects_its_own_result() {
     let (lost, won) = (sent_result_id(&summaries[0]), sent_result_id(&summaries[1]));
     assert_ne!(lost, won, "each produced result has its own identity");
     assert_eq!(row.result_id.map(|id| id.to_string()), Some(won.clone()));
-    let features = sent_to(&harness.fault, FEATURES).await;
-    assert!(
-        features.iter().all(|sent| sent_result_id(sent) == lost),
-        "only the abandoned attempt wrote drift detail"
+    let outputs = sent_to(&harness.fault, OUTPUTS).await;
+    assert_eq!(
+        outputs.iter().map(sent_result_id).collect::<Vec<_>>(),
+        [lost, won],
+        "each attempt wrote one output under its own result identity"
     );
 
     harness.durable_rows().await;
@@ -1723,7 +1917,10 @@ async fn crashed_runner_restarts_and_reclaims_without_duplicates() {
     harness.expire(run).await;
     let row = harness.wait_execution(run, status("completed")).await;
     assert_eq!(row.attempts, 2);
-    assert_eq!(harness.writes().await, vec![RESULTS.to_owned()]);
+    assert_eq!(
+        harness.writes().await,
+        vec![OUTPUTS.to_owned(), RESULTS.to_owned()]
+    );
 
     let rendered = metrics.render();
     assert!(
@@ -1882,7 +2079,10 @@ async fn shutdown_drains_runs_that_finish_within_the_grace() {
     stopping.await.expect("the runtime stops");
     let row = harness.seed.execution(run).await.expect("execution reads");
     assert_eq!(row.status, "completed");
-    assert_eq!(harness.writes().await, vec![RESULTS.to_owned()]);
+    assert_eq!(
+        harness.writes().await,
+        vec![OUTPUTS.to_owned(), RESULTS.to_owned()]
+    );
 }
 
 /// Concurrent runtimes ticking the same due occurrence, and a runtime
@@ -2926,7 +3126,7 @@ async fn verification_targets_are_cached_and_a_deleted_card_errors() {
     assert_eq!(script.entered(), 2, "a deleted Card's run never executes");
     assert_eq!(
         harness.writes().await,
-        vec![RESULTS.to_owned(), RESULTS.to_owned()]
+        [OUTPUTS, RESULTS, OUTPUTS, RESULTS].map(str::to_owned)
     );
 }
 
@@ -3237,7 +3437,9 @@ async fn operator_rejected_queued_attempt_still_reaches_a_sampled_caller() {
 ///
 /// The sampled caller's tenant copy holds exactly one `verification.attempt`
 /// root, linked to the caller's trace, whose copied trace is that attempt
-/// and its `verification.*` descendants, each stamped with the enqueuing
+/// and its `verification.*` descendants plus the `bifrost.gate.*` and
+/// `bifrost.oracle.query` spans of its input-record read, each stamped with
+/// the enqueuing
 /// writer as subject and SYSTEM as actor. The unsampled caller's trace links
 /// no copied attempt. Attempts are found through their copied link, so the
 /// proof holds whether or not the operator also exports them.
@@ -3307,7 +3509,12 @@ async fn assert_queued_copies(
             "the attempt's descendants are copied: {copy:#?}"
         );
         for span in &copy {
-            assert!(span.name.starts_with("verification."), "{span:#?}");
+            assert!(
+                span.name.starts_with("verification.")
+                    || span.name.starts_with("bifrost.gate.")
+                    || span.name == "bifrost.oracle.query",
+                "{span:#?}"
+            );
             assert_eq!(span.sub_principal_id, id.to_string(), "{span:#?}");
             assert_eq!(span.act_principal_id, system, "{span:#?}");
         }
@@ -3393,7 +3600,7 @@ async fn traced_tenant(
         .ensure_builtin_tables_for_test(tenant)
         .await
         .expect("tenant receives every built-in table");
-    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant)
+    let seed = VerificationFixture::provision(server.state(), tenant)
         .await
         .expect("tenant provisions");
     let (subject, _) = seed.service("traced").await.expect("subject registers");
@@ -4554,7 +4761,8 @@ async fn only_associated_account_activity_activates_exact_root() {
 /// `staging`; every one is accepted. An empty tag is refused with
 /// `WYRD_SPEC_400_VALIDATION` before any execution exists. The runtime stops
 /// with every accepted execution unfinished; a fresh runtime completes them,
-/// and status reads and the retained `execution_inputs` and `results` rows
+/// and status reads and the retained `execution_inputs`, `execution_outputs`,
+/// and `results` rows
 /// return each one's own subject and exactly its supplied tag, and every
 /// retained row names the owning Service and its own subject by kind, name,
 /// and version.
@@ -4756,7 +4964,7 @@ async fn configured_service_context_survives_acceptance_and_restart() {
             subject.as_str(),
             "{state}"
         );
-        for table in ["execution_inputs", "results"] {
+        for table in ["execution_inputs", "execution_outputs", "results"] {
             let stored = server
                 .retained_records(
                     server.data_tenant_id(),
@@ -4927,14 +5135,14 @@ impl Harness {
             .expect("the exported spans publish");
     }
 
-    /// The frozen acceptance of `execution`: its authority, inputs,
-    /// attribution, idempotency, attempt budget, and exact identities.
+    /// The frozen acceptance of `execution`: its authority, attribution,
+    /// idempotency, attempt budget, and exact identities.
     ///
     /// # Panics
     /// Panics when the execution cannot be read.
     async fn accepted(&self, execution: ExecutionId) -> serde_json::Value {
         sqlx::query_scalar(
-            "SELECT jsonb_build_object('authority', authority, 'inputs', inputs, \
+            "SELECT jsonb_build_object('authority', authority, \
                     'sub', sub_principal_id, 'act', act_principal_id, \
                     'key', idempotency_key, 'sha', request_sha256, \
                     'max_attempts', max_attempts, 'verifier', verifier_card_uid, \
@@ -5075,7 +5283,11 @@ async fn missing_trace_retries_same_execution() {
     assert_eq!((row.attempts, row.error_code), (3, None));
     let result = row.result_id.expect("a completed run has a result");
     assert_eq!(harness.verdicts(result).await, ["passed"]);
-    assert_eq!(harness.writes().await, [RESULTS], "one final result");
+    assert_eq!(
+        harness.writes().await,
+        [OUTPUTS, RESULTS],
+        "one final result"
+    );
     assert_eq!(harness.accepted(run).await, accepted);
 }
 
@@ -5154,7 +5366,11 @@ async fn missing_trace_exhaustion_keeps_decision_rule() {
     }
     runtime.stop().await;
     assert!(
-        harness.writes().await.iter().all(|table| table == RESULTS),
+        harness
+            .writes()
+            .await
+            .iter()
+            .all(|table| [OUTPUTS, RESULTS].contains(&table.as_str())),
         "only final results are written; group commit may batch them"
     );
 }

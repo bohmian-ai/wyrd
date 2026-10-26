@@ -42,7 +42,7 @@ use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecy
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::LogicalIdentity;
 use crate::tables::{
-    CallsTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, TableError,
+    CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable, TableError,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::auth::Attribution;
@@ -1140,7 +1140,10 @@ fn is_verification_result_table(table: &TableRef) -> bool {
     [
         (ResultsTable::NAMESPACE, ResultsTable::NAME),
         (ExecutionInputsTable::NAMESPACE, ExecutionInputsTable::NAME),
-        (ResultFeaturesTable::NAMESPACE, ResultFeaturesTable::NAME),
+        (
+            ExecutionOutputsTable::NAMESPACE,
+            ExecutionOutputsTable::NAME,
+        ),
     ]
     .into_iter()
     .any(|(namespace, name)| {
@@ -2762,7 +2765,7 @@ mod tests {
         for table in [
             "bifrost.verification.results",
             "bifrost.verification.execution_inputs",
-            "bifrost.drift.result_features",
+            "bifrost.verification.execution_outputs",
         ] {
             for (label, auth) in &principals {
                 let scribe_calls = Arc::new(AtomicUsize::new(0));

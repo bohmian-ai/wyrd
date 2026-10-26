@@ -40,15 +40,19 @@ use tokio::sync::watch::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use tracing::field::Empty;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_verify::blocks::{DriftChecks, EngineError};
 use wyrd_runtime::outbox::Reservation;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{Attribution, PrincipalId};
+use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::operator::DriftCounts;
 use wyrd_spec::card::verifier::VerifierSpec;
-use wyrd_spec::ids::VerificationResultId;
-use wyrd_spec::verification::VerifierReadiness;
-use wyrd_spec::verification::execution::VerificationOutcome;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::{SlotName, VerificationResultId};
+use wyrd_spec::verification::execution::{InputDeclaration, VerificationOutcome};
+use wyrd_spec::verification::{TaskId, VerifierReadiness};
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::verifier_executions::{
     ClaimedExecution, Completion, EnqueueRefusal, ExecutionInput, RetryOutcome, TerminalStatus,
@@ -59,6 +63,7 @@ use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
 use super::RuntimeLimits;
+use super::authority::SystemReadAuthority;
 use super::cache::{Db, Target};
 use super::claims::{ClaimLoop, LeasedWork, settled};
 use super::completions::{self, Completions, SharedResult};
@@ -66,11 +71,13 @@ use super::drift::DriftEngine;
 use super::engines::{self, EngineOutcome};
 use super::health::RuntimeCapability;
 use super::hosted::blocks::{Execution, HostedBlocks};
+use super::inputs::{InputResolver, InputRow};
 use super::leases::LeaseRenewal;
 use super::results::{ResultPayloadBuilder, ResultRun};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
 use crate::components::gateway::GatewayCallContext;
+use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
 use crate::state::AppState;
 
@@ -101,6 +108,11 @@ pub const EVIDENCE_UNAVAILABLE: &str = "evidence_unavailable";
 /// Stable error code when the tenant has no active `UUIDv7` SYSTEM principal
 /// to execute and attribute the result as.
 pub const SYSTEM_PRINCIPAL_MISSING: &str = "system_principal_missing";
+
+/// How long, by the claim's PostgreSQL age, a queued execution waits without
+/// spending attempts for its input record to publish: the same bound an
+/// incomplete group selection retries within.
+const PUBLICATION_BOUND: Duration = Duration::from_mins(5);
 
 /// First wait before a failed settlement is tried again.
 const PERSIST_INITIAL: Duration = Duration::from_millis(50);
@@ -397,10 +409,12 @@ impl VerifierRunner {
 
     /// Run `spec` over the claimed execution's frozen input.
     ///
-    /// A scheduled window first scores every drift requirement as the
-    /// tenant's SYSTEM read authority, then runs with no pinned evidence; a
-    /// submission runs over its pinned inputs and route overrides; a group
-    /// snapshot runs over its pinned source lists. The engine
+    /// A scheduled window first scores every drift requirement over its
+    /// frozen population as the tenant's SYSTEM read authority, then runs
+    /// with no pinned evidence; a submission runs over its recorded inputs
+    /// and route overrides; a group selection runs over its resolved source
+    /// lists; all three are read from the execution's input record on every
+    /// attempt. The engine
     /// executes as the authority accepted with the execution, executed by
     /// `system`, with model calls attributed to the verified Card and the
     /// submission's application Run. Every attempt before the last defers a
@@ -423,42 +437,60 @@ impl VerifierRunner {
         {
             return outcome;
         }
-        let (no_inputs, no_routes) = (BTreeMap::new(), BTreeMap::new());
         let (drift, evidence, routes, run_id) = match &run.input {
             ExecutionInput::Scheduled { window } => {
-                match self
-                    .drift
-                    .checks(tenant, run, system, spec, window, telemetry)
-                    .await
-                {
-                    Ok(drift) => (drift, &no_inputs, &no_routes, None),
+                let selected = self
+                    .recorded(tenant, run, system, async |_, row| row.schedule().map(Some))
+                    .await;
+                let checks = match selected {
+                    Ok(selected) => {
+                        self.drift
+                            .checks(
+                                tenant,
+                                run,
+                                system,
+                                spec,
+                                window,
+                                &selected.record_ids,
+                                telemetry,
+                            )
+                            .await
+                    }
+                    Err(outcome) => Err(outcome),
+                };
+                match checks {
+                    Ok(drift) => (drift, BTreeMap::new(), BTreeMap::new(), None),
                     Err(outcome) => return outcome,
                 }
             }
-            ExecutionInput::Submitted {
-                run_id,
-                inputs,
-                route_overrides,
-            } => (
-                DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                inputs,
-                route_overrides,
-                run_id.clone(),
-            ),
-            ExecutionInput::Grouped { inputs, .. } => (
-                DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
-                inputs,
-                &no_routes,
-                None,
-            ),
+            ExecutionInput::Submitted { run_id } => {
+                match self.supplied(tenant, run, system).await {
+                    Ok((evidence, routes)) => (
+                        DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                        evidence,
+                        routes,
+                        run_id.clone(),
+                    ),
+                    Err(outcome) => return outcome,
+                }
+            }
+            ExecutionInput::Grouped => match self.supplied(tenant, run, system).await {
+                Ok((evidence, routes)) => (
+                    DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
+                    evidence,
+                    routes,
+                    None,
+                ),
+                Err(outcome) => return outcome,
+            },
         };
         let caller = Caller::accepted(&run.authority, system);
         let engine = match self.blocks.engine(
             &self.state,
             Execution {
                 caller: &caller,
-                evidence,
-                routes,
+                evidence: &evidence,
+                routes: &routes,
                 subject: GatewayCallContext {
                     workload_card_uid: run
                         .owner_card_uid
@@ -483,13 +515,98 @@ impl VerifierRunner {
                 ));
             }
         };
-        match engine
-            .run(Arc::clone(spec), evidence.clone(), deadline)
-            .await
-        {
+        match engine.run(Arc::clone(spec), evidence, deadline).await {
             Ok(outcome) => EngineOutcome::Completed(outcome),
             Err(error) => engine_failure(run, &error),
         }
+    }
+
+    /// Resolve a submitted or group execution's evidence and accepted routes
+    /// from its input record through [`Self::recorded`].
+    ///
+    /// # Errors
+    /// Returns the [`EngineOutcome`] the execution ends this attempt in.
+    async fn supplied(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedExecution,
+        system: PrincipalId,
+    ) -> Result<
+        (
+            BTreeMap<SlotName, InputDeclaration>,
+            BTreeMap<TaskId, ExecutionRoute>,
+        ),
+        EngineOutcome,
+    > {
+        self.recorded(tenant, run, system, async |records, row| {
+            let routes = row.routes()?;
+            Ok(records
+                .evidence(&row)
+                .await?
+                .map(|evidence| (evidence, routes)))
+        })
+        .await
+    }
+
+    /// Read the execution's input record as the tenant's `system` principal
+    /// granted only the verification input and output tables and serving the
+    /// accepted authority, and resolve it through `resolve`, which answers
+    /// `None` while a record it needs is not visible.
+    ///
+    /// A record not yet visible defers the execution without spending an
+    /// attempt while it is younger than [`PUBLICATION_BOUND`], and retries
+    /// within the attempt budget afterwards, so a record that never publishes
+    /// ends the execution `errored` rather than deferring it forever. A
+    /// failed read retries.
+    ///
+    /// # Errors
+    /// Returns the [`EngineOutcome`] the execution ends this attempt in.
+    async fn recorded<T>(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedExecution,
+        system: PrincipalId,
+        resolve: impl AsyncFnOnce(&InputResolver<'_>, InputRow) -> Result<Option<T>, WyrdError>,
+    ) -> Result<T, EngineOutcome> {
+        let unreadable = |error: &dyn std::fmt::Display| {
+            tracing::warn!(execution_id = %run.lease.execution_id, %error, "the execution's input record cannot be read");
+            EngineOutcome::Retry(failure(
+                EVIDENCE_UNAVAILABLE,
+                "the execution's input record cannot be read",
+            ))
+        };
+        let unpublished = || {
+            let error = failure(
+                EVIDENCE_UNAVAILABLE,
+                "the execution's input record is not visible yet",
+            );
+            if run.age < PUBLICATION_BOUND {
+                EngineOutcome::Deferred(error)
+            } else {
+                EngineOutcome::Retry(error)
+            }
+        };
+        let tables = ["execution_inputs", "execution_outputs"]
+            .map(|name| TableRef::new(BifrostNamespace::Verification, name));
+        let read = SystemReadAuthority::resolve(&self.state, tenant, Some(system), &tables)
+            .await
+            .map_err(|error| unreadable(&error))?
+            .serving(&run.authority);
+        let query = ScheduledQueryCaller::new(
+            self.state.clone(),
+            read.into_context(),
+            CancellationToken::new(),
+        );
+        let records = InputResolver::new(&query, None);
+        let row = records
+            .record(run.lease.execution_id)
+            .await
+            .map_err(|error| unreadable(&error))?
+            .ok_or_else(unpublished)?;
+        resolve(&records, row)
+            .await
+            .map_err(|error| unreadable(&error))?
+            .ok_or_else(unpublished)
     }
 
     /// Apply `transition` to `run` in one tenant transaction.

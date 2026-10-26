@@ -3887,11 +3887,7 @@ impl WyrdTestServer {
     pub async fn verification_fixture(
         &self,
     ) -> Result<VerificationFixture, VerificationFixtureError> {
-        VerificationFixture::provision(
-            self.inner.state.postgres.wyrd(),
-            self.inner.fixture.data_tenant_id(),
-        )
-        .await
+        VerificationFixture::provision(&self.inner.state, self.inner.fixture.data_tenant_id()).await
     }
 
     /// Wait until the fixture tenant's Drift Verifier `verifier` has a ready

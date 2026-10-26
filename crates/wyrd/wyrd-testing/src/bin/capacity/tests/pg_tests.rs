@@ -831,7 +831,7 @@ fn reference_verdict(record: &Record, step: &str, metric: &str) -> Option<Verdic
 }
 
 /// Each engine's ordinary full L1 measurement reaches the normal reference
-/// judge: two clean `--qualify-baseline` suites of its 64-client case
+/// judge: two clean `--qualify-baseline` suites of one measured case
 /// promote same-method references, an unperturbed normal run against them
 /// PASSes every reference, and the same run with [`STORM`] server scrape
 /// loops over each window FAILs a reference by the noise-aware regression
@@ -855,9 +855,9 @@ async fn measured_regressions_reach_normal_reference_judgment() {
     let cases = [
         (
             Engine::Bifrost,
-            vec!["hot"],
-            "point-c64",
-            ["p99_ms", "cpu_ms_per_query", "queries_per_s_per_vcpu"],
+            vec!["writes-hot"],
+            "native-write-c1",
+            ["p95_ms", "cpu_us_per_row", "rows_per_s_per_vcpu"],
         ),
         (
             Engine::Verification,

@@ -18,7 +18,7 @@ use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{ArrayRef, BooleanArray, StringArray, TimestampMicrosecondArray};
+use arrow::array::{ArrayRef, BooleanArray, StringBuilder, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
@@ -557,9 +557,21 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<String, JsonError> {
     serde_jcs::to_string(&serde_json::to_value(value)?)
 }
 
-/// Build a nullable UTF-8 column.
+/// Build a nullable UTF-8 column sized to its values.
+///
+/// [`arrow::array::StringArray::from_iter`] reserves a kilobyte of value
+/// bytes whatever it holds, which a one-row result column would carry while
+/// it is staged.
 fn text<S: AsRef<str>>(values: impl IntoIterator<Item = Option<S>>) -> ArrayRef {
-    Arc::new(StringArray::from_iter(values))
+    let values: Vec<Option<S>> = values.into_iter().collect();
+    let bytes = values
+        .iter()
+        .flatten()
+        .map(|value| value.as_ref().len())
+        .sum();
+    let mut builder = StringBuilder::with_capacity(values.len(), bytes);
+    builder.extend(values);
+    Arc::new(builder.finish())
 }
 
 /// Build a nullable microsecond timestamp column in the stored
@@ -882,5 +894,22 @@ mod tests {
                 "{expected_problem}: got {error:?}"
             );
         }
+    }
+
+    /// Proves a one-row text column holds memory near its value's length,
+    /// not a builder's default reservation, since every staged result row
+    /// is admitted to the Scribe outbox by the memory it holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the column holds 256 bytes or more.
+    #[test]
+    fn a_one_row_text_column_holds_about_its_value() {
+        let column = text([Some(ExecutionId::new_v7().to_string())]);
+        assert!(
+            column.get_array_memory_size() < 256,
+            "holds {} bytes",
+            column.get_array_memory_size()
+        );
     }
 }

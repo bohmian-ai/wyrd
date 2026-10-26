@@ -13,8 +13,10 @@
 // Card, Bifrost, and code tools at once and then finishes. Scripted answer
 // texts also fail the reader's provider, schema, and deadline and the code step
 // and check; scoped and delegated principals exercise every tool grant.
+// `handbook-desk`'s judges mount an uploaded, extracted Artifact and cite the
+// line `fs.read` returned.
 import { randomBytes } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -127,6 +129,9 @@ function upstream(request: ReceivedRequest): Reply {
       toolCall("call-read-policy", "fs.extract", { path: "/inputs/policy.pdf", output_path: "/work/policy.json" }),
     ]);
   }
+  if (body.includes("HANDBOOK JUDGE")) {
+    return toolResults ? judgeReply(handbookVerdict(body)) : toolTurn(READ_HANDBOOK);
+  }
   if (body.includes("INVESTIGATE")) {
     return toolResults ? judgeReply('{"done":true}') : toolTurn(INVESTIGATION);
   }
@@ -153,6 +158,43 @@ function upstream(request: ReceivedRequest): Reply {
     }
   }
   return { status: 404 };
+}
+
+/** The handbook judge's first turn: read its mounted handbook. */
+const READ_HANDBOOK = [toolCall("call-handbook", "fs.read", { path: "/inputs/handbook.json" })];
+
+/**
+ * The handbook judge's Verdict once `body` carries its `fs.read` result: a
+ * pass citing the one read line holding a `MARKER-` on the slot the read
+ * named. A failed read, a wrong call ID or path, or no single marked line
+ * answers no Verdict.
+ */
+function handbookVerdict(body: string): string {
+  const messages = (JSON.parse(body) as { messages: { role: string; content: string; tool_call_id?: string }[] })
+    .messages;
+  const read = messages.find((message) => message.role === "tool");
+  let output: { path?: string; sources?: string[]; units?: { text: string; locator: unknown }[] };
+  try {
+    output = JSON.parse(read?.content ?? "") as typeof output;
+  } catch {
+    return "not a verdict";
+  }
+  const marked = (output.units ?? []).filter((unit) => /MARKER-[0-9a-f]{16}/.test(unit.text));
+  const [unit] = marked;
+  if (
+    read?.tool_call_id !== "call-handbook" ||
+    output.path !== "/inputs/handbook.json" ||
+    marked.length !== 1 ||
+    unit === undefined
+  ) {
+    return "not a verdict";
+  }
+  const marker = /MARKER-[0-9a-f]{16}/.exec(unit.text)?.[0];
+  return JSON.stringify({
+    outcome: "passed",
+    reason: `the handbook names ${marker}`,
+    citations: [{ slot: output.sources?.[0], locator: unit.locator }],
+  });
 }
 
 /** The `policy-review` inputs: an answer with `text` offering `refund` dollars, the policy, and its trace when there is one. */
@@ -871,4 +913,44 @@ test("typed_verdict_data_mismatch_keeps_original_result", async ({ provider, des
   await mismatch(execution.statusTyped(numbersOnly));
   expect((await execution.status()).result, "the stored result is unchanged").toEqual(ordinary);
   expect(scoredCalls(), "nothing is judged again").toBe(judged);
+});
+
+test("uploaded artifacts are reused by service judges", async ({ server, provider }) => {
+  const marker = `MARKER-${randomBytes(8).toString("hex")}`;
+  const source = mkdtempSync(join(tmpdir(), "wyrd-ts-handbook-"));
+  writeFileSync(join(source, "handbook.md"), `# Staff handbook\nOutages escalate with code ${marker}.\n`);
+  writeFileSync(join(source, "rota.txt"), "never mounted\n");
+  await configureGateway(WyrdClient.connect());
+  const cards = await Cards.connect();
+  const handbook = await cards.uploadArtifact(source, {
+    metadata: { name: "staff-handbook", version: "1.0.0" },
+    extract: true,
+  });
+  const files = await cards.listArtifacts(handbook);
+  expect(files.artifacts.map((file) => file.relative_path)).toContain("extracted/handbook.md.json");
+  const receipt = await cards.declareFromPath(fixture("cards/uploaded_artifacts/handbook-desk.yaml"));
+  const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-handbook-desk-"));
+  await cards.pull(receipt.root, bundle);
+  const credential = server.scopedApiKey("handbook_judge", grants({ tool: "fs.read" }));
+  const state = WyrdState.fromPath(bundle, { client: WyrdClient.connect({ credential }) });
+  const asked = provider.received.length;
+
+  for (const verifier of ["handbook-review", "handbook-audit"]) {
+    const result = await state.run().observe.verify(verifier, "How do outages escalate?");
+
+    expect(result.outcome.verdict, JSON.stringify(result)).toBe("passed");
+    const judged = requirement(result, "handbook-answers");
+    expect(judged.reason).toContain(marker);
+    const [citation] = judged.citations ?? [];
+    expect(citation?.slot).toMatch(/^attachment_/);
+    expect(citation?.locator).toHaveProperty("lines");
+  }
+  const judges = provider.received.slice(asked).filter((request) => request.body.includes("HANDBOOK JUDGE"));
+  expect(judges).toHaveLength(4);
+  for (const request of judges) {
+    const body = JSON.parse(request.body) as { tools: { function: { name: string } }[]; messages: unknown[] };
+    expect(body.tools.map((tool) => tool.function.name)).toEqual(["fs_read"]);
+    expect(JSON.stringify(body.messages[0])).not.toContain(marker);
+    expect(request.body).not.toContain("rota");
+  }
 });

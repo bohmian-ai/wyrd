@@ -1005,19 +1005,23 @@ pub fn timer_resolution_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// The release `wyrd-server` built beside the running benchmark binary.
+/// The release `wyrd-server` built beside the running benchmark binary, or
+/// one directory up from a test binary in Cargo's `deps/`.
 ///
 /// # Errors
 ///
 /// Returns an error when the current executable cannot be located or the
 /// server has not been built beside it.
 pub fn release_binary() -> Result<PathBuf, Error> {
-    let binary = std::env::current_exe()?.with_file_name("wyrd-server");
-    if binary.is_file() {
-        Ok(binary)
-    } else {
-        Err(format!("{} is not built; run through mise", binary.display()).into())
-    }
+    let executable = std::env::current_exe()?;
+    let beside = executable.with_file_name("wyrd-server");
+    executable
+        .ancestors()
+        .skip(1)
+        .take(2)
+        .map(|directory| directory.join("wyrd-server"))
+        .find(|binary| binary.is_file())
+        .ok_or_else(|| format!("{} is not built; run through mise", beside.display()).into())
 }
 
 /// The identity of the measured server `binary` a record keeps: its file

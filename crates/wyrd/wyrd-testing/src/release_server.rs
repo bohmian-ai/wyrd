@@ -244,22 +244,59 @@ impl LocalServer {
         env: &[(&str, &str)],
     ) -> Result<Self> {
         wyrd_tls::install_crypto_provider().map_err(|error| error.to_string())?;
-        let host = Host::detect()?;
-        let log = File::create(root.path().join("server.log"))?;
-        let child = operator(binary, root.path(), storage_url, env)
+        let mut server = Self {
+            host: Host::detect()?,
+            child: None,
+            root,
+            tenants: Vec::new(),
+        };
+        server.launch(binary, storage_url, env).await?;
+        Ok(server)
+    }
+
+    /// Stops the serving process and serves `binary` again from the same
+    /// working directory, store, database and tenants with `env` added, so
+    /// one provisioned fixture can be measured under two server
+    /// configurations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the old process exits unsuccessfully or
+    /// outlives its grace, or the new one cannot spawn, exits, or never
+    /// becomes ready.
+    pub async fn restart(&mut self, binary: &Path, env: &[(&str, &str)]) -> Result<()> {
+        self.terminate()?;
+        let storage_url = format!("file://{}", self.storage_dir().display());
+        self.launch(binary, &storage_url, env).await
+    }
+
+    /// Spawns the serving process with the benchmark timing snapshot on,
+    /// unless `env` turns it off, appending to `server.log`, and waits until
+    /// it is ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the log cannot open or the process cannot
+    /// spawn, exits, or never becomes ready.
+    async fn launch(
+        &mut self,
+        binary: &Path,
+        storage_url: &str,
+        env: &[(&str, &str)],
+    ) -> Result<()> {
+        let log = File::options()
+            .create(true)
+            .append(true)
+            .open(self.log_path())?;
+        let child = operator(binary, self.root.path(), storage_url, env)
             .env("WYRD_METRICS_BENCHMARK_SNAPSHOT", "1")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
             .spawn()?;
-        let mut server = Self {
-            host,
-            child: Some(child),
-            root,
-            tenants: Vec::new(),
-        };
-        server.await_ready().await?;
-        Ok(server)
+        self.child = Some(child);
+        self.await_ready().await
     }
 
     /// The machine the server runs on.
@@ -314,7 +351,8 @@ impl LocalServer {
     }
 
     /// Reads the server's cumulative benchmark timing snapshot from the
-    /// loopback metrics listener, which [`Self::serve`] enables.
+    /// loopback metrics listener, which serving enables unless the caller's
+    /// environment turned it off.
     ///
     /// # Errors
     ///

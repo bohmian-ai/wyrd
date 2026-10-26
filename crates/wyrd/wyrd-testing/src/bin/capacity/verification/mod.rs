@@ -599,7 +599,7 @@ mod tests {
     use super::{COMPETING, OVERHEAD_LIMIT_MS, STAGES, Schedule, declare};
 
     /// A clean base declaration at `level` with no release binary.
-    fn base(level: Level) -> Declaration {
+    pub(super) fn base(level: Level) -> Declaration {
         Declaration {
             engine: Engine::Verification,
             experiment: String::new(),
@@ -642,7 +642,7 @@ mod tests {
 
     /// The repository root, whose `benchmarks/verification/baselines.toml`
     /// holds only excluded entries.
-    fn root() -> &'static Path {
+    pub(super) fn root() -> &'static Path {
         Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.."))
     }
 

@@ -1206,4 +1206,338 @@ mod tests {
         assert_eq!(measured.percentile(0.5).value, Some(0.2));
         assert_eq!(measured.unexpected(None), 4);
     }
+
+    /// The measurement path calibrated against independent references on a
+    /// real release server: the shared runner, the actual [`Window`] and
+    /// resource readers, the server's timing readout and the persisted record,
+    /// compared with the same workload with benchmark collection turned off.
+    mod calibration {
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use tokio::time::Instant;
+        use tokio_util::sync::CancellationToken;
+        use wyrd_testing::capacity::{Window, release_binary};
+        use wyrd_testing::experiment::{
+            ExperimentError, Level, Options, Phase, Record, Repetition, Step, Timing, Verdict,
+            Workload, run,
+        };
+        use wyrd_testing::release_server::HostLoad;
+
+        use crate::verification::declare;
+        use crate::verification::run::{Bench, SELECTION, drive};
+        use crate::verification::tests::{base, root};
+
+        /// The step calibrated: one closed-loop client.
+        const STEP: &str = "direct-verify-c1";
+
+        /// Each measured window, the known delay the record's seconds are read
+        /// against.
+        const WINDOW: Duration = Duration::from_secs(5);
+
+        /// The window's stop fires on a millisecond timer before the stop
+        /// scrape starts; 50 ms covers that and scheduling on a quiet host.
+        const WINDOW_SLACK_SECONDS: f64 = 0.05;
+
+        /// The known CPU work the second repetition's driver adds, on its own
+        /// thread, inside the window.
+        const SPIN: Duration = Duration::from_secs(1);
+
+        /// A thread spinning on a quiet host is charged at least this share of
+        /// its wall time; the spin starts a few milliseconds before the window
+        /// opens.
+        const SPIN_FLOOR: f64 = 0.8;
+
+        /// Two 10 ms CPU accounting ticks, one at each end of a reading.
+        const TICKS_SECONDS: f64 = 0.02;
+
+        /// How much the driver's own request CPU may differ between two equal
+        /// windows, as a share of it.
+        const DRIVER_DRIFT: f64 = 0.25;
+
+        /// Allowed observation cost per verification, as a share of the
+        /// uncollected control: recording adds one label read and two histogram
+        /// records to a request costing hundreds of microseconds, and 10% covers
+        /// the difference between two sequential windows on a quiet host.
+        const COST_SHARE: f64 = 0.10;
+
+        /// Allowed observation cost per verification below which a share is
+        /// meaningless, milliseconds.
+        const COST_FLOOR_MS: f64 = 0.01;
+
+        /// The real L1 workload, with [`SPIN`] of driver CPU burned beside the
+        /// second repetition. It starts the server inside the runner's clock
+        /// and leaves it running, so the control reuses its tenant.
+        struct Calibration {
+            /// The Verification L1 workload.
+            bench: Bench,
+        }
+
+        #[async_trait]
+        impl Workload for Calibration {
+            async fn prepare(&mut self) -> Result<(), ExperimentError> {
+                self.bench.start().await
+            }
+
+            fn processes(&self) -> Vec<u32> {
+                self.bench.processes()
+            }
+
+            async fn measure(
+                &mut self,
+                step: &Step,
+                phase: Phase,
+                window: Duration,
+            ) -> Result<Repetition, ExperimentError> {
+                let spin = (phase == Phase::Repetition(1))
+                    .then(|| tokio::task::spawn_blocking(|| burn(SPIN)));
+                let repetition = self.bench.measure(step, phase, window).await;
+                if let Some(spin) = spin {
+                    spin.await.map_err(ExperimentError::workload)?;
+                }
+                repetition
+            }
+
+            async fn finish(&mut self) -> Result<(), ExperimentError> {
+                Ok(())
+            }
+        }
+
+        /// Computes on this thread for `length`.
+        fn burn(length: Duration) {
+            let started = std::time::Instant::now();
+            let mut state = 0_u64;
+            while started.elapsed() < length {
+                state = std::hint::black_box(
+                    state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1),
+                );
+            }
+        }
+
+        /// Whether `observed` lies in its reference `[low, high]`, naming
+        /// `what` when it does not.
+        fn within(what: &str, observed: f64, low: f64, high: f64) -> Result<(), String> {
+            if (low..=high).contains(&observed) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{what} read {observed}, outside its reference [{low}, {high}]"
+                ))
+            }
+        }
+
+        /// One verification's wall and server CPU milliseconds over a window.
+        fn per_verification(seconds: f64, cpu_seconds: f64, verifications: f64) -> [f64; 2] {
+            [seconds, cpu_seconds].map(|total| total * 1e3 / verifications)
+        }
+
+        /// The release server's direct `verify` through the shared runner keeps
+        /// what independent references say: each window's recorded seconds
+        /// match the declared window, the driver CPU of a repetition with a
+        /// known spin exceeds the plain one's by that spin, the server's p50
+        /// lies under the client's own round trip and its count reconciles,
+        /// and the record and its timing evidence read back. The same workload
+        /// with collection off then measures what observing costs per
+        /// verification in wall and server CPU, which stays within its
+        /// allowance; each check rejects a materially wrong reading.
+        ///
+        /// Needs `mise run bench:build` and the repository Postgres wrapper on
+        /// a quiet host:
+        /// `RUSTFLAGS='-C force-frame-pointers=yes' CARGO_PROFILE_RELEASE_DEBUG=line-tables-only mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked --release --target-dir target/profiling -p wyrd-testing --bin capacity --run-ignored=only --no-capture -E 'test(=verification::run::tests::calibration::the_measurement_path_agrees_with_independent_references)'`.
+        ///
+        /// # Panics
+        ///
+        /// Panics when a reading falls outside its reference, the observation
+        /// cost exceeds its allowance, or a check accepts a wrong reading.
+        #[tokio::test]
+        #[ignore = "needs the release server from `mise run bench:build`, the Postgres wrapper and a quiet host"]
+        async fn the_measurement_path_agrees_with_independent_references() {
+            let directory = tempfile::tempdir().expect("directory");
+            let mut declaration =
+                declare(Level::One, &[], base(Level::One), root()).expect("L1 declares");
+            declaration.selection = Some(vec![STEP.to_owned()]);
+            declaration.timing = Timing {
+                warmup_seconds: 1,
+                repetition_seconds: WINDOW.as_secs(),
+                repetitions: 2,
+                budget_seconds: 600,
+                minimum_seconds: 0,
+            };
+            let options = Options {
+                artifacts: directory.path().join("artifacts"),
+                profiler: None,
+                interrupt: CancellationToken::new(),
+            };
+            let mut workload = Calibration {
+                bench: Bench::new(Level::One, directory.path().join("logs")),
+            };
+            let record = run(
+                declaration.seal(),
+                &mut workload,
+                HostLoad::sample,
+                &options,
+            )
+            .await;
+            let path = record.publish(directory.path()).expect("publish");
+            let read = Record::read(&path).expect("read back");
+            assert_eq!(read.render(), record.render());
+            assert_eq!(read.verdict, Verdict::Pass, "{:?}", read.reasons);
+            let step = read
+                .steps
+                .iter()
+                .find(|step| step.id == STEP)
+                .expect("calibrated step");
+            let [plain, spun] = step.repetitions.as_slice() else {
+                panic!("two repetitions: {:?}", step.repetitions.len());
+            };
+            for label in ["repetition-1", "repetition-2"] {
+                let kept = options
+                    .artifacts
+                    .join(format!("timings/{STEP}/{label}.json"));
+                assert!(kept.is_file(), "{} kept", kept.display());
+            }
+
+            let window = WINDOW.as_secs_f64();
+            let seconds = |repetition: &Repetition| repetition.seconds;
+            for repetition in [plain, spun] {
+                within(
+                    "window seconds",
+                    seconds(repetition),
+                    window,
+                    window + WINDOW_SLACK_SECONDS,
+                )
+                .expect("the known delay");
+            }
+            let driver =
+                |repetition: &Repetition| repetition.driver_cpu_seconds.expect("driver CPU");
+            let spin = SPIN.as_secs_f64();
+            let (spin_low, spin_high) = (
+                spin * SPIN_FLOOR,
+                spin + TICKS_SECONDS + DRIVER_DRIFT * driver(plain),
+            );
+            within(
+                "spin CPU",
+                driver(spun) - driver(plain),
+                spin_low,
+                spin_high,
+            )
+            .expect("the known CPU");
+
+            let server_p50 = plain.reading("p50_ms");
+            let client_p50 = plain.reading("client_p50_ms");
+            let (Some(above), Some(client)) = (server_p50.above, client_p50.value) else {
+                panic!("bucketed server and exact client p50: {server_p50:?} {client_p50:?}");
+            };
+            within("server p50 lower bound", above, f64::MIN_POSITIVE, client)
+                .expect("the server's time lies inside the client's round trip");
+            let verifications = plain.reading("verifications").value.expect("verifications");
+            let late = plain
+                .reading("verifications_after_window")
+                .value
+                .expect("late");
+            let recorded: u64 = plain
+                .reconciliation
+                .iter()
+                .map(|cohort| cohort.recorded)
+                .sum();
+            assert_eq!(
+                recorded as f64,
+                verifications + late,
+                "{:?}",
+                plain.reconciliation
+            );
+
+            let bench = &mut workload.bench;
+            let server = bench.server.as_mut().expect("the server still runs");
+            let binary = release_binary().expect("release server");
+            server
+                .restart(&binary, &[("WYRD_METRICS_BENCHMARK_SNAPSHOT", "0")])
+                .await
+                .expect("serve without collection");
+            let server = &*server;
+            assert!(
+                server.timings().await.is_err(),
+                "collection off serves no timing readout"
+            );
+            let states = &bench.states[..1];
+            drive(states, Instant::now() + Duration::from_secs(1), "warmup").await;
+            let (opened, _) = Window::open(server, SELECTION).await.expect("open");
+            let stop = Instant::now() + WINDOW;
+            let (measured, usage, _) = opened
+                .measure(server, stop.into_std(), drive(states, stop, "repetition-1"))
+                .await
+                .expect("control window");
+            assert!(measured.errors.is_empty(), "{:?}", measured.errors);
+            let control = per_verification(
+                usage.seconds,
+                usage.server_cpu_seconds.expect("control server CPU"),
+                (measured.latencies_us.len() as u64 - measured.late) as f64,
+            );
+            let enabled = per_verification(
+                plain.seconds,
+                plain.server_cpu_seconds.expect("server CPU"),
+                verifications,
+            );
+            let mut costs = Vec::new();
+            for (what, index) in [("wall", 0), ("server CPU", 1)] {
+                let cost = enabled[index] - control[index];
+                let allowance = (control[index] * COST_SHARE).max(COST_FLOOR_MS);
+                println!(
+                    "{what} per verification: {:.4} ms collected, {:.4} ms control, observation cost {cost:+.4} ms, allowance ±{allowance:.4} ms",
+                    enabled[index], control[index]
+                );
+                costs.push((what, cost, allowance));
+            }
+            println!(
+                "window {:.4}/{:.4} s against {window} s; spin CPU {:.4} s in [{spin_low:.4}, {spin_high:.4}]; server p50 ({above}, {:?}] ms under client p50 {client} ms; residual mean {:?} ms",
+                plain.seconds,
+                spun.seconds,
+                driver(spun) - driver(plain),
+                server_p50.value,
+                plain.reading("overhead_mean_ms").value,
+            );
+            for (what, cost, allowance) in &costs {
+                within(
+                    &format!("{what} observation cost"),
+                    *cost,
+                    -allowance,
+                    *allowance,
+                )
+                .expect("observing stays within its allowance");
+            }
+
+            assert!(
+                within(
+                    "window seconds",
+                    plain.seconds * 1e3,
+                    window,
+                    window + WINDOW_SLACK_SECONDS
+                )
+                .is_err(),
+                "a window read in milliseconds is rejected"
+            );
+            assert!(
+                within("spin CPU", 0.0, spin_low, spin_high).is_err(),
+                "a CPU reader that missed the spin is rejected"
+            );
+            assert!(
+                within(
+                    "server p50 lower bound",
+                    client * 2.0,
+                    f64::MIN_POSITIVE,
+                    client
+                )
+                .is_err(),
+                "a server time beyond the client's round trip is rejected"
+            );
+            let (_, _, allowance) = costs[1];
+            assert!(
+                within("observation cost", allowance * 2.0, -allowance, allowance).is_err(),
+                "an excessive observation cost is rejected"
+            );
+            workload.bench.finish().await.expect("stop");
+        }
+    }
 }

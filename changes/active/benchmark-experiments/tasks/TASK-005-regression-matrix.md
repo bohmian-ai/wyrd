@@ -3,12 +3,12 @@ id: TASK-005
 kind: implementation
 status: proposed
 spec: SPEC-benchmark-experiments
-spec_revision: 8
-requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-019, REQ-020, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, INV-009, INV-010, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010, AC-013]
-depends_on: [TASK-004]
+spec_revision: 10
+requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-019, REQ-020, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, INV-009, INV-010, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010, AC-011, AC-012, AC-013]
+depends_on: [TASK-004, TASK-004-R2, TASK-004-R3]
 ---
 
-# Complete manual L1 regression suite and sustained L2 coverage
+# Complete and prove the L1/L2 benchmark measurements
 
 ## Outcome and Value
 
@@ -23,12 +23,25 @@ Parquet-configured ingestion evidence. A throughput improvement cannot hide a
 CPU-cost or tail-latency regression. Diagnostic traces and profiles explain
 failures without becoming the baseline measurement configuration.
 
+Completion also proves the measurements mean what their case says: they cover
+the intended operation, server processes and interval, and remain associated
+with that case in saved evidence. For example, a Bifrost query result must not
+receive CPU from a separate Verification server or a previous case. An engineer
+can follow a slow case from its record to server timing components, diagnostic
+traces and a server CPU profile to locate waits or expensive functions.
+
 ## What Changes and What Must Stay True
 
 Keep the existing shared experiment runner, production fixtures, public SDK/OTLP
 workloads, correctness checks, clean-source rules, portability, profile option
 and append-only evidence. No engine optimization, harness rewrite, new workload
 DSL, optional dead-helper cleanup, baseline-format migration or CI dependency.
+
+TASK-004-R2 owns the real-path smoke rewrite; TASK-004-R3 completes bounded
+calibration and the separate normal-mode judging proof. Integrate both first;
+reuse their tests and extend only missing case/metric coverage here. This task
+does not create a second smoke or calibration runner. Revision 8's approval
+persists; the smoke instructions follow the approved revision-10 contract.
 
 The complete L1 matrix is:
 
@@ -45,8 +58,9 @@ Retain deterministic seeds/answer checks, 10M events + 1M spans read fixtures,
 2M-row write generators, payload sizes, storage ratio samples, shredding/pruning
 checks, existing peak/scaling derived rows and exact unit meanings. Check read
 residence before measurement. Reuse prepared state only when equivalence and
-ownership are proved; no waits for publication in the smoke or acknowledgement
-window. No shared mutable fixture across independently owned databases.
+ownership are proved. Smoke uses the real loader and required publication waits;
+write-ack timing itself still ends at durable acknowledgement, not publication.
+No shared mutable fixture across independently owned databases.
 
 Every case reports server latency, CPU seconds, C/T busy cores, provisioned P,
 W/T, (W/T)/P, W/C, C/W, peak memory and all outcome counts; write cases also report
@@ -55,12 +69,44 @@ scan facts and scaling; capture cases retain capture bytes/accounting. Phase
 histograms guide diagnosis. Resources and work use matching windows; drain work
 is separate. No favorable metric is inferred from an absent observation.
 
+Keep a compact evidence mapping for every declared case: named operation and
+timing boundary, outcome/cohort and phase, included server processes, resource
+window, work/byte units, and corresponding record fields and artifact paths.
+This is task evidence using the existing declarations/records, not a new
+manifest format. Prove distinct measurement paths once with controlled inputs,
+then use all-case real smoke to establish that each declaration is wired to the
+proved path. A mapping or fabricated Repetition alone is not runtime proof.
+
+CPU is actual user+system consumption of the declared server processes, with
+driver, provider, profiler and Postgres processes excluded. Required server
+replicas/workers are included once. Do not import counters from another process,
+case or repetition. Work intentionally sharing that server, including required
+background work, remains part of its CPU cost. Mixed L2 CPU is explicitly the
+combined workload's CPU; never label it query-only or attribute CPU to individual
+functions using elapsed timings. Profiles diagnose where that CPU went.
+
+Latency and overhead retain the specification's server boundaries. Exclude only
+the per-request union of declared Verifier/provider waits; do not subtract
+percentiles. Keep timing groups, scan facts, work and bytes associated with the
+correct case/admission phase. Incidental lanes, filler and visibility probes
+cannot satisfy foreground populations: exactly reconcile required populations
+and document the purpose, accounting scope and reason for any incidental group
+that is not reconciled request by request. Do not claim unmeasured attribution.
+
 Preserve 5 s + 3 x 10 s L1 windows, four Bifrost per-experiment budgets from the
 spec, and the existing 15-minute budgets for other engines. Existing sample
 floors still govern judged percentiles. Never reduce coverage, durations or
 sample floors to fit a runtime budget; use recorded phase timings to fix setup
 or lifecycle waste. Building and service prerequisites precede the experiment
-clock; smoke, fixtures, pre/post host checks and drain remain inside it.
+clock. The isolated smoke prepass has its own declared budget/time; the full
+clock starts afterward and includes full fixtures, pre/post host checks and
+drain. Full-run windows/floors remain unchanged. Explicit smoke may shrink only
+the controls allowed by REQ-008, with production criteria explicitly inapplicable
+and their observed readings retained. Recorded production errors,
+dropped/refused calls, shedding, wrong
+answers and target misses do not fail smoke. Broken measurement/evidence
+plumbing is INVALID. Smoke cannot qualify or supply a reference; normal judging
+is proved separately with controlled results and exercised by full runs.
 
 Keep three-repetition L2 workloads and exact declared rates/mixes, overloaded
 phases, backlog/drain/recovery and capture accounting. Independent arrivals are
@@ -86,13 +132,15 @@ judged, so short windows do not manufacture a scan-tail sample population.
 2. Close metric/report and lifecycle consumers, including L2 independent arrivals,
    task cancellation, window boundaries and profiler/drain behavior.
 3. Extend comparison identity, reference eligibility and relative judgment for
-   all required dimensions with deterministic negative/noise cases.
+   all required dimensions with deterministic negative/noise cases; prove real
+   measurement wiring and controlled regressions through the existing runner.
 4. Update mise descriptions and the existing README/TESTING/configuration docs;
    prove direct and aggregate coverage, smoke and exit precedence.
 5. On clean integrated source, run smoke, full L1 one engine at a time, repeat
    for replacement references and perform matched tracing overhead comparisons.
-6. Hand integrated L2 and all required production/language-surface proof to final
-   change review; do not repeat broad suites after every task scenario.
+6. Supply real L2 evidence and a trace/profile investigation for each engine;
+   final change review checks that evidence and owns broad production/language
+   journeys once, rather than repeating them after every task scenario.
 
 ## Ordered Implementation Scenarios
 
@@ -131,6 +179,66 @@ using TASK-004's histogram/population contract. Run V1/V2 and V6.
 **REFACTOR.** Reuse common controls and one record/report path. Do not average
 unlike query/storage classes or turn engine metrics into one generic score.
 
+### Scenario 2a — Each measurement belongs to the work it claims to measure
+
+**Behavior.** Controlled requests drive the actual engine measurement path,
+through server instrumentation, snapshots, resource accounting, reconciliation
+and saved records/reports. Cover every distinct boundary/transport/accounting
+path; equivalent case variations share proof only when the case mapping shows
+the same owner and conversion. Include native/OTLP spans/OTLP logs ingestion,
+queries, direct/background Verification and buffered/streaming/capture Gateway
+paths where declared. In particular, exercise the real Gateway ingress, not
+only synthetic Observed values or a provider fixture in isolation.
+
+| Measurement | Small controlled proof and expected observation |
+|---|---|
+| Latency and overhead | Compare controls with a known delay inside the named server boundary and a delay outside it. Only the included delay moves server latency; outside client delay does not. For Verification/provider waits, changing wait from zero to W moves elapsed and excluded wait together while residual overhead stays within a justified tolerance; zero-wait residual agrees with elapsed. Buffered/head/final streaming boundaries and overlapping waits retain their distinct meanings. Compare p50/max and HDR bounds against independently observed durations, allowing declared scheduling/timer error. Client duration to the corresponding outcome bounds the server interval; never compare different streaming endpoints. |
+| Process and window attribution | A bounded known CPU operation in a declared server process moves server CPU, not driver CPU. A driver-only control moves driver CPU, not server CPU. Use independent process-counter observations or existing injected resource seams to prove an unrelated PID, a prior case and work before/after the window cannot enter the result, including summed worker scopes. Real controlled CPU work runs inside the benchmark process scope, never as synthetic host load; sleep duration is not a CPU reference. |
+| Work, rows and bytes | A known successful population gives exact completed work and rows, with W/T, W/C, C/W and (W/T)/P recomputed from independent operands. Refused/failed/retried/late requests follow their declared accounting, not admitted=successful. Known payloads establish retained Arrow bytes and encoded OTLP protobuf bytes separately, plus required scan/capture accounting; source JSON size is not retained Arrow size. |
+
+Record independent expected values, measured values, tolerances and reasons.
+Tolerances are fixed before execution from clock/sampling precision and control
+noise; they must still detect a wrong boundary, process, unit or window. A
+green check must not derive its expected value from the result being checked.
+Deterministic negative controls deliberately substitute a wrong case/process,
+boundary or window at an existing test seam and must trip the assertions or
+normal INVALID checks. Do not require fresh production switches or APIs for
+test-only perturbations.
+
+**RED.** Planned V2a extends TASK-004-R2's real-path tests where needed. Confirm
+each new check fails for the diagnosed missing/wrong measurement, rather than
+fixture setup. Already-correct paths use verification-only evidence; do not
+manufacture source changes. Scripted resource negatives complement, and never
+replace, real server/driver accounting and real engine requests.
+
+**GREEN.** Repair only uncovered wiring at the existing owning instrument,
+request context, resource window or record conversion. Run V2a, V1/V2 and
+affected existing TASK-004-R2 proofs. V7 reads the persisted evidence from every
+real case; V8/V9 establish ordinary full-size behavior.
+
+**REFACTOR.** Reuse engine fixtures, process readers, timing populations and the
+shared recorder. No parallel runner, general calibration framework, new
+per-request production record or inferred per-function CPU accounting.
+
+As part of this scenario, audit instrumentation on the benchmark measurement
+paths only. For each timer or recording hook, identify its operation boundary,
+existing owner and benchmark or production-monitoring consumer. Reuse existing
+timing owners where their boundaries match; remove duplicate or unconsumed
+instrumentation introduced by this benchmark change without losing required
+observations. Keep necessary scheduling/deadline clocks distinct from operation
+timers. Benchmark-only collection stays centralized and gated; verify its
+disabled path avoids clock reads, histogram recording and label processing
+performed solely for benchmarks. Use profiles for function-level investigation
+rather than adding timers to every function. Preserve timers required by normal
+production behavior, monitoring or correctness; unrelated instrumentation is
+outside this task.
+
+Record this bounded audit alongside the case mapping: source location, purpose,
+consumer, gating where applicable, and retain/reuse/remove decision. This is
+source/consumer inspection, so no manufactured RED is required. Any resulting
+behavior change uses the affected focused tests and V2a/V7 to prove required
+measurements survive; carry forward existing disabled-path proof when unchanged.
+
 ### Scenario 3 — Comparable regressions fail without manufacturing certainty
 
 **Behavior.** Compatible references trigger the specified independent latency,
@@ -139,13 +247,30 @@ boundaries and noise behave as specified; ambiguous precision or missing
 required operands is INVALID. Cross-host/method/profiled/partial references
 cannot silently judge a case. Reference promotion is explicit.
 
+In addition to judgment arithmetic, controlled real workload regressions in
+latency, CPU/work and throughput per provisioned core must reach the normal
+judge and produce criterion FAIL/exit 1 against a compatible reference. The
+unperturbed control must be valid and pass the compared criterion; an INVALID
+run, smoke-only run or edited metric/record is not regression-detection proof.
+Use the same ordinary full-run measurement rules, repetitions and sample floors,
+with existing fixture/test-support controls. Cover each engine's conversion to
+the judge and all three regression dimensions across the proof; a full Cartesian
+matrix of engines, cases and perturbations is not required. Keep artifacts for
+the control and regression, reference identity, perturbation, operands and
+failing criterion. Diagnostic/calibration records never become promoted
+performance references.
+
 **RED.** Planned V3 adds throughput/P and latency regression, baseline identity,
 quantization ambiguity and first-reference cases to existing comparison proof
 V6. Current judgment does not cover all these dimensions.
+Planned V3a adds the real-path controlled regression proof; retain an existing
+passing equivalent instead of duplicating it. Choose perturbations large enough
+to cross unchanged limits despite normal spread, without breaking validity.
 
 **GREEN.** Extend existing judgment/selection and baseline metadata, preserving
 original numeric values as historical evidence. Absolute SLO and correctness
 misses still fail despite noisy relative results. Run V3/V6.
+Run V3a through actual measured workloads, not manually supplied Repetitions.
 
 **REFACTOR.** Reuse direction/spread arithmetic and baseline TOML structure;
 avoid a new statistical framework or reference database.
@@ -166,7 +291,8 @@ behavior is verification-only, not an excuse to manufacture production churn.
 
 **GREEN.** Fix only uncovered lifecycle/open-arrival gaps in current engine
 owners, preserving declared mixes and limits. Run V1/V4 and focused affected
-module tests. Actual sustained proof runs once at integrated review (V9).
+module tests. Supply actual sustained proof in V9 for integrated review to
+assess; do not defer the first real L2 run beyond this task's evidence.
 
 **REFACTOR.** Use established Tokio ownership/cancellation and existing profiler
 lifecycle; remove detached work or duplicated cleanup rather than add another
@@ -180,9 +306,15 @@ is partial. On clean source, full suites produce reproducible reports and allow
 reviewed same-method references. Detailed tracing/profile diagnosis is optional
 and explicitly differs from qualification configuration.
 
+V7 proves all-case real smoke and persisted-output readback; exit 0 alone is
+insufficient. Carry forward TASK-004-R2's unchanged selected-step/prepass failure
+proof. V8 proves a useful trace/profile investigation for each engine.
+
 **RED.** Extend V1 dispatch coverage and planned V5 to test qualification versus
 partial/diagnostic records and incompatible reference promotion. A changed
 README alone cannot establish runtime behavior.
+Extend V5 to reject smoke as a reference even after relocation. V7 must expose
+missing, mislabeled or unreadable artifacts from the real default case matrix.
 
 **GREEN.** Close mise/CLI/record consumers, then execute V7/V8 sequentially. Report
 Bifrost, Verification and Gateway results separately, including FAIL/INVALID;
@@ -197,10 +329,14 @@ script, automatic commit/promotion, CI job or broad test gate is introduced.
 |---|---|
 | REQ-001/003/007/008/010, AC-001/009 | V1/V2 plus clean V7/V8 establish the exact full matrix, smoke, honest budgets, storage state and documented commands. |
 | REQ-002/006/013/014, INV-004/005/008, AC-004/005/006 | V2/V6 and real records reconcile work/CPU/P/bytes, outcomes, windows, reports, missing data and historical schema support. |
+| REQ-006/007, INV-004/005, AC-001/005/012 | V2a proves metric meaning with independent controls through each distinct real measurement path; all-case V7 maps each declaration to that proof and reads back its measurements. Wrong process/case/boundary/window controls fail, server/driver CPU remain disjoint, and mixed-workload CPU scope is explicit. |
+| REQ-007/015, maintainer-directed instrumentation check | Scenario 2a's source/consumer audit accounts for timers/hooks on benchmark measurement paths, reuses matching owners, removes change-introduced duplication or unused instrumentation, and verifies benchmark-only collection is gated. Required production timers and benchmark observations remain intact; no repository-wide cleanup or per-function timer expansion. |
 | REQ-011/012, AC-002/003/013 | V3/V5/V6 establish comparable references, all regression dimensions, noise/limit behavior and explicit promotion; V8 supplies real clean reference evidence. |
+| REQ-020, AC-013 | V3a supplies valid unperturbed controls and real measured regressions reaching normal reference judgment: latency, CPU/work and throughput/P each FAIL without edited readings, weakened limits or INVALID standing in for detection. Each engine's measurement-to-judge path is exercised. |
 | REQ-004/005/009, INV-001/002/003/007, AC-007/010 | V1/V4 and integrated V9 prove complete phase coverage, independent arrivals, cancellation/drain, correctness, audit/durability and no host-load/build contamination. |
 | REQ-015/016, INV-009, AC-008/009 | Source/consumer/task inventory preserves one runner and retirement work; Linux real proof plus portability inspection covers unchanged commands/schema on supported platforms. |
 | REQ-019/020, INV-006/010, AC-011/013 | V8's matched telemetry comparisons and documented trace/profile investigation preserve client/tenant policy, safe artifacts and normal measurement configuration. TASK-003 owns focused tenant timeline proof. |
+| REQ-007/008/013/015, AC-012 | V7 exercises every default real L1/L2 case and phase and reproduces saved evidence/report. Production outcomes remain recorded without failing smoke; missing/inconsistent measurements or failed persistence/readback remain INVALID. Smoke cannot be a reference. TASK-004-R2/R3 supply the shared prepass, negative paths and separate controlled full-mode judging proof. |
 
 ## Implementation Reference
 
@@ -216,10 +352,13 @@ script, automatic commit/promotion, CI job or broad test gate is introduced.
 - `experiment.rs::judge_criterion`, baseline selection, Record/Report and
   `capacity.rs` resource readers already supply efficiency/spread/provenance.
   Extend these owners for new matching dimensions, not a second judgment engine.
-- `levels.rs`, capacity binary main and `mise.toml` already run smoke, separate
-  experiments, Postgres wrappers and worst-exit aggregation. Expand writes to
-  two records. Correct the current Gateway L2 mise description (payload capture)
-  to match actual declared metadata capture rather than silently change workload.
+- `levels.rs::execute/select/report`, capacity binary main and `mise.toml` own
+  declaration selection, execution, record readback, Postgres wrappers and
+  worst-exit aggregation. TASK-004-R2 replaces separate request-only smoke with
+  this same normal runner in smoke mode; extend its coverage for the completed
+  matrix and expand writes to two records. Correct the Gateway L2 mise
+  description (payload capture) to match actual declared metadata capture rather
+  than silently change workload.
 - `query/competing.rs`, Verification run, Gateway scheduler/request tasks and
   `profile.rs` are the lifecycle consumers for the carried-forward review
   findings. Revalidate existing fixes; do not assume the old candidate is still
@@ -227,6 +366,23 @@ script, automatic commit/promotion, CI job or broad test gate is introduced.
 - Existing `benchmarks/*/baselines.toml`, README and TESTING are the reference
   and discoverability owners. Preserve source values/history; annotate method
   incompatibility and add reviewed replacements linked to real clean records.
+- `capacity.rs::Window/ResourceWindow/Population`, `release_server.rs::LocalServer`
+  and `release_server/os` own measured stop, server PID/resource reads and timing
+  cohorts; `driver_cpu_seconds` reads the calling process separately. Current
+  engine conversions consume those readings. Extend their existing tests and
+  TASK-004-R2 calibration proof for misattribution and independent controls;
+  the synthetic accounting test alone cannot prove which live PID was read.
+- `gateway_capture.rs::PacedUpstream/Pacing` already supplies real controlled
+  buffered/streaming waits and is used by Gateway capacity's Driver. Gateway
+  run's synthetic Observed tests exercise conversion only; supplement them by
+  driving the actual ingress and recorder. Reuse existing Verification/Bifrost
+  fixtures and test-support seams for equivalent controlled work, adding only
+  missing in-owner support, not another transport or benchmark framework.
+- `profile.rs::Profiler` attaches samply to declared server PIDs and records
+  capture paths/notes; the experiment runner owns its lifecycle and optional
+  failure behavior. Verify selected-case diagnostic use of these existing
+  owners. Profiles cover their recorded capture interval; sampled traces explain
+  individual flow and do not replace complete benchmark histograms.
 
 ## Verification and Evidence
 
@@ -252,6 +408,29 @@ mise exec -- cargo nextest run --locked -p wyrd-testing --bin capacity -E 'test(
 mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=experiment::tests::compatible_histogram_baselines_judge_all_regression_dimensions)'
 ```
 
+### V2a / V3a — Real measurement integrity and controlled regression proof (planned)
+
+These planned selectors belong to Postgres tests in the existing capacity binary,
+using actual engine plans and the shared experiment runner. Confirm actual names
+before RED. Reuse equivalent TASK-004-R2 tests by recording their exact selectors
+and coverage instead of adding duplicates. Use real time for real-process proof,
+not the paused clock used by declaration-only tests. Build the release server
+and driver with `mise run bench:build` and provision repository prerequisites
+before these manual checks; they are not new CI performance gates.
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-testing --bin capacity --test-threads=1 -E 'test(=tests::pg_tests::engine_measurements_keep_boundaries_processes_and_windows)'
+mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-testing --bin capacity --test-threads=1 -E 'test(=tests::pg_tests::measured_regressions_reach_normal_reference_judgment)'
+```
+
+V2a keeps expected/observed operands and predeclared tolerances for Scenario 2a.
+V3a uses valid ordinary full measurement rules against compatible references;
+it must show the normal judge's criterion FAIL/exit 1 and persisted evidence,
+not only a helper returning false. Existing test-support perturbations need no
+new public CLI. Complete measurement-integrity checks and each engine's L1 smoke
+before its V8 qualification; run L2 smoke before V9 once the required L1
+calibration exists. No builds or independent tests run beside measurements.
+
 ### V4 — Owned sustained workload lifecycle (planned)
 
 ```bash
@@ -274,11 +453,45 @@ mise run check:deps
 mise exec -- git diff --check
 ```
 
-### V7 — Clean release smoke
+### V7 — Clean real-path release smoke and output readback
 
 ```bash
-mise run bench:smoke
+mise run bench:l1:bifrost -- --smoke
+mise run bench:l1:verification -- --smoke
+mise run bench:l1:gateway -- --smoke
+mise run bench:l2:bifrost -- --smoke
+mise run bench:l2:verification -- --smoke
+mise run bench:l2:gateway -- --smoke
 ```
+
+These --smoke invocations are supplied by TASK-004-R2. Run sequentially on the
+final clean implementation, with no --steps: all four Bifrost L1 experiments,
+every engine case and each L2 phase must appear in the resulting evidence.
+`bench:smoke` remains a convenience aggregate of these same commands; no second
+aggregate run is required. Resolve any L2 calibration prerequisite through the
+normal declared compatibility rules; never invent or promote a smoke reference.
+
+For each emitted JSON record, run the existing report reader, substituting the
+printed path for `<record.json>`:
+
+```bash
+mise exec -- target/profiling/release/capacity report "<record.json>"
+```
+
+Compare the regenerated report with the original. Open its retained
+`timings/<step>/<phase>.json` evidence, difference the snapshots and check counts,
+percentile ranks/bounds/maxima and applicable scan facts against saved readings
+and the case mapping. Check units, source/engine/experiment/step/phase identity,
+CPU/work operands, required artifacts and explicit production-criterion
+inapplicability with observed values retained.
+All smoke output stays under `target/benchmarks/smoke/` and mode is smoke.
+Record exact commands, source identity, artifact paths and observations per
+plan. Exit 0 without these observations does not close V7. Smoke is PASS when
+the plumbing works, including when it accurately records production errors,
+dropped calls or target misses; those outcomes do not block full preparation.
+A plumbing failure is INVALID and must be diagnosed and fixed before the full
+run. Do not cite an older probe run. Carry forward TASK-004-R3's separate
+controlled full-mode judgment/persistence/report/exit-code proof.
 
 Use bench:build and repository prerequisites before timing, commit implementation
 before qualification, then prove clean source. All new run outputs remain
@@ -310,10 +523,36 @@ These diagnostic/control runs are not replacement references. Exercise selected
 case plus existing --profile for documented diagnosis; return to normal
 configuration before judging optimization.
 
-### V9 — Integrated qualification, once at change review
+For each engine, retain one selected-case diagnostic run using the documented
+--steps/--profile and temporary operator tracing controls. Record the exact
+resolved invocation after confirming real step IDs, return to normal settings
+afterward, and explain one observed wait or expensive function using the record's
+components, a matching request trace and a readable server profile. Confirm the
+profile targets the declared server PID(s) and identify its capture interval.
+This proves the artifacts are usable for investigation, not that all requests
+have sampled traces or that a whole-run profile gives exact per-case CPU.
+Missing/unusable profiler behavior remains nonfatal with an explicit note, but
+that fallback alone cannot close the required successful Linux profile
+demonstration. Diagnostic runs never qualify references.
 
-After all tasks integrate, run each engine's L2 command from REQ-010 sequentially
-and retain real Linux x86_64 release records. Run the integrated production
+### V9 — Full L2 evidence and once-only integrated qualification
+
+TASK-005 supplies one actual Linux x86_64 full run of each engine's L2 on the
+integrated candidate, after compatible L1 calibration is available:
+
+```bash
+mise run bench:l2:bifrost
+mise run bench:l2:verification
+mise run bench:l2:gateway
+```
+
+Retain records, timing evidence, report readback and phase/accounting observations
+as for V7, with full durations, three repetitions and normal floors/judgments.
+Report and diagnose FAIL/INVALID honestly; they do not establish a valid reference
+or passing qualification. Final change review assesses these artifacts and
+carries unchanged proof forward; it does not repeat valid runs without reason.
+
+At final change review, run the integrated production
 correctness/security/storage and existing Rust/Python/TypeScript client timeline
 journeys required by changed surfaces, once using their owning setup lanes.
 The integrated change reviewer owns this evidence closure; TASK-005 supplies
@@ -351,7 +590,10 @@ rustdoc on changed Rust items and precise # Errors/# Panics where applicable.
 
 ## Material Stop Conditions
 
-Revision 8 must be approved and TASK-004 integrated. Stop for spec authority if
+Integrate TASK-004 and its TASK-004-R2/R3 remediations before execution. Revision 8
+is already approved; do not reopen that approval because of its historical
+header. Approved revision 10 owns the plumbing-only smoke behavior and
+separate controlled judging proof. Stop for spec authority if
 required cases cannot meet a declared budget without changing fixture/coverage,
 if reference qualification needs different measurement boundaries, if an engine
 optimization is required, or if a new dependency/feature/public API is necessary.
@@ -360,7 +602,8 @@ invalid baselines or treat absent evidence as a passing regression check.
 
 ## Authority Links
 
-- [Specification](../spec.md), revision 8.
+- [Specification](../spec.md), approved revision 10 (revision 8's measurement decisions retained).
+- [Smoke and residual timing remediation](../review/TASK-004-R2/TASK-004-R2-finish-stop-counters-and-otlp-cohorts.md).
 - [Repository rules](../../../../AGENTS.md).
 - [Workflow](../../../spec-driven-development.md).
 - [Execution](../../../implementation-execution.md).

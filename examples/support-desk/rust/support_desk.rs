@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 use wyrd_ai::cards::{BundleMode, CardSelector, Cards, DeclarationReceipt};
-use wyrd_ai::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, ModelId};
+use wyrd_ai::gateway_admin::{GatewayCaptureMode, GatewayCapturePolicyWrite, ModelId};
 use wyrd_ai::observe::Run;
 use wyrd_ai::otel::start_telemetry;
 use wyrd_ai::state::WyrdState;

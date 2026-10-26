@@ -27,7 +27,7 @@ from wyrd import WyrdClient, WyrdState
 client = WyrdClient()  # finds the server and credential wyrd init saved
 state = WyrdState.declare("service/support-desk.yaml", client)
 state.start_bifrost()    # the writer for rows and verdict inputs
-state.start_telemetry()  # exports spans started inside a Run
+state.start_telemetry()  # exports spans, logs, and metrics under this Service and environment
 
 # Your model calls go through Wyrd's gateway. http_auth signs each call and
 # ties it to the Run it is made in.

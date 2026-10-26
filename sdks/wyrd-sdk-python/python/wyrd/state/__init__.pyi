@@ -209,18 +209,25 @@ class WyrdState:
         ...
 
     def start_telemetry(self) -> None:
-        """Install the global tracer provider exporting spans as this state's client.
+        """Install the global tracer, meter, and logger providers exporting as this state's client.
 
-        Spans export through the stock OTLP/HTTP exporter, which asks the
-        client for a fresh access token on every export; spans started inside
-        ``with state.run(...)`` carry that Run and Card. A second call is
-        idempotent, and ``shutdown`` flushes only the provider installed here.
-        Needs the ``otel`` extra.
+        The three share one Resource: ``service.name`` and ``service.version``
+        from the loaded Service and, when configured,
+        ``deployment.environment.name``, so every span, log record, and metric
+        point lands under this state's Service and environment. Starting
+        fixes the state's configuration. Each signal exports through the
+        stock OTLP/HTTP exporter, which asks the client for a fresh access
+        token on every export; spans started inside ``with state.run(...)``
+        carry that Run and Card. A second call is idempotent, and ``flush``
+        and ``shutdown`` flush only the providers installed here. Needs the
+        ``otel`` extra.
 
         Raises:
             WyrdError: ``WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`` when the
-                application already installed its own tracer provider; add
-                ``wyrd.otel.span_exporter`` to it instead.
+                application already installed its own tracer, meter, or logger
+                provider; add ``wyrd.otel.span_exporter``,
+                ``log_exporter``, and ``metric_exporter`` to its providers
+                instead.
             ImportError: naming the ``otel`` extra when it is not installed.
         """
         ...

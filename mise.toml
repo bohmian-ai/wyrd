@@ -764,7 +764,10 @@ run = "scripts/identity/with-identity-providers.sh -- bash scripts/server/test-s
 [tasks."build:server"]
 hide = true
 description = "Build the dev wyrd-server binary that in-process test servers (Rust journeys, Python, TypeScript) spawn as their Monty worker"
-run = "cargo build --locked -p wyrd-server --bin wyrd-server"
+# The first launch of a freshly linked binary can pay a one-time operating
+# system verification cost longer than a code block's deadline; launching it
+# here keeps that cost out of every test server's first worker spawn.
+run = "cargo run --locked -p wyrd-server --bin wyrd-server -- --version"
 
 [tasks."test:verification:sandbox"]
 description = "Run the Verifier Python sandbox and registered-Artifact code tests against the real Monty worker and test Postgres"

@@ -1,18 +1,18 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 8
-status: draft
+revision: 10
+status: approved
 ---
 
 # Benchmarks as experiments
 
-Revision 8 incorporates the maintainer-selected simple export-loss policy into
-the benchmark and tracing proposal of 2026-10-24. Revision 7 introduced the
-overall plan; this revision removes its unsupported live queue-drop counter
-requirement while keeping the stock OpenTelemetry processor. It supersedes revision 6's raw-sample/100%-OTLP measurement decision
-and expands Bifrost writes across hot and Parquet configurations. This material
-revision is draft; implementation tasks are proposed alongside it. Approval of
-the earlier revision does not imply approval of newly specified interfaces.
+Revision 10 records the maintainer's explicit correction and approval: smoke
+checks that the actual benchmark collects, reconciles, saves and reports its
+measurements. Dropped calls, server errors, capture shedding, wrong returned
+results and missed performance targets are recorded production benchmark
+outcomes; they do not fail smoke. Broken measurement or evidence plumbing does.
+Judging is verified separately with controlled results. Revision 9's reduced
+real-path workflow and revision 8's approved measurement decisions remain.
 
 L1 is the manual regression suite engineers run whenever they change Bifrost,
 Verification or Gateway. It measures server latency, CPU cost and throughput per
@@ -115,7 +115,8 @@ part of no gate or verification lane.
   and elapsed budget. Busy host, CPU-bound driver, missed open-loop arrivals,
   too few samples, dirty tree without explicit override, missing required
   resource readings, or over-budget execution is INVALID. A dirty override is
-  declared before execution and stored; no other validity check is bypassed.
+  declared before execution and stored. REQ-008 defines smoke's sole sample-floor
+  applicability exception; other validity checks are not bypassed.
   Sample host CPU for 10 seconds before the run and again after it. Either
   sample showing non-benchmark processes using more than 10% of logical CPUs
   invalidates the run. Driver use above 80% of its declared CPU budget is
@@ -125,7 +126,7 @@ part of no gate or verification lane.
   fewer is INVALID. A judged slow-step percentile, including L2 heavy scans,
   uses p95 with ≥200 samples per repetition; there is no heavy-scan p99 exception.
   Send lateness is solely a driver-validity check, never a server latency SLO.
-- **REQ-003 — Repetitions.** Every step has a discarded warmup followed by three
+- **REQ-003 — Repetitions.** Every full-run step has a discarded warmup followed by three
   measured repetitions with the same controls. L1 discards 5 seconds of warmup
   then measures 3 × 10 seconds; L2 discards 2 minutes of warmup then measures
   3 × 6 minutes. Preserve each repetition's
@@ -133,7 +134,7 @@ part of no gate or verification lane.
   into a percentile and call it the median repetition. Warmup contributes no
   measured work, CPU, latency, or sample count. A missing/invalid repetition
   invalidates the step; do not silently select the fastest repetition.
-- **REQ-004 — Judgment.** Every measured step and every applicable criterion
+- **REQ-004 — Judgment.** In full mode, every measured step and every applicable criterion
   yields PASS, FAIL, or INVALID. PASS means valid evidence meets its criteria;
   FAIL means valid evidence misses at least one criterion; INVALID means the
   experiment did not measure what it claims. An invalid step invalidates the
@@ -141,16 +142,20 @@ part of no gate or verification lane.
   run. Exit codes are PASS=0, FAIL=1, INVALID/discarded=2. An aggregate L1
   invocation uses the same precedence across engines and preserves their
   individual records. Invalidity reasons and any valid failures remain visible.
+  REQ-008 defines smoke's plumbing-only verdict and inapplicable production
+  criteria; separate controlled tests prove normal judgment and propagation.
 - **REQ-005 — Complete steps.** No sustained-only gate or report-only stress
   step remains. Overload steps declare expected rejections, queue/capture loss
   accounting, recovery, and bounds in advance; a successfully measured overload
   is not inherently INVALID or FAIL. Accidental request errors, wrong results,
-  or undeclared loss in a valid run fail correctness criteria. Expected server
+  or undeclared loss in a valid full run fail correctness criteria. Expected server
   admission rejection differs from a driver that failed to issue arrivals.
 
-A step's numeric criteria use the median repetition metric unless explicitly
-declared otherwise; correctness and integrity criteria must hold in all three
-repetitions. Repetition spread never excuses an absolute SLO miss. Conditions
+A full step's numeric criteria use the median repetition metric unless explicitly
+declared otherwise; correctness and integrity criteria must hold in every
+full-run repetition. Smoke enforces measurement/evidence validity under REQ-008,
+without judging the measured production outcomes against these criteria.
+Repetition spread never excuses an absolute SLO miss. Conditions
 such as capture saturation are recorded observations, not additional verdicts.
 A runner failure after declaration retains partial evidence as INVALID and
 marks unmeasured declared steps explicitly; it never fabricates zero metrics.
@@ -361,16 +366,71 @@ correctness; it does not pretend a 10-second single-client scan window supplies
 1,000-sample floor. L2 scans retain their judged p95/200-sample requirement. The same case at different
 storage states is never averaged into one result. A complete Bifrost L1 suite
 is all four records at full default coverage: 12 reads and 12 writes. The telemetry span fixture is deterministic, with attribute keys
-straddling the 10% shredding threshold. Inside each experiment's clock, before fixture loading, a mandatory seconds-scale
-release smoke sends a handful of real requests through every required engine
-boundary. It requires positive work, populated integer-duration histograms,
-valid CPU/provisioned-core readings and the engine's throughput counters.
-Diagnostic tracing may be disabled and the smoke must still pass. Failure names
-the engine, boundary and exact missing field/counter and stops immediately.
-The smoke never loads the full fixture, waits for publication or imposes the
-normal percentile sample floor. Both direct L1/L2 and aggregate invocations
-reach the same smoke. A settled Parquet read without required scan facts is
-INVALID.
+straddling the 10% shredding threshold. The former request-only release preflight
+is replaced by the following real-path smoke contract.
+A settled Parquet read without required scan facts remains INVALID.
+
+**Smoke mode.** `--smoke` on the normal L1/L2 commands runs the same shared
+experiment workflow, engine plans and selected steps as a full run. Without
+`--steps`, every declared step runs. Only declared fixture scale, warmup duration,
+repetition count and measured/phase durations shrink: one short discarded warmup
+and one short measured repetition, with windows measured in seconds. Publish
+the actual reduced controls and a bounded smoke budget before execution.
+Do not silently omit a case, transport, query class or capacity/overload/recovery
+phase to make smoke pass. Preserve concurrency and physical fixture properties
+needed to exercise each declared path, including hot versus published Parquet,
+shredded versus residual attributes, scans, capture and background work.
+
+The normal declaration validation, real fixture loader and publication waits,
+step loop, warmup, measurement, stop/freeze, bounded drain, cohort reconciliation,
+judgment, record and timing-evidence writes, and report generation all execute.
+Use the same production authentication, tenant, durability and telemetry paths.
+Delete the handwritten per-engine request-only smoke workflows and separate
+capacity smoke subcommand; retain `mise run bench:smoke` as an aggregate of the
+normal commands in smoke mode. Smoke enforces measurement/evidence validity:
+required CPU/work readings, exact labelled outcome populations, required counters,
+Scribe/capture accounting and applicable scan facts. Diagnostic trace export may
+be disabled. Missing/reset counters, absent required measurements, zero CPU,
+incomplete or mismatched populations, unreadable or missing artifacts and failed
+record/evidence writes remain plumbing failures. Failures name the engine, step,
+boundary and missing or inconsistent evidence.
+
+Smoke uses the shared runner, judgment entry and report machinery with production
+criteria explicitly inapplicable. Record all observed values and reasons,
+including dropped/refused calls, server errors, incorrect returned results,
+capture shedding and missed performance targets. Those observations alone do
+not fail smoke or its full-run prepass. For example, accurately accounting for
+10 dropped calls is successful plumbing; losing those 10 calls from the outcome
+totals is a reconciliation failure. Smoke is PASS/exit 0 when its plumbing works
+and INVALID/exit 2 when it does not; PASS never claims production criteria passed.
+Every required measured population remains nonempty. Full runs retain all normal
+criteria, sample floors, durations, repetitions, references and FAIL/exit 1 rules.
+
+Separate deterministic tests feed controlled passing, failing and invalid
+readings through the normal full-mode judge, then persist/read the record and
+regenerate the report. They prove that a known criterion miss becomes FAIL with
+its observed value and exit 1, while invalidity retains precedence and exit 2.
+This proves judging without requiring live smoke workloads to meet production
+targets or changing the real benchmark's limits.
+
+Every normal full invocation first runs this same smoke-sized plan as a fail-fast
+pass, with its own record, isolated/reset fixture state and declared budget.
+Only a smoke PASS permits full-size fixture preparation. A failed prepass leaves
+its evidence and reports that the full run did not start; it cannot fabricate a
+full-run result. Smoke mode does not recursively preflight itself. Build and
+external prerequisites remain outside both clocks. The full experiment clock
+starts after the smoke pass and includes its normal host checks, startup, loading,
+measurement and drain; report the prepass time separately so command wall time
+is not hidden. Smoke fixture/publication work must not pollute full-run counters
+or state. This costs a real small fixture load and settlement before a full run;
+it has no promise to finish as quickly as a handful of requests.
+
+Smoke records, timing evidence and reports live only under
+`target/benchmarks/smoke/`, never committed benchmark history. New records declare
+`mode: smoke` or `mode: full`; readers retain older records' original full-run
+meaning when that field is absent. Smoke records are always baseline-ineligible,
+including when manually moved or supplied as a reference. Reports identify smoke
+as functional pipeline evidence rather than performance qualification.
 
 Reset or otherwise establish equivalent declared data state between repetitions;
 repeated writes must not turn later repetitions into duplicate acknowledgments.
@@ -480,10 +540,11 @@ precedence even if an earlier experiment fails or is invalid. `bench:l1` runs ev
 contaminate one another.
 All old `bench:*` entry points are replaced without aliases. L1 commands
 accept the planned `--qualify-baseline` mode defined in REQ-011 and forward it
-through aggregates; it is rejected with partial selections, --profile or L2. No L2 aggregate
+through aggregates; it is rejected with partial selections, --profile, --smoke or L2. No L2 aggregate
 is required. Every experiment and both levels use identical commands and record
 schema on all three platforms. Each engine command accepts optional `--profile`,
-forwarded through mise (for example, `mise run bench:l1:bifrost -- --profile`);
+and `--smoke`, forwarded through mise (for example,
+`mise run bench:l1:bifrost -- --smoke` or `--profile`);
 `bench:l1` forwards it to each sequential engine run. There is no platform-only
 experiment or alternative command. `benchmarks/README.md` explains levels, budgets, prerequisites,
 validity, metrics/units, baseline eligibility, exits, examples, and how to read
@@ -549,7 +610,8 @@ a single throughput number. This resolves D-4's comparison decision.
 ### Record and report contract
 
 **REQ-013 — One persisted record.** The shared recorder writes each completed,
-failed, or discarded experiment to:
+failed, or discarded full experiment to the following history; smoke uses the
+separate local destination in REQ-008 through the same recorder:
 
 ```text
 benchmarks/<engine>/<experiment>/<UTC timestamp>-<short sha>.json
@@ -576,13 +638,14 @@ stable identifiers and explicit units rather than formatted table strings.
 |---|---|
 | `schema_version` | Integer 2 for new records; legacy 1 remains readable. Breaking semantic/shape changes require a new version; readers reject unsupported versions explicitly. |
 | `engine`, `experiment`, `level`, `question` | Declared identity, level integer 1/2, and question. |
+| `mode` | `full` or `smoke` for new records; absent on older records retains their original full-run meaning. Smoke is never an eligible baseline, independently of filename/location. |
 | `started_at`, `finished_at` | UTC RFC 3339 instants, including partial/INVALID runs. Elapsed budgeting uses monotonic time, also stored. |
 | `commit`, `dirty`, `dirty_override` | Full measured-source SHA, source dirtiness at declaration, explicit override state. Dirty runs store `dirty: true` and `diff_sha256`, SHA-256 of the bytes from `git diff HEAD`. Output created by this run does not retroactively dirty its source. |
 | `host` | OS/version, architecture, CPU model/logical count, physical memory, and declared storage context; record available provisioned vCPUs P per server host and combined scope separately from mean used cores C/T. P supplies throughput per provisioned vCPU; C supplies work/CPU-s. |
 | `build` | Profile, feature/compiler flags, compiler and binary identities; detect a stale binary rather than attribute it to the current tree. Existing build stale-binary detection applies; no additional source-to-binary correspondence validity rule is required. The diff digest does not make a dirty run baseline-eligible. |
 | `command` | Exact invocation as argument values plus the non-secret configuration needed to reproduce it. |
 | `variables`, `controls`, `criteria` | Sweep and fixed controls, validity/budget declarations, metric definitions (including latency clock/resolution, histogram method/range/precision, quantization interval, population and expected/recorded counts) and criterion IDs/operators/limits/units/applicability, chosen baseline snapshots. |
-| `steps` | Ordered declared steps: IDs/params, timings, metrics with units, all three repetition summaries, median/min/max spread, per-criterion observed values/verdicts/reasons, step verdict. Missing observations are null with reasons, never NaN or infinity. |
+| `steps` | Ordered declared steps: IDs/params, timings, metrics with units, three repetition summaries in full mode or one in smoke mode, median/min/max spread, per-criterion observed values/verdicts/reasons and explicit applicability, step verdict. Missing observations are null with reasons, never NaN or infinity. |
 | `validity`, `verdict`, `reasons` | Check observations, overall PASS/FAIL/INVALID, structured reasons for a literal agent reader. |
 | `artifacts` | Optional local `target/` references and capture completeness; historical summaries remain readable without them. |
 
@@ -782,12 +845,19 @@ constraints; private implementation choices remain open.
    platforms; plain-child servers, sysinfo readings and optional samply
    diagnostics, without OS resource envelopes. Required real evidence is Linux
    x86_64 only; the other two platforms require unchanged runnable behavior.
-7. **Validity versus failure:** INVALID has precedence and exit 2; valid criterion
-   misses exit 1; every step is judged, including overload/recovery.
+7. **Validity versus failure:** in full mode, INVALID has precedence and exit 2;
+   valid criterion misses exit 1; every step is judged, including overload/recovery.
+   Smoke checks plumbing with production criteria explicitly inapplicable.
 
-Revision 8 retains the proposed changes to measurement, comparison eligibility, Bifrost write coverage,
-record version and production tracing policy. These meanings require explicit
-approval of this revision; ordinary private structure remains implementation-owned.
+8. **Smoke:** the actual experiment workflow with reduced declared controls,
+   automatic isolated prepass, explicit criterion applicability and local-only,
+   permanently baseline-ineligible records. A separate probe runner is rejected
+   because it cannot validate the measurement and evidence workflow and can drift.
+
+Revision 10 preserves the approved measurement, comparison, coverage, record
+and tracing decisions. The maintainer explicitly approved the plumbing-only
+smoke correction and directed revision of its remediation packet; ordinary
+private structure remains implementation-owned.
 
 ## Acceptance: user and agent journeys
 
@@ -811,7 +881,7 @@ MCP API that would require a new product-surface projection.
 | AC-009 — Maintainer checks migration and discoverability | README and TESTING explain invocation and records; coverage mapping has no lost workload; old tasks/aliases, dead thresholds/SloGate/load exports and duplicate code are gone. Every client-queue step judges criteria; Gateway has declared capacity SLO constants. Static consumer/task/docs inventory plus relevant existing correctness lanes; no benchmark added to CI/gates. | REQ-010, REQ-016 |
 | AC-010 — Operator checks preserved production guarantees | Wrong results and unexpected loss fail valid runs; tenant-negative journeys cannot expose data; acknowledged writes survive existing durability checks; audit stays non-blocking and accounted; fixture cleanup remains scoped and credentials never enter summaries. Existing security/storage journeys and focused record privacy/cancellation checks are credible evidence. | INV-001, INV-002, INV-003, INV-006 |
 | AC-011 — Operator changes logging/sampling or loses its backend | Production-initialized tests prove independent log/operator policies and SDK overflow/shutdown loss reporting and accurate failed-export-batch counters; real authenticated client → gateway → tenant timeline journeys retain catalog IDs/links at ratio zero/no endpoint, with tenant-negative readback. All shipped language surfaces retain their existing journeys at integrated review. | REQ-017, REQ-018, INV-010 |
-| AC-012 — Engineer measures without trace export | Full release smoke and deterministic histogram tests prove complete observations, interval deltas, quantization-bound judgment, overflow/zero/reset handling and separate drain populations. Readout is absent normally and rejects enabled non-loopback binding; snapshots expose no sensitive identity. | REQ-007, REQ-008, INV-006, INV-010 |
+| AC-012 — Engineer smoke-tests the actual benchmark without trace export | Real release commands exercise every default L1/L2 plan for all engines, including all four Bifrost L1 experiments after TASK-005 completes the matrix, through actual loading/publication, selected steps/phases, measured stop/drain, exact outcome reconciliation, record/full timing evidence and report. Read the record and regenerate its report; verify retained histograms reproduce recorded readings. Accurately recorded production errors, dropped/refused calls, capture shedding, wrong answers and target misses do not fail smoke. Missing measurements/counters, mismatched populations, zero CPU, missing applicable scan facts and failed evidence/report handling are plumbing failures. Production criteria remain explicitly inapplicable with observed values retained; smoke PASS claims plumbing only. A separate deterministic full-mode test proves a controlled criterion miss survives judgment, record/readback, report and exit 1, and invalidity retains precedence/exit 2. Selected-step and automatic isolated prepass proof remains; invalid plumbing stops full preparation. Mode round-trips, output stays outside history and smoke cannot become a baseline after relocation. Deterministic interval/quantization/overflow/reset/drain proof and bounded known-delay, known-CPU and instrumentation-cost calibration use the actual measurement path with independent references and justified tolerances, without synthetic host load or a side runner. Normal readout absence, non-loopback refusal and snapshot privacy remain. | REQ-007, REQ-008, REQ-013, REQ-015, INV-006, INV-010 |
 | AC-013 — Maintainer establishes regression evidence | Two clean full suites establish reviewed same-method references; latency/throughput-core/CPU-work regression cases fail correctly. Same-build export and tenant-copy comparisons quantify overhead; diagnostic traces and profile reproduce the documented investigation workflow without becoming references. | REQ-011, REQ-012, REQ-019, REQ-020 |
 
 Implementation planning must select exact focused commands and evidence under
@@ -826,8 +896,8 @@ proposal. The proposed dependency order is:
 2. [TASK-004: independent server timing](tasks/TASK-004-server-benchmark-timing.md).
 3. [TASK-005: complete regression suite](tasks/TASK-005-regression-matrix.md).
 
-These replace remaining execution instructions in TASK-001, TASK-002 and the
-TASK-001-R1 refinement once revision 8 is approved. Existing implemented fixes,
+Revision 8 replaced remaining execution instructions in TASK-001, TASK-002 and the
+TASK-001-R1 refinement. Existing implemented fixes,
 review findings, verdicts and run artifacts remain evidence, not erased work.
 Carry forward relevant resource/window/lifecycle/cancellation/doc fixes; the
 raw timing collector, its mandatory helper and exact-span matching obligations
@@ -842,13 +912,29 @@ TASK-005 obligations; rustdoc finding 11 applies to each changed owner; real
 qualification finding 12 remains once at integrated change review. No review
 finding is declared fixed merely by revising this spec.
 
+The maintainer directed the real-path smoke correction into the existing
+[TASK-004-R2 remediation](review/TASK-004-R2/TASK-004-R2-finish-stop-counters-and-otlp-cohorts.md).
+That direction is separate from the four independently validated residual
+findings. The current smoke contract supersedes TASK-004/005
+instructions for request-only smoke, skipping fixture/publication work, accepting
+probe-only evidence or including the prepass inside the full experiment clock.
+REQ-008 instead declares and reports a separate prepass budget/time. Their
+historical evidence remains intact. TASK-005 full-run
+qualification obligations remain; a small smoke PASS cannot close them.
+
+The maintainer subsequently clarified smoke's verdict and withdrew
+FIND-TASK-004-7 as written. Revision 10 supersedes any task/review instruction
+to fail smoke for accurately recorded production errors, loss, wrong answers or
+criterion misses. The revised TASK-004-R3 retains F8 calibration and separately
+proves normal full-mode judging with controlled results. Historical review
+reports remain evidence under their recorded authority, not current instructions.
+
 ## Open material decisions
 
-No alternative is left to the implementer: this draft selects bounded HDR
-measurement and an opt-in local read-only metrics snapshot, the four Bifrost
-experiments, explicit tracing policies and same-method replacement baselines.
-The maintainer approves these material choices, including the benchmark-only
-classification metadata and explicit qualification mode, by approving revision 8.
+No material decision remains open. Revision 8's approval and the directed
+real-path smoke workflow persist; the maintainer explicitly approved revision
+10's plumbing-only verdict and separate controlled judgment proof. Private
+scaling choices remain implementation-owned.
 Historical clean-source gaps remain recorded as exclusions/advisory evidence,
 not a reason to invent a reference or weaken coverage.
 
@@ -912,6 +998,23 @@ not a reason to invent a reference or weaken coverage.
   proof without owning a new queue or parsing loss logs. Other benchmark,
   tracing, matrix and client-timeline decisions are unchanged. Draft; earlier
   readiness report remains historical evidence, not a verdict on this revision.
+
+- Revision 9 — 2026-10-25: At the maintainer's direction, replace the separate
+  request-only smoke with reduced executions of the actual benchmark workflow,
+  automatic isolated prepasses, explicit applicability and baseline-ineligible
+  local records. Inspection during TASK-004 remediation found the old smoke
+  bypassed fixture loading, measurement, judging and persisted report/evidence;
+  its green result therefore could not establish that those paths worked.
+  Add this correction to TASK-004-R2 without relabelling it as an old review
+  finding. Draft; no source implementation or benchmark run is claimed.
+
+- Revision 10 — 2026-10-25: The maintainer explicitly agreed that smoke verifies
+  benchmark plumbing and directed the remediation packet revision. Production
+  outcomes, including errors and dropped calls, are recorded without failing
+  smoke; only broken measurement/evidence handling makes it INVALID. Withdraw
+  F7 as written and prove ordinary full-mode judging separately with controlled
+  results. F8 calibration and full benchmark criteria remain unchanged. Approved
+  by that explicit direction; no additional approval is requested.
 
 Authority (plain repository references):
 

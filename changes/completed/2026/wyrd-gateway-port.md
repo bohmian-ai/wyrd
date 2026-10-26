@@ -17,5 +17,5 @@ Acceptance closed through the credential-free gateway journey, native protocol a
 Current owners and evidence:
 
 - [Wyrd design](../../../architecture/wyrd-design.md), [security posture](../../../architecture/wyrd-security-posture.md), and [Bifrost design](../../../architecture/bifrost-design.md).
-- [Gateway engine](../../../crates/wyrd/wyrd-gateway), [server gateway](../../../crates/wyrd/wyrd-server/src/components/gateway), and [shared client](../../../crates/shared/wyrd-client/src/gateway.rs).
+- [Gateway engine](../../../crates/wyrd/wyrd-gateway), [server gateway](../../../crates/wyrd/wyrd-server/src/components/gateway), and [shared client](../../../crates/shared/wyrd-client/src/gateway_admin.rs).
 - [Gateway journeys](../../../crates/wyrd/wyrd-testing/tests/gateway).

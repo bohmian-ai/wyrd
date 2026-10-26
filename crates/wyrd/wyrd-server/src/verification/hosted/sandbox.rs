@@ -183,7 +183,9 @@ impl Sandbox {
     ///
     /// Admission refusal and a worker wait that ends unserved are
     /// [`BlockError::Busy`]: the process, not the code, lacked capacity, so
-    /// the engine defers the whole execution instead of judging it.
+    /// the engine defers the whole execution instead of judging it. A wait
+    /// ends unserved both when every worker is checked out and when a worker
+    /// spawned on demand does not finish starting in time.
     ///
     /// # Errors
     /// Returns [`BlockError::Busy`] when admission is full or no worker frees
@@ -211,7 +213,7 @@ impl Sandbox {
         };
         let mut checkout = tokio::time::timeout_at(deadline, self.pool.checkout(&repl))
             .await
-            .map_err(|_| busy("no Python worker was free before the deadline".to_owned()))?
+            .map_err(|_| busy("no Python worker was ready before the deadline".to_owned()))?
             .map_err(|error| failed(&error))?;
         let budget = self.limits.tool_result_max_bytes;
         let mut output = String::new();

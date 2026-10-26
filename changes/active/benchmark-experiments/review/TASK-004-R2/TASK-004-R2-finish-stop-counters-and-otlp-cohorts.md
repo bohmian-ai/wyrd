@@ -12,6 +12,14 @@ remediates: [FIND-TASK-004-1, FIND-TASK-004-2, FIND-TASK-004-3, FIND-TASK-004-5]
 
 # Finish measured counters, OTLP cohorts and real benchmark smoke
 
+> **Execution update:** approved spec revision 10 and
+> [TASK-004-R3](../TASK-004-R3-0bf0cb866/TASK-004-R3-restore-smoke-judgment-and-calibration.md)
+> supersede this packet's smoke-criterion instructions. Accurately recorded
+> production errors, drops, shedding, wrong answers or target misses do not fail
+> smoke. Missing/inconsistent measurement or failed evidence handling remains
+> INVALID. Normal judging is proved separately with controlled results. Preserve
+> the original findings and historical implementation evidence below.
+
 ## Immutable acceptance context
 
 Route this task to `$wyrd-implement`. It contains the bounded remainder of the

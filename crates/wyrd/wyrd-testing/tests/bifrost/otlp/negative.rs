@@ -1248,12 +1248,10 @@ mod pg_tests {
     /// dimensions of OTLP rows.
     ///
     /// An export under a validated root stores that Service's canonical name
-    /// and version over the resource's `service.name`, and an accepted request
-    /// environment over the resource's. Without a request environment the
-    /// typed resource environment survives, also under a validated root, and
-    /// a rootless export keeps its observed Service and no version. An empty
-    /// environment header refuses the whole request over HTTP and gRPC, and a
-    /// repeated one over HTTP.
+    /// and version over the resource's `service.name`. The typed resource
+    /// environment survives a deployment-environment header, which OTLP does
+    /// not read, and a rootless export keeps its observed Service and no
+    /// version.
     ///
     /// # Panics
     ///
@@ -1298,37 +1296,6 @@ mod pg_tests {
         );
         let root = root.as_str();
         let generic = [None; 3];
-        let refused = Err((StatusCode::BAD_REQUEST, "WYRD_SPEC_400_VALIDATION"));
-
-        export_everywhere(
-            &journey,
-            anchor,
-            generic,
-            &[(key, api_key), (selector, root), (environment, "")],
-            refused,
-        )
-        .await;
-        for signal in Signal::ALL {
-            let (status, body) = post_otlp_with_headers(
-                &journey,
-                signal.path(),
-                HttpEncoding::Protobuf,
-                signal.body(anchor, generic),
-                &[
-                    (key, api_key),
-                    (selector, root),
-                    (environment, "staging"),
-                    (environment, "prod"),
-                ],
-            )
-            .await;
-            assert_refusal(
-                status,
-                &body,
-                StatusCode::BAD_REQUEST,
-                "WYRD_SPEC_400_VALIDATION",
-            );
-        }
         for headers in [
             &[(key, api_key), (selector, root), (environment, "staging")][..],
             &[(key, api_key), (selector, root)],
@@ -1369,12 +1336,6 @@ mod pg_tests {
             assert_eq!(
                 stored,
                 BTreeSet::from([
-                    [
-                        name.clone(),
-                        version.clone(),
-                        Some("staging".to_owned()),
-                        Some(root.to_owned()),
-                    ],
                     [
                         name.clone(),
                         version.clone(),

@@ -446,8 +446,10 @@ Direct and queued verification capture one context
 work stores it with the accepted execution; both paths write it unchanged to
 the result and inputs rows. Nothing else reads it.
 
-HTTP/OTLP/gRPC use optional `x-wyrd-deployment-environment` header/metadata;
-typed/MCP invocations use optional `deployment_environment`.
+Gateway calls and native Bifrost gRPC writes use optional
+`x-wyrd-deployment-environment` header/metadata; OTLP uses the
+`deployment.environment.name` resource attribute; typed/MCP invocations use
+optional `deployment_environment`.
 Configure mismatch/empty input uses `WYRD_CLIENT_400_CONFIG_INVALID`; later
 configure uses `WYRD_SDK_409_STATE_CONFIG_FROZEN`. These remain public typed
 errors with remediation and generated SDK/schema closure.

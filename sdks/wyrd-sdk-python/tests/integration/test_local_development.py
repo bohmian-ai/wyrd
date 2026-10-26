@@ -172,7 +172,7 @@ def server() -> Iterator[WyrdTestServer]:
     yield from local_server()
 
 
-@pytest.mark.usefixtures("fresh_tracer_provider")
+@pytest.mark.usefixtures("fresh_telemetry_providers")
 def test_admin_key_completes_the_local_workflow(server: WyrdTestServer, tmp_path: Path) -> None:
     client = WyrdClient(
         server_url=server.base_url, credential=server.tenant_admin_key(), grpc_url=server.grpc_url
@@ -181,7 +181,7 @@ def test_admin_key_completes_the_local_workflow(server: WyrdTestServer, tmp_path
     work(client, tmp_path)
 
 
-@pytest.mark.usefixtures("fresh_tracer_provider")
+@pytest.mark.usefixtures("fresh_telemetry_providers")
 def test_start_telemetry_refuses_the_applications_own_provider(
     server: WyrdTestServer, tmp_path: Path
 ) -> None:

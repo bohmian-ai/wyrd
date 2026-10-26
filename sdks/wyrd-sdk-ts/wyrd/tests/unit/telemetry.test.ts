@@ -9,6 +9,7 @@ import {
   AlwaysOffSampler,
   BasicTracerProvider,
   InMemorySpanExporter,
+  type ReadableSpan,
   SimpleSpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -50,10 +51,18 @@ afterEach(async () => {
 
 test("telemetry setup", async () => {
   const state = offlineState();
+  state.configure({ deploymentEnvironment: "prod" });
   // Overlapping calls on one state install a single provider.
   await Promise.all([state.startTelemetry(), state.startTelemetry()]);
   const installed = globalProvider();
   expect(installed).toBeInstanceOf(BasicTracerProvider);
+  // Its resource carries the configured Service and environment; the span is never ended, so nothing exports.
+  const span = trace.getTracer("unit").startSpan("configured") as unknown as ReadableSpan;
+  expect(span.resource.attributes).toMatchObject({
+    "service.name": state.rootRef.name,
+    "service.version": state.rootRef.version,
+    "deployment.environment.name": "prod",
+  });
   await state.startTelemetry();
   expect(globalProvider()).toBe(installed);
 

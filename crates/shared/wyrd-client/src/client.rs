@@ -499,7 +499,7 @@ impl WyrdClient {
     /// Return a client whose requests run as the exact Service root `uid` in
     /// `deployment_environment`, as [`Self::for_workload`] does.
     ///
-    /// Every request also carries the environment on
+    /// Native Bifrost writes and gateway calls also carry the environment on
     /// [`DEPLOYMENT_ENVIRONMENT_HEADER`](wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER)
     /// as descriptive context; it never changes the grant.
     ///
@@ -618,7 +618,7 @@ mod tests {
     use crate::auth::AuthMiddleware;
     use crate::cards::Cards;
     use crate::config::{ClientConfig, TokenCacheMode};
-    use crate::gateway::Gateway;
+    use crate::gateway_admin::Gateway;
     use crate::operator_connections::OperatorConnections;
     use crate::platform::Platform;
     use crate::principals::Principals;

@@ -7,8 +7,8 @@ One Agent-backed Service, the same story in Rust, Python, and TypeScript.
 `support-agent`. `policy-check` takes the `answer` and the `policy` PDF
 (`refund-policy.pdf`):
 
-- the `findings` step runs `policy-reader`, an Agent that reads the PDF with
-  `fs.read` and lists its refund rules with their pages;
+- the `findings` step runs `policy-reader`, an Agent that extracts the PDF with
+  `fs.extract`, reads the result with `fs.read`, and lists its refund rules with their pages;
 - `no-refund-promise` asserts the answer never says "guaranteed refund";
 - `follows-policy` asks `policy-judge`, a tool-less Agent, whether the answer
   follows those findings, citing the policy page.

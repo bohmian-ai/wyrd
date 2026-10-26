@@ -2025,8 +2025,7 @@ impl PyCards {
     /// refused extraction, or a failed declaration.
     #[pyo3(signature = (source, *, name, version=None, version_bump=None, artifact_kind="file", extract=false))]
     fn upload_artifact(
-        &self,
-        py: Python<'_>,
+        slf: &Bound<'_, Self>,
         source: PathBuf,
         name: &str,
         version: Option<&str>,
@@ -2047,7 +2046,9 @@ impl PyCards {
             artifact_kind: artifact_kind.to_owned(),
             ..wyrd_spec::card::artifact::ArtifactSpec::default()
         };
-        let cards = self.cards(py)?;
+        let py = slf.py();
+        let this = slf.borrow();
+        let cards = this.cards(py)?;
         crate::trace::block_on(py, cards.upload_artifact(&source, metadata, spec, extract))
             .map(CardRefPy)
             .map_err(WyrdPyError::from)

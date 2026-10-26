@@ -1216,14 +1216,17 @@ Python, TypeScript, and MCP.
 
 `bifrost.system.audit_log` is the authoritative retained audit history. Every
 audit event is staged in memory on the process Scribe outbox, whose one
-background writer groups a tenant slice by destination, encodes one Arrow
+background writer cuts each tenant's writes into producer lanes keyed by
+request, Verifier execution, or a queued submission's idempotency key, groups a lane's slice by destination, encodes one Arrow
 frame per group with a batch id derived from its content, and submits it to
 the local Scribe or, from a pod without Scribe, to a Scribe pod over the
 mutually authenticated peer plane. Audit frames are submitted under the
 platform audit principal, the one principal Scribe admits for the reserved
 system owner's audit history. A retryable failure resubmits the identical
 slice, so Scribe's durable batch-id fence absorbs a write whose
-acknowledgement was lost; later arrivals wait for the next slice. A row carries
+acknowledgement was lost; later arrivals in that lane wait for the next slice.
+Producer lanes are independent of Scribe shards, which keep their own routing,
+WAL, and fence. A row carries
 only decision content: there is no chain, sequence, or publication progress,
 and readers order by decision time. Writes Scribe has not acknowledged are lost
 on abrupt process death or an expired shutdown deadline; observable loss is

@@ -208,7 +208,9 @@ const DUE_BINDING_SQL: &str = r"
 /// `after` is the exact authored duration, at most the one year Trigger
 /// validation admits; it is added as elapsed seconds, so a day is always
 /// 86,400 seconds whatever the session time zone's daylight time. `DISTINCT` keeps one row per binding and group so the
-/// upsert never touches a row twice.
+/// upsert never touches a row twice, and rows are upserted in key order so
+/// concurrent writers of one tenant lock shared groups in the same order
+/// rather than deadlocking.
 const RECORD_GROUP_ACTIVITY_SQL: &str = r"
     INSERT INTO wyrd.verification_group_pending (data_tenant_id, binding_id, group_id, due_at)
     SELECT DISTINCT wyrd.current_tenant(), b.binding_id, a.group_id,
@@ -222,6 +224,7 @@ const RECORD_GROUP_ACTIVITY_SQL: &str = r"
            SELECT 1 FROM jsonb_each(b.group_end -> 'sources') AS s(slot, source)
             WHERE (s.source ->> 'card_uid')::uuid = a.card_uid
               AND (s.source ->> 'verifier_card_uid')::uuid = a.verifier_card_uid)
+     ORDER BY b.binding_id, a.group_id
     ON CONFLICT (data_tenant_id, binding_id, group_id)
     DO UPDATE SET due_at = EXCLUDED.due_at
 ";

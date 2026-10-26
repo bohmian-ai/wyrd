@@ -616,3 +616,877 @@ maintainer rather than an implementation guess.
 - [Queue specification](../../verification-execution-queue/spec.md) and
   [long-horizon specification](../../long-horizon-verification/spec.md), for
   the explicitly superseded storage contracts and existing pre-release reset.
+
+## Execution evidence
+
+Commits: `2000a51ac` (three-table storage, writer, reader, tests), `55146eb36`
+(outcome-only output reads, re-baselined statement counts), `4c3c70517`
+(retained-data readers on outputs, docs table names). Unrelated dirty
+`vala-bifrost-redux/src/tables/audit/projection.rs` and untracked
+`benchmarks/*` records were left untouched. Cargo commands ran sequentially.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| S5-INPUT-COPIES | `verification/inputs.rs` (`InputResolver`, one input record per execution; group/schedule selectors reference sources), `verification/results.rs` and `scribe_outbox.rs` (output then summary), new immutable `wyrd-sql` migration dropping queue `inputs`/`route_overrides`/`group_sources` | V5 `pg_verification_runtime::verification_records_have_one_payload_owner` (record per origin, outputs↔summaries by result ID, `information_schema` has no payload columns); V6 68/68 | PASS |
+| S5-INCONSISTENT-READBACK | `components/verification/service.rs` (one joined summary⋈outputs⋈inputs read; direct lookup by input origin; RBAC refusal → not found) | V1 4/4, V2 4/4, V3 4/4, V4 4/4 (incl. new `scheduled_drift_execution_reads_its_inputs_and_output`); V5; wyrd-testing `verification_runtime::` 29/29 | PASS |
+| Settled selection | `verification/groups.rs` (`wyrd_ingested_at < due_at`, SQL `overdue`), `scheduler.rs` (frozen drift `record_ids` via `DriftEngine::select`), `drift.rs::checks(&ScheduleSelector)` | V6 groups/runtime; V7 `grouped_executions_include_late_evidence`; `wyrd-sql` `pg_verifier_executions` 27/27; `window_lookup_preserves_population` | PASS |
+| S5-PERSISTENCE-COST | Variant encoded once; summary-only queries; outputs read only for outcome slots | V8 (below) | see V8 |
+| INV-001/002 | Audit/attribution/lease/replay assertions kept; coordination deadlines remain `statement_timestamp()` | V1–V6, `drift_runner_without_local_oracle_reads_through_a_peer` (each peer read audited) | PASS |
+| Contract cleanup | `result_features` owner and registration removed; three verification tables; docs name `execution_inputs` | V9: `db:migrate:all` (run as `db:migrate:all:inner` under `with-test-postgres.sh`), 3 table tests, `codegen:check`, `check:deps`, `check:tenant-isolation`, `fmt`, `lints`, `docs:check`, `git diff --check` all exit 0; `git grep result_features` empty outside `changes/` and migrations | PASS |
+
+Additional exact commands run (all PASS after fixes):
+
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --lib"` — 575/575.
+- `... cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(/verification_runtime::/)'` — 29/29.
+- `... cargo nextest run --locked -p wyrd-sql --test integration -E 'test(/pg_verifier_executions/)'` — 27/27.
+- `... cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=verification::pg_tests::custom_verdict_data_round_trips)'` — 1/1.
+- `... uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_verifier_building_blocks.py::test_custom_verdict_data_survives_readback` — 1/1.
+- `... pnpm exec vitest run tests/integration/verifier-building-blocks.test.ts -t '^custom_verdict_data_survives_readback$'` — 1/1.
+- `mise run py:format`, `py:lints`, `py:typecheck`, `ts:typecheck`, `docs:generate` (no generated drift) — exit 0.
+
+### Diagnoses
+
+| Failure | Evidence | Cause | Fix site |
+|---|---|---|---|
+| Routes: caller without query permission got 403 on GET execution | route trace: direct lookup reached `records.direct()` and returned `PermissionDeniedRbac` | the direct-lookup fallback surfaced the Bifrost read refusal instead of not-found | `components/verification/service.rs::direct_execution` maps the RBAC refusal to `None` (only caller) |
+| `pg_verification_groups` incomplete-snapshot retry (line 759) | diagnostician: rows excluded by `wyrd_ingested_at < due_at` after the test moved `due_at` back | test rewound `due_at` past the snapshot's ingest | test-support `Scheduler::with_overdue_groups`; SQL `overdue` covered in `pg_verifier_executions` |
+| `pg_verification_groups` debounce (line 860) | diagnostician: the GET poll inside `turn()` consumed the armed query fault | ordering in the test | test reordered: flush and pending assertion before arming the fault |
+| Hosted busy-capacity deferral | diagnostician: the spinner's input read raced the adder's admission | concurrency in the test fixture, not production | test holds the sandbox admission itself (`HostedBlocks::sandbox`, test-support) |
+| Span-name and write-list assertions | runtime trace shows `bifrost.gate.*`/`bifrost.oracle.query` under attempts; writes `[OUTPUTS, RESULTS]` | runner reads its input record; result writes are output then summary | assertions updated to the designed reads/writes |
+| Statement counts (`window_lookup` 3→9, `completed_result` 2→4, peer reads 1→3, group 2→14, readback files 1→3) | diagnostician attributed every statement from profile/trace (`g2.txt`, `c1.txt`): input-record reads (task lines 119/135), group probe and resolution (line 92), one joined readback over three tables (line 239), one file per table with older day partitions pruned | designed reads; one avoidable outputs read in the group order probe | `InputResolver::slots` reads outputs only when a slot names an outcome (group 16→14); assertions re-baselined with per-statement docs |
+| MCP/Python/TS `custom_verdict_data` SQL read `results.outcome` | `git grep` for result payload reads | `results` is payload-free | readers query `execution_outputs.output` requirements |
+
+### Test removal and replacement mapping
+
+| Removed or rewritten | Replacement |
+|---|---|
+| `results.rs` drift feature-before-summary tests | `results.rs::outcome_writes_output_then_summary` |
+| summary-only unscored drift test | renamed and asserted as canonical empty-output behavior (`unscored_report`) |
+| outbox tests assuming `result_features` | redesigned `scribe_outbox.rs` output-then-summary cases with byte accounting across records |
+| PostgreSQL pinned-array/all-history group assertions | `pg_verification_groups` selector/range assertions and V5 record checks |
+| incomplete-snapshot test rewinding `due_at` | `with_overdue_groups` pass; `overdue` SQL in `pg_verifier_executions` |
+| hosted busy test spinner | held sandbox admission |
+
+### Non-goal audit
+
+No new public API, wire field or input kind; no independent input/output IDs,
+new runtime, dependency, retention service, durable snapshot/watermark,
+crash-recovery protocol, repair scan, drift backfill, compatibility
+route/view/alias, L2 or reference promotion. No `#[allow]`, `#[ignore]`,
+widened glob or deleted story. Material risk: a refused oversized output still
+lets its summary write (existing outbox semantic, unchanged).
+
+## Revision — bounded memory and concurrent write partitioning
+
+### Outcome, authority and diagnosis
+
+Complete Scenario 5's unfinished performance obligation without undoing the
+three-table design. Reduce actual retained allocation, correct demonstrated
+shared-buffer overcharging, and distribute independent verification executions
+over the existing generic outbox lanes. Preserve durable acknowledgments,
+retry identity, tenant isolation and the unchanged benchmark workload/limits.
+
+The maintainer requested this revision after the implementation's throughput
+regression and approved direction to use generic partitioning and high-throughput
+producer practices. This section extends the revision-14 task contract; it is
+not another task, a claim of passing V8, or approval to introduce Kafka. Its
+ordering policy explicitly supersedes the security posture's fixed verification
+lane-zero rule. Update that owning paragraph and the corresponding Bifrost/Wyrd
+producer description before implementing the routing change. Document the
+already requested policy; do not invent a specification approval or silently
+leave contradictory authority behind. Synchronize REQ-021's implementation
+description where needed without changing any numeric criterion.
+
+Historical comparison: the matched clean, unprofiled full records
+`20261026T123533Z-0bdabaf8b.json` and `20261026T173720Z-4c3c70517.json`
+under `benchmarks/verification/direct-verify/` show median c64 throughput
+41,566.6 → 31,837.6 successful verifications/s, CPU 510.7 → 607.3 µs/success,
+and refusals 38,184 → 154,260 per repetition. Total CPU use fell rather than
+rose. Successful overhead p99 improved 1.336319 → 1.132543 ms; refusals are
+excluded from that histogram. The later dirty/profiled diagnostic hit the
+805,306,368-byte reservation threshold in every parsed staging-refusal warning,
+establishing byte pressure for that run, not an item-count limit. Direct work
+still reserves two logical outbox items; its result item holds output and
+summary batches. Three tables do not imply three reservations or a linear
+2/3-throughput rule.
+
+Single-lane serialization and excessive one-row allocation are demonstrated
+mechanisms. Their individual contribution to the measured regression is not
+yet isolated. Mixed `outbox_write_seconds` includes multiple producers/lanes,
+encoding, scheduling and acknowledgment phases; it is neither a fsync timer nor
+a measurement of one verification lane's service capacity. Do not claim CPU
+saturation merely from ~19 active logical cores on a 32-logical-CPU host.
+
+### Required architecture and control flow
+
+Use the existing generic `OutboxSink::LANES`/`lane` and bounded writer machinery.
+Producers supply their ordering key; queueing, concurrency, retries, accounting
+and shutdown stay in the established owners. No second partitioner, queue,
+worker framework, per-execution task fan-out, global buffer registry or broker.
+
+```text
+Verification                 Gateway capture        Audit
+execution-ID ordering key    request-ID key         existing request key
+          |                         |                      |
+          +-------------------------+----------------------+
+                                    |
+                       producer memory/item admission
+                                    |
+                  existing generic (tenant, hashed-key lane)
+                                    |
+                       ordered lanes 0 / 1 / 2 / 3
+                                    |
+                    existing bounded concurrent slice writers
+                    batch rows by destination table + schema
+                                    |
+                  verification details ACK -> summaries ACK
+                                    |
+                                    v
+Bifrost native / OTLP ----------> Scribe ingress admission
+payloads bypass producer outbox      |
+                      hash(tenant, table, batch ID)
+                                    |
+                         configured Scribe shard owners
+                                    |
+                     WAL -> group sync -> durable fence
+                                    |
+                           memtable insertion -> ACK
+                                    |
+                  complete slice -> release producer charges
+```
+
+Outbox lanes and Scribe shards are independent. Keep Scribe's existing batch
+routing, shard mailbox bounds, tenant/table scheduling, shared resource roots,
+WAL/fence protocol and acknowledgment point. Producer concurrency may feed more
+work into one shard's group commit; it does not create another WAL owner or
+require a shard per lane. Do not raise writer/lane/shard counts or memory limits
+to hide the regression. Record actual configured shard geometry during
+measurement: the source default of one does not prove what a benchmark process
+inherited from its environment.
+
+Apply the generic policy to the producer branches that actually use the outbox.
+Gateway capture/audit already share request-key routing; preserve it. Server
+spans and records lacking an ordering key retain their existing fallback.
+Native/OTLP Bifrost payloads reach Scribe directly and must not be redirected
+through this outbox. Their audit side effects can use it. Bifrost read benchmarks
+use Oracle and are not evidence of this producer bottleneck. This revision
+permits necessary shared-owner consumer closure and focused Gateway/audit
+regression proof, not unrelated Gateway/Bifrost optimization or new L2 work.
+
+### Memory accounting and allocation contract
+
+Keep memory admission distinct from transport-frame sizing:
+
+- Charge retained allocated capacity of owned payload buffers while queued,
+  dispatched, in flight or retained for retry. Logical/encoded row bytes remain
+  the frame-sizing operand; they cannot replace memory charges.
+- Construct small Arrow columns with capacity appropriate to their actual
+  values. Do not allocate a large default buffer and then add a compacting copy
+  on the hot path. Reuse the current sized text construction, validate its
+  empty/null/non-ASCII cases and examine other in-scope builders only where
+  measured retained allocation shows the same problem.
+- Do not repeatedly charge the same shared allocation. Establish the ownership
+  boundary explicitly: queue-owned buffers are charged for their retained
+  lifetime; process-wide immutable buffers are accounted once as shared
+  resident memory. Merely cloning an `Arc` must not create another backing-buffer
+  charge. Preserve charges for distinct owned buffers and avoid overlap errors
+  for slices sharing a backing allocation.
+- Extend the existing weight/admission owners with the smallest sufficient
+  ownership-aware accounting. Avoid a global pointer-deduplication service or a
+  per-column allocation scan on every reserve. Conservative structural overhead
+  is acceptable when explained; omitting owned backing capacity is not.
+- Preserve item and byte limits, their reserved-share split, reservation
+  sequencing, release-on-settlement/loss, fail-fast errors and observed-loss
+  accounting. Do not release a charge on dequeue or before a retry completes,
+  raise the configured byte budget, or turn an admitted bundle into silent loss.
+
+At revision authoring, `verification/results.rs::text` already uses
+`StringBuilder::with_capacity`, and its sized-allocation regression exists.
+Treat passing implemented behavior as verification-only. Preserve concurrent
+audit projection work and existing diagnostic edits; validate the final
+integrated candidate rather than duplicate or revert another correction.
+
+### Partitioning, batching and retry contract
+
+Verification input items and their output/summary result item use the same
+execution-ID ordering key, regardless of direct/submitted/grouped/scheduled
+origin or which attempt produced the result. Hash through the existing lane
+mechanism; a result ID, table ID, frame ID or group ID must not split or serialize
+that execution incorrectly. Different executions must be able to occupy
+different lanes within one tenant. Preserve existing per-tenant separation and
+bounded scheduler progress across tenants; add no strict fairness guarantee.
+
+An execution's input is staged before its result item. One active slice per
+tenant/lane and FIFO across subsequent slices preserve that relationship.
+Same lane does not promise the same slice. Within result delivery, retain
+successful output/detail acknowledgment before summary submission; a retryable
+detail failure prevents advancing to summaries. Keep these rules when an
+acknowledgment is lost, a slice is retrying, or another tenant progresses.
+Replays retain the sealed content/identities and deduplicate through existing
+batch fences; they must not mint a new result or allow later same-lane writes
+to overtake an uncertain earlier write.
+
+The historical terminal-rejection exception in the execution evidence remains
+unchanged: an unsplittable output that Scribe rejects terminally is logged,
+counted lost and consumed, and its summary can still be written. It is outside
+the successful-detail ACK rule, not a new exception for full producer memory or
+a reason to return a fabricated complete result. Preserve that exact negative
+case in RV2 and the existing reader's incomplete-result behavior. This revision
+does not redesign terminal settlement or promise atomic cross-table retention.
+Its admission correction must introduce no additional post-admission loss.
+
+Keep destination/schema batching, bounded chunks in flight and the existing
+global writer pool. Do not send one request per execution/table, add unbounded
+concurrency, merge outputs back into summaries, or weaken cross-table read
+assembly to excuse missing inputs/outputs. Keep source activity notification
+and shutdown handoffs after their existing acknowledgment boundaries.
+
+### Delay and backpressure policy
+
+Do not add an artificial batching sleep, linger setting, server admission wait,
+larger queue, new retry policy or background timer in this revision. Existing
+backlog batching and bounded in-flight work provide the initial batching policy;
+milliseconds of deliberate delay cannot be assumed compatible with the
+unchanged sub-500-µs overhead target.
+
+Preserve producer fail-fast staging refusal and Scribe's bounded admission.
+Pressure on background work uses the existing queue/defer/retry behavior.
+Audit never delays or refuses the originating operation, including under full
+buffers and while verification lanes are stalled. Do not suppress required
+audits or warning/loss accounting to make the benchmark appear faster.
+
+Real callers retrying a refused operation should use capped backoff with jitter
+and bounded outstanding requests. That is guidance, not authorization for an
+SDK retry implementation in this task. The benchmark's immediate next-request
+loop, client counts, warmup, windows and sample floors stay unchanged. Adding
+client sleeps/backoff, reducing arrivals or judging only a friendlier workload
+cannot close V8. Any bounded-wait or deliberate-linger policy requires a later
+explicit latency/API decision backed by measurements.
+
+These choices use Kafka's partitioned ordering, batching, bounded buffering and
+retry-safety principles without copying its numeric defaults, sequence protocol
+or blocking-buffer API. Reference: [Kafka producer configuration](https://kafka.apache.org/41/configuration/producer-configs/),
+[partitioning](https://kafka.apache.org/41/getting-started/introduction/), and
+[Arrow memory semantics](https://arrow.apache.org/rust/arrow_data/struct.ArrayData.html#method.get_buffer_memory_size).
+
+### Ordered implementation scenarios for this revision
+
+#### Scenario R1 — Retained memory is reduced and charged accurately
+
+**Behavior.** Small nullable text columns retain capacity near their contents;
+larger owned values remain fully charged. Shared immutable buffers are not
+repeatedly charged as distinct allocations. Pending and retrying work retain
+their memory/item charges, and full admission preserves existing refusal and
+nonblocking audit behavior.
+
+**RED.** Use [RV1](#rv1--allocation-and-admission) for existing sized-allocation
+and capacity proof. Verify the implemented sized builder rather than manufacture
+RED. Add the planned shared-buffer test and demonstrate the existing repeated
+charge, including a distinct-allocation counterexample, before correcting it.
+
+**GREEN.** Reuse the sized builder and existing sink weight/admission owners.
+Record representative input/output/summary retained allocation and admission
+weight before/after, distinguishing owned capacity from shared memory. Pass
+RV1/RV2 without increasing limits or bypassing admission.
+
+**REFACTOR.** Delete redundant size calculations or copies at their owning
+boundary. Retain a cheap stage path and avoid a new memory-accounting subsystem.
+
+#### Scenario R2 — Independent executions drain concurrently with ordered replay
+
+**Behavior.** One tenant's unrelated execution can make progress while another
+lane is stalled. Input/result items for the same execution remain ordered even
+when dispatched in different slices; output is acknowledged before its summary.
+Lost-ACK replay deduplicates and blocks later same-lane overtaking. Other tenants
+and existing request-key Gateway/audit routing retain their current progress.
+
+**RED.** Extend RV2's planned verification-key and concurrent-delivery tests.
+Hold one submission deterministically and assert another lane progresses;
+inject lost acknowledgment and check identical replay and phase order. Do not
+prove distribution solely by hashing IDs or infer concurrency from a stopwatch.
+
+**GREEN.** Update the owner lane rule and use execution keys in existing generic
+routing; preserve shared writer/chunk bounds, batching, retry fencing and group
+notifications. Run RV1/RV2 and affected real-server V1/V6/V7 proof. Existing
+V1–V7 results can be carried forward only where dependencies remain unchanged.
+
+**REFACTOR.** Remove fixed verification lane-zero assumptions and obsolete test
+assertions, preserving their replacement map. Add no parallel producer framework
+or replacement Scribe sharding.
+
+#### Scenario R3 — Normal production measurements establish the improvement
+
+**Behavior.** Full normal L1 verification retains exact results, all required
+storage/audit work and valid populations. Median-repetition c64 overhead p99
+is strictly below 500 µs; correctness and zero unexpected refusals hold in every
+repetition. Report successful throughput, CPU/success, actual memory/geometry
+and refusal counts alongside latency. Lower p99 with lower successful throughput
+and more refusals does not establish successful remediation.
+
+**RED.** The matched records above supply the regression; the existing V8 limit
+miss remains performance RED. If diagnostic cost attribution is needed, use
+existing timings/profiles and bounded temporary probes. Do not treat mixed
+outbox durations as fsync CPU or fast refusals as successful latency samples.
+
+**GREEN.** Use [RV3](#rv3--production-evidence-and-consumer-closure), then the
+existing final V8 command on clean caller-authorized source. Keep source/config
+identities and per-repetition operands. Separate allocation/accounting and
+partitioning diagnostic results so their contributions can be assessed; only
+the integrated ordinary production configuration supplies acceptance.
+
+**REFACTOR.** Remove temporary hot-path probes before final measurement and
+rerun affected correctness proof. Preserve historical evidence and do not
+promote references or claim a passing benchmark from a dirty/profiled run.
+
+### Source-backed reuse and proof
+
+| Owner | Existing capability, precise gap and required extension |
+|---|---|
+| `wyrd-runtime/src/outbox.rs::OutboxSink`, reservation/load and writer dispatch | Generic keyed lanes, retained charges, bounded global writers and ordered retry already exist. Reuse them; change only demonstrated accounting gaps and preserve multi-tenant progress. |
+| `wyrd-server/src/scribe_outbox.rs::ScribeSink::{lane,weight,write}`, frames/submit | Gateway/audit already hash request keys; verification falls back to zero. Route its existing item variants by execution identity; preserve frame batching and ACK phases. Current weights sum Arrow array memory and can repeat shared allocations. |
+| `verification/results.rs::text`, `ONE_NULL_TEXT`, `ResultPayloadBuilder` | Sized text allocation is already present; shared null arrays remain reused. Verify capacity/representation and correct charges at the established owner, without another encoder or duplicate payload. |
+| `vala-bifrost-redux/src/scribe/{routing,ingress,shards}.rs`; Gate native/OTLP ingestion | Existing independent shard routing, bounded queues, group commit and durable deduplication. No new shard or payload routing is needed for this revision. |
+| Security posture producer-outbox paragraph; Bifrost producer/durability sections; benchmark REQ-021 | Replace tenant-wide verification serialization wording with execution-key ordering and independent lanes. Explain retained-memory versus frame-byte budgets and unchanged backpressure/durability. |
+
+The following planned names live in existing modules/targets; confirm actual
+selectors after adding them, before RED. Existing names were checked from source.
+
+#### RV1 — Allocation and admission
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=verification::results::tests::a_one_row_text_column_holds_about_its_value)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::shared_buffer_charges_preserve_owned_memory)'
+mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(=outbox::tests::large_items_shed_on_bytes_before_items) | test(=outbox::tests::bounded_staging_covers_retrying_and_inflight_work) | test(=outbox::tests::bounded_audit_staging_remains_nonblocking)'
+```
+
+The shared-buffer selector is **planned**. Its assertions cover shared backing
+storage, distinct owned allocations, null/empty text and retained lifetime;
+allocation-size expectations must express the property rather than freeze a
+dependency's incidental struct layout. If the correction changes generic load
+ownership, extend the relevant existing admission test at that owner as well.
+
+#### RV2 — Partitioning, phase ordering and replay
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::verification_items_share_execution_lanes_and_executions_spread) | test(=scribe_outbox::tests::verification_lanes_keep_phase_order_across_retry)'
+mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(=outbox::tests::a_tenants_lanes_write_concurrently_and_each_keeps_order)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::a_calls_writes_share_a_lane_and_calls_spread) | test(=scribe_outbox::tests::a_slice_of_small_writes_travels_as_one_frame) | test(=scribe_outbox::tests::a_retry_resubmits_identical_frames) | test(=scribe_outbox::tests::a_slice_keeps_a_bounded_number_of_frames_in_flight) | test(=scribe_outbox::tests::an_unsplittable_row_is_submitted_whole_and_terminal_refusal_consumes_it)'
+```
+
+The first two server selectors are **planned**. Reuse the current recording
+Scribe and blocked-lane seams. Add deterministic cross-tenant progress and
+separate-slice/lost-ACK variations within those existing owners; no new test
+binary or duplicated SDK journey. Reuse V1/V6/V7 for real-server readback and
+grouped late-evidence closure; no full cross-language journey-suite rerun solely
+to prove a shared internal partitioner.
+
+#### RV3 — Production evidence and consumer closure
+
+Use existing V8 diagnostics and final normal verification command; do not
+duplicate their recipes here. Run the existing `mise run bench:l1:gateway`
+when shared Scribe weight/frame/audit projection changes affect Gateway, to
+retain capture accounting and unchanged limits. This is consumer-regression
+proof, not a new Gateway optimization task. Outbox-only changes do not justify
+running Bifrost read benchmarks or claiming their payload write path improved.
+An unexpected need to alter Scribe shard routing/durability is a material scope
+change, not permission to tune it until the benchmark passes.
+
+Capture resolved shard count, lane/writer bounds, byte/item budgets and ordinary
+telemetry configuration in the execution evidence alongside record paths.
+Measure retained allocation/weight on representative batches and byte/item
+refusal reasons using existing diagnostics; do not add high-cardinality or
+per-function permanent metrics. Compare like-for-like unprofiled full records.
+Keep normal benchmark source/host/config checks, no automatic commits, and the
+existing V9 format/lint/boundary/diff closure. This document-only revision uses
+static link, command-owner and scenario checks; it runs no runtime proof.
+
+### Acceptance mapping and boundaries
+
+| Obligation | Completion observation |
+|---|---|
+| REQ-021; S5-PERSISTENCE-COST | RV1–RV3 and V8 prove actual allocation reduction, safe shared-buffer accounting, concurrent keyed delivery and the unchanged performance/correctness criteria; no larger budget or hidden shedding. |
+| INV-001/002 | RV1/RV2 and affected V1/V6/V7 preserve bounded admission, nonblocking audit, attribution, selected results, grouped ordering and lost-ACK deduplication. |
+| REQ-019; AC-010/014 | Comparable ordinary records distinguish successful work from refusals and component elapsed time from CPU. Temporary diagnostic probes are absent from final acceptance. |
+| Generic ownership | Existing outbox owners handle every affected producer; Gateway request-key behavior and direct Bifrost payload ingestion remain correct. Source-owner text describes two independent partitioning layers. |
+
+Append revision evidence separately from the historical implementation table.
+Map removed/replaced assertions to their retained proofs; preserve existing
+correctness evidence where unchanged. A passing sized-allocation check alone
+does not prove drain capacity or complete the task.
+
+Excluded: a Kafka dependency, new queue/partitioner/accounting service, larger
+resource limits, new shard geometry, deliberate linger/admission waits, changed
+SDK retries or benchmark arrival loop, weaker audit/durability, re-embedded
+outputs, new routes/wire contracts, L2 and reference promotion. If correctness
+needs one of these or another expensive-to-reverse policy, stop with its exact
+owner/evidence instead of silently expanding this revision.
+
+Revision authoring checks: source owners, existing test names, document links
+and the three complete scenario blocks were checked. An independent read-only
+comprehension pass against the task/spec found one terminal-rejection ambiguity;
+the explicit preservation rule and RV2 negative proof above resolve it. No
+implementation, runtime verification or performance PASS is claimed by this
+document revision.
+
+### Revision execution evidence
+
+Uncommitted candidate on `415082a72` (no commit authorized). Unrelated
+`projection.rs` edits were preserved; the revision adds only the sized text
+builder and its test to that file.
+
+| Obligation | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| R1 sized allocation (reuse) | `verification/results.rs::text` (existing, `415082a72`) | RV1 `a_one_row_text_column_holds_about_its_value`, extended to null, empty, multi-byte: PASS (verification only, no RED manufactured) | PASS |
+| R1 shared-buffer charge | `ResultBatch::owned_bytes` skips the process-wide `ONE_NULL_TEXT`; `ScribeSink::weight` uses it for inputs and results | RV1 `shared_buffer_charges_preserve_owned_memory`: RED 6,328 charged vs 4,024 owned; GREEN equal; a 64 KiB output stays charged above its bytes | PASS |
+| R1 audit allocation (measured, same defect) | `tables/audit/projection.rs` text closure sized with `StringBuilder::with_capacity` | `text_columns_hold_about_their_values`: RED `trace_id` 1,216 B; GREEN all < 256 B | PASS |
+| R1 admission unchanged | no limit, share, or release change | RV1 `large_items_shed_on_bytes_before_items`, `bounded_staging_covers_retrying_and_inflight_work`, `bounded_audit_staging_remains_nonblocking` 3/3 | PASS |
+| R2 execution lanes | `ScribeSink::lane`: inputs and results by `execution_id`; queued submission inputs by `SubmissionSink::lane` (idempotency key); capture/audit by request; spans lane 0 | RV2 `verification_items_share_execution_lanes_and_executions_spread` (RED: all lane 0), `verification_lanes_keep_phase_order_across_retry` (held lane, other lane and other tenant drain, lost-ACK replay keeps batch id, inputs → outputs → summary across separate slices) | PASS |
+| R2 existing ordering/batching | slice fixtures now attempts of one execution (`detail`) so they stay one slice | RV2 generic `a_tenants_lanes_write_concurrently_and_each_keeps_order`; five existing server selectors 5/5; `scribe_outbox::` 17/17 | PASS |
+| R2 group activity under concurrent lanes | `RECORD_GROUP_ACTIVITY_SQL` upserts `ORDER BY binding_id, group_id` (consistent lock order) | `wyrd-sql` `pg_verifier_executions` 27/27 | PASS |
+| R2 authority text | security posture producer-outbox paragraph, Bifrost audit/outbox paragraph, REQ-021 bullet: producer lanes by request, execution, or submission key; distinct from Scribe shards; owned-memory accounting | `docs:check` exit 0 | PASS |
+| Carry-forward V1/V6/V7 | — | V1 + V7 `wyrd-ai` 5/5; V6 68/68; `wyrd-server --lib` 579/579 | PASS |
+| R3 / V8 limit | — | dirty diagnostics below; c64 overhead p99 1.17 ms | FAIL |
+
+Retained-memory weights (owned Arrow bytes per staged write):
+
+| Write | Before | After |
+|---|---|---|
+| Result (output + summary) | 6,328 | 4,024 |
+| Direct inputs record | 3,571 | 2,419 |
+| Audit decision | 20,704 | 3,465 |
+
+Commands (all exit 0 unless stated):
+
+- `mise exec -- cargo nextest run --locked -p <crate> --lib -E '<RV1/RV2 selector>'` for each RV1/RV2 line above, with quoting preserved.
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --features test-support --test integration --test-threads=1 -E 'test(/^pg_verification_groups::/) | test(/^pg_verification_routes::/) | test(/^pg_verification_runtime::/)'"` — 68/68.
+- V1/V7 `wyrd-ai --test integration -P journey --run-ignored=all` exact selectors — 5/5; `wyrd-sql` `pg_verifier_executions` 27/27; `wyrd-server --features test-support --lib` 579/579.
+- `mise run fmt`, `lints`, `docs:check`, `check:deps`, `check:tenant-isolation`, `git diff --check` — exit 0.
+
+Diagnosis — `pg_verification_routes::enqueued_executions_replay_conflict_and_read_back`:
+
+- **Symptom:** intermittent: the first keyed execution settled `errored` with an idempotency conflict instead of `pending`.
+- **Evidence:** trace `submission conflicts ... execution_id=<first> original=<later>`; an independent read-only diagnostician confirmed it.
+- **Cause:** keyed submissions are decided in `SubmissionOutbox` arrival order (`wyrd-design.md` "Requests sharing an idempotency key are written in arrival order"), which held only because all inputs rows shared lane 0. Execution-ID lanes let a later same-key request be acknowledged first.
+- **Fix site:** `ScribeSink::lane` lanes a queued inputs row by `SubmissionSink::lane`. The other `ExecutionInputs` callers (direct, group, schedule) have `queued: None` and are unchanged.
+- **Result:** 20/20 after the fix.
+
+Test mapping: `detail()` fixtures become attempts of one execution, so `a_slice_keeps_a_bounded_number_of_frames_in_flight` and `a_silent_peer_times_out_and_the_slice_retries_on_the_next_scribe` still assert one slice's frame bound and phase order. No assertion was weakened.
+
+V8 diagnostics (dirty, `mise run bench:l1:verification -- --steps direct-verify-c64 --allow-dirty`; INVALID by construction, not acceptance):
+
+| Record | Host | Successful/s | CPU µs/verification | Errors | c64 overhead p99 (median rep) |
+|---|---|---|---|---|---|
+| `20261026T173720Z-4c3c70517` (clean, before) | quiet | 31,837.6 | 607.3 | 154,260 refusals/rep | 1.133 ms (refusals excluded) |
+| `20261026T193423Z-415082a72` | other load present | 49,722.6 | 417.1 | 0 | 1.218 ms |
+| `20261026T193658Z-415082a72` | quiet (QEMU VM ~0.3 core) | 50,807.4 | 409.8 | 0 | 1.169 ms |
+
+Accounting and partitioning were not isolated in clean records. Dirty record `20261026T180424Z-415082a72`, taken earlier in this revision, reported 146,889–178,328 errors per repetition (median 155,621); with lanes, both later records report 0.
+
+Configuration: Scribe shards 1 (`WYRD_MEM_TABLE_BUCKET_NUM` unset, source default); `SCRIBE_WRITERS` 4; `SCRIBE_LANES` 4; `FRAMES_IN_FLIGHT` 8; `scribe.outbox_capacity` 65,536; `scribe.outbox_bytes` 1 GiB; ordinary telemetry.
+
+Profiled diagnostic `20261026T193910Z-415082a72`, profile `target/benchmarks/verification/direct-verify/20261026T193910Z/profiles/profile-1223081.json.gz`, CPU shares of server:
+
+- Tokio threads 59.8%; Scribe ingress 14.5%, persistence 13.6%, coordinator 6.2%, WAL 5.8%.
+- Outbox `Chunk::encode` ≈ 8.9%, almost entirely `concat_batches` of one-row batches; freeing written slices ≈ 3.9%; mimalloc ≈ 17% of Tokio-thread self time.
+- During the measured window the server used 20.8 cores and the driver 5.3 of 32 logical CPUs, while mean request phases were admit 0.021 ms, stage 0.068 ms and engine 0.125 ms. The p99 tail therefore tracks CPU scheduling under host saturation rather than per-request work.
+
+Remaining limitation: V8 c64 overhead p99 fails (1.17 ms against < 0.5 ms); the task is not complete. Producer-side encode CPU is within this revision's owner. Scribe ingest/persistence CPU (~40%) is Bifrost Scribe's and outside this revision.
+
+## Approved revision — build batches once and remove shared Scribe copies
+
+### Outcome, approval and precedence
+
+The maintainer explicitly approved the implementation plan in the conversation
+and requested that it be recorded here. This is the next revision of the same
+Task 006 remediation, under approved specification revision 14 plus that
+direction. It is not a new task or a claim that the unfinished latency gate
+passes. Preserve all earlier implementation and diagnostic evidence.
+
+This revision brings the shared producer and Scribe work into scope **now**.
+It supersedes the preceding evidence's statement that Scribe work is outside
+the revision, the earlier prohibition on changing the local producer payload
+path, and the earlier conditional requirement to run Gateway/Bifrost proof.
+Verification, Gateway and Bifrost must all satisfy the existing agreed L1
+criteria before acceptance. Do not move Scribe remediation to a later task.
+
+Keep the three canonical verification tables and unchanged public results.
+Remove four demonstrated costs in order: validation-only buffer copies,
+one-row producer batches later concatenated, local IPC decode/revalidation of
+producer-proven rows, and unsorted payload concatenation before persistence
+sorting. The material cost is changing internal staging and local delivery
+ownership while preserving resource bounds, attribution and exact replay.
+
+Record the approved producer/canonical delivery and persistence behavior in
+the owning Bifrost design, security posture and REQ-021 description before
+executable changes. Do not manufacture another approval, a new public trust
+flag or a spec revision number; preserve all numeric requirements. This task
+record fixes the decisions below; private decomposition remains implementation
+owned.
+
+### Fixed architecture and configuration decisions
+
+| Boundary | Approved decision |
+|---|---|
+| Stored facts | Inputs, outputs and payload-free results remain separate; no PostgreSQL input values or new durable tables. |
+| Producer ordering | Preserve current execution-key lanes and the same-idempotency-key submission ordering correction. Preserve Gateway/audit request-key routing and deterministic group-upsert lock order. |
+| Staged verification/audit data | Own scalar values and already-encoded Variant buffers; do not build a one-row Arrow batch for each record. |
+| Dense batch construction | Append staged values directly to table-specific Arrow builders at drain; preserve destination/schema grouping, input order and attribution. |
+| Gateway capture | Keep its existing owned capture and batch-projection capability; do not replace it with another row representation or re-encode/redact bodies. |
+| Local Scribe delivery | Use existing canonical-batch ingestion for producer-proven rows, through ordinary admission and managed-envelope checks. |
+| Peer/native transport | Keep IPC and full receiver-side boundary validation. No wire flag permits a caller to claim canonical trust. |
+| Batch identity | Keep existing IPC-derived content hashing, domain separator and deterministic frame splitting. Local and peer delivery of the same prepared frame use the same identity. |
+| Persistence sorting | Sort using key columns; gather payload directly from source batches into bounded sorted output. Do not first concatenate the entire unsorted payload. |
+| Shards and worker pools | Keep the production shard default at **one**, and keep existing worker-pool provisioning, lane/writer/chunk bounds and resource limits. No topology sweep or automatic tuning in this revision. |
+| Pressure and delay | Keep bounded fail-fast admission, current background retry/defer behavior and nonblocking audit. Add no linger, sleep, admission wait, larger queue or SDK retry change. |
+| Benchmark work | Same clients, arrivals, fixtures, timing, telemetry, criteria and required durable work. No friendly workload or delayed persistence to manufacture a pass. |
+
+One shard can use many ingress, persistence and WAL workers. Shard count does
+not determine the count of producer lanes or worker threads. Record resolved
+geometry/pool/resource configuration with measurements, not merely whether an
+environment override was present. Keep these values fixed across before/after
+comparisons; do not substitute a topology change when latency remains red.
+
+```text
+verification + audit                         Gateway capture
+owned scalars + encoded Variants             existing owned validated capture
+                  \                           /
+                   bounded producer admission
+                              |
+              existing keyed lanes / bounded slice writers
+                              |
+              build dense table/schema batches once
+                              |
+          deterministic IPC sizing, splitting and content identity
+                         /                 \
+             local canonical rows        peer IPC bytes
+             ordinary memory admission   full boundary validation
+                         \                 /
+                  existing Scribe shard routing
+                              |
+                 WAL -> sync -> fence -> memtable -> ACK
+                              |
+            freeze existing bounded persistence candidate
+                              |
+             sort keys -> gather sorted payload once
+                              |
+          staged Parquet -> preflight -> existing bounded merge
+```
+
+### Step 1 — Validation without constructing discarded owned values
+
+**Owners:** `wyrd-queue/src/variant.rs::EncodedVariant` and
+`vala-bifrost-redux/src/tables/mod.rs::validate_variant_values`.
+
+Add the approved `EncodedVariant::validate_bytes` capability returning
+`Result<(), VariantViolation>`. Delegate to the existing borrowed validator;
+do not expose its upstream Variant type, implement another scanner or alter
+its size/depth/numeric/canonical checks, panic containment or error precedence.
+Use it where the table validator currently constructs an owned Variant solely
+to discard it. Keep `from_bytes` for callers that need owned buffers.
+
+**Behavior.** Valid and invalid raw Variants receive identical acceptance and
+catalog errors, including nested values and row/column attribution, without
+copying metadata/value buffers merely for validation.
+
+**RED.** The current copy/discard call and allocation profile supply performance
+RED. Add the planned equivalence test in P1 and use existing registry dispatch
+proof, exercising the same valid, malformed, oversized, too-deep and numeric
+fixtures through both entry points. A missing API or compilation failure is
+not behavioral RED; do not invent a different validation failure for an
+optimization that preserves existing semantics.
+
+**GREEN.** Extend the existing owner, replace the validation-only call and pass
+P1. Confirm profile/allocation evidence no longer attributes discarded owned
+buffer construction to table validation. Full validation cost is not claimed
+to disappear.
+
+**REFACTOR.** Remove only the unnecessary owned construction at validation-only
+call sites. Keep one raw-byte validation authority and its existing renderers.
+
+### Step 2 — Construct producer batches directly at drain
+
+**Owners:** verification `ResultPayloadBuilder`/input projection, audit
+projection, `CallCapture::project` and `ScribeSink` frame construction.
+
+Verification input, output and summary records retain their exact typed
+scalars, accepted context, identity/times and already-encoded Variant bytes.
+Audit staging retains normalized decision fields and encoded detail. Perform
+required canonical encoding, redaction and validation at the existing producer
+boundary; do not defer permission decisions, capture policy or audit safety.
+Owned values must outlive the caller without borrowing request data.
+
+At drain, the existing frame owner groups destination/schema records and
+appends values directly to the existing table-specific Arrow builders. Allocate
+from the batch's actual row/value sizes, produce dense bounded batches, and
+append subject/actor/request attribution exactly as today. No intermediate
+one-row verification/audit Arrow batches and no subsequent concat of those
+batches. Keep Gateway's existing batch capture projection, rather than adding
+a second capture representation. Leave native/OTLP payloads on their current
+direct Gate-to-Scribe path.
+
+Charge retained owned values until settlement/loss, shared backing buffers at
+their established ownership boundary, and active construction/encoding buffers
+under existing bounded work/admission owners. Preserve temporary overlap
+accounting; a scalar staging representation is not permission to stop charging
+its payload. Keep item count, reserved-share split and byte limits unchanged.
+Do not introduce a global allocation registry, a general row engine, JSON
+round trips or another queue. Change lane-key extraction to use the retained
+typed identity when one-row columns no longer exist; keep its semantics.
+
+**Behavior.** Dense projection preserves exact schema, values, nulls, row order,
+attribution, grouping and frame bounds while eliminating per-record Arrow
+construction and concatenation. Empty/null/non-ASCII data and large Variants
+retain existing representation and pressure behavior.
+
+**RED.** Add P2's dense-projection test in the existing outbox module, comparing
+fixed expected records across verification, audit and capture cases. Use RV1/RV2
+for lifetime, pressure, frame limits, ordered lanes and replay. Show current
+one-row allocation/concat costs in the baseline profile; existing passing
+sized-string tests remain verification-only.
+
+**GREEN.** Change staging and projection together with their callers, weights,
+row-owner mapping, tests and necessary table-projection exports. Run P2, RV1/RV2
+and affected V1/V6/V7 real-server proof. Report actual allocations/copying and
+encoded geometry, not only producer elapsed time.
+
+**REFACTOR.** Remove superseded one-row constructors, concat branches and tests
+whose only property is that removed representation. Map them to dense-schema,
+allocation, pressure and replay proof; preserve distinct negative assertions.
+
+### Step 3 — Local canonical delivery with transport-equivalent identity
+
+**Owners:** `ScribeBatch`, `ScribeRoute`, existing frame construction,
+`CanonicalIngress::unreserved`, ingress/execution-lane preprocessing.
+
+Use the dense batches from Step 2 for local delivery through existing
+`IngressPayload::Canonical`. Eligibility is limited to the server-owned
+projections that establish their value contracts. Merely receiving a
+`RecordBatch`, matching a table name or selecting a local route is not proof.
+Preserve required validation in producer construction; raw external input and
+peer IPC never acquire a caller-controlled canonical bypass.
+
+Keep deterministic encoded frame-size checks/splitting and the existing hash
+of IPC bytes, including attribution. Local delivery may discard the transport
+bytes after obtaining the frame's identity and pass its corresponding dense
+row range to ordinary Scribe admission. Peer delivery retains/transmits IPC.
+Do not retain an uncharged duplicate payload. Keep staged source ownership
+through retries so re-preparation reproduces the same split frames/identities.
+Encoding still exists for identity/size; this step removes local decode and
+repeated producer-proven value walks, not the encoding needed by that contract.
+
+Preserve tenant/schema/fingerprint/reserved-column checks, managed stamping,
+expanded/request limits, memory adoption, source partitioning, logical row
+identity, WAL fencing and acknowledgment timing. Both payload modes use the
+same durable path. A retryable detail failure still blocks summaries; the
+existing logged/counted terminal oversized-output exception remains as defined
+in the preceding revision. No atomic cross-table retention promise is added.
+
+**Behavior.** Equivalent local canonical and peer IPC delivery retain identical
+logical rows and attribution and the same prepared frame IDs, error behavior,
+admission bounds and lost-ACK deduplication. Local delivery performs no IPC
+decode of those rows. Canonical eligibility cannot weaken external validation.
+
+**RED.** Add P3's local/peer outbox test, including separate slices and lost
+acknowledgments, and extend the existing real-WAL canonical/native equivalence
+test for the producer shapes. Include invalid externally supplied data and
+forced pressure. Confirm actual absence of local native decode through the
+payload seam, rather than infer it from matching final values.
+
+**GREEN.** Extend the existing route/frame owners without a new ingestion API
+or peer protocol. Pass P3, RV2 and affected public readback/permission proof.
+Check retained memory for local and peer attempts separately.
+
+**REFACTOR.** Remove the local IPC decode/revalidation detour only for eligible
+producer frames. Keep a single identity/splitting implementation and a fully
+validated peer/native path.
+
+### Step 4 — Gather sorted persistence payload without an unsorted copy
+
+**Owners:** `scribe/parquet_writer.rs::ParquetBatchEncoder`, current sort/layout
+logic, `ScribeMemberStager` and existing resource accounting.
+
+For each existing bounded persistence candidate, compute ordering from its
+sort-key columns rather than concatenating every payload column first. Preserve
+the exact resolved comparator, descending/null handling and equal-key ordering
+over source batch/row positions. Map ordered positions back to the original
+source batches and gather payload columns directly into the bounded sorted
+output batches using the installed Arrow gather/interleave capability. Key
+materialization is allowed; a second unsorted materialization of all payloads
+is not. Do not introduce another sorting framework or dependency.
+
+Keep candidate boundaries, scratch/resource charges, artifact identity/ordinal
+rules, row-group/object targets, tenant/table/partition checks and deterministic
+retry output. Budget key/index and output working memory explicitly through
+the existing persistence owner. Do not split a candidate into independent
+unsorted runs or change logical row multiplicity to save memory.
+
+Retain staged Parquet preflight before authority/WAL-retirement transitions
+and the later bounded sorted-run merge into target objects. Those reads prove
+durability/readability and object geometry; they are not removed as duplicate
+work. No WAL/checksum/fence or readback safety check is weakened.
+
+**Behavior.** Gathered sorting emits the same sorted logical rows, nulls,
+Variants and artifact attribution as the current concat-then-sort path with
+less payload copying. Memory pressure remains bounded/retryable and recovery
+retains every accepted row exactly once.
+
+**RED.** Add P4's gathered-sort equivalence test with multiple source batches,
+equal keys, nulls, nested/Variant payloads and partition boundaries. Use the
+old concat-then-sort behavior only as a test reference, together with explicit
+expected rows and existing generation/sort/tenant tests. Add the planned
+admission test for key/index/output working memory before optimizing the path.
+
+**GREEN.** Replace unsorted payload concatenation at the current encoder owner,
+pass P4 and existing real Scribe publication/recovery journeys, and confirm
+copy/allocation reductions without growing downstream merge work.
+
+**REFACTOR.** Delete the obsolete production concat/sort materialization path
+and unused helpers; retain the shared comparator and required durable stages.
+
+### Step 5 — Integrated configuration and performance acceptance
+
+Run Steps 1–4 in that order. Retain separate diagnostic evidence for each
+intervention, then measure the integrated production candidate. No promise is
+made that inclusive profile percentages are fully removable or that saving a
+CPU percentage produces the same percentage reduction in p99.
+
+**Behavior.** One-shard normal production configuration passes the existing
+verification, Gateway and Bifrost L1 criteria with complete durable/audit work,
+valid measurement populations and bounded memory. Successful throughput,
+CPU/work and refusal/loss counts accompany latency. Tail-request evidence
+distinguishes measured waits from hypotheses about scheduling.
+
+**RED.** The historical 1.17 ms c64 overhead result and prior throughput/refusal
+records remain performance RED. Existing successful allocation/lane tests do
+not establish performance acceptance. Use existing traces/profiles for
+attribution, distinguishing blocking tasks from async workers and inclusive
+from self CPU.
+
+**GREEN.** Run P5's sequential full normal experiments after focused correctness
+proof. Median-repetition verification c64 overhead p99 must be strictly below
+500 µs; correctness and zero unexpected refusals hold in every repetition.
+Gateway/Bifrost retain all current declared latency, throughput, durability,
+capture and correctness criteria. Clean, unprofiled source and the reference
+host/configuration are mandatory for final acceptance. Commits require separate
+caller authorization; do not fabricate clean-source evidence.
+
+**REFACTOR.** Remove temporary probes before final acceptance and rerun affected
+proof. A remaining red criterion keeps this task incomplete; it authorizes no
+silent topology, pool, resource, workload, validation or durability change.
+
+### Reuse map and verification commands
+
+| Existing owner / inspected behavior | Selected extension and consumer closure |
+|---|---|
+| `EncodedVariant::from_bytes` calls private borrowed `validate`, then copies; table Variant validation immediately drops the result | Add validation-only owner capability and use it at that call; retain renderer/owned-construction semantics. No new validator. |
+| Verification builder and audit projection create one-row Arrow batches; `Chunk::encode` concatenates and appends attribution | Retain owned staged fields/encoded bytes and construct dense Arrow once through existing schema owners. Close weight/key/row-owner/frame callers and tests together. |
+| `CallCapture::project(&captures)` already projects a group of owned captures | Reuse this batch projection and existing privacy/canonicalization policy; no capture rewrite. |
+| `ScribeBatch` stores IPC and `ScribeRoute::Local` currently builds `ArrowIpc` frames; canonical ingress already accepts internal validated batches | Carry the corresponding dense rows locally under existing admission while retaining IPC-derived identity; keep peer/native IPC checks. |
+| `ParquetBatchEncoder::prepare_sorted_candidate` concatenates all columns, then `sort_batch` gathers via indices | Keep key/comparator authority, gather payload directly from source positions using installed Arrow `interleave`/`interleave_record_batch`; retain candidates, resources and durable artifact owners. |
+| Existing member preflight, claim merge, WAL/fence and real Scribe journeys | Preserve these boundaries; prove exact source/readback/replay after changing materialization. |
+
+Paths and symbols identify reuse, not a private type/file allowlist. Add no new
+general row, transport, sorting or ownership framework. All new/changed Rust
+items keep required rustdoc and errors at the owning tier. Native/OTLP Bifrost
+clients continue to use their existing ingest surface.
+
+The new test names below are **planned**, in inspected existing package/module
+owners. Confirm each actual selector after adding it and before RED. Reuse
+existing fixtures and targets; do not add test binaries or full SDK matrices.
+
+#### P1 — Borrowed validation equivalence
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-queue --lib -E 'test(=variant::tests::validation_only_matches_owned_validation)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=tables::tests::builtin_registry_dispatches_canonical_value_validation)'
+```
+
+The first selector is planned. Include identical violation precedence and nested
+row/column attribution in the owning tests; retain existing hostile-input proof.
+
+#### P2 — Dense projection and retained pressure
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::dense_projection_preserves_records_and_attribution)'
+```
+
+This selector is planned. Reuse RV1/RV2 exact commands for admission lifetime,
+batch bounds, replay, nonblocking audit and concurrent-key ordering; update
+obsolete representation-specific assertions with an explicit replacement map.
+
+#### P3 — Local/peer delivery and real durable equivalence
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=scribe_outbox::tests::local_canonical_and_peer_ipc_preserve_frames_and_replay)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::scribe_persistence_path::canonical_nested_batches_share_one_managed_wal_path)'
+```
+
+The first selector is planned. Existing real-WAL proof must be extended to the
+eligible producer shapes and matching identity/pressure cases, not replaced
+with a mock. Reuse V1/V6/V7 for real-server public readback and grouped behavior;
+carry other surface evidence forward only where dependencies are unchanged.
+
+#### P4 — Gathered persistence equivalence and resource bounds
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::parquet_writer::tests::gathered_sort_matches_concatenated_reference) | test(=scribe::parquet_writer::tests::gathered_sort_respects_persistence_admission)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::parquet_writer::tests::generation_encoding_preserves_sort_tenant_and_artifact_identity) | test(=scribe::parquet_writer::tests::parquet_writer_honors_sort_order) | test(=scribe::parquet_writer::tests::tenant_binding_mismatch_fails_before_encoding)'
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'test(=cross_shard::scribe_cross_shard_generations_publish_packed_objects_once) | test(=source_boundary::scribe_local_stage_to_hot_source_transition_is_exact)'"
+```
+
+The first two selectors are planned. The existing four-shard journey remains
+regression proof, not a change to the one-shard benchmark/default. Keep affected
+WAL/crash/recovery negative proof at its owning tests, with exact selectors
+recorded before execution rather than substituting a full journey suite.
+
+#### P5 — All required normal L1 experiments
+
+```bash
+mise run bench:l1:verification
+mise run bench:l1:gateway
+mise run bench:l1:bifrost:writes
+mise run bench:l1:bifrost:hot
+mise run bench:l1:bifrost:parquet
+```
+
+Run sequentially without overlapping builds/tests/benchmarks. Builds and setup
+follow the existing mise owners. Dirty/profiled/partial/smoke experiments are
+diagnostics only. Record source/configuration identity, effective geometry,
+rows/frame, decoded batch geometry, allocations/copied bytes and existing
+stage/CPU/work operands using bounded diagnostics. Add no permanent per-function
+or high-cardinality metrics. Do not infer fsync counts from mixed outbox timing.
+
+Reuse V9's format, lint, boundary and diff checks, plus necessary codegen/docs
+checks when their sources change. This task adds no wire/schema migration,
+new benchmark criterion, L2 execution or reference promotion. Existing transient
+diagnostic changes in the worktree are not acceptance source; preserve unrelated
+edits and inspect the integrated final diff.
+
+### Acceptance mapping, stop conditions and evidence
+
+| Obligation | Required owner/proof observation |
+|---|---|
+| REQ-021; S5-PERSISTENCE-COST | P1–P5 demonstrate fewer owned copies and producer allocations, no local re-decode of eligible frames, sorted payload gathered once, and passing unchanged full L1 limits across all three engines. |
+| INV-001/002 | P1/P3 preserve full untrusted validation and local eligibility proof; RV1/RV2/V1/V6/V7 preserve memory, audit, attribution, ordering, accepted authority, selected results and replay. |
+| REQ-019; AC-010/014 | Per-intervention diagnostic evidence and final clean normal records distinguish CPU savings from work transfer, changed load and measurement artifacts. Independent review still required. |
+| Approved fixed decisions | One-shard default, pool/concurrency/resource bounds, three tables, public API, frame identity algorithm, fail-fast admission and benchmark arrivals remain unchanged. |
+
+Append a new implementation-evidence subsection for Steps 1–5; do not rewrite
+the earlier failing records or assert that the prior scheduling explanation was
+proven. Link every removed/replaced test to its retained property. Preserve
+existing terminal rejection/loss semantics and no fabricated partial results.
+
+The implementer owns private mechanics inside these boundaries. Stop for
+maintainer direction if correctness requires a different shard/pool/default,
+identity protocol, validation trust boundary, durable format, memory/admission
+policy, public contract or benchmark criterion. Do not substitute an unapproved
+alternative or report partial performance success as completion. These are
+material stop conditions, not authorization to defer agreed Scribe work.
+
+Authoring verification: inspected existing owners, installed Arrow gather
+support, test packages/targets, setup wrappers and mise experiment commands.
+Static checks confirmed local links, five complete scenario blocks, planned
+selector labels and all seven named existing selectors. An independent
+read-only comprehension pass over the full task and current spec found no
+material ambiguity or contradiction in this revision. No implementation,
+runtime proof, benchmark execution or performance PASS is claimed here.

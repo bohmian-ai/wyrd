@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::array::{ArrayRef, RecordBatch, StringBuilder, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use chrono::{DateTime, Utc};
@@ -62,7 +62,13 @@ pub fn project_audit_event(
     event: &AuditEvent,
     decided_at: DateTime<Utc>,
 ) -> Result<RecordBatch, AuditProjectionError> {
-    let text = |value: Option<String>| Arc::new(StringArray::from(vec![value])) as ArrayRef;
+    // Sized to the value: `StringArray::from` reserves a kilobyte per column,
+    // which the staged row would hold until Scribe acknowledges it.
+    let text = |value: Option<String>| {
+        let mut column = StringBuilder::with_capacity(1, value.as_ref().map_or(0, String::len));
+        column.append_option(value);
+        Arc::new(column.finish()) as ArrayRef
+    };
     let detail = event.detail.as_ref().map(audit_detail_canonical_json);
     let detail =
         VariantColumnBuilder::encode(DETAIL, [detail.as_deref()], EncodedVariant::from_json_text)
@@ -99,7 +105,7 @@ pub fn project_audit_event(
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::Array;
+    use arrow::array::{Array, StringArray};
     use chrono::TimeZone;
     use uuid::Uuid;
     use wyrd_queue::variant::variant_cell_to_json;
@@ -206,5 +212,27 @@ mod tests {
             variant_cell_to_json(row.column(7).as_ref(), 0).expect("decodes"),
             serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical JSON")
         );
+    }
+
+    /// Every text column of a projected decision holds memory near its
+    /// value's length, not a builder's default reservation, since the
+    /// staged row is admitted to the Scribe outbox by the memory it holds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a text column holds 256 bytes or more.
+    #[test]
+    fn text_columns_hold_about_their_values() {
+        let row = project_audit_event(&event(), Utc::now()).expect("valid projection");
+        for (field, column) in row.schema().fields().iter().zip(row.columns()) {
+            if field.data_type() == &DataType::Utf8 {
+                assert!(
+                    column.get_array_memory_size() < 256,
+                    "{} holds {} bytes",
+                    field.name(),
+                    column.get_array_memory_size()
+                );
+            }
+        }
     }
 }

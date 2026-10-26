@@ -117,6 +117,21 @@ pub struct ResultBatch {
     pub batch: RecordBatch,
 }
 
+impl ResultBatch {
+    /// Arrow memory this batch owns while it is staged: every column's
+    /// buffers except the process-wide null column one-row batches share,
+    /// which stays resident once however many batches point at it.
+    #[must_use]
+    pub fn owned_bytes(&self) -> usize {
+        self.batch
+            .columns()
+            .iter()
+            .filter(|column| !Arc::ptr_eq(column, &ONE_NULL_TEXT))
+            .map(|column| column.get_array_memory_size())
+            .sum()
+    }
+}
+
 /// Every batch of one result, in required write order.
 ///
 /// The output record precedes the summary. Built once and staged on the
@@ -898,18 +913,24 @@ mod tests {
 
     /// Proves a one-row text column holds memory near its value's length,
     /// not a builder's default reservation, since every staged result row
-    /// is admitted to the Scribe outbox by the memory it holds.
+    /// is admitted to the Scribe outbox by the memory it holds, and that a
+    /// null, empty, or multi-byte value keeps its exact representation.
     ///
     /// # Panics
     ///
-    /// Panics when the column holds 256 bytes or more.
+    /// Panics when a column holds 256 bytes or more, or a value changes.
     #[test]
     fn a_one_row_text_column_holds_about_its_value() {
-        let column = text([Some(ExecutionId::new_v7().to_string())]);
-        assert!(
-            column.get_array_memory_size() < 256,
-            "holds {} bytes",
-            column.get_array_memory_size()
-        );
+        let execution = ExecutionId::new_v7().to_string();
+        for value in [Some(execution.as_str()), None, Some(""), Some("vérifié ✓")] {
+            let column = text([value]);
+            assert!(
+                column.get_array_memory_size() < 256,
+                "{value:?} holds {} bytes",
+                column.get_array_memory_size()
+            );
+            let column = column.as_string::<i32>();
+            assert_eq!(column.is_valid(0).then(|| column.value(0)), value);
+        }
     }
 }

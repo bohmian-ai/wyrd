@@ -741,14 +741,14 @@ test("custom_verdict_data_survives_readback", async ({ server, desk }) => {
   const retained = async (executionId: string): Promise<unknown> => {
     server.flushBifrost();
     const rows = await (await Bifrost.connect()).sql(
-      "SELECT to_json(outcome) AS outcome FROM bifrost.verification.results WHERE execution_id = $1",
+      "SELECT to_json(output) AS output FROM bifrost.verification.execution_outputs WHERE execution_id = $1",
       [executionId],
-      z.object({ outcome: z.string() }),
+      z.object({ output: z.string() }),
     );
     expect(rows).toHaveLength(1);
-    return JSON.parse(rows[0]?.outcome ?? "null");
+    return JSON.parse(rows[0]?.output ?? "null").requirements;
   };
-  expect(await retained(waited.execution_id), "the retained outcome keeps its data").toEqual(waited.outcome);
+  expect(await retained(waited.execution_id), "the retained output keeps its data").toEqual(waited.outcome.requirements);
 
   for (const [marker, data] of Object.entries(EXACT_DATA)) {
     const text = `${marker} refunds`;
@@ -758,7 +758,7 @@ test("custom_verdict_data_survives_readback", async ({ server, desk }) => {
     const exact = await execution.wait({ timeoutMs: WAIT_MS });
     expect(requirement(exact, "well-formed").data, `${marker}: wait`).toEqual(data);
     expect((await execution.status()).result, `${marker}: status`).toEqual(exact);
-    expect(await retained(exact.execution_id), `${marker}: retained`).toEqual(exact.outcome);
+    expect(await retained(exact.execution_id), `${marker}: retained`).toEqual(exact.outcome.requirements);
   }
 });
 

@@ -1087,8 +1087,8 @@ mod pg_tests {
         let retained = rows(
             &agent_client,
             format!(
-                "SELECT to_json(outcome -> 'requirements' -> 0 -> 'data') \
-                 FROM bifrost.verification.results WHERE execution_id = '{execution_id}'"
+                "SELECT to_json(output -> 'requirements' -> 0 -> 'data') \
+                 FROM bifrost.verification.execution_outputs WHERE execution_id = '{execution_id}'"
             ),
         )
         .await?;
@@ -1114,7 +1114,7 @@ mod pg_tests {
                 .call_tool(call(
                     QUERY,
                     serde_json::json!({
-                        "sql": format!("SELECT outcome FROM bifrost.verification.results WHERE execution_id = '{execution_id}'"),
+                        "sql": format!("SELECT output FROM bifrost.verification.execution_outputs WHERE execution_id = '{execution_id}'"),
                         "max_rows": 1
                     }),
                 )?)

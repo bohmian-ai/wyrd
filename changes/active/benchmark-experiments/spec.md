@@ -243,8 +243,8 @@ For mixed-load attribution, benchmark-mode clients attach the closed case and
 phase using `x-wyrd-benchmark-case` and `x-wyrd-benchmark-phase` HTTP/gRPC metadata.
 The first is an enumerated case/query class from this matrix; the second is a
 warmup or repetition/steady-capacity-overload-recovery classification, never an
-arbitrary caller string. The authenticated receiving boundary propagates these
-labels through existing request context to the timing owner. They confer no
+arbitrary caller string. The server reads these labels where each request
+arrives, onto the request context the timing owner reads. They confer no
 authority and cannot select tenant, storage or sampling. Ordinary deployments
 ignore them; enabled benchmark mode rejects unknown classifications with a
 counted invalid-measurement reason. Internal incidental/probe operations use a
@@ -742,7 +742,7 @@ the documented commands on Linux x86_64; no new setup script is required.
 |---|---|
 | INV-001 | Production server/client paths, exact result checks, authentication, tenant binding and permission checks stay enabled. A benchmark cannot obtain speed by bypassing real work or reading another tenant's data. |
 | INV-002 | Acknowledged durability and publication semantics remain unchanged. Report accepted work, durable publication, and visibility distinctly; benchmark convenience cannot weaken storage guarantees. |
-| INV-003 | Authorization still stages non-blocking audit at each permission decision; its production cost stays measured. Benchmark records are repository evidence, not canonical `vala.system.audit_log` rows. |
+| INV-003 | Authorization still stages non-blocking audit at each permission decision; its production cost stays measured. Benchmark records are repository evidence, not canonical `bifrost.system.audit_log` rows. |
 | INV-004 | Server/driver accounting is disjoint and portable on all supported platforms. Provisioned vCPU count P and consumed CPU C have separate labelled metrics; missing readings or an unavailable profiler cannot fabricate favorable efficiency. |
 | INV-005 | Declared controls/criteria cannot change after observing performance. Invalid measurements never become baseline evidence or a performance FAIL. |
 | INV-006 | Committed records contain synthetic-fixture summaries only: no keys, tokens, private endpoints, tenant payloads, or sensitive host identifiers. Reproducibility records symbolic secret inputs, never secret values. |

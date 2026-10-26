@@ -903,3 +903,68 @@ The three V9 commands ran in order on a quiet host, each with its smoke prepass 
   - engine optimization of ingest under query and compaction contention;
   - a different `--server-cores` declaration.
 - **Routing.** All three route to the spec decision below, not to a local fix.
+
+### V8 evidence: telemetry comparison and per-engine diagnostics, clean `300c60a1d`
+
+**Setup.**
+- **Profiler.** `samply` 0.13.1 was installed with `cargo install --locked samply`. `kernel.perf_event_paranoid` is 1.
+- **Trace sink.** A local OpenTelemetry collector (`otel/opentelemetry-collector-contrib:0.139.0`) received OTLP gRPC on `127.0.0.1:4317` and wrote to a file exporter under `target/otel-sink/`.
+- **Configuration forwarding.** Configuration reached the server through the existing `WYRD_*` forwarding. Each record's `command.config` holds it, with secrets shown as `<set>`.
+- **Order.** The runs below went one at a time. The record for each is under `benchmarks/` (untracked). Every one exits 2: with no reviewed references, each `reference.*` criterion is INVALID (`no reviewed reference with this id`). Each run's smoke prepass passed.
+
+| Run | Resolved invocation | Record |
+|---|---|---|
+| Endpoint absent | `mise run bench:l1:verification -- --steps direct-verify-c64` | `verification/direct-verify/20261026T095136Z-300c60a1d.json` |
+| Ordinary 1% export | `WYRD_OTLP_ENDPOINT=http://127.0.0.1:4317 WYRD_OTLP_SAMPLE_RATIO=0.01 mise run bench:l1:verification -- --steps direct-verify-c64` | `verification/direct-verify/20261026T095323Z-300c60a1d.json` |
+| Verification diagnostic | the same two variables, plus `mise run bench:l1:verification -- --profile --steps direct-verify-c64` | `verification/direct-verify/20261026T095510Z-300c60a1d.json` |
+| Bifrost diagnostic | the same two variables, plus `mise run bench:l1:bifrost:hot -- --profile --steps point-c64` | `bifrost/hot/20261026T095656Z-300c60a1d.json` |
+| Gateway diagnostic | the same two variables, plus `mise run bench:l1:gateway -- --profile --steps chat-capture.c64` | `gateway/overhead/20261026T095850Z-300c60a1d.json` |
+
+The variables applied only to those invocations, and the collector was removed afterwards. `Record::qualification_refusals` refuses every exporting or profiled record as "a diagnostic configuration" or "a profiled run", so none can become a reference.
+
+**Matched telemetry comparison: `direct-verify-c64`, same build and fixture.** Values are medians over 3 repetitions, as recorded, with nothing subtracted.
+
+| Configuration | Overhead p99 ms | CPU µs/verification | Verifications/s/vCPU | Cores |
+|---|---|---|---|---|
+| Endpoint absent | 1.335 [1.33, 1.371] | 499.4 [492.9, 511.6] | 1336 [1298, 1357] | 21.36 |
+| 1% export | 1.357 [1.328, 1.378] | 502.3 [500.7, 507.7] | 1324 [1318, 1326] | 21.31 |
+
+Ordinary 1% export cost about +0.6% CPU per verification and −0.9% throughput per vCPU. Its p99 difference lies inside the repetition spread. 167 OTLP export batches reached the collector.
+
+The third configuration, sampled-client tenant recording, was **not run**:
+- The capacity driver has no way to send sampled client trace context (`traceparent`). No existing option or configuration does this.
+- Adding one would be a new driver capability, which Material Stop Conditions route to the spec. The task also forbids presenting an invented option as implemented.
+- It is part of the spec decision.
+
+**Per-engine investigation.** In each case:
+- The profile is `profiles/profile-<pid>.json.gz` in the record's `artifacts.directory`, and `artifacts.profile.complete` is true.
+- The samply log reads "Recording process with PID <pid>". That PID equals the server PID in every timing snapshot of the record.
+- Sampling interval is 1.001 ms, and each capture spans 35 s: the 5 s warmup plus 3 × 10 s.
+- I symbolicated the profiles offline with `addr2line` against `target/profiling/release/wyrd-server`, which is built with frame pointers and line tables.
+- The Bifrost run overlapped my symbolication of the first profile. Diagnostic runs are not judged, so this changes no verdict.
+
+- **Verification, `direct-verify-c64`.**
+  - **Sampled traces.** 18,086 `request` spans: p50 0.330 ms, p99 1.556 ms.
+  - **Slow request.** Trace `001f5ba56bb9d1a902163d08b4d7ac16` (p99) spends 1.116 ms of its 1.556 ms in `verification.engine` and 0.003 ms in `verification.load`. The p50 trace spends 0.069 ms in `verification.engine`.
+  - **The wait.** Across all sampled spans, `verification.engine` is p50 0.056 ms and p99 0.919 ms. That span wraps the async `engine.run` (`components/verification/service.rs:596`). The evaluator itself (`vala_verify::assertion::evaluate_single`) is only 0.2% of profile samples. The tail is therefore waiting inside the engine future, not evaluation CPU.
+  - **CPU.** Inclusive:
+    - `authenticate_tenant_http`: 55.7%, wrapping the request;
+    - the `verification/routes::execute` closure: 45.8%;
+    - `verify_access_token`: 3.3%;
+    - Scribe `execute_persistence_operation`: 6.2%;
+    - audit `project_audit_event`: 5.2%;
+    - `wyrd_queue::variant::append_raw`: 6.6%.
+
+    The allocator is about 15% of self samples (`mi_*`).
+  - **Refusals.** Status codes: 16,162 × 200 and 1,921 × 429, which are the staging refusals behind `no-errors`.
+- **Bifrost hot, `point-c64`.**
+  - **Sampled traces.** 3,080 sampled lookups: request p50 3.756 ms, p99 12.318 ms. They are slower than the unprofiled 7.4 ms, which is expected under profiling.
+  - **Where the time goes.** The nested spans (`bifrost.gate.query.stream` ⊃ `bifrost.gate.query` ⊃ `bifrost.oracle.query` ⊃ `bifrost.oracle.stream` ⊃ `bifrost.oracle.source`) show most of it in `bifrost.oracle.source`: p50 2.178 ms and p99 7.092 ms, of the oracle query's 3.307 and 8.929 ms.
+  - **CPU.** Self time is dominated by generic iterator `next`, `drop` and `clone` (about 30%) under `vala_bifrost_redux::oracle::exec::project_batch` (5.3% inclusive). That fits the expensive part of a memtable point lookup being per-row projection and copying, not admission: `grant_waiters` is 0.2%.
+- **Gateway, `chat-capture.c64`.**
+  - **Sampled traces.** 3,736 sampled requests: p50 4.194 ms and p99 9.006 ms, mostly the paced upstream exchange `gateway.attempt` (p99 6.949 ms).
+  - **Server overhead.** The server-side `gateway.capture` stage is p50 0.469 ms and p99 1.871 ms, which alone exceeds the 0.5 ms overhead limit.
+  - **The expensive function.** Inclusive: `gateway::capture::redacted_canonical_json` 10.6% and `wyrd_spec::gateway::record::validate_canonical_json` 10.1%. Self time includes `serde_json` string escaping (about 8.6%) and libc copies (46.1%, mostly copies of the 64 KiB bodies).
+  - **Interpretation.** Each capture serializes and validates the 64 KiB body as canonical JSON twice. This is the CPU behind the capture overhead and the capture-outbox shedding seen in V8.
+
+These runs show that the artifacts are usable for investigation. They don't sample every request, and they don't give exact per-case CPU.

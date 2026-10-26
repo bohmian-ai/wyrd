@@ -686,6 +686,22 @@ invalid baselines or treat absent evidence as a passing regression check.
   - The driver side of the spin check and every negative control still run there.
   - writes-hot proves the same server-process accounting: the same `LocalServer::cpu_usec` owner, the same transports and the same conversion.
 
+**D6: the trimmed qualification declaration had no criterion**
+
+- **Symptom.** The first V3a run panicked before measuring: `declaration.missing`, "no criterion is declared".
+- **Evidence.** The writes-hot `no-errors` Limit names all six write steps. The test kept only criteria whose steps all equal the kept step, and `Declaration::compare` on a qualify run then dropped every relative criterion.
+- **Cause.** The test's trim dropped every criterion that names the kept step together with others, instead of narrowing it to that step.
+- **Fix site.** In the test, `judged` narrows each criterion's steps to the kept step and drops only those that never named it. Production code is unchanged.
+
+**D7: the full writes-hot c64 window exhausts host memory**
+
+- **Symptom.** The second V3a run was killed by the session's memory-pressure reaper 50 s in. Run 3 completed.
+- **Evidence.** A 5 s memory log next to run 3 recorded the following:
+  - `wyrd-server` RSS reached 58.9 GB, and available host memory fell to 182 MB of 91 GiB.
+  - The record showed a memtable backlog of up to 45 GiB and 48.9 GiB of sampled peak memory.
+- **Cause.** Under the hot settings every row stays in a memtable. At 64 clients the full L1 timing, a 5 s warmup and three 10 s windows at about 3.5 M rows/s, holds tens of GiB.
+- **Fix site.** None in the test, which now judges `native-write-c1`; run 6 held at least 46 GB available. This is the same full L1 that V8 runs: a writes-hot suite on this 91 GiB host is close to the memory limit, and V8 must run with no other memory load.
+
 ### V2a evidence
 
 The V2a command above, run after `mise run bench:build` on a quiet host, gave PASS in 772.6 s. 40 measured L1 cases held (4+4+12+8+6+6):
@@ -711,3 +727,35 @@ Fast lanes after the change:
 - `cargo nextest run --locked -p wyrd-testing --bin capacity`: 44 passed.
 - `-p wyrd-testing --lib -E 'test(/release_server/) | test(/experiment::/)'`: 20 passed.
 - `mise run lints` and `git diff --check`: clean.
+
+### V3a evidence
+
+The V3a command above, run from clean committed source (`6d4316122`) after `mise run bench:build` on a quiet host, gave PASS in 773.1 s. For each engine, `tests::pg_tests::measured_regressions_reach_normal_reference_judgment` does the following:
+- runs the engine's ordinary full L1 plan: a 5 s warmup and three 10 s repetitions, the full fixtures and sample floors, unchanged limits, no `--allow-dirty`, `--smoke`, selection or profile;
+- trims the declaration to one measured case, narrowing each criterion to that case (D6);
+- runs two `--qualify-baseline` suites, each from a fresh database;
+- promotes them with `Baselines::promote`, which checks every qualification refusal and requires the same method identity;
+- runs an unperturbed normal control against those references;
+- runs the same normal run with 32 sequential `/metrics` scrape loops against the server over each window.
+
+The perturbation is real server work that competes with the measured requests. Nothing is edited after measurement: the readings, operands and limits are the runner's own. Every record is published, read back, and rendered identically.
+
+| Engine, case | Control | Latency | CPU / work | Throughput / P | Record |
+|---|---|---|---|---|---|
+| Bifrost writes-hot `native-write-c1` | PASS, every reference | p95 (16.753, 16.761] ms vs 12.632: FAIL | 31.14 vs 0.443 µs/row, spread 3.52: FAIL | 15870.9 vs 17891.3 rows/s/vCPU, spread 256.5: FAIL | FAIL, exit 1 |
+| Verification `direct-verify-c1` | PASS, every reference | overhead p99 (0.405, 0.406] ms vs 0.303: FAIL | 7893.0 vs 347.6 µs/verification, spread 73.2: FAIL | 61.16 vs 126.83 verifications/s/vCPU, spread 2.99: FAIL | FAIL, exit 1 |
+| Gateway `chat.c1` | PASS, every reference | overhead p99 (0.41, 0.411] ms vs 0.264: FAIL | 8584.9 vs 486.3 µs/request, spread 186.6: FAIL | 52.82 vs 130.31 requests/s/vCPU, spread 4.62: FAIL | FAIL, exit 1 |
+
+Each FAIL is the normal judge's own `Rule::Regression` reason, "regressed against reference.<experiment>.<step>.<metric>", and none is INVALID.
+- **Per engine,** the test requires the control to PASS every judged dimension, the perturbed run to FAIL with exit code 1, and at least one dimension to regress.
+- **Across the proof,** it requires each of the three dimensions to regress, which is what Scenario 3 requires.
+- **In run 6,** all nine regressed. In run 3, Bifrost c64 latency and throughput did not: about 15 of 32 cores were busy, so the storm's server CPU did not reach the write path's latency.
+
+The test uses `#[tokio::test(flavor = "multi_thread")]`, the CLI's runtime. D2's stop fix does not depend on the flavor.
+
+**Findings for V8, measured unperturbed in these qualification attempts:**
+- **Bifrost hot `point-c64`** misses its absolute SLO on this host: median p99 (7.496, 7.5] ms against `< 5` ms (`point-p99-slo`). A normal hot L1 FAILs on this alone.
+- **Verification `direct-verify-c64`** misses its SLO: overhead p99 (1.346, 1.347] ms against `< 0.5` ms. It also refuses 50630–78677 calls per window with `WYRD_VERIFICATION_429_STAGING_FULL`, which `no-errors` counts. A normal direct-verify L1 FAILs, and the c64 case cannot qualify a reference.
+- **Bifrost writes-hot c64** needs about 59 GB of server memory (D7).
+
+These are measured product behavior, not defects in V3a. They are left for V8 to report and route, with no limit changed.

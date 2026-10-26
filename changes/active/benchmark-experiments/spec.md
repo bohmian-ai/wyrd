@@ -1,10 +1,16 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 10
-status: approved
+revision: 11
+status: draft
 ---
 
 # Benchmarks as experiments
+
+Revision 11 applies five maintainer decisions from TASK-005's real runs: drop
+`writes-hot`, make each L1 experiment command finish within 5 minutes, bring
+the engine optimizations needed to meet the unchanged limits into this change,
+calibrate Bifrost L2 under contention, and add a sampled-client `traceparent`
+driver option. It is a draft awaiting approval.
 
 Revision 10 records the maintainer's explicit correction and approval: smoke
 checks that the actual benchmark collects, reconciles, saves and reports its
@@ -45,8 +51,8 @@ failing the command. After this change every step has declared criteria and a
 verdict. A valid criterion miss exits 1; a saturated load driver discards the
 measurement as INVALID and exits 2. Both leave a compact historical record.
 
-Level 1 gives opt-in feedback within 15 minutes for Verification and Gateway.
-Bifrost has separately runnable hot reads, Parquet reads, hot writes and
+Level 1 gives opt-in feedback within 5 minutes per experiment command.
+Bifrost has separately runnable hot reads, Parquet reads and
 Parquet-configured writes; each has its own budget. Level 2 measures
 mixed traffic and background work together over 20–30 minutes per engine.
 The purpose is to measure server throughput and server overhead. Report both
@@ -78,8 +84,9 @@ actual CPU cost. These alternatives are rejected.
 This packet owns benchmark structure, recording, measurement definitions,
 criteria, and command levels across `bifrost`, `verification`, and `gateway`,
 and the shared production tracing configuration used by these engines.
-Capacity coverage is kept and rebuilt, not deleted. Engine optimization and
-ClickBench reproduction are not part of this change. Repository architecture
+Capacity coverage is kept and rebuilt, not deleted. The engine optimizations
+named in REQ-021 are part of this change; other engine optimization and
+ClickBench reproduction are not. Repository architecture
 remains authoritative.
 
 “Experiment” here means a repository performance experiment, not a new Card
@@ -89,7 +96,8 @@ snapshot on the existing metrics listener is the sole added measurement surface;
 its exposure is constrained below. Existing client trace APIs are preserved. The public contributor surfaces are
 `mise` commands, documentation, JSON records, and baseline configuration.
 
-Non-goals: optimize an engine; change durability, authorization, or admission;
+Non-goals: optimize an engine beyond REQ-021; relax a declared limit to make
+it pass; change durability, authorization, or admission;
 add benchmark CI wiring or any gate dependency;
 reproduce ClickBench; publish marketing rankings; add platform-specific resource
 isolation; import historical results as records; commit samples or profiles;
@@ -128,7 +136,8 @@ part of no gate or verification lane.
   Send lateness is solely a driver-validity check, never a server latency SLO.
 - **REQ-003 — Repetitions.** Every full-run step has a discarded warmup followed by three
   measured repetitions with the same controls. L1 discards 5 seconds of warmup
-  then measures 3 × 10 seconds; L2 discards 2 minutes of warmup then measures
+  then measures 3 × 5 seconds, or 3 × 10 seconds for a case whose 5-second
+  window cannot meet its sample floor (REQ-008); L2 discards 2 minutes of warmup then measures
   3 × 6 minutes. Preserve each repetition's
   metrics, median, minimum, maximum, and sample counts; never merge the samples
   into a percentile and call it the median repetition. Warmup contributes no
@@ -331,12 +340,15 @@ and diagnostic spans and their required client-visible catalog.
 
 ### Levels and commands
 
-**REQ-008 — Level 1, fast.** Each Verification and Gateway suite completes in
-at most 15 minutes. Bifrost L1 has four records and budgets: `writes-hot`
-at most 8 minutes, `writes-parquet` at most 8 minutes, `hot` reads at most
-5 minutes, and `parquet` reads at most 9 minutes. A complete Bifrost suite
-therefore has a 30-minute upper bound, not a 15-minute claim. Its 24 measured
-cases require 14 minutes of warmup/repetition windows alone. Individual cases
+**REQ-008 — Level 1, fast.** Every L1 experiment command completes in at most
+5 minutes: Verification `direct-verify`, Gateway `overhead`, and each of the
+three Bifrost experiments `writes-parquet`, `hot` and `parquet`. The Bifrost
+aggregate runs three such experiments and therefore has a 15-minute upper
+bound. L1 measures 1 and 64 clients only on every engine. Measured windows are
+3 × 5 seconds after a 5-second warmup; a case keeps 3 × 10 seconds only when
+5 seconds cannot meet its declared sample floor, and the record names which
+cases did. The 15 Bifrost cases need about 6 minutes of warmup/repetition
+windows in total, split across their three commands. Individual cases
 and experiments remain available for fast optimization feedback. Build binaries and prepare external prerequisites before
 starting the experiment clock; the clock includes quiet-host checking, server
 startup, fixture loading, warmups, repetitions, and drain. An overrun is stopped
@@ -348,24 +360,27 @@ one fixed fixture configuration per experiment, and isolated operations:
 
 | Engine | Required L1 coverage |
 |---|---|
-| Bifrost `writes-hot` / `writes-parquet` | Native Arrow, OTLP spans and OTLP logs at 1 and 64 clients in each configuration: 12 measured cases. Reuse the 2M-row generators and fresh identities. Hot uses the existing 16,384 MB rotation/24-hour retention configuration; Parquet uses default rotation/30 s retention. Measure durable acknowledgement, not publication. Include actual staging/publication CPU in Parquet-configured windows, record its activity and backlog, and do not claim storage-maintenance cost if none occurred. |
+| Bifrost `writes-parquet` | Native Arrow, OTLP spans and OTLP logs at 1 and 64 clients: 6 measured cases. Reuse the 2M-row generators and fresh identities. The server uses production default rotation sizes and a 30 s retention; no write experiment overrides rotation. Measure durable acknowledgement, not publication. Include actual staging/publication CPU in Parquet-configured windows, record its activity and backlog, and do not claim storage-maintenance cost if none occurred. |
 | Bifrost `hot` | Reads while every row stays in the memtable: the server runs with memtable and on-disk rotation sizes of 16,384 MB and a 24-hour retention, the earlier hot tier's declared settings, so nothing stages or publishes; a staged or published row makes the experiment INVALID. Fixtures: the standard 10M-row events fixture and 1M telemetry spans. Events point lookup at 1 and 64 clients; events small aggregate at 1; span filter on a shredded attribute key at 1. |
 | Bifrost `parquet` | Reads after every row is published as Parquet: default rotation sizes and a declared 30 s retention, then one settlement until nothing remains in a memtable, staging or claim. Fixtures: the standard 10M-row events fixture, 1M telemetry spans, and one 200,000-row sample per write path, all settled together. This record holds each write path's storage ratio; both write records report it as inapplicable with that reason. Events point lookup at 1 and 64 clients; events small aggregate and full scan at 1; span lookup by `trace_id`, a declared Bloom column, at 1 and 64; span filters on a shredded attribute key and on a long-tail key below the shredding threshold at 1. Two correctness checks run once after settlement, outside every measured window: the published span files shred exactly the expected attribute keys and none below the threshold, and a span-time window scans fewer files than the whole table. |
-| Verification `direct-verify` | Four direct-verify cases at 1/4/16/64 clients: existing four assertion checks over 2 KiB JSON, alternating expected pass/fail judgments. Expected failing judgments are correct completed verifications, not transport errors. Record elapsed, Verifier wait and server overhead, CPU/verification and scaling. |
-| Gateway `overhead` | Twelve cases: buffered chat with metadata capture, streamed chat with metadata capture, and buffered chat with payload capture, each at 1/4/16/64 clients. Reuse the local controlled provider, 1 KiB metadata shapes/32 stream events and 64 KiB request/response payload-capture shape. Record header/final overhead where applicable, calls/s, CPU/call, capture bytes and memory. |
+| Verification `direct-verify` | Two direct-verify cases at 1 and 64 clients: existing four assertion checks over 2 KiB JSON, alternating expected pass/fail judgments. Expected failing judgments are correct completed verifications, not transport errors. Record elapsed, Verifier wait and server overhead, CPU/verification and scaling. |
+| Gateway `overhead` | Six cases: buffered chat with metadata capture, streamed chat with metadata capture, and buffered chat with payload capture, each at 1 and 64 clients. Reuse the local controlled provider, 1 KiB metadata shapes/32 stream events and 64 KiB request/response payload-capture shape. Record header/final overhead where applicable, calls/s, CPU/call, capture bytes and memory. |
 
-Bifrost L1 measures 1 and 64 clients only: 1 gives unloaded latency and the
+L1 measures 1 and 64 clients only: 1 gives unloaded latency and the
 cost floor, and 64 is where the SLO applies. Scaling is reported for each query
 class measured at both; a class measured at 1 only records scaling as
 inapplicable with that reason. The absolute Bifrost L1 latency criterion remains point-lookup p99 at 64
 clients. Other cases retain their distributions, correctness and relative
 regression criteria when a compatible baseline exists. The L1 full scan keeps
 latency percentiles descriptive and judges throughput/core, CPU/query and
-correctness; it does not pretend a 10-second single-client scan window supplies
+correctness; it does not pretend a short single-client scan window supplies
 200 tail samples. Non-scan L1 latency regressions judge p99 with the existing
 1,000-sample floor. L2 scans retain their judged p95/200-sample requirement. The same case at different
 storage states is never averaged into one result. A complete Bifrost L1 suite
-is all four records at full default coverage: 12 reads and 12 writes. The telemetry span fixture is deterministic, with attribute keys
+is all three records at full default coverage: 12 reads and 6 writes. The
+16,384 MB rotation/24-hour retention override exists only for the `hot` read
+experiment, whose bounded fixture is loaded once and never grows; an override
+that lets an unbounded write workload accumulate in memory is not allowed. The telemetry span fixture is deterministic, with attribute keys
 straddling the 10% shredding threshold. The former request-only release preflight
 is replaced by the following real-path smoke contract.
 A settled Parquet read without required scan facts remains INVALID.
@@ -414,7 +429,11 @@ This proves judging without requiring live smoke workloads to meet production
 targets or changing the real benchmark's limits.
 
 Every normal full invocation first runs this same smoke-sized plan as a fail-fast
-pass, with its own record, isolated/reset fixture state and declared budget.
+pass, with its own record, isolated/reset fixture state and declared budget,
+unless a smoke PASS record already exists under `target/benchmarks/smoke/` for
+the same clean commit, experiment and selected steps. The full record then
+names that smoke record instead of repeating it; a dirty tree, different
+selection or missing/INVALID smoke record still runs the prepass.
 Only a smoke PASS permits full-size fixture preparation. A failed prepass leaves
 its evidence and reports that the full run did not start; it cannot fabricate a
 full-run result. Smoke mode does not recursively preflight itself. Build and
@@ -435,7 +454,7 @@ as functional pipeline evidence rather than performance qualification.
 Reset or otherwise establish equivalent declared data state between repetitions;
 repeated writes must not turn later repetitions into duplicate acknowledgments.
 The Parquet query fixture and its fixed size/seed are declared before measuring.
-Measured windows remain 10 seconds; the 2M-row configuration does not end
+Measured windows follow REQ-003; the 2M-row configuration does not end
 measurement early, and writes use fresh identities as needed. Throughput uses
 the baseline regression rule with no new absolute floors. Growing staging/publication backlog is visible;
 a short write-ack rate is not labelled sustained storage throughput. Retain only native
@@ -466,7 +485,7 @@ overload/recovery sequence follows the repetition rule below.
 
 | Engine | Required L2 coverage |
 |---|---|
-| Bifrost | 100M-row heavy fixture (today's `--heavy`); ingest at 70% of L1-measured rows/CPU-s capacity, split by rows 50% OTLP spans / 30% logs / 20% native. 32 query clients: 60% point lookups, 25% dashboard aggregates (small and 1m), 10% table aggregates, 5% scans. Forge compaction on; reads while writing and full-queue behavior. Record the L1 calibration and declared server CPU budget; the budget sets load, never the measured CPU denominator. |
+| Bifrost | 100M-row heavy fixture (today's `--heavy`); ingest at 70% of the contended sustainable rate defined below, split by rows 50% OTLP spans / 30% logs / 20% native. 32 query clients: 60% point lookups, 25% dashboard aggregates (small and 1m), 10% table aggregates, 5% scans. Forge compaction on; reads while writing and full-queue behavior. Record the L1 calibration and declared server CPU budget; the budget sets load, never the measured CPU denominator. |
 | Verification | Direct and background verification together, Bifrost evidence writes, backlog progression and bounded drain. |
 | Gateway | Open-loop capacity with captures, declared overload, then recovery; judge server completion, first-token handoff, full-stream handoff, overhead, capture accounting, and recovery concurrently where applicable; client timings and inter-chunk lag are diagnostic-only. |
 
@@ -477,19 +496,23 @@ across repetitions. Warm up the complete sequence, not recovery in isolation,
 which would erase the backlog recovery is intended to measure. Other L2 steps
 also declare and preserve their initial state across repetitions.
 
-Bifrost workload load must identify an L1 run with compatible host, build,
-fixture projection, and limits; missing/incompatible calibration refuses the
-workload as INVALID rather than silently using a historical total rows/s.
-The fixed-client L1 SLO and L2's 32 query clients have different applicability:
-L2 uses the concurrent criteria below; it cannot claim a 64-client SLO
-from a 32-client observation. Calibrate each signal from its matching L1 write
-sweep's peak valid rows/CPU-second at 1 and 64 clients from the newest
-compatible `writes-parquet` record selected by `bench:l1:bifrost:writes`.
-A hot-write capacity must not silently calibrate a Parquet workload. For row fractions `f_i`
-and capacities `r_i`, mixed capacity is `1 / Σ(f_i/r_i)` rows/CPU-second.
-Initial ingest is 70% of that capacity times the declared server CPU budget.
-That budget and the small/1m split within the 25% dashboard share are run
-controls fixed before execution.
+Bifrost L2 calibrates its ingest rate under contention, inside the same run
+and clock, before its measured repetitions. With the declared 32 query clients
+and Forge compaction running on the loaded heavy fixture, it offers the
+declared row mix at increasing rates and finds the highest rate the server
+sustains: achieved arrivals match offered arrivals and backlog grows by at
+most one second of offered work over a declared calibration window. Measured
+repetitions then run at 70% of that rate. The record keeps each calibration
+step's offered and achieved rate and backlog, the selected sustainable rate
+and the resulting load. A calibration that cannot find a sustainable rate, or
+whose search exceeds its declared share of the budget, is INVALID; no
+historical or isolated L1 rate substitutes for it. The search bounds, window
+length and step size, and the small/1m split within the 25% dashboard share,
+are run controls fixed before execution. Isolated L1 write capacity overstates
+what the server sustains while queries and compaction compete, so it no longer
+sets L2 load. The fixed-client L1 SLO and L2's 32 query clients have different
+applicability: L2 uses the concurrent criteria below; it cannot claim a
+64-client SLO from a 32-client observation.
 
 Concurrent Bifrost L2 criteria: point lookup p99 <5 ms; small aggregate
 p95 <100 ms; 1m aggregate p95 <300 ms; heavy scan p95 <2 s (≥200 samples per repetition); server write
@@ -521,8 +544,6 @@ The strict <500 µs overhead SLO at 64 clients remains unchanged.
 ```text
 mise run bench:l1:bifrost
 mise run bench:l1:bifrost:writes
-mise run bench:l1:bifrost:writes:hot
-mise run bench:l1:bifrost:writes:parquet
 mise run bench:l1:bifrost:hot
 mise run bench:l1:bifrost:parquet
 mise run bench:l1:verification
@@ -533,8 +554,8 @@ mise run bench:l2:verification
 mise run bench:l2:gateway
 ```
 
-`bench:l1:bifrost:writes` runs the two write configurations sequentially.
-`bench:l1:bifrost` runs `writes-hot`, `writes-parquet`, `hot` and `parquet`
+`bench:l1:bifrost:writes` runs the `writes-parquet` experiment.
+`bench:l1:bifrost` runs `writes-parquet`, `hot` and `parquet`
 sequentially, each under fresh Postgres, preserving records and worst-exit
 precedence even if an earlier experiment fails or is invalid. `bench:l1` runs every L1 experiment sequentially so they do not
 contaminate one another.
@@ -712,7 +733,7 @@ correctness coverage. Evidence for current consumers is in research.
 | Current coverage | New owner / level |
 |---|---|
 | query-capacity standard, hot and Parquet tiers, telemetry fixture | Bifrost L1 `hot` / `parquet` |
-| write sweeps | Bifrost L1 `writes-hot` / `writes-parquet` |
+| write sweeps | Bifrost L1 `writes-parquet` |
 | heavy fixture, reads-while-writing, full queue, forge-capacity, client-queue | Bifrost L2 |
 | verification case 1 / case 2 | Verification L1 / L2 |
 | gateway-overhead / gateway-capacity | Gateway L1 / L2 |
@@ -785,14 +806,43 @@ plane or client-forced operator sampling is introduced. Client spans appear in
 Wyrd's timeline only when the client exporter also sends them to Wyrd. Preserve
 Rust/Python/TypeScript timeline behavior and tenant-negative coverage.
 
+**REQ-021 — Engine limits met in this change.** The declared limits stay as
+written. TASK-005's runs on the reference host missed four of them, and this
+change optimizes the engines until each passes on that host:
+
+- Verification `direct-verify` at 64 clients: the engine wait that dominates
+  server latency.
+- Bifrost point lookup, from both the memtable (`hot`) and Parquet (`parquet`):
+  the projection cost that holds p99 above 5 ms at 64 clients.
+- Bifrost `writes-parquet` OTLP spans: the ≥30 MiB/CPU-s wire floor.
+- Gateway `overhead`: the <500 µs overhead SLO at 64 clients, including the
+  payload capture that serializes canonical JSON twice.
+
+Each optimization keeps INV-001 and INV-002: exact results, authentication,
+tenancy, audit and durability are unchanged, and no work moves outside the
+measured server. Use REQ-019's workflow to locate the cost and judge the fix
+under the normal configuration. References are qualified only after every L1
+limit passes; a limit that still misses blocks qualification instead of being
+relaxed or recorded as accepted.
+
+**REQ-022 — Sampled-client trace option.** The benchmark driver accepts
+`--client-trace-ratio <f>`, validated in [0,1], default 0. On that fraction of
+requests, chosen deterministically from the run seed, it sends a W3C
+`traceparent` with the sampled flag set, exercising tenant trace recording
+through the production path. A nonzero ratio is recorded as a control and
+makes the record a diagnostic configuration, ineligible as a reference. It
+never changes operator export (REQ-017).
+
 **REQ-020 — Qualification and discoverability.** Before baseline promotion,
 measure the same clean build with operator endpoint absent versus ordinary
-1% export, and separately with sampled-client tenant recording. Use identical
+1% export, and separately with sampled-client tenant recording using
+`--client-trace-ratio` (REQ-022). Use identical
 workload/fixtures and record the configurations; report the observed CPU,
 latency and throughput difference without subtracting it. Run each engine's
 full L1 separately and report after each. Establish compatible references and
 prove injected/controlled regressions in latency, throughput/core and CPU/work
-fail without weakening limits. Run full L2 once on the integrated candidate.
+fail without weakening limits. Run full L2 once on the integrated candidate;
+L2 evidence may be collected after the L1 qualification work, in its own task.
 README explains matrix, quantities, startup/prerequisites, runtime budgets,
 partial selections, reference qualification, diagnosis and recovery. L1 remains
 manual and outside CI/gates; contributors run the owning engine after its code
@@ -831,8 +881,9 @@ constraints; private implementation choices remain open.
    engine-specific workload behavior remains with existing owners.
 2. **Persistent evidence:** versioned JSON schema v2, exact three-engine directory
    layout, timestamp/SHA identity, committed summaries and external raw artifacts.
-3. **Levels:** L1 ≤15 minutes for Verification and Gateway; Bifrost L1 as four
-   independently runnable experiments of at most 8, 8, 5 and 9 minutes; L2 20–30 minutes per engine;
+3. **Levels:** every L1 experiment command ≤5 minutes at 1 and 64 clients;
+   Bifrost L1 as three independently runnable experiments; L2 20–30 minutes
+   per engine with contended in-run ingest calibration;
    three repetitions per step, defined clock boundaries, opt-in commands
    replacing old tasks without aliases.
 4. **Metric semantics:** both provisioned-vCPU and consumed-CPU denominators, explicit byte units,
@@ -870,19 +921,20 @@ MCP API that would require a new product-surface projection.
 
 | ID / situation and actor | Expected observable result / credible evidence | Obligations |
 |---|---|---|
-| AC-001 — Engineer runs one engine's L1 | Each engine command is exercised separately, and each Bifrost experiment (`writes-hot`, `writes-parquet`, `hot`, `parquet`) within its own budget; `hot` reads show no staged or published rows and `parquet` reads show nothing left in a memtable, staging or claim. Within its budget the full matrix runs with discarded warmup and three repetitions. Engineer reads question, controls, units, per-step criteria and verdict; opens the printed JSON path and regenerates an identical report. Real Linux x86_64 release-process journey, record and report comparison. Recompute server latency bounds from retained interval histograms; changing client network delay, polling cadence or scheduled-time latency cannot change server latency judgment (driver send lateness still checks validity); verify exact values just below, equal to and above strict SLO limits, and reject missing/overflowed timing evidence and ambiguous threshold bounds; coarse monitoring buckets cannot judge latency. Operator export disabled or lossy cannot erase complete benchmark timing. | REQ-001, REQ-003, REQ-007, REQ-008, REQ-010, REQ-013, REQ-014 |
+| AC-001 — Engineer runs one engine's L1 | Each engine command is exercised separately, and each Bifrost experiment (`writes-parquet`, `hot`, `parquet`) within its 5-minute budget, with a same-commit smoke PASS reused instead of a repeated prepass; `hot` reads show no staged or published rows and `parquet` reads show nothing left in a memtable, staging or claim. Within its budget the full matrix runs with discarded warmup and three repetitions. Engineer reads question, controls, units, per-step criteria and verdict; opens the printed JSON path and regenerates an identical report. Real Linux x86_64 release-process journey, record and report comparison. Recompute server latency bounds from retained interval histograms; changing client network delay, polling cadence or scheduled-time latency cannot change server latency judgment (driver send lateness still checks validity); verify exact values just below, equal to and above strict SLO limits, and reject missing/overflowed timing evidence and ambiguous threshold bounds; coarse monitoring buckets cannot judge latency. Operator export disabled or lossy cannot erase complete benchmark timing. | REQ-001, REQ-003, REQ-007, REQ-008, REQ-010, REQ-013, REQ-014 |
 | AC-002 — Engineer compares a valid regression with its baseline | W/C baseline 100, repetitions 75/80/85: criterion FAIL and exit 1; a CPU/operation case beyond +15% and spread also fails. Exact percentage boundaries pass. Deterministic judgment cases plus an eligible compatible replacement-baseline-to-run integration journey preserve operands and provenance. | REQ-011, REQ-012 |
 | AC-003 — Engineer encounters noisy results | Baseline 100, repetitions 70/85/100: regression criterion PASS with spread visible; another absolute SLO miss still makes the run FAIL. Shared-judgment cases prove noise cannot excuse latency/correctness. | REQ-004, REQ-012 |
 | AC-004 — Engineer cannot obtain valid evidence | Independently exercise busy preflight/post-run host (10-second samples, >10% non-benchmark CPU), driver above 80% budget, any missed arrival or p99 send lateness >5 ms, insufficient samples (<1,000 p99 / <200 p95), dirty source without override, missing/reset CPU and budget overrun: INVALID, exit 2, reasons and partial record, no fabricated successful step. Declared dirty override is visible. Combine an invalid step and valid failure: overall INVALID retains both. Injected resource/clock observations and runner integration; no synthetic host load. | REQ-002, REQ-004, REQ-006, INV-005, INV-007 |
 | AC-005 — Engineer runs and compares supported platforms | Prove real CPU accounting and every L1 and L2 experiment for all three engines on Linux x86_64. Inspect portability of the same commands, schema v2 and measurement paths on macOS arm64 and Linux arm64; real runs there are optional and missing runs do not block completion. Recompute (W/T)/P, W/C and C/W from records, with distinct labels and recorded P; results agree and never substitute removed quotas. Verify write rows and uncompressed MiB in both normalizations and query scan rows/bytes per query alongside server time. Cross-host and cross-OS comparisons show both OS/architecture fingerprints and remain advisory, never same-host regression proof. Exercise `--profile` on Linux x86_64 and missing/unusable profiler cases: capture or an explicit note is recorded without affecting judgment; required accounting stays mandatory. Real release-process journeys/records plus deterministic arithmetic, provenance and diagnostic-failure checks. Static command/source review confirms both levels and all experiments lack OS-specific paths and resource envelopes. | REQ-006, REQ-010, REQ-011, REQ-013, REQ-015, REQ-016, INV-004, INV-009 |
 | AC-006 — Agent reads history without prose parsing | Agent discovers engine/experiment records, validates new v2 and legacy v1 fields, reads numeric values/units, repetitions, baseline snapshot and typed verdict/reasons, and identifies omitted/invalid steps. Unsupported version refuses interpretation. Report regeneration works without target artifacts; same-second/SHA collisions use -2/-3 and cannot overwrite history; temp-write/rename failure cannot return PASS. A dirty override records the SHA-256 of `git diff HEAD`. Record-reader/writer integration and malformed/unsupported input cases. | REQ-013, REQ-014, INV-008 |
-| AC-007 — Engineer runs L2 with competing work | For each engine, observe real overlapping foreground/background work during each repetition, offered versus achieved arrivals, concurrently evaluated SLOs, bounded backlog and drain. Bifrost records compatible L1-derived initial load and 32 query clients; Verification includes evidence writes; Gateway overload/recovery judges capture accounting. A missed concurrent criterion fails despite an isolated case passing. Real workload journeys, timelines and records. | REQ-005, REQ-009 |
+| AC-007 — Engineer runs L2 with competing work | For each engine, observe real overlapping foreground/background work during each repetition, offered versus achieved arrivals, concurrently evaluated SLOs, bounded backlog and drain. Bifrost records its contended calibration steps, selected sustainable rate, 70% load and 32 query clients; Verification includes evidence writes; Gateway overload/recovery judges capture accounting. A missed concurrent criterion fails despite an isolated case passing. Real workload journeys, timelines and records. | REQ-005, REQ-009 |
 | AC-008 — Contributor adds an experiment | Contributor declares question/variables/controls/metrics/criteria and supplies workload behavior to the existing shared experiment owner. The same validity, repetitions, report, record and verdict behavior applies without another measurement/report implementation. One small representative integration experiment and source review demonstrate reuse. | REQ-015 |
 | AC-009 — Maintainer checks migration and discoverability | README and TESTING explain invocation and records; coverage mapping has no lost workload; old tasks/aliases, dead thresholds/SloGate/load exports and duplicate code are gone. Every client-queue step judges criteria; Gateway has declared capacity SLO constants. Static consumer/task/docs inventory plus relevant existing correctness lanes; no benchmark added to CI/gates. | REQ-010, REQ-016 |
 | AC-010 — Operator checks preserved production guarantees | Wrong results and unexpected loss fail valid runs; tenant-negative journeys cannot expose data; acknowledged writes survive existing durability checks; audit stays non-blocking and accounted; fixture cleanup remains scoped and credentials never enter summaries. Existing security/storage journeys and focused record privacy/cancellation checks are credible evidence. | INV-001, INV-002, INV-003, INV-006 |
 | AC-011 — Operator changes logging/sampling or loses its backend | Production-initialized tests prove independent log/operator policies and SDK overflow/shutdown loss reporting and accurate failed-export-batch counters; real authenticated client → gateway → tenant timeline journeys retain catalog IDs/links at ratio zero/no endpoint, with tenant-negative readback. All shipped language surfaces retain their existing journeys at integrated review. | REQ-017, REQ-018, INV-010 |
-| AC-012 — Engineer smoke-tests the actual benchmark without trace export | Real release commands exercise every default L1/L2 plan for all engines, including all four Bifrost L1 experiments after TASK-005 completes the matrix, through actual loading/publication, selected steps/phases, measured stop/drain, exact outcome reconciliation, record/full timing evidence and report. Read the record and regenerate its report; verify retained histograms reproduce recorded readings. Accurately recorded production errors, dropped/refused calls, capture shedding, wrong answers and target misses do not fail smoke. Missing measurements/counters, mismatched populations, zero CPU, missing applicable scan facts and failed evidence/report handling are plumbing failures. Production criteria remain explicitly inapplicable with observed values retained; smoke PASS claims plumbing only. A separate deterministic full-mode test proves a controlled criterion miss survives judgment, record/readback, report and exit 1, and invalidity retains precedence/exit 2. Selected-step and automatic isolated prepass proof remains; invalid plumbing stops full preparation. Mode round-trips, output stays outside history and smoke cannot become a baseline after relocation. Deterministic interval/quantization/overflow/reset/drain proof and bounded known-delay, known-CPU and instrumentation-cost calibration use the actual measurement path with independent references and justified tolerances, without synthetic host load or a side runner. Normal readout absence, non-loopback refusal and snapshot privacy remain. | REQ-007, REQ-008, REQ-013, REQ-015, INV-006, INV-010 |
-| AC-013 — Maintainer establishes regression evidence | Two clean full suites establish reviewed same-method references; latency/throughput-core/CPU-work regression cases fail correctly. Same-build export and tenant-copy comparisons quantify overhead; diagnostic traces and profile reproduce the documented investigation workflow without becoming references. | REQ-011, REQ-012, REQ-019, REQ-020 |
+| AC-012 — Engineer smoke-tests the actual benchmark without trace export | Real release commands exercise every default L1/L2 plan for all engines, including all three Bifrost L1 experiments, through actual loading/publication, selected steps/phases, measured stop/drain, exact outcome reconciliation, record/full timing evidence and report. Read the record and regenerate its report; verify retained histograms reproduce recorded readings. Accurately recorded production errors, dropped/refused calls, capture shedding, wrong answers and target misses do not fail smoke. Missing measurements/counters, mismatched populations, zero CPU, missing applicable scan facts and failed evidence/report handling are plumbing failures. Production criteria remain explicitly inapplicable with observed values retained; smoke PASS claims plumbing only. A separate deterministic full-mode test proves a controlled criterion miss survives judgment, record/readback, report and exit 1, and invalidity retains precedence/exit 2. Selected-step and automatic isolated prepass proof remains; invalid plumbing stops full preparation. Mode round-trips, output stays outside history and smoke cannot become a baseline after relocation. Deterministic interval/quantization/overflow/reset/drain proof and bounded known-delay, known-CPU and instrumentation-cost calibration use the actual measurement path with independent references and justified tolerances, without synthetic host load or a side runner. Normal readout absence, non-loopback refusal and snapshot privacy remain. | REQ-007, REQ-008, REQ-013, REQ-015, INV-006, INV-010 |
+| AC-014 — Maintainer checks the engine limits | Clean full L1 on the reference host passes Verification 64-client latency, Bifrost hot and Parquet point-lookup p99 <5 ms at 64 clients, the OTLP spans ≥30 MiB/CPU-s floor and Gateway <500 µs overhead at 64 clients, with unchanged limits, exact results and existing tenancy/durability journeys green. Before/after records and the diagnostic run that located each cost. | REQ-021, INV-001, INV-002 |
+| AC-013 — Maintainer establishes regression evidence | Only after AC-014 passes, two clean full suites establish reviewed same-method references; latency/throughput-core/CPU-work regression cases fail correctly. Same-build export and `--client-trace-ratio` tenant-recording comparisons quantify overhead, and a nonzero ratio record is refused as a reference; diagnostic traces and profile reproduce the documented investigation workflow without becoming references. | REQ-011, REQ-012, REQ-019, REQ-020, REQ-022 |
 
 Implementation planning must select exact focused commands and evidence under
 these decisions; a proposed task is not a claim that its tests already pass.
@@ -895,6 +947,13 @@ proposal. The proposed dependency order is:
 1. [TASK-003: production tracing](tasks/TASK-003-production-tracing.md).
 2. [TASK-004: independent server timing](tasks/TASK-004-server-benchmark-timing.md).
 3. [TASK-005: complete regression suite](tasks/TASK-005-regression-matrix.md).
+
+Revision 11 adds one revision task after TASK-005. It drops `writes-hot`,
+applies the L1 turnaround, smoke reuse and `--client-trace-ratio` changes,
+makes the REQ-021 optimizations, and runs only L1: the limit checks, the
+telemetry comparison and reference qualification. The contended L2
+calibration and the full L2 runs follow in a later task; the revision task
+does not run L2. TASK-005's recorded evidence remains history.
 
 Revision 8 replaced remaining execution instructions in TASK-001, TASK-002 and the
 TASK-001-R1 refinement. Existing implemented fixes,
@@ -931,7 +990,8 @@ reports remain evidence under their recorded authority, not current instructions
 
 ## Open material decisions
 
-No material decision remains open. Revision 8's approval and the directed
+No material decision remains open in revision 11; the maintainer decided all
+five items on 2026-10-26. Revision 8's approval and the directed
 real-path smoke workflow persist; the maintainer explicitly approved revision
 10's plumbing-only verdict and separate controlled judgment proof. Private
 scaling choices remain implementation-owned.
@@ -1015,6 +1075,17 @@ not a reason to invent a reference or weaken coverage.
   F7 as written and prove ordinary full-mode judging separately with controlled
   results. F8 calibration and full benchmark criteria remain unchanged. Approved
   by that explicit direction; no additional approval is requested.
+
+- Revision 11 — 2026-10-26: TASK-005's real runs (recorded in its V6–V9
+  evidence) showed that the `writes-hot` override let the write workload
+  exhaust host memory, that L1 took far longer than fast feedback allows, that
+  four declared limits miss on the reference host, that isolated L1 capacity
+  overstates contended L2 ingest, and that the driver had no way to exercise
+  sampled-client tenant recording. The maintainer decided: drop `writes-hot`;
+  ≤5 minutes per L1 experiment command at 1 and 64 clients with 3 × 5 s
+  windows where sample floors hold and same-commit smoke reuse; keep the limits
+  and optimize the engines in this change (REQ-021); calibrate L2 under
+  contention; add `--client-trace-ratio` (REQ-022). Draft awaiting approval.
 
 Authority (plain repository references):
 

@@ -25,9 +25,7 @@ and hot writes nearly exhausted memory. After, L1 uses 1 and 64 clients, reuses
 an eligible same-commit smoke PASS, and qualifies performance evidence only when
 all unchanged limits, correctness and validity checks pass.
 
-**Approval dependency:** revision 11 is currently **draft**. The maintainer
-explicitly requested planning against it; this proposed task is not executable
-until the maintainer approves revision 11. TASK-005 supplies the implemented
+**Approval dependency:** the maintainer approved revision 11 on 2026-10-26. TASK-005 supplies the implemented
 foundation and historical evidence, not a claim that its blocked qualification
 or L2 obligations completed. No additional task is created by this packet.
 
@@ -518,8 +516,7 @@ suite. Record commands once and link scenario evidence here.
 
 ## Material Stop Conditions
 
-- Revision 11 has not been explicitly approved: task stays proposed; planning
-  does not approve it. A changed revision requires remapping before execution.
+- A later spec revision requires remapping before execution.
 - Meeting a limit requires different measured work, fixture/host, weakened
   sample/validity/latency rules, altered authorization/admission/durability,
   trace policy or public/persistent contract: return to specification authority.
@@ -533,10 +530,9 @@ suite. Record commands once and link scenario evidence here.
 
 ## Authority Links
 
-- [Spec revision 11, draft pending maintainer approval](../spec.md), especially
+- [Spec revision 11, approved 2026-10-26](../spec.md), especially
   Delivery and supersession, fast L1, comparable baselines, engine limits and
-  sampled-client tracing. Current user direction authorizes this proposed plan
-  before approval and explicitly limits execution to L1.
+  sampled-client tracing. Current user direction limits execution to L1.
 - [TASK-005 evidence](TASK-005-regression-matrix.md): V6–V9, Scenario 2a case
   mapping/instrumentation audit, spec revision request and maintainer decisions.
 - [Spec-driven development](../../../spec-driven-development.md) and

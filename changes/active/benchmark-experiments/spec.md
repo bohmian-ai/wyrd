@@ -1,7 +1,7 @@
 ---
 id: SPEC-benchmark-experiments
 revision: 11
-status: draft
+status: approved
 ---
 
 # Benchmarks as experiments
@@ -10,7 +10,7 @@ Revision 11 applies five maintainer decisions from TASK-005's real runs: drop
 `writes-hot`, make each L1 experiment command finish within 5 minutes, bring
 the engine optimizations needed to meet the unchanged limits into this change,
 calibrate Bifrost L2 under contention, and add a sampled-client `traceparent`
-driver option. It is a draft awaiting approval.
+driver option. The maintainer approved it on 2026-10-26.
 
 Revision 10 records the maintainer's explicit correction and approval: smoke
 checks that the actual benchmark collects, reconciles, saves and reports its
@@ -1085,7 +1085,8 @@ not a reason to invent a reference or weaken coverage.
   ≤5 minutes per L1 experiment command at 1 and 64 clients with 3 × 5 s
   windows where sample floors hold and same-commit smoke reuse; keep the limits
   and optimize the engines in this change (REQ-021); calibrate L2 under
-  contention; add `--client-trace-ratio` (REQ-022). Draft awaiting approval.
+  contention; add `--client-trace-ratio` (REQ-022). Approved by the
+  maintainer on 2026-10-26.
 
 Authority (plain repository references):
 

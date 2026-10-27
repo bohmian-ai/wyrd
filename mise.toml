@@ -539,6 +539,10 @@ description = "Builds the release wyrd-server and the capacity benchmark driver 
 env = { CARGO_PROFILE_RELEASE_DEBUG = "line-tables-only", RUSTFLAGS = "-C force-frame-pointers=yes" }
 run = "cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir target/profiling"
 
+[tasks."bench:results"]
+description = "Writes every recorded benchmark run under benchmarks/ into one self-contained HTML page at target/benchmarks/results.html: each experiment's question, method, results and verdict, and its runs in chronological order with a history chart per metric and step and a side-by-side comparison of chosen runs. Reads only the records; runs no benchmark."
+run = "cargo run --locked --quiet -p wyrd-testing --bin capacity -- results"
+
 [tasks."bench:smoke"]
 description = "Smoke of every default benchmark plan: `capacity l1 --smoke` (Bifrost writes-parquet, hot and parquet, Verification, Gateway) and `capacity l2 <engine> --smoke` for Bifrost, Verification and Gateway, each under its own fresh Postgres. A smoke runs the normal command's whole workflow (fixture loading and publication waits, every declared step, capacity/overload/recovery, measured stop, drain, exact reconciliation, judgment, record, timing evidence and report) at smoke-scale fixtures with one 1 s warmup and one 3 s repetition per L1 step (3 s and 36 s at L2), within a 10 min (L1) or 15 min (L2) budget. A smoke judges no criterion: readings, errors and target misses are recorded beside inapplicable criteria, so it is PASS, or INVALID when the measurement itself is broken; a busy driver does not invalidate it. Records `mode: smoke` under target/benchmarks/smoke/, never benchmarks/, and is never a calibration or baseline. Full bench:l1 and bench:l2 commands never run it first; pass --smoke to one of them to smoke just that plan. Exits with the worst result (2 over 0). Opt-in; part of no gate, CI or verify lane."
 depends = ["bench:build"]

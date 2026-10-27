@@ -9,6 +9,9 @@
 //! - `l2 <engine>`: competing open-loop work through capacity, overload, and
 //!   recovery, through `mise run bench:l2:<engine>`.
 //! - `report <record.json>`: regenerates a persisted record's report.
+//! - `results`: writes every recorded run of `benchmarks/` into one HTML
+//!   page at `target/benchmarks/results.html`, through
+//!   `mise run bench:results`.
 //!
 //! Every experiment shares one lifecycle ([`levels`] over
 //! `wyrd_testing::experiment`): a sealed declaration, quiet-host checks,
@@ -35,6 +38,9 @@ use std::process::ExitCode;
 use wyrd_testing::experiment::{Engine, Level};
 
 use crate::levels::{Context, Plan};
+
+/// Where `results` writes the results page, under the repository root.
+const RESULTS: &str = "target/benchmarks/results.html";
 
 /// Dispatches the level command the arguments name.
 fn main() -> ExitCode {
@@ -127,9 +133,22 @@ async fn dispatch(arguments: &[String], root: &Path) -> u8 {
                 }
             }
         }
+        (Some("results"), _, _) if arguments.len() == 2 => {
+            let out = root.join(RESULTS);
+            match levels::results(root, &out) {
+                Ok(records) => {
+                    println!("{records} records: {}", out.display());
+                    0
+                }
+                Err(message) => {
+                    eprintln!("capacity results: {message}");
+                    2
+                }
+            }
+        }
         _ => {
             eprintln!(
-                "capacity: expected `l1 [bifrost [writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, or `reference <record.json>...`, got {:?}",
+                "capacity: expected `l1 [bifrost [writes-parquet|hot|parquet]|verification|gateway]`, `l2 <bifrost|verification|gateway>`, `report <record.json>`, `reference <record.json>...`, or `results`, got {:?}",
                 &arguments[1.min(arguments.len())..]
             );
             2
@@ -1606,7 +1625,9 @@ mod tests {
     /// V12: the aggregate runs every engine in order with the forwarded
     /// shared flags, keeps going after a failure or an invalid run, and
     /// combines exits 2 over 1 over 0; usage errors exit 2 before any work;
-    /// and `report` regenerates a persisted record.
+    /// `report` regenerates a persisted record; and `results` writes every
+    /// history file into one page, marking one that is not a current record
+    /// and escaping embedded text.
     ///
     /// # Panics
     ///
@@ -1673,6 +1694,36 @@ mod tests {
             let arguments = line(&["report", path.to_str().expect("path")]);
             assert_eq!(dispatch(&arguments, root.path()).await, 0);
         }
+
+        let stale = root
+            .path()
+            .join("benchmarks/verification/direct-verify/19990101T000000Z-000000000.json");
+        std::fs::write(
+            &stale,
+            br#"{"schema_version": 2, "engine": "verification", "note": "</script><b>"}"#,
+        )
+        .expect("write");
+        let page = root.path().join("results.html");
+        assert_eq!(levels::results(root.path(), &page), Ok(4));
+        let html = std::fs::read_to_string(&page).expect("page");
+        assert!(!html.contains("/*RECORDS*/"), "the records fill the slot");
+        assert_eq!(
+            html.matches("</script>").count(),
+            2,
+            "embedded text cannot close the page's scripts"
+        );
+        assert_eq!(
+            html.matches(r#""problem":null"#).count(),
+            3,
+            "every published record reads as current"
+        );
+        assert_eq!(
+            html.matches(r#""problem":""#).count(),
+            1,
+            "a file that is not a current record is kept and marked"
+        );
+        assert_eq!(dispatch(&line(&["results"]), root.path()).await, 0);
+        assert!(root.path().join(super::RESULTS).is_file());
 
         let malformed = root.path().join("malformed.json");
         std::fs::write(&malformed, b"{}").expect("write");

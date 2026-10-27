@@ -1,10 +1,17 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 15
+revision: 16
 status: approved
 ---
 
 # Benchmarks as experiments
+
+Revision 16 puts the slow tail of Verification in the record. Each
+`direct-verify` repetition records its maximum overhead, how many executions
+exceeded 0.5, 1, 5 and 10 ms of overhead, and the p99 and maximum of each
+execution phase, all from the same server HDR timing. One HTML page renders
+every record and charts each experiment's history in chronological order. The
+maintainer approved this on 2026-10-26.
 
 Revision 15 decouples smoke from full runs. A full command runs only its full
 experiment; smoke runs only when asked, through `--smoke` on the same command
@@ -253,6 +260,14 @@ Nanosecond representation is not a claim of nanosecond clock accuracy. A value
 outside the configured range, a failed recording, overflow, counter reset or an
 unreconciled population makes the affected measurement INVALID; never clamp.
 Zero-duration observations must remain represented and counted explicitly.
+
+Verification `direct-verify` also records, per repetition and from the same
+HDR timing, the maximum overhead, the count of executions whose overhead
+exceeded 0.5, 1, 5 and 10 ms (bounded by the histogram bucket that straddles
+each threshold), and the p99 and maximum of each execution phase (`admit`,
+`load`, `prepare`, `engine`, `stage`, and `outside` every phase). Each phase is
+recorded under the same lock as its request. Phase readings are diagnostic:
+phases overlap, are never summed, and never judge or invalidate a run.
 
 The server timing owner extends the already installed HDR capability, not the
 coarse production Prometheus buckets. Do not install a second global metrics
@@ -701,6 +716,13 @@ are rendered from the same record as supporting detail. Reports can be
 regenerated without rerunning the experiment or loading full distributions. Console
 and regenerated summaries must agree with JSON, including FAIL and INVALID.
 
+`capacity results` renders every record under `benchmarks/` into one
+self-contained HTML page under `target/`, read from the records alone. It
+states each experiment's question, method, per-step results with every
+repetition, criteria and verdict; charts any metric of any step across runs in
+chronological order against its limit; and compares selected runs side by side.
+A file that does not read as a current record is shown as stored and marked.
+
 ### Shared owner and retirement
 
 **REQ-015 — Reuse and consolidation.** Use one `experiment` module in
@@ -1125,6 +1147,12 @@ not a reason to invent a reference or weaken coverage.
   smoke-record reuse; smoke runs only through `--smoke` or `bench:smoke`; a
   smoke does not judge driver saturation, which full runs still enforce.
   Directed by the maintainer on 2026-10-26.
+- Revision 16 — 2026-10-26: Verification's slow tail was visible only in
+  side files outside the record, and history could be compared only by reading
+  JSON. The maintainer decided: the record carries maximum overhead,
+  over-threshold counts and per-phase p99/max from server HDR timing, and one
+  HTML page renders and compares history from records only. Approved by the
+  maintainer on 2026-10-26.
 
 Authority (plain repository references):
 

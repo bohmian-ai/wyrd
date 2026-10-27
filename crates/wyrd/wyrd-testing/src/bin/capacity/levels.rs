@@ -387,6 +387,91 @@ pub fn report(path: &Path) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+/// The results page; [`results`] replaces its [`RESULTS_SLOT`] with the
+/// records it shows.
+const RESULTS_PAGE: &str = include_str!("results.html");
+
+/// The placeholder in [`RESULTS_PAGE`] the records replace.
+const RESULTS_SLOT: &str = "/*RECORDS*/[]";
+
+/// Writes one self-contained HTML page of every record in `root`'s
+/// `benchmarks/<engine>/<experiment>/` history to `out` and returns how
+/// many it holds. The page renders each record and compares the runs of
+/// one experiment in chronological order; it reads nothing else.
+///
+/// Each record is embedded as the recorder reads it. A file that does not
+/// read as a current record is embedded as stored with the reason, so the
+/// page shows it marked rather than hiding history.
+///
+/// # Errors
+///
+/// Returns a message when the history cannot be listed, a file cannot be
+/// read or is not JSON, or the page cannot be written.
+pub fn results(root: &Path, out: &Path) -> Result<usize, String> {
+    let history = root.join("benchmarks");
+    let mut paths = Vec::new();
+    for engine in children(&history)? {
+        for experiment in children(&engine)? {
+            paths.extend(
+                children(&experiment)?
+                    .into_iter()
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "json")),
+            );
+        }
+    }
+    paths.sort();
+    let entries = paths
+        .iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let (record, problem) = match Record::parse(&text) {
+                Ok(record) => (
+                    serde_json::to_value(record).map_err(|error| error.to_string())?,
+                    None,
+                ),
+                Err(error) => (
+                    serde_json::from_str(&text)
+                        .map_err(|json| format!("{}: {json}", path.display()))?,
+                    Some(error.to_string()),
+                ),
+            };
+            let path = path.strip_prefix(root).unwrap_or(path);
+            Ok(json!({ "path": path, "record": record, "problem": problem }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let data = serde_json::to_string(&entries)
+        .map_err(|error| error.to_string())?
+        .replace('<', "\\u003c");
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    std::fs::write(out, RESULTS_PAGE.replacen(RESULTS_SLOT, &data, 1))
+        .map_err(|error| format!("{}: {error}", out.display()))?;
+    Ok(entries.len())
+}
+
+/// The entries of directory `path`, sorted; none when it does not exist.
+///
+/// # Errors
+///
+/// Returns a message when an existing directory cannot be listed.
+fn children(path: &Path) -> Result<Vec<PathBuf>, String> {
+    if !path.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut entries = std::fs::read_dir(path)
+        .and_then(|entries| {
+            entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()
+        })
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    entries.sort();
+    Ok(entries)
+}
+
 /// Reads two or more `--qualify-baseline` records and returns the
 /// reviewed-reference TOML they establish ([`Baselines::promote`]), for an
 /// engineer to review and commit to the engine's `baselines.toml`. It

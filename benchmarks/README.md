@@ -21,6 +21,7 @@ mise run bench:l1:gateway -- --profile --steps chat.c64
 mise run bench:l1:gateway -- --smoke # one plan at smoke scale
 mise run bench:l1:gateway -- --qualify-baseline   # a reference candidate
 target/profiling/release/capacity reference <a.json> <b.json>  # reviewed references
+mise run bench:results               # every record as one HTML page
 ```
 
 `--smoke` runs a normal command's whole workflow (fixture loading and
@@ -142,7 +143,12 @@ What each engine covers:
     Without such a record, L2 is INVALID before any work.
 - **Verification.**
   - L1 `direct-verify` runs direct verify at 1 and 64 clients. Server
-    overhead p99 must be below 500 µs at 64.
+    overhead p99 must be below 500 µs at 64. Each repetition also records
+    how many executions exceeded 0.5, 1, 5, and 10 ms of overhead, and the
+    p99 and maximum of each execution phase (`admit`, `load`, `prepare`,
+    `engine`, `stage`, and `outside`, the time outside every phase) from
+    the same server timing histograms, to locate a slow tail. Phase
+    readings are diagnostic: they never judge and never invalidate.
   - L2 `competing` overlaps direct and background verification with their
     evidence writes.
 - **Gateway.**
@@ -235,6 +241,15 @@ target/profiling/release/capacity report benchmarks/bifrost/parquet/<record>.jso
 
 Commit records worth keeping. The history in this directory is how results
 are compared over time.
+
+`mise run bench:results` writes every record here into one self-contained
+page, `target/benchmarks/results.html`, read from the records alone. For
+each experiment it shows the question, the method (host, build, timing,
+validity rules, workload), every step's results with each repetition, the
+criteria and why the verdict is what it is. Its history charts any metric of
+any step across runs in chronological order against its limit, and ticking
+runs compares them side by side. A file that does not read as a current
+record is shown as stored and marked.
 
 ## Source
 

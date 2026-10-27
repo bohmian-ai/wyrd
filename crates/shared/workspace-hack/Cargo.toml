@@ -19,11 +19,11 @@ publish = false
 ahash = { version = "0.8", features = ["serde"] }
 aho-corasick = { version = "1" }
 arrayvec = { version = "0.7" }
-arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", features = ["canonical_extension_types", "chrono-tz", "prettyprint"] }
-arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", default-features = false, features = ["chrono-tz"] }
-arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", default-features = false, features = ["prettyprint"] }
-arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", features = ["lz4", "zstd"] }
-arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", default-features = false, features = ["canonical_extension_types"] }
+arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749", features = ["canonical_extension_types", "chrono-tz", "prettyprint"] }
+arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749", default-features = false, features = ["chrono-tz"] }
+arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749", default-features = false, features = ["prettyprint"] }
+arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749", features = ["lz4", "zstd"] }
+arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749", default-features = false, features = ["canonical_extension_types"] }
 axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
@@ -148,11 +148,11 @@ zstd-sys = { version = "2", default-features = false, features = ["legacy", "std
 ahash = { version = "0.8", features = ["serde"] }
 aho-corasick = { version = "1" }
 arrayvec = { version = "0.7" }
-arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", features = ["canonical_extension_types", "chrono-tz", "prettyprint"] }
-arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", default-features = false, features = ["chrono-tz"] }
-arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", default-features = false, features = ["prettyprint"] }
-arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", features = ["lz4", "zstd"] }
-arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "3978b6dadde458809497d9084464a2d2615db054", default-features = false, features = ["canonical_extension_types"] }
+arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749", features = ["canonical_extension_types", "chrono-tz", "prettyprint"] }
+arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749", default-features = false, features = ["chrono-tz"] }
+arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749", default-features = false, features = ["prettyprint"] }
+arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749", features = ["lz4", "zstd"] }
+arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "ca5feff3b1c523640a03acaa437096b8934c3749", default-features = false, features = ["canonical_extension_types"] }
 axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }

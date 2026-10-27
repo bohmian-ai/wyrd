@@ -65,7 +65,11 @@ impl Default for ExtractLimits {
 /// Every refusal is final for these bytes; retrying cannot succeed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
-pub struct ExtractError(pub String);
+pub struct ExtractError(
+    /// Why the bytes were refused, naming the format or limit; the error
+    /// displays exactly this text.
+    pub String,
+);
 
 /// Word's table column limit; a DOCX row spanning more is malformed.
 const DOCX_MAX_COLUMNS: usize = 63;

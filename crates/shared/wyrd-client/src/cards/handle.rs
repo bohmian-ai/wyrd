@@ -294,6 +294,17 @@ impl Cards {
     /// # Errors
     /// Returns [`wyrd_loader::ArtifactUpload::prepare`]'s refusals and the
     /// declaration's errors.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future during preparation abandons the result while the
+    /// blocking preparation finishes in the background; nothing is
+    /// submitted. Dropping it after submission can leave the Card declared
+    /// but pending, its files partially uploaded, or already Active; that
+    /// server-owned state remains for reconciliation. Upload is not atomic,
+    /// and each call submits under a fresh idempotency key, so a retry is a
+    /// new declaration under the ordinary version rules rather than a
+    /// replay of the interrupted one.
     pub async fn upload_artifact(
         &self,
         source: impl AsRef<Path>,

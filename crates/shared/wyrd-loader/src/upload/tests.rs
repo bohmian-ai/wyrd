@@ -26,7 +26,11 @@ fn spec() -> ArtifactSpec {
     }
 }
 
-/// The manifest paths of `upload`.
+/// The manifest paths of `upload`'s one submission, which an Artifact
+/// upload always produces.
+///
+/// # Panics
+/// Panics when `upload` holds no submission.
 fn paths(upload: &ArtifactUpload) -> Vec<&str> {
     upload.input.submissions[0]
         .artifacts

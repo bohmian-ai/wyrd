@@ -1826,6 +1826,9 @@ impl LiveCapture {
     /// batches, its staged run paths in merge order, and the lease that keeps
     /// those runs on disk.
     ///
+    /// The batch list is sized once from the in-range sources, so a read
+    /// never regrows it.
+    ///
     /// Pruning never changes which generations the read serves: the staged
     /// half was fixed when the capture was taken, so a generation whose every
     /// batch is pruned is still not read again from its staged runs.
@@ -1844,13 +1847,19 @@ impl LiveCapture {
         required: &[FieldRef],
         pruning: Option<&crate::scan_sizing::BatchPruning>,
     ) -> Result<CapturedRead, ScribeError> {
-        let mut batches = Vec::new();
-        let mut charges = Vec::new();
-        for source in &self.memory {
-            if partitions.contains(&source.seal_key.partition.time()) {
-                source.project(required, pruning, &mut batches)?;
-                charges.push(Arc::clone(&source.charge));
-            }
+        let in_range: Vec<&ReadableSource> = self
+            .memory
+            .iter()
+            .filter(|source| partitions.contains(&source.seal_key.partition.time()))
+            .collect();
+        // Sized once: growing one batch at a time reallocates into fresh
+        // pages on every query while writes keep many batches live.
+        let mut batches =
+            Vec::with_capacity(in_range.iter().map(|source| source.batches.len()).sum());
+        let mut charges = Vec::with_capacity(in_range.len());
+        for source in in_range {
+            source.project(required, pruning, &mut batches)?;
+            charges.push(Arc::clone(&source.charge));
         }
         let runs = self
             .staged
@@ -2296,7 +2305,8 @@ mod tests {
 
     /// A capture read that projects every written column, in order and
     /// uncast, shares each batch's recorded bounds instead of copying them,
-    /// and a narrower projection copies only its columns' bounds.
+    /// and a narrower projection copies only its columns' bounds. Either read
+    /// sizes its batch list exactly to the captured batches.
     ///
     /// # Panics
     ///
@@ -2327,12 +2337,12 @@ mod tests {
         let partitions = key.partition.time()..=key.partition.time();
         let recorded = Arc::clone(&capture.memory[0].statistics[0]);
         let read = |fields: &[FieldRef]| {
-            capture
+            let mut batches = capture
                 .read(&partitions, fields, None)
                 .expect("capture read")
-                .batches
-                .remove(0)
-                .statistics
+                .batches;
+            assert_eq!(batches.capacity(), 1, "the batch list is sized once");
+            batches.remove(0).statistics
         };
 
         assert!(Arc::ptr_eq(&read(schema.fields()), &recorded));

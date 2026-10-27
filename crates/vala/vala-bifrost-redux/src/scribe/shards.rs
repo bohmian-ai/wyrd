@@ -6845,10 +6845,7 @@ mod tests {
                 batch_id,
                 request_id: uuid::Uuid::now_v7(),
                 ingested_at_micros: 0,
-                rows: crate::scribe::preprocess::AdmittedRows::Projected(
-                    owner_prepared_batch(),
-                    None,
-                ),
+                rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
                 measured_wire_bytes: initial_bytes,
                 reservation,
                 memory,

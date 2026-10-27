@@ -402,8 +402,7 @@ impl ScribeImpl {
                     expanded_limit_bytes: self.ingest_limits.expanded_bytes(),
                 })))
             }
-            IngressPayload::Canonical(mut canonical) => {
-                let known = canonical.logical_identity.take();
+            IngressPayload::Canonical(canonical) => {
                 let rows = self
                     .ingress_cpu
                     .decode(
@@ -428,10 +427,7 @@ impl ScribeImpl {
                         limit: material_limit,
                     });
                 }
-                // Only an identity whose inputs survived decode travels on, so
-                // a cast column's original buffers are released here.
-                let known = known.filter(|known| known.for_rows(&rows).is_some());
-                Ok(AdmittedRows::Projected(rows, known))
+                Ok(AdmittedRows::Projected(rows))
             }
         }
     }
@@ -1153,7 +1149,6 @@ fn unclaimed_retry(frame: &ScribeIngressFrame) -> ScribeIngressFrame {
                 IngressPayload::Canonical(crate::contracts::CanonicalIngress {
                     batches: canonical.batches.clone(),
                     owner: None,
-                    logical_identity: canonical.logical_identity.clone(),
                 })
             }
         },

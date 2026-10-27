@@ -40,7 +40,7 @@ pub use crate::gate::limits::{IngestLimits, OtlpWireLimits};
 use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
-use crate::scribe::preprocess::LogicalIdentity;
+use crate::scribe::preprocess::logical_data_identity;
 use crate::tables::{
     CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable, TableError,
 };
@@ -119,7 +119,7 @@ fn record_write_rejection(error: &IngestError) {
 /// (the pair Scribe stamps on the rows), the logical table FQN,
 /// the accepted `context` — workload root and deployment environment — that
 /// the shared dimensions are stamped from, and the canonical batch's logical
-/// Arrow digest from [`LogicalIdentity`], which binds the batch's accepted
+/// Arrow digest from [`logical_data_identity`], which binds the batch's accepted
 /// correlation columns. The logical digest omits the per-request managed
 /// columns (request id, ingest time) that change across a legitimate retry,
 /// so a genuine replay still converges;
@@ -145,9 +145,8 @@ fn otlp_batch_id(
     publisher: Attribution,
     context: [Option<&str>; 2],
     table: &TableRef,
-    identity: &LogicalIdentity,
+    logical_digest: &[u8; 32],
 ) -> Uuid {
-    let logical_digest = identity.digest();
     let mut digest = Sha256::new();
     digest.update(b"wyrd.otlp.batch-id.v1");
     digest.update(tenant.as_uuid().as_bytes());
@@ -988,7 +987,8 @@ impl<A: GateAudit + 'static> Gate<A> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let identity = LogicalIdentity::of(&batch).map_err(IngestError::from_scribe)?;
+        let (logical_digest, _) =
+            logical_data_identity(&batch).map_err(IngestError::from_scribe)?;
         let batch_id = otlp_batch_id(
             auth.tenant,
             auth.attribution(),
@@ -997,18 +997,15 @@ impl<A: GateAudit + 'static> Gate<A> {
                 auth.deployment_environment.as_deref(),
             ],
             &table,
-            &identity,
+            &logical_digest,
         );
         let dimensions = self
             .frame_dimensions(auth, attributed_cards.as_deref())
             .await?;
-        let payload = IngressPayload::Canonical(
-            match owner {
-                Some(owner) => CanonicalIngress::new(vec![batch], owner),
-                None => CanonicalIngress::unreserved(vec![batch]),
-            }
-            .with_logical_identity(identity),
-        );
+        let payload = IngressPayload::Canonical(match owner {
+            Some(owner) => CanonicalIngress::new(vec![batch], owner),
+            None => CanonicalIngress::unreserved(vec![batch]),
+        });
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         scribe
             .ingest_frame(ScribeIngressFrame {
@@ -3141,9 +3138,9 @@ mod otlp_batch_id_tests {
         let spans = TableRef::new(BifrostNamespace::Traces, "spans");
         let records = TableRef::new(BifrostNamespace::Logs, "records");
         let in_context = |context, tenant, principal, table: &TableRef, values: &[i32], run| {
-            let identity = crate::scribe::preprocess::LogicalIdentity::of(&batch(values, run))
+            let (logical_digest, _) = super::logical_data_identity(&batch(values, run))
                 .expect("the fixture batch has a logical identity");
-            otlp_batch_id(tenant, principal, context, table, &identity)
+            otlp_batch_id(tenant, principal, context, table, &logical_digest)
         };
         let id = |tenant, principal, table: &TableRef, values: &[i32], run| {
             in_context([None, None], tenant, principal, table, values, run)

@@ -638,3 +638,12 @@ REQ-025 it is not removed and identity semantics are unchanged. No code
 change, so no before/after run. Other SHA-256 users in the same profile
 (WAL append, Parquet artifact sealing, staging, remote verification, Forge
 promotion) digest different data and are outside 7(d).
+
+With the maintainer's agreement, the Gate→Scribe identity hand-off was then
+deleted (`LogicalIdentity`, `CanonicalIngress::with_logical_identity`, the
+ingress and slice `for_rows` checks, and their reuse test). OTLP frames are
+always frame-attributed, so `principal_column` stamps fresh principal arrays
+and `for_rows` could never match. Gate keeps `logical_data_identity` for the
+OTLP batch id, and each slice computes its own digest, as it already did.
+148 `vala-bifrost-redux` lib tests (preprocess, gate, ingress, shards,
+execution lanes, under the repository Postgres) pass. Lints are clean.

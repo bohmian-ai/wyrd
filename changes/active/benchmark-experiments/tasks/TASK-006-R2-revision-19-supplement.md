@@ -337,3 +337,45 @@ these changes and measure subsequent work separately.
 - **Fix site:** that closed set, the one owner every engine's labels pass
   through. The new `query::tests::every_benchmark_case_is_declared_to_the_server`
   checks every write and read case the capacity driver declares (4bab4d7ff).
+
+### Item 11: profile analysis of the 2026-10-27 parquet run
+
+- **Profile:** `../benchmark-experiments/target/benchmarks/bifrost/parquet/20261027T140911Z/profiles/`.
+  - Its recorded binary (build id `b5791094…`) was since rebuilt, so the
+    profile was symbolicated against the rebuilt one by per-region address
+    offsets, accepted only where the return address follows a call
+    instruction (99.98% on an exact-match control, 7% unshifted).
+  - 5.3–5.5% of leaf samples stay unsymbolicated.
+  - The samples were segmented per step from the record's timing `taken_ns`
+    windows: point-c64 is profile seconds 25.5–39.5, span-trace-c64 is
+    136–150.
+- **Supported explanation:** CPU saturation. In both c64 windows the server
+  is on-CPU on 29 of 32 cores, 99.4% of it in tokio workers.
+  - CPU per query: about 4.3 ms (point) and 7.4 ms (span).
+  - Server p50/p99 is 6.1/13.1 ms (point) and 13.4/24.2 ms (span), against
+    2.1/3.2 and 3.2/4.4 ms at one client: queries wait for cores.
+  - Lock self time is under 2%. Off-CPU waiting is not sampled, which is a
+    stated gap.
+- **Largest costs (inclusive):**
+
+  | Cost | point-c64 | span-trace-c64 |
+  |---|---|---|
+  | ZSTD page decompression (`decode_page`) | 31.8% | 13.2% |
+  | Row-filter evaluation | 40% | 10.6% |
+  | `skip_records` decode-then-skip | 13.9% | 6.7% |
+  | Row-group statistics pruning | — | 10% |
+  | Bloom filter loading | — | 6.2% |
+
+  Allocator self time is 16% / 23%.
+- **Planning (item 12):** `create_physical_plan` is 8.5% / 9.0%, of which
+  2.6% is Iceberg `Table::scan` → `available_parallelism` per query.
+  `SessionState::optimize` is 4.8% / 7.3% and SQL parsing about 1.5%.
+  - DataFusion planning is about 10–13% of server CPU, from a subtraction
+    estimate (the exact breakdown pass did not finish).
+  - Planning is therefore a material cost, but a smaller one than page
+    decode.
+- **Evidence gaps:** the 025401Z span-trace-c64 window was not aggregated,
+  and the planning share above is a subtraction estimate.
+- **Chosen direction:** reduce decompression per lookup first. The byte-range
+  cache holds compressed pages, and data pages use the default size
+  (`parquet/writer_properties.rs`). No change has been made or measured yet.

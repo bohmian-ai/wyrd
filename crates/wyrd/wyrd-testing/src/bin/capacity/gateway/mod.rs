@@ -56,7 +56,7 @@ pub const CLIENTS: [usize; 2] = [1, 64];
 /// The client count the fixed overhead SLO applies at.
 pub const SLO_CLIENTS: usize = 64;
 
-/// The strict L1 overhead p99 limit, milliseconds; equality fails.
+/// The strict L1 overhead p99 limit, milliseconds; equality misses.
 pub const OVERHEAD_LIMIT_MS: f64 = 0.5;
 
 /// The declared server process whose CPU every repetition sums.

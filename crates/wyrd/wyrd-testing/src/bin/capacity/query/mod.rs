@@ -102,7 +102,7 @@ const SMOKE_INGEST_ROWS_PER_S: f64 = 20_000.0;
 /// window's rows continue past it, so every repetition writes fresh rows.
 pub const WRITE_FIXTURE_ROWS: i64 = 2_000_000;
 
-/// Strict point-lookup p99 objective, milliseconds; equality fails.
+/// Strict point-lookup p99 objective, milliseconds; equality misses.
 pub const POINT_P99_MS: f64 = 5.0;
 
 /// Native write peak sanity floor, rows per second.
@@ -110,6 +110,11 @@ pub const NATIVE_PEAK_FLOOR: f64 = 200_000.0;
 
 /// OTLP write peak sanity floor, encoded wire MiB per server CPU-second.
 pub const OTLP_PEAK_FLOOR: f64 = 30.0;
+
+/// The `writes-parquet` budget, seconds: its measured windows, the
+/// publication each path waits for before the next, and its drain take
+/// about 311 s, over the L1 300 s every other experiment keeps.
+const WRITES_BUDGET_SECONDS: u64 = 420;
 
 /// The L2 experiment and step id.
 pub const COMPETING: &str = "competing";
@@ -730,9 +735,13 @@ const STORAGE_RATIO: &str = "the path's table growth in published Parquet bytes 
 /// The L1 declaration of `experiment`: its read steps and their scaling,
 /// or the write sweeps and their peaks, the exactness, error, SLO,
 /// sanity-floor, scan-fact, and settled-check criteria, within the
-/// experiment's own budget.
+/// experiment's own budget: [`WRITES_BUDGET_SECONDS`] for `writes-parquet`,
+/// the L1 budget otherwise.
 fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration {
     experiment.name().clone_into(&mut base.experiment);
+    if experiment.writes() {
+        base.timing.budget_seconds = WRITES_BUDGET_SECONDS;
+    }
     base.question = String::from(match experiment {
         Experiment::WritesParquet => {
             "Under the Parquet Scribe settings, whose windows pay for the staging and publication they cause, what does each native, OTLP spans, and OTLP logs write cost the server per CPU-second and per provisioned vCPU at 1 and 64 closed-loop clients up to its durable acknowledgement, with no error, how much publication ran and what backlog remained, and do the native and OTLP write peaks clear their sanity floors?"

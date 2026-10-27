@@ -200,7 +200,7 @@ mod tests {
     use wyrd_testing::experiment::{
         Arrivals, Declaration, Derive, Engine, ExperimentError, HostRecord, Level, Mode, Op,
         Options, Outcome, Over, Phase, Reading, Record, Repetition, Rule, Source, Status, Step,
-        StepKind, Verdict, Workload, run,
+        StepKind, Timing, Verdict, Workload, run,
     };
     use wyrd_testing::release_server::{HostLoad, PEAK_SAMPLE_INTERVAL_MS};
 
@@ -530,9 +530,16 @@ mod tests {
         let writes = experiment(query::Experiment::WritesParquet, &[], HOST);
         let hot = experiment(query::Experiment::Hot, &[], HOST);
         let parquet = experiment(query::Experiment::Parquet, &[], HOST);
-        for bifrost in [&writes, &hot, &parquet] {
+        for (bifrost, budget) in [(&writes, 420), (&hot, 300), (&parquet, 300)] {
             assert!(bifrost.refusals().is_empty(), "{:?}", bifrost.refusals());
-            assert_eq!(bifrost.timing, timing, "every L1 experiment fits 5 minutes");
+            assert_eq!(
+                bifrost.timing,
+                Timing {
+                    budget_seconds: budget,
+                    ..timing
+                },
+                "writes-parquet fits 420 s and every other L1 experiment 300 s"
+            );
             for control in ["fixture", "limits", "workload", "timing"] {
                 assert!(bifrost.controls.contains_key(control), "{control}");
             }
@@ -704,7 +711,7 @@ mod tests {
             measured.len() * 4,
             "a warmup and three repetitions per step"
         );
-        assert!(record.elapsed_seconds <= 300.0);
+        assert!(record.elapsed_seconds <= 420.0);
         let peak = record
             .steps
             .iter()

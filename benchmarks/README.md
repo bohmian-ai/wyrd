@@ -34,9 +34,10 @@ It is INVALID only when the measurement itself is broken (a missing reading
 or counter, a mismatched population, zero CPU, a failed record); a busy
 driver does not invalidate a smoke. A full command never runs a smoke first:
 run `--smoke` on the same command, or `bench:smoke` for every default plan's
-smoke. Every L1 experiment takes up to 5 minutes: Verification, Gateway,
-and each of the three Bifrost experiments, so `bench:l1:bifrost` takes up to
-15 and `bench:l1` up to 25 in all. An L2 engine takes 20 to 30 minutes.
+smoke. Every L1 experiment takes up to 5 minutes (Verification, Gateway,
+Bifrost `hot` and `parquet`) except Bifrost `writes-parquet`, which takes up
+to 7 (420 s), so `bench:l1:bifrost` takes up to 17 minutes (1,020 s) and
+`bench:l1` up to 27 in all. An L2 engine takes 20 to 30 minutes.
 
 ## Prerequisites
 
@@ -96,7 +97,7 @@ run is discarded.
 
 | Level | Shape | Windows | Budget |
 |---|---|---|---|
-| L1 | Isolated closed-loop work at 1 and 64 clients per operation | 5 s warmup, then 3 × 5 s per step; 3 × 10 s for a step whose 5 s window cannot meet its sample floor, declared in its `window_seconds` | 300 s per experiment |
+| L1 | Isolated closed-loop work at 1 and 64 clients per operation | 5 s warmup, then 3 × 5 s per step; 3 × 10 s for a step whose 5 s window cannot meet its sample floor, declared in its `window_seconds` | 300 s per experiment; 420 s for Bifrost `writes-parquet` |
 | L2 | Competing open-loop work: every repetition runs capacity → overload → recovery from equivalent state | 120 s warmup, then 3 × 360 s | 1,800 s, at least 1,200 s |
 
 What each engine covers:

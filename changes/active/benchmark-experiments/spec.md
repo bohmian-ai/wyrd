@@ -129,7 +129,7 @@ Complete, clean, unprofiled full runs retain history under either verdict.
 Performance targets are observations, never CI gates.
 
 Level 1 gives opt-in feedback within 5 minutes per experiment command, except
-`writes-parquet`, whose budget is 360 seconds.
+`writes-parquet`, whose budget is 420 seconds.
 Bifrost has separately runnable hot reads, Parquet reads and
 Parquet-configured writes; each has its own budget. Level 2 measures
 mixed traffic and background work together over 20–30 minutes per engine.
@@ -442,8 +442,8 @@ and diagnostic spans and their required client-visible catalog.
 
 **REQ-008 — Level 1, fast.** Verification `direct-verify`, Gateway `overhead`,
 and Bifrost `hot` and `parquet` each complete within 300 seconds. Bifrost
-`writes-parquet` completes within 360 seconds. `bench:l1:bifrost` has a
-960-second (16-minute) upper bound across its three experiments.
+`writes-parquet` completes within 420 seconds. `bench:l1:bifrost` has a
+1,020-second (17-minute) upper bound across its three experiments.
 L1 measures 1 and 64 clients only on every engine. Measured windows are
 3 × 5 seconds after a 5-second warmup; a case keeps 3 × 10 seconds only when
 5 seconds cannot meet its declared sample floor, and the record names which
@@ -942,8 +942,8 @@ constraints; private implementation choices remain open.
    engine-specific workload behavior remains with existing owners.
 2. **Persistent evidence:** versioned JSON schema v3, exact three-engine directory
    layout, timestamp/SHA identity, committed summaries and external raw artifacts.
-3. **Levels:** L1 experiments ≤300 seconds except writes-parquet ≤360 seconds,
-   at 1 and 64 clients; Bifrost aggregate ≤960 seconds;
+3. **Levels:** L1 experiments ≤300 seconds except writes-parquet ≤420 seconds,
+   at 1 and 64 clients; Bifrost aggregate ≤1,020 seconds;
    Bifrost L1 as three independently runnable experiments; L2 20–30 minutes
    per engine with contended in-run ingest calibration;
    three repetitions per step, defined clock boundaries, opt-in commands
@@ -984,7 +984,7 @@ MCP API that would require a new product-surface projection.
 
 | ID / situation and actor | Expected observable result / credible evidence | Obligations |
 |---|---|---|
-| AC-001 — Engineer runs one engine's L1 | Each engine command is exercised separately, and each Bifrost experiment (`writes-parquet`, `hot`, `parquet`) within its declared 300- or 360-second budget, without running a smoke first; `hot` reads show no staged or published rows and `parquet` reads show nothing left in a memtable, staging or claim. Within its budget the full matrix runs with discarded warmup and three repetitions. Engineer reads question, controls, units, per-step criteria and verdict; opens the printed JSON path and regenerates an identical report. Real Linux x86_64 release-process journey, record and report comparison. Recompute server latency bounds from retained interval histograms; changing client network delay, polling cadence or scheduled-time latency cannot change server latency judgment (driver send lateness still checks validity); verify exact values just below, equal to and above strict SLO limits, and reject missing/overflowed timing evidence and report ambiguous target bounds as unsettled without invalidation; coarse monitoring buckets cannot judge latency. Operator export disabled or lossy cannot erase complete benchmark timing. | REQ-001, REQ-003, REQ-007, REQ-008, REQ-010, REQ-013, REQ-014 |
+| AC-001 — Engineer runs one engine's L1 | Each engine command is exercised separately, and each Bifrost experiment (`writes-parquet`, `hot`, `parquet`) within its declared 300- or 420-second budget, without running a smoke first; `hot` reads show no staged or published rows and `parquet` reads show nothing left in a memtable, staging or claim. Within its budget the full matrix runs with discarded warmup and three repetitions. Engineer reads question, controls, units, per-step criteria and verdict; opens the printed JSON path and regenerates an identical report. Real Linux x86_64 release-process journey, record and report comparison. Recompute server latency bounds from retained interval histograms; changing client network delay, polling cadence or scheduled-time latency cannot change server latency judgment (driver send lateness still checks validity); verify exact values just below, equal to and above strict SLO limits, and reject missing/overflowed timing evidence and report ambiguous target bounds as unsettled without invalidation; coarse monitoring buckets cannot judge latency. Operator export disabled or lossy cannot erase complete benchmark timing. | REQ-001, REQ-003, REQ-007, REQ-008, REQ-010, REQ-013, REQ-014 |
 | AC-002 — Engineer reads a run on its own | One VALID full record, read with no other record, file or run present: its report shows every metric's median, minimum, maximum and spread, absolute and per server core, per provisioned vCPU, per second and per row or query. No report, exit or validity reads another record. | REQ-011, REQ-012 |
 | AC-003 — Engineer encounters noisy results | Repetitions 70/85/100: the report shows median 85 and spread 30; an absolute target miss reports missed and retains VALID/exit 0. Censored or straddling target readings report unsettled without invalidation. Integrity failure in any repetition gives INVALID/exit 2 regardless of median or spread. | REQ-004, REQ-012 |
 | AC-004 — Engineer cannot obtain valid evidence | Independently exercise busy preflight/post-run host (10-second samples, >10% non-benchmark CPU), any missed arrival or p99 send lateness >5 ms, insufficient samples (<1,000 p99 / <200 p95), dirty source with or without override, missing/reset CPU and budget overrun: untrusted, exit 2, reasons and partial record, no fabricated successful step. Declared dirty override is visible. Combine an invalid step and target miss: overall INVALID retains both. Dirty overrides remain INVALID. Injected resource/clock observations and runner integration; no synthetic host load. | REQ-002, REQ-004, REQ-006, INV-005, INV-007 |

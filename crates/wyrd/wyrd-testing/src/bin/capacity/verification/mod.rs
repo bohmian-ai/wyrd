@@ -43,7 +43,7 @@ pub const CLIENTS: [u64; 2] = [1, 64];
 /// The client count the strict overhead objective applies at.
 pub const OBJECTIVE_CLIENTS: u64 = 64;
 
-/// Strict server-overhead p99 objective, milliseconds; equality fails.
+/// Strict server-overhead p99 objective, milliseconds; equality misses.
 pub const OVERHEAD_LIMIT_MS: f64 = 0.5;
 
 /// Each direct execution phase the server times beside

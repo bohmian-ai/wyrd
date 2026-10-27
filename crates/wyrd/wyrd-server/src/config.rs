@@ -333,6 +333,7 @@ pub struct ScribeRuntimeConfig {
     /// retrying, and in flight. Verifier calls that would take reservations
     /// past three quarters of it are refused with retryable pressure; past
     /// all of it, unreserved writes such as audit decisions are counted lost.
+    /// Default 1,048,576, so `outbox_bytes` is the bound that normally binds.
     #[serde(default = "default_outbox_capacity")]
     pub outbox_capacity: usize,
     /// Most accounted bytes this process's Scribe outbox admits at once,

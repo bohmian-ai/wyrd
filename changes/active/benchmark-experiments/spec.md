@@ -1,10 +1,17 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 17
+revision: 18
 status: approved
 ---
 
 # Benchmarks as experiments
+
+Revision 18 measures the production binary and judges lost evidence. The
+measured `wyrd-server` builds in its own cargo invocation, so the driver's
+`test-support` features never unify into it. Each `direct-verify` repetition
+records `lost_writes`, the Scribe outbox writes lost over its window and drain
+for any reason, shed audit decisions included, and fails above zero. The
+maintainer approved this on 2026-10-27.
 
 Revision 17 makes the benchmark simple enough to read without this document.
 It is defined by the nine lines below. A requirement that says more says how,
@@ -292,6 +299,10 @@ Nanosecond representation is not a claim of nanosecond clock accuracy. A value
 outside the configured range, a failed recording, overflow, counter reset or an
 unreconciled population makes the affected measurement untrusted; never clamp.
 Zero-duration observations must remain represented and counted explicitly.
+
+Verification `direct-verify` judges every repetition by `lost_writes`, the
+growth of `outbox_events_lost_total{outbox="scribe"}` from before its window
+until after its drain; any loss fails the run.
 
 Verification `direct-verify` also records, per repetition and from the same
 HDR timing, the maximum overhead, the count of executions whose overhead

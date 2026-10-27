@@ -1221,7 +1221,9 @@ Python, TypeScript, and MCP.
 `bifrost.system.audit_log` is the authoritative retained audit history. Every
 audit event is staged in memory on the process Scribe outbox, whose one
 background writer cuts each tenant's writes into producer lanes keyed by
-request, Verifier execution, or a queued submission's idempotency key, groups a lane's slice by destination, and
+request, Verifier execution, or a queued submission's idempotency key, lets a
+lane's slice linger until its oldest write is 50 ms old or it holds 4,096 writes,
+as a Kafka producer's `linger.ms` and `batch.size` do, groups a lane's slice by destination, and
 builds each group's rows once into dense Arrow batches from the owned values
 and encoded Variants each write staged, never one batch per write. Each frame
 is encoded as Arrow IPC, which sizes and splits it and derives its batch id

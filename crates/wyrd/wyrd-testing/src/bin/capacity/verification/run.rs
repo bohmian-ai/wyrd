@@ -304,6 +304,7 @@ impl Bench {
                 ))
             })?;
         let before = timings(server).await?;
+        let first = scrape(server).await?;
         let (opened, _) = Window::open(server, SELECTION)
             .await
             .map_err(ExperimentError::workload)?;
@@ -316,6 +317,7 @@ impl Bench {
             )
             .await
             .map_err(ExperimentError::workload)?;
+        let last = scrape(server).await?;
         let mut repetition = Repetition {
             seconds: usage.seconds,
             processes: vec![PROCESS.to_owned()],
@@ -383,6 +385,7 @@ impl Bench {
         repetition.set("drain_seconds", Reading::exact(usage.drain_seconds));
         repetition.set("errors", Reading::count(measured.unexpected(None)));
         repetition.set("wrong", Reading::count(measured.wrong));
+        repetition.set("lost_writes", lost_writes(&first, &last));
         if !observed_components(telemetry) {
             repetition.invalid.push(
                 "the verification runtime recorded no component observation in the window"
@@ -958,6 +961,19 @@ async fn timings(server: &LocalServer) -> Result<TimingSnapshot, ExperimentError
 ///
 /// # Errors
 ///
+/// Scribe outbox writes lost for any reason between two scrapes, shed audit
+/// decisions included; missing when a counter went backwards.
+fn lost_writes(first: &Metrics, last: &Metrics) -> Reading {
+    let labels = ["outbox=\"scribe\""];
+    let lost = last.sum("outbox_events_lost_total", &labels)
+        - first.sum("outbox_events_lost_total", &labels);
+    if lost.is_finite() && lost >= 0.0 {
+        Reading::exact(lost)
+    } else {
+        Reading::missing("the Scribe outbox loss counter went backwards")
+    }
+}
+
 /// Returns the scrape failure as a workload error.
 async fn scrape(server: &LocalServer) -> Result<Metrics, ExperimentError> {
     server.metrics().await.map_err(ExperimentError::workload)

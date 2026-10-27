@@ -384,6 +384,11 @@ fn direct(mut base: Declaration) -> Declaration {
             "direct results whose verdict was not the expected one",
         ),
         Metric::raw(
+            "lost_writes",
+            "writes",
+            "server: `outbox_events_lost_total{outbox=\"scribe\"}` added over the window and its drain, every reason including shed audit decisions",
+        ),
+        Metric::raw(
             "overhead_p99_ms",
             "ms",
             "server: per execution, `verification.direct` elapsed less the union of its own Verifier blocks; nearest-rank bucket bounds of the server's timing histograms",
@@ -447,6 +452,7 @@ fn direct(mut base: Declaration) -> Declaration {
         .percentile(99),
         Criterion::every("no-errors", "errors", &steps, Op::Le, 0.0),
         Criterion::every("correct-verdicts", "wrong", &steps, Op::Le, 0.0),
+        Criterion::every("no-lost-evidence", "lost_writes", &steps, Op::Le, 0.0),
     ];
     base
 }

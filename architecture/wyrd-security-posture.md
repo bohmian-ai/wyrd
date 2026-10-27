@@ -772,7 +772,7 @@ engine mechanics. Permissions are blocking; audits are non-blocking. Every
 audited surface stages its decision in memory on the one process Scribe outbox
 once the decision is known, outside the operation's transaction, and never
 waits for the write. The outbox admits a finite process capacity, by writes
-(`scribe.outbox_capacity`, default 65,536) and by accounted bytes
+(`scribe.outbox_capacity`, default 1,048,576, so bytes normally bind) and by accounted bytes
 (`scribe.outbox_bytes`, default 1 GiB, counting at least every captured
 payload and object a write holds and the Arrow memory its staged rows own,
 with an immutable column every write shares resident once for the process),
@@ -785,7 +785,10 @@ over a few producer lanes, keeping one request's decisions and capture in one
 lane and one Verifier execution's inputs and result in one lane, so an
 execution's inputs commit no later than its result while different requests
 and executions are written concurrently; queued submissions sharing an
-idempotency key share a lane, so they are acknowledged in arrival order. It groups each lane's slice by
+idempotency key share a lane, so they are acknowledged in arrival order. As a
+Kafka producer lingers, a lane's slice waits until its oldest write is 50 ms old
+or it holds 4,096 writes before it is submitted, so writes staged one per
+request share one Scribe commit; producers never wait for it. It groups each lane's slice by
 destination, builds each group's server-projected rows once, encodes Arrow
 frames with content-derived batch ids, and submits them to the local Scribe or
 over the mutually authenticated peer plane to a Scribe pod. Only the local

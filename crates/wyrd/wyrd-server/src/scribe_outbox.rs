@@ -111,10 +111,28 @@ const SCRIBE_WRITERS: usize = 4;
 const SCRIBE_LANES: usize = 4;
 
 /// Default of `scribe.outbox_capacity`: the most writes the process Scribe
-/// outbox admits at once, queued, retrying, or in flight. Every write's rows
-/// are bounded by its producer's input limits, so this also bounds the
-/// outbox's memory.
-pub(crate) const SCRIBE_CAPACITY: usize = 65_536;
+/// outbox admits at once, queued, retrying, or in flight.
+///
+/// Every write is weighed by the bytes it owns, so [`SCRIBE_BYTES`] bounds
+/// the outbox's memory, as a Kafka producer's `buffer.memory` does; this
+/// count only stops a flood of near-empty writes, and is set high enough
+/// that small audit decisions are bounded by their bytes rather than shed
+/// by count during a short Scribe stall.
+pub(crate) const SCRIBE_CAPACITY: usize = 1 << 20;
+
+/// Longest a lane's oldest staged write waits for others to join its Scribe
+/// commit; see [`OutboxSink::LINGER`].
+///
+/// Each write is a durable Scribe commit whose decode, WAL append and sync,
+/// memtable insert, and identity cost nearly the same for one row as for
+/// thousands, so without lingering a tenant staging one audit decision per
+/// query commits one row per write. Producers never wait for it; only the
+/// delay before a staged row is durable and readable grows, by at most this.
+const SCRIBE_LINGER: Duration = Duration::from_millis(50);
+
+/// Staged writes at which a lane commits without lingering further; see
+/// [`OutboxSink::BATCH_ITEMS`].
+const SCRIBE_BATCH_WRITES: usize = 4_096;
 
 /// Default of `scribe.outbox_bytes`: the most accounted bytes the process
 /// Scribe outbox admits at once, as [`ScribeSink::weight`]. A quarter of it,
@@ -1510,6 +1528,8 @@ impl OutboxSink for ScribeSink {
     /// are written by several slices at once instead of waiting on one
     /// slice's acknowledgements.
     const LANES: usize = SCRIBE_LANES;
+    const LINGER: Duration = SCRIBE_LINGER;
+    const BATCH_ITEMS: usize = SCRIBE_BATCH_WRITES;
 
     /// A gateway capture and every audit decision lane by their request
     /// correlation ID, so one call's decision and capture share a lane and

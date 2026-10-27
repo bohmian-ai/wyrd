@@ -380,3 +380,30 @@ these changes and measure subsequent work separately.
 - **Chosen direction:** reduce decompression per lookup first. The byte-range
   cache holds compressed pages, and data pages use the default size
   (`parquet/writer_properties.rs`). No change has been made or measured yet.
+
+### Diagnosis: writes-parquet over its 420-second budget
+
+- **Symptom:** the clean `bench:l1:bifrost` run on 434aaf5c1 had
+  writes-parquet INVALID at 432.7 s of 420 s, and native-write-c64 lost
+  repetition 3.
+- **Evidence:** the per-step timing snapshots show about 235 s of measured
+  windows and warmups. Before each of the three later paths' c1 warmups
+  there is a gap of 61.4, 62.5 and 62.5 s.
+- **Cause:** `Residence::settle` waits until every earlier row has
+  published, which takes about 62 s under the 30 s retention whatever the
+  backlog. Item 4's `otlp-spans-1k` added a fourth path and so a third
+  settle. The 420 s budget covered only that path's windows, not its settle.
+- **Fix site:** the REQ-008 budget, raised to 480 s (Bifrost aggregate
+  1,080 s), by maintainer decision on 2026-10-27, in eaa8ad209. Shortening
+  or skipping a settle was rejected because it would break per-path CPU
+  isolation.
+
+### Acceptance evidence, items 1–5
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. VALID/INVALID only; targets reported | 466805448 | 60 capacity/experiment unit tests; parquet record `20261027T171900Z-434aaf5c1` VALID with `point-p99-slo` missed (11.2 ms) | PASS |
+| 2. writes-parquet completes every repetition within budget | ce6a6f188, eaa8ad209 (480 s) | `writes-parquet/20261027T173358Z-eaa8ad209`: VALID, 420.1 s of 480 s, native-write-c64 3/3 repetitions | PASS |
+| 3. History only for clean full runs | 7d639b0b1 | V7 publish-destination test; the three records published to `benchmarks/history` and committed on `benchmark-records` (d7426b338) | PASS |
+| 4. Small and ~1 KiB spans at 1 and 64 clients with wire B/row, rows and wire MiB per core | 5dc650807, 4bab4d7ff | `wide_spans_carry_about_one_kib_with_distinct_ids`; `every_benchmark_case_is_declared_to_the_server`; the eaa8ad209 record reports `otlp-spans` and `otlp-spans-1k` c1/c64 with `wire_bytes_per_row`, `rows_per_cpu_s` and `wire_mib_per_cpu_s` | PASS |
+| 5. Records self-contained; no reference reason | 466805448, 80167c4ed | hot `20261027T171701Z-434aaf5c1` and parquet records VALID with no reference reason; `reports_regenerate_from_persisted_records` checks server and client latency in each row | PASS |

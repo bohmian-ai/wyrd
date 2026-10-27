@@ -4,6 +4,7 @@
 
 mod context;
 mod export;
+mod log_writer;
 pub mod timing;
 
 pub use context::{
@@ -108,6 +109,9 @@ pub enum OtlpProtocol {
 pub struct TelemetryGuard {
     config: TelemetryConfig,
     tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    /// The formatted-log writer thread of [`init`]; dropping it drains the
+    /// lines still queued for stdout.
+    log_writer: Option<log_writer::LogWriter>,
 }
 
 /// Read-only representation of one finished production-pipeline span.
@@ -316,11 +320,23 @@ impl Drop for TelemetryGuard {
     /// spans, shuts down every exporter within the SDK's default timeout, and
     /// logs the processor's lifetime dropped-span total. A shutdown error is
     /// logged, never raised. Without a provider this does nothing.
+    ///
+    /// Then logs, as a final line, how many formatted lines were dropped
+    /// because stdout fell behind, and drains the lines still queued.
     fn drop(&mut self) {
         if let Some(provider) = self.tracer_provider.take()
             && let Err(e) = provider.shutdown()
         {
             tracing::warn!(error = %e, "OTLP shutdown error");
+        }
+        if let Some(writer) = self.log_writer.take() {
+            let dropped_lines = writer.dropped_lines();
+            if dropped_lines > 0 {
+                tracing::warn!(
+                    dropped_lines,
+                    "formatted log lines were dropped because stdout fell behind"
+                );
+            }
         }
     }
 }
@@ -423,6 +439,7 @@ pub fn init_test_only_no_global(config: TelemetryConfig) -> TelemetryGuard {
     TelemetryGuard {
         config,
         tracer_provider: None,
+        log_writer: None,
     }
 }
 
@@ -436,10 +453,15 @@ pub fn init_test_only_no_global(config: TelemetryConfig) -> TelemetryGuard {
 /// destination. When `config.endpoint` is set, the spans the server sampler
 /// samples are also batched to that OTLP endpoint.
 ///
+/// Formatted logs reach stdout through one writer thread behind a bounded
+/// queue, so emitting an event never blocks on stdout; a line that finds the
+/// queue full is dropped and counted, and the guard reports the count.
+///
 /// # Errors
 /// Returns an error if the sampling ratio is invalid, another Rustls
-/// provider already owns the process, a global subscriber was already
-/// installed, or the OTLP exporter fails to build.
+/// provider already owns the process, the log writer thread cannot start, a
+/// global subscriber was already installed, or the OTLP exporter fails to
+/// build.
 pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
     use opentelemetry::trace::TracerProvider as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
@@ -462,12 +484,19 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
         telemetry_resource(&config),
         operator,
     );
+    let (writer, log_writer) =
+        log_writer::LogWriter::start(std::io::stdout(), log_writer::QUEUED_LINES).map_err(
+            |error| WyrdError::Internal {
+                message: "telemetry log writer thread failed to start".to_owned(),
+                details: serde_json::json!({ "cause": error.to_string() }),
+            },
+        )?;
     subscriber(
         resolve_filter(&config),
         resolve_trace_filter(&config),
         provider.tracer("wyrd"),
         false,
-        std::io::stdout,
+        writer,
     )
     .try_init()
     .map_err(|_| WyrdError::Conflict {
@@ -477,6 +506,7 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
     Ok(TelemetryGuard {
         config,
         tracer_provider: Some(provider),
+        log_writer: Some(log_writer),
     })
 }
 
@@ -537,6 +567,7 @@ pub fn init_test_capture(
         TelemetryGuard {
             config,
             tracer_provider: Some(provider),
+            log_writer: None,
         },
         capture,
     ))
@@ -1117,6 +1148,7 @@ mod tests {
             let guard = super::TelemetryGuard {
                 config: super::TelemetryConfig::default(),
                 tracer_provider: Some(provider),
+                log_writer: None,
             };
             (guard, tracer)
         };

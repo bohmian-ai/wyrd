@@ -19,7 +19,7 @@
 //! 5. **Scribe hot object** — the staging assembly target, the smaller of the
 //!    WAL segment size and Forge's rewrite target.
 //!
-//! The shard count (`WYRD_MEM_TABLE_BUCKET_NUM`) is carried here too because
+//! The shard count (`WYRD_SCRIBE_SHARD_COUNT`) is carried here too because
 //! every shard applies the limits above independently.
 //!
 //! Forge's Iceberg rewrite target is a sixth geometry owned by `forge`, kept

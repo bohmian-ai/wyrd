@@ -345,9 +345,9 @@ pub struct ScribeRuntimeConfig {
     pub outbox_bytes: usize,
     /// Number of Scribe shards, each with its own WAL and memtable.
     ///
-    /// `WYRD_MEM_TABLE_BUCKET_NUM` overrides the file value. Default 1.
-    #[serde(default = "default_scribe_mem_table_bucket_num")]
-    pub mem_table_bucket_num: usize,
+    /// `WYRD_SCRIBE_SHARD_COUNT` overrides the file value. Default 1.
+    #[serde(default = "default_scribe_shard_count")]
+    pub shard_count: usize,
     /// Megabytes one shard's WAL segment holds before the shard rotates.
     ///
     /// `WYRD_MAX_FILE_SIZE_ON_DISK` overrides the file value. Default 512. It
@@ -1483,8 +1483,8 @@ fn default_outbox_bytes() -> usize {
 /// Bytes in one megabyte of the megabyte-valued Scribe size settings.
 const SCRIBE_MEGABYTE: u64 = 1024 * 1024;
 
-/// Returns the default for [`ScribeRuntimeConfig::mem_table_bucket_num`].
-fn default_scribe_mem_table_bucket_num() -> usize {
+/// Returns the default for [`ScribeRuntimeConfig::shard_count`].
+fn default_scribe_shard_count() -> usize {
     vala_bifrost_redux::scribe::geometry::DEFAULT_SHARD_COUNT
 }
 
@@ -1523,7 +1523,7 @@ impl Default for ScribeRuntimeConfig {
             ingest_request_bytes: default_ingest_request_bytes(),
             outbox_capacity: default_outbox_capacity(),
             outbox_bytes: default_outbox_bytes(),
-            mem_table_bucket_num: default_scribe_mem_table_bucket_num(),
+            shard_count: default_scribe_shard_count(),
             max_file_size_on_disk: default_scribe_max_file_size_on_disk(),
             max_file_size_in_memory: default_scribe_max_file_size_in_memory(),
             max_file_retention_time: default_scribe_max_file_retention_time(),
@@ -1557,8 +1557,8 @@ impl ScribeRuntimeConfig {
         }
         let rotation_values = [
             (
-                "mem_table_bucket_num",
-                u64::try_from(self.mem_table_bucket_num).unwrap_or(u64::MAX),
+                "shard_count",
+                u64::try_from(self.shard_count).unwrap_or(u64::MAX),
             ),
             ("max_file_size_on_disk", self.max_file_size_on_disk),
             ("max_file_size_in_memory", self.max_file_size_in_memory),
@@ -1655,7 +1655,7 @@ impl ScribeRuntimeConfig {
     ) -> Result<ScribeGeometry, ScribeGeometryError> {
         let on_disk_bytes = self.max_file_size_on_disk.saturating_mul(SCRIBE_MEGABYTE);
         ScribeGeometry::new(
-            self.mem_table_bucket_num,
+            self.shard_count,
             on_disk_bytes,
             self.max_file_size_in_memory.saturating_mul(SCRIBE_MEGABYTE),
             Duration::from_secs(self.max_file_retention_time),
@@ -3033,11 +3033,9 @@ impl WyrdServerConfig {
         )?
         .unwrap_or(self.bifrost.oracle.max_query_deadline_ms);
         let scribe = &mut self.bifrost.scribe;
-        scribe.mem_table_bucket_num = parse_optional_env(
-            "WYRD_MEM_TABLE_BUCKET_NUM",
-            Some(scribe.mem_table_bucket_num),
-        )?
-        .unwrap_or(scribe.mem_table_bucket_num);
+        scribe.shard_count =
+            parse_optional_env("WYRD_SCRIBE_SHARD_COUNT", Some(scribe.shard_count))?
+                .unwrap_or(scribe.shard_count);
         scribe.max_file_size_on_disk = parse_optional_env(
             "WYRD_MAX_FILE_SIZE_ON_DISK",
             Some(scribe.max_file_size_on_disk),
@@ -4213,14 +4211,14 @@ maintenance_interval_secs = 45
     fn file_target_environment_overrides_win_and_refuse_nonpositive_values() {
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         let file = from_toml_str_with_dev_oracle_opt_in(
-            "[forge]\ntarget_file_size_bytes = 268435456\n\n[bifrost.scribe]\nmem_table_bucket_num = 2\nmax_file_size_on_disk = 128\nmax_file_size_in_memory = 64\nmax_file_retention_time = 30\n",
+            "[forge]\ntarget_file_size_bytes = 268435456\n\n[bifrost.scribe]\nshard_count = 2\nmax_file_size_on_disk = 128\nmax_file_size_in_memory = 64\nmax_file_retention_time = 30\n",
         )
         .expect("file targets parse");
         assert_eq!(file.forge.target_file_size_bytes, Some(268_435_456));
         let scribe = &file.bifrost.scribe;
         assert_eq!(
             (
-                scribe.mem_table_bucket_num,
+                scribe.shard_count,
                 scribe.max_file_size_on_disk,
                 scribe.max_file_size_in_memory,
                 scribe.max_file_retention_time,
@@ -4233,7 +4231,7 @@ maintenance_interval_secs = 45
                     "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
                     Some("2147483648"),
                 ),
-                ("WYRD_MEM_TABLE_BUCKET_NUM", Some("8")),
+                ("WYRD_SCRIBE_SHARD_COUNT", Some("8")),
                 ("WYRD_MAX_FILE_SIZE_ON_DISK", Some("256")),
                 ("WYRD_MAX_FILE_SIZE_IN_MEMORY", Some("32")),
                 ("WYRD_MAX_FILE_RETENTION_TIME", Some("60")),
@@ -4245,7 +4243,7 @@ maintenance_interval_secs = 45
                 let scribe = &config.bifrost.scribe;
                 assert_eq!(
                     (
-                        scribe.mem_table_bucket_num,
+                        scribe.shard_count,
                         scribe.max_file_size_on_disk,
                         scribe.max_file_size_in_memory,
                         scribe.max_file_retention_time,
@@ -4257,7 +4255,7 @@ maintenance_interval_secs = 45
         );
         for key in [
             "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
-            "WYRD_MEM_TABLE_BUCKET_NUM",
+            "WYRD_SCRIBE_SHARD_COUNT",
             "WYRD_MAX_FILE_SIZE_ON_DISK",
             "WYRD_MAX_FILE_SIZE_IN_MEMORY",
             "WYRD_MAX_FILE_RETENTION_TIME",
@@ -4975,7 +4973,7 @@ minimum_slots = 2
             cfg.ingest_request_bytes,
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
         );
-        assert_eq!(cfg.mem_table_bucket_num, 1);
+        assert_eq!(cfg.shard_count, 1);
         assert_eq!(cfg.max_file_size_on_disk, 512);
         assert_eq!(cfg.max_file_size_in_memory, 512);
         assert_eq!(cfg.max_file_retention_time, 600);
@@ -5020,7 +5018,7 @@ minimum_slots = 2
         );
 
         // Each setting moves only its own geometry field.
-        config.mem_table_bucket_num = 4;
+        config.shard_count = 4;
         config.max_file_size_in_memory = 64;
         let narrowed = config
             .scribe_geometry(1024 * MIB)
@@ -5060,7 +5058,7 @@ minimum_slots = 2
         assert_rejected!(ingress_cpu_threads, 0);
         assert_rejected!(persistence_cpu_threads, 0);
         assert_rejected!(wal_io_threads, 0);
-        assert_rejected!(mem_table_bucket_num, 0);
+        assert_rejected!(shard_count, 0);
         assert_rejected!(max_file_size_on_disk, 0);
         assert_rejected!(max_file_size_in_memory, 0);
         assert_rejected!(max_file_retention_time, 0);

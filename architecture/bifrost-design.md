@@ -556,7 +556,7 @@ after a valid terminal.
 
 ### Shards and hierarchical ownership
 
-Each Scribe pod runs a configured number of shards (`WYRD_MEM_TABLE_BUCKET_NUM`,
+Each Scribe pod runs a configured number of shards (`WYRD_SCRIBE_SHARD_COUNT`,
 default 1, at most 256). The routing key is:
 
 ```text

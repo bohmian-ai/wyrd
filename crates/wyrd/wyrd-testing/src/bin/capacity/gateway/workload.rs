@@ -119,7 +119,7 @@ impl Tenant {
     }
 
     /// The captured call rows this tenant's administrator can read in
-    /// `vala.gateway.calls`, which only this tenant's calls may land in.
+    /// `bifrost.gateway.calls`, which only this tenant's calls may land in.
     ///
     /// # Errors
     ///
@@ -127,7 +127,7 @@ impl Tenant {
     pub async fn captured(&self) -> Result<u64> {
         let bifrost = Bifrost::connect_with(&self.admin, BifrostOptions::default()).await?;
         let result = bifrost
-            .sql("SELECT count(*) AS calls FROM vala.gateway.calls", &[])
+            .sql("SELECT count(*) AS calls FROM bifrost.gateway.calls", &[])
             .await?;
         let mut calls = 0;
         for batch in result.batches() {

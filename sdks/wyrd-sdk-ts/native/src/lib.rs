@@ -854,10 +854,10 @@ impl NativeBifrost {
         &self,
         env: Env,
         row: String,
-        card_uid: Option<String>,
+        subject_card_uid: Option<String>,
         run_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
-        let inserted = correlation(card_uid.as_deref(), run_id).and_then(|correlation| {
+        let inserted = correlation(subject_card_uid.as_deref(), run_id).and_then(|correlation| {
             crate::trace::traced(env, || self.client.insert(row.into_bytes(), correlation))
         });
         match inserted {
@@ -975,11 +975,11 @@ impl NativeBifrost {
         table: String,
         schema_json: String,
         row: String,
-        card_uid: Option<String>,
+        subject_card_uid: Option<String>,
         run_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
         let (schema, correlation) = match telemetry_schema(&schema_json)
-            .and_then(|schema| Ok((schema, correlation(card_uid.as_deref(), run_id)?)))
+            .and_then(|schema| Ok((schema, correlation(subject_card_uid.as_deref(), run_id)?)))
         {
             Ok(parsed) => parsed,
             Err(error) => return Ok(NativeLifecycleResult::failure(&error)),
@@ -1465,17 +1465,19 @@ fn telemetry_schema(schema_json: &str) -> StdResult<SchemaRef, BifrostClientErro
 ///
 /// # Errors
 ///
-/// Returns the shared validation refusal when `card_uid` is not one parsable
+/// Returns the shared validation refusal when `subject_card_uid` is not one parsable
 /// Card UID.
 fn correlation(
-    card_uid: Option<&str>,
+    subject_card_uid: Option<&str>,
     run_id: Option<String>,
 ) -> StdResult<Correlation, BifrostClientError> {
     Ok(Correlation {
-        card_uid: card_uid
+        subject_card_uid: subject_card_uid
             .map(str::parse)
             .transpose()
-            .map_err(|error| validation_error(format!("invalid cardUid: {error}"), "cardUid"))?,
+            .map_err(|error| {
+                validation_error(format!("invalid subjectCardUid: {error}"), "subjectCardUid")
+            })?,
         run_id: run_id.map(RunId::from_string),
     })
 }

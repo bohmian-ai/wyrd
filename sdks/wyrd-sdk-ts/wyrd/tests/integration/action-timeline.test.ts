@@ -66,7 +66,7 @@ test("sdk requests carry the active trace", async ({ server, state }) => {
 test("service action timeline is one connected tree", async ({ server, assistant, state }) => {
   await startTelemetry(state);
   await state.startBifrost();
-  const actions = "vala.datasets.actions";
+  const actions = "bifrost.datasets.actions";
   const admin = await Bifrost.connect({ table: TableConfig.fromJsonSchema(actions, z.object({ action: z.string() })) });
   await admin.register();
   await admin.shutdown();
@@ -153,7 +153,7 @@ test("service action timeline is one connected tree", async ({ server, assistant
     JSON.stringify(attempts),
   ).toBe(true);
   const stamped = await (await Bifrost.connect()).sql(
-    `SELECT encode(span_id, 'hex') AS span_id, sub_principal_id, act_principal_id FROM vala.traces.spans WHERE trace_id = X'${action.traceId}'`,
+    `SELECT encode(span_id, 'hex') AS span_id, sub_principal_id, act_principal_id FROM bifrost.traces.spans WHERE trace_id = X'${action.traceId}'`,
     [],
     z.object({ span_id: z.string(), sub_principal_id: z.string(), act_principal_id: z.string() }),
   );

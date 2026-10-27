@@ -471,7 +471,7 @@ Its `metadata.uid` is the Service's `uid`. Save this query as `stored-verdicts.s
 
 ```sql title="stored-verdicts.sql"
 -- Replace <uid> with the Service's metadata.uid from wyrd get.
-SELECT result_id, run_id, card_uid, verdict FROM vala.verification.results WHERE card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
+SELECT result_id, run_id, subject_card_uid, verdict FROM bifrost.verification.results WHERE subject_card_uid = '<uid>' ORDER BY ended_at DESC LIMIT 20
 
 ```
 
@@ -484,8 +484,8 @@ wyrd query --server http://127.0.0.1:8080 --file stored-verdicts.sql
 It prints one JSON row per stored verdict, newest first:
 
 ```text
-{"result_id":"<id>","run_id":"<run_id>","card_uid":"<uid>","verdict":"failed"}
-{"result_id":"<id>","run_id":"<run_id>","card_uid":"<uid>","verdict":"passed"}
+{"result_id":"<id>","run_id":"<run_id>","subject_card_uid":"<uid>","verdict":"failed"}
+{"result_id":"<id>","run_id":"<run_id>","subject_card_uid":"<uid>","verdict":"passed"}
 ```
 
 The `failed` and `passed` rows with the same `run_id` are your program's two verdicts, and that `run_id` identifies its Run. The server publishes rows shortly after the program ends: if a verdict is missing, repeat the query for up to a minute.
@@ -2343,7 +2343,7 @@ Observations go to Bifrost, the Wyrd data plane:
 | Drift samples, with `observe.submit` | `vala.drift.observations` |
 | OpenTelemetry spans, metrics, and logs | `vala.traces.spans`, `vala.metrics.points`, and `vala.logs.records` |
 
-Every row carries its `card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE` ([Errors](/wyrd/api/errors/)).
+Every row carries its `subject_card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE` ([Errors](/wyrd/api/errors/)).
 
 ## Recording is buffered
 
@@ -3555,7 +3555,7 @@ This page is generated from the error definitions in the Wyrd source.
 | `WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET` | 400 | Invalid Bifrost compaction target | Omit compaction_target_file_size_bytes to follow the deployment default, or supply at least 134217728 bytes. |
 | `WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT` | 400 | Invalid Bifrost physical layout | Declare a non-null UTC timestamp time column partitioned by hour or day plus at most two identity, bucket (2 to 1024), or truncate dimensions over string or integer columns, at most four unique scalar sort keys, and at most sixteen string, integer, or binary Bloom columns. |
 | `WYRD_VALA_400_BIFROST_INVALID_TABLE_EDIT` | 400 | Invalid Bifrost table edit | Describe the table and send at least one effective change: nullable top-level custom columns to add, existing top-level custom columns to rename to unused names, or partition, sort, and Bloom lists. |
-| `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` | 400 | Reserved system column name | Rename the column; run_id, card_uid, principal_id, wyrd_request_id, and wyrd_ingested_at are reserved. |
+| `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` | 400 | Reserved system column name | Rename the column; workload_card_uid, subject_card_uid, run_id, sub_principal_id, act_principal_id, and every wyrd_ name are reserved. |
 | `WYRD_VALA_400_BIFROST_TENANT_ISOLATION_COLUMN_MISSING` | 400 | Tenant isolation column missing | Add the server-managed data_tenant_id Utf8 column to the physical table schema. |
 | `WYRD_VALA_400_BIFROST_UNDECLARED_FIELD` | 400 | Undeclared Bifrost field | Remove the key or declare it on the table; store open data in a Variant field. |
 | `WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE` | 400 | Unsupported Bifrost type | Use a supported Bifrost column type; store open data in a Variant field. |

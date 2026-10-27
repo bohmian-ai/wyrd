@@ -5,23 +5,23 @@ use iceberg::NamespaceIdent;
 /// Closed set of Bifrost logical namespaces a table may belong to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BifrostNamespace {
-    /// `vala.system` — retained audit history.
+    /// `bifrost.system` — retained audit history.
     Audit,
-    /// `vala.bifrost` — Bifrost's own operational tables.
+    /// `bifrost.bifrost` — Bifrost's own operational tables.
     Bifrost,
-    /// `vala.traces` — OpenTelemetry spans.
+    /// `bifrost.traces` — OpenTelemetry spans.
     Traces,
-    /// `vala.metrics` — OpenTelemetry metric points.
+    /// `bifrost.metrics` — OpenTelemetry metric points.
     Metrics,
-    /// `vala.logs` — OpenTelemetry log records.
+    /// `bifrost.logs` — OpenTelemetry log records.
     Logs,
-    /// `vala.drift` — Drift observations and per-feature result details.
+    /// `bifrost.drift` — Drift observations and per-feature result details.
     Drift,
-    /// `vala.verification` — the shared per-run Verifier verdict table.
+    /// `bifrost.verification` — the shared per-run Verifier verdict table.
     Verification,
-    /// `vala.datasets` — caller-owned dynamic tables.
+    /// `bifrost.datasets` — caller-owned dynamic tables.
     Datasets, // Redux-only variant for dynamic table namespace
-    /// Gateway capture tables such as `vala.gateway.calls`.
+    /// Gateway capture tables such as `bifrost.gateway.calls`.
     Gateway,
 }
 
@@ -40,22 +40,22 @@ impl BifrostNamespace {
         Self::Gateway,
     ];
 
-    /// The wire namespace string (e.g. `"vala.traces"`) every FQN is built from.
+    /// The wire namespace string (e.g. `"bifrost.traces"`) every FQN is built from.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Audit => "vala.system",
-            Self::Bifrost => "vala.bifrost",
-            Self::Traces => "vala.traces",
-            Self::Metrics => "vala.metrics",
-            Self::Logs => "vala.logs",
-            Self::Drift => "vala.drift",
-            Self::Verification => "vala.verification",
-            Self::Datasets => "vala.datasets",
-            Self::Gateway => "vala.gateway",
+            Self::Audit => "bifrost.system",
+            Self::Bifrost => "bifrost.bifrost",
+            Self::Traces => "bifrost.traces",
+            Self::Metrics => "bifrost.metrics",
+            Self::Logs => "bifrost.logs",
+            Self::Drift => "bifrost.drift",
+            Self::Verification => "bifrost.verification",
+            Self::Datasets => "bifrost.datasets",
+            Self::Gateway => "bifrost.gateway",
         }
     }
 
-    /// Parse a wire namespace string (e.g. `"vala.bifrost"`) into the enum.
+    /// Parse a wire namespace string (e.g. `"bifrost.bifrost"`) into the enum.
     /// Returns `None` for unknown namespaces.
     pub fn from_wire(s: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|ns| ns.as_str() == s)
@@ -114,16 +114,16 @@ impl std::fmt::Display for BifrostNamespace {
 
 /// Joins a table binding's namespace and table into the canonical Wyrd FQN.
 ///
-/// A wire `TenantTableBinding` carries its namespace either with the `vala.`
-/// root (`vala.bifrost`) or with that root already stripped
+/// A wire `TenantTableBinding` carries its namespace either with the `bifrost.`
+/// root (`bifrost.bifrost`) or with that root already stripped
 /// (`oracle::tail_discovery::wire_binding`), so every consumer that has to name the
 /// catalog's closed namespace set normalizes through this one function rather
 /// than guessing which producer built the binding it holds.
 pub(crate) fn canonical_table_name(namespace: &str, table: &str) -> String {
-    if namespace.starts_with("vala.") {
+    if namespace.starts_with("bifrost.") {
         format!("{namespace}.{table}")
     } else {
-        format!("vala.{namespace}.{table}")
+        format!("bifrost.{namespace}.{table}")
     }
 }
 
@@ -173,11 +173,20 @@ mod tests {
         }
     }
 
+    /// The `Datasets` namespace renders as `bifrost.datasets` and resolves back from
+    /// both its wire spelling and its bare domain namespace.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rendered name or either lookup differs from `Datasets`.
     #[test]
     fn bifrost_namespace_datasets_variant_round_trips() {
         let datasets = BifrostNamespace::Datasets;
-        assert_eq!(datasets.as_str(), "vala.datasets");
-        assert_eq!(BifrostNamespace::from_wire("vala.datasets"), Some(datasets));
+        assert_eq!(datasets.as_str(), "bifrost.datasets");
+        assert_eq!(
+            BifrostNamespace::from_wire("bifrost.datasets"),
+            Some(datasets)
+        );
         assert_eq!(
             BifrostNamespace::from_domain_namespace("datasets"),
             Some(datasets)

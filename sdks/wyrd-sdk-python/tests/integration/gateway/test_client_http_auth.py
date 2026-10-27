@@ -29,7 +29,7 @@ from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
 
 from ..support import Receiver, client_of, declare, pull, service_key
-from .support import PROVIDER_KEY, assert_upstream_credentials, calls, deploy
+from .support import PROVIDER_KEY, access_token, assert_upstream_credentials, calls, deploy
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -308,12 +308,74 @@ def test_state_http_auth_supplies_service_and_agent_context(
         assert not any(name.startswith(("x-wyrd", "wyrd-")) for name in delivery.headers)
         assert key not in repr(delivery.headers)
 
-    rows = calls(server, "TRUE", "card_uid, run_id, outcome")
-    assert [(str(row["card_uid"]), row["run_id"], row["outcome"]) for row in rows[:3]] == [
+    rows = calls(server, "TRUE", "subject_card_uid, run_id, outcome")
+    assert [(str(row["subject_card_uid"]), row["run_id"], row["outcome"]) for row in rows[:3]] == [
         (service, None, "succeeded"),
         (service, service_run.run_id, "succeeded"),
         (agent, agent_run.run_id, "succeeded"),
     ]
-    assert sorted((str(row["card_uid"]), row["run_id"]) for row in rows[3:]) == sorted(
+    assert sorted((str(row["subject_card_uid"]), row["run_id"]) for row in rows[3:]) == sorted(
         (agent, run_id) for run_id in concurrent_runs
     )
+
+
+def test_configured_gateway_calls_have_canonical_dimensions(
+    backends: tuple[WyrdTestServer, Receiver], tmp_path: Path
+) -> None:
+    server, upstream = backends
+    cards = Cards(client_of(server))
+    declare(cards, "cards/observe_a_run/configured-service.yaml")
+    bundle = pull(cards, "configured-service", tmp_path)
+    key = service_key("configured-service", client=client_of(server))
+    state = WyrdState.from_path(bundle, client_of(server, key))
+    state.configure(deployment_environment="prod")
+    service, agent = state.root_ref.uid, state.card_ref("agent").uid
+    assert service is not None and agent is not None
+    bound = openai.OpenAI(
+        base_url=f"{server.base_url}/v1",
+        api_key="wyrd",
+        http_client=openai.DefaultHttpxClient(auth=state.http_auth),
+        max_retries=0,
+    )
+    token = access_token(server, key)
+    explicit = anthropic.Anthropic(
+        base_url=server.base_url,
+        api_key=token,
+        default_headers={
+            "x-wyrd-workload-uid": service,
+            "wyrd-card-uid": agent,
+            "wyrd-run-id": "explicit-run",
+        },
+        max_retries=0,
+    )
+
+    bound.chat.completions.create(model="openai/gpt-4o", messages=MESSAGES)
+    with state.run("agent") as agent_run:
+        bound.chat.completions.create(model="openai/gpt-4o", messages=MESSAGES)
+    explicit.messages.create(
+        model="anthropic/claude-sonnet-5",
+        max_tokens=16,
+        messages=MESSAGES,
+        extra_headers={"x-wyrd-deployment-environment": "staging"},
+    )
+    explicit.messages.create(model="anthropic/claude-sonnet-5", max_tokens=16, messages=MESSAGES)
+
+    for delivery in upstream.deliveries:
+        assert not any(name.startswith(("x-wyrd", "wyrd-")) for name in delivery.headers)
+        assert token not in repr(delivery.headers)
+    rows = calls(
+        server,
+        "TRUE",
+        "CAST(workload_card_uid AS VARCHAR) AS workload, service_name, service_version, "
+        "deployment_environment, subject_kind, subject_name, subject_version, "
+        "CAST(subject_card_uid AS VARCHAR) AS subject, run_id",
+    )
+    owner = (service, "configured-service", "1.0.0")
+    as_service = ("Service", "configured-service", "1.0.0", service)
+    as_agent = ("Agent", "observed-agent", "1.0.0", agent)
+    assert [tuple(row.values()) for row in rows] == [
+        (*owner, "prod", *as_service, None),
+        (*owner, "prod", *as_agent, agent_run.run_id),
+        (*owner, "staging", *as_agent, "explicit-run"),
+        (*owner, None, *as_agent, "explicit-run"),
+    ]

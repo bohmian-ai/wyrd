@@ -118,12 +118,12 @@ pub struct BifrostTableDescription {
     pub user_fields: Vec<FieldSpec>,
     /// The correlation inputs a writer supplies alongside its user fields.
     ///
-    /// Exactly nullable `card_uid: Utf8` then nullable `run_id: Utf8`, each
+    /// Exactly nullable `subject_card_uid: Utf8` then nullable `run_id: Utf8`, each
     /// with the field id its physical column holds.
     ///
-    /// Card correlation is optional, so a writer may omit `card_uid` entirely;
+    /// Card correlation is optional, so a writer may omit `subject_card_uid` entirely;
     /// the server then stores the row with its authenticated subject/actor
-    /// pair and a null `card_uid`. A supplied UID is stored only once the server has
+    /// pair and a null `subject_card_uid`. A supplied UID is stored only once the server has
     /// confirmed the writer may correlate to that Card.
     pub correlation_fields: Vec<FieldSpec>,
     /// Lower-case 64-character hex of the complete canonical physical
@@ -536,7 +536,7 @@ pub struct RegisterTableRequest {
     pub namespace: String,
     /// Table name.
     pub name: String,
-    /// User fields only; `wyrd_*`, `card_uid`, `run_id`, `sub_principal_id`, and
+    /// User fields only; `wyrd_*`, `workload_card_uid`, `subject_card_uid`, `run_id`, `sub_principal_id`, and
     /// `act_principal_id` reserved names are rejected.
     pub fields: Vec<FieldSpec>,
     /// Optional physical layout declaration.
@@ -2595,7 +2595,7 @@ pub enum AuditOutcome {
 ///
 /// `card_ref` is the **writer-identity card** (who performed the op), derived
 /// from the resolved `Principal`; it is `None` only for a `User` principal.
-/// This is decoupled from the per-row `card_uid` data column.
+/// This is decoupled from the per-row `subject_card_uid` data column.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct AuditEvent {
@@ -2766,10 +2766,18 @@ mod bifrost_wire_tests {
         assert!(minimal.metadata.is_empty());
     }
 
+    /// A field's `wyrd:column_class` metadata survives the wire round trip, so a
+    /// correlation column keeps its class between SDK and server.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the field spec fails to serialize, deserialize, or compare
+    /// equal after the round trip, or the decoded metadata no longer names the
+    /// column `correlation`.
     #[test]
     fn bifrost_wire_field_spec_carries_correlation_metadata() {
         let mut spec = FieldSpec {
-            name: "card_uid".to_string(),
+            name: "subject_card_uid".to_string(),
             data_type: DataTypeSpec::Utf8,
             nullable: true,
             metadata: BTreeMap::default(),
@@ -2785,10 +2793,15 @@ mod bifrost_wire_tests {
 
     /// An omitted `physical_layout` stays `None` on the wire so the server can
     /// distinguish "no declaration" (defaults apply) from an explicit object.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request fails to deserialize or serialize, decodes a
+    /// `physical_layout`, or re-encodes with a `physical_layout` key.
     #[test]
     fn bifrost_wire_register_request_omits_physical_layout() {
         let req: RegisterTableRequest =
-            serde_json::from_str(r#"{"namespace":"vala.bifrost","name":"events","fields":[]}"#)
+            serde_json::from_str(r#"{"namespace":"bifrost.bifrost","name":"events","fields":[]}"#)
                 .expect("deserialize");
         assert!(req.physical_layout.is_none());
         let json = serde_json::to_string(&req).expect("serialize");
@@ -2801,10 +2814,16 @@ mod bifrost_wire_tests {
     /// The wire distinction between `None` and an explicit object survives; what
     /// the server no longer distinguishes is an empty `sort_keys` from an
     /// omitted one, which both resolve to the canonical event-time default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request fails to deserialize, decodes without a layout,
+    /// decodes a non-empty `partition_by`, `sort_keys`, or `bloom_columns`, or
+    /// differs from itself after a serialize/deserialize round trip.
     #[test]
     fn bifrost_wire_register_request_keeps_explicit_empty_layout_lists() {
         let req: RegisterTableRequest = serde_json::from_str(
-            r#"{"namespace":"vala.bifrost","name":"events","fields":[],
+            r#"{"namespace":"bifrost.bifrost","name":"events","fields":[],
                 "physical_layout":{"partition_by":[],
                 "sort_keys":[],"bloom_columns":[]}}"#,
         )
@@ -2828,19 +2847,19 @@ mod bifrost_wire_tests {
     #[test]
     fn bifrost_wire_register_request_carries_hyphenated_compaction_type() {
         let req: RegisterTableRequest = serde_json::from_str(
-            r#"{"namespace":"vala.datasets","name":"events","fields":[],
+            r#"{"namespace":"bifrost.datasets","name":"events","fields":[],
                 "compaction_type":"small-files"}"#,
         )
         .expect("deserialize");
         assert_eq!(req.compaction_type, Some(CompactionTypeWire::SmallFiles));
         bifrost_wire_round_trip(&req);
         let omitted: RegisterTableRequest =
-            serde_json::from_str(r#"{"namespace":"vala.datasets","name":"events","fields":[]}"#)
+            serde_json::from_str(r#"{"namespace":"bifrost.datasets","name":"events","fields":[]}"#)
                 .expect("deserialize");
         assert_eq!(omitted.compaction_type, None);
         assert!(
             serde_json::from_str::<RegisterTableRequest>(
-                r#"{"namespace":"vala.datasets","name":"events","fields":[],
+                r#"{"namespace":"bifrost.datasets","name":"events","fields":[],
                     "compaction_type":"small_files"}"#,
             )
             .is_err()
@@ -2989,7 +3008,7 @@ mod bifrost_wire_tests {
     #[test]
     fn bifrost_wire_table_entry_and_description_round_trip() {
         let entry = BifrostTableEntry {
-            namespace: "vala.bifrost".to_string(),
+            namespace: "bifrost.bifrost".to_string(),
             name: "events".to_string(),
             table_uid: "ab".repeat(16),
             status: TableStatus::Active,
@@ -3009,7 +3028,7 @@ mod bifrost_wire_tests {
             }],
             correlation_fields: vec![
                 FieldSpec {
-                    name: "card_uid".to_string(),
+                    name: "subject_card_uid".to_string(),
                     data_type: DataTypeSpec::Utf8,
                     nullable: true,
                     metadata: BTreeMap::from([(

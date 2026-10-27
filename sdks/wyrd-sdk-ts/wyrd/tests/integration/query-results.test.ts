@@ -11,8 +11,8 @@ import { serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
-/** The `vala.datasets` table the conversion reads, holding ids 1 to 3. */
-const IDS = "vala.datasets.result_ids";
+/** The `bifrost.datasets` table the conversion reads, holding ids 1 to 3. */
+const IDS = "bifrost.datasets.result_ids";
 
 /** The ids table, written and published once through the SDK, and a reader. */
 const test = serverTest().extend<{ bifrost: Bifrost }>({

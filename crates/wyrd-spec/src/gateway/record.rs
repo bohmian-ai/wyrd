@@ -530,13 +530,13 @@ fn validate_payload_object_refs(
     Ok(())
 }
 
-/// Exact version-1 payload of one `vala.gateway.calls` row.
+/// Exact version-1 payload of one `bifrost.gateway.calls` row.
 ///
 /// Bifrost appends its canonical managed envelope; the payload never
 /// duplicates managed identity and never substitutes zero for unknowns. The
 /// envelope's `wyrd_request_id` names the Scribe write that carried the row,
 /// so the admitting HTTP request is the payload's own `request_id`, the join
-/// key to that request's `vala.system.audit_log` decisions.
+/// key to that request's `bifrost.system.audit_log` decisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]

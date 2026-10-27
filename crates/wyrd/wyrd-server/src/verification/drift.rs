@@ -5,7 +5,7 @@
 //! server-owned aggregates over the execution's subject and frozen
 //! `created_at` window, and feeds only those aggregates to the existing
 //! `vala-drift` scorers. The reports become the engine's [`DriftChecks`]. [`ObservationWindow`] renders the fixed SQL: the
-//! canonical `vala.drift.observations` table, the exact subject/series/window
+//! canonical `bifrost.drift.observations` table, the exact subject/series/window
 //! filter, and one method-specific aggregate. The subject UID, feature name,
 //! fitted edges and labels, and window bounds are escaped typed literals; a
 //! Verifier contributes no SQL text.
@@ -76,7 +76,7 @@ pub const DRIFT_INVALID: &str = "drift_invalid";
 pub const BASELINE_LEGACY: &str = "baseline_legacy";
 
 /// Canonical Bifrost table every Drift statement reads.
-const OBSERVATIONS: &str = "vala.drift.observations";
+const OBSERVATIONS: &str = "bifrost.drift.observations";
 /// Aggregate bin of a null or non-finite value: the window is not scorable.
 const INVALID_BIN: i64 = -1;
 /// Part of a combined statement carrying the completeness count; feature
@@ -113,12 +113,12 @@ fn retry(code: &str, message: impl Into<String>) -> EngineOutcome {
 /// One run's subject and frozen `created_at` window over the observation table.
 ///
 /// A pure value: it renders the fixed SQL and never executes it. Every
-/// statement filters the exact subject `card_uid`, one feature `series`, and
+/// statement filters the exact `subject_card_uid`, one feature `series`, and
 /// `created_at`, the table's time column, in `[start, end)` before its
 /// method-specific aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationWindow {
-    /// Observed subject Card UID as the managed `card_uid` column stores it.
+    /// Observed subject Card UID as the managed `subject_card_uid` column stores it.
     subject: String,
     /// Inclusive window start.
     start: DateTime<Utc>,
@@ -157,7 +157,7 @@ impl ObservationWindow {
     /// also satisfy `filter`.
     fn rows_in(&self, filter: &str) -> String {
         format!(
-            "FROM {OBSERVATIONS} WHERE card_uid = {} AND {filter} \
+            "FROM {OBSERVATIONS} WHERE subject_card_uid = {} AND {filter} \
              AND created_at >= {} AND created_at < {}",
             Self::text(&self.subject),
             Self::instant(self.start),
@@ -941,7 +941,7 @@ mod tests {
     //! Proof of the fixed Drift SQL and aggregate folds.
     //!
     //! Every statement is executed by DataFusion over the real
-    //! `vala.drift.observations` schema, so fitted-edge equality, category
+    //! `bifrost.drift.observations` schema, so fitted-edge equality, category
     //! escaping, `[start, end)` exclusion, subject/series isolation, and SPC
     //! observation order are proved on the rendered SQL rather than on its
     //! text. The fold tests pin malformed-aggregate refusal and the
@@ -1036,7 +1036,9 @@ mod tests {
             .iter()
             .map(|field| -> Arc<dyn Array> {
                 match field.name().as_str() {
-                    "card_uid" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0))),
+                    "subject_card_uid" => {
+                        Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0)))
+                    }
                     "series" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
                     "num_value" => Arc::new(rows.iter().map(|r| r.2).collect::<Float64Array>()),
                     "str_value" => Arc::new(rows.iter().map(|r| r.3).collect::<StringArray>()),
@@ -1066,7 +1068,7 @@ mod tests {
         catalog
             .register_schema("drift", drift)
             .expect("schema registers");
-        context.register_catalog("vala", catalog);
+        context.register_catalog("bifrost", catalog);
         context
             .sql(sql)
             .await
@@ -1420,6 +1422,13 @@ mod tests {
     /// run is unscorable, without it the complete population scores. A
     /// selected record whose configured values are all null is incomplete,
     /// agreeing with direct scoring of a preselected batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a baseline or statement fails to build, the PSI statement
+    /// does not read `bifrost.drift.observations` three times, the complete
+    /// population does not score (SPC as `NoDrift`), or a population with the
+    /// late partial or all-null record scores under PSI or SPC.
     #[tokio::test]
     async fn one_statement_decides_completeness_and_scores_from_one_cut() {
         let uid = subject().to_string();
@@ -1446,7 +1455,7 @@ mod tests {
         let psi = vala_drift::fit_psi_baseline(&fitting_batch(1000), &psi_profile, &features)
             .expect("PSI fits");
         let sql = window().psi_statement(&psi).expect("PSI SQL");
-        assert_eq!(sql.matches("vala.drift.observations").count(), 3);
+        assert_eq!(sql.matches("bifrost.drift.observations").count(), 3);
         let fold = || DistributionFold::psi(&psi, &psi_profile);
         assert!(decide(&sql, &complete, fold()).await.is_some());
         assert_eq!(

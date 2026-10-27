@@ -321,7 +321,7 @@ impl PyObserveHandle {
     /// # Errors
     /// Raises `WYRD_SPEC_400_VALIDATION` for a row of another shape,
     /// `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
-    /// `vala.datasets`, `WYRD_SDK_400_BIFROST_NOT_STARTED`,
+    /// `bifrost.datasets`, `WYRD_SDK_400_BIFROST_NOT_STARTED`,
     /// `WYRD_SDK_409_BIFROST_CLOSED`, `WYRD_CLIENT_429_QUEUE_FULL`, and the
     /// server's error for an unknown, unauthorized, or unavailable table.
     fn record(&self, py: Python<'_>, table: &str, row: &Bound<'_, PyAny>) -> WyrdPyResult<()> {

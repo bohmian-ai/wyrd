@@ -150,7 +150,7 @@ transaction-pooled path.
   loss and invokes recovery; it is not a clean restart.
 - Oracle has a bounded, encrypted scratch volume for spill. Spill is disposable
   after query termination; Oracle keeps no durable local audit state.
-- Audit history is written to retained `vala.system.audit_log` through the
+- Audit history is written to retained `bifrost.system.audit_log` through the
   process Scribe outbox and Scribe. No pod holds durable local audit state;
   writes Scribe has not acknowledged are lost on abrupt process death or an
   expired shutdown deadline, and that loss is counted.

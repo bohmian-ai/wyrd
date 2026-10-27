@@ -1729,7 +1729,7 @@ mod tests {
         let read = AccessTokenClaims {
             permissions: PermissionSet::from_iter([Permission {
                 scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                    catalog: "vala".to_owned(),
+                    catalog: "bifrost".to_owned(),
                     schema: "drift".to_owned(),
                     table_uid: uuid::Uuid::now_v7(),
                 })),

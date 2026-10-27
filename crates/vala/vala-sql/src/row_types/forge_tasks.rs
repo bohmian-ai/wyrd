@@ -98,16 +98,16 @@ impl ForgeTaskTableIdentity {
         table: impl Into<String>,
     ) -> Result<Self, SqlError> {
         const NAMESPACES: &[&str] = &[
-            "vala.system",
-            "vala.bifrost",
-            "vala.traces",
-            "vala.metrics",
-            "vala.logs",
-            "vala.drift",
-            "vala.verification",
-            "vala.dev",
-            "vala.datasets",
-            "vala.gateway",
+            "bifrost.system",
+            "bifrost.bifrost",
+            "bifrost.traces",
+            "bifrost.metrics",
+            "bifrost.logs",
+            "bifrost.drift",
+            "bifrost.verification",
+            "bifrost.dev",
+            "bifrost.datasets",
+            "bifrost.gateway",
         ];
         let value = Self {
             catalog: catalog.into(),
@@ -1908,16 +1908,20 @@ mod tests {
     /// Panics when a boundary assertion does not hold.
     #[test]
     fn task_identity_rejects_unsafe_components() {
-        assert!(ForgeTaskTableIdentity::new("", "vala.bifrost", "events").is_err());
-        assert!(ForgeTaskTableIdentity::new("unsupported", "vala.bifrost", "events").is_err());
+        assert!(ForgeTaskTableIdentity::new("", "bifrost.bifrost", "events").is_err());
+        assert!(ForgeTaskTableIdentity::new("unsupported", "bifrost.bifrost", "events").is_err());
         assert!(ForgeTaskTableIdentity::new("wyrd-redux", "", "events").is_err());
         assert!(ForgeTaskTableIdentity::new("wyrd-redux", "unsupported", "events").is_err());
-        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "../events").is_err());
-        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", ".events").is_err());
-        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "events.").is_err());
-        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "bad name").is_err());
-        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "x".repeat(64)).is_err());
-        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "x".repeat(63)).is_ok());
+        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "../events").is_err());
+        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", ".events").is_err());
+        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "events.").is_err());
+        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "bad name").is_err());
+        assert!(
+            ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "x".repeat(64)).is_err()
+        );
+        assert!(
+            ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "x".repeat(63)).is_ok()
+        );
     }
 
     /// Rejects unknown plan versions, duplicate inputs, and unsafe candidates.
@@ -1975,9 +1979,9 @@ mod tests {
             committed_metadata_digest: Some("digest".to_owned()),
             cleanup_candidates: vec![ForgeCleanupCandidate {
                 category: ForgeCleanupCategory::Data,
-                table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "events")
+                table: ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "events")
                     .expect("table"),
-                path: ForgeCleanupPath::new("tenants/t/vala.bifrost/events/data/a.parquet")
+                path: ForgeCleanupPath::new("tenants/t/bifrost.bifrost/events/data/a.parquet")
                     .expect("path"),
             }],
             deleted_candidate_count: 2,
@@ -2004,16 +2008,16 @@ mod tests {
         }
         let other = ForgeCleanupCandidate {
             category: ForgeCleanupCategory::Data,
-            table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "other")
+            table: ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "other")
                 .expect("other"),
-            path: ForgeCleanupPath::new("tenants/t/vala.bifrost/events/data/a.parquet")
+            path: ForgeCleanupPath::new("tenants/t/bifrost.bifrost/events/data/a.parquet")
                 .expect("safe path"),
         };
         assert!(
             other.validate().is_err(),
             "candidate path must contain its exact table segment"
         );
-        let malformed = serde_json::json!({"version":1,"committed_snapshot_id":7,"committed_metadata_location":"metadata/v7.json","committed_metadata_digest":"digest","cleanup_candidates":[{"category":"data","catalog":"wyrd-redux","namespace":"vala.bifrost","table":"events","path":"/absolute/events/a.parquet"}],"deleted_candidate_count":0});
+        let malformed = serde_json::json!({"version":1,"committed_snapshot_id":7,"committed_metadata_location":"metadata/v7.json","committed_metadata_digest":"digest","cleanup_candidates":[{"category":"data","catalog":"wyrd-redux","namespace":"bifrost.bifrost","table":"events","path":"/absolute/events/a.parquet"}],"deleted_candidate_count":0});
         assert!(
             evidence_from_value(malformed).is_err(),
             "malformed persisted cleanup paths fail closed"

@@ -10,10 +10,10 @@ use wyrd_ai::bifrost::{BifrostClientError, Correlation, TableConfig};
 use crate::support::Deployment;
 
 /// Customers: `customer_id`, `name`, and a nullable `region`.
-const CUSTOMERS: &str = "vala.datasets.coverage_customers";
+const CUSTOMERS: &str = "bifrost.datasets.coverage_customers";
 
 /// Orders: `order_id`, a nullable `customer_id`, and `amount`.
-const ORDERS: &str = "vala.datasets.coverage_orders";
+const ORDERS: &str = "bifrost.datasets.coverage_orders";
 
 /// One query of the corpus and the exact rows it must return.
 ///

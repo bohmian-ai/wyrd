@@ -297,7 +297,7 @@ async fn observations_store_the_client_emit_time() {
     let after = chrono::Utc::now().timestamp_micros();
     let emitted: Vec<EventTime> = observed
         .drain_and_read(
-            "SELECT CAST(created_at AS BIGINT) AS event_time FROM vala.drift.observations",
+            "SELECT CAST(created_at AS BIGINT) AS event_time FROM bifrost.drift.observations",
         )
         .await;
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
@@ -337,7 +337,7 @@ async fn drift_burst_survives_a_byte_budget_override() {
         emit_with_resubmit(&observed.state, &model, &features).await;
     }
     let groups: Vec<RecordCount> = observed
-        .drain_and_read("SELECT COUNT(*) AS n FROM vala.drift.observations GROUP BY record_id")
+        .drain_and_read("SELECT COUNT(*) AS n FROM bifrost.drift.observations GROUP BY record_id")
         .await;
 
     assert_exactly_once(&groups, OBSERVATIONS, FEATURES);
@@ -398,7 +398,7 @@ async fn sustained_hundred_feature_drift_lands_exactly_once_with_flat_client_byt
     observed.state.flush().await.expect("the emission drains");
     let drained = owned_bytes();
     let groups: Vec<RecordCount> = observed
-        .drain_and_read("SELECT COUNT(*) AS n FROM vala.drift.observations GROUP BY record_id")
+        .drain_and_read("SELECT COUNT(*) AS n FROM bifrost.drift.observations GROUP BY record_id")
         .await;
 
     assert!(

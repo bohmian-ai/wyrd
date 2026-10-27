@@ -17,7 +17,7 @@ const DriftRow = z.object({
   num_value: z.number().nullable(),
   str_value: z.string().nullable(),
   session_id: z.string().nullable(),
-  card_uid: z.string(),
+  subject_card_uid: z.string(),
   run_id: z.string(),
 });
 
@@ -36,8 +36,8 @@ test("run observations read back by run id", async ({ server, reader, state }) =
   server.flushBifrost();
 
   const rows = await reader.sql(
-    `SELECT series, num_value, str_value, session_id, card_uid, run_id
-       FROM vala.drift.observations WHERE run_id = $1 ORDER BY series`,
+    `SELECT series, num_value, str_value, session_id, subject_card_uid, run_id
+       FROM bifrost.drift.observations WHERE run_id = $1 ORDER BY series`,
     [run.runId],
     DriftRow,
   );
@@ -47,7 +47,7 @@ test("run observations read back by run id", async ({ server, reader, state }) =
       num_value: 12.5,
       str_value: "12.5",
       session_id: null,
-      card_uid: state.cardRef("model").uid,
+      subject_card_uid: state.cardRef("model").uid,
       run_id: run.runId,
     },
   ]);

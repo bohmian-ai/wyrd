@@ -73,7 +73,7 @@ use wyrd_spec::error::WyrdProblem;
 ///
 /// Used to derive the physical Bifrost table name for per-signal error messages
 /// so that `IngestBusy` / `IngressClosed` responses name the correct table
-/// (`vala.traces.spans`, `vala.metrics.points`, `vala.logs.records`) rather
+/// (`bifrost.traces.spans`, `bifrost.metrics.points`, `bifrost.logs.records`) rather
 /// than always reporting the traces table.
 #[derive(Clone, Copy, Debug)]
 enum OtlpSignal {
@@ -86,9 +86,9 @@ impl OtlpSignal {
     /// The fully-qualified Bifrost table name for this signal.
     fn table(self) -> &'static str {
         match self {
-            Self::Traces => "vala.traces.spans",
-            Self::Metrics => "vala.metrics.points",
-            Self::Logs => "vala.logs.records",
+            Self::Traces => "bifrost.traces.spans",
+            Self::Metrics => "bifrost.metrics.points",
+            Self::Logs => "bifrost.logs.records",
         }
     }
 }
@@ -247,7 +247,8 @@ async fn export_traces(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let auth = caller_auth_context(&caller);
+    let auth = caller_auth_context(&caller, &headers)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
 
     let bifrost = Arc::clone(&state.bifrost);
     let (owner, request) = match encoding {
@@ -361,7 +362,8 @@ async fn export_metrics(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let auth = caller_auth_context(&caller);
+    let auth = caller_auth_context(&caller, &headers)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
 
     let bifrost = Arc::clone(&state.bifrost);
     let (owner, request) = match encoding {
@@ -476,7 +478,8 @@ async fn export_logs(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let auth = caller_auth_context(&caller);
+    let auth = caller_auth_context(&caller, &headers)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
 
     let bifrost = Arc::clone(&state.bifrost);
     let (owner, request) = match encoding {
@@ -527,14 +530,29 @@ async fn export_logs(
 ///
 /// Tenant, principal, and request id all come from the verified [`Caller`] — the
 /// tenant is token-derived, never taken from the request body, so the HTTP and
-/// gRPC transports preserve tenant isolation identically.
-fn caller_auth_context(caller: &Caller) -> AuthContext {
-    AuthContext {
+/// gRPC transports preserve tenant isolation identically. The request's
+/// accepted deployment environment is the one descriptive value read from
+/// `headers`.
+///
+/// # Errors
+///
+/// Returns [`IngestError::RequestContext`] when the deployment-environment
+/// header is repeated, empty, or not UTF-8.
+fn caller_auth_context(caller: &Caller, headers: &HeaderMap) -> Result<AuthContext, IngestError> {
+    let deployment_environment = wyrd_spec::auth::deployment_environment_selector(
+        headers
+            .get_all(wyrd_spec::auth::DEPLOYMENT_ENVIRONMENT_HEADER)
+            .iter()
+            .map(axum::http::HeaderValue::as_bytes),
+    )
+    .map_err(IngestError::RequestContext)?;
+    Ok(AuthContext {
         principal: caller.principal.clone(),
         tenant: caller.data_tenant_id,
         request_id: caller.request_id.clone(),
         delegation_chain: caller.delegation_chain.clone(),
-    }
+        deployment_environment,
+    })
 }
 
 /// Map an [`IngestError`] onto the single Gate-owned HTTP error projection.
@@ -606,11 +624,15 @@ mod tests {
     }
 
     /// Verify Gate's busy identity renders as retryable HTTP 429.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rendered response status is not 429 Too Many Requests.
     #[test]
     fn writer_busy_maps_to_429() {
         let response = ingest_error_to_response(
             IngestError::IngestBusy {
-                table: "vala.traces.spans".to_owned(),
+                table: "bifrost.traces.spans".to_owned(),
             },
             OtlpSignal::Traces,
         );
@@ -619,12 +641,17 @@ mod tests {
     }
 
     /// Verify endpoint-specific table context survives Gate's canonical projection.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a signal's closed-ingress error is not `WriterUnavailable` or
+    /// names a table other than that signal's physical table.
     #[test]
     fn writer_closed_table_name_is_per_signal() {
         for (signal, expected_table) in [
-            (OtlpSignal::Traces, "vala.traces.spans"),
-            (OtlpSignal::Metrics, "vala.metrics.points"),
-            (OtlpSignal::Logs, "vala.logs.records"),
+            (OtlpSignal::Traces, "bifrost.traces.spans"),
+            (OtlpSignal::Metrics, "bifrost.metrics.points"),
+            (OtlpSignal::Logs, "bifrost.logs.records"),
         ] {
             let wyrd_err = IngestError::IngressClosed.to_wyrd_error(signal.table());
             match wyrd_err {
@@ -740,11 +767,15 @@ mod tests {
     }
 
     /// Verify table-not-found uses the catalog's 404 response.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rendered response status is not 404 Not Found.
     #[test]
     fn table_not_found_maps_to_404() {
         let response = ingest_error_to_response(
             IngestError::TableNotFound {
-                table: "vala.traces.spans".to_owned(),
+                table: "bifrost.traces.spans".to_owned(),
             },
             OtlpSignal::Traces,
         );
@@ -753,6 +784,12 @@ mod tests {
     }
 
     /// Verify malformed OTLP requests retain the dedicated code and table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a decode or request-validation error is not
+    /// `OtlpRequestMalformed` for `bifrost.traces.spans`, or its status or code
+    /// differs from 400 and `WYRD_VALA_400_OTLP_REQUEST_MALFORMED`.
     #[test]
     fn decode_error_maps_to_400_with_signal_table_context() {
         for (variant, label) in [
@@ -769,7 +806,7 @@ mod tests {
             match &wyrd_err {
                 wyrd_spec::error::WyrdError::Vala {
                     error: BifrostError::OtlpRequestMalformed { table, .. },
-                } => assert_eq!(table, "vala.traces.spans", "{label} table context"),
+                } => assert_eq!(table, "bifrost.traces.spans", "{label} table context"),
                 other => panic!("{label}: expected OtlpRequestMalformed, got {other:?}"),
             }
             assert_eq!(wyrd_err.status(), 400);
@@ -778,6 +815,11 @@ mod tests {
     }
 
     /// Verify malformed metrics requests use the metrics physical table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the error is not `OtlpRequestMalformed` naming
+    /// `bifrost.metrics.points`.
     #[test]
     fn metrics_decode_error_names_metrics_table() {
         let wyrd_err =
@@ -785,12 +827,17 @@ mod tests {
         match wyrd_err {
             wyrd_spec::error::WyrdError::Vala {
                 error: BifrostError::OtlpRequestMalformed { table, .. },
-            } => assert_eq!(table, "vala.metrics.points"),
+            } => assert_eq!(table, "bifrost.metrics.points"),
             other => panic!("expected OtlpRequestMalformed, got {other:?}"),
         }
     }
 
     /// Verify malformed logs requests use the logs physical table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the error is not `OtlpRequestMalformed` naming
+    /// `bifrost.logs.records`.
     #[test]
     fn logs_decode_error_names_logs_table() {
         let wyrd_err =
@@ -798,7 +845,7 @@ mod tests {
         match wyrd_err {
             wyrd_spec::error::WyrdError::Vala {
                 error: BifrostError::OtlpRequestMalformed { table, .. },
-            } => assert_eq!(table, "vala.logs.records"),
+            } => assert_eq!(table, "bifrost.logs.records"),
             other => panic!("expected OtlpRequestMalformed, got {other:?}"),
         }
     }

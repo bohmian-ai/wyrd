@@ -258,7 +258,7 @@ async fn retired_tables_are_unknown() {
         )
     };
     for name in ["result_items", "observations"] {
-        let codes = ["vala.eval", "vala.absent"].map(|namespace| {
+        let codes = ["bifrost.eval", "bifrost.absent"].map(|namespace| {
             let output = query(&format!("SELECT * FROM {namespace}.{name}"));
             assert!(!output.status.success(), "{namespace}.{name} is refused");
             assert!(

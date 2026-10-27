@@ -139,7 +139,7 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
     let tickets = Bifrost::connect_with(&admin, BifrostOptions::default())
         .await
         .expect("Bifrost connects")
-        .describe_table("vala.datasets", "tickets")
+        .describe_table("bifrost.datasets", "tickets")
         .await
         .expect("the declared table exists before Bifrost starts");
     let fields: Vec<&str> = tickets

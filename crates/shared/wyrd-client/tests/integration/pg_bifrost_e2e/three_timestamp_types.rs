@@ -25,11 +25,11 @@ use wyrd_testing::server::WyrdTestServer;
 use super::pg_tests::service_client;
 
 /// The table orders declared with Wyrd types are written to.
-const WYRD_ORDERS: &str = "vala.datasets.wyrd_orders";
+const WYRD_ORDERS: &str = "bifrost.datasets.wyrd_orders";
 /// The table orders declared with chrono types are written to.
-const CHRONO_ORDERS: &str = "vala.datasets.chrono_orders";
+const CHRONO_ORDERS: &str = "bifrost.datasets.chrono_orders";
 /// The table Arrow orders are written to.
-const ARROW_ORDERS: &str = "vala.datasets.arrow_orders";
+const ARROW_ORDERS: &str = "bifrost.datasets.arrow_orders";
 
 /// An order declared with Wyrd timestamp types.
 #[derive(Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -4,6 +4,8 @@
 //! worker, in the same profile before it runs these tests.
 
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use monty_pool::{MountSpec, MountSpecMode};
@@ -15,9 +17,32 @@ use wyrd_server::verification::hosted::sandbox::{CodeRun, Sandbox};
 use wyrd_server::verification::hosted::workspace::{Staged, Workspace};
 
 /// The worker binary: this package's `wyrd-server`, which serves as its own
-/// worker.
+/// worker, launched once to completion before its path is first returned.
+///
+/// The first launch of a freshly linked binary can pay a one-time operating
+/// system verification cost longer than a test's code deadline, and a launch
+/// killed before it finishes never completes that cost. Paying it here, with
+/// no stdin, keeps it outside every sandbox deadline, as the production pool's
+/// prewarmed workers do.
+///
+/// # Panics
+/// Panics when the worker binary cannot be launched.
 pub(crate) fn worker() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_wyrd-server"))
+    static WORKER: OnceLock<PathBuf> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let path = PathBuf::from(env!("CARGO_BIN_EXE_wyrd-server"));
+            Command::new(&path)
+                .arg("subprocess")
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("the worker binary launches");
+            path
+        })
+        .clone()
 }
 
 /// A sandbox under `limits` with no prewarmed workers.

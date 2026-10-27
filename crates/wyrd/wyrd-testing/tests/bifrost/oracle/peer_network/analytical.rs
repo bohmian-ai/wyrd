@@ -72,7 +72,7 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
     }
 
     let sql = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
     let rows = cluster.execute_sql(LEADER, &sql).await?;
@@ -187,7 +187,7 @@ async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourney
     cluster.arm_execute_pause(paused)?;
 
     let sql = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
     cluster.start_sql(LEADER, &sql)?;
@@ -664,7 +664,7 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
         QueryStyle {
             name: "partitioned scan, filter, and projection",
             sql: format!(
-                "SELECT id FROM vala.bifrost.{left} WHERE filter_key = 'group_7' \
+                "SELECT id FROM bifrost.bifrost.{left} WHERE filter_key = 'group_7' \
                  AND id < {LEFT_ROWS}"
             ),
             // One id per full pass of the group cycle across the whole table.
@@ -675,7 +675,7 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
         QueryStyle {
             name: "grouped aggregation",
             sql: format!(
-                "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{left} \
+                "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{left} \
                  GROUP BY filter_key"
             ),
             rows: usize::try_from(INGEST_GROUPS).unwrap_or(usize::MAX),
@@ -689,8 +689,8 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
             // and only a correct one keeps each of them exactly once.
             sql: format!(
                 "SELECT {key} AS filter_key, COUNT(*) AS matched \
-                 FROM vala.bifrost.{left} AS l \
-                 LEFT JOIN vala.bifrost.{right} AS r ON l.id = r.id \
+                 FROM bifrost.bifrost.{left} AS l \
+                 LEFT JOIN bifrost.bifrost.{right} AS r ON l.id = r.id \
                  GROUP BY l.id ORDER BY filter_key"
             ),
             rows: usize::try_from(LEFT_ROWS).unwrap_or(usize::MAX),
@@ -701,7 +701,7 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
             name: "sort with limit",
             sql: format!(
                 "SELECT {key} AS filter_key, COUNT(*) AS matched \
-                 FROM vala.bifrost.{left} AS l \
+                 FROM bifrost.bifrost.{left} AS l \
                  GROUP BY l.id ORDER BY filter_key LIMIT {SORT_LIMIT_ROWS}"
             ),
             rows: SORT_LIMIT_ROWS,
@@ -844,7 +844,7 @@ async fn prove_canonical_genai_span(cluster: &mut PeerCluster) -> Result<(), Pee
                 CAST(array_length(links) AS BIGINT) AS links, \
                 events[1]['name'] AS event_name, links[1]['trace_state'] AS link_state, \
                 service_name \
-         FROM vala.traces.spans \
+         FROM bifrost.traces.spans \
          WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
     );
     let leader = public_client(cluster.server(LEADER)?, &api_key)?;
@@ -893,7 +893,7 @@ async fn prove_canonical_genai_span(cluster: &mut PeerCluster) -> Result<(), Pee
         &leader,
         &format!(
             "SELECT name, gen_ai_operation_name, status_code \
-             FROM vala.traces.spans \
+             FROM bifrost.traces.spans \
              WHERE scope_name = '{scope}' AND parent_span_id IS NOT NULL"
         ),
     )
@@ -912,7 +912,7 @@ async fn prove_canonical_genai_span(cluster: &mut PeerCluster) -> Result<(), Pee
     let payload = public_query(
         &leader,
         &format!(
-            "SELECT attributes FROM vala.traces.spans \
+            "SELECT attributes FROM bifrost.traces.spans \
              WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
         ),
     )
@@ -937,7 +937,7 @@ async fn prove_canonical_genai_span(cluster: &mut PeerCluster) -> Result<(), Pee
         &leader,
         &format!(
             "SELECT events[1]['attributes'] ->> 'gen_ai.finish_reason' AS reason \
-             FROM vala.traces.spans {filter}"
+             FROM bifrost.traces.spans {filter}"
         ),
     )
     .await?;
@@ -948,7 +948,7 @@ async fn prove_canonical_genai_span(cluster: &mut PeerCluster) -> Result<(), Pee
     let (_, whole_bytes) = scanned_bytes(
         cluster,
         &leader,
-        &format!("SELECT events FROM vala.traces.spans {filter}"),
+        &format!("SELECT events FROM bifrost.traces.spans {filter}"),
     )
     .await?;
     // Strict `Less`, so an incomparable (NaN) metric fails rather than passes.
@@ -1225,7 +1225,7 @@ async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
     }
     let client = public_client(cluster.server(LEADER)?, &api_key)?;
     let query = wyrd_client::Bifrost::query_only(&client);
-    let sql = format!("SELECT id FROM vala.bifrost.{table}");
+    let sql = format!("SELECT id FROM bifrost.bifrost.{table}");
 
     let case = "client dropped";
     let window = cluster.telemetry().checkpoint()?;
@@ -1472,6 +1472,10 @@ async fn remote_live_window_blocked_scribe_stops_cleanly() {
 /// # Errors
 ///
 /// Returns the first step whose stop, release, or terminal broke the contract.
+///
+/// # Panics
+///
+/// Panics when the ingest chunk size does not fit `usize`.
 async fn prove_window_blocked_scribe_stop() -> Result<(), PeerJourneyError> {
     let case = "window-blocked Scribe stopped";
     let mut cluster = PeerCluster::start(&[
@@ -1499,7 +1503,7 @@ async fn prove_window_blocked_scribe_stop() -> Result<(), PeerJourneyError> {
     let mut stream = query
         .query(&BifrostQueryRequest {
             params: Vec::new(),
-            sql: format!("SELECT id, filter_key FROM vala.bifrost.{table}"),
+            sql: format!("SELECT id, filter_key FROM bifrost.bifrost.{table}"),
             deadline_ms: Some(LIVE_OPEN_DEADLINE_MS),
         })
         .await
@@ -1740,7 +1744,7 @@ async fn prove_two_leaders_retry_preaccept_capacity() -> Result<(), PeerJourneyE
     }
 
     let sql = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
     // The first graph occupies the receiver's only Analytical envelope and is

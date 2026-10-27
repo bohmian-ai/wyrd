@@ -24,7 +24,7 @@ use wyrd_spec::gateway::{GatewayOperation, ModelRef};
 
 use super::ingress::{anthropic_usage_bound, google_usage_bound};
 use super::invocation::{
-    GatewayCallAttribution, GatewayCallRequest, GatewayCallSubject, GatewayInvocation,
+    GatewayCallAttribution, GatewayCallContext, GatewayCallRequest, GatewayInvocation,
 };
 use super::routes::usage_bound;
 use crate::components::auth::Caller;
@@ -46,7 +46,7 @@ pub(crate) struct ServerWyrdGatewayCaller {
     caller: Caller,
     /// Run and Card every call is attributed to, already resolved by the
     /// operation the calls serve; `None` leaves calls uncorrelated.
-    subject: Option<GatewayCallSubject>,
+    subject: Option<GatewayCallContext>,
 }
 
 impl ServerWyrdGatewayCaller {
@@ -64,7 +64,7 @@ impl ServerWyrdGatewayCaller {
     /// originating operation already resolved in the caller's tenant, such as
     /// a direct verification's subject and Run. Admission records it without
     /// re-authorizing the Card; `None` leaves calls uncorrelated.
-    pub(crate) fn attributed(mut self, subject: Option<GatewayCallSubject>) -> Self {
+    pub(crate) fn attributed(mut self, subject: Option<GatewayCallContext>) -> Self {
         self.subject = subject;
         self
     }

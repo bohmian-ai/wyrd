@@ -55,7 +55,7 @@ impl LifecycleFixture {
             .await
             .expect("lifecycle server starts");
         let table_fqn = format!(
-            "vala.datasets.query_lifecycle_{}",
+            "bifrost.datasets.query_lifecycle_{}",
             uuid::Uuid::now_v7().simple()
         );
         let owner = Self::client(&server, None, "query-lifecycle-owner", &["admin"]).await;
@@ -402,7 +402,7 @@ async fn denied_describe_is_audited_before_admission() {
     .expect("the query-only writer connects");
 
     let denied = writer
-        .writer_table("vala.drift.observations")
+        .writer_table("bifrost.drift.observations")
         .await
         .expect_err("a caller without bifrost_table:read cannot describe");
     assert_eq!(
@@ -412,15 +412,15 @@ async fn denied_describe_is_audited_before_admission() {
     server
         .await_retained_audit_count(
             server.data_tenant_id(),
-            "operation = 'vala.bifrost.describe' \
-             AND resource = 'vala.drift.observations' AND outcome = 'denied'",
+            "operation = 'bifrost.bifrost.describe' \
+             AND resource = 'bifrost.drift.observations' AND outcome = 'denied'",
             1,
         )
         .await
         .expect("one retained denied decision names the requested table");
     assert!(
         writer
-            .cached_writer_table("vala.drift.observations")
+            .cached_writer_table("bifrost.drift.observations")
             .is_none()
     );
     assert_eq!(

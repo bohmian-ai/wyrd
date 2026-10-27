@@ -141,7 +141,7 @@ async fn script_investigator(upstream: &MockServer) {
         tool_call(
             "call-query",
             TOOLS[1],
-            &json!({ "sql": "SELECT execution_id FROM vala.verification.results LIMIT 1", "max_rows": 1 }),
+            &json!({ "sql": "SELECT execution_id FROM bifrost.verification.results LIMIT 1", "max_rows": 1 }),
         ),
         tool_call("call-code", TOOLS[2], &json!({ "source": "6 * 7" })),
     ];
@@ -1274,7 +1274,7 @@ async fn delegated_tools_keep_the_narrower_authority() {
             .expect("Bifrost connects")
             .sql_as(
                 "SELECT sub_principal_id, act_principal_id \
-                   FROM vala.verification.results WHERE execution_id = $1",
+                   FROM bifrost.verification.results WHERE execution_id = $1",
                 &[QueryParam::String(result.execution_id.to_string())],
             )
             .await
@@ -1439,7 +1439,7 @@ async fn retained(desk: &PolicyDesk, result: &VerificationResult) -> Verificatio
             .expect("Bifrost connects")
             .sql_as(
                 "SELECT to_json(outcome) AS outcome \
-                   FROM vala.verification.results WHERE execution_id = $1",
+                   FROM bifrost.verification.results WHERE execution_id = $1",
                 &[QueryParam::String(result.execution_id.to_string())],
             )
             .await

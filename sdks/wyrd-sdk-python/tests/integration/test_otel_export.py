@@ -18,7 +18,7 @@ pytestmark = pytest.mark.integration
 
 
 class SpanRow(BaseModel):
-    """The ``vala.traces.spans`` columns the trace story reads."""
+    """The ``bifrost.traces.spans`` columns the trace story reads."""
 
     name: str
     trace_id: bytes
@@ -49,7 +49,7 @@ def test_stock_exporter_span_reads_back_through_bifrost(
 
     rows = bifrost.sql(
         "SELECT name, trace_id, span_id, parent_span_id, status_code, status_message, "
-        "gen_ai_request_model, gen_ai_usage_input_tokens FROM vala.traces.spans "
+        "gen_ai_request_model, gen_ai_usage_input_tokens FROM bifrost.traces.spans "
         "WHERE scope_name = 'wyrd.tests.otel.trace' ORDER BY name",
         model=SpanRow,
     )

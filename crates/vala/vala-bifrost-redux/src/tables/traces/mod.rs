@@ -76,6 +76,8 @@ mod tests {
                 "url.full",
                 Value::StringValue("https://api/chat".to_owned()),
             ),
+            attribute("url.path", Value::StringValue("/chat".to_owned())),
+            attribute("url.query", Value::StringValue("q=1".to_owned())),
         ]
     }
 
@@ -116,6 +118,24 @@ mod tests {
                     attribute(
                         "deployment.environment.name",
                         Value::StringValue("prod".to_owned()),
+                    ),
+                    attribute("service.namespace", Value::StringValue("shop".to_owned())),
+                    attribute(
+                        "service.instance.id",
+                        Value::StringValue("pod-7".to_owned()),
+                    ),
+                    attribute("process.pid", Value::IntValue(4_242)),
+                    attribute(
+                        "telemetry.sdk.name",
+                        Value::StringValue("opentelemetry".to_owned()),
+                    ),
+                    attribute(
+                        "telemetry.sdk.language",
+                        Value::StringValue("rust".to_owned()),
+                    ),
+                    attribute(
+                        "telemetry.sdk.version",
+                        Value::StringValue("0.31.0".to_owned()),
                     ),
                 ],
                 dropped_attributes_count: 3,
@@ -307,7 +327,7 @@ mod tests {
             );
         }
 
-        let card_uids = typed::<StringArray>(&batch, "card_uid");
+        let card_uids = typed::<StringArray>(&batch, "subject_card_uid");
         let run_ids = typed::<StringArray>(&batch, "run_id");
         assert!(
             card_uids.is_null(0) && run_ids.is_null(0),
@@ -345,6 +365,8 @@ mod tests {
                 "http.route": "/chat",
                 "http.response.status_code": 502,
                 "url.full": "https://api/chat",
+                "url.path": "/chat",
+                "url.query": "q=1",
             })
         );
     }
@@ -510,6 +532,13 @@ mod tests {
             ("http_request_method", Some("POST")),
             ("http_route", Some("/chat")),
             ("url_full", Some("https://api/chat")),
+            ("url_path", Some("/chat")),
+            ("url_query", Some("q=1")),
+            ("service_namespace", Some("shop")),
+            ("service_instance_id", Some("pod-7")),
+            ("telemetry_sdk_name", Some("opentelemetry")),
+            ("telemetry_sdk_language", Some("rust")),
+            ("telemetry_sdk_version", Some("0.31.0")),
             ("exception_type", Some("TimeoutError")),
             ("exception_message", Some("upstream timed out")),
             ("exception_stacktrace", None),
@@ -525,6 +554,71 @@ mod tests {
             typed::<Int64Array>(batch, "http_response_status_code").value(0),
             502
         );
+        assert_eq!(typed::<Int64Array>(batch, "process_pid").value(0), 4_242);
+        assert!(
+            typed::<BooleanArray>(batch, "is_exception").value(0),
+            "an event named exception marks the span"
+        );
+    }
+
+    /// Span exception strings come only from the last event named exactly
+    /// `exception`, and any such event marks the span independent of status.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a string is filled from an earlier exception event, when a
+    /// span with an exception event is not marked, or when a span without one
+    /// is.
+    #[test]
+    fn span_exception_strings_and_flag_follow_the_last_exception_event() {
+        let mut request = maximal_resource_spans(Vec::new());
+        let template = request[0].scope_spans[0].spans[0].clone();
+        let event = |name: &str, attributes| Event {
+            time_unix_nano: template.start_time_unix_nano,
+            name: name.to_owned(),
+            attributes,
+            dropped_attributes_count: 0,
+        };
+        let text = |value: &str| Value::StringValue(value.to_owned());
+        request[0].scope_spans[0].spans = vec![
+            Span {
+                events: vec![
+                    exception_event(),
+                    event(
+                        "exception",
+                        vec![attribute("exception.stacktrace", text("at main"))],
+                    ),
+                ],
+                ..template.clone()
+            },
+            Span {
+                span_id: vec![9; 8],
+                events: vec![event(
+                    "Exception",
+                    vec![attribute("exception.type", text("E"))],
+                )],
+                ..template
+            },
+        ];
+        let (batch, _) = project_resource_spans(&request, None, usize::MAX).expect("spans project");
+        let text_at = |name: &str, row| {
+            let values = typed::<StringArray>(&batch, name);
+            values.is_valid(row).then(|| values.value(row).to_owned())
+        };
+        assert_eq!(text_at("exception_type", 0), None);
+        assert_eq!(text_at("exception_message", 0), None);
+        assert_eq!(
+            text_at("exception_stacktrace", 0).as_deref(),
+            Some("at main")
+        );
+        assert_eq!(
+            text_at("exception_type", 1),
+            None,
+            "the name matches exactly"
+        );
+        let is_exception = typed::<BooleanArray>(&batch, "is_exception");
+        assert!(is_exception.value(0));
+        assert!(!is_exception.value(1));
     }
 
     /// Reverse a batch's column order without changing any value.
@@ -635,7 +729,7 @@ mod tests {
         );
         assert_eq!(batch.num_rows(), 3, "only the two defective spans are lost");
 
-        let card_uids = typed::<StringArray>(&batch, "card_uid");
+        let card_uids = typed::<StringArray>(&batch, "subject_card_uid");
         assert!(
             card_uids.is_null(0),
             "a missing wyrd.card_uid projects null"

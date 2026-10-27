@@ -2,10 +2,8 @@
 
 use arrow::datatypes::{Field, Schema};
 use vala_sql::row_types::olap_catalog::BifrostTableRow;
-use wyrd_spec::vala::api::{
-    BifrostTableEntry, DataTypeSpec, FieldSpec, PhysicalLayoutWire, TableStatus,
-};
-use wyrd_spec::vala::{CARD_UID, RUN_ID};
+use wyrd_spec::vala::api::{BifrostTableEntry, FieldSpec, PhysicalLayoutWire, TableStatus};
+use wyrd_spec::vala::{RUN_ID, SUBJECT_CARD_UID};
 
 use wyrd_types::field_to_spec;
 
@@ -79,7 +77,8 @@ pub fn layout_wire_from_row(
 pub struct DescribedFields {
     /// The table's own declared columns, in stored order.
     pub user_fields: Vec<FieldSpec>,
-    /// `card_uid` then `run_id`, the correlation inputs a writer supplies.
+    /// `subject_card_uid` then `run_id`, the correlation inputs a writer
+    /// supplies.
     pub correlation_fields: Vec<FieldSpec>,
 }
 
@@ -87,11 +86,12 @@ pub struct DescribedFields {
 ///
 /// Every declaration is taken from the stored schema, so its type,
 /// nullability, and registered field id are the table's actual ones rather
-/// than a restatement. A table whose correlation policy appends no
-/// `card_uid` or `run_id` column still accepts one on the wire, so the missing
-/// correlation input is synthesized nullable `Utf8` with no field id. Card
-/// correlation is optional: a row without one is stored with its authenticated
-/// `sub_principal_id`/`act_principal_id` pair and a null `card_uid`.
+/// than a restatement. Every table stores the managed envelope, so the
+/// correlation inputs are its `subject_card_uid` and `run_id` columns; the
+/// rest of the envelope is server-stamped and described in neither class.
+/// Card correlation is optional: a row without one is stored with its
+/// authenticated `sub_principal_id`/`act_principal_id` pair and a null
+/// `subject_card_uid`.
 ///
 /// # Errors
 ///
@@ -104,31 +104,19 @@ pub fn described_fields_from_stored_schema(
         user_fields: Vec::new(),
         correlation_fields: Vec::new(),
     };
-    let (mut card_uid, mut run_id) = (None, None);
     for field in schema.fields() {
         let name = field.name().as_str();
-        if name != CARD_UID && name != RUN_ID && is_managed_column(name) {
+        let correlation = name == SUBJECT_CARD_UID || name == RUN_ID;
+        if !correlation && is_managed_column(name) {
             continue;
         }
         let spec = field_to_spec(field)
             .map_err(|error| BifrostCatalogError::MetadataMismatch(error.to_string()))?;
-        if name == CARD_UID {
-            card_uid = Some(spec);
-        } else if name == RUN_ID {
-            run_id = Some(spec);
+        if correlation {
+            described.correlation_fields.push(spec);
         } else {
             described.user_fields.push(spec);
         }
-    }
-    for (name, stored) in [(CARD_UID, card_uid), (RUN_ID, run_id)] {
-        described
-            .correlation_fields
-            .push(stored.unwrap_or_else(|| FieldSpec {
-                name: name.to_owned(),
-                data_type: DataTypeSpec::Utf8,
-                nullable: true,
-                metadata: std::collections::BTreeMap::new(),
-            }));
     }
     Ok(described)
 }
@@ -198,10 +186,8 @@ mod tests {
     /// Panics when a class gains or loses a column.
     #[test]
     fn stored_schema_projection_classifies_every_correlation_column() {
-        let mut fields: Vec<Field> = crate::tables::managed_columns::ensure_managed_columns(
-            Vec::new(),
-            crate::tables::CorrelationPolicy::Observation,
-        );
+        let mut fields: Vec<Field> =
+            crate::tables::managed_columns::ensure_managed_columns(Vec::new());
         fields.push(Field::new("value", DataType::Int64, true));
         let schema = Schema::new(fields);
 
@@ -224,7 +210,7 @@ mod tests {
                 .iter()
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![CARD_UID, RUN_ID],
+            vec![SUBJECT_CARD_UID, RUN_ID],
             "correlation is exactly the card uid and the run id"
         );
     }

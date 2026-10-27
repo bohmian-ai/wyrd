@@ -850,7 +850,7 @@ impl NativeRun {
         })
     }
 
-    /// Emits one row into a registered `vala.datasets` table.
+    /// Emits one row into a registered `bifrost.datasets` table.
     ///
     /// Asynchronous because the first call for a table describes it; later calls
     /// reuse the cached schema and producer.

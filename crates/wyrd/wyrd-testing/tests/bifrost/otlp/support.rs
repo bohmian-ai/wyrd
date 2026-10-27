@@ -31,9 +31,9 @@ use wyrd_tonic::otlp::trace::v1::span::{Event, Link};
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
 /// The canonical span ledger every trace case reads.
-pub(super) const SPANS_TABLE: &str = "vala.traces.spans";
+pub(super) const SPANS_TABLE: &str = "bifrost.traces.spans";
 /// The canonical log ledger every log case reads.
-pub(super) const LOGS_TABLE: &str = "vala.logs.records";
+pub(super) const LOGS_TABLE: &str = "bifrost.logs.records";
 
 /// Identity one copy of the maximal span is exported under.
 ///
@@ -481,7 +481,7 @@ pub(super) fn maximal_resource_logs(time: i64) -> Vec<ResourceLogs> {
 }
 
 /// The canonical metric ledger every metric case reads.
-pub(super) const METRICS_TABLE: &str = "vala.metrics.points";
+pub(super) const METRICS_TABLE: &str = "bifrost.metrics.points";
 /// Instrumentation scope name carried by the metric envelope.
 pub(super) const METRIC_SCOPE_NAME: &str = "wyrd.tests.otlp.metric";
 /// Distance the metric points' start instant precedes their observation.

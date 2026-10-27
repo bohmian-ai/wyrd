@@ -31,7 +31,12 @@ use crate::bifrost::table::{Correlation, WriterTable};
 pub fn record(bifrost: &Bifrost, table: &WriterTable, json: Vec<u8>, correlation: Correlation) {
     let writer = bifrost.writer();
     if writer
-        .insert(table, json, correlation.card_uid, correlation.run_id)
+        .insert(
+            table,
+            json,
+            correlation.subject_card_uid,
+            correlation.run_id,
+        )
         .is_err()
     {
         writer.note_drop();

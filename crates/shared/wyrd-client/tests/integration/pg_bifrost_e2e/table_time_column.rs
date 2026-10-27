@@ -21,11 +21,11 @@ use wyrd_testing::server::WyrdTestServer;
 use super::pg_tests::service_client;
 
 /// The table partitioned on its declared `event_time` column.
-const READINGS: &str = "vala.datasets.time_column_readings";
+const READINGS: &str = "bifrost.datasets.time_column_readings";
 /// The table registered without a declared time column.
-const DEFAULT_READINGS: &str = "vala.datasets.time_column_defaults";
+const DEFAULT_READINGS: &str = "bifrost.datasets.time_column_defaults";
 /// The table whose declared time column is not a timestamp.
-const REFUSED_READINGS: &str = "vala.datasets.time_column_refused";
+const REFUSED_READINGS: &str = "bifrost.datasets.time_column_refused";
 /// The declared time column.
 const EVENT_TIME: &str = "event_time";
 /// One hour in microseconds.

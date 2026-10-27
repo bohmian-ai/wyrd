@@ -110,7 +110,7 @@ bootstrapTest.skipIf(!process.env.WYRD_LOCAL_DEV_CONFIG_HOME)("cli_gateway_setup
     const retained = async () =>
       (
         await bifrost.sql(
-          "SELECT DISTINCT resolved_deployment, requested_model['model'] AS model FROM vala.gateway.calls WHERE outcome = 'succeeded' AND run_id IS NULL ORDER BY resolved_deployment",
+          "SELECT DISTINCT resolved_deployment, requested_model['model'] AS model FROM bifrost.gateway.calls WHERE outcome = 'succeeded' AND run_id IS NULL ORDER BY resolved_deployment",
         )
       )
         .toArrow()

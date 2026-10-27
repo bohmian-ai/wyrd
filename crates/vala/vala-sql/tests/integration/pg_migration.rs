@@ -69,7 +69,7 @@ mod pg_tests {
         .await
         .expect("Forge namespace constraint reads");
         assert!(
-            !namespaces.contains("vala.eval") && namespaces.contains("vala.verification"),
+            !namespaces.contains("vala.") && namespaces.contains("bifrost.verification"),
             "Forge admits only current namespaces: {namespaces}"
         );
     }

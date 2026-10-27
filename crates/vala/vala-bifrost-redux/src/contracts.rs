@@ -47,7 +47,7 @@ pub(crate) fn projected_source_schema_fingerprint(
         .filter(|field| {
             !matches!(
                 field.name().as_str(),
-                wyrd_spec::vala::CARD_UID
+                wyrd_spec::vala::SUBJECT_CARD_UID
                     | wyrd_spec::vala::SUB_PRINCIPAL_ID
                     | wyrd_spec::vala::ACT_PRINCIPAL_ID
                     | "run_id"
@@ -95,6 +95,14 @@ pub struct ScribeIngressFrame {
     /// never from its transport identity. No client row or header value can
     /// set it.
     pub attribution: StampedAttribution,
+    /// The accepted Service release a [`StampedAttribution::Frame`] write
+    /// stamps as every row's `workload_card_uid`.
+    ///
+    /// Gate selects it once from the verified token's current actor, so
+    /// Scribe never rereads [`Self::principal`] for it. A
+    /// [`StampedAttribution::Rows`] frame leaves it `None`: each row carries
+    /// its own accepted workload.
+    pub workload: Option<wyrd_spec::ids::CardUid>,
     /// Authenticated tenant selected by the transport boundary.
     pub authenticated_tenant: wyrd_spec::DataTenantId,
     /// Card UIDs the frame's rows may correlate to, when the principal's
@@ -106,6 +114,13 @@ pub struct ScribeIngressFrame {
     /// subjects the gateway already authorized. `None` leaves the principal's
     /// signed scope in force.
     pub attributed_cards: Option<Vec<wyrd_spec::ids::CardUid>>,
+    /// The accepted context a public frame's shared Service, environment, and
+    /// subject dimensions are stamped from.
+    ///
+    /// Gate resolves it for client ingest; `None` leaves every row's own
+    /// dimension values, as a server-internal writer that built them from its
+    /// accepted origin supplies.
+    pub dimensions: Option<crate::tables::FrameDimensions>,
     /// Requested logical table, unchanged by physical resolution.
     pub table: TableRef,
     /// Fingerprint asserted by an engine-internal producer with no catalog.

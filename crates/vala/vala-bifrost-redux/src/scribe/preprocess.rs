@@ -107,9 +107,14 @@ pub(crate) struct NativeAdmittedRows {
     /// Source of the trusted subject/actor pair stamped as managed
     /// correlation columns.
     pub(crate) attribution: crate::contracts::StampedAttribution,
-    /// Card UIDs every row's `card_uid` is authorized against: the frame's
+    /// Verified workload Service release a frame-attributed write stamps.
+    pub(crate) workload: Option<wyrd_spec::ids::CardUid>,
+    /// Card UIDs every row's `subject_card_uid` is authorized against: the frame's
     /// attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
+    /// Accepted context the shared Service, environment, and subject
+    /// dimensions are stamped from; `None` keeps each row's own values.
+    pub(crate) dimensions: Option<crate::tables::FrameDimensions>,
     /// Caller-supplied fingerprint validated independently for every source
     /// batch, when one was supplied.
     pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
@@ -409,7 +414,9 @@ fn stamp_native_source(
         rows,
         &crate::scribe::execution_lanes::DecodeContext {
             attribution: source.attribution,
+            workload: source.workload.as_ref(),
             card_scope: source.card_scope.as_deref(),
+            dimensions: source.dimensions.as_ref(),
             expected_schema_fingerprint: source.expected_schema_fingerprint,
             request_id: &source.request_id,
             receipt_micros: source.receipt_micros,
@@ -475,35 +482,6 @@ fn digest_array_data(
     Ok(())
 }
 
-/// Computes the identity of the accepted correlation attribution on `rows`.
-///
-/// [`logical_data_identity`] deliberately drops the universal correlation
-/// columns so a server restamp cannot break retry convergence, which also
-/// means two callers can present the same user payload under different
-/// accepted attribution and reach the same logical digest. A caller that
-/// derives a durable identity from that digest must bind this second digest
-/// as well; the two together describe both what the rows are and whose
-/// correlation they carry. Columns are folded in schema order, and a batch
-/// carrying no correlation column digests the domain separator alone.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::Internal`] when a correlation column's buffer length
-/// overflows its accumulator.
-pub(crate) fn correlation_data_identity(rows: &RecordBatch) -> Result<[u8; 32], ScribeError> {
-    let mut digest = Sha256::new();
-    digest.update(b"wyrd.correlation-identity.v1");
-    let mut bytes = 0_usize;
-    for (field, column) in rows.schema().fields().iter().zip(rows.columns()) {
-        if !crate::tables::managed_columns::is_correlation_column(field.name()) {
-            continue;
-        }
-        digest.update(field.name().as_bytes());
-        digest_array_data(&column.to_data(), &mut digest, &mut bytes)?;
-    }
-    Ok(digest.finalize().into())
-}
-
 /// A logical identity already computed over one batch, reusable for any rows
 /// that still hold that batch's exact identity inputs.
 ///
@@ -544,13 +522,8 @@ impl LogicalIdentity {
         &self.digest
     }
 
-    /// The rows the identity covers.
-    pub(crate) const fn rows(&self) -> &RecordBatch {
-        &self.rows
-    }
-
     /// Returns this identity for `rows` when `rows` hold exactly its inputs:
-    /// the same non-managed column names in the same order, each with the
+    /// the same non-volatile column names in the same order, each with the
     /// same length, offset, validity bytes, data buffers, and children by
     /// address. Any difference returns `None`, and the caller recomputes.
     pub(crate) fn for_rows(&self, rows: &RecordBatch) -> Option<([u8; 32], u32)> {
@@ -560,9 +533,7 @@ impl LogicalIdentity {
                 .fields()
                 .iter()
                 .zip(batch.columns())
-                .filter(|(field, _)| {
-                    !crate::tables::managed_columns::is_managed_column(field.name())
-                })
+                .filter(|(field, _)| !is_volatile_column(field.name()))
                 .map(|(field, column)| (field.name().clone(), column.to_data()))
                 .collect::<Vec<_>>()
         };
@@ -609,11 +580,25 @@ fn same_identity_inputs(left: &ArrayData, right: &ArrayData) -> bool {
             .all(|(left, right)| same_identity_inputs(left, right))
 }
 
+/// Reports whether `name` is a managed column a legitimate retry restamps
+/// with a fresh value: the request and ingestion-time columns.
+///
+/// The managed correlation columns are not volatile: an honest retry of one
+/// accepted batch carries the same workload, subject, Run, and account pair,
+/// so they belong to what the rows are.
+fn is_volatile_column(name: &str) -> bool {
+    crate::tables::managed_columns::is_managed_column(name)
+        && !crate::tables::managed_columns::is_correlation_column(name)
+}
+
 /// Computes the stable logical Arrow identity used only for retained retries.
 ///
 /// Server-generated request and time columns change across a legitimate client
-/// retry, so they are excluded. Schema identity remains an independent retained
-/// fact, while every other Arrow buffer participates byte-for-byte.
+/// retry, so they are excluded. The managed correlation columns are bound, so
+/// a batch id replayed under another workload, subject, Run, or account pair
+/// is a different batch rather than a retry. Schema identity remains an
+/// independent retained fact, while every other Arrow buffer participates
+/// byte-for-byte.
 ///
 /// # Errors
 ///
@@ -623,14 +608,13 @@ pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32
     let mut digest = Sha256::new();
     let mut bytes = 0_usize;
     for (field, column) in rows.schema().fields().iter().zip(rows.columns()) {
-        // Managed columns describe *which* request carried the rows and whose
-        // attribution they bear, not what the rows are: the request and time
-        // columns are stamped fresh on every attempt, and correlation is bound
-        // separately by `correlation_data_identity`. Binding any of them here
-        // would make an honest client retry of the same batch look like a
-        // different batch. The set is the managed-column declaration itself,
-        // so a newly managed column cannot silently enter this identity.
-        if crate::tables::managed_columns::is_managed_column(field.name()) {
+        // The request and time columns describe *which* attempt carried the
+        // rows, not what they are: they are stamped fresh on every attempt, so
+        // binding them would make an honest client retry of the same batch
+        // look like a different batch. The set is the managed-column
+        // declaration itself, so a newly managed column enters this identity
+        // unless it is declared request- or time-scoped.
+        if is_volatile_column(field.name()) {
             continue;
         }
         digest.update(field.name().as_bytes());
@@ -1093,7 +1077,7 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::managed_columns::{WYRD_INGESTED_AT, WYRD_REQUEST_ID};
+    use wyrd_spec::vala::managed_columns::{WORKLOAD_CARD_UID, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
     use super::{NativeAdmittedRows, NativeSliceProducer, encode_ipc, logical_data_identity};
     use crate::catalog::TableRef;
@@ -1132,11 +1116,13 @@ mod tests {
         let source = NativeAdmittedRows {
             definition: None,
             card_scope: None,
+            dimensions: None,
             registered_schema: None,
             conform: Arc::default(),
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,
             attribution: Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())).into(),
+            workload: None,
             expected_schema_fingerprint: Some(fingerprint),
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
@@ -1331,12 +1317,31 @@ mod tests {
         ));
     }
 
-    /// Volatile server columns do not alter retained logical payload identity.
+    /// Volatile server columns do not alter retained logical payload identity,
+    /// and accepted correlation does.
+    ///
+    /// A fresh request id and ingestion time keep the identity of the same
+    /// rows, while a changed user value or a changed workload is a different
+    /// batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture batch does not build, an identity cannot be
+    /// computed, or a volatile change alters it or a stable change does not.
     #[test]
     fn logical_identity_ignores_server_receipt_columns_only() {
-        fn rows(value: i64, request: &str, receipt: i64) -> RecordBatch {
+        /// One stamped row for the identity comparisons: `value` is the user
+        /// payload and `workload` the stable accepted correlation, both of
+        /// which the identity binds, while `request` and `receipt` fill the
+        /// volatile `wyrd_request_id` and `wyrd_ingested_at` columns it skips.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the arrays do not build a batch of the declared schema.
+        fn rows(value: i64, workload: &str, request: &str, receipt: i64) -> RecordBatch {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("value", DataType::Int64, false),
+                Field::new(WORKLOAD_CARD_UID, DataType::Utf8, true),
                 Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
                 Field::new(WYRD_INGESTED_AT, DataType::Int64, false),
             ]));
@@ -1344,6 +1349,7 @@ mod tests {
                 schema,
                 vec![
                     Arc::new(Int64Array::from(vec![value])),
+                    Arc::new(StringArray::from(vec![workload])),
                     Arc::new(StringArray::from(vec![request])),
                     Arc::new(Int64Array::from(vec![receipt])),
                 ],
@@ -1351,24 +1357,25 @@ mod tests {
             .expect("identity batch")
         }
 
-        let first = logical_data_identity(&rows(7, "request-a", 10)).expect("first identity");
-        let fresh = logical_data_identity(&rows(7, "request-b", 20)).expect("fresh identity");
-        let changed = logical_data_identity(&rows(8, "request-c", 30)).expect("changed identity");
-        assert_eq!(first, fresh);
-        assert_ne!(first, changed);
+        let identity = |rows: RecordBatch| logical_data_identity(&rows).expect("identity");
+        let first = identity(rows(7, "s1", "request-a", 10));
+        assert_eq!(first, identity(rows(7, "s1", "request-b", 20)));
+        assert_ne!(first, identity(rows(8, "s1", "request-c", 30)));
+        assert_ne!(first, identity(rows(7, "s2", "request-a", 10)));
     }
 
     /// A known logical identity is reused only for rows holding its exact
     /// inputs, and the reused value equals a recomputation.
     ///
-    /// Restamping the managed columns, as decode does, keeps the identity;
-    /// the same values in fresh buffers and a partition `take` both fall back
-    /// to recomputation.
+    /// Restamping the volatile request column, as decode does, keeps the
+    /// identity; restamping a correlation column, the same values in fresh
+    /// buffers, and a partition `take` all fall back to recomputation.
     ///
     /// # Panics
     ///
     /// Panics when a fixture batch does not build, the restamped rows do not
-    /// reuse the identity or reuse a wrong one, or copied or taken rows do.
+    /// reuse the identity or reuse a wrong one, or copied, taken, or
+    /// re-correlated rows do.
     #[test]
     fn known_identity_is_reused_only_for_its_exact_inputs() {
         let batch = |values: ArrayRef, request: &str| {
@@ -1390,6 +1397,25 @@ mod tests {
             known.for_rows(&stamped),
             Some(logical_data_identity(&stamped).expect("recomputed identity")),
             "restamped managed columns keep the known identity"
+        );
+
+        let correlated = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, true),
+                Field::new(WORKLOAD_CARD_UID, DataType::Utf8, true),
+                Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::clone(&values),
+                Arc::new(StringArray::from(vec!["s1"; 3])),
+                Arc::new(StringArray::from(vec!["scribe"; 3])),
+            ],
+        )
+        .expect("correlated batch");
+        assert_eq!(
+            known.for_rows(&correlated),
+            None,
+            "a stamped correlation column recomputes"
         );
 
         let copied = batch(

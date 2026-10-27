@@ -24,6 +24,12 @@ mod pg_tests {
     }
 
     /// Proves Forge sees only active registrations in tenant/FQN order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture, tenant seeding, registration upsert, deprecation
+    /// update, or operator listing fails, or the listing is not exactly the two
+    /// active rows in strictly ascending tenant/FQN order.
     #[tokio::test]
     async fn active_table_inventory_is_operator_visible_ordered_and_status_filtered() {
         let fixture = PgFixture::start().await.expect("fixture");
@@ -40,9 +46,9 @@ mod pg_tests {
                 .expect("seed tenant");
         }
         for (tenant, uid, fqn) in [
-            (second_tenant, [2_u8; 16], "vala.bifrost.zeta"),
-            (first_tenant, [1_u8; 16], "vala.bifrost.alpha"),
-            (first_tenant, [3_u8; 16], "vala.bifrost.hidden"),
+            (second_tenant, [2_u8; 16], "bifrost.bifrost.zeta"),
+            (first_tenant, [1_u8; 16], "bifrost.bifrost.alpha"),
+            (first_tenant, [3_u8; 16], "bifrost.bifrost.hidden"),
         ] {
             let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
@@ -62,7 +68,7 @@ mod pg_tests {
         let superuser = fixture.superuser_pool().expect("superuser");
         sqlx::query("UPDATE vala.bifrost_tables SET status = 'deprecated' WHERE data_tenant_id = $1 AND fqn = $2")
             .bind(first_tenant.as_uuid())
-            .bind("vala.bifrost.hidden")
+            .bind("bifrost.bifrost.hidden")
             .execute(&superuser)
             .await
             .expect("deprecate row");
@@ -92,7 +98,7 @@ mod pg_tests {
             PrincipalId::new(Uuid::now_v7()),
             PrincipalId::new(Uuid::now_v7()),
         );
-        let fqn = "vala.datasets.attributed";
+        let fqn = "bifrost.datasets.attributed";
         for attribution in [
             creator,
             Attribution::direct(PrincipalId::new(Uuid::now_v7())),

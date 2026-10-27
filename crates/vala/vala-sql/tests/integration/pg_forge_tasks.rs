@@ -77,7 +77,7 @@ mod pg_tests {
     fn task(tenant: DataTenantId, table: &str, hash: u8) -> NewForgeTask {
         NewForgeTask {
             data_tenant_id: tenant,
-            table_ref: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", table)
+            table_ref: ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", table)
                 .expect("identity"),
             strategy: ForgeTaskStrategy::SmallFiles,
             base_snapshot_id: i64::from(hash),
@@ -748,9 +748,9 @@ mod pg_tests {
             committed_metadata_digest: Some("digest".to_owned()),
             cleanup_candidates: vec![ForgeCleanupCandidate {
                 category: ForgeCleanupCategory::Data,
-                table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "audit")
+                table: ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "audit")
                     .expect("candidate table"),
-                path: ForgeCleanupPath::new("tenants/t/vala.bifrost/audit/data/old.parquet")
+                path: ForgeCleanupPath::new("tenants/t/bifrost.bifrost/audit/data/old.parquet")
                     .expect("candidate path"),
             }],
             deleted_candidate_count: 0,
@@ -758,9 +758,9 @@ mod pg_tests {
         let wrong_table_evidence = ForgeTaskEvidence {
             cleanup_candidates: vec![ForgeCleanupCandidate {
                 category: ForgeCleanupCategory::Data,
-                table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "other")
+                table: ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "other")
                     .expect("wrong table"),
-                path: ForgeCleanupPath::new("tenants/t/vala.bifrost/other/data/old.parquet")
+                path: ForgeCleanupPath::new("tenants/t/bifrost.bifrost/other/data/old.parquet")
                     .expect("wrong path"),
             }],
             ..evidence.clone()
@@ -1052,8 +1052,9 @@ mod pg_tests {
         let (fixture, admin) = setup().await;
         let tasks = ForgeTasks::new(fixture.operator_pool().clone());
         let tenant = fixture.data_tenant_id();
-        let table = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "atomic-successor")
-            .expect("table identity");
+        let table =
+            ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "atomic-successor")
+                .expect("table identity");
         let owner = Uuid::now_v7();
         let task_id = tasks
             .enqueue(&task(tenant, "atomic-successor", 91))
@@ -1146,7 +1147,7 @@ mod pg_tests {
 
         let noop_table = ForgeTaskTableIdentity::new(
             "wyrd-redux",
-            "vala.bifrost",
+            "bifrost.bifrost",
             "atomic-noop-acknowledgement",
         )
         .expect("no-op table identity");
@@ -1238,9 +1239,9 @@ mod pg_tests {
         let op = fixture.operator_pool();
         let tasks = ForgeTasks::new(op.clone());
         let tenant = fixture.data_tenant_id();
-        assert!(ForgeTaskTableIdentity::new("unsupported", "vala.bifrost", "events").is_err());
+        assert!(ForgeTaskTableIdentity::new("unsupported", "bifrost.bifrost", "events").is_err());
         assert!(ForgeTaskTableIdentity::new("wyrd-redux", "unsupported", "events").is_err());
-        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "../events").is_err());
+        assert!(ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "../events").is_err());
         let mut malformed = task(tenant, "malformed", 5);
         malformed.plan.version = 99;
         assert!(tasks.enqueue(&malformed).await.is_err());
@@ -1280,7 +1281,7 @@ mod pg_tests {
             .expect("tenant");
         let identity = ForgeTaskTableIdentity::new(
             "wyrd-redux",
-            "vala.bifrost",
+            "bifrost.bifrost",
             if first.task_id == prepared_id {
                 "prepared"
             } else {
@@ -1633,7 +1634,7 @@ mod pg_tests {
         ForgeClaimTable {
             table_uid: [9_u8; 16],
             catalog_name: "wyrd-redux".to_owned(),
-            namespace_name: "vala.bifrost".to_owned(),
+            namespace_name: "bifrost.bifrost".to_owned(),
             table_name: "cleanup".to_owned(),
             table_uuid: Uuid::now_v7(),
         }
@@ -1646,7 +1647,7 @@ mod pg_tests {
     fn cleanup_candidate(name: &str) -> ForgeCleanupCandidate {
         ForgeCleanupCandidate {
             category: ForgeCleanupCategory::Data,
-            table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "cleanup")
+            table: ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "cleanup")
                 .expect("identity"),
             path: ForgeCleanupPath::new(format!("cleanup/data/{name}.parquet")).expect("path"),
         }
@@ -1658,7 +1659,7 @@ mod pg_tests {
     /// # Panics
     /// Panics when any seeding statement fails.
     async fn seed_cleanup_roots(superuser: &PgPool, tenant: DataTenantId, table: &ForgeClaimTable) {
-        sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout,sub_principal_id,act_principal_id) VALUES ($1,$2,'vala.bifrost.cleanup',decode(repeat('00',32),'hex'),'{}'::jsonb,'00000000-0000-7000-8000-000000000000','00000000-0000-7000-8000-000000000000')")
+        sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout,sub_principal_id,act_principal_id) VALUES ($1,$2,'bifrost.bifrost.cleanup',decode(repeat('00',32),'hex'),'{}'::jsonb,'00000000-0000-7000-8000-000000000000','00000000-0000-7000-8000-000000000000')")
             .bind(tenant.as_uuid())
             .bind(table.table_uid.as_slice())
             .execute(superuser)
@@ -1842,8 +1843,8 @@ mod pg_tests {
         let tasks = ForgeTasks::new(fixture.operator_pool().clone());
         let tenant = fixture.data_tenant_id();
         let table = cleanup_table();
-        let identity =
-            ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "cleanup").expect("identity");
+        let identity = ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "cleanup")
+            .expect("identity");
         let candidates = vec![cleanup_candidate("a"), cleanup_candidate("b")];
         let source = seed_expiration_source(&admin, tenant, &table, &candidates).await;
 
@@ -1968,7 +1969,7 @@ mod pg_tests {
         };
         let sibling = ForgeCleanupCandidate {
             category: ForgeCleanupCategory::Data,
-            table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "sibling")
+            table: ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "sibling")
                 .expect("sibling identity"),
             path: ForgeCleanupPath::new("sibling/data/a.parquet").expect("sibling path"),
         };
@@ -2468,7 +2469,7 @@ mod pg_tests {
         let table = ForgeClaimTable {
             table_uid: [7_u8; 16],
             catalog_name: "wyrd-redux".to_owned(),
-            namespace_name: "vala.bifrost".to_owned(),
+            namespace_name: "bifrost.bifrost".to_owned(),
             table_name: "orphan".to_owned(),
             table_uuid: Uuid::now_v7(),
         };
@@ -2815,7 +2816,7 @@ mod pg_tests {
             "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,\
              table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,\
              estimated_bytes,state,evidence,ready_at,next_eligible_at,updated_at) \
-             VALUES ($1,$2,'wyrd-redux','vala.bifrost',$3,$4,4242,$5::jsonb,\
+             VALUES ($1,$2,'wyrd-redux','bifrost.bifrost',$3,$4,4242,$5::jsonb,\
              decode(repeat('22',32),'hex'),1,100,$6,$7::jsonb,\
              statement_timestamp()+($8*interval '1 hour'),\
              statement_timestamp()+($8*interval '1 hour'),statement_timestamp())",

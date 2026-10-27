@@ -42,6 +42,11 @@ mod tests {
     use super::*;
 
     /// Invalid durable identity is rejected by conversion before callers can load a catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an identity with a foreign catalog, an unknown namespace, a
+    /// traversal table name, or a task tenant other than the scheduler's converts.
     #[test]
     fn durable_identity_conversion_fails_closed() {
         let tenant = DataTenantId::new_v7();
@@ -51,8 +56,12 @@ mod tests {
             table: table.to_owned(),
         };
         assert!(
-            task_table_binding(tenant, tenant, &identity("other", "vala.bifrost", "events"))
-                .is_err()
+            task_table_binding(
+                tenant,
+                tenant,
+                &identity("other", "bifrost.bifrost", "events")
+            )
+            .is_err()
         );
         assert!(
             task_table_binding(tenant, tenant, &identity("wyrd-redux", "unknown", "events"))
@@ -62,7 +71,7 @@ mod tests {
             task_table_binding(
                 tenant,
                 tenant,
-                &identity("wyrd-redux", "vala.bifrost", "../events")
+                &identity("wyrd-redux", "bifrost.bifrost", "../events")
             )
             .is_err()
         );
@@ -70,7 +79,7 @@ mod tests {
             task_table_binding(
                 DataTenantId::new_v7(),
                 tenant,
-                &identity("wyrd-redux", "vala.bifrost", "events")
+                &identity("wyrd-redux", "bifrost.bifrost", "events")
             )
             .is_err()
         );

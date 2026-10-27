@@ -1,14 +1,15 @@
 //! Arrow payloads for one Verifier execution: pure mapping, no transport.
 //!
 //! [`ResultPayloadBuilder`] maps one engine [`VerificationOutcome`] onto the
-//! authored schemas of `vala.verification.results` and
-//! `vala.drift.result_features`, and the execution's pinned inputs onto
-//! `vala.verification.execution_inputs`, taken from the tables' own declarations so
+//! authored schemas of `bifrost.verification.results` and
+//! `bifrost.drift.result_features`, and the execution's pinned inputs onto
+//! `bifrost.verification.execution_inputs`, taken from the tables' own declarations so
 //! the payload can never drift from the registered contract. Every batch also
-//! carries the two correlation columns Scribe admits from a native payload:
-//! `card_uid` (the Card verified; the Verifier is the authored
-//! `verifier_card_uid`) and `run_id` (the application Run judged, null when
-//! none, as for scheduled drift).
+//! carries the three correlation columns Scribe admits from a row-attributed
+//! payload: `workload_card_uid` (the binding owner), `subject_card_uid` (the
+//! Card verified; the Verifier is the authored `verifier_card_uid`), and
+//! `run_id` (the application Run judged, null when none, as for scheduled
+//! drift).
 
 use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap};
@@ -33,7 +34,10 @@ use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, GroupId, SlotName, Verific
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::UTC_TIME_ZONE;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::vala::managed_columns::{CARD_UID, RUN_ID};
+use wyrd_spec::vala::managed_columns::{
+    DEPLOYMENT_ENVIRONMENT, RUN_ID, SERVICE_NAME, SERVICE_VERSION, SUBJECT_CARD_UID, SUBJECT_KIND,
+    SUBJECT_NAME, SUBJECT_VERSION, WORKLOAD_CARD_UID,
+};
 use wyrd_spec::verification::TaskId;
 use wyrd_spec::verification::execution::{
     CallProvenance, InputDeclaration, RequirementDetail, RequirementResult, VerificationOutcome,
@@ -78,7 +82,7 @@ pub enum ResultPayloadError {
 type NamedColumn = (&'static str, ArrayRef);
 
 /// The one schema every row of each result table shares: the table's fields
-/// followed by `card_uid` and `run_id`, keyed by its table type.
+/// followed by the [`CORRELATION`] columns, keyed by its table type.
 ///
 /// Each result row is its own batch until the Scribe outbox concatenates a
 /// slice of them, so one shared schema lets the outbox group rows by pointer
@@ -87,10 +91,7 @@ static SCHEMAS: LazyLock<[(TypeId, SchemaRef); 3]> = LazyLock::new(|| {
     /// `T`'s fields followed by the correlation columns, keyed by `T`.
     fn schema<T: DomainTable + 'static>() -> (TypeId, SchemaRef) {
         let mut fields = T::arrow_fields();
-        fields.extend([
-            Field::new(CARD_UID, DataType::Utf8, true),
-            Field::new(RUN_ID, DataType::Utf8, true),
-        ]);
+        fields.extend(CORRELATION.map(|name| Field::new(name, DataType::Utf8, true)));
         (TypeId::of::<T>(), Arc::new(Schema::new(fields)))
     }
     [
@@ -100,10 +101,14 @@ static SCHEMAS: LazyLock<[(TypeId, SchemaRef); 3]> = LazyLock::new(|| {
     ]
 });
 
+/// The correlation columns every result row carries after its table's
+/// fields, in this order.
+const CORRELATION: [&str; 3] = [WORKLOAD_CARD_UID, SUBJECT_CARD_UID, RUN_ID];
+
 /// One sealed-ready batch and the table it is written to.
 #[derive(Debug, Clone)]
 pub struct ResultBatch {
-    /// Fully qualified destination table, such as `vala.verification.results`.
+    /// Fully qualified destination table, such as `bifrost.verification.results`.
     pub table: String,
     /// The rows, including the correlation columns.
     pub batch: RecordBatch,
@@ -173,15 +178,17 @@ pub struct ResultRun<'a> {
     pub run_id: Option<&'a RunId>,
     /// Exact Verifier Card version used.
     pub verifier_version: &'a str,
-    /// The Card verified, stored as the managed `card_uid`.
+    /// The Card verified, stored as the managed `subject_card_uid`.
     pub card_uid: &'a CardUid,
-    /// Owner Service: the binding owner for binding-created work, else the
-    /// authenticated caller's owner Service; `None` when neither is known.
+    /// Owner Service, stored as the managed `workload_card_uid`: the binding
+    /// owner for binding-created work, else the authenticated caller's owner
+    /// Service; `None` when neither is known.
     pub owner_card_uid: Option<&'a CardUid>,
     /// Caller group the execution belongs to; `None` when ungrouped.
     pub group_id: Option<&'a GroupId>,
     /// Deployment environment tag the execution was accepted with, stored
-    /// unchanged as `deployment_environment`; `None` when it carried none.
+    /// unchanged as every row's `deployment_environment`; `None` when it
+    /// carried none.
     pub deployment_environment: Option<&'a str>,
     /// Binding; `None` for an execution with no binding.
     pub binding_id: Option<BindingId>,
@@ -191,7 +198,7 @@ pub struct ResultRun<'a> {
     pub window: Option<&'a DriftWindow>,
 }
 
-/// One `vala.drift.result_features` row before encoding.
+/// One `bifrost.drift.result_features` row before encoding.
 struct DriftRow<'r> {
     /// The drift requirement that scored the feature.
     requirement: &'r str,
@@ -271,7 +278,7 @@ impl<'a> ResultPayloadBuilder<'a> {
         })
     }
 
-    /// Author the named columns of the one `vala.verification.results` row
+    /// Author the named columns of the one `bifrost.verification.results` row
     /// identified by `result_id`.
     ///
     /// The outcome is serialized straight to JSON text for the one Variant
@@ -300,17 +307,12 @@ impl<'a> ResultPayloadBuilder<'a> {
             ("execution_status", text([Some("completed")])),
             ("verdict", text([Some(verdict)])),
             ("verifier_version", text([Some(self.run.verifier_version)])),
-            ("owner_card_uid", text([self.owner()])),
             (
                 "verifier_card_uid",
                 text([Some(self.verifier_uid.as_str())]),
             ),
             ("binding_id", text([self.binding()])),
             ("group_id", text([self.group()])),
-            (
-                "deployment_environment",
-                text([self.run.deployment_environment]),
-            ),
             ("trigger_identity", text([trigger])),
             (
                 "window_start",
@@ -331,7 +333,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     }
 
     /// Map the execution's pinned `inputs` to its one
-    /// `vala.verification.execution_inputs` row, recorded at `started_at`.
+    /// `bifrost.verification.execution_inputs` row, recorded at `started_at`.
     ///
     /// A `submission` marks the row `queue_execution` and records its
     /// accepted request context — route overrides, idempotency key and
@@ -366,17 +368,12 @@ impl<'a> ResultPayloadBuilder<'a> {
                 "execution_id",
                 text([Some(self.run.execution_id.to_string())]),
             ),
-            ("owner_card_uid", text([self.owner()])),
             (
                 "verifier_card_uid",
                 text([Some(self.verifier_uid.as_str())]),
             ),
             ("binding_id", text([self.binding()])),
             ("group_id", text([self.group()])),
-            (
-                "deployment_environment",
-                text([self.run.deployment_environment]),
-            ),
             (
                 "queue_execution",
                 Arc::new(BooleanArray::from(vec![submission.is_some()])),
@@ -401,7 +398,7 @@ impl<'a> ResultPayloadBuilder<'a> {
         ])
     }
 
-    /// Author the named `vala.drift.result_features` columns: one row per
+    /// Author the named `bifrost.drift.result_features` columns: one row per
     /// scored feature of every drift requirement, each keyed by `result_id`.
     ///
     /// A row's window is its requirement's scored window, else the
@@ -456,10 +453,6 @@ impl<'a> ResultPayloadBuilder<'a> {
             (
                 "requirement_id",
                 text(rows.iter().map(|row| Some(row.requirement))),
-            ),
-            (
-                "owner_card_uid",
-                text(std::iter::repeat_n(self.owner(), count)),
             ),
             (
                 "verifier_card_uid",
@@ -527,7 +520,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             .map(|(_, schema)| Arc::clone(schema))
             .expect("every result table has a shared schema");
         Ok(ResultBatch {
-            table: format!("vala.{}.{}", T::NAMESPACE, T::NAME),
+            table: format!("bifrost.{}.{}", T::NAMESPACE, T::NAME),
             batch: self.assemble(schema, columns)?,
         })
     }
@@ -535,11 +528,12 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Order named columns by `schema`'s table fields, then append the
     /// correlation columns.
     ///
-    /// `schema` is a table's fields followed by `card_uid` and `run_id`.
+    /// `schema` is a table's fields followed by the [`CORRELATION`] columns.
     /// Every authored column must fill exactly one table field by name; the
     /// arrays are placed in field order, never in authoring order, so a
-    /// reordered declaration keeps each value under its own name. The
-    /// correlation columns repeat for the authored row count.
+    /// reordered declaration keeps each value under its own name. The shared
+    /// dimensions and correlation columns repeat the run's context for the
+    /// authored row count.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::ColumnMismatch`] with problem
@@ -561,9 +555,20 @@ impl<'a> ResultPayloadBuilder<'a> {
                 });
             }
         }
+        named.extend(
+            [
+                (SERVICE_NAME, None),
+                (SERVICE_VERSION, None),
+                (DEPLOYMENT_ENVIRONMENT, self.run.deployment_environment),
+                (SUBJECT_KIND, None),
+                (SUBJECT_NAME, None),
+                (SUBJECT_VERSION, None),
+            ]
+            .map(|(name, value)| (name, text(std::iter::repeat_n(value, rows)))),
+        );
         let fields = schema.fields();
         let mut arrays = Vec::with_capacity(fields.len());
-        for field in &fields[..fields.len().saturating_sub(2)] {
+        for field in &fields[..fields.len().saturating_sub(CORRELATION.len())] {
             let array = named.remove(field.name().as_str()).ok_or_else(|| {
                 ResultPayloadError::ColumnMismatch {
                     column: field.name().clone(),
@@ -578,6 +583,7 @@ impl<'a> ResultPayloadBuilder<'a> {
                 problem: "unexpected",
             });
         }
+        arrays.push(text(std::iter::repeat_n(self.owner(), rows)));
         arrays.push(text(std::iter::repeat_n(
             Some(self.run.card_uid.as_str()),
             rows,
@@ -625,8 +631,8 @@ fn serialized_name<T: Serialize>(value: &T) -> Result<Option<String>, JsonError>
 }
 
 /// The stored value of a Drift feature verdict: the snake_case spelling the
-/// published `vala.drift.result_features.verdict` column carries, matching
-/// `vala.verification.results.verdict`.
+/// published `bifrost.drift.result_features.verdict` column carries, matching
+/// `bifrost.verification.results.verdict`.
 const fn drift_verdict(verdict: DriftVerdict) -> &'static str {
     match verdict {
         DriftVerdict::NoDrift => "no_drift",
@@ -821,8 +827,8 @@ mod tests {
         let [features, summary] = payload.batches() else {
             panic!("features then summary");
         };
-        assert_eq!(features.table, "vala.drift.result_features");
-        assert_eq!(summary.table, "vala.verification.results");
+        assert_eq!(features.table, "bifrost.drift.result_features");
+        assert_eq!(summary.table, "bifrost.verification.results");
         let rows = &features.batch;
         assert_eq!(rows.num_rows(), 2);
         for row in 0..2 {

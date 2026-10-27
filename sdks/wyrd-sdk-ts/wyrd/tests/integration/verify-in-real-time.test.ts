@@ -92,7 +92,7 @@ function localJudge(request: ReceivedRequest): Reply {
     return judgeReply(REVIEWED);
   }
   const [traceId] = request.body.match(/[0-9a-f]{32}/) ?? [];
-  const sql = `SELECT name FROM vala.traces.spans WHERE trace_id = decode('${traceId}', 'hex') ORDER BY name`;
+  const sql = `SELECT name FROM bifrost.traces.spans WHERE trace_id = decode('${traceId}', 'hex') ORDER BY name`;
   return toolTurn([toolCall("call-spans", "bifrost.query", { sql, max_rows: 10 })]);
 }
 
@@ -131,8 +131,8 @@ async function assertCalledAsSystem(executionId: string, principal: string, run:
   const joined = await (await Bifrost.connect()).sql(
     `SELECT r.sub_principal_id AS result_subject, r.act_principal_id AS result_actor, r.run_id AS result_run,
             c.sub_principal_id AS call_subject, c.act_principal_id AS call_actor, c.run_id AS call_run
-       FROM vala.verification.results r
-       JOIN vala.gateway.calls c ON c.card_uid = r.card_uid
+       FROM bifrost.verification.results r
+       JOIN bifrost.gateway.calls c ON c.subject_card_uid = r.subject_card_uid
       WHERE r.execution_id = $1`,
     [executionId],
     ResultJudgeCall,
@@ -234,7 +234,7 @@ test("judge call is attributed to the run and card", async ({ server, assistant,
     calls.every((call) => call.act_principal_id !== assistant.principal),
     JSON.stringify(calls),
   ).toBe(true);
-  expect(calls.map((call) => [call.sub_principal_id, call.run_id, call.card_uid])).toEqual([
+  expect(calls.map((call) => [call.sub_principal_id, call.run_id, call.subject_card_uid])).toEqual([
     [assistant.principal, run.runId, result.subject.uid],
   ]);
   await assertCalledAsSystem(result.execution_id, assistant.principal, run.runId);
@@ -244,7 +244,7 @@ test("judge call without a run joins the callers trace attributed to the card", 
   const execution = await verifyOverHttp(server.baseUrl, assistant, `00-${CALLER_TRACE}-${CALLER_SPAN}-01`);
 
   const calls = await judgeCalls(server);
-  expect(calls.map((call) => [call.sub_principal_id, call.run_id, call.card_uid])).toEqual([
+  expect(calls.map((call) => [call.sub_principal_id, call.run_id, call.subject_card_uid])).toEqual([
     [assistant.principal, null, assistant.agent.uid],
   ]);
   const spans = await timeline(server, CALLER_TRACE);
@@ -430,7 +430,7 @@ test("retired verification contracts are refused", async ({ server, assistant })
   }
 
   const bifrost = await Bifrost.connect();
-  expect((await bifrost.listTables()).every((table) => table.namespace !== "vala.eval")).toBe(true);
+  expect((await bifrost.listTables()).every((table) => table.namespace !== "bifrost.eval")).toBe(true);
   const refusals = async (namespace: string, name: string) =>
     Promise.all(
       [
@@ -445,11 +445,11 @@ test("retired verification contracts are refused", async ({ server, assistant })
       ),
     );
   for (const name of ["result_items", "observations"]) {
-    const retired = await refusals("vala.eval", name);
+    const retired = await refusals("bifrost.eval", name);
     expect(retired).not.toContain("accepted");
-    expect(retired).toEqual(await refusals("vala.absent", name));
+    expect(retired).toEqual(await refusals("bifrost.absent", name));
   }
-  await bifrost.sql("SELECT COUNT(*) AS n FROM vala.verification.results");
+  await bifrost.sql("SELECT COUNT(*) AS n FROM bifrost.verification.results");
 });
 
 test("exact verifier grant verifies only that verifier", async ({ server, assistant }) => {
@@ -641,7 +641,7 @@ test("grouped refund changes verdict", async ({ server }) => {
     [6, "passed", ["latest-not-overdue"], 1],
   ]);
   const history = await (await Bifrost.connect()).sql(
-    "SELECT execution_id, result_id, verdict FROM vala.verification.results WHERE binding_id = $1 ORDER BY ended_at",
+    "SELECT execution_id, result_id, verdict FROM bifrost.verification.results WHERE binding_id = $1 ORDER BY ended_at",
     [bindingId],
     z.object({ execution_id: z.string(), result_id: z.string(), verdict: z.string() }),
   );
@@ -912,7 +912,7 @@ const Retained = z.object({ execution_id: z.string() });
 async function groupExecutions(server: { flushBifrost(): void }, bindingId: string): Promise<string[]> {
   server.flushBifrost();
   const rows = await (await Bifrost.connect()).sql(
-    "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1 ORDER BY ended_at",
+    "SELECT execution_id FROM bifrost.verification.results WHERE binding_id = $1 ORDER BY ended_at",
     [bindingId],
     Retained,
   );
@@ -983,7 +983,7 @@ test("grouped conversations coexist with drift", async ({ server, state: drift }
     "conv-b": [2, { kind: "json", value: [turn("b1"), turn("")] }, "failed"],
   });
   const ungrouped = await (await Bifrost.connect()).sql(
-    "SELECT execution_id FROM vala.verification.results WHERE execution_id = $1 AND group_id IS NULL",
+    "SELECT execution_id FROM bifrost.verification.results WHERE execution_id = $1 AND group_id IS NULL",
     [solo.execution_id],
     Retained,
   );
@@ -1105,7 +1105,7 @@ stagingTest("verification_staging_refuses_and_recovers", async ({ server, state 
 
   server.flushBifrost();
   const rows = await (await Bifrost.connect()).sql(
-    "SELECT count(*) AS n FROM vala.verification.execution_inputs",
+    "SELECT count(*) AS n FROM bifrost.verification.execution_inputs",
     [],
     z.object({ n: z.coerce.number() }),
   );

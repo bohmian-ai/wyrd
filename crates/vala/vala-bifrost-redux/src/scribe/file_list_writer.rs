@@ -771,7 +771,7 @@ mod tests {
                 FileListArtifactInsert {
                     id,
                     data_tenant_id: tenant,
-                    namespace: "vala.traces".to_owned(),
+                    namespace: "bifrost.traces".to_owned(),
                     table_name: "spans".to_owned(),
                     promotion_record: fixture_promotion_record(
                         tenant,

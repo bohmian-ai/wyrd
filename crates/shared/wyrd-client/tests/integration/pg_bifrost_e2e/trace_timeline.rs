@@ -1,6 +1,6 @@
 //! Read one trace's span tree through `Bifrost::trace_timeline`.
 //!
-//! Spans are written to the tenant's `vala.traces.spans` through the public
+//! Spans are written to the tenant's `bifrost.traces.spans` through the public
 //! Arrow batch door with chosen trace ids, span ids, start times, and links,
 //! then read back as canonical span records: the seed trace plus each trace
 //! linking directly to it, deduplicated and in a total order.
@@ -16,7 +16,7 @@ use wyrd_testing::server::WyrdTestServer;
 use super::pg_tests::service_client;
 
 /// The span table every timeline reads.
-const SPANS: &str = "vala.traces.spans";
+const SPANS: &str = "bifrost.traces.spans";
 /// 2026-10-14T00:00:00Z in Unix nanoseconds, the first span's start.
 const ANCHOR_NANOS: i64 = 1_791_936_000_000_000_000;
 

@@ -30,7 +30,7 @@ describe("Wyrd timestamp types", () => {
       local: z.iso.datetime({ local: true }),
     });
 
-    const schema = TableConfig.fromJsonSchema("vala.datasets.orders", order).arrowSchema;
+    const schema = TableConfig.fromJsonSchema("bifrost.datasets.orders", order).arrowSchema;
 
     expect(Object.fromEntries(schema.fields.map((field) => [field.name, String(field.type)]))).toEqual({
       store_opens: NTZ,

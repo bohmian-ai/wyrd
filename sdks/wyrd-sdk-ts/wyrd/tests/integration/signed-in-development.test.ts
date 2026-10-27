@@ -44,9 +44,9 @@ test("saved login completes the workflow past token expiry", async ({ server }) 
   exportSpan(run);
   await worked.state.shutdown();
   const rows = await (await Bifrost.connect({ client })).sql(
-    "SELECT card_uid FROM vala.traces.spans WHERE run_id = $1",
+    "SELECT subject_card_uid FROM bifrost.traces.spans WHERE run_id = $1",
     [run.runId],
     Attributed,
   );
-  expect(rows).toEqual([{ card_uid: worked.agentUid }]);
+  expect(rows).toEqual([{ subject_card_uid: worked.agentUid }]);
 });

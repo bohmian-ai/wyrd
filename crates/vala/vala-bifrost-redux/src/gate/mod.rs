@@ -40,7 +40,7 @@ pub use crate::gate::limits::{IngestLimits, OtlpWireLimits};
 use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
-use crate::scribe::preprocess::{LogicalIdentity, correlation_data_identity};
+use crate::scribe::preprocess::LogicalIdentity;
 use crate::tables::{
     CallsTable, DomainTable, ExecutionInputsTable, ResultFeaturesTable, ResultsTable, TableError,
 };
@@ -104,11 +104,12 @@ fn record_write_rejection(error: &IngestError) {
 /// metadata. The identity is the SHA-256 of a domain separator, the
 /// authenticated tenant, the verified publisher's subject and current actor
 /// (the pair Scribe stamps on the rows), the logical table FQN,
-/// the canonical batch's logical Arrow digest from
-/// [`LogicalIdentity`], and the accepted correlation attribution that
-/// digest deliberately excludes ([`correlation_data_identity`]). The logical
-/// digest omits the per-request managed columns (request id, ingest time) that
-/// change across a legitimate retry, so a genuine replay still converges;
+/// the accepted `context` — workload root and deployment environment — that
+/// the shared dimensions are stamped from, and the canonical batch's logical
+/// Arrow digest from [`LogicalIdentity`], which binds the batch's accepted
+/// correlation columns. The logical digest omits the per-request managed
+/// columns (request id, ingest time) that change across a legitimate retry,
+/// so a genuine replay still converges;
 /// binding the publisher pair and the correlation columns keeps two authorized
 /// publishers in one tenant, including two actors for one subject, from
 /// collapsing an identical user payload onto one fence and losing the second
@@ -121,37 +122,39 @@ fn record_write_rejection(error: &IngestError) {
 /// the actual duplicate decision: a repeat returns `AlreadyCommitted` and a
 /// digest collision carrying a different durable identity stays fail-closed.
 ///
-/// # Errors
-///
-/// Returns the mapped Scribe failure when the canonical batch has no
-/// representable logical or correlation identity.
-///
 /// # Panics
 ///
 /// Never panics: the sixteen-byte slice of a SHA-256 digest is infallible and
 /// its `expect` names that invariant.
+#[must_use]
 fn otlp_batch_id(
     tenant: DataTenantId,
     publisher: Attribution,
+    context: [Option<&str>; 2],
     table: &TableRef,
     identity: &LogicalIdentity,
-) -> Result<Uuid, IngestError> {
+) -> Uuid {
     let logical_digest = identity.digest();
-    let correlation_digest =
-        correlation_data_identity(identity.rows()).map_err(IngestError::from_scribe)?;
     let mut digest = Sha256::new();
     digest.update(b"wyrd.otlp.batch-id.v1");
     digest.update(tenant.as_uuid().as_bytes());
     digest.update(publisher.sub_principal_id.as_uuid().as_bytes());
     digest.update(publisher.act_principal_id.as_uuid().as_bytes());
+    // The accepted context stamps the workload and the shared dimensions, so
+    // a replay under another root or environment is another batch. Each part
+    // is length-prefixed so adjacent values cannot run together.
+    for context in context {
+        let context = context.unwrap_or_default();
+        digest.update((context.len() as u64).to_be_bytes());
+        digest.update(context.as_bytes());
+    }
     digest.update(table.fqn().as_bytes());
     digest.update(logical_digest);
-    digest.update(correlation_digest);
     let digest: [u8; 32] = digest.finalize().into();
     let mut bytes: [u8; 16] = digest[..16].try_into().expect("sixteen digest bytes");
     bytes[6] = (bytes[6] & 0x0f) | 0x70;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Ok(Uuid::from_bytes(bytes))
+    Uuid::from_bytes(bytes)
 }
 
 /// Owns exactly one terminal Gate request metric across return or cancellation.
@@ -501,6 +504,26 @@ impl<A: GateAudit + 'static> Gate<A> {
         Ok(attributed.or_else(|| auth.principal.card_scope().map(<[_]>::to_vec)))
     }
 
+    /// Resolves the shared-dimension context of one frame whose rows may name
+    /// `subjects`, or `None` where no registry is composed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry's unavailability error.
+    async fn frame_dimensions(
+        &self,
+        auth: &AuthContext,
+        subjects: Option<&[wyrd_spec::ids::CardUid]>,
+    ) -> Result<Option<crate::tables::FrameDimensions>, IngestError> {
+        match &self.cards {
+            Some(registry) => registry
+                .frame_dimensions(auth, subjects.unwrap_or_default())
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Attaches the sink every write decision is staged on.
     ///
     /// A Gate with a Scribe but no sink refuses every write as an internal
@@ -515,7 +538,7 @@ impl<A: GateAudit + 'static> Gate<A> {
 
     /// Evaluates the table-scoped write permission and stages the decision.
     ///
-    /// The verification result tables and `vala.gateway.calls` are written
+    /// The verification result tables and `bifrost.gateway.calls` are written
     /// only by the server's internal writer, which never passes Gate, so every
     /// public write to them is refused. Every allowed or denied decision is
     /// staged on the audit sink without waiting, then the verdict is enforced.
@@ -548,10 +571,10 @@ impl<A: GateAudit + 'static> Gate<A> {
     ///
     /// The checks run cheapest first. A principal holding `BifrostRecord`
     /// `Write` under no scope at all is refused before any catalog work. The
-    /// four server-owned verification tables and the exact `vala.gateway.calls`
+    /// four server-owned verification tables and the exact `bifrost.gateway.calls`
     /// table are written only by the server's internal capture writer, which
     /// never passes Gate, so every public principal, a wildcard holder
-    /// included, is refused next; the rest of `vala.gateway` is not reserved. Otherwise Scribe resolves the tenant's registered table UID and the principal must
+    /// included, is refused next; the rest of `bifrost.gateway` is not reserved. Otherwise Scribe resolves the tenant's registered table UID and the principal must
     /// hold `BifrostRecord` `Write` covering that exact table object scope.
     ///
     /// # Errors
@@ -706,14 +729,15 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// # Errors
     ///
     /// Returns the ingress-closed refusal when the Gate is closed or its
-    /// Scribe is not ready.
+    /// Scribe is not ready, and [`IngestError::RequestContext`] for a
+    /// malformed deployment environment.
     pub fn admit_verified(
         &self,
         verified: VerifiedToken,
         metadata: &MetadataMap,
     ) -> Result<AuthContext, IngestError> {
         self.ensure_open()?;
-        Ok(AuthContext::from_verified(verified, metadata))
+        AuthContext::from_verified(verified, metadata)
     }
 
     /// Mount the Gate on the shared tonic router.
@@ -953,7 +977,19 @@ impl<A: GateAudit + 'static> Gate<A> {
             return Ok(());
         }
         let identity = LogicalIdentity::of(&batch).map_err(IngestError::from_scribe)?;
-        let batch_id = otlp_batch_id(auth.tenant, auth.attribution(), &table, &identity)?;
+        let batch_id = otlp_batch_id(
+            auth.tenant,
+            auth.attribution(),
+            [
+                auth.workload().map(wyrd_spec::ids::CardUid::as_str),
+                auth.deployment_environment.as_deref(),
+            ],
+            &table,
+            &identity,
+        );
+        let dimensions = self
+            .frame_dimensions(auth, attributed_cards.as_deref())
+            .await?;
         let payload = IngressPayload::Canonical(
             match owner {
                 Some(owner) => CanonicalIngress::new(vec![batch], owner),
@@ -966,8 +1002,10 @@ impl<A: GateAudit + 'static> Gate<A> {
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
                 attribution: auth.attribution().into(),
+                workload: auth.workload().cloned(),
                 authenticated_tenant: auth.tenant,
                 attributed_cards,
+                dimensions,
                 table,
                 expected_schema_fingerprint: None,
                 table_version: None,
@@ -1046,12 +1084,17 @@ impl<A: GateAudit + 'static> Gate<A> {
         let attributed_cards = self
             .attributed_cards(auth, || attribution::native_card_uids(&frame.arrow_ipc))
             .await?;
+        let dimensions = self
+            .frame_dimensions(auth, attributed_cards.as_deref())
+            .await?;
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
             attribution: auth.attribution().into(),
+            workload: auth.workload().cloned(),
             authenticated_tenant: auth.tenant,
             attributed_cards,
+            dimensions,
             table,
             expected_schema_fingerprint: None,
             table_version: Some(table_version),
@@ -1640,13 +1683,21 @@ mod tests {
         ///
         /// This implementation returns no error after the frame invariants
         /// succeed; invariant violations panic in the test that owns it.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the frame's tenant differs from its principal's, its table
+        /// is not `bifrost.traces.spans`, it carries a schema fingerprint, its
+        /// payload is not an owner-backed canonical batch, or a `subject_card_uid`
+        /// column is missing, not Utf8, unparseable, or outside the signed scope,
+        /// and when a row or card log lock is poisoned.
         async fn ingest_frame(
             &self,
             frame: crate::contracts::ScribeIngressFrame,
         ) -> Result<crate::contracts::FrameAdmission, crate::contracts::ScribeError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             assert_eq!(frame.authenticated_tenant, frame.principal.tenant_id);
-            assert_eq!(frame.table.fqn(), "vala.traces.spans");
+            assert_eq!(frame.table.fqn(), "bifrost.traces.spans");
             assert!(frame.expected_schema_fingerprint.is_none());
             let crate::contracts::IngressPayload::Canonical(canonical) = &frame.payload else {
                 panic!("Gate must hand Scribe validated canonical batches");
@@ -1660,11 +1711,11 @@ mod tests {
             let mut handed = self.card_uids.lock().expect("card log is not poisoned");
             for batch in &canonical.batches {
                 let column = batch
-                    .column_by_name("card_uid")
+                    .column_by_name("subject_card_uid")
                     .expect("a canonical signal batch carries its correlation column")
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
-                    .expect("card_uid is Utf8");
+                    .expect("subject_card_uid is Utf8");
                 for row in 0..column.len() {
                     if column.is_null(row) {
                         handed.push(None);
@@ -1827,6 +1878,7 @@ mod tests {
             tenant,
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
+            deployment_environment: None,
         }
     }
 
@@ -1835,6 +1887,9 @@ mod tests {
         TableUid::from_bytes(*uuid::Uuid::now_v7().as_bytes())
     }
 
+    /// One user context in a fresh tenant, granted wildcard `bifrost_record_write`
+    /// only when `with_permission` is set, so a Gate test can drive both the allowed
+    /// and the RBAC-denied path.
     fn auth_context(with_permission: bool) -> AuthContext {
         let tenant = DataTenantId::new_v7();
         let permissions = if with_permission {
@@ -1854,6 +1909,7 @@ mod tests {
             tenant,
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
+            deployment_environment: None,
         }
     }
 
@@ -1873,6 +1929,7 @@ mod tests {
             tenant,
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
+            deployment_environment: None,
         }
     }
 
@@ -2035,7 +2092,7 @@ mod tests {
             wildcard,
         );
         let error = gate
-            .dispatch_native_frame(&limits, &context, native_frame("vala.gateway.calls"))
+            .dispatch_native_frame(&limits, &context, native_frame("bifrost.gateway.calls"))
             .await
             .expect_err("no public principal writes the reserved call table");
         assert!(matches!(
@@ -2046,15 +2103,21 @@ mod tests {
         assert_eq!(scribe.ingested.load(Ordering::Relaxed), 0);
         assert_eq!(
             audit.decisions(),
-            vec![("vala.gateway.calls".to_owned(), AuditOutcome::Denied)]
+            vec![("bifrost.gateway.calls".to_owned(), AuditOutcome::Denied)]
         );
     }
 
     /// A table-scoped record write is authorized against the resolved UID.
     ///
     /// The same grant is refused when the destination resolves to another
-    /// registration, while the rest of `vala.gateway` stays unreserved for an
+    /// registration, while the rest of `bifrost.gateway` stays unreserved for an
     /// ordinary wildcard writer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the foreign-UID write is admitted or refused with anything but
+    /// `RbacDenied`, reaches Scribe, the exact-UID or wildcard write is refused, or
+    /// Scribe does not ingest exactly those two frames.
     #[tokio::test]
     async fn gate_authorizes_record_writes_against_the_resolved_table_uid() {
         let granted = random_uid();
@@ -2081,14 +2144,14 @@ mod tests {
 
         let (gate, scribe) = gate_resolving_to(random_uid());
         let error = gate
-            .dispatch_native_frame(&limits, &scoped, native_frame("vala.traces.spans"))
+            .dispatch_native_frame(&limits, &scoped, native_frame("bifrost.traces.spans"))
             .await
             .expect_err("a grant for another registration does not cover this one");
         assert!(matches!(error, IngestError::RbacDenied { .. }));
         assert_eq!(scribe.ingested.load(Ordering::Relaxed), 0);
 
         let (gate, scribe) = gate_resolving_to(granted);
-        gate.dispatch_native_frame(&limits, &scoped, native_frame("vala.traces.spans"))
+        gate.dispatch_native_frame(&limits, &scoped, native_frame("bifrost.traces.spans"))
             .await
             .expect("the grant covers its exact registration");
         let wildcard = context_with(
@@ -2096,7 +2159,7 @@ mod tests {
             PrincipalKind::User,
             [Permission::bifrost_record_write()],
         );
-        gate.dispatch_native_frame(&limits, &wildcard, native_frame("vala.gateway.other"))
+        gate.dispatch_native_frame(&limits, &wildcard, native_frame("bifrost.gateway.other"))
             .await
             .expect("only the exact call table is reserved");
         assert_eq!(scribe.ingested.load(Ordering::Relaxed), 2);
@@ -2486,13 +2549,13 @@ mod tests {
                 detail: "bifrost:record:write denied".to_owned(),
             },
             IngestError::ReservedBuiltinWriteDenied {
-                table: "vala.audit.events".to_owned(),
+                table: "bifrost.audit.events".to_owned(),
             },
             IngestError::RequestValidation("bad batch id".to_owned()),
             IngestError::Decode("truncated frame".to_owned()),
             IngestError::PayloadTooLarge { bytes: 2, limit: 1 },
             IngestError::TableNotFound {
-                table: "vala.traces.absent".to_owned(),
+                table: "bifrost.traces.absent".to_owned(),
             },
             IngestError::IngressClosed,
             IngestError::WalDiskFull,
@@ -2531,7 +2594,7 @@ mod tests {
     fn gate_rejection_increments_only_the_projected_reason() {
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         let error = IngestError::TableNotFound {
-            table: "vala.bifrost/absent".to_owned(),
+            table: "bifrost.bifrost/absent".to_owned(),
         };
         let reason = error
             .rejection_reason()
@@ -2607,6 +2670,7 @@ mod tests {
             tenant,
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
+            deployment_environment: None,
         }
     }
 
@@ -2683,9 +2747,9 @@ mod tests {
             ("system", kind_context(PrincipalKind::System, wildcard())),
         ];
         for table in [
-            "vala.verification.results",
-            "vala.verification.execution_inputs",
-            "vala.drift.result_features",
+            "bifrost.verification.results",
+            "bifrost.verification.execution_inputs",
+            "bifrost.drift.result_features",
         ] {
             for (label, auth) in &principals {
                 let scribe_calls = Arc::new(AtomicUsize::new(0));
@@ -2749,7 +2813,7 @@ mod tests {
             )
             .with_audit(Arc::clone(&audit));
             let frame = wyrd_tonic::wyrd::v1::InsertBatchRequest {
-                table: "vala.datasets.events".to_owned(),
+                table: "bifrost.datasets.events".to_owned(),
                 wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
                 arrow_ipc: Vec::new().into(),
                 producer_trace_contexts: Vec::new(),
@@ -2823,7 +2887,7 @@ mod tests {
     fn batch_identity_acceptance_is_unchanged() {
         let limits = IngestLimits::default();
         let frame = |batch_id: Vec<u8>| wyrd_tonic::wyrd::v1::InsertBatchRequest {
-            table: "vala.traces.spans".to_owned(),
+            table: "bifrost.traces.spans".to_owned(),
             wyrd_batch_id: batch_id.into(),
             arrow_ipc: Vec::new().into(),
             producer_trace_contexts: Vec::new(),
@@ -2934,7 +2998,8 @@ mod otlp_batch_id_tests {
     ///
     /// Retry suppression depends on a repeated export converging on one
     /// `wyrd_batch_id`, and on any other tenant, table, row order, payload,
-    /// verified publisher subject or current actor, or accepted correlation
+    /// verified publisher subject or current actor, accepted workload root or
+    /// environment, or accepted correlation
     /// attribution diverging so identity never correlates across those
     /// boundaries and two authorized publishers never collapse onto one fence. The value must also remain a
     /// `UUIDv7`, which is the contract the native ingest path validates.
@@ -2954,12 +3019,15 @@ mod otlp_batch_id_tests {
         let other_actor = Attribution::new(subject, PrincipalId::new(uuid::Uuid::now_v7()));
         let spans = TableRef::new(BifrostNamespace::Traces, "spans");
         let records = TableRef::new(BifrostNamespace::Logs, "records");
-        let id = |tenant, principal, table: &TableRef, values: &[i32], run| {
+        let in_context = |context, tenant, principal, table: &TableRef, values: &[i32], run| {
             let identity = crate::scribe::preprocess::LogicalIdentity::of(&batch(values, run))
                 .expect("the fixture batch has a logical identity");
-            otlp_batch_id(tenant, principal, table, &identity)
-                .expect("the fixture batch has an identity")
+            otlp_batch_id(tenant, principal, context, table, &identity)
         };
+        let id = |tenant, principal, table: &TableRef, values: &[i32], run| {
+            in_context([None, None], tenant, principal, table, values, run)
+        };
+        let root = uuid::Uuid::now_v7().to_string();
 
         let baseline = id(tenant, principal, &spans, &[1, 2, 3], Some("run-a"));
         assert_eq!(
@@ -2987,11 +3055,35 @@ mod otlp_batch_id_tests {
             id(tenant, principal, &spans, &[1, 2, 4], Some("run-a")),
             id(tenant, principal, &spans, &[1, 2, 3], Some("run-b")),
             id(tenant, principal, &spans, &[1, 2, 3], None),
+            in_context(
+                [Some(&root), None],
+                tenant,
+                principal,
+                &spans,
+                &[1, 2, 3],
+                Some("run-a"),
+            ),
+            in_context(
+                [None, Some("prod")],
+                tenant,
+                principal,
+                &spans,
+                &[1, 2, 3],
+                Some("run-a"),
+            ),
+            in_context(
+                [Some("prod"), None],
+                tenant,
+                principal,
+                &spans,
+                &[1, 2, 3],
+                Some("run-a"),
+            ),
         ] {
             assert_ne!(
                 baseline, divergent,
-                "a different tenant, publisher, table, row order, payload, or accepted \
-                 correlation attribution is a different batch"
+                "a different tenant, publisher, workload root, environment, table, row \
+                 order, payload, or accepted correlation attribution is a different batch"
             );
         }
         assert_ne!(

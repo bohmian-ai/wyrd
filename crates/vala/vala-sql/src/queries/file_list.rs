@@ -394,7 +394,7 @@ mod tests {
         HotFileRow {
             id: Uuid::now_v7(),
             data_tenant_id: Uuid::now_v7(),
-            namespace: "vala.bifrost".to_owned(),
+            namespace: "bifrost.bifrost".to_owned(),
             table_name: "events".to_owned(),
             file_path: "events/a.parquet".to_owned(),
             file_ordinal: 0,
@@ -504,7 +504,7 @@ mod pg_tests {
                     forge_publication_operation_id, node_id, writer_epoch, wal_lsn_min,
                     wal_lsn_max, promotion_record
                 ) VALUES (
-                    $1, $2, 'vala.bifrost', 'events', $3, $4,
+                    $1, $2, 'bifrost.bifrost', 'events', $3, $4,
                     $5, 16, 4, $6, $6,
                     'hour', $6, $7, $8,
                     $9, $10, 1, $4, $4,
@@ -527,7 +527,7 @@ mod pg_tests {
             .expect("insert manifest row");
         }
 
-        let catalog = HotFileCatalog::new("vala.bifrost", "events");
+        let catalog = HotFileCatalog::new("bifrost.bifrost", "events");
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant connection");

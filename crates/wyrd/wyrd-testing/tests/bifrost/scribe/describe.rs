@@ -13,12 +13,12 @@ use super::support::{start_scribe_server, tenant_client, unique_table};
 ///
 /// For a canonical signal table the description's projected Arrow schema is
 /// the registry's physical schema — every name, type shape, and nullability —
-/// including the `card_uid` correlation input a writer supplies, and the
+/// including the `subject_card_uid` correlation input a writer supplies, and the
 /// exact canonical physical fingerprint. Types compare exactly, because the
 /// description projects the registry's own physical schema. For a dynamic
 /// table, batches prepared straight from the description are accepted by the
 /// real ingest wire and land with optional Card correlation: the correlated
-/// row keeps its `card_uid`, the uncorrelated row stores none and still
+/// row keeps its `subject_card_uid`, the uncorrelated row stores none and still
 /// carries its authenticated principal.
 ///
 /// # Panics
@@ -31,7 +31,7 @@ use super::support::{start_scribe_server, tenant_client, unique_table};
 async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     let server = start_scribe_server().await;
     let table_name = unique_table("described");
-    let fqn = format!("vala.datasets.{table_name}");
+    let fqn = format!("bifrost.datasets.{table_name}");
     let bootstrap = server
         .bootstrap_service(&unique_table("describe_writer"), &["admin"])
         .await
@@ -73,7 +73,7 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     let query = Bifrost::query_only(&client);
 
     let canonical = query
-        .describe_table("vala.traces", "spans")
+        .describe_table("bifrost.traces", "spans")
         .await
         .expect("describe the canonical span table");
     let definition = vala_bifrost_redux::tables::builtin_table("traces", "spans")
@@ -118,16 +118,17 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
             "`{name}` sends no field identity beyond its extension type; ingress compares by shape"
         );
     }
-    let card_uid = canonical
+    let subject_card_uid = canonical
         .correlation_fields
         .iter()
-        .find(|field| field.name == "card_uid")
+        .find(|field| field.name == "subject_card_uid")
         .expect("the Card correlation input is described");
     assert!(
-        card_uid.nullable && card_uid.data_type == wyrd_spec::vala::api::DataTypeSpec::Utf8,
-        "card_uid is the optional text column the writer supplies"
+        subject_card_uid.nullable
+            && subject_card_uid.data_type == wyrd_spec::vala::api::DataTypeSpec::Utf8,
+        "subject_card_uid is the optional text column the writer supplies"
     );
-    for name in ["card_uid", "run_id"] {
+    for name in ["subject_card_uid", "run_id"] {
         assert_eq!(
             described_schema
                 .fields()
@@ -151,7 +152,7 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     assert!(
         wyrd_types::writable_schema(&dynamic)
             .expect("the dynamic description projects an Arrow schema")
-            .field_with_name("card_uid")
+            .field_with_name("subject_card_uid")
             .expect("the Card correlation input is described")
             .is_nullable(),
         "Card correlation is optional, so describe must not demand it"
@@ -201,25 +202,27 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     let mut stream = query
         .query(&BifrostQueryRequest {
             params: Vec::new(),
-            sql: format!("SELECT id, card_uid, sub_principal_id FROM {fqn} ORDER BY id"),
+            sql: format!("SELECT id, subject_card_uid, sub_principal_id FROM {fqn} ORDER BY id"),
             deadline_ms: None,
         })
         .await
         .expect("Oracle reads the stored correlation columns");
     let mut correlation = Vec::new();
     while let Some(batch) = stream.next_batch().await.expect("valid terminal stream") {
-        let card_uid = batch.column_by_name("card_uid").expect("card_uid column");
+        let subject_card_uid = batch
+            .column_by_name("subject_card_uid")
+            .expect("subject_card_uid column");
         let principal_id = batch
             .column_by_name("sub_principal_id")
             .expect("sub_principal_id column");
         for row in 0..batch.num_rows() {
-            correlation.push((card_uid.is_null(row), principal_id.is_null(row)));
+            correlation.push((subject_card_uid.is_null(row), principal_id.is_null(row)));
         }
     }
     assert_eq!(
         correlation,
         vec![(false, false), (true, false)],
-        "both described rows land; only the correlated one carries a card_uid"
+        "both described rows land; only the correlated one carries a subject_card_uid"
     );
     server.shutdown().await.expect("server shutdown");
 }
@@ -300,7 +303,7 @@ async fn registered_layouts_are_bounded_and_resolved() {
         let schema = std::sync::Arc::clone(&schema);
         async move {
             let mut config = wyrd_client::bifrost::TableConfig::from_arrow(
-                &format!("vala.datasets.{table}"),
+                &format!("bifrost.datasets.{table}"),
                 schema,
             )
             .expect("declared table");
@@ -349,7 +352,7 @@ async fn registered_layouts_are_bounded_and_resolved() {
         RegisterOutcome::Created
     );
     let described = query
-        .describe_table("vala.datasets", &table)
+        .describe_table("bifrost.datasets", &table)
         .await
         .expect("describe the composite table");
     assert_eq!(
@@ -365,7 +368,7 @@ async fn registered_layouts_are_bounded_and_resolved() {
     );
     assert_eq!(
         query
-            .describe_table("vala.datasets", &table)
+            .describe_table("bifrost.datasets", &table)
             .await
             .expect("describe after re-registration")
             .table_version,
@@ -383,7 +386,7 @@ async fn registered_layouts_are_bounded_and_resolved() {
     );
     assert_eq!(
         query
-            .describe_table("vala.datasets", &table)
+            .describe_table("bifrost.datasets", &table)
             .await
             .expect("describe after the refused change")
             .physical_layout,
@@ -396,7 +399,7 @@ async fn registered_layouts_are_bounded_and_resolved() {
         .await
         .expect("an omitted layout registers");
     let default_layout = query
-        .describe_table("vala.datasets", &defaults)
+        .describe_table("bifrost.datasets", &defaults)
         .await
         .expect("describe the default table")
         .physical_layout;
@@ -438,7 +441,7 @@ async fn registered_layouts_are_bounded_and_resolved() {
     .await
     .expect("a declared time column alone registers");
     let timed_layout = query
-        .describe_table("vala.datasets", &timed)
+        .describe_table("bifrost.datasets", &timed)
         .await
         .expect("describe the timed table")
         .physical_layout;
@@ -611,7 +614,7 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
         BifrostOptions {
             table: Some(
                 wyrd_client::bifrost::TableConfig::from_arrow(
-                    &format!("vala.datasets.{table}"),
+                    &format!("bifrost.datasets.{table}"),
                     std::sync::Arc::new(Schema::new(vec![
                         Field::new("customer", DataType::Utf8, true),
                         Field::new("name", DataType::Utf8, false),
@@ -638,8 +641,8 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
     };
 
     for (namespace, name, candidate) in [
-        ("vala.traces", "spans".to_owned(), "span_id"),
-        ("vala.datasets", table.clone(), "name"),
+        ("bifrost.traces", "spans".to_owned(), "span_id"),
+        ("bifrost.datasets", table.clone(), "name"),
     ] {
         let before = describe(namespace, name.clone()).await;
         let blooms: &[&str] = if before.physical_layout.bloom_columns.is_empty() {
@@ -678,10 +681,10 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
         assert_eq!(describe(namespace, name).await, committed);
     }
 
-    let current = describe("vala.datasets", table.clone()).await;
+    let current = describe("bifrost.datasets", table.clone()).await;
     let combined = bifrost
         .alter_table(
-            "vala.datasets",
+            "bifrost.datasets",
             &table,
             &layout_edit(
                 current.table_version,
@@ -720,7 +723,7 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
     assert_eq!(combined.physical_layout.bloom_columns, ["name"]);
     let cleared = bifrost
         .alter_table(
-            "vala.datasets",
+            "bifrost.datasets",
             &table,
             &bloom_edit(combined.table_version, &[]),
         )
@@ -737,8 +740,8 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
         bloom_edit(cleared.table_version, &["customer"]),
     );
     let (first, second) = tokio::join!(
-        bifrost.alter_table("vala.datasets", &table, &name_edit),
-        bifrost.alter_table("vala.datasets", &table, &customer_edit),
+        bifrost.alter_table("bifrost.datasets", &table, &name_edit),
+        bifrost.alter_table("bifrost.datasets", &table, &customer_edit),
     );
     let (winner, loser) = match (first, second) {
         (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
@@ -749,7 +752,7 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
         winner.table_version,
         cleared.table_version.next().expect("next")
     );
-    let settled = describe("vala.datasets", table.clone()).await;
+    let settled = describe("bifrost.datasets", table.clone()).await;
     assert_eq!(settled, winner, "the losing edit changed nothing");
 
     let refusals = [
@@ -790,7 +793,7 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
     ];
     for (edit, expected_code, expected) in refusals {
         let refused = bifrost
-            .alter_table("vala.datasets", &table, &edit)
+            .alter_table("bifrost.datasets", &table, &edit)
             .await
             .expect_err("the edit is refused");
         assert_eq!(code(&refused), expected_code, "{refused}");
@@ -799,7 +802,7 @@ async fn table_patch_preserves_omitted_lists_and_compares_versions() {
             "names {expected}: {refused}"
         );
         assert_eq!(
-            describe("vala.datasets", table.clone()).await,
+            describe("bifrost.datasets", table.clone()).await,
             settled,
             "a refused edit changes nothing"
         );
@@ -885,7 +888,7 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
     let client = tenant_client(&server, server.data_tenant_id()).await;
     let bifrost = Bifrost::query_only(&client);
     let table = unique_table("evolved");
-    let fqn = format!("vala.datasets.{table}");
+    let fqn = format!("bifrost.datasets.{table}");
     Bifrost::connect_with(
         &client,
         BifrostOptions {
@@ -941,13 +944,13 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
     .await
     .expect("rows under the registered schema are accepted");
     let before = bifrost
-        .describe_table("vala.datasets", &table)
+        .describe_table("bifrost.datasets", &table)
         .await
         .expect("describe before the edit");
 
     let edited = bifrost
         .alter_table(
-            "vala.datasets",
+            "bifrost.datasets",
             &table,
             &schema_edit(
                 before.table_version,
@@ -1055,9 +1058,9 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
             "RequiredColumn",
         ),
         (
-            schema_edit(version, vec![string_column("card_uid", true)], &[]),
+            schema_edit(version, vec![string_column("subject_card_uid", true)], &[]),
             "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
-            "card_uid",
+            "subject_card_uid",
         ),
         (
             schema_edit(
@@ -1071,7 +1074,7 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
     ];
     for (edit, expected_code, expected) in refusals {
         let refused = bifrost
-            .alter_table("vala.datasets", &table, &edit)
+            .alter_table("bifrost.datasets", &table, &edit)
             .await
             .expect_err("the edit is refused");
         assert_eq!(code(&refused), expected_code, "{refused}");
@@ -1081,7 +1084,7 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
         );
         assert_eq!(
             bifrost
-                .describe_table("vala.datasets", &table)
+                .describe_table("bifrost.datasets", &table)
                 .await
                 .expect("describe after a refusal"),
             edited,
@@ -1091,12 +1094,12 @@ async fn custom_schema_edits_preserve_field_ids_and_values() {
     assert_eq!(rows().await, expected, "refusals change no rows");
 
     let spans = bifrost
-        .describe_table("vala.traces", "spans")
+        .describe_table("bifrost.traces", "spans")
         .await
         .expect("describe the span table");
     let refused = bifrost
         .alter_table(
-            "vala.traces",
+            "bifrost.traces",
             "spans",
             &schema_edit(spans.table_version, vec![string_column("tag", true)], &[]),
         )
@@ -1200,7 +1203,7 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
         let name = name.to_owned();
         async move {
             bifrost
-                .describe_table("vala.datasets", &name)
+                .describe_table("bifrost.datasets", &name)
                 .await
                 .expect("describe the table")
         }
@@ -1209,7 +1212,7 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
 
     let refused = Bifrost::query_only(&a)
         .alter_table(
-            "vala.datasets",
+            "bifrost.datasets",
             &name,
             &bloom_edit(original.table_version, &["absent"]),
         )
@@ -1224,7 +1227,7 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
 
     let committed = Bifrost::query_only(&a)
         .alter_table(
-            "vala.datasets",
+            "bifrost.datasets",
             &name,
             &layout_edit(
                 original.table_version,
@@ -1281,7 +1284,7 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
         .expect("pod B admits a batch at the committed version");
 
     let spans = Bifrost::query_only(&a)
-        .describe_table("vala.traces", "spans")
+        .describe_table("bifrost.traces", "spans")
         .await
         .expect("describe spans");
     let blooms: &[&str] = if spans.physical_layout.bloom_columns.is_empty() {
@@ -1291,7 +1294,7 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
     };
     let spans = Bifrost::query_only(&a)
         .alter_table(
-            "vala.traces",
+            "bifrost.traces",
             "spans",
             &bloom_edit(spans.table_version, blooms),
         )
@@ -1321,7 +1324,7 @@ async fn tenant_layout_overrides_survive_restart_and_refresh() {
         );
         assert_eq!(
             Bifrost::query_only(client)
-                .describe_table("vala.traces", "spans")
+                .describe_table("bifrost.traces", "spans")
                 .await
                 .expect("describe spans after restart"),
             spans,
@@ -1415,7 +1418,7 @@ async fn an_edit_returns_its_own_committed_definition() {
     let client = tenant_client(&server, tenant).await;
     let bifrost = Bifrost::query_only(&client);
     let before = bifrost
-        .describe_table("vala.datasets", &name)
+        .describe_table("bifrost.datasets", &name)
         .await
         .expect("describe the registered table");
     let next = before.table_version.next().expect("next version");
@@ -1424,10 +1427,11 @@ async fn an_edit_returns_its_own_committed_definition() {
     pause_next_alter_after_publication_for_test(Arc::clone(&published), Arc::clone(&release));
     let first_edit = bloom_edit(before.table_version, &["value"]);
     let second_edit = bloom_edit(next, &[]);
-    let first = bifrost.alter_table("vala.datasets", &name, &first_edit);
+    let first = bifrost.alter_table("bifrost.datasets", &name, &first_edit);
     let second = async {
         published.notified().await;
-        let mut second = std::pin::pin!(bifrost.alter_table("vala.datasets", &name, &second_edit));
+        let mut second =
+            std::pin::pin!(bifrost.alter_table("bifrost.datasets", &name, &second_edit));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(500), &mut second)
                 .await
@@ -1447,7 +1451,7 @@ async fn an_edit_returns_its_own_committed_definition() {
     assert!(second.physical_layout.bloom_columns.is_empty());
     assert_eq!(
         bifrost
-            .describe_table("vala.datasets", &name)
+            .describe_table("bifrost.datasets", &name)
             .await
             .expect("describe the table"),
         second,
@@ -1514,7 +1518,7 @@ async fn table_patch_http_contract_refuses_invalid_requests() {
     let writer = token(tenant, &["patch_writer_reader"]).await;
     let foreign = token(neighbour, &["admin"]).await;
     let url = format!(
-        "{}/v1/bifrost/tables/vala.datasets/{name}",
+        "{}/v1/bifrost/tables/bifrost.datasets/{name}",
         server.base_url().expect("HTTP URL")
     );
     let http = reqwest::Client::new();
@@ -1670,7 +1674,7 @@ async fn table_patch_http_contract_refuses_invalid_requests() {
     server.await_audit_retained().await.expect("audit settles");
     assert_eq!(
         server
-            .retained_audit_operation_count(tenant, "vala.bifrost.alter")
+            .retained_audit_operation_count(tenant, "bifrost.bifrost.alter")
             .await
             .expect("count audited decisions"),
         3,

@@ -41,7 +41,7 @@ JUDGED = frozenset({"passed", "failed"})
 """Verdicts that are real judgments; ``inconclusive`` and a missing verdict are not."""
 
 TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
-"""A ``vala.datasets`` table segment safe to name in SQL."""
+"""A ``bifrost.datasets`` table segment safe to name in SQL."""
 
 ROW_LIMIT = 200
 """Rows each evidence query projects; a working application needs only one."""
@@ -162,8 +162,8 @@ class Observer:
         evidence.kinds = sorted(set(evidence.kinds))
         cards = ", ".join(f"${index}" for index in range(1, len(uids) + 1))
         evidence.telemetry_runs = self.runs(
-            f"SELECT DISTINCT run_id FROM vala.traces.spans "
-            f"WHERE run_id IS NOT NULL AND card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
+            f"SELECT DISTINCT run_id FROM bifrost.traces.spans "
+            f"WHERE run_id IS NOT NULL AND subject_card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
             uids,
             evidence,
         )
@@ -172,8 +172,8 @@ class Observer:
                 evidence.notes.append(f"skipped unexpected table name {table!r}")
                 continue
             evidence.custom_runs[table] = self.runs(
-                f"SELECT DISTINCT run_id FROM vala.datasets.{table} "
-                f"WHERE run_id IS NOT NULL AND card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
+                f"SELECT DISTINCT run_id FROM bifrost.datasets.{table} "
+                f"WHERE run_id IS NOT NULL AND subject_card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
                 uids,
                 evidence,
             )
@@ -181,16 +181,16 @@ class Observer:
             Judgment(row["execution_id"], row["execution_status"], row["verdict"], row["run_id"])
             for row in self.rows(
                 "SELECT r.execution_id, r.execution_status, r.verdict, r.run_id "
-                "FROM vala.verification.results r "
-                "JOIN vala.verification.execution_inputs i ON i.execution_id = r.execution_id "
-                f"WHERE NOT i.queue_execution AND r.card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
+                "FROM bifrost.verification.results r "
+                "JOIN bifrost.verification.execution_inputs i ON i.execution_id = r.execution_id "
+                f"WHERE NOT i.queue_execution AND r.subject_card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
                 uids,
                 evidence,
             )
         ]
         queued = self.rows(
-            "SELECT DISTINCT execution_id FROM vala.verification.execution_inputs "
-            f"WHERE queue_execution AND card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
+            "SELECT DISTINCT execution_id FROM bifrost.verification.execution_inputs "
+            f"WHERE queue_execution AND subject_card_uid IN ({cards}) LIMIT {ROW_LIMIT}",
             uids,
             evidence,
         )

@@ -15,10 +15,10 @@ from wyrd.client import WyrdClient
 # ANCHOR: sql
 SQL = """
 SELECT t.run_id, t.question, t.answer, s.trace_id, g.call_id, r.execution_id, r.verdict
-FROM vala.datasets.tickets t
-JOIN vala.traces.spans s ON s.run_id = t.run_id AND s.name = 'support-desk.ask'
-JOIN vala.gateway.calls g ON g.run_id = t.run_id
-JOIN vala.verification.results r ON r.run_id = t.run_id
+FROM bifrost.datasets.tickets t
+JOIN bifrost.traces.spans s ON s.run_id = t.run_id AND s.name = 'support-desk.ask'
+JOIN bifrost.gateway.calls g ON g.run_id = t.run_id
+JOIN bifrost.verification.results r ON r.run_id = t.run_id
 WHERE t.run_id = $1
 """
 # ANCHOR_END: sql

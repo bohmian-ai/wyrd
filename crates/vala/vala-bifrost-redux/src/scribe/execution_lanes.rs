@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use arrow::array::{Array, ArrayRef, StringArray, TimestampMicrosecondArray};
+use arrow::array::{Array, ArrayRef, AsArray, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -30,11 +30,14 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::managed_columns::{
-    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    ACT_PRINCIPAL_ID, DEPLOYMENT_ENVIRONMENT, RUN_ID, SERVICE_NAME, SERVICE_VERSION,
+    SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME, SUBJECT_VERSION,
+    WORKLOAD_CARD_UID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
-use crate::tables::CorrelationPolicy;
-use crate::tables::managed_columns::ensure_managed_columns;
+use crate::tables::managed_columns::{
+    MANAGED_COLUMNS, ensure_managed_columns, is_managed_column, is_reserved_column,
+};
 
 #[cfg(test)]
 const INGRESS_QUEUE_ITEMS: usize = 256;
@@ -221,7 +224,9 @@ impl ScribeIngressCpuPool {
     ) -> Result<RecordBatch, ScribeError> {
         let IngressDecodeInputs {
             attribution,
+            workload,
             card_scope,
+            dimensions,
             expected_schema_fingerprint,
             request_id,
             receipt_micros,
@@ -254,7 +259,9 @@ impl ScribeIngressCpuPool {
                     payload,
                     &DecodeContext {
                         attribution,
+                        workload: workload.as_ref(),
                         card_scope: card_scope.as_deref(),
+                        dimensions: dimensions.as_ref(),
                         expected_schema_fingerprint,
                         request_id: &request_id,
                         receipt_micros,
@@ -462,9 +469,15 @@ pub(crate) fn decode_native_batch(
 pub(crate) struct IngressDecodeInputs {
     /// Source of the trusted subject/actor pair stamped on every row.
     pub(crate) attribution: StampedAttribution,
-    /// Card UIDs every row's `card_uid` is authorized against: the frame's
-    /// attributed UIDs, or the principal's signed scope.
+    /// Verified workload Service release a frame-attributed write stamps as
+    /// `workload_card_uid`; ignored for row attribution.
+    pub(crate) workload: Option<CardUid>,
+    /// Card UIDs every row's `subject_card_uid` is authorized against: the
+    /// frame's attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<Vec<CardUid>>,
+    /// Accepted context the shared Service, environment, and subject
+    /// dimensions are stamped from; `None` keeps each row's own values.
+    pub(crate) dimensions: Option<crate::tables::FrameDimensions>,
     /// Caller-supplied fingerprint required of the caller-owned source
     /// schema; `None` leaves conformance to the registered schema as the only
     /// schema authority.
@@ -490,9 +503,15 @@ pub(crate) struct IngressDecodeInputs {
 pub(crate) struct DecodeContext<'a> {
     /// Source of the trusted subject/actor pair stamped on every row.
     pub(crate) attribution: StampedAttribution,
-    /// Card UIDs every row's `card_uid` is authorized against: the frame's
-    /// attributed UIDs, or the principal's signed scope.
+    /// Verified workload Service release a frame-attributed write stamps as
+    /// `workload_card_uid`; ignored for row attribution.
+    pub(crate) workload: Option<&'a CardUid>,
+    /// Card UIDs every row's `subject_card_uid` is authorized against: the
+    /// frame's attributed UIDs, or the principal's signed scope.
     pub(crate) card_scope: Option<&'a [CardUid]>,
+    /// Accepted context the shared Service, environment, and subject
+    /// dimensions are stamped from; `None` keeps each row's own values.
+    pub(crate) dimensions: Option<&'a crate::tables::FrameDimensions>,
     /// Caller-supplied fingerprint required of the caller-owned source
     /// schema; `None` leaves conformance to the registered schema as the only
     /// schema authority.
@@ -505,8 +524,8 @@ pub(crate) struct DecodeContext<'a> {
     /// Canonical built-in whose physical identity this decode must preserve.
     ///
     /// `Some` only for a canonical signal table. A dynamic or pre-declared
-    /// table leaves this `None` and keeps the existing catalog-fingerprint and
-    /// managed-field policy.
+    /// table leaves this `None` and keeps the existing catalog-fingerprint
+    /// check.
     pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
     ///
@@ -558,41 +577,49 @@ fn decode_rows(
         if !seen.insert(field.name().as_str()) {
             return Err(ScribeError::InvalidFrame);
         }
-        // `run_id` and `card_uid` are caller correlation that this function
-        // relinquishes and restamps exactly once in their slots, `card_uid`
-        // only after authorizing it, and a row-attributed frame's
-        // subject/actor pair is validated and restamped the same way. Every
-        // other reserved column is unconditionally server-owned, so
-        // supplying one is a refusal rather than an override.
+        // `run_id` and `subject_card_uid` are caller correlation that this
+        // function relinquishes and restamps exactly once in their slots,
+        // `subject_card_uid` only after authorizing it, and a row-attributed
+        // frame's workload, principal pair, and request are validated and
+        // restamped the same way. Every other reserved column is
+        // unconditionally server-owned, so supplying one is a refusal rather
+        // than an override.
         let name = field.name().as_str();
         let carried = context.attribution == StampedAttribution::Rows
-            && (name == SUB_PRINCIPAL_ID || name == ACT_PRINCIPAL_ID);
-        if correlation_policy(context).reserves(name)
-            && name != RUN_ID
-            && name != CARD_UID
-            && !carried
-        {
+            && matches!(
+                name,
+                WORKLOAD_CARD_UID | SUB_PRINCIPAL_ID | ACT_PRINCIPAL_ID | WYRD_REQUEST_ID
+            );
+        if is_reserved_column(name) && name != RUN_ID && name != SUBJECT_CARD_UID && !carried {
             return Err(ScribeError::InvalidFrame);
         }
     }
     let conformed;
     let rows = match context.registered_schema {
         Some(registered) => {
-            let policy = correlation_policy(context);
             conformed = match context.conform {
-                Some(plans) => plans.conform(rows, registered, policy)?,
-                None => conform_to_registered(rows, registered, policy)?,
+                Some(plans) => plans.conform(rows, registered)?,
+                None => conform_to_registered(rows, registered)?,
             };
             &conformed
         }
         None => rows,
     };
     if let Some(definition) = context.definition {
-        enforce_builtin_source_contract(rows, definition, trusted)?;
+        enforce_builtin_source_contract(
+            rows,
+            definition,
+            trusted,
+            context.attribution == StampedAttribution::Rows,
+        )?;
+        if matches!(context.attribution, StampedAttribution::Frame(_))
+            && (definition.canonical_fields)().is_none()
+        {
+            refuse_supplied_dimensions(rows)?;
+        }
     }
     if let Some(expected) = context.expected_schema_fingerprint
-        && source_schema_fingerprint(rows.schema().as_ref(), correlation_policy(context))
-            != expected
+        && source_schema_fingerprint(rows.schema().as_ref()) != expected
     {
         return Err(ScribeError::FingerprintMismatch {
             table: "resolved ingress table".to_owned(),
@@ -638,9 +665,9 @@ fn decode_rows(
 ///   marker with parameters, at any depth — is refused as an unsupported type
 ///   before any value is read, because the storage-only fingerprint cannot
 ///   see the extension;
-/// - any other matched column, a column `policy` does not reserve that the
-///   table does not register, and a registered column `policy` does not
-///   reserve that was not sent are refused, so the registered schema of the
+/// - any other matched column, an unreserved column the table does not
+///   register, and an unreserved registered column that was not sent are
+///   refused, so the registered schema of the
 ///   selected table version alone decides the caller-owned columns; reserved
 ///   columns are left for managed stamping.
 ///
@@ -656,9 +683,8 @@ fn decode_rows(
 fn conform_to_registered(
     rows: &RecordBatch,
     registered: &IcebergSchema,
-    policy: CorrelationPolicy,
 ) -> Result<RecordBatch, ScribeError> {
-    ConformPlan::build(&rows.schema(), registered, policy)?.apply(rows)
+    ConformPlan::build(&rows.schema(), registered)?.apply(rows)
 }
 
 /// How every batch of one sent Arrow schema conforms to one registered
@@ -687,20 +713,14 @@ impl ConformPlan {
     /// [`ScribeError::FingerprintMismatch`] for a column the registered schema
     /// does not accept, a missing registered column, or a registered schema
     /// with no Arrow form.
-    fn build(
-        sent: &Schema,
-        registered: &IcebergSchema,
-        policy: CorrelationPolicy,
-    ) -> Result<Self, ScribeError> {
+    fn build(sent: &Schema, registered: &IcebergSchema) -> Result<Self, ScribeError> {
         let mismatch = || ScribeError::FingerprintMismatch {
             table: "resolved ingress table".to_owned(),
         };
         let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| mismatch())?;
-        if target
-            .fields()
-            .iter()
-            .any(|wanted| !policy.reserves(wanted.name()) && sent.index_of(wanted.name()).is_err())
-        {
+        if target.fields().iter().any(|wanted| {
+            !is_reserved_column(wanted.name()) && sent.index_of(wanted.name()).is_err()
+        }) {
             return Err(mismatch());
         }
         let registered_columns = target
@@ -731,7 +751,7 @@ impl ConformPlan {
                     ));
                 }
                 Some(_) => return Err(mismatch()),
-                None if !policy.reserves(field.name()) => return Err(mismatch()),
+                None if !is_reserved_column(field.name()) => return Err(mismatch()),
                 None => None,
             };
             // The selected schema owns top-level requiredness, so Arrow
@@ -826,7 +846,6 @@ impl ConformPlans {
         &self,
         rows: &RecordBatch,
         registered: &Arc<IcebergSchema>,
-        policy: CorrelationPolicy,
     ) -> Result<RecordBatch, ScribeError> {
         let sent = rows.schema();
         let key = Arc::as_ptr(registered).addr();
@@ -843,7 +862,7 @@ impl ConformPlans {
         if let Some(plan) = remembered {
             return plan.apply(rows);
         }
-        let plan = Arc::new(ConformPlan::build(&sent, registered, policy)?);
+        let plan = Arc::new(ConformPlan::build(&sent, registered)?);
         self.plans
             .write()
             .expect("the conform plan lock is never poisoned")
@@ -927,6 +946,13 @@ fn enforce_dynamic_variants(
 /// were built; for them the reserved-column refusal still runs but the value
 /// validator does not walk the batch a second time.
 ///
+/// `carried` marks a row-attributed frame, whose producer accepted each row's
+/// origin: its `wyrd_request_id` is that row's admitting request, and on a
+/// canonical signal its `deployment_environment` is that request's accepted
+/// environment rather than a resource promotion, so the validator judges
+/// every other field against the environment the resource derives. A public
+/// frame supplies neither.
+///
 /// # Errors
 ///
 /// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column,
@@ -937,27 +963,94 @@ fn enforce_builtin_source_contract(
     rows: &RecordBatch,
     definition: &'static crate::tables::BuiltinTableDefinition,
     trusted: bool,
+    carried: bool,
 ) -> Result<(), ScribeError> {
     let canonical = (definition.canonical_fields)().is_some();
     let schema = rows.schema();
     if canonical
-        && schema
-            .fields()
-            .iter()
-            .any(|field| field.name().starts_with("wyrd_"))
+        && schema.fields().iter().any(|field| {
+            field.name().starts_with("wyrd_") && !(carried && field.name() == WYRD_REQUEST_ID)
+        })
     {
         return Err(ScribeError::InvalidFrame);
     }
     if trusted {
         return Ok(());
     }
-    let policy = definition.correlation_policy;
-    let user = RecordBatch::try_new(
-        Arc::new(Schema::new(user_fields(rows, policy))),
-        user_columns(rows, policy),
-    )
-    .map_err(|_| ScribeError::InvalidFrame)?;
+    let fields = user_fields(rows);
+    let mut columns = user_columns(rows);
+    if carried
+        && canonical
+        && let Some(environment) = fields
+            .iter()
+            .position(|field| field.name() == DEPLOYMENT_ENVIRONMENT)
+    {
+        columns[environment] =
+            resource_environment(rows).map_err(ScribeError::ContractViolation)?;
+    }
+    let user = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|_| ScribeError::InvalidFrame)?;
     (definition.canonical_validator)(&user).map_err(ScribeError::ContractViolation)?;
+    Ok(())
+}
+
+/// The `deployment_environment` each row of a canonical signal batch derives
+/// from its `resource_attributes`, as the signal's projection promotes it.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] when the batch has no
+/// `resource_attributes` column, and the
+/// [`crate::tables::signal::stored_attributes`] refusal of a row whose
+/// attributes cannot be read.
+fn resource_environment(rows: &RecordBatch) -> Result<ArrayRef, BifrostError> {
+    use crate::tables::signal::{ResourcePromotions, stored_attributes, utf8_opt_column};
+
+    let column =
+        rows.column_by_name("resource_attributes")
+            .ok_or_else(|| BifrostError::SchemaParse {
+                detail: "canonical batch is missing column resource_attributes".to_owned(),
+            })?;
+    let environments = (0..rows.num_rows())
+        .map(|row| {
+            stored_attributes(column.as_ref(), row)
+                .map(|set| ResourcePromotions::extract(&set).deployment_environment)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(utf8_opt_column(&environments))
+}
+
+/// Refuses a public non-signal built-in batch that supplies a shared
+/// dimension.
+///
+/// Such a table has no source field a supplied Service, environment, or
+/// subject value could be validated against: its [`SHARED_DIMENSIONS`] come
+/// only from the accepted request context that [`stamp_dimensions`] applies.
+/// A public writer therefore sends each one null, and any value refuses the
+/// whole batch before ACK. Row-attributed frames are server-built from their
+/// producer's accepted origin and never reach this check, and the canonical
+/// signals validate their resource promotions against their source fields
+/// instead.
+///
+/// [`SHARED_DIMENSIONS`]: crate::tables::SHARED_DIMENSIONS
+///
+/// # Errors
+///
+/// Returns [`ScribeError::ContractViolation`] carrying
+/// [`BifrostError::SchemaParse`] naming the first dimension a row supplies.
+fn refuse_supplied_dimensions(rows: &RecordBatch) -> Result<(), ScribeError> {
+    for column in crate::tables::SHARED_DIMENSIONS {
+        if rows
+            .column_by_name(column)
+            .is_some_and(|values| values.null_count() != values.len())
+        {
+            return Err(ScribeError::ContractViolation(BifrostError::SchemaParse {
+                detail: format!(
+                    "{column} is stamped from the accepted request context; send it null"
+                ),
+            }));
+        }
+    }
     Ok(())
 }
 
@@ -998,15 +1091,14 @@ fn enforce_canonical_physical_identity(
 
 /// Fingerprints the caller-owned block of one source schema.
 ///
-/// Every column `policy` reserves — the managed columns it stamps and every
-/// `wyrd_*` name — is dropped first, so the result is comparable with the
-/// registered table's user-field fingerprint. A [`CorrelationPolicy::None`]
-/// table's own identity columns stay in it as content.
-fn source_schema_fingerprint(schema: &Schema, policy: CorrelationPolicy) -> SchemaFingerprint {
+/// Every reserved column — the managed envelope and every `wyrd_*` name — is
+/// dropped first, so the result is comparable with the registered table's
+/// user-field fingerprint.
+fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
-        .filter(|field| !policy.reserves(field.name()))
+        .filter(|field| !is_reserved_column(field.name()))
         .map(|field| field.as_ref().clone())
         .collect();
     SchemaFingerprint::from_arrow_schema(&Schema::new(fields))
@@ -1054,7 +1146,7 @@ fn authorized_card_uids(
     rows: &RecordBatch,
     scope: Option<&[CardUid]>,
 ) -> Result<Vec<Option<String>>, ScribeError> {
-    let Some(column) = rows.column_by_name(CARD_UID) else {
+    let Some(column) = rows.column_by_name(SUBJECT_CARD_UID) else {
         return Ok(vec![None; rows.num_rows()]);
     };
     let uids = column
@@ -1118,6 +1210,8 @@ fn caller_run_id_column(rows: &RecordBatch) -> Result<Option<ArrayRef>, ScribeEr
 /// `context`, read once per batch at admission. Projected payloads retain
 /// their remaining correlation values unchanged. Each row's `card_uid` is
 /// authorized against `context.card_scope` before anything is stamped.
+/// A built-in table's shared dimensions are then stamped from
+/// `context.dimensions` by [`stamp_dimensions`].
 ///
 /// # Errors
 /// Returns [`ScribeError::CardScopeDenied`] when a row's `card_uid` is not
@@ -1138,11 +1232,9 @@ fn stamp_correlation_columns(
     let (attribution, request_id, receipt_micros) = (*attribution, *request_id, *receipt_micros);
     let card_uids = authorized_card_uids(rows, context.card_scope)?;
     let caller_run_id = caller_run_id_column(rows)?;
-    let policy = correlation_policy(context);
-    let mut fields = user_fields(rows, policy);
-    let mut columns = user_columns(rows, policy);
-    fields.extend(ensure_managed_columns(Vec::new(), policy));
-    columns.extend(managed_arrays(
+    let mut fields = user_fields(rows);
+    let mut columns = user_columns(rows);
+    let managed = managed_arrays(
         rows,
         &ManagedValues {
             attribution,
@@ -1150,9 +1242,28 @@ fn stamp_correlation_columns(
             request_id,
             receipt_micros,
             caller_run_id,
+            workload: context.workload,
         },
-        policy,
-    )?);
+    )?;
+    if let (Some(dimensions), Some(_)) = (context.dimensions, context.definition) {
+        let stamped = |name: &str| {
+            MANAGED_COLUMNS
+                .iter()
+                .zip(&managed)
+                .find(|(column, _)| column.field.name == name)
+                .and_then(|(_, array)| array.as_string_opt::<i32>())
+                .ok_or(ScribeError::InvalidFrame)
+        };
+        stamp_dimensions(
+            &fields,
+            &mut columns,
+            dimensions,
+            stamped(WORKLOAD_CARD_UID)?,
+            stamped(SUBJECT_CARD_UID)?,
+        )?;
+    }
+    fields.extend(ensure_managed_columns(Vec::new()));
+    columns.extend(managed);
     // A canonical built-in constructs only the arrays here: every correlation
     // and managed `Field` — with its sensitivity metadata — is
     // cloned from the table's own physical schema, and the locally assembled
@@ -1198,50 +1309,104 @@ fn stamp_correlation_columns(
     Ok(stamped)
 }
 
-/// Returns the caller's user fields, in order, without the managed columns
-/// `policy` stamps.
+/// Overwrites a built-in table's shared dimensions with the frame's accepted
+/// context.
+///
+/// Only a dimension the payload declares is replaced, and only from a value
+/// the context owns: each row's workload Service name and version, the
+/// accepted request environment, and each row's subject descriptor, null for
+/// a row without a subject. A row whose workload is absent or undescribed, or
+/// a frame without an accepted environment, keeps the row's observed Service
+/// or environment value; subject columns never do.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::CardScopeDenied`] when a row's authorized subject
+/// has no descriptor in the context, and [`ScribeError::InvalidFrame`] when a
+/// declared Service column is not `Utf8`.
+fn stamp_dimensions(
+    fields: &[Field],
+    columns: &mut [ArrayRef],
+    dimensions: &crate::tables::FrameDimensions,
+    workloads: &StringArray,
+    subjects: &StringArray,
+) -> Result<(), ScribeError> {
+    let subject_of = subjects
+        .iter()
+        .map(|uid| {
+            uid.map(|uid| dimensions.describe(uid).ok_or(ScribeError::CardScopeDenied))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let service_of: Vec<_> = workloads
+        .iter()
+        .map(|uid| uid.and_then(|uid| dimensions.describe(uid)))
+        .collect();
+    let subject = |value: fn(&crate::tables::CardDescriptor) -> &str| -> ArrayRef {
+        Arc::new(
+            subject_of
+                .iter()
+                .map(|descriptor| descriptor.map(value))
+                .collect::<StringArray>(),
+        )
+    };
+    let service = |observed: &ArrayRef, value: fn(&crate::tables::CardDescriptor) -> &str| {
+        let observed = observed
+            .as_string_opt::<i32>()
+            .ok_or(ScribeError::InvalidFrame)?;
+        Ok::<ArrayRef, ScribeError>(Arc::new(
+            service_of
+                .iter()
+                .zip(observed.iter())
+                .map(|(owned, observed)| owned.map(value).or(observed))
+                .collect::<StringArray>(),
+        ))
+    };
+    for (field, column) in fields.iter().zip(columns.iter_mut()) {
+        let stamped = match field.name().as_str() {
+            SERVICE_NAME => Some(service(column, |descriptor| &descriptor.name)?),
+            SERVICE_VERSION => Some(service(column, |descriptor| &descriptor.version)?),
+            DEPLOYMENT_ENVIRONMENT => dimensions.environment.as_deref().map(|environment| {
+                Arc::new(StringArray::from(vec![environment; subjects.len()])) as ArrayRef
+            }),
+            SUBJECT_KIND => Some(subject(|descriptor| descriptor.kind.wire_name())),
+            SUBJECT_NAME => Some(subject(|descriptor| &descriptor.name)),
+            SUBJECT_VERSION => Some(subject(|descriptor| &descriptor.version)),
+            _ => None,
+        };
+        if let Some(stamped) = stamped {
+            *column = stamped;
+        }
+    }
+    Ok(())
+}
+
+/// Returns the caller's user fields, in order, without the managed columns.
 ///
 /// Every stamped column is excluded from the user projection and
 /// materialized in its declared slot by [`managed_arrays`], regardless of
 /// whether the caller supplied it: `run_id` so the canonical nullable column
-/// is stamped exactly once, and `card_uid` so only its authorized value is
-/// stamped. A [`CorrelationPolicy::None`] table keeps its own identity
-/// columns as content.
-fn user_fields(rows: &RecordBatch, policy: CorrelationPolicy) -> Vec<Field> {
+/// is stamped exactly once, and `subject_card_uid` so only its authorized
+/// value is stamped.
+fn user_fields(rows: &RecordBatch) -> Vec<Field> {
     rows.schema()
         .fields()
         .iter()
-        .filter(|field| !policy.stamps(field.name()))
+        .filter(|field| !is_managed_column(field.name()))
         .map(|field| field.as_ref().clone())
         .collect()
 }
 
-/// Returns the caller's user columns, in order, without the managed columns
-/// `policy` stamps; the column-wise twin of [`user_fields`].
-fn user_columns(rows: &RecordBatch, policy: CorrelationPolicy) -> Vec<ArrayRef> {
+/// Returns the caller's user columns, in order, without the managed columns;
+/// the column-wise twin of [`user_fields`].
+fn user_columns(rows: &RecordBatch) -> Vec<ArrayRef> {
     rows.schema()
         .fields()
         .iter()
         .zip(rows.columns())
-        .filter(|(field, _)| !policy.stamps(field.name()))
+        .filter(|(field, _)| !is_managed_column(field.name()))
         .map(|(_, column)| Arc::clone(column))
         .collect()
-}
-
-/// Resolves the correlation policy this write is decoded and stamped under.
-///
-/// The full envelope ([`CorrelationPolicy::Observation`]) is the default: a
-/// dynamic table has no declaration to consult and keeps it. A built-in
-/// stamps exactly the envelope its registered physical schema declares — a
-/// [`CorrelationPolicy::None`] table carries its own identity columns — so the
-/// sealed object is never wider or narrower than the table it is promoted
-/// into.
-fn correlation_policy(context: &DecodeContext<'_>) -> CorrelationPolicy {
-    context
-        .definition
-        .map_or(CorrelationPolicy::Observation, |definition| {
-            definition.correlation_policy
-        })
 }
 
 /// The per-batch values the managed columns are stamped from.
@@ -1249,7 +1414,7 @@ struct ManagedValues<'a> {
     /// Source of the trusted pair stamped as `sub_principal_id` and
     /// `act_principal_id`.
     attribution: StampedAttribution,
-    /// Authorized `card_uid` of each row, in row order.
+    /// Authorized `subject_card_uid` of each row, in row order.
     card_uid: ArrayRef,
     /// Request identity stamped as `wyrd_request_id`.
     request_id: &'a RequestId,
@@ -1257,6 +1422,8 @@ struct ManagedValues<'a> {
     receipt_micros: i64,
     /// Caller `run_id` column lifted out of the user projection, if supplied.
     caller_run_id: Option<ArrayRef>,
+    /// Verified workload a frame-attributed write stamps on every row.
+    workload: Option<&'a CardUid>,
 }
 
 /// Builds the stamped `name` principal column of `rows` from `attribution`.
@@ -1301,7 +1468,37 @@ fn principal_column(
     }
 }
 
-/// Builds one array per managed column `policy` appends, in declared order.
+/// Returns a row-attributed frame's own `name` column, if it carries one.
+///
+/// A trusted producer may carry a managed value per row; the column must be
+/// `Utf8` and every present value must satisfy `valid`, so a carried value is
+/// as well-formed as one Scribe derives itself. A null stays null.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when the column is not `Utf8` or a
+/// present value fails `valid`.
+fn carried_column(
+    rows: &RecordBatch,
+    name: &str,
+    valid: fn(&str) -> bool,
+) -> Result<Option<ArrayRef>, ScribeError> {
+    let Some(column) = rows.column_by_name(name) else {
+        return Ok(None);
+    };
+    let values = column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or(ScribeError::InvalidFrame)?;
+    values
+        .iter()
+        .flatten()
+        .all(valid)
+        .then(|| Some(Arc::clone(column)))
+        .ok_or(ScribeError::InvalidFrame)
+}
+
+/// Builds one array per managed column, in declared order.
 ///
 /// The layout — which columns, in which order, with which type — comes from
 /// [`MANAGED_COLUMNS`](crate::tables::managed_columns::MANAGED_COLUMNS); this
@@ -1312,26 +1509,38 @@ fn principal_column(
 ///
 /// Returns [`ScribeError::Internal`] when a declared managed column has no
 /// stamping rule here, and [`ScribeError::InvalidFrame`] when a
-/// row-attributed frame's subject or actor column is missing or malformed.
+/// row-attributed frame's principal column is missing or malformed, or its
+/// workload or request column is malformed.
 fn managed_arrays(
     rows: &RecordBatch,
     values: &ManagedValues<'_>,
-    policy: CorrelationPolicy,
 ) -> Result<Vec<ArrayRef>, ScribeError> {
     let row_count = rows.num_rows();
     let admitted_at = Arc::new(
         TimestampMicrosecondArray::from(vec![values.receipt_micros; row_count])
             .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
     ) as ArrayRef;
-    policy
-        .managed_columns()
+    MANAGED_COLUMNS
+        .iter()
         .map(|column| {
             Ok(match column.field.name {
                 RUN_ID => values.caller_run_id.as_ref().map_or_else(
                     || Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef,
                     Arc::clone,
                 ),
-                CARD_UID => Arc::clone(&values.card_uid),
+                WORKLOAD_CARD_UID => match values.attribution {
+                    StampedAttribution::Frame(_) => {
+                        Arc::new(StringArray::from(vec![
+                            values.workload.map(CardUid::as_str);
+                            row_count
+                        ]))
+                    }
+                    StampedAttribution::Rows => carried_column(rows, WORKLOAD_CARD_UID, |value| {
+                        CardUid::from_str(value).is_ok()
+                    })?
+                    .unwrap_or_else(|| Arc::new(StringArray::from(vec![None::<&str>; row_count]))),
+                },
+                SUBJECT_CARD_UID => Arc::clone(&values.card_uid),
                 SUB_PRINCIPAL_ID => {
                     principal_column(rows, values.attribution, SUB_PRINCIPAL_ID, |pair| {
                         pair.sub_principal_id
@@ -1342,10 +1551,22 @@ fn managed_arrays(
                         pair.act_principal_id
                     })?
                 }
-                WYRD_REQUEST_ID => Arc::new(StringArray::from(vec![
-                    values.request_id.as_str();
-                    row_count
-                ])),
+                WYRD_REQUEST_ID => {
+                    let carried = match values.attribution {
+                        StampedAttribution::Frame(_) => None,
+                        StampedAttribution::Rows => {
+                            carried_column(rows, WYRD_REQUEST_ID, |value| {
+                                RequestId::parse(value).is_ok()
+                            })?
+                        }
+                    };
+                    carried.unwrap_or_else(|| {
+                        Arc::new(StringArray::from(vec![
+                            values.request_id.as_str();
+                            row_count
+                        ]))
+                    })
+                }
                 WYRD_INGESTED_AT => Arc::clone(&admitted_at),
                 other => {
                     return Err(ScribeError::Internal {
@@ -2273,7 +2494,9 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::managed_columns::{
-        ACT_PRINCIPAL_ID, CARD_UID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+        ACT_PRINCIPAL_ID, DEPLOYMENT_ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION, SUB_PRINCIPAL_ID,
+        SUBJECT_CARD_UID, SUBJECT_KIND, SUBJECT_NAME, SUBJECT_VERSION, WORKLOAD_CARD_UID,
+        WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
 
     use bytes::Bytes;
@@ -2290,7 +2513,6 @@ mod tests {
     use crate::scribe::replay::ReplayedSealKey;
     use crate::scribe::seal_key::SealKey;
     use crate::scribe::stream_identity::StreamIdentity;
-    use crate::tables::CorrelationPolicy;
     use crate::tables::managed_columns::ensure_managed_columns;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -2317,7 +2539,9 @@ mod tests {
         super::DecodeContext {
             definition: None,
             attribution: Attribution::direct(principal.id).into(),
+            workload: principal.workload_uid.as_ref(),
             card_scope,
+            dimensions: None,
             expected_schema_fingerprint: Some(SchemaFingerprint([0_u8; 32])),
             request_id,
             receipt_micros: receipt_now(),
@@ -2381,7 +2605,6 @@ mod tests {
         assert_eq!(stamped.column(run_id).null_count(), stamped.num_rows());
         let expected = Schema::new(crate::tables::managed_columns::ensure_managed_columns(
             vec![Field::new("value", DataType::Int64, false)],
-            CorrelationPolicy::Observation,
         ));
         assert_eq!(
             SchemaFingerprint::from_arrow_schema(stamped.schema().as_ref()),
@@ -2420,18 +2643,18 @@ mod tests {
     fn decode_for_cast_table(rows: RecordBatch) -> Result<RecordBatch, ScribeError> {
         let registered = crate::tables::iceberg_schema_for(&Schema::new(ensure_managed_columns(
             cast_table_columns(),
-            CorrelationPolicy::Observation,
         )))
         .expect("the registered schema converts to Iceberg");
         decode(
             IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
+                workload: None,
                 card_scope: principal().card_scope(),
-                expected_schema_fingerprint: Some(source_schema_fingerprint(
-                    &Schema::new(cast_table_columns()),
-                    CorrelationPolicy::Observation,
-                )),
+                dimensions: None,
+                expected_schema_fingerprint: Some(source_schema_fingerprint(&Schema::new(
+                    cast_table_columns(),
+                ))),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -2506,28 +2729,16 @@ mod tests {
         let plans = super::ConformPlans::default();
 
         let first = plans
-            .conform(
-                &narrow_spellings(Some("UTC")),
-                &registered,
-                CorrelationPolicy::Observation,
-            )
+            .conform(&narrow_spellings(Some("UTC")), &registered)
             .expect("the first batch conforms");
         let second = plans
-            .conform(
-                &narrow_spellings(Some("UTC")),
-                &registered,
-                CorrelationPolicy::Observation,
-            )
+            .conform(&narrow_spellings(Some("UTC")), &registered)
             .expect("the second batch conforms");
 
         assert_eq!(
             first,
-            super::conform_to_registered(
-                &narrow_spellings(Some("UTC")),
-                &registered,
-                CorrelationPolicy::Observation
-            )
-            .expect("a fresh plan conforms")
+            super::conform_to_registered(&narrow_spellings(Some("UTC")), &registered)
+                .expect("a fresh plan conforms")
         );
         assert!(
             Arc::ptr_eq(&first.schema(), &second.schema()),
@@ -2570,26 +2781,14 @@ mod tests {
         };
 
         assert!(matches!(
-            conform_to_registered(
-                &sent(vec![Some(1), None]),
-                &registered(false),
-                CorrelationPolicy::Observation
-            ),
+            conform_to_registered(&sent(vec![Some(1), None]), &registered(false)),
             Err(ScribeError::InvalidFrame)
         ));
-        let valid = conform_to_registered(
-            &sent(vec![Some(1), Some(2)]),
-            &registered(false),
-            CorrelationPolicy::Observation,
-        )
-        .expect("non-null values conform to a required column");
+        let valid = conform_to_registered(&sent(vec![Some(1), Some(2)]), &registered(false))
+            .expect("non-null values conform to a required column");
         assert!(!valid.schema().field(0).is_nullable());
-        let optional = conform_to_registered(
-            &sent(vec![Some(1), None]),
-            &registered(true),
-            CorrelationPolicy::Observation,
-        )
-        .expect("an optional column keeps its null");
+        let optional = conform_to_registered(&sent(vec![Some(1), None]), &registered(true))
+            .expect("an optional column keeps its null");
         assert_eq!(optional.column(0).null_count(), 1);
     }
 
@@ -2712,7 +2911,9 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
+                workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(SchemaFingerprint((definition
                     .schema_fingerprint)(
                 ))),
@@ -2735,17 +2936,16 @@ mod tests {
         );
     }
 
-    /// A decision projected for the audit log decodes against its built-in
-    /// definition with its subject/actor pair kept as content.
+    /// A decision projected for the audit log decodes, row-attributed, with
+    /// the decision's own subject/actor pair and request in the envelope.
     ///
-    /// The audit log stamps no correlation, so its own `sub_principal_id` and
-    /// `act_principal_id` are part of its user fingerprint and must survive
-    /// projection rather than be stripped and restamped from the transport.
+    /// The delivering frame's request and transport identity must never
+    /// replace the decision's, so the carried values survive stamping.
     ///
     /// # Panics
     ///
-    /// Panics when the decode refuses the row or the pair is not the
-    /// decision's own.
+    /// Panics when the decode refuses the row or the pair or request is not
+    /// the decision's own.
     #[test]
     fn audit_rows_keep_their_own_subject_and_actor() {
         let definition =
@@ -2772,8 +2972,10 @@ mod tests {
         let decoded = decode(
             ipc_payload(&rows),
             &DecodeContext {
-                attribution: Attribution::direct(principal().id).into(),
+                attribution: StampedAttribution::Rows,
+                workload: None,
                 card_scope: None,
+                dimensions: None,
                 expected_schema_fingerprint: Some(SchemaFingerprint((definition
                     .schema_fingerprint)(
                 ))),
@@ -2799,6 +3001,156 @@ mod tests {
         assert_eq!(
             text(ACT_PRINCIPAL_ID),
             Some(pair.act_principal_id.to_string())
+        );
+        assert_eq!(
+            text(WYRD_REQUEST_ID),
+            Some(event.request_id.as_str().to_owned()),
+            "the decision's request, not the delivering frame's"
+        );
+    }
+
+    /// A built-in table's shared dimensions are stamped from the frame's
+    /// accepted context over whatever the rows carried: each row's Service
+    /// from its own workload, so a mixed-origin frame keeps every origin, a
+    /// row without a described workload keeps its observed Service, a row
+    /// without a subject gets null subject columns, and a subject without a
+    /// descriptor refuses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a stamped dimension or the refusal differs.
+    #[test]
+    fn built_in_rows_take_their_dimensions_from_the_frame_context() {
+        let definition =
+            crate::tables::builtin_table("system", "audit_log").expect("audit_log is built in");
+        let event = wyrd_spec::vala::api::AuditEvent::new(
+            RequestId::now_v7(),
+            None,
+            "cards.read".to_owned(),
+            "cards".to_owned(),
+            None,
+            Attribution::direct(PrincipalId::new(Uuid::now_v7())),
+            wyrd_spec::auth::PrincipalKindTag::User,
+            "cards:read".to_owned(),
+            wyrd_spec::vala::api::AuditOutcome::Allowed,
+        );
+        let projected =
+            crate::tables::audit::projection::project_audit_event(&event, chrono::Utc::now())
+                .expect("valid projection");
+        let uid = || CardUid::new(Uuid::now_v7().to_string()).expect("card uid");
+        let (subject, checkout, billing) = (uid(), uid(), uid());
+        // Two rows, each naming its own workload and subject; every other
+        // dimension the rows carry is a forged label.
+        let rows = |origins: [(Option<&str>, Option<&str>); 2]| {
+            let schema = projected.schema();
+            let mut fields: Vec<Field> =
+                schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+            let mut columns: Vec<ArrayRef> = fields
+                .iter()
+                .zip(projected.columns())
+                .map(|(field, column)| {
+                    if crate::tables::SHARED_DIMENSIONS.contains(&field.name().as_str()) {
+                        Arc::new(StringArray::from(vec!["forged"; 2])) as ArrayRef
+                    } else {
+                        arrow::compute::concat(&[column.as_ref(), column.as_ref()])
+                            .expect("two rows")
+                    }
+                })
+                .collect();
+            for (name, column) in [
+                (WORKLOAD_CARD_UID, origins.map(|(workload, _)| workload)),
+                (SUBJECT_CARD_UID, origins.map(|(_, subject)| subject)),
+            ] {
+                fields.push(Field::new(name, DataType::Utf8, true));
+                columns.push(Arc::new(StringArray::from(column.to_vec())));
+            }
+            batch(fields, columns)
+        };
+        let descriptor = |kind, name: &str| crate::tables::CardDescriptor {
+            kind,
+            name: name.to_owned(),
+            version: "2".to_owned(),
+        };
+        let mut dimensions = crate::tables::FrameDimensions {
+            environment: Some("prod".to_owned()),
+            cards: vec![
+                (
+                    subject.clone(),
+                    descriptor(wyrd_spec::envelope::CardKind::Agent, "planner"),
+                ),
+                (
+                    checkout.clone(),
+                    descriptor(wyrd_spec::envelope::CardKind::Service, "checkout"),
+                ),
+                (
+                    billing.clone(),
+                    descriptor(wyrd_spec::envelope::CardKind::Service, "billing"),
+                ),
+            ],
+        };
+        let scope = [subject.clone()];
+        let request_id = RequestId::now_v7();
+        let principal = principal();
+        let stamp = |origins, dimensions: &crate::tables::FrameDimensions| {
+            let mut context = stamping_context(&principal, Some(&scope), &request_id);
+            context.attribution = StampedAttribution::Rows;
+            context.definition = Some(definition);
+            context.dimensions = Some(dimensions);
+            stamp_correlation_columns(&rows(origins), &context)
+        };
+        let text = |stamped: &RecordBatch, name: &str| {
+            stamped
+                .column_by_name(name)
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .expect("a dimension is Utf8")
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let pair = |first: Option<&str>, second: Option<&str>| {
+            vec![first.map(str::to_owned), second.map(str::to_owned)]
+        };
+        let both = |value: &str| pair(Some(value), Some(value));
+
+        let mixed = [
+            (Some(checkout.as_str()), Some(subject.as_str())),
+            (Some(billing.as_str()), Some(subject.as_str())),
+        ];
+        let stamped = stamp(mixed, &dimensions).expect("attributed rows stamp");
+        assert_eq!(
+            text(&stamped, SERVICE_NAME),
+            pair(Some("checkout"), Some("billing")),
+            "each row keeps its own workload's Service"
+        );
+        assert_eq!(text(&stamped, SERVICE_VERSION), both("2"));
+        assert_eq!(text(&stamped, DEPLOYMENT_ENVIRONMENT), both("prod"));
+        assert_eq!(text(&stamped, SUBJECT_KIND), both("Agent"));
+        assert_eq!(text(&stamped, SUBJECT_NAME), both("planner"));
+        assert_eq!(text(&stamped, SUBJECT_VERSION), both("2"));
+
+        dimensions.environment = None;
+        let undescribed = uid();
+        let unowned = stamp(
+            [(None, None), (Some(undescribed.as_str()), None)],
+            &dimensions,
+        )
+        .expect("unattributed rows stamp");
+        assert_eq!(
+            text(&unowned, SERVICE_NAME),
+            both("forged"),
+            "rows without a described workload keep their Service"
+        );
+        assert_eq!(text(&unowned, DEPLOYMENT_ENVIRONMENT), both("forged"));
+        assert_eq!(
+            text(&unowned, SUBJECT_NAME),
+            pair(None, None),
+            "no subject, no label"
+        );
+
+        dimensions.cards.retain(|(uid, _)| *uid != subject);
+        assert!(
+            matches!(stamp(mixed, &dimensions), Err(ScribeError::CardScopeDenied)),
+            "a subject without a descriptor refuses"
         );
     }
 
@@ -2900,6 +3252,109 @@ mod tests {
             decode_rows(&rows("not-a-principal"), &context, false),
             Err(ScribeError::InvalidFrame)
         ));
+    }
+
+    /// A row-attributed canonical span decodes with its producer's accepted
+    /// environment and request, while a public frame supplying either is
+    /// refused: a forged environment as a contract violation and a request as
+    /// a reserved column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the span fixture does not project, or a decode outcome or
+    /// carried value differs.
+    #[test]
+    fn row_attributed_spans_carry_their_accepted_environment_and_request() {
+        use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let definition =
+            crate::tables::builtin_table("traces", "spans").expect("spans is built in");
+        let resource = ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![1; 16],
+                    span_id: vec![2; 8],
+                    name: "chat".to_owned(),
+                    start_time_unix_nano: 1,
+                    end_time_unix_nano: 2,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        };
+        let (projected, _) =
+            crate::tables::traces::project_resource_spans(&[resource], None, usize::MAX)
+                .expect("the span projects");
+        let with = |carried: &[(&str, &str)]| {
+            let schema = projected.schema();
+            let mut fields: Vec<Field> =
+                schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+            let mut columns = projected.columns().to_vec();
+            for (name, value) in carried {
+                let column = Arc::new(StringArray::from(vec![*value])) as ArrayRef;
+                if let Ok(index) = schema.index_of(name) {
+                    columns[index] = column;
+                } else {
+                    fields.push(Field::new(*name, DataType::Utf8, false));
+                    columns.push(column);
+                }
+            }
+            batch(fields, columns)
+        };
+        let request = RequestId::now_v7();
+        let pair = PrincipalId::new(Uuid::now_v7()).to_string();
+        let principal = principal();
+        let frame_request = RequestId::now_v7();
+        let mut context = stamping_context(&principal, None, &frame_request);
+        context.definition = Some(definition);
+        context.expected_schema_fingerprint =
+            Some(SchemaFingerprint((definition.schema_fingerprint)()));
+        context.attribution = StampedAttribution::Rows;
+        let stamped = decode_rows(
+            &with(&[
+                (DEPLOYMENT_ENVIRONMENT, "prod"),
+                (WYRD_REQUEST_ID, request.as_str()),
+                (SUB_PRINCIPAL_ID, &pair),
+                (ACT_PRINCIPAL_ID, &pair),
+            ]),
+            &context,
+            false,
+        )
+        .expect("an accepted origin decodes");
+        let text = |name: &str| {
+            stamped
+                .column_by_name(name)
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .expect("the column is Utf8")
+                .value(0)
+                .to_owned()
+        };
+        assert_eq!(text(DEPLOYMENT_ENVIRONMENT), "prod");
+        assert_eq!(text(WYRD_REQUEST_ID), request.as_str());
+
+        context.attribution = Attribution::direct(principal.id).into();
+        let forged = decode_rows(&with(&[(DEPLOYMENT_ENVIRONMENT, "prod")]), &context, false);
+        assert!(
+            matches!(
+                forged,
+                Err(ScribeError::ContractViolation(
+                    BifrostError::SchemaParse { .. }
+                ))
+            ),
+            "a public environment must derive from the resource: {forged:?}"
+        );
+        assert!(
+            matches!(
+                decode_rows(
+                    &with(&[(WYRD_REQUEST_ID, request.as_str())]),
+                    &context,
+                    false
+                ),
+                Err(ScribeError::InvalidFrame)
+            ),
+            "a public frame never supplies its request"
+        );
     }
 
     #[test]
@@ -3274,10 +3729,11 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
+                workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
                 )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
@@ -3323,11 +3779,10 @@ mod tests {
             payload,
             &DecodeContext {
                 attribution: Attribution::direct(principal.id).into(),
+                workload: None,
                 card_scope: principal.card_scope(),
-                expected_schema_fingerprint: Some(source_schema_fingerprint(
-                    schema,
-                    CorrelationPolicy::Observation,
-                )),
+                dimensions: None,
+                expected_schema_fingerprint: Some(source_schema_fingerprint(schema)),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,
@@ -3361,7 +3816,7 @@ mod tests {
             vec![
                 Field::new("value", DataType::Int64, false),
                 Field::new("run_id", DataType::Utf8, false),
-                Field::new(CARD_UID, DataType::Utf8, false),
+                Field::new(SUBJECT_CARD_UID, DataType::Utf8, false),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
@@ -3439,7 +3894,7 @@ mod tests {
             PermissionSet::new(),
         );
         let rows = batch(
-            vec![Field::new(CARD_UID, DataType::Utf8, false)],
+            vec![Field::new(SUBJECT_CARD_UID, DataType::Utf8, false)],
             vec![Arc::new(StringArray::from(vec![
                 Uuid::now_v7().to_string(),
             ]))],
@@ -3450,10 +3905,11 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal.id).into(),
+                workload: None,
                 card_scope: principal.card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
                 )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
@@ -3486,8 +3942,8 @@ mod tests {
     fn duplicate_arrow_column_names_fail_closed_for_dynamic_tables() {
         let rows = batch(
             vec![
-                Field::new(CARD_UID, DataType::Utf8, true),
-                Field::new(CARD_UID, DataType::Utf8, true),
+                Field::new(SUBJECT_CARD_UID, DataType::Utf8, true),
+                Field::new(SUBJECT_CARD_UID, DataType::Utf8, true),
             ],
             vec![
                 Arc::new(StringArray::from(vec![None::<&str>])),
@@ -3500,10 +3956,11 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
+                workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
                 )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
@@ -3542,10 +3999,11 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
+                workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
                 )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
@@ -3598,10 +4056,11 @@ mod tests {
             ])),
             &DecodeContext {
                 attribution: Attribution::direct(principal().id).into(),
+                workload: None,
                 card_scope: principal().card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
                 )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
@@ -3673,7 +4132,6 @@ mod tests {
     fn canonical_managed_order() -> Vec<String> {
         Schema::new(crate::tables::managed_columns::ensure_managed_columns(
             vec![Field::new("value", DataType::Int64, false)],
-            CorrelationPolicy::Observation,
         ))
         .fields()
         .iter()
@@ -3694,7 +4152,7 @@ mod tests {
         let rows = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_UID, DataType::Utf8, false),
+                Field::new(SUBJECT_CARD_UID, DataType::Utf8, false),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
@@ -3705,10 +4163,11 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 attribution: Attribution::direct(principal.id).into(),
+                workload: None,
                 card_scope: principal.card_scope(),
+                dimensions: None,
                 expected_schema_fingerprint: Some(source_schema_fingerprint(
                     rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
                 )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
@@ -3746,7 +4205,7 @@ mod tests {
             let rows = batch(
                 vec![
                     Field::new(reserved, DataType::Utf8, false),
-                    Field::new(CARD_UID, DataType::Utf8, false),
+                    Field::new(SUBJECT_CARD_UID, DataType::Utf8, false),
                 ],
                 vec![
                     Arc::new(StringArray::from(vec!["caller"])),
@@ -3757,10 +4216,11 @@ mod tests {
                 ipc_payload(&rows),
                 &DecodeContext {
                     attribution: Attribution::direct(principal.id).into(),
+                    workload: None,
                     card_scope: principal.card_scope(),
+                    dimensions: None,
                     expected_schema_fingerprint: Some(source_schema_fingerprint(
                         rows.schema().as_ref(),
-                        CorrelationPolicy::Observation,
                     )),
                     request_id: &RequestId::now_v7(),
                     receipt_micros: receipt_now(),
@@ -3852,7 +4312,7 @@ mod tests {
             SuppliedCardUid::Text(text) => Some(Some(text)),
         };
         if let Some(value) = value {
-            fields.push(Field::new(CARD_UID, DataType::Utf8, true));
+            fields.push(Field::new(SUBJECT_CARD_UID, DataType::Utf8, true));
             columns.push(Arc::new(StringArray::from(vec![value])));
         }
         stamp_correlation_columns(
@@ -3868,13 +4328,13 @@ mod tests {
     fn stamped_card_uid(stamped: &RecordBatch) -> Option<String> {
         let index = stamped
             .schema()
-            .index_of(CARD_UID)
-            .expect("card_uid column");
+            .index_of(SUBJECT_CARD_UID)
+            .expect("subject_card_uid column");
         let uids = stamped
             .column(index)
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("card_uid is Utf8");
+            .expect("subject_card_uid is Utf8");
         (!uids.is_null(0)).then(|| uids.value(0).to_owned())
     }
 
@@ -4016,18 +4476,14 @@ mod tests {
             "{\"shredded\":true}".to_owned(),
         );
 
-        conform_to_registered(
-            &send(variant.clone()),
-            &registered,
-            CorrelationPolicy::Observation,
-        )
-        .expect("the canonical Variant conforms");
+        conform_to_registered(&send(variant.clone()), &registered)
+            .expect("the canonical Variant conforms");
         for sent in [
             Field::new("payload", variant.data_type().clone(), true),
             variant.with_metadata(parameters),
         ] {
             assert!(matches!(
-                conform_to_registered(&send(sent), &registered, CorrelationPolicy::Observation),
+                conform_to_registered(&send(sent), &registered),
                 Err(ScribeError::ContractViolation(BifrostError::UnsupportedType { ref field, .. }))
                     if field == "payload"
             ));
@@ -4058,7 +4514,7 @@ mod tests {
     fn columns_are_put_in_declared_order_by_name() {
         let rows = RecordBatch::try_from_iter([
             (
-                CARD_UID,
+                SUBJECT_CARD_UID,
                 Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
             ),
             ("b", Arc::new(Int64Array::from(vec![2])) as ArrayRef),
@@ -4066,9 +4522,7 @@ mod tests {
         ])
         .expect("batch builds");
 
-        let ordered =
-            conform_to_registered(&rows, &registered_ab(), CorrelationPolicy::Observation)
-                .expect("names all match");
+        let ordered = conform_to_registered(&rows, &registered_ab()).expect("names all match");
 
         let names = ordered
             .schema()
@@ -4076,7 +4530,7 @@ mod tests {
             .iter()
             .map(|field| field.name().clone())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["a", "b", CARD_UID]);
+        assert_eq!(names, ["a", "b", SUBJECT_CARD_UID]);
         assert_eq!(
             ordered.column(0).as_ref(),
             &Int64Array::from(vec![1]) as &dyn Array

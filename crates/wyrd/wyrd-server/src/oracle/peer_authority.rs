@@ -1029,6 +1029,11 @@ mod tests {
     }
 
     /// Builds one fully bound v1 forwarding envelope for authority tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `AuthorizedQueryContext::try_new` refuses the tenant-bound
+    /// principal holding `bifrost_query_read`.
     fn forward_claims(
         worker: NodeId,
         worker_fence: u64,
@@ -1064,7 +1069,7 @@ mod tests {
             context,
             request: BifrostQueryRequest {
                 params: Vec::new(),
-                sql: "SELECT value FROM vala.bifrost.events".to_owned(),
+                sql: "SELECT value FROM bifrost.bifrost.events".to_owned(),
                 deadline_ms: Some(5_000),
             },
             absolute_deadline_ms: (now + chrono::Duration::seconds(30)).timestamp_millis(),

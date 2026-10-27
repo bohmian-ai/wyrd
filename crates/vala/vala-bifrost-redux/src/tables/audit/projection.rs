@@ -1,10 +1,10 @@
-//! Pure projection of one staged audit decision into the canonical audit
-//! content schema.
+//! Pure projection of one staged audit decision into one row-attributed
+//! audit batch.
 
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -12,14 +12,22 @@ use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 use wyrd_spec::vala::audit_detail_canonical_json;
+use wyrd_spec::vala::managed_columns::{ACT_PRINCIPAL_ID, SUB_PRINCIPAL_ID, WYRD_REQUEST_ID};
 
 use super::{AuditLogTable, DETAIL};
-use crate::tables::DomainTable;
+use crate::tables::{DomainTable, SHARED_DIMENSIONS};
 
-/// The `audit_log` content schema, built once and shared by every projected
-/// row, so rows compare as one schema by pointer instead of field by field.
-static AUDIT_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(AuditLogTable::arrow_fields())));
+/// The `audit_log` content schema followed by the decision's carried pair
+/// and request, built once and shared by every projected row, so rows
+/// compare as one schema by pointer instead of field by field.
+static AUDIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let mut fields = AuditLogTable::arrow_fields();
+    fields.extend(
+        [SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID, WYRD_REQUEST_ID]
+            .map(|name| Field::new(name, DataType::Utf8, false)),
+    );
+    Arc::new(Schema::new(fields))
+});
 
 /// Why one audit decision could not be projected into an `audit_log` row.
 #[derive(Debug, Error)]
@@ -36,11 +44,14 @@ pub enum AuditProjectionError {
 
 /// Projects `event`, decided at `decided_at`, into one `audit_log` row.
 ///
-/// Column order follows [`AuditLogTable::arrow_fields`]. The detail is its
-/// canonical JSON encoded as a Variant, the outcome and subject kind their
-/// stable snake-case tags, and the decision instant is the `created_at` time
-/// column, so a retained row partitions by when the boundary decided rather
-/// than when it was written.
+/// Column order follows [`AuditLogTable::arrow_fields`], whose shared
+/// dimensions are null, then the decision's `sub_principal_id`,
+/// `act_principal_id`, and `wyrd_request_id`, which Scribe carries into the
+/// managed envelope of a row-attributed frame. The detail is its canonical
+/// JSON encoded as a Variant, the outcome and subject kind their stable
+/// snake-case tags, and the decision instant is the `created_at` time column,
+/// so a retained row partitions by when the boundary decided rather than when
+/// it was written.
 ///
 /// # Errors
 ///
@@ -56,15 +67,12 @@ pub fn project_audit_event(
     let detail =
         VariantColumnBuilder::encode(DETAIL, [detail.as_deref()], EncodedVariant::from_json_text)
             .map_err(AuditProjectionError::InvalidDetail)?;
-    let columns = vec![
-        text(Some(event.request_id.as_str().to_owned())),
+    let mut columns = vec![
         text(event.trace_id.clone()),
         text(Some(event.operation.clone())),
         text(Some(event.resource.clone())),
         text(event.card_ref.as_ref().map(ToString::to_string)),
-        text(Some(event.sub_principal_id.to_string())),
         text(Some(event.sub_principal_kind.as_str().to_owned())),
-        text(Some(event.act_principal_id.to_string())),
         text(Some(event.permission.clone())),
         text(Some(
             match event.outcome {
@@ -80,6 +88,12 @@ pub fn project_audit_event(
                 .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
         ),
     ];
+    columns.extend(SHARED_DIMENSIONS.map(|_| text(None)));
+    columns.extend([
+        text(Some(event.sub_principal_id.to_string())),
+        text(Some(event.act_principal_id.to_string())),
+        text(Some(event.request_id.as_str().to_owned())),
+    ]);
     Ok(RecordBatch::try_new(Arc::clone(&AUDIT_SCHEMA), columns)?)
 }
 
@@ -113,7 +127,8 @@ mod tests {
 
     /// One decision projects every content column in canonical order, the
     /// credential before the `created_at` time column, which carries the
-    /// decision instant.
+    /// decision instant, then null shared dimensions and the carried pair and
+    /// request.
     ///
     /// # Panics
     ///
@@ -131,27 +146,38 @@ mod tests {
         let row = project_audit_event(&event, decided_at).expect("valid projection");
 
         assert_eq!(row.num_rows(), 1);
-        assert_eq!(row.num_columns(), 13);
-        let text = |index: usize| {
-            row.column(index)
+        assert_eq!(row.num_columns(), 19);
+        let text = |name: &str| {
+            row.column_by_name(name)
+                .expect("projected column")
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("text column")
         };
-        assert_eq!(row.schema().field(11).name(), CREDENTIAL_ID);
-        assert_eq!(text(11).value(0), credential.to_string());
-        assert_eq!(text(5).value(0), event.sub_principal_id.to_string());
-        assert_eq!(text(6).value(0), "system");
-        assert_eq!(text(7).value(0), event.act_principal_id.to_string());
-        assert_eq!(text(9).value(0), "denied");
-        assert!(text(1).is_null(0), "no trace id projects null");
-        assert!(row.column(10).is_null(0), "no detail projects null");
+        assert_eq!(row.schema().field(8).name(), CREDENTIAL_ID);
+        assert_eq!(text(CREDENTIAL_ID).value(0), credential.to_string());
+        assert_eq!(
+            text(SUB_PRINCIPAL_ID).value(0),
+            event.sub_principal_id.to_string()
+        );
+        assert_eq!(text("sub_principal_kind").value(0), "system");
+        assert_eq!(
+            text(ACT_PRINCIPAL_ID).value(0),
+            event.act_principal_id.to_string()
+        );
+        assert_eq!(text(WYRD_REQUEST_ID).value(0), event.request_id.as_str());
+        assert_eq!(text("outcome").value(0), "denied");
+        assert!(text("trace_id").is_null(0), "no trace id projects null");
+        assert!(row.column(7).is_null(0), "no detail projects null");
+        for dimension in SHARED_DIMENSIONS {
+            assert!(text(dimension).is_null(0), "{dimension} projects null");
+        }
         let time = row
-            .column(12)
+            .column(9)
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .expect("created_at column");
-        assert_eq!(row.schema().field(12).name(), CREATED_AT);
+        assert_eq!(row.schema().field(9).name(), CREATED_AT);
         assert_eq!(time.value(0), decided_at.timestamp_micros());
     }
 
@@ -177,7 +203,7 @@ mod tests {
         let row = project_audit_event(&event, Utc::now()).expect("valid projection");
 
         assert_eq!(
-            variant_cell_to_json(row.column(10).as_ref(), 0).expect("decodes"),
+            variant_cell_to_json(row.column(7).as_ref(), 0).expect("decodes"),
             serde_json::from_str::<serde_json::Value>(&canonical).expect("canonical JSON")
         );
     }

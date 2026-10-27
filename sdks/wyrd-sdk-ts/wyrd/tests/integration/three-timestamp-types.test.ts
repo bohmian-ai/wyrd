@@ -17,9 +17,9 @@ import { serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 60_000 });
 
-const WYRD_ORDERS = "vala.datasets.wyrd_orders";
-const ZOD_ORDERS = "vala.datasets.zod_orders";
-const ARROW_ORDERS = "vala.datasets.arrow_orders";
+const WYRD_ORDERS = "bifrost.datasets.wyrd_orders";
+const ZOD_ORDERS = "bifrost.datasets.zod_orders";
+const ARROW_ORDERS = "bifrost.datasets.arrow_orders";
 const SCHEMA_PARSE = "WYRD_VALA_400_SCHEMA_PARSE";
 
 /** 2026-10-06T17:00:00Z in microseconds. */

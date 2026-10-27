@@ -476,7 +476,7 @@ async fn sample(
     Ok(readings)
 }
 
-/// Rows each tenant could read in `vala.gateway.calls` over a window,
+/// Rows each tenant could read in `bifrost.gateway.calls` over a window,
 /// beside the calls it answered and the most it could have had admitted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Ownership {

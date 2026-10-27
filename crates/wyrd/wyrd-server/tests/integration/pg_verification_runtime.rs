@@ -9,7 +9,7 @@
 //! on a Scribe outbox writing to the server's own Scribe, wrapped in a
 //! [`PublicationFault`] that records every submitted batch; execution state is
 //! read back from `wyrd.verifier_executions` and audit from the tenant's retained
-//! `vala.system.audit_log` history.
+//! `bifrost.system.audit_log` history.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -60,10 +60,10 @@ use wyrd_testing::verification::{ExecutionRow, VerificationFixture};
 const WAIT: Duration = Duration::from_mins(1);
 
 /// Summary table every completed result ends with.
-const RESULTS: &str = "vala.verification.results";
+const RESULTS: &str = "bifrost.verification.results";
 
 /// Drift detail table.
-const FEATURES: &str = "vala.drift.result_features";
+const FEATURES: &str = "bifrost.drift.result_features";
 
 /// One bound server, one seeded tenant, and the controls a runtime is built with.
 struct Harness {
@@ -3329,7 +3329,7 @@ async fn linked_attempts(
         .collect()
 }
 
-/// One span a tenant reads back from its own `vala.traces.spans`.
+/// One span a tenant reads back from its own `bifrost.traces.spans`.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct TenantSpan {
     /// Hex span id, equal to the operator's id for the same span.
@@ -4258,7 +4258,7 @@ async fn accepted_authority_survives_account_and_context_changes() {
         panic!("one result is published: {}", results.len());
     };
     assert_eq!(
-        sent_values(result, "owner_card_uid"),
+        sent_values(result, "workload_card_uid"),
         std::collections::BTreeSet::from([harness.subject.to_string()]),
         "the shared component's other owner never becomes the result owner"
     );
@@ -4536,7 +4536,9 @@ async fn only_associated_account_activity_activates_exact_root() {
 /// `WYRD_SPEC_400_VALIDATION` before any execution exists. The runtime stops
 /// with every accepted execution unfinished; a fresh runtime completes them,
 /// and status reads and the retained `execution_inputs` and `results` rows
-/// return each one's own subject and exactly its supplied tag.
+/// return each one's own subject and exactly its supplied tag, and every
+/// retained row names the owning Service and its own subject by kind, name,
+/// and version.
 ///
 /// # Panics
 /// Panics when the empty tag is accepted or leaves an execution, an accepted
@@ -4654,6 +4656,11 @@ async fn configured_service_context_survives_acceptance_and_restart() {
         (&service_check, &service, Some("staging")),
         (&agent_check, &agent, Some("staging")),
     ] {
+        let described = if *subject == service {
+            ["Service", "ask-service"]
+        } else {
+            ["Agent", "ask-agent"]
+        };
         let (code, body) = send(
             server,
             &jwt,
@@ -4668,7 +4675,7 @@ async fn configured_service_context_survives_acceptance_and_restart() {
             .and_then(|id| id.parse().ok())
             .unwrap_or_else(|| panic!("the run is accepted: {body}"));
         harness.wait_execution(run, |_| true).await;
-        accepted.push((run, subject.clone(), supplied));
+        accepted.push((run, subject.clone(), supplied, described));
     }
     let after = harness.seed.executions().await.expect("executions read");
     assert_eq!(
@@ -4678,7 +4685,7 @@ async fn configured_service_context_survives_acceptance_and_restart() {
     );
     runtime.stop().await;
 
-    for (run, subject, supplied) in &accepted {
+    for (run, subject, supplied, _) in &accepted {
         let (environment, card_uid): (Option<String>, Uuid) = sqlx::query_as(
             "SELECT deployment_environment, card_uid FROM wyrd.verifier_executions \
              WHERE execution_id = $1",
@@ -4710,7 +4717,7 @@ async fn configured_service_context_survives_acceptance_and_restart() {
     }
     restarted.stop().await;
     harness.durable_rows().await;
-    for (run, subject, supplied) in &accepted {
+    for (run, subject, supplied, [kind, name]) in &accepted {
         let (code, state) = send(
             server,
             &jwt,
@@ -4735,8 +4742,9 @@ async fn configured_service_context_survives_acceptance_and_restart() {
                 .retained_records(
                     server.data_tenant_id(),
                     format!(
-                        "SELECT deployment_environment FROM vala.verification.{table} \
-                         WHERE execution_id = '{run}'"
+                        "SELECT service_name, service_version, deployment_environment, \
+                         subject_kind, subject_name, subject_version \
+                         FROM bifrost.verification.{table} WHERE execution_id = '{run}'"
                     ),
                 )
                 .await
@@ -4745,7 +4753,15 @@ async fn configured_service_context_survives_acceptance_and_restart() {
             for row in stored {
                 assert_eq!(
                     row,
-                    vec![supplied.map(str::to_owned)],
+                    [
+                        Some("ask-service"),
+                        Some("1.0.0"),
+                        *supplied,
+                        Some(*kind),
+                        Some(*name),
+                        Some("1.0.0"),
+                    ]
+                    .map(|value| value.map(str::to_owned)),
                     "{table} row of {run}"
                 );
             }

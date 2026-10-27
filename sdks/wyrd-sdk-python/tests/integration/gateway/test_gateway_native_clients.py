@@ -4,7 +4,7 @@ Each client holds a Wyrd access token, or a static Wyrd API key the gateway
 exchanges for one, in its own API-key slot, the way a LiteLLM-style proxy is
 used. The server's built-in adapters reach the shared
 recording upstream, which proves the operator provider key, never the caller
-token, travels upstream, and each call is recorded in ``vala.gateway.calls``.
+token, travels upstream, and each call is recorded in ``bifrost.gateway.calls``.
 """
 
 from __future__ import annotations

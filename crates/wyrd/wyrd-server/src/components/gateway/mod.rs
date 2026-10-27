@@ -34,7 +34,7 @@ pub use capture::CallCapture;
 pub(crate) use capture::{recording, tests as capture_tests};
 pub use ingress::gateway_ingress_router;
 pub use invocation::{
-    GatewayCallAttribution, GatewayCallRequest, GatewayCallResponse, GatewayCallSubject,
+    GatewayCallAttribution, GatewayCallContext, GatewayCallRequest, GatewayCallResponse,
     GatewayInvocation,
 };
 pub use owner::Gateway;

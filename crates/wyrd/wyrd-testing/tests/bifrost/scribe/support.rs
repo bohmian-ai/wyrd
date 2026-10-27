@@ -525,7 +525,7 @@ where
     }
 }
 
-/// Builds one `vala.traces.spans` batch carrying `values` as `duration_nano`.
+/// Builds one `bifrost.traces.spans` batch carrying `values` as `duration_nano`.
 ///
 /// The rows come from the canonical `OTLP` span projection rather than
 /// hand-assembled columns, so this fixture tracks the ledger's field list
@@ -626,7 +626,7 @@ pub(super) fn hour_start(at: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<
 /// The inspected buckets this journey is answerable for.
 ///
 /// The server runs its own retained-audit publisher on a fixed interval, and it
-/// appends `vala.system.audit_log` through the same local Scribe as any other
+/// appends `bifrost.system.audit_log` through the same local Scribe as any other
 /// writer. Those buckets are live engine state owned by that publisher's
 /// schedule, not ownership left behind by the publication a journey drove, so a
 /// case proving it returned every byte it borrowed must read past them. Every

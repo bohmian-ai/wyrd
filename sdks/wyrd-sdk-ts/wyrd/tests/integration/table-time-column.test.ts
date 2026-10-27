@@ -14,7 +14,7 @@ import { Bifrost, TableConfig } from "wyrd-ai";
 
 import { serverTest } from "../support/server.js";
 
-const NAMESPACE = "vala.datasets";
+const NAMESPACE = "bifrost.datasets";
 const READINGS = "ts_time_column_readings";
 const DEFAULTS = "ts_time_column_defaults";
 const REFUSED = "ts_time_column_refused";

@@ -172,7 +172,7 @@ async fn startup_image_write() {
         .expect("register a Card with a local artifact through nginx");
     let card_uid = receipt.root.uid.expect("registered root carries its uid");
 
-    let fqn = format!("vala.datasets.startup_{}", uuid::Uuid::now_v7().simple());
+    let fqn = format!("bifrost.datasets.startup_{}", uuid::Uuid::now_v7().simple());
     let bifrost = Bifrost::connect_with(
         &client,
         BifrostOptions {
@@ -319,11 +319,16 @@ async fn insert_ids(client: &WyrdClient, fqn: &str, ids: std::ops::RangeInclusiv
 
 /// Before the scale-up, through the fixed `all` anchor: its Scribe
 /// acknowledges rows `1..=4`, and a fused read through it returns them.
+///
+/// # Panics
+/// Panics when the environment client or seed inserts fail, Bifrost does not
+/// connect or drain, rows `1..=4` never read back before the deadline, or the
+/// table name cannot be written to the state directory for the later phases.
 #[tokio::test]
 #[ignore = "run by scripts/server/test-kind-autoscale.sh against a kind cluster"]
 async fn kind_seed() {
     let client = env_client();
-    let fqn = format!("vala.datasets.kind_{}", uuid::Uuid::now_v7().simple());
+    let fqn = format!("bifrost.datasets.kind_{}", uuid::Uuid::now_v7().simple());
     insert_ids(&client, &fqn, 1..=4).await;
     let bifrost = Bifrost::connect_with(
         &client,

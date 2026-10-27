@@ -448,7 +448,7 @@ mod error_mapper_tests {
         );
         let ingest_busy = WyrdErrorResponse::from(WyrdError::from(
             wyrd_spec::vala::error::BifrostError::IngestBusy {
-                table: "vala.traces.spans".to_owned(),
+                table: "bifrost.traces.spans".to_owned(),
             },
         ))
         .into_response();

@@ -2047,7 +2047,7 @@ mod tests {
     fn physical_dispatch_fragment(id: &str) -> PhysicalDispatchFragment {
         let binding = TenantTableBinding {
             tenant_id: DataTenantId::SYSTEM_OWNER,
-            namespace: "vala.bifrost".to_owned(),
+            namespace: "bifrost.bifrost".to_owned(),
             table: "events".to_owned(),
         };
         PhysicalDispatchFragment {

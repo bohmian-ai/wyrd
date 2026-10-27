@@ -242,12 +242,12 @@ export interface BifrostTableDescription {
   /**
    * The correlation inputs a writer supplies alongside its user fields.
    *
-   * Exactly nullable `card_uid: Utf8` then nullable `run_id: Utf8`, each
+   * Exactly nullable `subject_card_uid: Utf8` then nullable `run_id: Utf8`, each
    * with the field id its physical column holds.
    *
-   * Card correlation is optional, so a writer may omit `card_uid` entirely;
+   * Card correlation is optional, so a writer may omit `subject_card_uid` entirely;
    * the server then stores the row with its authenticated subject/actor
-   * pair and a null `card_uid`. A supplied UID is stored only once the server has
+   * pair and a null `subject_card_uid`. A supplied UID is stored only once the server has
    * confirmed the writer may correlate to that Card.
    */
   readonly correlation_fields: readonly FieldSpec2[];
@@ -5485,7 +5485,7 @@ export interface ServiceSpec {
   /**
    * Bifrost dataset tables this Service writes.
    *
-   * Registration validates and ensures each one in `vala.datasets` before
+   * Registration validates and ensures each one in `bifrost.datasets` before
    * the Service becomes active; removing the Service never drops them.
    */
   readonly tables?: readonly ServiceTable[];
@@ -5504,7 +5504,7 @@ export interface ServiceSpec {
  */
 export interface ServiceTable {
   /**
-   * Dataset table name inside `vala.datasets`.
+   * Dataset table name inside `bifrost.datasets`.
    */
   readonly name: string;
   /**

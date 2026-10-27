@@ -265,7 +265,7 @@ const rows = await bifrost.sql(
 </LangTab>
 </LangTabs>
 
-`binding_id` is in the Service's Card status (`status.verification.binding_ids`). A scheduled window has no `run_id`, because no application run produced it; filter on `binding_id` or `card_uid` instead. The `churn-inputs-stable` requirement's `detail` holds every feature's score, threshold, sample counts, and drift flag, with the window and baseline it used.
+`binding_id` is in the Service's Card status (`status.verification.binding_ids`). A scheduled window has no `run_id`, because no application run produced it; filter on `binding_id` or `subject_card_uid` instead. The `churn-inputs-stable` requirement's `detail` holds every feature's score, threshold, sample counts, and drift flag, with the window and baseline it used.
 
 ## What can go wrong
 

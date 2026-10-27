@@ -22,7 +22,7 @@ await state.startBifrost();
 const run = state.run();
 
 // Store a row
-await run.observe.record("vala.datasets.answers", { question, answer });
+await run.observe.record("bifrost.datasets.answers", { question, answer });
 
 // Run a Verifier now and wait for the verdict
 const result = await run.observe.verify("my-check", { answer });

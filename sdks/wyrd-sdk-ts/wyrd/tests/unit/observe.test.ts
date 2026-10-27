@@ -29,7 +29,7 @@ function fakeRun(result: Record<string, unknown> = { valueJson: "null" }, submis
 /** Every JSON-carrying method, called with `value`, so a refusal must hold for each. */
 function everyCall(observe: Observe, value: () => unknown): (() => Promise<unknown>)[] {
   return [
-    () => observe.record("vala.datasets.events", value()),
+    () => observe.record("bifrost.datasets.events", value()),
     () => observe.verify("policy-check", { answer: value() as never }),
     () => observe.submit("policy-check", { answer: value() as never }),
   ];
@@ -37,7 +37,7 @@ function everyCall(observe: Observe, value: () => unknown): (() => Promise<unkno
 
 /** The JSON payload a call sent native, whichever method recorded it. */
 function payload(call: Call): unknown {
-  return call[0] === "vala.datasets.events" ? call[1] : (call[1] as { valueJson: string }[])[0].valueJson;
+  return call[0] === "bifrost.datasets.events" ? call[1] : (call[1] as { valueJson: string }[])[0].valueJson;
 }
 
 // Internal: these drive the TypeScript wrapper over a fake native run, which

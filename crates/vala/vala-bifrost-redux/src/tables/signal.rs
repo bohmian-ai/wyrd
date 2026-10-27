@@ -11,8 +11,8 @@
 //! typed accumulators that turn projected rows into Arrow arrays.
 
 use arrow::array::{
-    ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray,
-    StringBuilder, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array,
+    Int64Array, ListArray, StringBuilder, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -32,9 +32,11 @@ use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, VariantViolation
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
-use wyrd_spec::vala::managed_columns::{CARD_UID, RUN_ID};
+use wyrd_spec::vala::managed_columns::{RUN_ID, SUBJECT_CARD_UID};
 use wyrd_tonic::otlp::common::v1::any_value::Value;
-use wyrd_tonic::otlp::common::v1::{AnyValue, EntityRef, InstrumentationScope, KeyValue};
+use wyrd_tonic::otlp::common::v1::{
+    AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList,
+};
 use wyrd_tonic::otlp::resource::v1::Resource;
 
 /// Element declaration of the key-name lists inside one entity reference.
@@ -335,6 +337,12 @@ impl ExceptionPromotions {
         }
     }
 
+    /// Whether any of the three values is present, an empty string included.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.exception_type.is_some() || self.message.is_some() || self.stacktrace.is_some()
+    }
+
     /// Returns the promoted text bytes these values add to one row.
     #[must_use]
     pub fn bytes(&self) -> usize {
@@ -390,12 +398,8 @@ pub struct ResourceEnvelope {
     pub schema_url: String,
     /// Entity references in request order.
     pub entity_refs: Vec<EntityRef>,
-    /// Promoted `service.name`.
-    pub service_name: Option<String>,
-    /// Promoted `service.version`.
-    pub service_version: Option<String>,
-    /// Promoted `deployment.environment.name`, else `deployment.environment`.
-    pub deployment_environment: Option<String>,
+    /// The typed conventions promoted out of the attributes.
+    pub promotions: ResourcePromotions,
 }
 
 impl ResourceEnvelope {
@@ -414,10 +418,7 @@ impl ResourceEnvelope {
             dropped_attributes_count: resource.map_or(0, |value| value.dropped_attributes_count),
             schema_url: schema_url.to_owned(),
             entity_refs: resource.map_or_else(Vec::new, |value| value.entity_refs.clone()),
-            service_name: promoted_string(attributes, "service.name"),
-            service_version: promoted_string(attributes, "service.version"),
-            deployment_environment: promoted_string(attributes, "deployment.environment.name")
-                .or_else(|| promoted_string(attributes, "deployment.environment")),
+            promotions: ResourcePromotions::extract(attributes),
         })
     }
 
@@ -425,12 +426,18 @@ impl ResourceEnvelope {
     /// row that repeats it, including one 4-byte offset per entity reference.
     #[must_use]
     pub fn repeated_bytes(&self) -> usize {
+        let promotions = &self.promotions;
         self.attributes.encoded_bytes()
             + self.schema_url.len()
             + [
-                &self.service_name,
-                &self.service_version,
-                &self.deployment_environment,
+                &promotions.service_name,
+                &promotions.service_version,
+                &promotions.deployment_environment,
+                &promotions.service_namespace,
+                &promotions.service_instance_id,
+                &promotions.telemetry_sdk_name,
+                &promotions.telemetry_sdk_language,
+                &promotions.telemetry_sdk_version,
             ]
             .into_iter()
             .flatten()
@@ -441,6 +448,111 @@ impl ResourceEnvelope {
                 .iter()
                 .map(|entity| entity_ref_bytes(entity) + size_of::<i32>())
                 .sum::<usize>()
+    }
+}
+
+/// The typed resource conventions every signal row promotes.
+///
+/// OTLP projection and native canonical validation both read them here, so a
+/// native row's promoted columns are judged by the projection's own rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourcePromotions {
+    /// Promoted `service.name`.
+    pub service_name: Option<String>,
+    /// Promoted `service.version`.
+    pub service_version: Option<String>,
+    /// Promoted `deployment.environment.name`, else `deployment.environment`.
+    pub deployment_environment: Option<String>,
+    /// Promoted `service.namespace`; descriptive, never a Card identity.
+    pub service_namespace: Option<String>,
+    /// Promoted `service.instance.id`.
+    pub service_instance_id: Option<String>,
+    /// Promoted `process.pid`, as a signed integer.
+    pub process_pid: Option<i64>,
+    /// Promoted `telemetry.sdk.name`.
+    pub telemetry_sdk_name: Option<String>,
+    /// Promoted `telemetry.sdk.language`.
+    pub telemetry_sdk_language: Option<String>,
+    /// Promoted `telemetry.sdk.version`.
+    pub telemetry_sdk_version: Option<String>,
+}
+
+impl ResourcePromotions {
+    /// Read every promoted convention from one resource attribute set.
+    #[must_use]
+    pub fn extract(attributes: &[KeyValue]) -> Self {
+        Self {
+            service_name: promoted_string(attributes, "service.name"),
+            service_version: promoted_string(attributes, "service.version"),
+            deployment_environment: promoted_string(attributes, "deployment.environment.name")
+                .or_else(|| promoted_string(attributes, "deployment.environment")),
+            service_namespace: promoted_string(attributes, "service.namespace"),
+            service_instance_id: promoted_string(attributes, "service.instance.id"),
+            process_pid: promoted_int(attributes, "process.pid"),
+            telemetry_sdk_name: promoted_string(attributes, "telemetry.sdk.name"),
+            telemetry_sdk_language: promoted_string(attributes, "telemetry.sdk.language"),
+            telemetry_sdk_version: promoted_string(attributes, "telemetry.sdk.version"),
+        }
+    }
+}
+
+/// Column-wise storage of the context columns every signal ledger declares
+/// directly after `deployment_environment`.
+///
+/// Those are the six descriptive resource promotions followed by the three
+/// subject descriptors. The projection never derives a subject descriptor
+/// from telemetry, so those columns are null here; they belong to the
+/// server's validated subject context.
+#[derive(Debug, Default)]
+pub struct ResourcePromotionColumns {
+    /// Promoted `service.namespace`, one entry per accepted row.
+    service_namespace: Vec<Option<String>>,
+    /// Promoted `service.instance.id`, one entry per accepted row.
+    service_instance_id: Vec<Option<String>>,
+    /// Promoted `process.pid`, one entry per accepted row; its length is the
+    /// row count [`Self::finish`] sizes the null subject columns by.
+    process_pid: Vec<Option<i64>>,
+    /// Promoted `telemetry.sdk.name`, one entry per accepted row.
+    telemetry_sdk_name: Vec<Option<String>>,
+    /// Promoted `telemetry.sdk.language`, one entry per accepted row.
+    telemetry_sdk_language: Vec<Option<String>>,
+    /// Promoted `telemetry.sdk.version`, one entry per accepted row.
+    telemetry_sdk_version: Vec<Option<String>>,
+}
+
+impl ResourcePromotionColumns {
+    /// Append one accepted row's resource promotions.
+    pub fn push(&mut self, resource: &ResourcePromotions) {
+        self.service_namespace
+            .push(resource.service_namespace.clone());
+        self.service_instance_id
+            .push(resource.service_instance_id.clone());
+        self.process_pid.push(resource.process_pid);
+        self.telemetry_sdk_name
+            .push(resource.telemetry_sdk_name.clone());
+        self.telemetry_sdk_language
+            .push(resource.telemetry_sdk_language.clone());
+        self.telemetry_sdk_version
+            .push(resource.telemetry_sdk_version.clone());
+    }
+
+    /// Build the nine columns in ledger order: the six promotions, then the
+    /// null `subject_kind`, `subject_name`, and `subject_version`.
+    #[must_use]
+    pub fn finish(self) -> [ArrayRef; 9] {
+        let rows = self.process_pid.len();
+        let subject = || arrow::array::new_null_array(&DataType::Utf8, rows);
+        [
+            utf8_opt_column(&self.service_namespace),
+            utf8_opt_column(&self.service_instance_id),
+            i64_opt_column(self.process_pid),
+            utf8_opt_column(&self.telemetry_sdk_name),
+            utf8_opt_column(&self.telemetry_sdk_language),
+            utf8_opt_column(&self.telemetry_sdk_version),
+            subject(),
+            subject(),
+            subject(),
+        ]
     }
 }
 
@@ -641,7 +753,7 @@ fn correlation_text<'a>(
 #[must_use]
 pub fn correlation_fields() -> [Field; 2] {
     [
-        Field::new(CARD_UID, DataType::Utf8, true),
+        Field::new(SUBJECT_CARD_UID, DataType::Utf8, true),
         Field::new(RUN_ID, DataType::Utf8, true),
     ]
 }
@@ -980,6 +1092,7 @@ pub fn validate_canonical_user_batch(
         supplied.push(Arc::clone(batch.column(index)));
     }
     crate::tables::validate_declared_variants(&fields, batch)?;
+    refuse_forged_resource_promotions(batch)?;
     let canonical = Schema::new(fields);
 
     let columns = canonical
@@ -1000,6 +1113,188 @@ pub fn validate_canonical_user_batch(
     RecordBatch::try_new(Arc::new(canonical), columns).map_err(|error| BifrostError::SchemaParse {
         detail: format!("canonical batch does not assemble: {error}"),
     })
+}
+
+/// Read row `row` of a stored Variant attribute column back as OTLP
+/// key-values.
+///
+/// A native canonical batch re-derives its promoted columns from these with
+/// the projection's own extractors. A promotion reads only the top-level type
+/// of a value, so nested lists and objects come back empty and a Variant type
+/// OTLP cannot carry comes back unset; neither satisfies a string, integer, or
+/// boolean promotion, exactly as on the OTLP path. A stored object already
+/// holds only the final occurrence of each key, and any other stored Variant
+/// carries no keys, so it derives no promotion.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] when the column is not Variant
+/// storage or the row does not decode.
+pub fn stored_attributes(column: &dyn Array, row: usize) -> Result<Vec<KeyValue>, BifrostError> {
+    stored_variant(column, row, |variant| {
+        variant.as_object().map_or_else(Vec::new, |object| {
+            object
+                .iter()
+                .map(|(key, value)| KeyValue {
+                    key: key.to_owned(),
+                    value: stored_value(&value).map(|value| AnyValue { value: Some(value) }),
+                })
+                .collect()
+        })
+    })
+}
+
+/// Read row `row` of a nullable stored Variant column as text, when it holds a
+/// string.
+///
+/// A null row or any other Variant type is `None`, the projection's rule for
+/// a column promoted from a string value.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] when the column is not Variant
+/// storage or a present row does not decode.
+pub fn stored_text(column: &dyn Array, row: usize) -> Result<Option<String>, BifrostError> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    stored_variant(column, row, |variant| match stored_value(variant) {
+        Some(Value::StringValue(text)) => Some(text),
+        _ => None,
+    })
+}
+
+/// Decode row `row` of a stored Variant column and map it with `read`.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] when the column is not Variant
+/// storage or the row does not decode.
+fn stored_variant<T>(
+    column: &dyn Array,
+    row: usize,
+    read: impl FnOnce(&Variant<'_, '_>) -> T,
+) -> Result<T, BifrostError> {
+    let malformed = || BifrostError::SchemaParse {
+        detail: "a canonical Variant column does not decode".to_owned(),
+    };
+    let storage = column.as_struct_opt().ok_or_else(malformed)?;
+    let child = |name: &str| {
+        storage
+            .column_by_name(name)
+            .and_then(|bytes| bytes.as_binary_opt::<i32>())
+            .map(|bytes| bytes.value(row))
+    };
+    let (Some(metadata), Some(value)) = (child("metadata"), child("value")) else {
+        return Err(malformed());
+    };
+    Variant::try_new(metadata, value)
+        .map(|variant| read(&variant))
+        .map_err(|_| malformed())
+}
+
+/// The OTLP value of one stored top-level Variant, as [`stored_attributes`]
+/// documents.
+fn stored_value(value: &Variant<'_, '_>) -> Option<Value> {
+    Some(match value {
+        Variant::String(text) => Value::StringValue((*text).to_owned()),
+        Variant::ShortString(text) => Value::StringValue(text.to_string()),
+        Variant::BooleanTrue => Value::BoolValue(true),
+        Variant::BooleanFalse => Value::BoolValue(false),
+        Variant::Int8(number) => Value::IntValue(i64::from(*number)),
+        Variant::Int16(number) => Value::IntValue(i64::from(*number)),
+        Variant::Int32(number) => Value::IntValue(i64::from(*number)),
+        Variant::Int64(number) => Value::IntValue(*number),
+        Variant::Double(number) => Value::DoubleValue(*number),
+        Variant::Binary(bytes) => Value::BytesValue(bytes.to_vec()),
+        Variant::List(_) => Value::ArrayValue(ArrayValue::default()),
+        Variant::Object(_) => Value::KvlistValue(KeyValueList::default()),
+        _ => return None,
+    })
+}
+
+/// Refuse a native canonical batch whose `column` differs from `derived`.
+///
+/// `derived` is what the table's projection computes from the row's source
+/// fields; a native writer may compute it too, but a different value would be
+/// a forged filter value and refuses the whole batch.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::SchemaParse`] naming `column` when it is missing or
+/// any row differs.
+pub fn refuse_forged(
+    batch: &RecordBatch,
+    column: &str,
+    derived: &ArrayRef,
+) -> Result<(), BifrostError> {
+    if batch
+        .column_by_name(column)
+        .is_some_and(|supplied| supplied.to_data() == derived.to_data())
+    {
+        return Ok(());
+    }
+    Err(BifrostError::SchemaParse {
+        detail: format!("canonical field {column} differs from the value its source fields derive"),
+    })
+}
+
+/// Refuse a native canonical signal batch whose resource promotions or
+/// subject descriptors differ from what the projection derives.
+///
+/// Every signal promotes the same resource conventions from
+/// `resource_attributes`, and the projection leaves the three subject
+/// descriptors null for the server's validated subject context to fill.
+///
+/// # Errors
+///
+/// Returns the [`refuse_forged`] or [`stored_attributes`] refusal of the first
+/// differing column.
+fn refuse_forged_resource_promotions(batch: &RecordBatch) -> Result<(), BifrostError> {
+    let column =
+        batch
+            .column_by_name("resource_attributes")
+            .ok_or_else(|| BifrostError::SchemaParse {
+                detail: "canonical batch is missing column resource_attributes".to_owned(),
+            })?;
+    let rows = (0..batch.num_rows())
+        .map(|row| {
+            stored_attributes(column.as_ref(), row).map(|set| ResourcePromotions::extract(&set))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let text = |pick: fn(&ResourcePromotions) -> &Option<String>| {
+        utf8_opt_column(&rows.iter().map(|row| pick(row).clone()).collect::<Vec<_>>())
+    };
+    let null = arrow::array::new_null_array(&DataType::Utf8, rows.len());
+    for (name, derived) in [
+        ("service_name", text(|row| &row.service_name)),
+        ("service_version", text(|row| &row.service_version)),
+        (
+            "deployment_environment",
+            text(|row| &row.deployment_environment),
+        ),
+        ("service_namespace", text(|row| &row.service_namespace)),
+        ("service_instance_id", text(|row| &row.service_instance_id)),
+        (
+            "process_pid",
+            i64_opt_column(rows.iter().map(|row| row.process_pid).collect()),
+        ),
+        ("telemetry_sdk_name", text(|row| &row.telemetry_sdk_name)),
+        (
+            "telemetry_sdk_language",
+            text(|row| &row.telemetry_sdk_language),
+        ),
+        (
+            "telemetry_sdk_version",
+            text(|row| &row.telemetry_sdk_version),
+        ),
+        ("subject_kind", Arc::clone(&null)),
+        ("subject_name", Arc::clone(&null)),
+        ("subject_version", null),
+    ] {
+        refuse_forged(batch, name, &derived)?;
+    }
+    Ok(())
 }
 
 /// Verify one supplied Arrow field's storage type and nullability.

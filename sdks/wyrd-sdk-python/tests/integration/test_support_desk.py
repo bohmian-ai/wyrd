@@ -141,7 +141,7 @@ def test_support_desk_answers_verifies_and_explains_every_request(tmp_path: Path
 
             desk = desk_example.deploy(admin, bundle)
 
-            tickets = TableConfig.describe("vala.datasets.tickets", admin)
+            tickets = TableConfig.describe("bifrost.datasets.tickets", admin)
             assert tickets.arrow_schema.names[:4] == ["ticket_id", "question", "answer", "refund"]
             with pytest.raises(WyrdError) as conflict:
                 Cards(admin).declare_from_path(

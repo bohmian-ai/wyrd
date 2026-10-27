@@ -1,4 +1,4 @@
-//! Table-owned `OTLP` metric projection for `vala.metrics.points`.
+//! Table-owned `OTLP` metric projection for `bifrost.metrics.points`.
 //!
 //! [`project_resource_metrics`] is the single deterministic, IO-free conversion
 //! from decoded `OTLP` resource metrics into canonical point rows. One accepted
@@ -33,12 +33,12 @@ use super::points::{
 use crate::otlp_contract::MetricsOutcome;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope, attributes_variant,
-    bool_column, bool_opt_column, checked_i64, entity_refs_column, f64_column, f64_opt_column,
-    fixed_binary_opt_column, fixed_row_bytes, i32_opt_column, i64_column, i64_opt_column, internal,
-    list_column, nested_fields, otlp_instant_column, projected_signal_schema, span_id_bytes,
-    struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
-    validate_canonical_user_batch, variant_column,
+    OutputBudget, RecordCorrelation, ResourceEnvelope, ResourcePromotionColumns, ScopeEnvelope,
+    attributes_variant, bool_column, bool_opt_column, checked_i64, entity_refs_column, f64_column,
+    f64_opt_column, fixed_binary_opt_column, fixed_row_bytes, i32_opt_column, i64_column,
+    i64_opt_column, internal, list_column, nested_fields, otlp_instant_column,
+    projected_signal_schema, span_id_bytes, struct_column, trace_id_bytes, u32_as_i64_column,
+    utf8_column, utf8_opt_column, validate_canonical_user_batch, variant_column,
 };
 use crate::tables::{TableError, refuse_partial_structs};
 use wyrd_spec::ids::CardUid;
@@ -277,7 +277,7 @@ impl Default for MetricOutputWidths {
     }
 }
 
-/// Return the canonical user-column schema of `vala.metrics.points`.
+/// Return the canonical user-column schema of `bifrost.metrics.points`.
 #[must_use]
 pub fn canonical_metric_schema() -> Arc<Schema> {
     Arc::new(Schema::new(canonical_arrow_fields(METRIC_FIELDS)))
@@ -913,6 +913,8 @@ struct PointColumns {
     service_version: Vec<Option<String>>,
     /// Promoted `deployment.environment.name`, else `deployment.environment`.
     deployment_environment: Vec<Option<String>>,
+    /// The descriptive resource promotions and subject descriptors that follow.
+    resource_promotions: ResourcePromotionColumns,
     card_uid: Vec<Option<String>>,
     run_id: Vec<Option<String>>,
 }
@@ -1055,10 +1057,13 @@ impl PointColumns {
             .push(scope.dropped_attributes_count);
         self.scope_schema_url.push(scope.schema_url.clone());
 
-        self.service_name.push(resource.service_name.clone());
-        self.service_version.push(resource.service_version.clone());
+        self.service_name
+            .push(resource.promotions.service_name.clone());
+        self.service_version
+            .push(resource.promotions.service_version.clone());
         self.deployment_environment
-            .push(resource.deployment_environment.clone());
+            .push(resource.promotions.deployment_environment.clone());
+        self.resource_promotions.push(&resource.promotions);
 
         self.rows += 1;
         payload_bytes
@@ -1132,7 +1137,7 @@ impl PointColumns {
     /// assembled columns do not match the canonical schema.
     fn finish(mut self) -> Result<RecordBatch, TableError> {
         let nested = self.nested_columns()?;
-        let columns: Vec<ArrayRef> = vec![
+        let mut columns: Vec<ArrayRef> = vec![
             utf8_column(&self.metric_name),
             utf8_column(&self.description),
             utf8_column(&self.unit),
@@ -1195,9 +1200,12 @@ impl PointColumns {
             utf8_opt_column(&self.service_name),
             utf8_opt_column(&self.service_version),
             utf8_opt_column(&self.deployment_environment),
+        ];
+        columns.extend(self.resource_promotions.finish());
+        columns.extend([
             utf8_opt_column(&self.card_uid),
             utf8_opt_column(&self.run_id),
-        ];
+        ]);
         RecordBatch::try_new(Arc::clone(&METRIC_SCHEMA), columns)
             .map_err(|error| TableError::Internal(format!("canonical metric batch: {error}")))
     }

@@ -61,8 +61,8 @@ def test_saved_login_completes_the_workflow_past_token_expiry(
     export(run)
     worked.state.shutdown()
     rows = Bifrost(client=client).sql(
-        "SELECT card_uid FROM vala.traces.spans WHERE run_id = $1",
+        "SELECT subject_card_uid FROM bifrost.traces.spans WHERE run_id = $1",
         [run.run_id],
         model=Attributed,
     )
-    assert rows == [Attributed(card_uid=worked.agent_uid)]
+    assert rows == [Attributed(subject_card_uid=worked.agent_uid)]

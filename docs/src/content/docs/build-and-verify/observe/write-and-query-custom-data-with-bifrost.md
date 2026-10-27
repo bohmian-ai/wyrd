@@ -85,7 +85,7 @@ console.log(await bifrost.register()); // "created" or "already_exists"
 </LangTab>
 </LangTabs>
 
-Registering the same schema again returns `already_exists` and changes nothing. A different schema for an existing table fails with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`; tables cannot be altered or dropped, so pick a new name. `card_uid`, `run_id`, `sub_principal_id`, `act_principal_id`, and names starting with `wyrd_` are reserved.
+Registering the same schema again returns `already_exists` and changes nothing. A different schema for an existing table fails with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`; tables cannot be altered or dropped, so pick a new name. `workload_card_uid`, `subject_card_uid`, `run_id`, `sub_principal_id`, `act_principal_id`, and names starting with `wyrd_` are reserved.
 
 By default the table is partitioned on `wyrd_ingested_at`, the time Bifrost received each row. If your rows carry their own event time and you will filter on it, name it as the time column. It must be a non-null UTC timestamp:
 
@@ -169,7 +169,7 @@ await bifrost.flush();
 
 For a large load you already have in Arrow, `write_batch(table, batch)` sends one batch and returns once it is stored, with no `flush` needed. Build the batch against `TableConfig.describe(...).arrow_schema`.
 
-Rows written this way carry no run. To tie a row to a Card, pass a correlation with its `card_uid`; your credential must be allowed to write about that Card.
+Rows written this way carry no run. To tie a row to a Card, pass a correlation with its `subject_card_uid` (`subjectCardUid` in TypeScript); your credential must be allowed to write about that Card.
 
 When you are done writing, call `shutdown()` to drain and stop the writer.
 
@@ -286,7 +286,7 @@ Only `vala.datasets` accepts writes from you.
 | Error code | Cause | Fix |
 | --- | --- | --- |
 | `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` | The table exists with a different schema | Use a new table name |
-| `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` | A field is named `card_uid`, `run_id`, or `wyrd_*` | Rename the field |
+| `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` | A field is named `workload_card_uid`, `subject_card_uid`, `run_id`, `sub_principal_id`, `act_principal_id`, or `wyrd_*` | Rename the field |
 | `WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT` | `time_column` is missing, nullable, or not a timestamp | Point it at a required timestamp field |
 | `WYRD_VALA_412_NO_ACTIVE_TABLE` | `insert` before a table was set | Register the table, or call `use_table_by_name` to bind a registered one |
 | `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` | Writing to a table that was never registered | Call `register` first |

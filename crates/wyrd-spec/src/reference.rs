@@ -353,7 +353,7 @@ impl CardRefScope {
     /// entry. Mint resolves each scope member against the tenant-local
     /// registry while its callers still hold the authored, UID-less root, so
     /// without this the resolved root identity would be dropped and ingest
-    /// could not stamp `card_uid` from signed claims alone.
+    /// could not stamp `subject_card_uid` from signed claims alone.
     #[must_use]
     pub fn from_root_and_members(
         root: &CardRef,
@@ -407,7 +407,7 @@ impl CardRefScope {
 
     /// The resolved UIDs of this scope's members, in member order.
     ///
-    /// This is the set a row's `card_uid` correlation is authorized against:
+    /// This is the set a row's `subject_card_uid` correlation is authorized against:
     /// the UIDs the mint signed onto the scope. A member without a resolved
     /// UID contributes none, so no row can correlate to it.
     #[must_use]

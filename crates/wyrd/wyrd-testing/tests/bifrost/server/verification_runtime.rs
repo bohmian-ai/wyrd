@@ -26,7 +26,7 @@ use arrow::array::{
     StructArray, TimestampMicrosecondArray,
 };
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::writer::StreamWriter;
 use arrow::json::writer::{JsonArray, WriterBuilder};
 use arrow::record_batch::RecordBatch;
@@ -65,7 +65,8 @@ use wyrd_spec::vala::api::{
     VARIANT_MAX_ENCODED_BYTES,
 };
 use wyrd_spec::vala::managed_columns::{
-    ACT_PRINCIPAL_ID, CARD_UID, RUN_ID, SUB_PRINCIPAL_ID, WYRD_INGESTED_AT,
+    ACT_PRINCIPAL_ID, RUN_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID,
+    WYRD_INGESTED_AT,
 };
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::TaskId;
@@ -173,7 +174,9 @@ async fn first_settled(
 /// result through the Scribe outbox's peer ingest RPC and completes
 /// the run. Its summary and both feature rows are queryable through the
 /// Oracle and carry the exact tenant SYSTEM principal, Verifier, subject,
-/// owner, binding, run, result, and one shared event time.
+/// owner, binding, run, result, and one shared event time, with the owner
+/// Service and subject described by name and version by the peer that
+/// admitted them.
 ///
 /// # Errors
 /// Returns cluster, seeding, runtime, publication, or query errors, or a
@@ -243,19 +246,23 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
         format!(
             "{alias}{RUN_ID} IS NULL AND {alias}result_id = '{result}' \
              AND {alias}{ACT_PRINCIPAL_ID} = '{system}' AND {alias}verifier_card_uid = '{verifier}' \
-             AND {alias}{CARD_UID} = '{subject}' AND {alias}owner_card_uid = '{owner}' \
-             AND {alias}binding_id = '{binding}'"
+             AND {alias}{SUBJECT_CARD_UID} = '{subject}' AND {alias}{WORKLOAD_CARD_UID} = '{owner}' \
+             AND {alias}binding_id = '{binding}' AND {alias}service_name = 'remote-owner' \
+             AND {alias}service_version = '1.0.0' AND {alias}subject_kind = 'Service' \
+             AND {alias}subject_name = 'remote-subject' AND {alias}subject_version = '1.0.0'"
         )
     };
     let checks = [
         (
-            format!("SELECT result_id FROM vala.verification.results WHERE result_id = '{result}'"),
+            format!(
+                "SELECT result_id FROM bifrost.verification.results WHERE result_id = '{result}'"
+            ),
             1,
             "one published summary for the run",
         ),
         (
             format!(
-                "SELECT result_id FROM vala.verification.results WHERE {}",
+                "SELECT result_id FROM bifrost.verification.results WHERE {}",
                 identity("")
             ),
             1,
@@ -263,17 +270,17 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
         ),
         (
             format!(
-                "SELECT result_id FROM vala.drift.result_features WHERE result_id = '{result}'"
+                "SELECT result_id FROM bifrost.drift.result_features WHERE result_id = '{result}'"
             ),
             2,
             "two published feature rows for the run",
         ),
         (
             format!(
-                "SELECT f.result_id FROM vala.drift.result_features f \
-                 JOIN vala.verification.results r \
+                "SELECT f.result_id FROM bifrost.drift.result_features f \
+                 JOIN bifrost.verification.results r \
                    ON f.result_id = r.result_id \
-                  AND f.{ACT_PRINCIPAL_ID} = r.{ACT_PRINCIPAL_ID} AND f.{CARD_UID} = r.{CARD_UID} \
+                  AND f.{ACT_PRINCIPAL_ID} = r.{ACT_PRINCIPAL_ID} AND f.{SUBJECT_CARD_UID} = r.{SUBJECT_CARD_UID} \
                  WHERE {}",
                 identity("f.")
             ),
@@ -473,7 +480,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     Bifrost::connect_with(&writer, BifrostOptions::default())
         .await?
         .write_batch(
-            "vala.drift.observations",
+            "bifrost.drift.observations",
             &observation_batch(&record, &subject, observed_in_current_month(Utc::now())?)?,
         )
         .await?;
@@ -532,7 +539,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         oracle,
         tenant,
         format!(
-            "SELECT {SUB_PRINCIPAL_ID}, {CARD_UID}, series FROM vala.drift.observations \
+            "SELECT {SUB_PRINCIPAL_ID}, {SUBJECT_CARD_UID}, series FROM bifrost.drift.observations \
              WHERE record_id = '{record}' ORDER BY series"
         ),
     )
@@ -554,7 +561,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         if query_texts(
             oracle,
             tenant,
-            format!("SELECT {column} FROM vala.drift.observations"),
+            format!("SELECT {column} FROM bifrost.drift.observations"),
         )
         .await
         .is_ok()
@@ -569,8 +576,8 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
             oracle,
             tenant,
             format!(
-                "SELECT verifier_card_uid, {CARD_UID}, verdict, {RUN_ID} \
-                 FROM vala.verification.results WHERE binding_id = '{binding}'"
+                "SELECT verifier_card_uid, {SUBJECT_CARD_UID}, verdict, {RUN_ID} \
+                 FROM bifrost.verification.results WHERE binding_id = '{binding}'"
             ),
         )
         .await?;
@@ -595,10 +602,12 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     Ok(())
 }
 
-/// One Drift observation `record` of the Card `card_uid` at `event_time`: a
+/// One Drift observation `record` of the Card `subject` at `event_time`: a
 /// drifting `score` and a `latency` feature, as the SDK's tall projection
 /// writes them.
 ///
+/// The batch carries the table's own authored columns, its shared dimensions
+/// left null for the server to derive, and the `subject_card_uid` correlation.
 /// `event_time` is the rows' `created_at`, the observation table's time
 /// column, which Scribe keeps verbatim.
 ///
@@ -606,36 +615,36 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
 /// Returns an Arrow error when the batch cannot be assembled.
 fn observation_batch(
     record: &str,
-    card_uid: &CardUid,
+    subject: &CardUid,
     event_time: DateTime<Utc>,
 ) -> Result<RecordBatch, ServerJourneyError> {
-    let utc = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("record_id", DataType::Utf8, false),
-        Field::new("series", DataType::Utf8, false),
-        Field::new("num_value", DataType::Float64, true),
-        Field::new("str_value", DataType::Utf8, true),
-        Field::new("session_id", DataType::Utf8, true),
-        Field::new("created_at", utc(), false),
-        Field::new(CARD_UID, DataType::Utf8, true),
-    ]));
+    use vala_bifrost_redux::tables::DomainTable;
+    use vala_bifrost_redux::tables::drift::ObservationsTable;
+
+    let mut fields = ObservationsTable::arrow_fields();
+    fields.push(Field::new(SUBJECT_CARD_UID, DataType::Utf8, true));
     let event_time = event_time.timestamp_micros();
+    let columns = fields
+        .iter()
+        .map(|field| -> ArrayRef {
+            match field.name().as_str() {
+                "record_id" => Arc::new(StringArray::from(vec![record, record])),
+                "series" => Arc::new(StringArray::from(vec!["score", "latency"])),
+                "num_value" => Arc::new(Float64Array::from(vec![3.0, 120.0])),
+                "created_at" => Arc::new(
+                    TimestampMicrosecondArray::from(vec![event_time, event_time])
+                        .with_data_type(field.data_type().clone()),
+                ),
+                SUBJECT_CARD_UID => {
+                    Arc::new(StringArray::from(vec![subject.as_str(), subject.as_str()]))
+                }
+                _ => arrow::array::new_null_array(field.data_type(), 2),
+            }
+        })
+        .collect();
     Ok(RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec![record, record])),
-            Arc::new(StringArray::from(vec!["score", "latency"])),
-            Arc::new(Float64Array::from(vec![3.0, 120.0])),
-            Arc::new(StringArray::from(vec![None::<&str>, None])),
-            Arc::new(StringArray::from(vec![None::<&str>, None])),
-            Arc::new(
-                TimestampMicrosecondArray::from(vec![event_time, event_time]).with_timezone("UTC"),
-            ),
-            Arc::new(StringArray::from(vec![
-                card_uid.as_str(),
-                card_uid.as_str(),
-            ])),
-        ],
+        Arc::new(Schema::new(fields)),
+        columns,
     )?)
 }
 
@@ -650,8 +659,8 @@ fn observation_batch(
 /// retrieved by `result_id` alone from both daily partitions; the straddling
 /// result's summary partitions on its `ended_at` while its details partition
 /// on a `wyrd_ingested_at` that falls on a different day. Every published Parquet file of
-/// the two tables carries a physical Bloom filter for its declared and
-/// managed-floor columns, and Oracle's scan metrics show a day-range
+/// the two tables carries a physical Bloom filter for every default Bloom
+/// column of its table's layout, and Oracle's scan metrics show a day-range
 /// predicate dropping the previous day's file and a `result_id` lookup
 /// selecting strictly fewer files or row groups than a full scan.
 ///
@@ -673,7 +682,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     for (result, expected) in [(&straddling, 2), (&previous_day, 2)] {
         let features = journey
             .texts(format!(
-                "SELECT feature FROM vala.drift.result_features WHERE result_id = '{result}'"
+                "SELECT feature FROM bifrost.drift.result_features WHERE result_id = '{result}'"
             ))
             .await?;
         if features.len() != expected {
@@ -686,7 +695,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     }
     let none = journey
         .texts(format!(
-            "SELECT feature FROM vala.drift.result_features WHERE result_id = '{unscored}'"
+            "SELECT feature FROM bifrost.drift.result_features WHERE result_id = '{unscored}'"
         ))
         .await?;
     if !none.is_empty() {
@@ -704,10 +713,10 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
         )
     };
     let summary = journey
-        .texts(times("ended_at", "vala.verification.results"))
+        .texts(times("ended_at", "bifrost.verification.results"))
         .await?;
     let details = journey
-        .texts(times(WYRD_INGESTED_AT, "vala.drift.result_features"))
+        .texts(times(WYRD_INGESTED_AT, "bifrost.drift.result_features"))
         .await?;
     let micros = |value: &Option<String>| -> Result<i64, ServerJourneyError> {
         Ok(value.as_deref().ok_or("null timestamp")?.parse()?)
@@ -736,7 +745,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
 
     let unfiltered = journey
         .scan(
-            "SELECT result_id FROM vala.verification.results".to_owned(),
+            "SELECT result_id FROM bifrost.verification.results".to_owned(),
             3,
         )
         .await?;
@@ -749,7 +758,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     let current_day = journey
         .scan(
             format!(
-                "SELECT result_id FROM vala.verification.results \
+                "SELECT result_id FROM bifrost.verification.results \
                  WHERE ended_at >= TIMESTAMP '{today}'"
             ),
             2,
@@ -765,7 +774,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     let by_result = journey
         .scan(
             format!(
-                "SELECT result_id FROM vala.verification.results WHERE result_id = '{straddling}'"
+                "SELECT result_id FROM bifrost.verification.results WHERE result_id = '{straddling}'"
             ),
             1,
         )
@@ -964,8 +973,8 @@ impl<'a> ResultLayoutJourney<'a> {
         })
     }
 
-    /// Require a physical Bloom filter on every declared and managed-floor
-    /// Bloom column in every published file of the two result tables.
+    /// Require a physical Bloom filter on every default Bloom column of each
+    /// result table's own layout, in every published file of the two tables.
     ///
     /// Files are found under the cluster's storage root and classified by a
     /// column only their table carries; each table must have at least one.
@@ -974,14 +983,21 @@ impl<'a> ResultLayoutJourney<'a> {
     /// Returns a filesystem or Parquet error, or names the first table with
     /// no file or the first column chunk without a Bloom filter.
     fn assert_blooms(&self) -> Result<(), ServerJourneyError> {
-        let floor = [RUN_ID, CARD_UID, SUB_PRINCIPAL_ID, ACT_PRINCIPAL_ID];
-        let tables: [(&str, &str, &[&str]); 2] = [
+        use vala_bifrost_redux::tables::DomainTable;
+        use vala_bifrost_redux::tables::drift::ResultFeaturesTable;
+        use vala_bifrost_redux::tables::verification::ResultsTable;
+
+        let tables = [
             (
-                "vala.verification.results",
+                "bifrost.verification.results",
                 "execution_status",
-                &["result_id", "verifier_card_uid", "binding_id"],
+                ResultsTable::physical_layout().bloom_columns,
             ),
-            ("vala.drift.result_features", "feature", &["result_id"]),
+            (
+                "bifrost.drift.result_features",
+                "feature",
+                ResultFeaturesTable::physical_layout().bloom_columns,
+            ),
         ];
         let mut found = [0_usize; 2];
         let mut pending = vec![self.cluster.storage_root().to_path_buf()];
@@ -1006,9 +1022,9 @@ impl<'a> ResultLayoutJourney<'a> {
                     continue;
                 };
                 found[index] += 1;
-                let (table, _, declared) = tables[index];
+                let (table, _, declared) = &tables[index];
                 for group in metadata.row_groups() {
-                    for name in declared.iter().chain(&floor) {
+                    for name in declared {
                         let chunk = group
                             .columns()
                             .iter()
@@ -1057,7 +1073,7 @@ impl Scribe for StraddleScribe {
     /// # Errors
     /// Returns the real Scribe's outcome.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
-        if self.straddle && frame.table.fqn() == "vala.verification.results" {
+        if self.straddle && frame.table.fqn() == "bifrost.verification.results" {
             self.inner.shift_receipt_clock_for_test(DAY);
         }
         self.inner.ingest_frame(frame).await
@@ -1177,7 +1193,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     let call = journey.gateway.capture_call().await?;
     let decision = journey.stage_audit_decision().await?;
     let outcomes_sql = format!(
-        "SELECT result_id, verdict, outcome FROM vala.verification.results \
+        "SELECT result_id, verdict, outcome FROM bifrost.verification.results \
          WHERE result_id IN ('{}', '{}') ORDER BY result_id",
         results.scored_drift.0, results.unscored_drift.0
     );
@@ -1201,7 +1217,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     // and the refused call's absent resolved model reads both children null.
     let models_sql = format!(
         "SELECT request_id, requested_model['deployment'], requested_model['model'], \
-         resolved_model['deployment'], resolved_model['model'] FROM vala.gateway.calls \
+         resolved_model['deployment'], resolved_model['model'] FROM bifrost.gateway.calls \
          WHERE request_id IN ('{}', '{}') ORDER BY request_id",
         call.request_id, call.unresolved_request_id
     );
@@ -1247,7 +1263,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     // Gateway capture: both selected payloads decode to the call's JSON.
     let payloads = journey
         .rows(format!(
-            "SELECT request_payload, response_payload FROM vala.gateway.calls \
+            "SELECT request_payload, response_payload FROM bifrost.gateway.calls \
              WHERE request_id = '{}'",
             call.request_id
         ))
@@ -1265,7 +1281,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     // Audit: the retained detail decodes to the decision's canonical JSON.
     let audit = journey
         .rows(format!(
-            "SELECT detail FROM vala.system.audit_log WHERE operation = '{}'",
+            "SELECT detail FROM bifrost.system.audit_log WHERE operation = '{}'",
             decision.operation
         ))
         .await?;
@@ -1275,11 +1291,355 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     Ok(())
 }
 
+/// Every built-in and a dynamic table share one attribution envelope.
+///
+/// Each of the nine freshly provisioned built-ins describes, through the
+/// public HTTP route, exactly `subject_card_uid` then `run_id` as writer
+/// correlation inputs, its declared ledger layout as the resolved layout, and
+/// the six shared dimensions once each as nullable text, with no managed or
+/// retired `card_uid`/`owner_card_uid` name among its own fields. A dynamic
+/// table describes its two declared fields and the same correlation inputs,
+/// and no shared dimension. All ten tables plan a read of the seven managed
+/// columns, and the dynamic table refuses a read of a shared dimension.
+/// Rows written by three producers carry their own origin: a verification
+/// result names its binding owner as workload and its subject Card, written
+/// by the tenant SYSTEM principal; a gateway call stores its own request as
+/// `wyrd_request_id`; and an audit decision keeps its decision pair and
+/// request, with no workload or subject.
+///
+/// # Errors
+/// Returns a server, describe, registration, publication, or query error, or a
+/// description of the first table or row that differs from its contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn system_and_dynamic_tables_share_attribution() -> Result<(), ServerJourneyError> {
+    use vala_bifrost_redux::tables::managed_columns::{MANAGED_COLUMNS, is_managed_column};
+    use vala_bifrost_redux::tables::{SHARED_DIMENSIONS, builtin_tables};
+
+    let journey = TypedPayloadJourney::start().await?;
+    let server = &journey.gateway.server;
+    for table in builtin_tables() {
+        server
+            .ensure_builtin_table_for_test(journey.gateway.tenant, table.namespace, table.name)
+            .await?;
+    }
+    let bootstrap = server
+        .bootstrap_service("attribution_describer", &["admin"])
+        .await?;
+    let client = super::query::client_for(server, bootstrap.api_key().ok_or("a machine API key")?)?;
+    let dynamic = format!(
+        "bifrost.datasets.attributed_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let declared = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, true),
+    ]));
+    Bifrost::connect_with(
+        &client,
+        BifrostOptions {
+            table: Some(TableConfig::from_arrow(&dynamic, declared)?),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?
+    .register()
+    .await?;
+    let query = Bifrost::query_only(&client);
+    let correlation = |description: &wyrd_spec::vala::api::BifrostTableDescription| {
+        description
+            .correlation_fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let mut fqns = Vec::new();
+    for table in builtin_tables() {
+        let fqn = format!("bifrost.{}.{}", table.namespace, table.name);
+        let description = query
+            .describe_table(&format!("bifrost.{}", table.namespace), table.name)
+            .await?;
+        expect_eq(
+            &format!("{fqn} correlation inputs"),
+            &correlation(&description),
+            &vec![SUBJECT_CARD_UID.to_owned(), RUN_ID.to_owned()],
+        )?;
+        expect_eq(
+            &format!("{fqn} resolved layout"),
+            &description.physical_layout,
+            &(table.physical_layout)(),
+        )?;
+        for dimension in SHARED_DIMENSIONS {
+            let declared: Vec<_> = description
+                .user_fields
+                .iter()
+                .filter(|field| field.name == dimension)
+                .map(|field| (field.data_type.clone(), field.nullable))
+                .collect();
+            expect_eq(
+                &format!("{fqn} {dimension}"),
+                &declared,
+                &vec![(wyrd_spec::vala::api::DataTypeSpec::Utf8, true)],
+            )?;
+        }
+        if let Some(field) = description.user_fields.iter().find(|field| {
+            is_managed_column(&field.name) || ["card_uid", "owner_card_uid"].contains(&&*field.name)
+        }) {
+            return Err(format!("{fqn} declares server-owned `{}`", field.name).into());
+        }
+        fqns.push(fqn);
+    }
+    let (namespace, name) = dynamic
+        .rsplit_once('.')
+        .ok_or("the dynamic FQN names its table")?;
+    let description = query.describe_table(namespace, name).await?;
+    expect_eq(
+        "dynamic declared fields",
+        &description
+            .user_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        &vec!["id", "value"],
+    )?;
+    expect_eq(
+        "dynamic correlation inputs",
+        &correlation(&description),
+        &vec![SUBJECT_CARD_UID.to_owned(), RUN_ID.to_owned()],
+    )?;
+    fqns.push(dynamic.clone());
+    let managed = MANAGED_COLUMNS
+        .iter()
+        .map(|column| column.field.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    for fqn in &fqns {
+        journey
+            .rows(format!("SELECT {managed} FROM {fqn} LIMIT 1"))
+            .await
+            .map_err(|error| format!("{fqn} does not read the managed envelope: {error}"))?;
+    }
+    if journey
+        .rows(format!("SELECT {} FROM {dynamic}", SHARED_DIMENSIONS[0]))
+        .await
+        .is_ok()
+    {
+        return Err("a dynamic table reads a shared dimension".into());
+    }
+
+    let results = journey.publish_results().await?;
+    let call = journey.gateway.capture_call().await?;
+    let decision = journey.stage_audit_decision().await?;
+    server.flush_bifrost().await?;
+    let envelope = format!(
+        "{WORKLOAD_CARD_UID}, {SUBJECT_CARD_UID}, {SUB_PRINCIPAL_ID}, {ACT_PRINCIPAL_ID}, \
+         {WYRD_INGESTED_AT} IS NOT NULL"
+    );
+    let writer = json!(results.writer.to_string());
+    let subject = json!(results.subject.as_str());
+    expect_eq(
+        "result envelope",
+        &journey
+            .rows(format!(
+                "SELECT {envelope} FROM bifrost.verification.results WHERE result_id = '{}'",
+                results.scored_drift.0
+            ))
+            .await?,
+        &vec![vec![
+            subject.clone(),
+            subject,
+            writer.clone(),
+            writer,
+            json!(true),
+        ]],
+    )?;
+    let calls = journey
+        .rows(format!(
+            "SELECT wyrd_request_id = request_id, {SUB_PRINCIPAL_ID} IS NOT NULL \
+             FROM bifrost.gateway.calls WHERE request_id = '{}'",
+            call.request_id
+        ))
+        .await?;
+    expect_eq(
+        "call envelope",
+        &calls,
+        &vec![vec![json!(true), json!(true)]],
+    )?;
+    let principal = json!(decision.principal);
+    expect_eq(
+        "audit envelope",
+        &journey
+            .rows(format!(
+                "SELECT {envelope}, wyrd_request_id FROM bifrost.system.audit_log \
+                 WHERE operation = '{}'",
+                decision.operation
+            ))
+            .await?,
+        &vec![vec![
+            Value::Null,
+            Value::Null,
+            principal.clone(),
+            principal,
+            json!(true),
+            json!(decision.request_id.as_str()),
+        ]],
+    )?;
+
+    journey.gateway.server.shutdown().await?;
+    Ok(())
+}
+
+/// Trusted producers sharing one tenant outbox keep each row's own origin.
+///
+/// Two root Services of different families and versions, each acting through
+/// its own runtime account under its own deployment environment, judge the
+/// same shared Agent component with one Drift Verifier. Each stages its
+/// pinned inputs row and its result through the production payload builder
+/// on the process outbox before one flush, so their rows travel together.
+/// Every retained `execution_inputs`, `results`, and `result_features` row
+/// names its own owning Service as workload and by name and version, its own
+/// account pair and environment, and the shared Agent by UID, kind, name,
+/// and version; no row takes another producer's or the delivering worker's
+/// identity.
+///
+/// # Errors
+///
+/// Returns a seeding, payload, flush, or query error, or the first table
+/// whose origins differ.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn trusted_delivery_preserves_each_origin() -> Result<(), ServerJourneyError> {
+    let journey = TypedPayloadJourney::start().await?;
+    let server = &journey.gateway.server;
+    let tenant = journey.gateway.tenant;
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    seed.declare(
+        "Prompt",
+        "origin-prompt",
+        &json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "Answer." }],
+        }),
+    )
+    .await?;
+    let agent = seed
+        .declare(
+            "Agent",
+            "origin-agent",
+            &json!({
+                "prompt": { "kind": "Prompt", "name": "origin-prompt", "version": "1.0.0" },
+                "execution_route": { "kind": "native" },
+            }),
+        )
+        .await?;
+    let verifier = seed.drift_verifier("origin-drift").await?;
+    for (namespace, name) in [
+        ("verification", "execution_inputs"),
+        ("verification", "results"),
+        ("drift", "result_features"),
+    ] {
+        server
+            .ensure_builtin_table_for_test(tenant, namespace, name)
+            .await?;
+    }
+    let now = Utc::now();
+    let window = DriftWindow {
+        start: now - chrono::Duration::hours(1),
+        end: now,
+    };
+    let outbox = server.state().bifrost.scribe_outbox();
+    let mut expected = Vec::new();
+    for (name, version, environment) in [
+        ("origin-billing", "2.0.0", "staging"),
+        ("origin-checkout", "1.0.0", "prod"),
+    ] {
+        let (root, account) = seed.release(name, version).await?;
+        let builder = ResultPayloadBuilder::new(
+            ResultRun {
+                execution_id: ExecutionId::new_v7(),
+                run_id: None,
+                verifier_version: "1.0.0",
+                card_uid: &agent,
+                owner_card_uid: Some(&root),
+                group_id: None,
+                deployment_environment: Some(environment),
+                binding_id: Some(BindingId::new_v7()),
+                trigger: None,
+                window: Some(&window),
+            },
+            &verifier,
+            now,
+            now,
+        );
+        let attribution = Attribution::direct(account);
+        outbox.stage(
+            tenant,
+            ScribeWrite::ExecutionInputs {
+                row: builder.inputs(&BTreeMap::new(), None)?,
+                attribution,
+                queued: None,
+            },
+        );
+        outbox.stage(
+            tenant,
+            ScribeWrite::Result {
+                payload: builder.build(&drift_outcome(Some(two_feature_report()?))?)?,
+                attribution,
+            },
+        );
+        expected.push(
+            [
+                root.as_str(),
+                agent.as_str(),
+                &account.to_string(),
+                &account.to_string(),
+                name,
+                version,
+                environment,
+                "Agent",
+                "origin-agent",
+                "1.0.0",
+            ]
+            .map(|value| json!(value))
+            .to_vec(),
+        );
+    }
+    server.flush_bifrost().await?;
+
+    for table in [
+        "bifrost.verification.execution_inputs",
+        "bifrost.verification.results",
+        "bifrost.drift.result_features",
+    ] {
+        expect_eq(
+            &format!("{table} origins"),
+            &journey
+                .rows(format!(
+                    "SELECT DISTINCT {WORKLOAD_CARD_UID}, {SUBJECT_CARD_UID}, \
+                     {SUB_PRINCIPAL_ID}, {ACT_PRINCIPAL_ID}, service_name, service_version, \
+                     deployment_environment, subject_kind, subject_name, subject_version \
+                     FROM {table} WHERE verifier_card_uid = '{verifier}' ORDER BY service_name"
+                ))
+                .await?,
+            &expected,
+        )?;
+    }
+
+    journey.gateway.server.shutdown().await?;
+    Ok(())
+}
+
 /// Raw Arrow IPC that bypasses every client-side Variant check reaches Scribe
 /// admission for a top-level and a nested signal Variant, and each malformed
 /// frame is refused with its exact catalogued error before any ACK.
 ///
-/// `vala.logs.records` covers a missing and a foreign extension marker,
+/// `bifrost.logs.records` covers a missing and a foreign extension marker,
 /// the Variant marker with foreign extension metadata, invalid bytes, one
 /// container past the depth limit, a compact value nested 20,000 levels deep
 /// that is refused for depth without taking the server down, and one byte
@@ -1287,7 +1647,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// beside an over-deep sibling in either order are refused as invalid, and a
 /// Decimal16 outside the exact numeric domain — fractional, past `u64::MAX`,
 /// or a scale-zero value within `i64` — is refused for numeric range, also
-/// beside an over-deep sibling. A `vala.metrics.points` frame whose absent
+/// beside an over-deep sibling. A `bifrost.metrics.points` frame whose absent
 /// bucket set keeps a child value is refused as a partial Struct.
 /// Precedence is pinned: an oversized value that is also
 /// malformed reports its size, a wrong marker on one field outranks invalid
@@ -1297,8 +1657,8 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// row whose Variant holds an out-of-range integer beside an over-deep branch
 /// is refused for numeric range in both key orders, and also when the integer
 /// sits inside the over-deep branch, before any ACK; that JSON row encodes
-/// against `vala.verification.execution_inputs` on the client.
-/// `vala.traces.spans` covers the Variant nested in `events`, with a missing
+/// against `bifrost.verification.execution_inputs` on the client.
+/// `bifrost.traces.spans` covers the Variant nested in `events`, with a missing
 /// marker and with foreign extension metadata, named by its top-level column.
 /// A non-Variant type change on a signal column is refused as a
 /// schema-conformance conflict. Afterward the same server accepts the valid sentinel frames and only
@@ -1810,14 +2170,14 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
 
 /// The client-writable built-in whose top-level Variants the journey writes:
 /// a required `attributes` and a nullable `body`.
-const RECORDS: &str = "vala.logs.records";
+const RECORDS: &str = "bifrost.logs.records";
 
 /// The server-written built-in the public JSON-row facade encodes against;
 /// its Variant refusals surface on the client before anything is queued.
-const EXECUTION_INPUTS: &str = "vala.verification.execution_inputs";
+const EXECUTION_INPUTS: &str = "bifrost.verification.execution_inputs";
 
 /// The signal built-in whose nested `events` Variant the journey writes.
-const SPANS: &str = "vala.traces.spans";
+const SPANS: &str = "bifrost.traces.spans";
 
 /// Arrow field-metadata key naming a field's extension type.
 const EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
@@ -1859,7 +2219,7 @@ const VARIANT_LONG_STRING: u8 = 16;
 const VARIANT_MALFORMED: u8 = 31 << 2;
 
 /// The canonical metric points ledger the journey writes raw frames to.
-const POINTS: &str = "vala.metrics.points";
+const POINTS: &str = "bifrost.metrics.points";
 
 /// One bound server and an admin ingest door that sends raw Arrow IPC frames.
 struct VariantAdmissionJourney {
@@ -1869,11 +2229,11 @@ struct VariantAdmissionJourney {
     ingest: RawIngest,
     /// Admin client the public Bifrost facade writes JSON rows through.
     client: wyrd_client::WyrdClient,
-    /// The described `vala.logs.records` user schema.
+    /// The described `bifrost.logs.records` user schema.
     records: SchemaRef,
-    /// The described `vala.traces.spans` user schema.
+    /// The described `bifrost.traces.spans` user schema.
     spans: SchemaRef,
-    /// The described `vala.metrics.points` user schema.
+    /// The described `bifrost.metrics.points` user schema.
     points: SchemaRef,
     /// Suffix that scopes this run's sessions and span scopes.
     run: String,
@@ -2054,7 +2414,8 @@ impl VariantAdmissionJourney {
     ///
     /// Every other column keeps the canonical fixture's valid value, so a
     /// refusal can come only from the two supplied fields or a deliberate
-    /// schema change.
+    /// schema change. No supplied body is a string, so the derived
+    /// `body_text` is null.
     ///
     /// # Errors
     ///
@@ -2078,10 +2439,11 @@ impl VariantAdmissionJourney {
             fields[index] = Arc::new(field);
             columns[index] = column;
         }
-        Ok(RecordBatch::try_new(
-            Arc::new(Schema::new(fields)),
-            columns,
-        )?)
+        with_text(
+            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?,
+            "body_text",
+            None,
+        )
     }
 
     /// The canonical two-span fixture under span scope `scope`.
@@ -2425,6 +2787,10 @@ struct PublishedResults {
     scored_drift: (VerificationResultId, VerificationOutcome),
     /// A Drift result whose window could not be scored.
     unscored_drift: (VerificationResultId, VerificationOutcome),
+    /// The Service both results judge, which also owns their bindings.
+    subject: CardUid,
+    /// The tenant SYSTEM principal that wrote both results.
+    writer: uuid::Uuid,
 }
 
 /// The staged audit decision and its native detail.
@@ -2433,6 +2799,10 @@ struct StagedDecision {
     operation: String,
     /// The detail's canonical JSON, the value the retained row must decode to.
     detail: Value,
+    /// The principal the decision was for and by.
+    principal: PrincipalId,
+    /// The request that made the decision.
+    request_id: RequestId,
 }
 
 /// The typed-payload journey's server, mock upstream, and tenant.
@@ -2517,6 +2887,8 @@ impl TypedPayloadJourney {
         Ok(PublishedResults {
             scored_drift,
             unscored_drift,
+            subject,
+            writer: seed.system_principal(),
         })
     }
 
@@ -2534,13 +2906,15 @@ impl TypedPayloadJourney {
             analytical_slots: 4,
             total_slots: 7,
         };
+        let principal = PrincipalId::new(uuid::Uuid::now_v7());
+        let request_id = RequestId::now_v7();
         let event = AuditEvent::new(
-            RequestId::now_v7(),
+            request_id.clone(),
             None,
             operation.clone(),
             "vala.oracle.admission".to_owned(),
             None,
-            Attribution::direct(PrincipalId::new(uuid::Uuid::now_v7())),
+            Attribution::direct(principal),
             PrincipalKindTag::User,
             "bifrost:query:read".to_owned(),
             AuditOutcome::Allowed,
@@ -2556,6 +2930,8 @@ impl TypedPayloadJourney {
         Ok(StagedDecision {
             operation,
             detail: serde_json::from_str(&audit_detail_canonical_json(&detail))?,
+            principal,
+            request_id,
         })
     }
 
@@ -2861,7 +3237,7 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
         &server,
         tenant,
         format!(
-            "SELECT result_id FROM vala.verification.results WHERE result_id = '{result}' \
+            "SELECT result_id FROM bifrost.verification.results WHERE result_id = '{result}' \
              AND {SUB_PRINCIPAL_ID} = '{a_id}' AND {ACT_PRINCIPAL_ID} = '{system}'"
         ),
     )
@@ -3103,7 +3479,7 @@ async fn scheduled_owner_authority_is_retained() -> Result<(), ServerJourneyErro
         &server,
         tenant,
         format!(
-            "SELECT result_id FROM vala.verification.results WHERE result_id = '{result}' \
+            "SELECT result_id FROM bifrost.verification.results WHERE result_id = '{result}' \
              AND binding_id = '{binding}' AND {SUB_PRINCIPAL_ID} = '{owner_id}' \
              AND {ACT_PRINCIPAL_ID} = '{system}'"
         ),
@@ -3275,9 +3651,9 @@ async fn reloaded_authority_cannot_widen_gateway_access() -> Result<(), ServerJo
         timeout: Duration::from_secs(10),
         subject: subject.map(|card_uid| {
             wyrd_server::components::gateway::GatewayCallAttribution::Resolved(
-                wyrd_server::components::gateway::GatewayCallSubject {
-                    run_id: None,
-                    card_uid: Some(card_uid),
+                wyrd_server::components::gateway::GatewayCallContext {
+                    subject_card_uid: Some(card_uid),
+                    ..Default::default()
                 },
             )
         }),
@@ -4414,7 +4790,7 @@ async fn shared_shutdown_drains_producers_workers_and_acknowledgements()
     let captured = query_rows(
         &server,
         server.data_tenant_id(),
-        "SELECT call_id FROM vala.gateway.calls WHERE outcome = 'cancelled'".to_owned(),
+        "SELECT call_id FROM bifrost.gateway.calls WHERE outcome = 'cancelled'".to_owned(),
     )
     .await?;
     server.shutdown().await?;
@@ -4516,6 +4892,169 @@ async fn native_row(
         .map(|_request_id| ())
 }
 
+/// A native batch id names one accepted origin, not only one user payload.
+///
+/// One row of a dynamic table is written under an explicit batch id by a
+/// Service account rooted at a registered Service, correlated to a Model and
+/// a Run. An exact retry is acknowledged without a second row. Reusing that
+/// batch id with the same user payload but another workload (the account
+/// rootless), another account pair, no subject, or another Run is refused,
+/// while each of those writes is accepted under a fresh batch id. After a
+/// restart empties the warm duplicate cache, the durable fence alone gives
+/// the same answers, and the original row keeps its original origin.
+///
+/// # Errors
+/// Returns [`ServerJourneyError`] when the server, a fixture, a restart, or a
+/// query fails.
+///
+/// # Panics
+/// Panics when a retry or fresh write is refused, a reused batch id with a
+/// changed origin is acknowledged, or the stored rows differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn native_batch_replay_is_bound_to_its_accepted_origin() -> Result<(), ServerJourneyError> {
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let key = async |name: &str, role: &str| -> Result<String, ServerJourneyError> {
+        Ok(server
+            .bootstrap_service(name, &[role])
+            .await?
+            .api_key()
+            .ok_or("a Service has an API key")?
+            .expose_secret()
+            .to_owned())
+    };
+    let [admin_key, writer_key, other_key] = [
+        key("native-replay-admin", "admin").await?,
+        key("native-replay-writer", "editor").await?,
+        key("native-replay-other", "editor").await?,
+    ];
+    let admin = native_client(&server, &admin_key)?;
+    let cards = wyrd_client::cards::Cards::connect_with(&admin).await?;
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    let model = Box::pin(cards.declare_from_path(&fixtures.join("observed-model.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Model has a UID")?;
+    let service = Box::pin(cards.declare_from_path(&fixtures.join("observed-service.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Service has a UID")?;
+    let fqn = format!(
+        "bifrost.datasets.native_replay_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    Bifrost::connect_with(
+        &admin,
+        BifrostOptions {
+            table: Some(TableConfig::from_arrow(
+                &fqn,
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ])),
+            )?),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?
+    .register()
+    .await?;
+    let (namespace, name) = fqn.rsplit_once('.').ok_or("the table is qualified")?;
+    let preflight = wyrd_queue::RowPreflight::from_description(
+        &Bifrost::query_only(&admin)
+            .describe_table(namespace, name)
+            .await?,
+    )?;
+    let [run, other_run] = ["replay-run", "other-run"]
+        .map(|run| wyrd_spec::vala::ids::RunId::from_string(run.to_owned()));
+    let payload = |subject: Option<&CardUid>, run: &wyrd_spec::vala::ids::RunId| {
+        preflight
+            .prepare(&[r#"{"id": 1, "value": "replayed"}"#], subject, Some(run))
+            .expect("the row prepares")
+            .to_ipc()
+            .expect("the row encodes")
+    };
+    let insert = async |client: &wyrd_client::WyrdClient, batch: uuid::Uuid, ipc: Vec<u8>| {
+        RawIngest::connect(client)
+            .await?
+            .insert(&fqn, batch, ipc)
+            .await
+    };
+    let batch = uuid::Uuid::now_v7();
+    let original = payload(Some(&model), &run);
+
+    let mut server = server;
+    for phase in ["warm", "cold"] {
+        let writer = native_client(&server, &writer_key)?;
+        let rooted = writer.for_workload(service.clone());
+        insert(&rooted, batch, original.clone()).await?;
+        insert(&rooted, batch, original.clone()).await?;
+        let changed = [
+            ("workload", writer.clone(), original.clone()),
+            (
+                "account pair",
+                native_client(&server, &other_key)?.for_workload(service.clone()),
+                original.clone(),
+            ),
+            ("subject", rooted.clone(), payload(None, &run)),
+            ("run", rooted.clone(), payload(Some(&model), &other_run)),
+        ];
+        for (origin, client, ipc) in changed {
+            insert(&client, batch, ipc.clone())
+                .await
+                .expect_err(&format!(
+                    "{phase}: a batch id reused under a changed {origin} is refused"
+                ));
+            if phase == "warm" {
+                insert(&client, uuid::Uuid::now_v7(), ipc).await?;
+            }
+        }
+        server.flush_bifrost().await?;
+        if phase == "warm" {
+            server = Box::pin(server.restart_bound(WyrdTestServer::builder())).await?;
+        }
+    }
+
+    let admin = native_client(&server, &admin_key)?;
+    let stored: Vec<Value> = Bifrost::query_only(&admin)
+        .sql_as(
+            &format!(
+                "SELECT CAST(workload_card_uid AS VARCHAR) AS workload_card_uid, \
+                 CAST(subject_card_uid AS VARCHAR) AS subject_card_uid, run_id, \
+                 COUNT(*) AS n FROM {fqn} \
+                 GROUP BY workload_card_uid, subject_card_uid, run_id, sub_principal_id \
+                 ORDER BY n DESC, run_id, workload_card_uid, subject_card_uid"
+            ),
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        stored.len(),
+        5,
+        "the original and each fresh write are distinct row sets: {stored:?}"
+    );
+    assert!(
+        stored.iter().all(|row| row["n"] == json!(1)),
+        "every write is stored exactly once: {stored:?}"
+    );
+    assert!(
+        stored.contains(&json!({
+            "workload_card_uid": service.to_string(),
+            "subject_card_uid": model.to_string(),
+            "run_id": "replay-run",
+            "n": 1,
+        })),
+        "the original row keeps its original origin: {stored:?}"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
 /// A normal User bearer with a loaded `WyrdState` writes native observations:
 /// the state selects its Service root on every frame, the server narrows the
 /// rootless User bearer to that validated root before Gate admission, and the
@@ -4606,20 +5145,22 @@ async fn user_state_native_io_selects_validated_root() -> Result<(), ServerJourn
     server.flush_bifrost().await?;
     let landed: Vec<Value> = Bifrost::query_only(&admin)
         .sql_as(
-            "SELECT CAST(card_uid AS VARCHAR) AS card_uid, \
+            "SELECT CAST(subject_card_uid AS VARCHAR) AS subject_card_uid, \
              CAST(sub_principal_id AS VARCHAR) AS sub_principal_id \
-             FROM vala.drift.observations",
+             FROM bifrost.drift.observations",
             &[],
         )
         .await?;
     assert_eq!(
         landed,
-        vec![json!({ "card_uid": model.to_string(), "sub_principal_id": editor_id.to_string() })],
+        vec![
+            json!({ "subject_card_uid": model.to_string(), "sub_principal_id": editor_id.to_string() })
+        ],
         "the User's state observation lands on its Model under the User"
     );
 
     let fqn = format!(
-        "vala.datasets.native_user_{}",
+        "bifrost.datasets.native_user_{}",
         uuid::Uuid::now_v7().simple()
     );
     Bifrost::connect_with(
@@ -4703,6 +5244,429 @@ async fn user_state_native_io_selects_validated_root() -> Result<(), ServerJourn
     )
     .await?;
     native_row(&editor, &fqn, &preflight, None).await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// `batch` with every row's `name` set to `value`, appending `name` as a
+/// nullable Utf8 column when the batch does not declare it.
+///
+/// # Errors
+/// Returns the Arrow error when the rebuilt batch does not assemble.
+fn with_text(
+    batch: &RecordBatch,
+    name: &str,
+    value: Option<&str>,
+) -> Result<RecordBatch, ServerJourneyError> {
+    let column: ArrayRef = Arc::new(StringArray::from(vec![value; batch.num_rows()]));
+    let mut fields = batch.schema().fields().to_vec();
+    let mut columns = batch.columns().to_vec();
+    if let Ok(index) = batch.schema().index_of(name) {
+        columns[index] = column;
+    } else {
+        fields.push(Arc::new(Field::new(name, DataType::Utf8, true)));
+        columns.push(column);
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
+}
+
+/// Send `batch` to `bifrost.traces.spans` as one native frame under
+/// `batch_id` as `client`, and return the request id its rows carry.
+///
+/// # Errors
+/// Returns the server's stable refusal, or a harness error when the ingest
+/// channel cannot be dialled.
+///
+/// # Panics
+/// Panics when the batch does not encode as Arrow IPC.
+async fn native_spans(
+    client: &wyrd_client::WyrdClient,
+    batch_id: uuid::Uuid,
+    batch: &RecordBatch,
+) -> Result<RequestId, WyrdError> {
+    RawIngest::connect(client)
+        .await?
+        .insert(SPANS, batch_id, ipc(batch).expect("the frame encodes"))
+        .await
+}
+
+/// The distinct shared dimensions and workload of the spans one request
+/// wrote, as `admin` reads them back; a null column is omitted.
+///
+/// # Errors
+/// Returns the query error.
+async fn span_dimensions(
+    admin: &wyrd_client::WyrdClient,
+    request: &RequestId,
+) -> Result<Vec<Value>, ServerJourneyError> {
+    table_dimensions(admin, SPANS, request).await
+}
+
+/// The distinct shared dimensions and workload of the rows one request wrote
+/// to `table`, as `admin` reads them back; a null column is omitted.
+///
+/// # Errors
+/// Returns the query error.
+async fn table_dimensions(
+    admin: &wyrd_client::WyrdClient,
+    table: &str,
+    request: &RequestId,
+) -> Result<Vec<Value>, ServerJourneyError> {
+    Ok(Bifrost::query_only(admin)
+        .sql_as(
+            &format!(
+                "SELECT DISTINCT service_name, service_version, deployment_environment, \
+                 subject_kind, subject_name, subject_version, \
+                 CAST(workload_card_uid AS VARCHAR) AS workload_card_uid \
+                 FROM {table} \
+                 WHERE CAST(wyrd_request_id AS VARCHAR) = '{}'",
+                request.as_str()
+            ),
+            &[],
+        )
+        .await?)
+}
+
+/// The table a native drift writer records raw observations in.
+const DRIFT_OBSERVATIONS: &str = "bifrost.drift.observations";
+
+/// One valid drift observation row in `schema`, with every shared dimension
+/// sent as the null placeholder the SDK Drift producer sends.
+///
+/// # Errors
+/// Returns the Arrow error when the row does not build against `schema`.
+fn drift_observation(schema: &SchemaRef) -> Result<RecordBatch, ServerJourneyError> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| -> ArrayRef {
+            match field.name().as_str() {
+                "record_id" => Arc::new(StringArray::from(vec!["native-drift"])),
+                "series" => Arc::new(StringArray::from(vec!["latency"])),
+                "num_value" => Arc::new(arrow::array::Float64Array::from(vec![1.5])),
+                "created_at" => Arc::new(
+                    TimestampMicrosecondArray::from(vec![Utc::now().timestamp_micros()])
+                        .with_timezone("+00:00"),
+                ),
+                _ => arrow::array::new_null_array(field.data_type(), 1),
+            }
+        })
+        .collect();
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+}
+
+/// Public native drift rows take their shared dimensions only from the
+/// accepted request context.
+///
+/// A drift observation has no source field a supplied Service, environment,
+/// or subject value could be validated against, so supplying any of the six
+/// shared dimensions refuses the whole frame before ACK, rootless and under
+/// a selected Service root and environment alike, and stores nothing. The
+/// same row with null placeholders lands with the accepted Service, the
+/// accepted environment, and its subject's descriptor. A User delegating to
+/// that Service's runtime account, which runs under the Service's root, lands
+/// owned by that root rather than unowned.
+///
+/// # Errors
+/// Returns [`ServerJourneyError`] when the server, a fixture, or a query
+/// fails.
+///
+/// # Panics
+/// Panics when a frame supplying a dimension is acked or refused for another
+/// reason, or a stored row's dimensions or count differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn native_drift_dimensions_come_only_from_accepted_context() -> Result<(), ServerJourneyError>
+{
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    server
+        .ensure_builtin_table_for_test(server.data_tenant_id(), "drift", "observations")
+        .await?;
+    let admin_key = server
+        .bootstrap_service("native-drift-admin", &["admin"])
+        .await?;
+    let admin = native_client(
+        &server,
+        admin_key
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let cards = wyrd_client::cards::Cards::connect_with(&admin).await?;
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    let model = Box::pin(cards.declare_from_path(&fixtures.join("observed-model.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Model has a UID")?;
+    let service = Box::pin(cards.declare_from_path(&fixtures.join("observed-service.yaml")))
+        .await?
+        .root;
+    let service_uid = service.uid.clone().ok_or("the Service has a UID")?;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("native-drift-editor", &["editor"])
+        .await?
+    else {
+        return Err("a user bootstraps as a user".into());
+    };
+    let editor = native_client(&server, &jwt)?;
+    let owned = editor.for_service(service_uid.clone(), Some("staging".to_owned()));
+    let schema = Arc::clone(
+        TableConfig::describe_with(&admin, DRIFT_OBSERVATIONS)
+            .await?
+            .user_schema(),
+    );
+    let row = with_text(
+        &drift_observation(&schema)?,
+        SUBJECT_CARD_UID,
+        Some(model.as_str()),
+    )?;
+    let insert = async |client: &wyrd_client::WyrdClient, batch: &RecordBatch| {
+        RawIngest::connect(client)
+            .await?
+            .insert(
+                DRIFT_OBSERVATIONS,
+                uuid::Uuid::now_v7(),
+                ipc(batch).expect("the frame encodes"),
+            )
+            .await
+    };
+
+    for column in vala_bifrost_redux::tables::SHARED_DIMENSIONS {
+        let forged = with_text(&row, column, Some("forged"))?;
+        for (context, client) in [("rootless", &editor), ("rooted", &owned)] {
+            let refused = insert(client, &forged)
+                .await
+                .expect_err("a supplied shared dimension is refused before any ACK");
+            assert!(
+                matches!(
+                    refused,
+                    WyrdError::Vala {
+                        error: BifrostError::SchemaParse { .. }
+                    }
+                ),
+                "{context} {column}: {refused:?}"
+            );
+        }
+    }
+
+    let actor = server
+        .credential_registered_service(&service, &["editor"])
+        .await?;
+    let actor = server
+        .exchange_api_key_for_workload(
+            actor
+                .api_key()
+                .ok_or("the runtime account has an API key")?,
+            &service_uid,
+        )
+        .await?;
+    let delegated = native_client(
+        &server,
+        &server
+            .delegate(&jwt, &actor, wyrd_spec::auth::TokenAudience::Wyrd)
+            .await?,
+    )?;
+    let landed = [
+        insert(&owned, &row).await?,
+        insert(&editor, &row).await?,
+        insert(&delegated, &row).await?,
+    ];
+    server.flush_bifrost().await?;
+
+    let subject = json!({
+        "subject_kind": "Model",
+        "subject_name": "observed-model",
+        "subject_version": "1.0.0",
+    });
+    let with_service = |environment: Option<&str>| {
+        let mut expected = subject.clone();
+        expected["service_name"] = json!("observed-service");
+        expected["service_version"] = json!("1.0.0");
+        expected["workload_card_uid"] = json!(service_uid.to_string());
+        if let Some(environment) = environment {
+            expected["deployment_environment"] = json!(environment);
+        }
+        expected
+    };
+    let expected = [
+        with_service(Some("staging")),
+        subject.clone(),
+        with_service(None),
+    ];
+    for (request, expected) in landed.iter().zip(expected) {
+        assert_eq!(
+            table_dimensions(&admin, DRIFT_OBSERVATIONS, request).await?,
+            vec![expected],
+            "request {request}"
+        );
+    }
+    let stored: Vec<Value> = Bifrost::query_only(&admin)
+        .sql_as(
+            &format!("SELECT COUNT(*) AS n FROM {DRIFT_OBSERVATIONS}"),
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        stored,
+        vec![json!({ "n": 3 })],
+        "no refused frame stores a row"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Native canonical span frames carry only what their source fields derive,
+/// and their shared dimensions come from the accepted request context.
+///
+/// A frame whose promoted Service, environment, or subject label is forged is
+/// refused whole before any ACK. A frame run as a Service in an accepted
+/// environment lands with that Service's canonical name and version and that
+/// environment over the rows' labels, and with its Model subject's kind,
+/// name, and version. Without a request environment the typed resource
+/// environment survives, a rootless frame keeps its observed Service labels,
+/// and an empty environment header refuses the request. A batch id replayed
+/// under a changed owner is refused and its rows keep the original owner,
+/// while an exact replay is answered as a duplicate.
+///
+/// # Errors
+/// Returns server, fixture, client, ingest, flush, or query failures.
+///
+/// # Panics
+/// Panics when a forged or context-refused frame is acked, a valid frame is
+/// refused, or a row lands with other dimensions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn native_signal_values_and_attribution_are_validated_before_ack()
+-> Result<(), ServerJourneyError> {
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    server
+        .ensure_builtin_table_for_test(server.data_tenant_id(), "traces", "spans")
+        .await?;
+    let admin_key = server
+        .bootstrap_service("native-signal-admin", &["admin"])
+        .await?;
+    let admin = native_client(
+        &server,
+        admin_key
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let cards = wyrd_client::cards::Cards::connect_with(&admin).await?;
+    let fixtures = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../fixtures/cards/observe_a_run"
+    ));
+    let model = Box::pin(cards.declare_from_path(&fixtures.join("observed-model.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Model has a UID")?;
+    let service_uid = Box::pin(cards.declare_from_path(&fixtures.join("observed-service.yaml")))
+        .await?
+        .root
+        .uid
+        .ok_or("the Service has a UID")?;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("native-signal-editor", &["editor"])
+        .await?
+    else {
+        return Err("a user bootstraps as a user".into());
+    };
+    let editor = native_client(&server, &jwt)?;
+    let owned = editor.for_service(service_uid.clone(), Some("staging".to_owned()));
+    let schema = Arc::clone(
+        TableConfig::describe_with(&admin, SPANS)
+            .await?
+            .user_schema(),
+    );
+    let spans = canonical_signals::spans(
+        &schema,
+        "native-signal",
+        Utc::now().timestamp_nanos_opt().unwrap_or(0),
+    );
+    let attributed = with_text(&spans, SUBJECT_CARD_UID, Some(model.as_str()))?;
+
+    for column in ["service_name", "deployment_environment", "subject_name"] {
+        let forged = with_text(&attributed, column, Some("forged"))?;
+        let refused = native_spans(&owned, uuid::Uuid::now_v7(), &forged)
+            .await
+            .expect_err("a forged frame is refused before any ACK");
+        assert!(
+            matches!(
+                refused,
+                WyrdError::Vala {
+                    error: BifrostError::SchemaParse { .. }
+                }
+            ),
+            "forged {column}: {refused:?}"
+        );
+    }
+    let empty = native_spans(
+        &editor.for_service(service_uid.clone(), Some(String::new())),
+        uuid::Uuid::now_v7(),
+        &spans,
+    )
+    .await
+    .expect_err("an empty environment refuses the request");
+    assert!(
+        matches!(empty, WyrdError::Validation { .. }),
+        "empty environment: {empty:?}"
+    );
+
+    let replayed = uuid::Uuid::now_v7();
+    let landed = [
+        native_spans(&owned, uuid::Uuid::now_v7(), &attributed).await?,
+        native_spans(
+            &editor.for_workload(service_uid.clone()),
+            uuid::Uuid::now_v7(),
+            &spans,
+        )
+        .await?,
+        native_spans(&editor, replayed, &spans).await?,
+    ];
+    native_spans(&editor, replayed, &spans).await?;
+    native_spans(&owned, replayed, &spans)
+        .await
+        .expect_err("a batch id replayed under a changed owner is refused");
+    server.flush_bifrost().await?;
+
+    let service = service_uid.to_string();
+    let expected = [
+        json!({
+            "service_name": "observed-service",
+            "service_version": "1.0.0",
+            "deployment_environment": "staging",
+            "subject_kind": "Model",
+            "subject_name": "observed-model",
+            "subject_version": "1.0.0",
+            "workload_card_uid": service,
+        }),
+        json!({
+            "service_name": "observed-service",
+            "service_version": "1.0.0",
+            "deployment_environment": canonical_signals::SPAN_ENVIRONMENT,
+            "workload_card_uid": service,
+        }),
+        json!({
+            "service_name": "wyrd.fixture.service",
+            "deployment_environment": canonical_signals::SPAN_ENVIRONMENT,
+        }),
+    ];
+    for (request, expected) in landed.iter().zip(expected) {
+        assert_eq!(
+            span_dimensions(&admin, request).await?,
+            vec![expected],
+            "request {request}"
+        );
+    }
     server.shutdown().await?;
     Ok(())
 }

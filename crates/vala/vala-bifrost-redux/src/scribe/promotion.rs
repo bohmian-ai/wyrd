@@ -439,6 +439,11 @@ mod tests {
     /// The bounds are the interesting part: they are the only fields whose JSON
     /// form is type-directed bytes rather than a number, so a round trip that
     /// keeps them is a round trip that keeps everything.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Unix-epoch day partition is refused or a `long` or `string`
+    /// bound datum cannot be encoded.
     fn record() -> ScribePublishedHotFileV1 {
         let partition = PhysicalPartition::from(
             TimePartition::new(TimeGranularity::Day, chrono::DateTime::UNIX_EPOCH)
@@ -447,7 +452,7 @@ mod tests {
         ScribePublishedHotFileV1::from_metrics(
             &PublishedHotFileIdentity {
                 data_tenant_id: Uuid::now_v7(),
-                namespace: "vala.traces",
+                namespace: "bifrost.traces",
                 table_name: "spans",
                 file_list_id: Uuid::now_v7(),
                 object_key: "tenant/table/day=1970-01-01/scribe-0-00000.parquet",

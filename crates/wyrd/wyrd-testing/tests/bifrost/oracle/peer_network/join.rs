@@ -129,14 +129,14 @@ async fn prove_peer_join_and_remote_query() -> Result<(), PeerJourneyError> {
     for index in [FIRST, SECOND, JOINED] {
         cluster.refresh_snapshot(index).await?;
     }
-    let sql = format!("SELECT id FROM vala.bifrost.{table} WHERE id < {ROWS}");
+    let sql = format!("SELECT id FROM bifrost.bifrost.{table} WHERE id < {ROWS}");
     let expected = usize::try_from(ROWS)?;
 
     // The coordinator is never a participant in its own worker set, so every
     // stage the joiner plans lands on the other two Oracles: a graph lease on
     // the first pod is the worker-ID-bearing remote Oracle RPC.
     let grouped = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
+        "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} GROUP BY filter_key"
     );
     let leases_before = cluster.graph_leases(FIRST)?.0;
     let evidence = cluster

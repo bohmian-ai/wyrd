@@ -104,8 +104,13 @@ struct AdmittedRowContext {
     /// Source of the trusted subject/actor pair moved into the retained
     /// source.
     attribution: StampedAttribution,
-    /// Card UIDs every row's `card_uid` is authorized against.
+    /// Verified workload Service release a frame-attributed write stamps.
+    workload: Option<wyrd_spec::ids::CardUid>,
+    /// Card UIDs every row's `subject_card_uid` is authorized against.
     card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
+    /// Accepted context the shared Service, environment, and subject
+    /// dimensions are stamped from; `None` keeps each row's own values.
+    dimensions: Option<crate::tables::FrameDimensions>,
     /// Caller-supplied fingerprint required of the projected source schema;
     /// `None` leaves the selected definition's conformance as the only
     /// schema authority.
@@ -119,9 +124,9 @@ struct AdmittedRowContext {
     /// Fixed material ceiling admitted for the current slice.
     material_limit: usize,
     /// Server-owned built-in whose declared physical contract the decode must
-    /// preserve, including its correlation policy.
+    /// preserve.
     ///
-    /// `None` for a dynamic table, which keeps the default envelope.
+    /// `None` for a dynamic table.
     definition: Option<&'static crate::tables::BuiltinTableDefinition>,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
     ///
@@ -368,7 +373,9 @@ impl ScribeImpl {
     ) -> Result<AdmittedRows, ScribeError> {
         let AdmittedRowContext {
             attribution,
+            workload,
             card_scope,
+            dimensions,
             expected_schema_fingerprint,
             request_id,
             batch_id,
@@ -382,7 +389,9 @@ impl ScribeImpl {
                 Ok(AdmittedRows::Native(Box::new(NativeAdmittedRows {
                     bytes,
                     attribution,
+                    workload,
                     card_scope,
+                    dimensions,
                     expected_schema_fingerprint,
                     request_id,
                     batch_id,
@@ -401,7 +410,9 @@ impl ScribeImpl {
                         IngressPayload::Canonical(canonical),
                         crate::scribe::execution_lanes::IngressDecodeInputs {
                             attribution,
+                            workload,
                             card_scope,
+                            dimensions,
                             expected_schema_fingerprint,
                             request_id,
                             receipt_micros,
@@ -534,7 +545,7 @@ impl ScribeImpl {
             table
                 .namespace
                 .as_str()
-                .strip_prefix("vala.")
+                .strip_prefix("bifrost.")
                 .unwrap_or_default(),
             &table.name,
         )
@@ -714,6 +725,8 @@ impl ScribeImpl {
                         .attributed_cards
                         .or_else(|| frame.principal.card_scope().map(<[_]>::to_vec)),
                     attribution: frame.attribution,
+                    workload: frame.workload,
+                    dimensions: frame.dimensions,
                     expected_schema_fingerprint,
                     request_id: frame.request_id,
                     batch_id: frame.batch_id,
@@ -1123,8 +1136,10 @@ fn unclaimed_retry(frame: &ScribeIngressFrame) -> ScribeIngressFrame {
     ScribeIngressFrame {
         principal: frame.principal.clone(),
         attribution: frame.attribution,
+        workload: frame.workload.clone(),
         authenticated_tenant: frame.authenticated_tenant,
         attributed_cards: frame.attributed_cards.clone(),
+        dimensions: frame.dimensions.clone(),
         table: frame.table.clone(),
         expected_schema_fingerprint: frame.expected_schema_fingerprint,
         table_version: None,
@@ -1406,6 +1421,11 @@ mod tests {
     /// bound out of the proof. The fingerprint is computed from the same schema
     /// the batch carries, so the frame clears schema validation and reaches the
     /// size gate.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the two-column fixture batch fails to build against its own
+    /// schema.
     fn decoded_size_frame(
         tenant: DataTenantId,
         principal: &Principal,
@@ -1436,7 +1456,9 @@ mod tests {
         let request_id = RequestId::now_v7();
         ScribeIngressFrame {
             attributed_cards: None,
+            dimensions: None,
             authenticated_tenant: tenant,
+            workload: principal.workload_uid.clone(),
             attribution: Attribution::direct(principal.id).into(),
             principal: principal.clone(),
             table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),

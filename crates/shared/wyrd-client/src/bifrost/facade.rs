@@ -611,7 +611,7 @@ impl Bifrost {
         correlation: Correlation,
     ) -> Result<(), BifrostClientError> {
         self.writer
-            .insert(table, row, correlation.card_uid, correlation.run_id)
+            .insert(table, row, correlation.subject_card_uid, correlation.run_id)
             .map_err(Into::into)
     }
 
@@ -667,7 +667,12 @@ impl Bifrost {
         correlation: Correlation,
     ) -> Result<(), BifrostClientError> {
         self.writer
-            .insert_rows(table, rows, correlation.card_uid, correlation.run_id)
+            .insert_rows(
+                table,
+                rows,
+                correlation.subject_card_uid,
+                correlation.run_id,
+            )
             .map_err(Into::into)
     }
 
@@ -716,7 +721,12 @@ impl Bifrost {
             .and_then(TableConfig::writer_table)
             .ok_or(BifrostClientError::NoActiveTable)?;
         self.writer
-            .insert(&table, row, correlation.card_uid, correlation.run_id)
+            .insert(
+                &table,
+                row,
+                correlation.subject_card_uid,
+                correlation.run_id,
+            )
             .map_err(Into::into)
     }
 
@@ -946,7 +956,7 @@ impl Bifrost {
     /// trace is not read. Spans are ordered by start time, then trace id, then
     /// span id, and a span id stored more than once keeps only its first copy
     /// in that order. The read is one
-    /// query over the caller's authorized `vala.traces.spans` with the trace
+    /// query over the caller's authorized `bifrost.traces.spans` with the trace
     /// id bound as a parameter, so it inherits the query deadline and result
     /// limits, and another tenant's trace or one never seen reads empty.
     ///
@@ -960,10 +970,10 @@ impl Bifrost {
         trace_id: TraceId,
     ) -> Result<Vec<SpanRecord>, BifrostClientError> {
         let query = format!(
-            "SELECT {SPAN_COLUMNS} FROM vala.traces.spans \
+            "SELECT {SPAN_COLUMNS} FROM bifrost.traces.spans \
              WHERE trace_id = decode($1, 'hex') OR trace_id IN ( \
                SELECT trace_id FROM ( \
-                 SELECT trace_id, unnest(links) AS link FROM vala.traces.spans) \
+                 SELECT trace_id, unnest(links) AS link FROM bifrost.traces.spans) \
                WHERE link['trace_id'] = decode($1, 'hex'))"
         );
         let result = match self
@@ -1170,7 +1180,7 @@ impl Bifrost {
     /// physical layout exactly as the server holds them.
     ///
     /// # Arguments
-    /// * `namespace` - The table's namespace, such as `vala.traces`.
+    /// * `namespace` - The table's namespace, such as `bifrost.traces`.
     /// * `name` - The table's name within `namespace`, such as `spans`.
     ///
     /// # Errors

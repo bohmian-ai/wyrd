@@ -423,7 +423,7 @@ async fn capture_metadata(state: &AppState, tenant: DataTenantId) {
         .expect("metadata policy stores");
 }
 
-/// The captured `vala.gateway.calls` row of `call_id` as a JSON object of
+/// The captured `bifrost.gateway.calls` row of `call_id` as a JSON object of
 /// its scalar columns, null columns absent; the row is where a call's
 /// usage, cost, and pricing are recorded.
 ///
@@ -1952,7 +1952,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
             "voice",
         ),
         (
-            |s, c, r| Box::pin(super::routes::create_batch(s, c, r)),
+            |s, c, r| Box::pin(super::routes::create_batch(s, c, HeaderMap::new(), r)),
             json!({"endpoint": "/v1/chat/completions", "completion_window": "24h"}),
             "input_file_id",
         ),
@@ -2628,6 +2628,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
         super::routes::create_batch(
             State(state.clone()),
             Ok(caller.clone()),
+            HeaderMap::new(),
             Ok(Json(json!({
                 "input_file_id": file_id,
                 "endpoint": "/v1/chat/completions",
@@ -2693,6 +2694,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let read = super::routes::get_batch(
         State(b.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         axum::extract::Path(batch_id.clone()),
     )
     .await;
@@ -2719,6 +2721,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let content = super::routes::file_content(
         State(a.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         axum::extract::Path(output),
     )
     .await;
@@ -2732,6 +2735,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let cancelled = super::routes::cancel_batch(
         State(a.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         axum::extract::Path(batch_id.clone()),
     )
     .await;
@@ -2752,6 +2756,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let hidden = super::routes::get_batch(
         State(a.clone()),
         Ok(outsider.clone()),
+        HeaderMap::new(),
         axum::extract::Path(batch_id.clone()),
     )
     .await;
@@ -2787,6 +2792,7 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let deleted = super::routes::delete_file(
         State(b.clone()),
         Ok(caller.clone()),
+        HeaderMap::new(),
         axum::extract::Path(file_id.clone()),
     )
     .await;
@@ -2801,8 +2807,13 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     )
     .await;
     assert_eq!(gone.status(), StatusCode::NOT_FOUND);
-    let kept =
-        super::routes::get_batch(State(a.clone()), Ok(caller), axum::extract::Path(batch_id)).await;
+    let kept = super::routes::get_batch(
+        State(a.clone()),
+        Ok(caller),
+        HeaderMap::new(),
+        axum::extract::Path(batch_id),
+    )
+    .await;
     assert_eq!(kept.status(), StatusCode::OK);
     drain_gateway(&a).await;
     drain_gateway(&b).await;
@@ -2933,6 +2944,7 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
         super::routes::create_batch(
             State(state.clone()),
             Ok(caller.clone()),
+            HeaderMap::new(),
             Ok(Json(json!({
                 "input_file_id": file_id, "endpoint": "/v1/chat/completions",
                 "completion_window": "24h", "metadata": {"n": n},
@@ -3004,6 +3016,7 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
     let denied = super::routes::create_batch(
         State(c.clone()),
         Ok(invoker(tenant, 9, [])),
+        HeaderMap::new(),
         Ok(Json(json!({
             "input_file_id": file_id, "endpoint": "/v1/chat/completions",
             "completion_window": "24h", "metadata": {"n": "denied"},
@@ -3173,6 +3186,7 @@ async fn gateway_batch_dispatch_reauthorizes_against_its_routing_snapshot() {
         super::routes::create_batch(
             State(state.clone()),
             Ok(caller.clone()),
+            HeaderMap::new(),
             Ok(Json(json!({
                 "input_file_id": file_id, "endpoint": "/v1/chat/completions",
                 "completion_window": "24h", "metadata": {"n": n},
@@ -3364,7 +3378,7 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
         .collect::<Vec<_>>();
     assert_eq!(
         tables,
-        ["vala.gateway.calls", "vala.traces.spans"],
+        ["bifrost.gateway.calls", "bifrost.traces.spans"],
         "the call row delivers before its spans"
     );
     assert!(received.iter().all(|frame| frame.tenant == tenant));
@@ -3442,9 +3456,10 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     let run = RunId::new();
     let call = |card_uid: &CardUid| GatewayCallRequest {
         subject: Some(super::GatewayCallAttribution::Requested(
-            super::GatewayCallSubject {
+            super::GatewayCallContext {
                 run_id: Some(run.clone()),
-                card_uid: Some(card_uid.clone()),
+                subject_card_uid: Some(card_uid.clone()),
+                ..super::GatewayCallContext::default()
             },
         )),
         ..request("dep-a/a", Some((1000, 500)), Duration::from_secs(10))
@@ -3461,12 +3476,12 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     let received = scribe.received();
     let calls = received
         .iter()
-        .find(|frame| frame.table == "vala.gateway.calls")
+        .find(|frame| frame.table == "bifrost.gateway.calls")
         .expect("the call row delivers");
     assert_eq!(
         calls.card_scope,
         std::slice::from_ref(&uid),
-        "Scribe stamps card_uid from exactly the attributed Agent"
+        "Scribe stamps subject_card_uid from exactly the attributed Agent"
     );
     let row =
         arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(calls.ipc.clone()), None)
@@ -3481,7 +3496,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
             .value(0)
             .to_owned()
     };
-    assert_eq!(text("card_uid"), uid.as_str());
+    assert_eq!(text("subject_card_uid"), uid.as_str());
     assert_eq!(text("run_id"), run.as_str());
 
     let ghost = CardUid::new(Uuid::now_v7().to_string()).expect("a UUID is a Card UID");
@@ -3518,7 +3533,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
         scribe
             .received()
             .iter()
-            .filter(|frame| frame.table == "vala.gateway.calls")
+            .filter(|frame| frame.table == "bifrost.gateway.calls")
             .count(),
         1,
         "no refused attribution captured"
@@ -3530,7 +3545,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
 ///
 /// The shared unit-test catalog lives over its own embedded fixture, so this
 /// fixture's tenant does not exist there and cannot register a table. Capture
-/// retrieval authorization resolves the tenant's registered `vala.gateway.calls`,
+/// retrieval authorization resolves the tenant's registered `bifrost.gateway.calls`,
 /// so it needs a catalog that shares the tenant registry the rest of the state
 /// uses.
 async fn replica_with_fixture_catalog(

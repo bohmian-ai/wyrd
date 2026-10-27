@@ -39,11 +39,11 @@ pub use lifecycle::DRIFT_OBSERVATIONS_TABLE;
 
 /// The only namespace `observe.record` may write.
 ///
-/// `vala.datasets` is the caller-owned registration namespace; every other
+/// `bifrost.datasets` is the caller-owned registration namespace; every other
 /// Bifrost namespace is reserved for server-managed tables. Refusing the rest
 /// here fails the call before admission instead of spending a describe and a
 /// queue slot on a table Gate would reject.
-const DATASETS_PREFIX: &str = "vala.datasets.";
+const DATASETS_PREFIX: &str = "bifrost.datasets.";
 
 tokio::task_local! {
     /// The `(card_uid, run_id)` text of the innermost [`Run::scope`] the
@@ -172,7 +172,7 @@ impl Run {
     /// This view's row correlation: the subject Card's UID plus invocation.
     fn correlation(&self) -> Correlation {
         Correlation {
-            card_uid: Some(self.subject_uid().clone()),
+            subject_card_uid: Some(self.subject_uid().clone()),
             run_id: Some(self.run_id.clone()),
         }
     }
@@ -241,12 +241,12 @@ impl Observe<'_> {
     /// batch.
     ///
     /// # Arguments
-    /// * `table` - A registered `vala.datasets.<name>` table.
+    /// * `table` - A registered `bifrost.datasets.<name>` table.
     /// * `row` - The row, serialized to the table's columns.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_400_INVALID_OBSERVATION` for a table outside
-    /// `vala.datasets`, which is where reserved and system-managed tables are
+    /// `bifrost.datasets`, which is where reserved and system-managed tables are
     /// refused before admission; the server's not-found, authorization, or
     /// availability error for an unknown, unauthorized, or unavailable table;
     /// and the lifecycle and queue errors of [`Observe::drift`].
@@ -258,7 +258,7 @@ impl Observe<'_> {
     /// Emit one row into a registered table from a foreign runtime's JSON text.
     ///
     /// # Arguments
-    /// * `table` - A registered `vala.datasets.<name>` table.
+    /// * `table` - A registered `bifrost.datasets.<name>` table.
     /// * `json` - The row as one JSON object.
     ///
     /// # Errors
@@ -277,7 +277,7 @@ impl Observe<'_> {
     async fn record_value(&self, table: &str, row: &Value) -> Result<(), WyrdError> {
         if !table.starts_with(DATASETS_PREFIX) || table[DATASETS_PREFIX.len()..].contains('.') {
             return Err(invalid_observation(
-                "observe.record writes only registered `vala.datasets.<name>` tables",
+                "observe.record writes only registered `bifrost.datasets.<name>` tables",
                 json!({ "table": table }),
             ));
         }

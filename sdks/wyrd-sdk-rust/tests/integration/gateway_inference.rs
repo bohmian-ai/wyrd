@@ -96,7 +96,7 @@ impl Inference {
         }
     }
 
-    /// Every retained `vala.gateway.calls` row's attribution, sorted, after
+    /// Every retained `bifrost.gateway.calls` row's attribution, sorted, after
     /// publishing captured rows.
     ///
     /// # Panics
@@ -112,8 +112,8 @@ impl Inference {
                 .await
                 .expect("Bifrost connects")
                 .sql_as(
-                    "SELECT sub_principal_id, act_principal_id, run_id, card_uid \
-                     FROM vala.gateway.calls",
+                    "SELECT sub_principal_id, act_principal_id, run_id, subject_card_uid \
+                     FROM bifrost.gateway.calls",
                     &[],
                 )
                 .await
@@ -452,7 +452,7 @@ async fn malformed_traceparent_is_ignored_by_the_gateway() {
         wyrd_ai::Bifrost::connect_with(&inference.deployment.admin(), BifrostOptions::default())
             .await
             .expect("Bifrost connects")
-            .sql_as::<CallId>("SELECT call_id FROM vala.gateway.calls", &[])
+            .sql_as::<CallId>("SELECT call_id FROM bifrost.gateway.calls", &[])
             .await
             .expect("calls read back");
     let [call] = &calls[..] else {
@@ -472,7 +472,7 @@ async fn malformed_traceparent_is_ignored_by_the_gateway() {
     inference.deployment.shutdown().await;
 }
 
-/// One `vala.gateway.calls` row's identity.
+/// One `bifrost.gateway.calls` row's identity.
 #[derive(Debug, serde::Deserialize)]
 struct CallId {
     /// The call's UUID, whose bytes are its trace id when no caller's trace
@@ -480,7 +480,7 @@ struct CallId {
     call_id: String,
 }
 
-/// One `vala.gateway.calls` row's subject/actor pair and attribution.
+/// One `bifrost.gateway.calls` row's subject/actor pair and attribution.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
 struct CallAttribution {
     /// The principal the call was for.
@@ -490,7 +490,7 @@ struct CallAttribution {
     /// The application Run the call is attributed to.
     run_id: Option<String>,
     /// The Card UID the call is attributed to.
-    card_uid: Option<String>,
+    subject_card_uid: Option<String>,
 }
 
 /// Every direct call records its caller as both subject and actor plus whichever of `wyrd-run-id` and
@@ -534,11 +534,11 @@ async fn gateway_call_records_whichever_attribution_it_carries() {
     }
 
     let calls = inference.calls().await;
-    let call = |run_id: Option<&str>, card_uid: Option<&str>| CallAttribution {
+    let call = |run_id: Option<&str>, subject_card_uid: Option<&str>| CallAttribution {
         sub_principal_id: id.to_string(),
         act_principal_id: id.to_string(),
         run_id: run_id.map(str::to_owned),
-        card_uid: card_uid.map(str::to_owned),
+        subject_card_uid: subject_card_uid.map(str::to_owned),
     };
     let mut expected = vec![
         call(None, None),
@@ -1261,11 +1261,11 @@ async fn stable_account_gateway_calls_keep_execution_identity() {
         }
     }
 
-    let call = |card_uid: Option<&str>| CallAttribution {
+    let call = |subject_card_uid: Option<&str>| CallAttribution {
         sub_principal_id: id.clone(),
         act_principal_id: id.clone(),
         run_id: None,
-        card_uid: card_uid.map(str::to_owned),
+        subject_card_uid: subject_card_uid.map(str::to_owned),
     };
     let mut expected = vec![call(None), call(Some(&agent))];
     expected.sort();
@@ -1322,7 +1322,7 @@ async fn user_through_service_gateway_delegation_keeps_the_intersection() {
             sub_principal_id: user.to_string(),
             act_principal_id: id,
             run_id: None,
-            card_uid: Some(agent),
+            subject_card_uid: Some(agent),
         }]
     );
     inference.deployment.shutdown().await;

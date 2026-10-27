@@ -180,7 +180,7 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
             .expect("the fixture schema is representable"),
         correlation_fields: vec![
             FieldSpec {
-                name: "card_uid".to_owned(),
+                name: "subject_card_uid".to_owned(),
                 data_type: wyrd_spec::vala::api::DataTypeSpec::Utf8,
                 nullable: true,
                 metadata: [(PARQUET_FIELD_ID_KEY.to_owned(), "1001".to_owned())].into(),
@@ -210,7 +210,7 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
 /// The describe route key for one fully-qualified table name.
 ///
 /// The route is `/v1/bifrost/tables/{namespace}/{name}`, and a Bifrost namespace
-/// keeps its `vala.` root, so the key is the FQN with its final dot replaced.
+/// keeps its `bifrost.` root, so the key is the FQN with its final dot replaced.
 ///
 /// # Panics
 /// Panics when `fqn` is not `<namespace>.<name>`.
@@ -1270,6 +1270,12 @@ fn row_value(bytes: &[u8]) -> Value {
 }
 
 /// Every feature becomes one tall row sharing the observation's identity.
+///
+/// # Panics
+/// Panics when the feature map or projection fails, the rows are not
+/// exactly `age`, `churned`, `plan`, `score`, or a row loses the record or
+/// session id, `created_at`, its 12 fixed columns, or carries a correlation
+/// field.
 #[test]
 fn drift_projects_one_tall_row_per_feature() {
     let record = drift::observation(
@@ -1295,11 +1301,11 @@ fn drift_projects_one_tall_row_per_feature() {
         assert!(row["created_at"].is_string());
         assert_eq!(
             row.as_object().expect("row is an object").len(),
-            6,
+            12,
             "a row carries exactly the fixed user columns"
         );
         assert!(
-            row.get("run_id").is_none() && row.get("card_uid").is_none(),
+            row.get("run_id").is_none() && row.get("subject_card_uid").is_none(),
             "correlation is not a row field"
         );
     }
@@ -1363,13 +1369,17 @@ fn drift_refuses_unsupported_inputs() {
 // ── Scenario 5: the generic record path ────────────────────────────────────
 
 /// The first call describes the table once; later calls reuse its schema.
+///
+/// # Panics
+/// Panics when startup or either record fails, or the server sees more
+/// than one describe for the table across the run and its sibling Card view.
 #[tokio::test]
 async fn record_describes_a_dataset_table_once() {
     let server = DescribeServer::start(fixed_table_bodies());
     server.publish(
-        "vala.datasets.app_events",
+        "bifrost.datasets.app_events",
         &description(
-            "vala.datasets.app_events",
+            "bifrost.datasets.app_events",
             vec![Field::new("event", DataType::Utf8, false)],
         ),
     );
@@ -1378,18 +1388,18 @@ async fn record_describes_a_dataset_table_once() {
     let run = state.run();
 
     run.observe()
-        .record("vala.datasets.app_events", &json!({ "event": "done" }))
+        .record("bifrost.datasets.app_events", &json!({ "event": "done" }))
         .await
         .expect("first record describes then enqueues");
     run.for_card("model")
         .expect("model view")
         .observe()
-        .record("vala.datasets.app_events", &json!({ "event": "scored" }))
+        .record("bifrost.datasets.app_events", &json!({ "event": "scored" }))
         .await
         .expect("a sibling view reuses the cached schema");
 
     assert_eq!(
-        server.calls("vala.datasets.app_events"),
+        server.calls("bifrost.datasets.app_events"),
         1,
         "one schema is authoritative per table for the writer's lifetime"
     );
@@ -1397,10 +1407,15 @@ async fn record_describes_a_dataset_table_once() {
 
 /// Racing first uses of one dynamic table converge on one describe and one
 /// producer, while two distinct tables keep their own destinations.
+///
+/// # Panics
+/// Panics when startup or any raced record fails, either table is
+/// described more than once, the pool holds other than two producers, or the
+/// two cached writer tables share a name.
 #[tokio::test]
 async fn concurrent_first_records_describe_each_table_once() {
     let server = DescribeServer::start(fixed_table_bodies());
-    for table in ["vala.datasets.first", "vala.datasets.second"] {
+    for table in ["bifrost.datasets.first", "bifrost.datasets.second"] {
         server.publish(
             table,
             &description(table, vec![Field::new("event", DataType::Utf8, false)]),
@@ -1414,17 +1429,17 @@ async fn concurrent_first_records_describe_each_table_once() {
 
     let results = futures_util::future::join_all((0..8).map(|index| {
         let table = if index % 2 == 0 {
-            "vala.datasets.first"
+            "bifrost.datasets.first"
         } else {
-            "vala.datasets.second"
+            "bifrost.datasets.second"
         };
         observe.record(table, &row)
     }))
     .await;
 
     assert!(results.iter().all(Result::is_ok), "{results:?}");
-    assert_eq!(server.calls("vala.datasets.first"), 1);
-    assert_eq!(server.calls("vala.datasets.second"), 1);
+    assert_eq!(server.calls("bifrost.datasets.first"), 1);
+    assert_eq!(server.calls("bifrost.datasets.second"), 1);
     let started = state.started_bifrost().expect("started");
     assert_eq!(
         started.bifrost.producer_count(),
@@ -1434,18 +1449,23 @@ async fn concurrent_first_records_describe_each_table_once() {
     assert_ne!(
         started
             .bifrost
-            .cached_writer_table("vala.datasets.first")
+            .cached_writer_table("bifrost.datasets.first")
             .expect("first cached")
             .fqn(),
         started
             .bifrost
-            .cached_writer_table("vala.datasets.second")
+            .cached_writer_table("bifrost.datasets.second")
             .expect("second cached")
             .fqn(),
     );
 }
 
 /// A reserved or system-managed table is refused before any describe.
+///
+/// # Panics
+/// Panics when startup fails, a record to a reserved, system, or
+/// malformed table succeeds or refuses with a code other than
+/// `WYRD_SDK_400_INVALID_OBSERVATION`, or the refusal reached a describe.
 #[tokio::test]
 async fn record_refuses_reserved_and_system_tables() {
     let server = DescribeServer::start(fixed_table_bodies());
@@ -1455,20 +1475,20 @@ async fn record_refuses_reserved_and_system_tables() {
 
     for table in [
         DRIFT_OBSERVATIONS_TABLE,
-        "vala.eval.observations",
-        "vala.system.audit_log",
-        "vala.traces.spans",
-        "vala.verification.results",
+        "bifrost.eval.observations",
+        "bifrost.system.audit_log",
+        "bifrost.traces.spans",
+        "bifrost.verification.results",
         "app.events",
-        "vala.datasets",
-        "vala.datasets.nested.name",
+        "bifrost.datasets",
+        "bifrost.datasets.nested.name",
     ] {
         let before = server.calls(table);
         let error = run
             .observe()
             .record(table, &json!({ "event": "done" }))
             .await
-            .expect_err("only registered vala.datasets tables are caller-owned");
+            .expect_err("only registered bifrost.datasets tables are caller-owned");
         assert_eq!(error.code(), "WYRD_SDK_400_INVALID_OBSERVATION", "{table}");
         assert_eq!(
             server.calls(table),
@@ -1479,6 +1499,10 @@ async fn record_refuses_reserved_and_system_tables() {
 }
 
 /// An unknown dataset table fails at describe, before queue admission.
+///
+/// # Panics
+/// Panics when startup fails, or recording to the unregistered table
+/// succeeds or refuses with a status other than 404.
 #[tokio::test]
 async fn record_refuses_an_unknown_dataset_table() {
     let server = DescribeServer::start(fixed_table_bodies());
@@ -1488,7 +1512,7 @@ async fn record_refuses_an_unknown_dataset_table() {
     let error = state
         .run()
         .observe()
-        .record("vala.datasets.absent", &json!({ "event": "done" }))
+        .record("bifrost.datasets.absent", &json!({ "event": "done" }))
         .await
         .expect_err("an unregistered table must refuse");
     assert_eq!(error.status(), 404);

@@ -87,7 +87,7 @@ impl ScribeWorkloadTableV1 {
     /// Returns the canonical fully-qualified name public ingest and query use.
     #[must_use]
     pub fn fqn(&self) -> String {
-        format!("vala.{}.{}", self.namespace, self.name)
+        format!("bifrost.{}.{}", self.namespace, self.name)
     }
 }
 

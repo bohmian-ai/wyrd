@@ -1595,7 +1595,7 @@ impl PromotionIntegrationFixture {
     ) -> TenantTableBinding {
         let segment = namespace
             .as_str()
-            .strip_prefix("vala.")
+            .strip_prefix("bifrost.")
             .expect("built-in namespaces are vala-qualified");
         let definition = vala_bifrost_redux::tables::builtin_table(segment, name)
             .expect("the built-in definition resolves");
@@ -3361,6 +3361,9 @@ pub(crate) async fn ingest_unclaimed(
 /// Drives one real native Scribe append claiming `table_version`, or the
 /// current version when `None`, as [`ingest_unclaimed`] does.
 ///
+/// Every append for one tenant comes from that tenant's one fixture writer,
+/// so a retry under the same batch id carries the same accepted origin.
+///
 /// # Errors
 ///
 /// Returns the Scribe refusal of the frame.
@@ -3383,7 +3386,7 @@ pub(crate) async fn ingest_at(
         .await
         .expect("fixture table registration");
     let principal = wyrd_runtime::principal::Principal::new(
-        wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+        wyrd_spec::auth::PrincipalId::new(tenant.as_uuid()),
         wyrd_runtime::principal::PrincipalKind::User,
         tenant,
         Vec::new(),

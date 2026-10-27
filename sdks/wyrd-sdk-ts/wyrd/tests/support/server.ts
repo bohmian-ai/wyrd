@@ -124,7 +124,7 @@ export async function binding(cards: Cards, owner: CardRef): Promise<string> {
 
 /**
  * The first retained result of `bindingId`, read back as the administrator:
- * publish captured rows until `vala.verification.results` names one, then
+ * publish captured rows until `bifrost.verification.results` names one, then
  * wait for that execution's typed result by its ID.
  */
 export async function scheduledResult(
@@ -137,7 +137,7 @@ export async function scheduledResult(
   for (;;) {
     server.flushBifrost();
     const [row] = await bifrost.sql(
-      "SELECT execution_id FROM vala.verification.results WHERE binding_id = $1",
+      "SELECT execution_id FROM bifrost.verification.results WHERE binding_id = $1",
       [bindingId],
       z.object({ execution_id: z.string() }),
     );

@@ -1006,7 +1006,7 @@ impl BifrostCatalog {
                 .table
                 .namespace
                 .as_str()
-                .strip_prefix("vala.")
+                .strip_prefix("bifrost.")
                 .unwrap_or_default(),
             &request.table.name,
         )
@@ -1049,7 +1049,7 @@ impl BifrostCatalog {
     ) -> Result<RegisterTableResponse, BifrostCatalogError> {
         if table.namespace != BifrostNamespace::Datasets {
             return Err(BifrostCatalogError::MetadataMismatch(
-                "caller-owned registrations must use vala.datasets".to_owned(),
+                "caller-owned registrations must use bifrost.datasets".to_owned(),
             ));
         }
         let registration = self
@@ -1128,7 +1128,7 @@ impl BifrostCatalog {
             table
                 .namespace
                 .as_str()
-                .strip_prefix("vala.")
+                .strip_prefix("bifrost.")
                 .unwrap_or_default(),
             &table.name,
         );
@@ -1872,7 +1872,7 @@ impl BifrostCatalog {
             table
                 .namespace
                 .as_str()
-                .strip_prefix("vala.")
+                .strip_prefix("bifrost.")
                 .unwrap_or_default(),
             &table.name,
         );
@@ -2115,7 +2115,6 @@ fn resolve_registration_layout(
         || {
             Schema::new(crate::tables::managed_columns::ensure_managed_columns(
                 user_fields.to_vec(),
-                crate::tables::CorrelationPolicy::Observation,
             ))
         },
         Clone::clone,
@@ -2664,7 +2663,7 @@ mod tests {
     /// Panics when the boundary schema is refused or the next one admitted.
     #[test]
     fn registration_admits_256_physical_leaves_including_managed_columns() {
-        let managed = resolve_registration_layout("vala.datasets.probe", &[], None, None)
+        let managed = resolve_registration_layout("bifrost.datasets.probe", &[], None, None)
             .expect("an empty user schema resolves")
             .0;
         let managed_leaves = parquet::arrow::ArrowSchemaConverter::new()
@@ -2677,10 +2676,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let at_limit = user(MAX_PHYSICAL_LEAF_COLUMNS - managed_leaves);
-        resolve_registration_layout("vala.datasets.wide", &at_limit, None, None)
+        resolve_registration_layout("bifrost.datasets.wide", &at_limit, None, None)
             .expect("256 physical leaves register");
         let over = user(MAX_PHYSICAL_LEAF_COLUMNS - managed_leaves + 1);
-        let error = resolve_registration_layout("vala.datasets.wide", &over, None, None)
+        let error = resolve_registration_layout("bifrost.datasets.wide", &over, None, None)
             .expect_err("257 physical leaves are refused");
         assert_eq!(
             error.into_public().code(),
@@ -3264,7 +3263,7 @@ mod production_pin_tests {
         tasks.len()
     }
 
-    /// Registers `vala.datasets.<name>` with one nullable `value` column and
+    /// Registers `bifrost.datasets.<name>` with one nullable `value` column and
     /// fast-appends one fixture data file, returning the table's binding.
     ///
     /// # Panics

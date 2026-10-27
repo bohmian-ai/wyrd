@@ -472,7 +472,7 @@ impl BifrostClusterLoad {
             .as_ref()
             .ok_or_else(|| ClusterLoadError::Cluster("cluster already shut down".to_owned()))?;
         let tenants = provision_tenants(cluster, self.profile.tenants).await?;
-        let table = format!("vala.bifrost.{TABLE_NAME}");
+        let table = format!("bifrost.bifrost.{TABLE_NAME}");
         provision_tables(cluster, &tenants).await?;
         let setup_server = cluster
             .server(0)

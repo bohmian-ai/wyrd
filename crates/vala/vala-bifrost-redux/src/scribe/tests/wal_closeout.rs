@@ -148,6 +148,8 @@ async fn ingest_as(
         scribe,
         ScribeIngressFrame {
             attributed_cards: None,
+            dimensions: None,
+            workload: principal.workload_uid.clone(),
             attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             authenticated_tenant: principal.tenant_id,
             principal,
@@ -185,6 +187,8 @@ async fn ingest_value(
         scribe,
         ScribeIngressFrame {
             attributed_cards: None,
+            dimensions: None,
+            workload: principal.workload_uid.clone(),
             attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             authenticated_tenant: tenant,
             principal,
@@ -222,6 +226,8 @@ async fn ingest_measured(
         scribe,
         ScribeIngressFrame {
             attributed_cards: None,
+            dimensions: None,
+            workload: principal.workload_uid.clone(),
             attribution: wyrd_spec::auth::Attribution::direct(principal.id).into(),
             authenticated_tenant: tenant,
             principal,

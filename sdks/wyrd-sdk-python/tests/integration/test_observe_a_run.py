@@ -31,12 +31,12 @@ pytestmark = pytest.mark.integration
 
 
 class DriftRow(BaseModel):
-    """One ``vala.drift.observations`` row: one per submitted feature."""
+    """One ``bifrost.drift.observations`` row: one per submitted feature."""
 
     series: str
     num_value: float | None
     str_value: str | None
-    card_uid: str
+    subject_card_uid: str
 
 
 def test_run_observations_read_back_by_run_id(
@@ -51,13 +51,15 @@ def test_run_observations_read_back_by_run_id(
     wyrd_server.flush_bifrost()
 
     rows = bifrost.sql(
-        "SELECT series, num_value, str_value, card_uid "
-        "FROM vala.drift.observations WHERE run_id = $1 ORDER BY series",
+        "SELECT series, num_value, str_value, subject_card_uid "
+        "FROM bifrost.drift.observations WHERE run_id = $1 ORDER BY series",
         [run.run_id],
         model=DriftRow,
     )
     model = str(observed_with_bifrost.card_ref("model").uid)
-    assert rows == [DriftRow(series="latency", num_value=12.5, str_value="12.5", card_uid=model)]
+    assert rows == [
+        DriftRow(series="latency", num_value=12.5, str_value="12.5", subject_card_uid=model)
+    ]
 
 
 def test_custom_drift_judges_the_submitted_window_on_schedule(

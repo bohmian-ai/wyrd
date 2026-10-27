@@ -86,7 +86,7 @@ fn describe_table_tool() -> Tool {
             "properties": {
                 "namespace": {
                     "type": "string",
-                    "description": "Fully qualified Bifrost namespace, e.g. `vala.bifrost`."
+                    "description": "Fully qualified Bifrost namespace, e.g. `bifrost.bifrost`."
                 },
                 "name": {
                     "type": "string",

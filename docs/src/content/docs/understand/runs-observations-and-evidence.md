@@ -57,7 +57,7 @@ Observations go to Bifrost, the Wyrd data plane:
 | Drift samples, with `observe.submit` | `vala.drift.observations` |
 | OpenTelemetry spans, metrics, and logs | `vala.traces.spans`, `vala.metrics.points`, and `vala.logs.records` |
 
-Every row carries its `card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE` ([Errors](/api/errors/)).
+Every row carries its `subject_card_uid`, its `run_id`, and the principal that wrote it. A service may write only about Cards in its own graph. Anything else fails with `WYRD_VALA_403_BIFROST_CARD_SCOPE` ([Errors](/api/errors/)).
 
 ## Recording is buffered
 

@@ -113,8 +113,8 @@ pub enum BifrostPermissionScope {
 
 /// One canonical Bifrost catalog and schema pair.
 ///
-/// These are the *logical* names a caller writes in SQL — catalog `vala`,
-/// schema `logs` — not the flattened internal namespace (`vala.logs`) and not
+/// These are the *logical* names a caller writes in SQL — catalog `bifrost`,
+/// schema `logs` — not the flattened internal namespace (`bifrost.logs`) and not
 /// the physical Iceberg catalog name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -270,19 +270,19 @@ mod tests {
     };
     use uuid::Uuid;
 
-    /// Builds one table scope under `vala` for the supplied schema and UID.
+    /// Builds one table scope under `bifrost` for the supplied schema and UID.
     fn table(schema: &str, uid: Uuid) -> PermissionScope {
         PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-            catalog: "vala".to_owned(),
+            catalog: "bifrost".to_owned(),
             schema: schema.to_owned(),
             table_uid: uid,
         }))
     }
 
-    /// Builds one schema scope under `vala` for the supplied schema.
+    /// Builds one schema scope under `bifrost` for the supplied schema.
     fn schema(schema: &str) -> PermissionScope {
         PermissionScope::Bifrost(BifrostPermissionScope::Schema(BifrostSchemaScope {
-            catalog: "vala".to_owned(),
+            catalog: "bifrost".to_owned(),
             schema: schema.to_owned(),
         }))
     }
@@ -327,6 +327,10 @@ mod tests {
 
     /// Proves the persisted scope JSON is exactly the approved domain-tagged
     /// projection, so the wire form cannot drift from the spec.
+    ///
+    /// # Panics
+    /// Panics when a scope fails to serialize or the `all`, schema, or table
+    /// scope JSON differs from its approved projection.
     #[test]
     fn scope_json_matches_the_approved_projection() {
         let uid = Uuid::from_u128(0x1234);
@@ -337,13 +341,13 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(schema("logs")).expect("schema scope serializes"),
-            serde_json::json!({"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}})
+            serde_json::json!({"bifrost": {"schema": {"catalog": "bifrost", "schema": "logs"}}})
         );
         assert_eq!(
             serde_json::to_value(table("traces", uid)).expect("table scope serializes"),
             serde_json::json!({
                 "bifrost": {"table": {
-                    "catalog": "vala",
+                    "catalog": "bifrost",
                     "schema": "traces",
                     "table_uid": uid.to_string(),
                 }}
@@ -353,6 +357,11 @@ mod tests {
 
     /// Proves object identities are validated, not merely parsed: an empty or
     /// over-long segment and a flattened namespace are all refused.
+    ///
+    /// # Panics
+    /// Panics when `all` or a valid schema scope fails validation, an empty
+    /// schema is not refused as an invalid `schema` identifier, or a flattened
+    /// catalog or 64-character schema segment validates.
     #[test]
     fn malformed_identities_are_rejected() {
         assert!(PermissionScope::All.validate().is_ok());
@@ -366,7 +375,7 @@ mod tests {
         );
         assert!(
             PermissionScope::Bifrost(BifrostPermissionScope::Schema(BifrostSchemaScope {
-                catalog: "vala.logs".to_owned(),
+                catalog: "bifrost.logs".to_owned(),
                 schema: "logs".to_owned(),
             }))
             .validate()
@@ -432,10 +441,14 @@ mod tests {
 
     /// Proves a non-UUID table identity fails at decode, so no unresolvable
     /// object identity can reach the synchronous checker.
+    ///
+    /// # Panics
+    /// Panics when the non-UUID table identity decodes or its decode error
+    /// does not name the UUID.
     #[test]
     fn malformed_table_identity_is_rejected_at_decode() {
         let error = serde_json::from_value::<PermissionScope>(serde_json::json!({
-            "bifrost": {"table": {"catalog": "vala", "schema": "traces", "table_uid": "not-a-uid"}}
+            "bifrost": {"table": {"catalog": "bifrost", "schema": "traces", "table_uid": "not-a-uid"}}
         }))
         .expect_err("a non-UUID table identity does not decode");
 

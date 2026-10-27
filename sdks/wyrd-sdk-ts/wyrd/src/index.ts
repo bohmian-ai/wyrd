@@ -660,7 +660,7 @@ export interface TableLayout {
 
 /** Optional per-row correlation; an omitted field is a null on the wire. */
 export interface Correlation {
-  cardUid?: string;
+  subjectCardUid?: string;
   runId?: string;
 }
 
@@ -1234,12 +1234,12 @@ export class Bifrost {
    * saturated queue throws the stable refusal rather than dropping the row.
    *
    * @param row - One row object matching the active table's columns.
-   * @param correlation - Optional `cardUid` and `runId` stamped on the row.
+   * @param correlation - Optional `subjectCardUid` and `runId` stamped on the row.
    * @throws {@link WyrdError} with no active table, for a malformed
-   * `cardUid`, or when the queue is full.
+   * `subjectCardUid`, or when the queue is full.
    */
   insert(row: Readonly<Record<string, unknown>>, correlation: Correlation = {}): void {
-    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardUid, correlation.runId));
+    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.subjectCardUid, correlation.runId));
   }
 
   /**
@@ -1484,7 +1484,7 @@ export class Bifrost {
   /**
    * Describe one registered table's stored physical schema.
    *
-   * @param namespace - The table's namespace, such as `vala.datasets`.
+   * @param namespace - The table's namespace, such as `bifrost.datasets`.
    * @param name - The table's name within `namespace`.
    * @returns The server's projection of the stored schema.
    * @throws {@link WyrdError} when the table is unknown or unauthorized, or
@@ -1497,7 +1497,7 @@ export class Bifrost {
   /**
    * Edit one registered table's layout or custom columns.
    *
-   * @param namespace - The table's namespace, such as `vala.datasets`.
+   * @param namespace - The table's namespace, such as `bifrost.datasets`.
    * @param name - The table's name within `namespace`.
    * @param alteration - The edit and the table version it was built from.
    * @returns The server's projection of the committed table version.
@@ -1543,11 +1543,11 @@ function cardRefText(ref: CardRef | string): string {
  * @param schema - The table's JSON Schema, or a schema that emits one, mapped
  * to the Arrow schema of the row.
  * @param row - One row object matching `schema`.
- * @param correlation - Optional `cardUid` and `runId` stamped on the row;
+ * @param correlation - Optional `subjectCardUid` and `runId` stamped on the row;
  * omitted, the row is uncorrelated.
  * @throws {@link WyrdError} `WYRD_VALA_400_SCHEMA_PARSE` for a schema that
  * does not map to Arrow, or `WYRD_SPEC_400_VALIDATION` for unparsable schema
- * text or a malformed `cardUid`.
+ * text or a malformed `subjectCardUid`.
  */
 export function record(
   bifrost: Bifrost,
@@ -1561,7 +1561,7 @@ export function record(
       table,
       jsonSchemaText(schema),
       JSON.stringify(row),
-      correlation.cardUid,
+      correlation.subjectCardUid,
       correlation.runId,
     ),
   );
@@ -2493,14 +2493,14 @@ export class Observe {
   }
 
   /**
-   * Emit one row into a registered `vala.datasets.<name>` table.
+   * Emit one row into a registered `bifrost.datasets.<name>` table.
    *
    * The first call for a table describes it; later calls reuse the cached
    * schema and producer, so only the first awaits a lookup.
    *
-   * @param table - The table's `vala.datasets.<name>`.
+   * @param table - The table's `bifrost.datasets.<name>`.
    * @param row - One JSON row matching the table's columns.
-   * @throws a {@link WyrdError} for a table outside `vala.datasets`, an unknown
+   * @throws a {@link WyrdError} for a table outside `bifrost.datasets`, an unknown
    * or unauthorized table, before startup, or after shutdown.
    */
   async record(table: string, row: unknown): Promise<void> {
@@ -3148,7 +3148,7 @@ export class WyrdState {
   /**
    * Connect this state's one Bifrost writer and describe the fixed table.
    *
-   * Runs as the state's client. Startup describes `vala.drift.observations`
+   * Runs as the state's client. Startup describes `bifrost.drift.observations`
    * before resolving, so submitted samples can never enqueue against a
    * missing, unauthorized, or incompatible system table.
    *

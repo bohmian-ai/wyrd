@@ -175,7 +175,7 @@ async fn prove_hot_variant_absent_key() -> Result<(), JourneyError> {
             .collect(),
     )
     .await?;
-    let table_fqn = format!("vala.bifrost.{table}");
+    let table_fqn = format!("bifrost.bifrost.{table}");
     writer(server, "hot-variant-writer")
         .await?
         .write(
@@ -262,7 +262,7 @@ async fn prove_selective_predicate_pruning(
     let rows = writer(ingest_server, "predicate-writer").await?;
     for (id, value) in [(1_i64, "alpha"), (2_i64, "target"), (3_i64, "zulu")] {
         rows.write(
-            &format!("vala.bifrost.{table}"),
+            &format!("bifrost.bifrost.{table}"),
             &journey_schema(),
             [journey_row(id, value)],
         )
@@ -276,7 +276,7 @@ async fn prove_selective_predicate_pruning(
 
     let query_server = cluster.server(query_index).ok_or("missing query node")?;
     let reader = client(query_server, "predicate-reader").await?;
-    let table_fqn = format!("vala.bifrost.{table}");
+    let table_fqn = format!("bifrost.bifrost.{table}");
 
     // Physical-authority precondition, asserted rather than assumed: the
     // projection proof below is only a hot-Parquet proof if every file in the
@@ -666,7 +666,7 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, &table)))?;
     set_table_property(&catalog, &binding, "wyrd.forge.enable-compaction", "false").await?;
     let rows = writer(ingest_server, "two-tier-writer").await?;
-    let table_fqn = format!("vala.bifrost.{table}");
+    let table_fqn = format!("bifrost.bifrost.{table}");
 
     for id in 1..=COMPACTED_BATCH_ROWS {
         rows.write(
@@ -1123,7 +1123,7 @@ async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
     let tenant = cluster.data_tenant_id();
     let table = unique_table("oracle_live_routes");
-    let table_fqn = format!("vala.bifrost.{table}");
+    let table_fqn = format!("bifrost.bifrost.{table}");
     let first = cluster.server(0).ok_or("missing node 0")?;
     register_timed_table(first, tenant, &table).await?;
     let now = chrono::Utc::now();
@@ -1295,7 +1295,7 @@ async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), Journ
     let (rows, path) = grouped_counts(
         &client,
         format!(
-            "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+            "SELECT filter_key, COUNT(*) AS matched FROM bifrost.bifrost.{table} \
              WHERE id >= 0 GROUP BY filter_key ORDER BY filter_key"
         ),
     )
@@ -1488,7 +1488,7 @@ async fn live_stream_backpressure_and_query_owned_lifetime() -> Result<(), Journ
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
     let tenant = cluster.data_tenant_id();
     let table = unique_table("oracle_live_lifetime");
-    let table_fqn = format!("vala.bifrost.{table}");
+    let table_fqn = format!("bifrost.bifrost.{table}");
     let writer_node = cluster.server(0).ok_or("missing node 0")?;
     register_table(writer_node, tenant, &table).await?;
     let writer = client(writer_node, "live-lifetime-writer").await?;
@@ -1591,7 +1591,7 @@ async fn seed_published_and_live(
     prefix: &str,
 ) -> Result<String, JourneyError> {
     let table = unique_table(prefix);
-    let table_fqn = format!("vala.bifrost.{table}");
+    let table_fqn = format!("bifrost.bifrost.{table}");
     let live_node = cluster.server(0).ok_or("missing node 0")?;
     let published_node = cluster.server(2).ok_or("missing node 2")?;
     register_table(live_node, cluster.data_tenant_id(), &table).await?;
@@ -2006,7 +2006,7 @@ async fn remote_staged_footer_refusal_fails_closed() -> Result<(), JourneyError>
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
     let tenant = cluster.data_tenant_id();
     let table = unique_table("oracle_staged_refusal");
-    let table_fqn = format!("vala.bifrost.{table}");
+    let table_fqn = format!("bifrost.bifrost.{table}");
     let leader = cluster.server(0).ok_or("missing node 0")?;
     let scribe = cluster.server(1).ok_or("missing node 1")?;
     register_table(leader, tenant, &table).await?;
@@ -2172,7 +2172,7 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
     register_table(server, tenant, &custom).await?;
     let rows = writer(server, "field-id-writer").await?;
     rows.write(
-        &format!("vala.bifrost.{custom}"),
+        &format!("bifrost.bifrost.{custom}"),
         &journey_schema(),
         [journey_row(1, "target")],
     )
@@ -2198,7 +2198,7 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
             table_ref
                 .namespace
                 .as_str()
-                .strip_prefix("vala.")
+                .strip_prefix("bifrost.")
                 .unwrap_or_default(),
             name,
         ) {
@@ -2282,6 +2282,206 @@ async fn iceberg_assigned_field_ids_promote_fresh_signal_tables() -> Result<(), 
     }
     cluster.shutdown().await?;
     Ok(())
+}
+
+/// Canonical signal rows read back identically through every storage tier.
+///
+/// Two canonical trace/log/metric datasets, each written by its own
+/// bootstrapped Service and flushed separately so every partition seals
+/// several files, and correlated rows in a caller-registered dynamic table are
+/// read with
+/// every column, nested values included, while still hot on Scribe. The same
+/// rows must then read back unchanged after the Scribe pod restarts and
+/// recovers, after the delayed coordinator promotes the sealed files, and
+/// after Forge rewrites them. Alongside, a direct aggregate over the Service
+/// and subject dimensions must equal the accepted owner on every tier, so a
+/// lifecycle step that dropped, renamed, or restamped a dimension fails.
+///
+/// # Errors
+///
+/// Returns an error when setup, writing, recovery, promotion, compaction, or
+/// reading fails, or when any tier reads back different rows.
+///
+/// # Panics
+///
+/// Panics only if `#[tokio::test]` cannot build its runtime; every
+/// expectation failure is returned as an error instead.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn canonical_signal_rows_survive_publication_recovery_and_compaction()
+-> Result<(), JourneyError> {
+    let spec = BifrostClusterSpec::for_targets(&[
+        BifrostTarget::Scribe,
+        BifrostTarget::Oracle,
+        BifrostTarget::ForgeWorker,
+        BifrostTarget::Server,
+    ]);
+    let scribe_node = spec
+        .nodes
+        .first()
+        .ok_or("the topology names Scribe")?
+        .node_id;
+    let coordinator = spec
+        .nodes
+        .last()
+        .ok_or("the topology names its delayed coordinator")?
+        .node_id;
+    let mut cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        spec,
+        ForgeConfig::default(),
+        true,
+        false,
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let custom = unique_table("oracle_lifecycle");
+    let mut scopes = Vec::new();
+    {
+        let scribe = cluster.server(0).ok_or("missing Scribe node")?;
+        register_table(scribe, tenant, &custom).await?;
+        let rows = writer(scribe, "lifecycle-writer").await?;
+        // Two flushes seal two files per partition, which gives Forge a
+        // rewrite to plan.
+        for id in [1, 2] {
+            rows.write(
+                &format!("bifrost.bifrost.{custom}"),
+                &journey_schema(),
+                [journey_row(id, "target")],
+            )
+            .await?;
+            let seeded = wyrd_testing::bifrost::canonical_signals::seed_canonical_signals(
+                scribe,
+                &format!("lifecycle-signals-{id}"),
+            )
+            .await?;
+            scopes.push(format!("'{}'", seeded.scope));
+        }
+    }
+    let scope = scopes.join(", ");
+    let reads = [
+        format!("SELECT * FROM bifrost.bifrost.{custom}"),
+        format!("SELECT * FROM bifrost.traces.spans WHERE scope_name IN ({scope})"),
+        format!("SELECT * FROM bifrost.logs.records WHERE scope_name IN ({scope})"),
+        format!("SELECT * FROM bifrost.metrics.points WHERE scope_name IN ({scope})"),
+        format!(
+            "SELECT service_name, service_version, subject_kind, subject_name, \
+             subject_version, count(*) FROM (\
+             SELECT service_name, service_version, subject_kind, subject_name, subject_version \
+             FROM bifrost.traces.spans WHERE scope_name IN ({scope}) UNION ALL \
+             SELECT service_name, service_version, subject_kind, subject_name, subject_version \
+             FROM bifrost.logs.records WHERE scope_name IN ({scope}) UNION ALL \
+             SELECT service_name, service_version, subject_kind, subject_name, subject_version \
+             FROM bifrost.metrics.points WHERE scope_name IN ({scope})) \
+             GROUP BY 1, 2, 3, 4, 5"
+        ),
+    ];
+    cluster.refresh_oracle_snapshots().await?;
+    let reader = client(
+        cluster.server(1).ok_or("missing Oracle node")?,
+        "lifecycle-reader",
+    )
+    .await?;
+    let hot = rendered_reads(&reader, &reads).await?;
+    let owners = hot.last().ok_or("the aggregate read ran")?;
+    if owners.len() != 2
+        || owners
+            .iter()
+            .zip(["lifecycle-signals-1\u{1f}", "lifecycle-signals-2\u{1f}"])
+            .any(|(owner, service)| !owner.starts_with(service))
+    {
+        return Err(format!("each dataset carries its writer's Service: {owners:?}").into());
+    }
+    if hot.iter().any(Vec::is_empty) {
+        return Err(format!("every hot read returns rows: {hot:?}").into());
+    }
+    let mut sealed = Vec::new();
+    for table in [custom.as_str(), "spans", "records", "points"] {
+        let (compacted, files) = file_tier_counts(&cluster, tenant, table).await?;
+        if compacted != 0 || files == 0 {
+            return Err(format!("{table}: rows are sealed hot first").into());
+        }
+        sealed.push((table, files));
+    }
+
+    cluster.stop_node(scribe_node).await?;
+    cluster.restart_node(scribe_node).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    if rendered_reads(&reader, &reads).await? != hot {
+        return Err("rows changed across the Scribe restart".into());
+    }
+
+    cluster.restart_node(coordinator).await?;
+    await_promotion(&cluster, coordinator, &sealed).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    if rendered_reads(&reader, &reads).await? != hot {
+        return Err("rows changed on publication".into());
+    }
+
+    let scribe = cluster
+        .server_by_node(scribe_node)
+        .ok_or("the Scribe pod is running")?;
+    await_rewrite(
+        &cluster,
+        scribe,
+        &[
+            (BifrostNamespace::Bifrost, custom.as_str()),
+            (BifrostNamespace::Traces, "spans"),
+            (BifrostNamespace::Logs, "records"),
+            (BifrostNamespace::Metrics, "points"),
+        ],
+    )
+    .await?;
+    cluster.refresh_oracle_snapshots().await?;
+    if rendered_reads(&reader, &reads).await? != hot {
+        return Err("rows changed on compaction".into());
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Every row each of `reads` returns, one cell-separated line per row,
+/// sorted so a tier's file order cannot change the comparison.
+///
+/// # Errors
+///
+/// Returns the query, stream, or formatting error.
+async fn rendered_reads(
+    client: &WyrdClient,
+    reads: &[String],
+) -> Result<Vec<Vec<String>>, JourneyError> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let mut rendered = Vec::with_capacity(reads.len());
+    for sql in reads {
+        let mut stream = wyrd_client::Bifrost::query_only(client)
+            .query(&BifrostQueryRequest {
+                params: Vec::new(),
+                sql: sql.clone(),
+                deadline_ms: None,
+            })
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next_batch().await? {
+            let formatters = batch
+                .columns()
+                .iter()
+                .map(|column| ArrayFormatter::try_new(column.as_ref(), &FormatOptions::default()))
+                .collect::<Result<Vec<_>, _>>()?;
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    formatters
+                        .iter()
+                        .map(|formatter| formatter.value(row).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\u{1f}"),
+                );
+            }
+        }
+        stream.terminal().ok_or("query terminal missing")?;
+        rows.sort_unstable();
+        rendered.push(rows);
+    }
+    Ok(rendered)
 }
 
 /// Report whether any field in `fields`, at any depth, declares a field id.
@@ -2577,7 +2777,8 @@ async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), Jour
         .await?;
 
     cluster.restart_node(coordinator).await?;
-    fixture.await_promotion(&cluster, coordinator).await?;
+    let promoted = fixture.tables().map(|(_, table)| (table, FILTER_FILES));
+    await_promotion(&cluster, coordinator, &promoted).await?;
     cluster.refresh_oracle_snapshots().await?;
     let scribe = cluster.server(0).ok_or("missing Scribe node")?;
     fixture
@@ -2591,6 +2792,61 @@ async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), Jour
         .await?;
     cluster.shutdown().await?;
     Ok(())
+}
+
+/// Waits, bounded, until the freshly started coordinator has promoted every
+/// table's sealed files.
+///
+/// Each entry names a table and the number of sealed files it must hold, all
+/// promoted. The coordinator's boot pass promotes owed Scribe debt; further
+/// passes are requested without touching the Forge clock, so no table's
+/// compaction interval elapses and nothing is rewritten. The exit condition is
+/// the durable `compacted` flag of every file.
+///
+/// # Errors
+///
+/// Returns an error when the coordinator is absent, its boot pass does not
+/// complete, a Postgres probe fails, or any table still holds hot files
+/// when the budget elapses.
+async fn await_promotion(
+    cluster: &WyrdTestCluster,
+    coordinator: NodeId,
+    tables: &[(&str, i64)],
+) -> Result<(), JourneyError> {
+    let server = cluster
+        .server_by_node(coordinator)
+        .ok_or("the delayed coordinator is running")?;
+    tokio::time::timeout(
+        COMPACTION_PASS_WAIT,
+        server.wait_for_forge_scheduler_passes_for_test(1),
+    )
+    .await
+    .map_err(|_| "the coordinator never completed its boot pass")?;
+    let tenant = cluster.data_tenant_id();
+    let deadline = std::time::Instant::now() + COMPACTION_BUDGET;
+    loop {
+        let mut hot_tables = Vec::new();
+        for &(table, files) in tables {
+            let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
+            if compacted != files || hot != 0 {
+                hot_tables.push(format!("{table}: compacted={compacted} hot={hot}"));
+            }
+        }
+        if hot_tables.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("promotion did not finish: {hot_tables:?}").into());
+        }
+        let before = server.completed_forge_scheduler_passes_for_test();
+        server.request_forge_scheduler_pass_for_test();
+        tokio::time::timeout(
+            COMPACTION_PASS_WAIT,
+            server.wait_for_forge_scheduler_passes_for_test(before + 1),
+        )
+        .await
+        .map_err(|_| "a requested scheduler pass did not complete")?;
+    }
 }
 
 /// Rows each Bloom-policy file seals: above the writer's 20,000-row page
@@ -2857,7 +3113,7 @@ impl BloomPolicyTable {
 
     /// The dataset's fully qualified name.
     fn fqn(&self) -> String {
-        format!("vala.datasets.{}", self.name)
+        format!("bifrost.datasets.{}", self.name)
     }
 
     /// Requires describe to report the version and Bloom list file `file` is
@@ -2873,7 +3129,7 @@ impl BloomPolicyTable {
         file: usize,
     ) -> Result<(), JourneyError> {
         let described = wyrd_client::Bifrost::query_only(writer.client())
-            .describe_table("vala.datasets", &self.name)
+            .describe_table("bifrost.datasets", &self.name)
             .await?;
         let expected = wyrd_spec::vala::ids::TableVersion::new(i64::try_from(file)? + 1)?;
         if described.table_version != expected
@@ -3292,9 +3548,9 @@ impl FilteringFixture {
         }
         let mut schemas = Vec::new();
         for fqn in [
-            "vala.traces.spans",
-            "vala.logs.records",
-            "vala.metrics.points",
+            "bifrost.traces.spans",
+            "bifrost.logs.records",
+            "bifrost.metrics.points",
         ] {
             let described =
                 wyrd_client::bifrost::TableConfig::describe_with(fixture.writer.client(), fqn)
@@ -3311,15 +3567,21 @@ impl FilteringFixture {
                 .await?;
             fixture
                 .writer
-                .write_batch("vala.traces.spans", &fixture.spans_batch(spans, file))
+                .write_batch("bifrost.traces.spans", &fixture.spans_batch(spans, file))
                 .await?;
             fixture
                 .writer
-                .write_batch("vala.logs.records", &fixture.records_batch(records, file))
+                .write_batch(
+                    "bifrost.logs.records",
+                    &fixture.records_batch(records, file),
+                )
                 .await?;
             fixture
                 .writer
-                .write_batch("vala.metrics.points", &fixture.points_batch(points, file))
+                .write_batch(
+                    "bifrost.metrics.points",
+                    &fixture.points_batch(points, file),
+                )
                 .await?;
             server.flush_bifrost().await?;
         }
@@ -3359,7 +3621,7 @@ impl FilteringFixture {
         .register()
         .await?;
         let resolved = wyrd_client::Bifrost::query_only(self.writer.client())
-            .describe_table("vala.datasets", &self.custom)
+            .describe_table("bifrost.datasets", &self.custom)
             .await?
             .physical_layout;
         if resolved.partition_by
@@ -3388,7 +3650,7 @@ impl FilteringFixture {
 
     /// The custom dataset's fully qualified name.
     fn custom_fqn(&self) -> String {
-        format!("vala.datasets.{}", self.custom)
+        format!("bifrost.datasets.{}", self.custom)
     }
 
     /// First microsecond of `file`'s event-time slice.
@@ -3585,60 +3847,6 @@ impl FilteringFixture {
         ]
     }
 
-    /// Waits, bounded, until the freshly started coordinator has promoted every
-    /// table's sealed files.
-    ///
-    /// The coordinator's boot pass promotes owed Scribe debt; further passes
-    /// are requested without touching the Forge clock, so no table's
-    /// compaction interval elapses and nothing is rewritten. The exit
-    /// condition is the durable `compacted` flag of every file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the coordinator is absent, its boot pass does not
-    /// complete, a Postgres probe fails, or any table still holds hot files
-    /// when the budget elapses.
-    async fn await_promotion(
-        &self,
-        cluster: &WyrdTestCluster,
-        coordinator: NodeId,
-    ) -> Result<(), JourneyError> {
-        let server = cluster
-            .server_by_node(coordinator)
-            .ok_or("the delayed coordinator is running")?;
-        tokio::time::timeout(
-            COMPACTION_PASS_WAIT,
-            server.wait_for_forge_scheduler_passes_for_test(1),
-        )
-        .await
-        .map_err(|_| "the coordinator never completed its boot pass")?;
-        let tenant = cluster.data_tenant_id();
-        let deadline = std::time::Instant::now() + COMPACTION_BUDGET;
-        loop {
-            let mut hot_tables = Vec::new();
-            for (_, table) in self.tables() {
-                let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
-                if compacted != FILTER_FILES || hot != 0 {
-                    hot_tables.push(format!("{table}: compacted={compacted} hot={hot}"));
-                }
-            }
-            if hot_tables.is_empty() {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(format!("promotion did not finish: {hot_tables:?}").into());
-            }
-            let before = server.completed_forge_scheduler_passes_for_test();
-            server.request_forge_scheduler_pass_for_test();
-            tokio::time::timeout(
-                COMPACTION_PASS_WAIT,
-                server.wait_for_forge_scheduler_passes_for_test(before + 1),
-            )
-            .await
-            .map_err(|_| "a requested scheduler pass did not complete")?;
-        }
-    }
-
     /// Proves `cut` is the one serving every table, the physical layout of its
     /// objects, and the per-mechanism query matrix against it.
     ///
@@ -3734,6 +3942,11 @@ impl FilteringFixture {
     /// Returns describe or decode errors, and an error naming the first file
     /// that is out of order, lacks a declared Bloom filter, carries an
     /// undeclared one, lacks pages, or yields no Bloom-negative probe.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a journey table's fully qualified name has no `.` separating
+    /// its namespace from its name.
     async fn expect_physical_layout(
         &self,
         custom: &[SealedObject],
@@ -3744,9 +3957,9 @@ impl FilteringFixture {
         let client = self.writer.client();
         for (fqn, objects, undeclared) in [
             (self.custom_fqn(), custom, "score"),
-            ("vala.traces.spans".to_owned(), spans, "name"),
-            ("vala.logs.records".to_owned(), records, "severity_text"),
-            ("vala.metrics.points".to_owned(), points, "unit"),
+            ("bifrost.traces.spans".to_owned(), spans, "name"),
+            ("bifrost.logs.records".to_owned(), records, "severity_text"),
+            ("bifrost.metrics.points".to_owned(), points, "unit"),
         ] {
             let (namespace, name) = fqn
                 .rsplit_once('.')
@@ -4096,9 +4309,9 @@ impl FilteringFixture {
 
         // Each signal row's identity is its time column's Unix nanoseconds.
         for (table, time) in [
-            ("vala.traces.spans", "start_time_unix_nano"),
-            ("vala.logs.records", "time_unix_nano"),
-            ("vala.metrics.points", "time_unix_nano"),
+            ("bifrost.traces.spans", "start_time_unix_nano"),
+            ("bifrost.logs.records", "time_unix_nano"),
+            ("bifrost.metrics.points", "time_unix_nano"),
         ] {
             let baseline = run_case(
                 cluster,
@@ -4133,7 +4346,7 @@ impl FilteringFixture {
             FilterCase {
                 name: "spans absent trace id within bounds".to_owned(),
                 sql: format!(
-                    "SELECT CAST(start_time_unix_nano AS BIGINT) AS id FROM vala.traces.spans \
+                    "SELECT CAST(start_time_unix_nano AS BIGINT) AS id FROM bifrost.traces.spans \
                      WHERE trace_id = X'{}' ORDER BY id",
                     hex::encode(probes.span_probe)
                 ),
@@ -4163,84 +4376,84 @@ impl FilteringFixture {
         for (name, table, time, filter, expected) in [
             (
                 "spans trace present",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
                 "start_time_unix_nano",
                 format!("trace_id = X'{}'", trace(1, 2)),
                 signals(&|file, row| file == 1 && row == 1),
             ),
             (
                 "spans mixed trace/time match",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
                 "start_time_unix_nano",
                 format!("trace_id = X'{}' AND {}", trace(2, 4), spans_time(2)?),
                 signals(&|file, row| file == 2 && row == 2),
             ),
             (
                 "spans mixed trace/time miss",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
                 "start_time_unix_nano",
                 format!("trace_id = X'{}' AND {}", trace(2, 4), spans_time(0)?),
                 Vec::new(),
             ),
             (
                 "spans root (null parent)",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
                 "start_time_unix_nano",
                 "parent_span_id IS NULL".to_owned(),
                 signals(&|_, row| row % 2 == 0),
             ),
             (
                 "records trace present",
-                "vala.logs.records",
+                "bifrost.logs.records",
                 "time_unix_nano",
                 format!("trace_id = X'{}'", trace(0, 2)),
                 signals(&|file, row| file == 0 && row == 1),
             ),
             (
                 "records severity key",
-                "vala.logs.records",
+                "bifrost.logs.records",
                 "time_unix_nano",
                 format!("severity_number = {}", record_severity(2)),
                 signals(&|_, row| row == 2),
             ),
             (
                 "records severity miss",
-                "vala.logs.records",
+                "bifrost.logs.records",
                 "time_unix_nano",
                 "severity_number = 99".to_owned(),
                 Vec::new(),
             ),
             (
                 "records uncorrelated in slice",
-                "vala.logs.records",
+                "bifrost.logs.records",
                 "time_unix_nano",
                 format!("trace_id IS NULL AND {}", signal_time(1)?),
                 signals(&|file, row| file == 1 && row % 2 == 0),
             ),
             (
                 "points metric present",
-                "vala.metrics.points",
+                "bifrost.metrics.points",
                 "time_unix_nano",
                 format!("metric_name = '{}'", metric_name(1, 3)),
                 signals(&|file, row| file == 1 && row == 3),
             ),
             (
                 "points metric miss",
-                "vala.metrics.points",
+                "bifrost.metrics.points",
                 "time_unix_nano",
                 "metric_name = 'metric-9-9'".to_owned(),
                 Vec::new(),
             ),
             (
                 "points null integer",
-                "vala.metrics.points",
+                "bifrost.metrics.points",
                 "time_unix_nano",
                 "int_value IS NULL".to_owned(),
                 signals(&|_, row| row % 2 == 1),
             ),
             (
                 "points mixed type/time",
-                "vala.metrics.points",
+                "bifrost.metrics.points",
                 "time_unix_nano",
                 format!("metric_type = 'sum' AND {}", signal_time(2)?),
                 signals(&|file, row| file == 2 && row % 2 == 0),
@@ -4858,7 +5071,7 @@ async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
     let server = cluster.server(0).ok_or("missing node")?;
     let tenant = cluster.data_tenant_id();
     let table = unique_table("oracle_binary_key");
-    let fqn = format!("vala.datasets.{table}");
+    let fqn = format!("bifrost.datasets.{table}");
     let rows = writer(server, "binary-key-writer").await?;
     let sort_keys = vec![SortKeyWire {
         column: "fixed_key".to_owned(),
@@ -5065,9 +5278,9 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
     let right = unique_table("cut_right");
     register_table(&server, tenant, &left).await?;
     register_table(&server, tenant, &right).await?;
-    let one = format!("SELECT id FROM vala.bifrost.{left}");
+    let one = format!("SELECT id FROM bifrost.bifrost.{left}");
     let join = format!(
-        "SELECT l.id FROM vala.bifrost.{left} l JOIN vala.bifrost.{right} r ON l.id = r.id"
+        "SELECT l.id FROM bifrost.bifrost.{left} l JOIN bifrost.bifrost.{right} r ON l.id = r.id"
     );
 
     reset_cut_reads_for_test();
@@ -5150,7 +5363,7 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
         &server,
         query_context(neighbour)?,
         &format!(
-            "SELECT id FROM vala.bifrost.{}",
+            "SELECT id FROM bifrost.bifrost.{}",
             unique_table("never_registered")
         ),
     )
@@ -5362,7 +5575,7 @@ async fn held_query_survives_cleanup_until_the_retention_window_passes() -> Resu
     for object in 0..HELD_QUERY_OBJECTS {
         for id in 1..=HELD_QUERY_ROWS {
             rows.write(
-                &format!("vala.bifrost.{table}"),
+                &format!("bifrost.bifrost.{table}"),
                 &journey_schema(),
                 [journey_row(object * HELD_QUERY_ROWS + id, "held")],
             )
@@ -5409,7 +5622,7 @@ async fn held_query_survives_cleanup_until_the_retention_window_passes() -> Resu
     let query = held_query_ids(
         &engine,
         context,
-        format!("SELECT id FROM vala.bifrost.{table} ORDER BY id"),
+        format!("SELECT id FROM bifrost.bifrost.{table} ORDER BY id"),
     );
     let maintain = async {
         tokio::time::timeout(HELD_QUERY_TRANSITION_BOUND, async {
@@ -5505,7 +5718,7 @@ async fn held_query_survives_cleanup_until_the_retention_window_passes() -> Resu
     // replacement, so the replacement stays live in the new head.
     set_table_property(&catalog, &binding, "wyrd.forge.enable-compaction", "false").await?;
     rows.write(
-        &format!("vala.bifrost.{table}"),
+        &format!("bifrost.bifrost.{table}"),
         &journey_schema(),
         [journey_row(0, "later")],
     )

@@ -1160,7 +1160,7 @@ async fn mixed_specifications_preserve_partition_and_sort_truth() {
     let rows_per_layout = 2 * u64::try_from(COMPOSITE_ROWS).expect("row count");
     let mut accepted = BTreeMap::new();
     for file in server
-        .published_hot_files_for_test(tenant, "vala.datasets", &name)
+        .published_hot_files_for_test(tenant, "bifrost.datasets", &name)
         .await
         .expect("published evidence reads")
     {

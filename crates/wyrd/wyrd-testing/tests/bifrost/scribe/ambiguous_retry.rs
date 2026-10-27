@@ -135,7 +135,7 @@ async fn ambiguous_deadline_retains_then_deduplicates_one_batch() {
         .insert(
             br#"{"value": 41}"#.to_vec(),
             Correlation {
-                card_uid: bootstrap.card_ref().and_then(|card| card.uid.clone()),
+                subject_card_uid: bootstrap.card_ref().and_then(|card| card.uid.clone()),
                 run_id: None,
             },
         )

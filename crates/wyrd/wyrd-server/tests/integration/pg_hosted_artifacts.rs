@@ -41,7 +41,7 @@ use wyrd_runtime::{
     PermissionScope, Principal, PrincipalKind, PrincipalRef,
 };
 use wyrd_server::components::auth::Caller;
-use wyrd_server::components::gateway::GatewayCallSubject;
+use wyrd_server::components::gateway::GatewayCallContext;
 use wyrd_server::verification::hosted::HostedLimits;
 use wyrd_server::verification::hosted::blocks::{Execution, HostedBlocks};
 use wyrd_server::verification::hosted::evidence::TenantEvidence;
@@ -510,7 +510,7 @@ fn document(value: Value) -> BTreeMap<String, CallInput> {
 /// A queued run's recovered authority drives a hosted Agent step and check.
 ///
 /// The accepted principal was delegated, holds every tool grant, and reads
-/// only `vala.logs.records`. Rebuilt through [`Caller::accepted`], its
+/// only `bifrost.logs.records`. Rebuilt through [`Caller::accepted`], its
 /// query, code, and file calls run and are recorded, yet Oracle refuses the
 /// other table and a join reaching it: tool grants never widen data scope.
 /// The located line the file tool returned becomes the step's citation, and
@@ -523,12 +523,12 @@ fn document(value: Value) -> BTreeMap<String, CallInput> {
 #[tokio::test(flavor = "multi_thread")]
 async fn recovered_authority_bounds_every_agent_tool() {
     /// A query of the one granted table.
-    const LOGS: &str = "SELECT severity_text FROM vala.logs.records";
+    const LOGS: &str = "SELECT severity_text FROM bifrost.logs.records";
     /// A query of a table the authority does not hold.
-    const SPANS: &str = "SELECT name FROM vala.traces.spans";
+    const SPANS: &str = "SELECT name FROM bifrost.traces.spans";
     /// One plan reaching both tables.
     const MIXED: &str = "SELECT r.severity_text, s.name \
-         FROM vala.logs.records r JOIN vala.traces.spans s ON r.trace_id = s.trace_id";
+         FROM bifrost.logs.records r JOIN bifrost.traces.spans s ON r.trace_id = s.trace_id";
     let registered = Registered::start().await;
     let state = registered.server.state().clone();
     let tenant = registered.server.data_tenant_id();
@@ -546,7 +546,7 @@ async fn recovered_authority_bounds_every_agent_tool() {
     }
     let logs_only = Permission {
         scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-            catalog: "vala".to_owned(),
+            catalog: "bifrost".to_owned(),
             schema: "logs".to_owned(),
             table_uid: uuid::Uuid::from_bytes(*uids[0].as_bytes()),
         })),
@@ -1142,10 +1142,7 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
                         caller,
                         evidence: &evidence,
                         routes: &routes,
-                        subject: GatewayCallSubject {
-                            run_id: None,
-                            card_uid: None,
-                        },
+                        subject: GatewayCallContext::default(),
                         accepted_at: chrono::Utc::now(),
                         drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                         clock: BlockClock::default(),

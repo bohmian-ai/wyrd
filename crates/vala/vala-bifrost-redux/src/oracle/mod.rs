@@ -3159,7 +3159,7 @@ impl Oracle {
     /// their stable public mapping without exposing dependency diagnostics.
     ///
     /// The optimized plan passes the payload-column gate before it is
-    /// returned, so a projection or filter reaching `vala.gateway.calls`
+    /// returned, so a projection or filter reaching `bifrost.gateway.calls`
     /// payload content without payload-read authority never becomes
     /// executable.
     async fn plan_logical(
@@ -3279,7 +3279,7 @@ pub fn assignment_schema_fingerprint(schema: &Schema) -> String {
 ///
 /// `DataFusion` does not synthesize catalog providers when a three-part table
 /// reference is registered. Oracle therefore creates the tenant-free logical
-/// hierarchy (`vala.<domain>.<table>`) explicitly while the provider itself
+/// hierarchy (`bifrost.<domain>.<table>`) explicitly while the provider itself
 /// remains bound to the authenticated tenant's physical cut.
 ///
 /// # Errors
@@ -3293,12 +3293,12 @@ fn register_session_table(
 ) -> Result<(), BifrostError> {
     let schema_name = binding
         .logical_namespace
-        .strip_prefix("vala.")
+        .strip_prefix("bifrost.")
         .filter(|name| !name.is_empty())
         .ok_or(BifrostError::QueryExecutionFailed)?;
-    let catalog = session.catalog("vala").unwrap_or_else(|| {
+    let catalog = session.catalog("bifrost").unwrap_or_else(|| {
         let catalog: Arc<dyn CatalogProvider> = Arc::new(MemoryCatalogProvider::new());
-        session.register_catalog("vala", Arc::clone(&catalog));
+        session.register_catalog("bifrost", Arc::clone(&catalog));
         catalog
     });
     let schema = if let Some(schema) = catalog.schema(schema_name) {
@@ -3314,9 +3314,9 @@ fn register_session_table(
     schema
         .register_table(binding.table_name.clone(), provider)
         .map_err(|error| map_datafusion_error(&error))?;
-    // DataFusion treats a quoted dotted identifier (`"vala.traces.spans"`)
+    // DataFusion treats a quoted dotted identifier (`"bifrost.traces.spans"`)
     // as one table in its default `datafusion.public` catalog. Keep this
-    // private alias alongside the canonical `vala.traces.spans` hierarchy so
+    // private alias alongside the canonical `bifrost.traces.spans` hierarchy so
     // both public SQL spellings resolve to the same authenticated provider.
     session
         .register_table(TableReference::bare(binding.table_ref.fqn()), alias)
@@ -3541,7 +3541,7 @@ fn execution_topology(
 /// Projects one catalog-resolved table binding into its RBAC object scope.
 ///
 /// The scope is built from the *catalog identity*, never from SQL text: the
-/// flattened internal namespace `vala.<schema>` is split back into the logical
+/// flattened internal namespace `bifrost.<schema>` is split back into the logical
 /// catalog and schema a grant names, and the object identity is the registered
 /// [`TableUid`](crate::catalog::TableUid) the catalog resolved. An alias, a view
 /// expansion, or a second spelling of the same table therefore cannot present a
@@ -3592,7 +3592,7 @@ pub(super) fn authorize_resolved_tables(
     Ok(())
 }
 
-/// Refuses a plan reaching `vala.gateway.calls` payload content without the
+/// Refuses a plan reaching `bifrost.gateway.calls` payload content without the
 /// tenant-wide payload-read permission.
 ///
 /// Runs on an optimized logical plan, including subqueries, after ordinary
@@ -3622,7 +3622,7 @@ pub(super) fn authorize_payload_columns(
     {
         return Ok(());
     }
-    let calls = format!("vala.{}.{}", CallsTable::NAMESPACE, CallsTable::NAME);
+    let calls = format!("bifrost.{}.{}", CallsTable::NAMESPACE, CallsTable::NAME);
     let payload = CallsTable::SENSITIVE_PAYLOAD_COLUMNS;
     let mut reached = false;
     plan.apply_with_subqueries(|node| {
@@ -4353,7 +4353,7 @@ mod tests {
         }
     }
 
-    /// Registers empty `vala.gateway.calls` and `vala.logs.records` built-ins
+    /// Registers empty `bifrost.gateway.calls` and `bifrost.logs.records` built-ins
     /// under their canonical names, the way Oracle names cut providers.
     ///
     /// # Panics
@@ -4377,7 +4377,7 @@ mod tests {
                 .register_schema(schema, Arc::new(provider))
                 .expect("schema registers");
         }
-        session.register_catalog("vala", Arc::new(catalog));
+        session.register_catalog("bifrost", Arc::new(catalog));
         session
     }
 
@@ -4393,7 +4393,7 @@ mod tests {
     async fn bound_values_replace_placeholders_as_data() {
         let context = payload_context(&[Permission::bifrost_query_read()]);
         let session = payload_session();
-        let sql = "SELECT call_id FROM vala.gateway.calls WHERE call_id = $1";
+        let sql = "SELECT call_id FROM bifrost.gateway.calls WHERE call_id = $1";
         let hostile = "x'; DROP TABLE t; --";
         let plan = match Oracle::plan_logical(
             &session,
@@ -4436,20 +4436,20 @@ mod tests {
         ]);
         let session = payload_session();
         for sql in [
-            "SELECT call_id, outcome FROM vala.gateway.calls",
-            "SELECT count(*) FROM vala.gateway.calls",
-            "SELECT * FROM vala.logs.records",
+            "SELECT call_id, outcome FROM bifrost.gateway.calls",
+            "SELECT count(*) FROM bifrost.gateway.calls",
+            "SELECT * FROM bifrost.logs.records",
         ] {
             if let Err(error) = Oracle::plan_logical(&session, &metadata, sql, &[]).await {
                 panic!("metadata read {sql} was refused: {error}");
             }
         }
         for sql in [
-            "SELECT request_payload FROM vala.gateway.calls",
-            "SELECT * FROM vala.gateway.calls",
-            "SELECT call_id FROM vala.gateway.calls WHERE response_payload IS NOT NULL",
-            "SELECT count(*) FROM vala.logs.records WHERE EXISTS \
-             (SELECT 1 FROM vala.gateway.calls WHERE request_payload IS NOT NULL)",
+            "SELECT request_payload FROM bifrost.gateway.calls",
+            "SELECT * FROM bifrost.gateway.calls",
+            "SELECT call_id FROM bifrost.gateway.calls WHERE response_payload IS NOT NULL",
+            "SELECT count(*) FROM bifrost.logs.records WHERE EXISTS \
+             (SELECT 1 FROM bifrost.gateway.calls WHERE request_payload IS NOT NULL)",
         ] {
             assert!(
                 matches!(
@@ -4479,13 +4479,13 @@ mod tests {
         };
         authorize_payload_columns(
             &metadata,
-            &typed("SELECT call_id FROM vala.gateway.calls").await,
+            &typed("SELECT call_id FROM bifrost.gateway.calls").await,
         )
         .expect("typed metadata projection is admitted");
         assert!(matches!(
             authorize_payload_columns(
                 &metadata,
-                &typed("SELECT response_payload FROM vala.gateway.calls").await
+                &typed("SELECT response_payload FROM bifrost.gateway.calls").await
             ),
             Err(BifrostError::QueryForbidden)
         ));
@@ -4494,7 +4494,7 @@ mod tests {
     /// Builds one Bifrost table scope for the supplied schema and UID.
     fn table_scope(schema: &str, uid: uuid::Uuid) -> PermissionScope {
         PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-            catalog: "vala".to_owned(),
+            catalog: "bifrost".to_owned(),
             schema: schema.to_owned(),
             table_uid: uid,
         }))
@@ -4990,18 +4990,24 @@ mod tests {
     }
 
     /// The SQL parser accepts a complete query and extracts its canonical tables.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the CTE-and-join query is refused or its extracted tables are
+    /// not exactly `observations` and `spans` in sorted order, with the CTE alias
+    /// excluded.
     #[test]
     fn query_floor_extracts_joined_and_cte_tables() {
         let tables = parse_select_tables(
-            "WITH recent AS (SELECT * FROM vala.bifrost.spans) \
-             SELECT * FROM recent JOIN vala.bifrost.observations o ON true",
+            "WITH recent AS (SELECT * FROM bifrost.bifrost.spans) \
+             SELECT * FROM recent JOIN bifrost.bifrost.observations o ON true",
         )
         .expect("complete SELECT is accepted");
         assert_eq!(
             tables.iter().map(TableRef::fqn).collect::<Vec<_>>(),
             vec![
-                "vala.bifrost.observations".to_owned(),
-                "vala.bifrost.spans".to_owned(),
+                "bifrost.bifrost.observations".to_owned(),
+                "bifrost.bifrost.spans".to_owned(),
             ]
         );
     }

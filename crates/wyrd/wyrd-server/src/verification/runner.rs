@@ -70,7 +70,7 @@ use super::leases::LeaseRenewal;
 use super::results::{ResultPayloadBuilder, ResultRun};
 use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 use crate::components::auth::Caller;
-use crate::components::gateway::GatewayCallSubject;
+use crate::components::gateway::GatewayCallContext;
 use crate::scribe_outbox::{ScribeOutbox, ScribeSink, ScribeWrite};
 use crate::state::AppState;
 
@@ -458,9 +458,15 @@ impl VerifierRunner {
                 caller: &caller,
                 evidence,
                 routes,
-                subject: GatewayCallSubject {
+                subject: GatewayCallContext {
+                    workload_card_uid: run
+                        .owner_card_uid
+                        .as_ref()
+                        .or_else(|| run.authority.owning_root())
+                        .cloned(),
+                    subject_card_uid: Some(run.card_uid.clone()),
                     run_id,
-                    card_uid: Some(run.card_uid.clone()),
+                    deployment_environment: run.deployment_environment.clone(),
                 },
                 accepted_at,
                 drift,

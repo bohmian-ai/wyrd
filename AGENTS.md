@@ -115,7 +115,7 @@ These are not open for discussion in a task or review.
 - **Bifrost clients** use `wyrd_client::Bifrost`. Gate, Scribe, Oracle, and
   Forge are server owners, never client types.
 - **Audit.** Permissions block; audits never do. Each permission decision is
-  staged on the process Scribe outbox and lands in `vala.system.audit_log`; a
+  staged on the process Scribe outbox and lands in `bifrost.system.audit_log`; a
   failed write is logged and counted and never fails the operation. A
   workflow that checks permission twice audits each check at its own commit
   boundary. Engine transitions record lineage, not audit. Mechanics:

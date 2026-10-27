@@ -276,7 +276,7 @@ mod pg_tests {
             ),
             (
                 "bifrost.describe_table",
-                serde_json::json!({"namespace": "vala.bifrost"}),
+                serde_json::json!({"namespace": "bifrost.bifrost"}),
             ),
         ] {
             let error = client
@@ -314,7 +314,7 @@ mod pg_tests {
             ),
             (
                 "unknown table",
-                serde_json::json!({"sql": "SELECT id FROM vala.bifrost.absent_table"}),
+                serde_json::json!({"sql": "SELECT id FROM bifrost.bifrost.absent_table"}),
                 "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
             ),
             (
@@ -326,7 +326,7 @@ mod pg_tests {
                 "unknown field in a join",
                 serde_json::json!({"sql": format!(
                     "SELECT t.valeu, t.valeu AS again FROM {table} t JOIN {table} u ON t.id = u.id \
-                     JOIN vala.verification.results v ON v.result_id = u.value"
+                     JOIN bifrost.verification.results v ON v.result_id = u.value"
                 )}),
                 "WYRD_VALA_400_QUERY_INVALID_SQL",
             ),
@@ -514,6 +514,15 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns setup, ingestion, MCP transport, query, or settlement failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the spans table or query tool is not discoverable, the
+    /// described table lacks `name` or `status_code`, the bounded read errors
+    /// or returns other columns, rows, query class, outcome, or row count, or
+    /// carries a freshness field, either ceiling does not refuse with
+    /// `WYRD_VALA_413_QUERY_RESULT_TOO_LARGE` and no rows, or the cancelled
+    /// query does not release every admission, byte, and peer slot.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn agent_debugs_otel_error_trace_through_mcp() -> Result<(), McpJourneyError> {
@@ -566,7 +575,7 @@ mod pg_tests {
         .await
         .map_err(|error| format!("OTLP ingestion failed: {error}"))?;
         server.flush_bifrost().await?;
-        let table = "vala.traces.spans";
+        let table = "bifrost.traces.spans";
         let client = ()
             .serve_with_lifecycle(
                 transport(&server, ResolvedCredential::BearerToken(token.into()), None)?,
@@ -584,7 +593,7 @@ mod pg_tests {
                 .as_array()
                 .ok_or("tables is an array")?
                 .iter()
-                .any(|table| table["namespace"] == "vala.traces" && table["name"] == "spans"),
+                .any(|table| table["namespace"] == "bifrost.traces" && table["name"] == "spans"),
             "the agent discovers actual OTEL spans: {listed}"
         );
 
@@ -601,7 +610,7 @@ mod pg_tests {
             client
                 .call_tool(
                     CallToolRequestParams::new("bifrost.describe_table").with_arguments(
-                        serde_json::json!({"namespace": "vala.traces", "name": name})
+                        serde_json::json!({"namespace": "bifrost.traces", "name": name})
                             .as_object()
                             .ok_or("describe arguments are an object")?
                             .clone(),
@@ -735,6 +744,13 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns fixture, transport, tool-call, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the span hierarchy, the GenAI token aggregate, the
+    /// log-to-span correlation, or the per-kind metric aggregate returns other
+    /// rows, the metric read is not a success, or the authorized reader does
+    /// not see the root span's structured GenAI attributes.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn agent_reads_canonical_trace_genai_logs_and_metrics_through_sql()
@@ -759,7 +775,7 @@ mod pg_tests {
                     "sql": format!(
                         "SELECT name, gen_ai_operation_name, status_code, \
                          CAST(CASE WHEN parent_span_id IS NULL THEN 1 ELSE 0 END AS BIGINT) \
-                         AS is_root FROM vala.traces.spans WHERE scope_name = '{scope}' \
+                         AS is_root FROM bifrost.traces.spans WHERE scope_name = '{scope}' \
                          ORDER BY start_time_unix_nano"
                     ),
                     "max_rows": 10,
@@ -781,7 +797,7 @@ mod pg_tests {
                     "sql": format!(
                         "SELECT CAST(SUM(gen_ai_usage_input_tokens) AS BIGINT) AS input_tokens, \
                          CAST(SUM(gen_ai_usage_output_tokens) AS BIGINT) AS output_tokens, \
-                         CAST(COUNT(*) AS BIGINT) AS spans FROM vala.traces.spans \
+                         CAST(COUNT(*) AS BIGINT) AS spans FROM bifrost.traces.spans \
                          WHERE scope_name = '{scope}' AND gen_ai_request_model = '{model}'",
                         model = fixture::MODEL,
                     ),
@@ -800,7 +816,7 @@ mod pg_tests {
                 .call_tool(query(serde_json::json!({
                     "sql": format!(
                         "SELECT l.severity_text, l.event_name, s.name AS span_name \
-                         FROM vala.logs.records l JOIN vala.traces.spans s \
+                         FROM bifrost.logs.records l JOIN bifrost.traces.spans s \
                          ON l.trace_id = s.trace_id AND l.span_id = s.span_id \
                          WHERE l.scope_name = '{scope}'"
                     ),
@@ -821,7 +837,7 @@ mod pg_tests {
                         "SELECT metric_type, \
                          CAST(SUM(COALESCE(int_value, 0)) AS BIGINT) AS ints, \
                          CAST(SUM(COALESCE(histogram_count, 0)) AS BIGINT) AS observations \
-                         FROM vala.metrics.points WHERE scope_name = '{scope}' \
+                         FROM bifrost.metrics.points WHERE scope_name = '{scope}' \
                          GROUP BY metric_type ORDER BY metric_type"
                     ),
                     "max_rows": 10,
@@ -841,7 +857,7 @@ mod pg_tests {
 
         // GenAI messages are ordinary trace-span columns governed by table RBAC.
         let payload_sql = format!(
-            "SELECT attributes FROM vala.traces.spans \
+            "SELECT attributes FROM bifrost.traces.spans \
              WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
         );
         let reader = agent_with_permissions(
@@ -858,10 +874,7 @@ mod pg_tests {
         // The tool renders a Variant cell as its JSON value.
         assert_eq!(
             messages["rows"][0][0],
-            serde_json::json!({
-                "gen_ai.input.messages": fixture::INPUT_MESSAGES,
-                "gen_ai.output.messages": fixture::OUTPUT_MESSAGES,
-            }),
+            fixture::root_span_attributes(),
             "an authorized agent reads the structured GenAI messages"
         );
         reader.cancel().await?;
@@ -894,7 +907,7 @@ mod pg_tests {
         let server = WyrdTestServer::start_bound().await?;
         let seeded = fixture::seed_canonical_signals(&server, "mcp-variant-payloads").await?;
         let parent = format!(
-            "FROM vala.traces.spans WHERE scope_name = '{}' AND parent_span_id IS NULL",
+            "FROM bifrost.traces.spans WHERE scope_name = '{}' AND parent_span_id IS NULL",
             seeded.scope
         );
         let client = ()
@@ -928,10 +941,7 @@ mod pg_tests {
             serde_json::json!([[
                 fixture::INPUT_MESSAGES,
                 null,
-                {
-                    "gen_ai.input.messages": fixture::INPUT_MESSAGES,
-                    "gen_ai.output.messages": fixture::OUTPUT_MESSAGES,
-                },
+                fixture::root_span_attributes(),
                 fixture::EVENT_NAME,
                 "stop",
                 {"n": 9_007_199_254_740_993_i64, "u": u64::MAX},
@@ -978,7 +988,7 @@ mod pg_tests {
     /// An agent without gateway payload authority cannot read any leaf of a
     /// sensitive Variant column, and the refusal happens before any read.
     ///
-    /// A real gateway call is captured into `vala.gateway.calls`. An agent
+    /// A real gateway call is captured into `bifrost.gateway.calls`. An agent
     /// holding payload-read authority reads `request_payload ->> 'model'`, and
     /// an agent holding only query read reads `call_id`; both scan storage.
     /// The query-only agent is then refused every shape that reaches a
@@ -1046,13 +1056,13 @@ mod pg_tests {
             (
                 "payload leaf with authority",
                 &payload_reader,
-                "SELECT request_payload ->> 'model' AS model FROM vala.gateway.calls \
+                "SELECT request_payload ->> 'model' AS model FROM bifrost.gateway.calls \
                  WHERE request_payload ->> 'model' IS NOT NULL",
             ),
             (
                 "metadata without payload authority",
                 &metadata_reader,
-                "SELECT call_id FROM vala.gateway.calls",
+                "SELECT call_id FROM bifrost.gateway.calls",
             ),
         ] {
             let window = telemetry.checkpoint()?;
@@ -1077,20 +1087,20 @@ mod pg_tests {
         for (case, sql) in [
             (
                 "->> projection",
-                "SELECT request_payload ->> 'model' AS model FROM vala.gateway.calls",
+                "SELECT request_payload ->> 'model' AS model FROM bifrost.gateway.calls",
             ),
             (
                 "-> chain",
-                "SELECT to_json(request_payload -> 'messages' -> 0) AS first FROM vala.gateway.calls",
+                "SELECT to_json(request_payload -> 'messages' -> 0) AS first FROM bifrost.gateway.calls",
             ),
             (
                 "predicate only",
-                "SELECT call_id FROM vala.gateway.calls \
+                "SELECT call_id FROM bifrost.gateway.calls \
                  WHERE request_payload ->> 'model' = 'openai/gpt-4o'",
             ),
             (
                 "to_json of the response",
-                "SELECT to_json(response_payload) AS body FROM vala.gateway.calls",
+                "SELECT to_json(response_payload) AS body FROM bifrost.gateway.calls",
             ),
         ] {
             let window = telemetry.checkpoint()?;
@@ -1125,7 +1135,7 @@ mod pg_tests {
     /// The retired verification contracts are unknown to an agent: a stale
     /// `evals` role cannot obtain a token, no tool names the retired Eval
     /// workflow, and a stale development registration of
-    /// `vala.eval.result_items` is listed nowhere and refused for describe and
+    /// `bifrost.eval.result_items` is listed nowhere and refused for describe and
     /// query exactly as a never-existing namespace is, while the current table
     /// still answers.
     ///
@@ -1164,7 +1174,7 @@ mod pg_tests {
         let stale = sqlx::query(
             "INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,status,\
              physical_layout,origin,sub_principal_id,act_principal_id) \
-             SELECT data_tenant_id,decode(md5(fqn),'hex'),'vala.eval.result_items',fingerprint,\
+             SELECT data_tenant_id,decode(md5(fqn),'hex'),'bifrost.eval.result_items',fingerprint,\
              status,physical_layout,origin,sub_principal_id,act_principal_id \
              FROM vala.bifrost_tables WHERE fqn = $1",
         )
@@ -1202,12 +1212,12 @@ mod pg_tests {
                 .as_array()
                 .ok_or("list_tables returns a tables array")?
                 .iter()
-                .all(|table| table["namespace"] != "vala.eval"),
+                .all(|table| table["namespace"] != "bifrost.eval"),
             "a stale registration is never listed: {listed}"
         );
         for name in ["result_items", "observations"] {
             let mut refusals = Vec::new();
-            for namespace in ["vala.eval", "vala.absent"] {
+            for namespace in ["bifrost.eval", "bifrost.absent"] {
                 let described = client
                     .call_tool(
                         CallToolRequestParams::new("bifrost.describe_table").with_arguments(

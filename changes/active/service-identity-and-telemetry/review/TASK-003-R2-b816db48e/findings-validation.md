@@ -1,0 +1,26 @@
+# TASK-003 R2 independent findings validation
+
+Recommendation: **PASS**. The independently validated open-finding ledger is **empty**. FIND-TASK-003-6 is closed; FIND-TASK-003-1 through -5 remain closed.
+
+Reviewed immutable prior candidate `ee970fbbef1511607a71c89ac16802b34724d422` to candidate `b816db48e29c5a06b2c9b0065e4c6689b379901b`, with original base `ca2ac4a37e229a8f95667c073db11c70ad7ecb8b` retained as context. HEAD matches the candidate. Independent Git inspection confirms `4f7dd6036b233923f2ea16db20d5369fea0fbf7f` adds review records only. The subsequent correction adds eight rustdoc lines and R2 task status/evidence; there is no executable change. Tracked source remains clean.
+
+Inputs: current subject/map, claim comparison, remediation review and verification; prior R1 verdict, independent findings validation and verification; R2 remediation task; approved revision-16 spec and original TASK-003 acceptance context. Root instructions, Rust rustdoc requirements, maintainer guidance and spec-driven workflow govern this bounded review. No CodeGraph directory exists. This validator independently inspected the actual diff, complete helper, immediate assertions, logical identity implementation and managed-column declaration rather than adopting the closure review's conclusion.
+
+| Obligation / stable ID | Independent source and proof assessment | Result |
+|---|---|---|
+| FIND-TASK-003-6: meaningful item-local purpose/invariants | `preprocess.rs:1333–1340` attaches rustdoc directly to nested `rows`. The body builds one row from the four named arguments. `logical_data_identity` skips managed noncorrelation fields; `tables/managed_columns.rs:93–99` classifies workload as correlation and request/time separately. The docs accurately distinguish bound value/workload from skipped request/receipt. Immediate assertions prove volatile equality and both stable inequalities. | CLOSED |
+| FIND-TASK-003-6: accurate Panics | Full helper ends in `RecordBatch::try_new(...).expect("identity batch")`; its own Panics section identifies failure to build arrays under the declared schema. It returns `RecordBatch`, so Errors documentation is unnecessary. | CLOSED |
+| Preserve accepted proof and bounded correction | All eight source additions are `///` lines. Signature, schema, arrays, body, four calls and assertions are unchanged. No new item, dependency, guard, suppression, test rename or contract is introduced. R2 task changes are status and evidence only. | PASS |
+| FIND-TASK-003-1: accepted attempt origin | Carry forward R1 source-backed closure for per-attempt projection, accepted environment/request and shared local/peer attribution. | CLOSED, carried |
+| FIND-TASK-003-2: public dimension refusal | Carry forward R1 source-backed Frame refusal, null-placeholder and trusted Rows/canonical sibling acceptance. | CLOSED, carried |
+| FIND-TASK-003-3: exact shared owner | Carry forward R1 source-backed `AuthContext::workload` / existing `owning_root` selection and accepted `frame.workload` handoff. | CLOSED, carried |
+| FIND-TASK-003-4: stable replay identity | Carry forward R1 source-backed stable correlation digest and warm/durable reuse closure; inspected unchanged digest and volatility rule also support the new docs. | CLOSED, carried |
+| FIND-TASK-003-5: retained subject projection | Carry forward R1 source-backed retained lookup for accepted delivery and live lookup for fresh public membership. | CLOSED, carried |
+| Original catalog/schema/layout/projection/SDK/lifecycle/reader acceptance and non-goals | Prior source-backed accepted evidence remains applicable: this delta changes no executable code, dependency or authority. No concrete evidence invalidates an accepted boundary. | PASS, carried |
+| Focused verification | Current `verification.md` records orchestrator PASS for `mise run fmt:check` and `git diff --check ee970fbbe b816db48e`. Source inspection directly establishes documentation closure and absence of behavior change. | PASS |
+
+The existing local helper is the smallest correction owner. Its documentation closes the explicit mandatory gate without rewriting accepted proof; deletion, inlining, new machinery or another runtime suite would add work without resolving a further gap. No correction burden or specification decision remains. The selected closure report is complete, its proposed finding union is empty, and independent inspection confirms that empty ledger. No new blocker or material conflict was discovered, so separate focused validation or expanded discovery is unnecessary.
+
+Verification provenance: this validator ran only read-only Git/source/authority inspection and edited this report. Current formatting/whitespace execution belongs to the orchestrator. R1 verification independently records three exact identity/Rows tests passing, nextest ID `89832355-57b0-4b12-8b09-1d4d81dfc89d`; broader journey/lint/library outcomes remain recorded implementation evidence, not fresh executions here. Prior R1 validation's diagnosis-transcript limitation also remains unchanged.
+
+Skipped builds, tests, lints, codegen and comprehensive rediscovery for this documentation-only delta. Functional confidence retains the provenance and limits of prior accepted evidence; no additional risk is introduced by the correction.

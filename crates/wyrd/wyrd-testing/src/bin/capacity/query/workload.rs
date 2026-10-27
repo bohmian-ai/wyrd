@@ -1,4 +1,4 @@
-//! The `vala.datasets.events` fixture, the named benchmark cases, their exact
+//! The `bifrost.datasets.events` fixture, the named benchmark cases, their exact
 //! answers, and their targets.
 //!
 //! Everything the benchmark writes and asks lives here, in plain functions of
@@ -13,12 +13,12 @@ use num_traits::ToPrimitive;
 
 /// Fully qualified table every read case queries.
 ///
-/// `vala.datasets` because it is the one namespace whose tables a public
+/// `bifrost.datasets` because it is the one namespace whose tables a public
 /// client may register.
-pub const TABLE: &str = "vala.datasets.events";
+pub const TABLE: &str = "bifrost.datasets.events";
 
 /// Second table that takes the concurrent writes, so read answers never move.
-pub const INGEST_TABLE: &str = "vala.datasets.events_ingest";
+pub const INGEST_TABLE: &str = "bifrost.datasets.events_ingest";
 
 /// Rows in the standard fixture.
 pub const STANDARD_ROWS: i64 = 10_000_000;
@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(
             Case::SmallAggregate.sql(fixture, 65),
             "SELECT service_id, COUNT(*) AS events, SUM(duration_ms) AS total_ms FROM \
-             vala.datasets.events WHERE event_id >= 1000000 AND event_id < 1100000 \
+             bifrost.datasets.events WHERE event_id >= 1000000 AND event_id < 1100000 \
              GROUP BY service_id ORDER BY service_id"
         );
         let small = Case::SmallAggregate.expected(fixture, 1);

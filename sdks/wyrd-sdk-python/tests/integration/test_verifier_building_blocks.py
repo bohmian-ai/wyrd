@@ -598,7 +598,7 @@ def test_delegated_tools_keep_the_narrower_authority(
     wyrd_server.flush_bifrost()
     attributed = Bifrost(client=client_of(wyrd_server)).sql(
         "SELECT sub_principal_id, act_principal_id "
-        "FROM vala.verification.results WHERE execution_id = $1",
+        "FROM bifrost.verification.results WHERE execution_id = $1",
         [result.execution_id],
         model=Attribution,
     )
@@ -637,7 +637,7 @@ def retained(wyrd_server: WyrdTestServer, execution_id: str) -> object:
     """The retained outcome of ``execution_id``, read back from Bifrost after publishing."""
     wyrd_server.flush_bifrost()
     [row] = Bifrost(client=client_of(wyrd_server)).sql(
-        "SELECT to_json(outcome) AS outcome FROM vala.verification.results WHERE execution_id = $1",
+        "SELECT to_json(outcome) AS outcome FROM bifrost.verification.results WHERE execution_id = $1",
         [execution_id],
         model=RetainedOutcome,
     )

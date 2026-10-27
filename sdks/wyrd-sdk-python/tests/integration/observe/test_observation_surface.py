@@ -23,7 +23,7 @@ from wyrd.testing import WyrdTestServer
 
 pytestmark = pytest.mark.integration
 
-DATASET = "vala.datasets.observed_rows"
+DATASET = "bifrost.datasets.observed_rows"
 """A caller-owned table runs record into."""
 
 BURST_OBSERVATIONS = 1_000
@@ -41,14 +41,14 @@ class RecordRow(BaseModel):
     """A ``DATASET`` row read back with the Card that recorded it."""
 
     value: int
-    card_uid: str
+    subject_card_uid: str
 
 
 class SpanRow(BaseModel):
     """A persisted span and the Card its run scope resolved to."""
 
     name: str
-    card_uid: str | None
+    subject_card_uid: str | None
 
 
 class FeatureCount(BaseModel):
@@ -97,21 +97,21 @@ def test_records_land_under_the_view_that_wrote_them(
     wyrd_server.flush_bifrost()
 
     rows = bifrost.sql(
-        f"SELECT value, card_uid FROM {dataset} WHERE run_id = $1 ORDER BY value",
+        f"SELECT value, subject_card_uid FROM {dataset} WHERE run_id = $1 ORDER BY value",
         [run.run_id],
         model=RecordRow,
     )
     assert rows == [
-        RecordRow(value=41, card_uid=str(observed_with_bifrost.card_ref("agent").uid)),
-        RecordRow(value=42, card_uid=str(observed_with_bifrost.card_ref("model").uid)),
+        RecordRow(value=41, subject_card_uid=str(observed_with_bifrost.card_ref("agent").uid)),
+        RecordRow(value=42, subject_card_uid=str(observed_with_bifrost.card_ref("model").uid)),
     ]
 
 
 @pytest.mark.parametrize(
     ("table", "code"),
     [
-        ("vala.drift.observations", "WYRD_SDK_400_INVALID_OBSERVATION"),
-        ("vala.datasets.never_registered", "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"),
+        ("bifrost.drift.observations", "WYRD_SDK_400_INVALID_OBSERVATION"),
+        ("bifrost.datasets.never_registered", "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"),
     ],
 )
 def test_record_into_a_managed_or_unregistered_table_is_refused(
@@ -142,13 +142,13 @@ def test_framework_spans_join_their_run_scope(
 
     agent = str(observed_with_bifrost.card_ref("agent").uid)
     spans = bifrost.sql(
-        "SELECT name, card_uid FROM vala.traces.spans WHERE run_id = $1 ORDER BY name",
+        "SELECT name, subject_card_uid FROM bifrost.traces.spans WHERE run_id = $1 ORDER BY name",
         [run.run_id],
         model=SpanRow,
     )
     assert spans == [
-        SpanRow(name="agent.invoke", card_uid=agent),
-        SpanRow(name="agent.tool", card_uid=agent),
+        SpanRow(name="agent.invoke", subject_card_uid=agent),
+        SpanRow(name="agent.tool", subject_card_uid=agent),
     ]
 
 
@@ -170,7 +170,7 @@ def test_nested_scope_stamps_its_view_and_restores_the_outer_one(
     wyrd_server.flush_bifrost()
 
     spans = bifrost.sql(
-        "SELECT name, card_uid FROM vala.traces.spans WHERE run_id = $1 ORDER BY name",
+        "SELECT name, subject_card_uid FROM bifrost.traces.spans WHERE run_id = $1 ORDER BY name",
         [run.run_id],
         model=SpanRow,
     )
@@ -179,10 +179,10 @@ def test_nested_scope_stamps_its_view_and_restores_the_outer_one(
         str(observed_with_bifrost.card_ref("model").uid),
     )
     assert spans == [
-        SpanRow(name="model.inner", card_uid=model),
-        SpanRow(name="pre.active", card_uid=root),
-        SpanRow(name="root.before", card_uid=root),
-        SpanRow(name="root.restored", card_uid=root),
+        SpanRow(name="model.inner", subject_card_uid=model),
+        SpanRow(name="pre.active", subject_card_uid=root),
+        SpanRow(name="root.before", subject_card_uid=root),
+        SpanRow(name="root.restored", subject_card_uid=root),
     ]
 
 
@@ -220,20 +220,24 @@ def test_async_tasks_keep_the_view_they_started_in(
     wyrd_server.flush_bifrost()
 
     spans = bifrost.sql(
-        "SELECT name, card_uid FROM vala.traces.spans WHERE run_id = $1 ORDER BY name",
+        "SELECT name, subject_card_uid FROM bifrost.traces.spans WHERE run_id = $1 ORDER BY name",
         [run.run_id],
         model=SpanRow,
     )
     root = str(observed_with_bifrost.card_ref("root").uid)
     assert spans == [
-        SpanRow(name="async.await", card_uid=root),
+        SpanRow(name="async.await", subject_card_uid=root),
         SpanRow(
-            name="async.concurrent.a", card_uid=str(observed_with_bifrost.card_ref("agent").uid)
+            name="async.concurrent.a",
+            subject_card_uid=str(observed_with_bifrost.card_ref("agent").uid),
         ),
         SpanRow(
-            name="async.concurrent.b", card_uid=str(observed_with_bifrost.card_ref("agent").uid)
+            name="async.concurrent.b",
+            subject_card_uid=str(observed_with_bifrost.card_ref("agent").uid),
         ),
-        SpanRow(name="async.spawned", card_uid=str(observed_with_bifrost.card_ref("model").uid)),
+        SpanRow(
+            name="async.spawned", subject_card_uid=str(observed_with_bifrost.card_ref("model").uid)
+        ),
     ]
 
 
@@ -251,7 +255,7 @@ def test_drift_burst_through_a_byte_budget_override_lands_once_per_sample(
     wyrd_server.flush_bifrost()
 
     counts = bifrost.sql(
-        "SELECT COUNT(*) AS n FROM vala.drift.observations WHERE run_id = $1 GROUP BY record_id",
+        "SELECT COUNT(*) AS n FROM bifrost.drift.observations WHERE run_id = $1 GROUP BY record_id",
         [model.run_id],
         model=FeatureCount,
     )

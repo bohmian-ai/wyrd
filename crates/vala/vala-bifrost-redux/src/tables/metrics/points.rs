@@ -1,4 +1,4 @@
-//! `vala.metrics.points` — the sole canonical durable table for the `OTLP`
+//! `bifrost.metrics.points` — the sole canonical durable table for the `OTLP`
 //! metric signal.
 //!
 //! [`METRIC_FIELDS`] is the table's ledger. One row is one data point of one
@@ -15,8 +15,7 @@ use crate::tables::fields::{
 };
 use crate::tables::signal;
 use crate::tables::{
-    CanonicalBatchValidator, CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc,
-    sort_desc,
+    CanonicalBatchValidator, DomainTable, PayloadClass, attributed_layout, hourly_layout,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
@@ -98,14 +97,16 @@ pub static EXEMPLAR_ELEMENT: F = F::sensitive(
     false,
 );
 
-/// The canonical `vala.metrics.points` ledger.
+/// The canonical `bifrost.metrics.points` ledger.
 ///
 /// Every kind-specific column is nullable because a point of another kind does not
 /// own it; the projector, not nullability, is what forbids a point from
 /// carrying a shape its declared kind cannot own. The trailing promoted
 /// resource columns copy well-known semantic-convention values out of
 /// `resource_attributes` so they can be filtered without decoding; each is
-/// null when its source is absent or is not a string.
+/// null when its source is absent or carries the wrong type, and the last
+/// duplicate key wins. The three subject columns are reserved for server
+/// attribution and stay null on projection.
 pub static METRIC_FIELDS: &[CanonicalField] = &[
     F::meta("metric_name", T::Utf8, false),
     F::meta("description", T::Utf8, false),
@@ -153,6 +154,15 @@ pub static METRIC_FIELDS: &[CanonicalField] = &[
     F::meta("service_name", T::Utf8, true),
     F::meta("service_version", T::Utf8, true),
     F::meta("deployment_environment", T::Utf8, true),
+    F::meta("service_namespace", T::Utf8, true),
+    F::meta("service_instance_id", T::Utf8, true),
+    F::meta("process_pid", T::Int64, true),
+    F::meta("telemetry_sdk_name", T::Utf8, true),
+    F::meta("telemetry_sdk_language", T::Utf8, true),
+    F::meta("telemetry_sdk_version", T::Utf8, true),
+    F::meta("subject_kind", T::Utf8, true),
+    F::meta("subject_name", T::Utf8, true),
+    F::meta("subject_version", T::Utf8, true),
 ];
 
 /// The canonical durable table for the `OTLP` metric signal.
@@ -161,7 +171,6 @@ pub struct PointsTable;
 impl DomainTable for PointsTable {
     const NAMESPACE: &'static str = "metrics";
     const NAME: &'static str = "points";
-    const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[
         "metadata",
@@ -183,18 +192,11 @@ impl DomainTable for PointsTable {
         canonical_arrow_fields(METRIC_FIELDS)
     }
 
+    /// Declares the attributed hourly layout on `time_unix_nano`: rows sort by
+    /// environment, Service name, and Service version, then newest first, and
+    /// the Bloom set is the attribution columns plus
+    /// `metric_name` so a per-metric lookup prunes point files.
     fn physical_layout() -> PhysicalLayoutWire {
-        hourly_layout(
-            "time_unix_nano",
-            vec![sort_desc("time_unix_nano"), sort_asc("metric_name")],
-            &[
-                "run_id",
-                "card_uid",
-                "sub_principal_id",
-                "act_principal_id",
-                "metric_name",
-                "metric_type",
-            ],
-        )
+        attributed_layout(hourly_layout, "time_unix_nano", &["metric_name"])
     }
 }

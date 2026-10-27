@@ -108,7 +108,7 @@ async fn leader_timer_rewrites_manifests_before_expiry() {
     let forge = table.supervised.forge();
     let missing = ForgeTableKey {
         tenant: table.fixture.tenant,
-        table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "aaa_missing")
+        table: ForgeTaskTableIdentity::new("wyrd-redux", "bifrost.bifrost", "aaa_missing")
             .expect("valid nonexistent identity"),
     };
     forge

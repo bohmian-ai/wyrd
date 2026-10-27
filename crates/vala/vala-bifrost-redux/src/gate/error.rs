@@ -50,11 +50,13 @@ pub enum IngestError {
     /// selected a root.
     #[error("Card attribution requires a selected workload root")]
     WorkloadContextRequired,
-    /// An `x-wyrd-workload-uid` selector was malformed, contradicted the
-    /// bearer's signed root, or named a root native ingest cannot resolve;
-    /// carries the shared selector refusal unchanged.
-    #[error("workload selector refused: {0}")]
-    WorkloadSelector(WyrdError),
+    /// The request's context headers were refused: an `x-wyrd-workload-uid`
+    /// selector was malformed, contradicted the bearer's signed root, or named
+    /// a root native ingest cannot resolve, or an
+    /// `x-wyrd-deployment-environment` was repeated, empty, or not UTF-8;
+    /// carries the shared refusal unchanged.
+    #[error("request context refused: {0}")]
+    RequestContext(WyrdError),
     /// A per-row `card_ref` was present but could not be resolved to a `card_uid`
     /// by the server (unknown card, cross-tenant, or uid not available). Fail-closed
     /// (M-11): an authenticated write with an unresolvable `card_ref` is always rejected.
@@ -181,7 +183,7 @@ impl IngestError {
             Self::TableNotFound { .. } | Self::SchemaMismatch { .. } => "catalog",
             Self::IngressClosed => "role_unavailable",
             Self::IngestBusy { .. } | Self::WalDiskFull => "scribe_admission",
-            Self::Unauthenticated(_) | Self::PrincipalUnresolved | Self::WorkloadSelector(_) => {
+            Self::Unauthenticated(_) | Self::PrincipalUnresolved | Self::RequestContext(_) => {
                 "auth"
             }
             Self::Internal(_) => return None,
@@ -210,7 +212,7 @@ impl IngestError {
             }
             .into(),
             Self::PrincipalUnresolved => BifrostError::PrincipalUnresolved.into(),
-            Self::WorkloadSelector(error) => error.clone(),
+            Self::RequestContext(error) => error.clone(),
             Self::ContractViolation(error) => error.clone().into(),
             Self::RequestValidation(detail) | Self::Decode(detail) => {
                 BifrostError::OtlpRequestMalformed {
@@ -472,7 +474,7 @@ mod tests {
                 Code::PermissionDenied,
             ),
             (
-                IngestError::WorkloadSelector(wyrd_spec::error::WyrdError::WorkloadUidRefused {
+                IngestError::RequestContext(wyrd_spec::error::WyrdError::WorkloadUidRefused {
                     message: "refused".to_owned(),
                     details: serde_json::json!({}),
                 }),
@@ -626,10 +628,15 @@ mod tests {
     }
 
     /// Stable ingest saturation alone carries the exact gRPC retry marker.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `IngestBusy` is not `ResourceExhausted` with a `retry-after-ms`
+    /// of `1000`, or a permanent capacity refusal carries that marker.
     #[test]
     fn ingest_busy_grpc_retry_metadata() {
         let busy = IngestError::IngestBusy {
-            table: "vala.traces.spans".to_owned(),
+            table: "bifrost.traces.spans".to_owned(),
         }
         .into_status();
         assert_eq!(busy.code(), Code::ResourceExhausted);
@@ -653,66 +660,71 @@ mod tests {
 
     /// Assert that Scribe remains domain-only while Gate supplies stable
     /// transport identity and preserves the Scribe-provided table where present.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Scribe error projects to a public code other than its
+    /// catalogued one, or the busy refusal loses the Scribe-provided table name.
     #[test]
     fn scribe_errors_project_through_gate_without_fallback_identity() {
         let cases = [
             (
                 ScribeError::IngestBusy {
-                    table: "vala.metrics.points".to_owned(),
+                    table: "bifrost.metrics.points".to_owned(),
                 },
                 "WYRD_VALA_429_INGEST_BUSY",
-                "vala.metrics.points",
+                "bifrost.metrics.points",
             ),
             (
                 ScribeError::PayloadTooLarge { bytes: 2, limit: 1 },
                 "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::FingerprintMismatch {
-                    table: "vala.logs.records".to_owned(),
+                    table: "bifrost.logs.records".to_owned(),
                 },
                 "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
-                "vala.logs.records",
+                "bifrost.logs.records",
             ),
             (
                 ScribeError::TableNotFound {
-                    table: "vala.bifrost.missing".to_owned(),
+                    table: "bifrost.bifrost.missing".to_owned(),
                 },
                 "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
-                "vala.bifrost.missing",
+                "bifrost.bifrost.missing",
             ),
             (
                 ScribeError::InvalidFrame,
                 "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::CardScopeDenied,
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::IngressClosed,
                 "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::WalDiskFull,
                 "WYRD_VALA_507_WAL_DISK_FULL",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::UnsupportedWalVersion { version: 2 },
                 "WYRD_VALA_500_BIFROST_INTERNAL",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
             (
                 ScribeError::Internal {
                     detail: "broken".to_owned(),
                 },
                 "WYRD_VALA_500_BIFROST_INTERNAL",
-                "vala.traces.spans",
+                "bifrost.traces.spans",
             ),
         ];
 
@@ -723,7 +735,7 @@ mod tests {
             if expected_code == "WYRD_VALA_429_INGEST_BUSY" {
                 assert_eq!(
                     public.to_string(),
-                    "ingest writer busy: vala.metrics.points"
+                    "ingest writer busy: bifrost.metrics.points"
                 );
             }
         }
@@ -753,7 +765,7 @@ mod tests {
                 "gate taxonomy must retain both bounds: {ingest_error:?}"
             );
 
-            let public = ingest_error.to_wyrd_error("vala.traces.spans");
+            let public = ingest_error.to_wyrd_error("bifrost.traces.spans");
             assert_eq!(public.code(), "WYRD_VALA_413_PAYLOAD_TOO_LARGE");
             assert_eq!(public.status(), 413);
 

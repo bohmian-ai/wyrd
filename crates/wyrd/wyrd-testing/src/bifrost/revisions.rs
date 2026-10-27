@@ -43,7 +43,7 @@ pub fn composite_first_hour_micros() -> i64 {
         .timestamp_micros()
 }
 
-/// Registers the composite table `vala.datasets.<name>` through the real
+/// Registers the composite table `bifrost.datasets.<name>` through the real
 /// catalog and returns its qualified name.
 ///
 /// # Panics
@@ -80,7 +80,7 @@ pub async fn register_composite_table(
         })
         .await
         .expect("the catalog registers the composite table");
-    format!("vala.datasets.{name}")
+    format!("bifrost.datasets.{name}")
 }
 
 /// The composite table's user schema.

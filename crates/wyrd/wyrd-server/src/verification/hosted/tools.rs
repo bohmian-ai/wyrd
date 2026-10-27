@@ -248,7 +248,6 @@ impl Invocation {
                 tokio::task::spawn_blocking(move || workspace.search(&search))
                     .await
                     .map_err(|error| invocation(error.to_string()))?
-                    .map_err(|error| invocation(error.to_string()))
             }
             BuiltinTool::FsList | BuiltinTool::FsRead | BuiltinTool::FsExtract => {
                 let workspace = Arc::clone(self.workspace()?);
@@ -265,7 +264,6 @@ impl Invocation {
                 })
                 .await
                 .map_err(|error| invocation(error.to_string()))?
-                .map_err(|error| invocation(error.to_string()))
             }
             BuiltinTool::CodeRun => {
                 let CodeArgs { source } = parse(args)?;
@@ -582,7 +580,7 @@ fn to_value<T: serde::Serialize>(result: Result<T, WyrdError>) -> Result<Value, 
 }
 
 /// A Wyrd error as a structured tool failure with its stable code.
-fn structured(error: &WyrdError) -> ToolError {
+pub(super) fn structured(error: &WyrdError) -> ToolError {
     let problem = error.problem();
     ToolError::StructuredInvocation(Box::new(StructuredInvocationError {
         code: problem.code,
@@ -595,7 +593,7 @@ fn structured(error: &WyrdError) -> ToolError {
 }
 
 /// A plain tool failure with `detail`.
-fn invocation(detail: String) -> ToolError {
+pub(super) fn invocation(detail: String) -> ToolError {
     ToolError::Invocation {
         detail,
         cause: None,

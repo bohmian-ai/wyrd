@@ -11,6 +11,23 @@ use zip::write::SimpleFileOptions;
 
 use super::*;
 
+/// The stable code and repair rule of a refused tool call.
+///
+/// # Panics
+/// Panics when `result` succeeded.
+fn refusal(result: Result<Value, ToolError>) -> (String, Value) {
+    let error = result.expect_err("refused");
+    let rule = error
+        .safe_details()
+        .map_or(Value::Null, |details| details["rule"].clone());
+    (error.code(), rule)
+}
+
+/// The expected refusal for repair `rule`.
+fn invalid(rule: &str) -> (String, Value) {
+    ("WYRD_SPEC_400_VALIDATION".to_owned(), json!(rule))
+}
+
 /// A stored zip archive holding `parts`.
 ///
 /// # Panics
@@ -142,8 +159,18 @@ fn workspace_reads_lines_and_extracts_on_request() {
             .expect("markdown")["units"],
         json!([{"locator": loc(Locator::Lines { start: 2, end: 2 }), "text": "within 30 days"}])
     );
-    for refused in ["/inputs/memo.docx", "/inputs/policy", "/inputs", "/work"] {
-        assert!(workspace.read(refused, 0).is_err(), "{refused}");
+    for (refused, rule) in [
+        ("/inputs/memo.docx", "utf8_text"),
+        ("/inputs/policy", "regular_file"),
+        ("/inputs", "regular_file"),
+        ("/work", "regular_file"),
+        ("/inputs/missing.md", "workspace_missing"),
+    ] {
+        assert_eq!(
+            refusal(workspace.read(refused, 0)),
+            invalid(rule),
+            "{refused}"
+        );
     }
 
     let extracted = workspace
@@ -168,15 +195,20 @@ fn workspace_reads_lines_and_extracts_on_request() {
             .extract("/inputs/memo.docx", "/work/nested/memo.json")
             .is_ok()
     );
-    for (path, output) in [
-        ("/inputs/deck.pdf", "/work/deck.json"),
-        ("/inputs/deck.pdf", "/inputs/deck.json"),
-        ("/inputs/deck.pdf", "/work/../deck.json"),
-        ("/inputs/policy", "/work/policy.json"),
-        ("/inputs/missing.pdf", "/work/missing.json"),
+    for (path, output, rule) in [
+        ("/inputs/deck.pdf", "/work/deck.json", "output_exists"),
+        ("/inputs/deck.pdf", "/inputs/deck.json", "output_path"),
+        ("/inputs/deck.pdf", "/work/../deck.json", "output_path"),
+        ("/inputs/policy", "/work/policy.json", "regular_file"),
+        (
+            "/inputs/missing.pdf",
+            "/work/missing.json",
+            "workspace_missing",
+        ),
     ] {
-        assert!(
-            workspace.extract(path, output).is_err(),
+        assert_eq!(
+            refusal(workspace.extract(path, output)),
+            invalid(rule),
             "{path} -> {output}"
         );
     }
@@ -187,10 +219,9 @@ fn workspace_reads_lines_and_extracts_on_request() {
     );
     corrupt.format = None;
     let workspace = open(vec![corrupt]).expect("materializes");
-    assert!(
-        workspace
-            .extract("/inputs/bad.pdf", "/work/bad.json")
-            .is_err()
+    assert_eq!(
+        refusal(workspace.extract("/inputs/bad.pdf", "/work/bad.json")),
+        invalid("extraction_refused")
     );
     assert!(!workspace.work_dir().join("bad.json").exists());
     assert_eq!(
@@ -299,23 +330,36 @@ fn workspace_search_matches_lines() {
         ..query("refund")
     };
     assert_eq!(hits(rooted), ["/inputs/other/refunds.md:1"]);
-    for refused in [
-        Search {
-            regex: true,
-            ..query("(")
-        },
-        Search {
-            glob: Some("/inputs/*".to_owned()),
-            ..query("refund")
-        },
-        Search {
-            glob: Some("../*".to_owned()),
-            ..query("refund")
-        },
-        scoped("/inputs/missing", None),
-        query(""),
+    for (refused, rule) in [
+        (
+            Search {
+                regex: true,
+                ..query("(")
+            },
+            "search_pattern",
+        ),
+        (
+            Search {
+                glob: Some("/inputs/*".to_owned()),
+                ..query("refund")
+            },
+            "search_glob",
+        ),
+        (
+            Search {
+                glob: Some("../*".to_owned()),
+                ..query("refund")
+            },
+            "search_glob",
+        ),
+        (scoped("/inputs/missing", None), "workspace_missing"),
+        (query(""), "search_query"),
     ] {
-        assert!(workspace.search(&refused).is_err(), "{refused:?}");
+        assert_eq!(
+            refusal(workspace.search(&refused)),
+            invalid(rule),
+            "{refused:?}"
+        );
     }
     let record = format!("lead\nREFUND {}\n", "é".repeat(35_000));
     let wide = open(vec![staged(
@@ -582,10 +626,23 @@ fn workspace_refuses_bad_paths_and_limits() {
         MediaFormat::Png,
     )])
     .expect("binary materializes");
-    assert!(workspace.read("/inputs/img.png", 0).is_err());
+    assert_eq!(
+        refusal(workspace.read("/inputs/img.png", 0)),
+        invalid("utf8_text")
+    );
     std::os::unix::fs::symlink("/etc/hostname", workspace.work_dir().join("link.txt"))
         .expect("link");
-    assert!(workspace.read("/work/link.txt", 0).is_err());
-    assert!(workspace.read("/work/../inputs/img.png", 0).is_err());
-    assert!(workspace.list("/etc").is_err());
+    assert_eq!(
+        refusal(workspace.read("/work/link.txt", 0)),
+        invalid("regular_file")
+    );
+    assert_eq!(
+        refusal(workspace.read("/work/../inputs/img.png", 0)),
+        invalid("workspace_path")
+    );
+    assert_eq!(refusal(workspace.list("/etc")), invalid("workspace_path"));
+    assert_eq!(
+        refusal(workspace.extract("/inputs/img.png", "/work/img.json")),
+        invalid("extractable_document")
+    );
 }

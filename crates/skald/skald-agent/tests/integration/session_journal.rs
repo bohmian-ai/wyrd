@@ -16,7 +16,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiMessageContent, OpenAiToolCall, OpenAiToolFunctionCall,
 };
 use skald_spec::{Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse};
-use skald_tool::{AgentTool, ToolError};
+use skald_tool::{AgentTool, StructuredInvocationError, ToolError};
 use wyrd_spec::error::WyrdError;
 
 #[tokio::test]
@@ -370,6 +370,57 @@ async fn before_model_abort_journals_synthetic_model_result_then_agent_finish() 
     assert!(matches!(events[4], JournalEvent::AgentFinish { .. }));
 }
 
+/// A failed tool result hands the model the failure's code, message, and
+/// agent-safe details, so it can repair the call; a plain failure has none.
+///
+/// # Panics
+/// Panics when the run fails or a result lacks its failure envelope.
+#[tokio::test]
+async fn failed_tool_results_carry_safe_details() {
+    let providers = registry(RecordingProvider::new(vec![
+        openai_tool_call_response(vec![
+            tool_call("c1", "tool_refuse", json!({})),
+            tool_call("c2", "tool_fail", json!({})),
+        ]),
+        openai_text_response("done"),
+    ]));
+    let agent = Agent::from_resolved("test", test_prompt())
+        .add_tool(Arc::new(RefusingTool))
+        .add_tool(Arc::new(FailingTool))
+        .with_run_config(RunConfig {
+            max_iterations: 3,
+            ..Default::default()
+        });
+
+    let run = agent
+        .run_with(&providers, None, "hello")
+        .await
+        .expect("run ok");
+
+    let results: Vec<_> = run
+        .conversation
+        .turns()
+        .iter()
+        .filter_map(|turn| match turn {
+            ConversationTurn::ToolResult { ok, content, .. } => Some((*ok, content.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results[0],
+        (
+            false,
+            json!({
+                "code": "WYRD_SPEC_400_VALIDATION",
+                "error": "tool invocation failed with structured metadata: path: /etc is not under /inputs or /work",
+                "details": {"rule": "workspace_path", "field": "path"},
+            })
+        )
+    );
+    assert_eq!(results[1].1["code"], "SKALD_TOOL_500_CALL");
+    assert!(results[1].1.get("details").is_none(), "{:?}", results[1]);
+}
+
 #[tokio::test]
 async fn tool_results_are_journaled_and_conversation_order_is_deterministic() {
     let journal = Arc::new(RecordingJournal::new());
@@ -690,6 +741,43 @@ impl AgentTool for FailingTool {
             detail: "test failure".to_owned(),
             cause: None,
         })
+    }
+}
+
+/// A tool whose call the model can repair: it refuses with a structured
+/// error carrying agent-safe details.
+#[derive(Debug)]
+struct RefusingTool;
+
+#[async_trait]
+impl AgentTool for RefusingTool {
+    fn name(&self) -> &'static str {
+        "tool_refuse"
+    }
+
+    fn description(&self) -> &'static str {
+        "refusing test tool"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn output_schema(&self) -> Value {
+        json!({})
+    }
+
+    async fn invoke(&self, _args: Value) -> Result<Value, ToolError> {
+        Err(ToolError::StructuredInvocation(Box::new(
+            StructuredInvocationError {
+                code: "WYRD_SPEC_400_VALIDATION".to_owned(),
+                status: 400,
+                title: "Validation failed".to_owned(),
+                detail: "path: /etc is not under /inputs or /work".to_owned(),
+                remediation: "Fix the field".to_owned(),
+                safe_details: Some(json!({"rule": "workspace_path", "field": "path"})),
+            },
+        )))
     }
 }
 

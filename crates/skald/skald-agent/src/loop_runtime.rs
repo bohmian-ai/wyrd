@@ -591,13 +591,14 @@ impl Agent {
                             ChainResult::Replaced(Ok(value)) => (true, value),
                             ChainResult::Replaced(Err(error)) => {
                                 record_error(&tool_span, &error.code());
-                                (
-                                    false,
-                                    serde_json::json!({
-                                        "code": error.code(),
-                                        "error": error.to_string(),
-                                    }),
-                                )
+                                let mut content = serde_json::json!({
+                                    "code": error.code(),
+                                    "error": error.to_string(),
+                                });
+                                if let Some(details) = error.safe_details() {
+                                    content["details"] = details.clone();
+                                }
+                                (false, content)
                             }
                             ChainResult::Abort(error, _) => {
                                 record_error(&tool_span, error.code());

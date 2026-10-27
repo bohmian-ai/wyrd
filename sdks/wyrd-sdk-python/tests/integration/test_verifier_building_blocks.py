@@ -863,6 +863,9 @@ def wyrd(*args: str) -> subprocess.CompletedProcess[str]:
 INVALID = "WYRD_LOADER_400_INVALID_ENVELOPE"
 """The stable code of an upload the loader refuses before declaring anything."""
 
+VALIDATION = "WYRD_SPEC_400_VALIDATION"
+"""The stable code of a refusal the caller repairs by the rule in its details."""
+
 HANDBOOK = {"type": "str", "value": "handbook"}
 """An authored ``spec.metadata`` value, in its tagged non-secret form."""
 
@@ -952,9 +955,9 @@ def test_artifact_upload_preserves_files_and_versions(cards: Cards, tmp_path: Pa
     }
     assert refused == {
         "blank-kind-upload": ("WYRD_SPEC_400_VALIDATION", "artifact_kind"),
-        "linked-upload": (INVALID, INVALID),
+        "linked-upload": (VALIDATION, "artifact_source_regular"),
         "missing-upload": (INVALID, "WYRD_LOADER_400_IO"),
-        "empty-upload": (INVALID, INVALID),
+        "empty-upload": (VALIDATION, "artifact_source_empty"),
     }
     for name in refused:
         assert not cards.list(kind="Artifact", name=name).refs, name
@@ -1031,9 +1034,9 @@ def test_artifact_upload_extracts_before_registration(cards: Cards, tmp_path: Pa
     (source / "extracted/handbook.md.json").unlink()
     (source / "extracted").rmdir()
     assert (corrupt, reported, colliding) == (
-        (INVALID, INVALID),
-        ("WYRD_SPEC_400_VALIDATION", "extraction_report"),
-        (INVALID, INVALID),
+        (VALIDATION, "extraction_refused"),
+        (VALIDATION, "extraction_report"),
+        (VALIDATION, "extraction_output_collision"),
     )
     for name in ("corrupt-handbook", "reported-handbook", "colliding-handbook"):
         assert not cards.list(kind="Artifact", name=name).refs, name
@@ -1143,6 +1146,11 @@ def tools_called(record: StepResult) -> list[str]:
     return [call["tool"] for call in record.get("tool_calls", [])]
 
 
+def recorded_codes(record: StepResult) -> list[str]:
+    """The error codes ``record`` keeps for its failed tool calls, in call order."""
+    return [call["error"].split(":")[0] for call in record.get("tool_calls", []) if "error" in call]
+
+
 def test_artifact_workspace_selects_files_and_directories(
     cards: Cards, wyrd_server: WyrdTestServer, tmp_path: Path
 ) -> None:
@@ -1183,8 +1191,10 @@ def test_artifact_workspace_selects_files_and_directories(
     assert lines(read)[1] == (2, "first release"), "a new version never retargets the pin"
 
 
-TOOL_FAILED = "SKALD_TOOL_500_CALL"
-"""The stable code of a tool call the tool itself refused, carried in its result."""
+def tool_refusal(result: dict[str, Any]) -> tuple[object, object]:
+    """The code and repair rule of a tool call the tool refused, carried in its result."""
+    return result.get("code"), result.get("details", {}).get("rule")
+
 
 OPAQUE = b"\xff\xfe\x00LIMIT"
 """Bytes no text tool reads, which ``code.run`` still reads from the mount."""
@@ -1224,13 +1234,12 @@ def test_agent_file_tools_read_without_extraction(
         ("fs.read", {"path": "/inputs/data/long.txt", "start": first_page["next"]})
     )[0]
     assert lines(resumed)[0] == (len(page) + 1, f"line {len(page) + 1}")
-    assert {"directory": directory, "blob": blob} == {
-        "directory": {
-            "code": TOOL_FAILED,
-            "error": directory.get("error"),
-        },
-        "blob": {"code": TOOL_FAILED, "error": blob.get("error")},
-    }
+    assert [tool_refusal(directory), tool_refusal(blob)] == [
+        (VALIDATION, "regular_file"),
+        (VALIDATION, "utf8_text"),
+    ]
+    assert "fs.list" in directory["error"] and "fs.extract" in blob["error"], (directory, blob)
+    assert recorded_codes(record) == [VALIDATION, VALIDATION], "the record keeps the model's code"
     assert lines(pdf) == [(1, "%PDF-1.7"), (2, "not a document")], "reading never extracts"
     assert hits(found) == [("/inputs/data/policy.json", 2)], "binary bytes are never searched"
     assert ran["value"] == repr(OPAQUE.hex()), "code.run reads the opaque mounted bytes"
@@ -1304,7 +1313,12 @@ def test_agent_file_search_supports_regex_across_files(
     assert hits(single) == [(py, 1), (py, 2), (py, 3)]
     assert hits(basename) == [(py, 1), (py, 2), (py, 3)]
     assert hits(recursive) == [(txt, 1)]
-    assert [each.get("code") for each in (bad_regex, bad_glob, bad_scope)] == [TOOL_FAILED] * 3
+    assert [tool_refusal(each) for each in (bad_regex, bad_glob, bad_scope)] == [
+        (VALIDATION, "search_pattern"),
+        (VALIDATION, "search_glob"),
+        (VALIDATION, "workspace_missing"),
+    ]
+    assert recorded_codes(record) == [VALIDATION] * 3, "the record keeps the model's code"
     assert none == {"matches": [], "truncated": False}
     assert many["truncated"] is True and 0 < len(many["matches"]) < 4000, len(many["matches"])
     [(path, _)] = hits(scratch)
@@ -1341,7 +1355,7 @@ def test_agent_extract_tool_writes_explicit_output(
     cards.upload_artifact(source, pinned_upload("extractable-docs"))
     probe = Probe(cards, wyrd_server, tmp_path / "probe", "extract-desk")
 
-    results = probe.play(
+    results, record = probe.play(
         ("fs.extract", {"path": "/inputs/docs/handbook.md", "output_path": "/work/handbook.json"}),
         ("fs.read", {"path": "/work/handbook.json"}),
         ("fs.extract", {"path": "/inputs/docs/handbook.md", "output_path": "/work/handbook.json"}),
@@ -1351,7 +1365,7 @@ def test_agent_extract_tool_writes_explicit_output(
         ("fs.extract", {"path": "/inputs/docs/handbook.md", "output_path": "/inputs/x.json"}),
         ("fs.extract", {"path": "/inputs/docs/handbook.md", "output_path": "/work/../x.json"}),
         ("fs.list", {"path": "/work"}),
-    )[0]
+    )
     [extracted, read, *refused, listed] = results
 
     assert extracted["output_path"] == "/work/handbook.json"
@@ -1359,7 +1373,15 @@ def test_agent_extract_tool_writes_explicit_output(
     text = "\n".join(text for _, text in lines(read))
     assert json.loads(text) == {"format": "markdown", "text": "# Handbook\nEscalate.\n"}
     assert all(not unit.get("sources") for unit in read["units"]), "scratch is no citation source"
-    assert [each.get("code") for each in refused] == [TOOL_FAILED] * 6
+    assert [tool_refusal(each) for each in refused] == [
+        (VALIDATION, "output_exists"),
+        (VALIDATION, "extraction_refused"),
+        (VALIDATION, "extractable_document"),
+        (VALIDATION, "regular_file"),
+        (VALIDATION, "output_path"),
+        (VALIDATION, "output_path"),
+    ]
+    assert recorded_codes(record) == [VALIDATION] * 6, "the record keeps the model's code"
     assert [each["path"] for each in listed["files"]] == ["/work/handbook.json"]
 
 

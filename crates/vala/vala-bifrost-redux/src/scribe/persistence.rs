@@ -505,7 +505,7 @@ pub struct ImmutableGeneration {
     /// WAL handle retained for grace-ordered segment retirement.
     pub wal: crate::scribe::wal::WalHandle,
     /// Original Arrow batches, shared by tail and persistence readers.
-    pub rows: Vec<arrow::record_batch::RecordBatch>,
+    pub rows: Arc<[arrow::record_batch::RecordBatch]>,
     /// Arrow schema shared by the original append batches.
     pub schema: SchemaRef,
     /// WAL-derived append metadata paired with the batches.
@@ -564,7 +564,7 @@ impl ImmutableGeneration {
             wal_lsn_max,
             wal_segments,
             wal,
-            rows: frozen.batches.clone(),
+            rows: Arc::clone(&frozen.batches),
             schema: frozen.schema.clone(),
             append_metas: frozen.metas.clone(),
             row_count: frozen.row_count(),
@@ -587,9 +587,9 @@ impl ImmutableGeneration {
             shard_id: self.shard_id,
             seal_key: self.seal_key.clone(),
             schema: self.schema.clone(),
-            batches: self.rows.clone(),
+            batches: Arc::clone(&self.rows),
             // Staging writes the rows; it never prunes them.
-            statistics: Vec::new(),
+            statistics: Arc::default(),
             metas: self.append_metas.clone(),
             opened_at: self.opened_at,
             closed_at: self.closed_at,
@@ -3168,7 +3168,7 @@ mod tests {
                 wal_lsn_max: WalLsn::new(1),
                 wal_segments: Vec::new(),
                 wal: self.wal.handle_for_shard(0).expect("WAL handle"),
-                rows,
+                rows: rows.into(),
                 schema,
                 append_metas: vec![crate::scribe::wal::ScribeAppendMeta {
                     batch_id: *batch_id.as_bytes(),

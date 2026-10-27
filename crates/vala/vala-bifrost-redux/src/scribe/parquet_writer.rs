@@ -1292,8 +1292,8 @@ mod tests {
             seal_key,
             shard_id: 0,
             schema: batch.schema(),
-            batches: vec![batch],
-            statistics: Vec::new(),
+            batches: vec![batch].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1365,8 +1365,9 @@ mod tests {
             batches: vec![
                 whole_member_batch(0, 60 * 1024),
                 whole_member_batch(60 * 1024, 50 * 1024),
-            ],
-            statistics: Vec::new(),
+            ]
+            .into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1434,8 +1435,8 @@ mod tests {
             ),
             shard_id: 1,
             schema,
-            batches: vec![batch],
-            statistics: Vec::new(),
+            batches: vec![batch].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1677,11 +1678,12 @@ mod tests {
     fn parquet_footer_preserves_complete_claim_evidence() {
         let tenant = DataTenantId::new_v7();
         let mut frozen = incompressible_frozen(tenant, FILE_CANDIDATE_TARGET_ROWS + 16);
-        let whole = frozen.batches.remove(0);
+        let whole = frozen.batches[0].clone();
         frozen.batches = vec![
             whole.slice(0, FILE_CANDIDATE_TARGET_ROWS),
             whole.slice(FILE_CANDIDATE_TARGET_ROWS, 16),
-        ];
+        ]
+        .into();
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
         let scratch = tempfile::tempdir().expect("rolling scratch");
@@ -1943,8 +1945,8 @@ mod tests {
             ),
             shard_id: 0,
             schema: Arc::clone(&schema),
-            batches: vec![batch],
-            statistics: Vec::new(),
+            batches: vec![batch].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -2049,8 +2051,8 @@ mod tests {
             ),
             shard_id: 4,
             schema: Arc::clone(&schema),
-            batches: vec![stored_batch(vec![40, 10]), stored_batch(vec![30, 20])],
-            statistics: Vec::new(),
+            batches: vec![stored_batch(vec![40, 10]), stored_batch(vec![30, 20])].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -2654,7 +2656,7 @@ mod tests {
             DataTenantId::new_v7(),
             batches[0].clone(),
         );
-        frozen.batches = batches;
+        frozen.batches = batches.into();
         (frozen, layout)
     }
 
@@ -3040,8 +3042,8 @@ mod tests {
             ),
             shard_id: 0,
             schema: batch.schema(),
-            batches: vec![batch.clone()],
-            statistics: Vec::new(),
+            batches: vec![batch.clone()].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),

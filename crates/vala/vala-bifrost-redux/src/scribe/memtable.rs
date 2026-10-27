@@ -496,8 +496,8 @@ impl Memtable {
             shard_id: 0,
             seal_key: replayed.seal_key.clone(),
             schema,
-            batches,
-            statistics,
+            batches: batches.into(),
+            statistics: statistics.into(),
             metas,
             opened_at: Instant::now(),
             closed_at: Instant::now(),
@@ -974,7 +974,7 @@ impl Memtable {
                     if matches!(entry.state, ImmutableState::Durable { .. }) {
                         continue;
                     }
-                    sources.push(entry.frozen.readable_source(self.ordinal(entry.seal_id)));
+                    sources.push(entry.readable_source(self.ordinal(entry.seal_id)));
                 }
             }
         }
@@ -1338,9 +1338,11 @@ impl Default for Memtable {
 pub(crate) struct MemtableBucket {
     seal_key: SealKey,
     schema: SchemaRef,
-    batches: Vec<RecordBatch>,
-    /// Exact column bounds of each batch, index-aligned with `batches`.
-    statistics: Vec<Arc<Statistics>>,
+    /// Sealed runs of [`APPEND_RUN_LEN`] appends each, oldest first, shared
+    /// by reference with every live capture.
+    runs: Vec<AppendRun>,
+    /// The appends after the last sealed run, copied by a live capture.
+    tail: AppendTail,
     metas: Vec<ScribeAppendMeta>,
     row_count: usize,
     bytes_accumulated: usize,
@@ -1357,8 +1359,8 @@ impl MemtableBucket {
         Self {
             seal_key,
             schema,
-            batches: Vec::new(),
-            statistics: Vec::new(),
+            runs: Vec::new(),
+            tail: AppendTail::default(),
             metas: Vec::new(),
             row_count: 0,
             bytes_accumulated: 0,
@@ -1371,13 +1373,18 @@ impl MemtableBucket {
     /// Retains one append batch with its metadata and exact column bounds.
     ///
     /// The bounds are computed here, once per batch, so a live read prunes
-    /// the batch without scanning its rows.
+    /// the batch without scanning its rows. The tail seals into a shared run
+    /// once it holds [`APPEND_RUN_LEN`] appends.
     fn append(&mut self, meta: ScribeAppendMeta, batch: RecordBatch) {
         self.row_count += batch.num_rows();
         self.bytes_accumulated += estimate_batch_bytes(&batch);
-        self.statistics.push(batch_statistics(&batch));
-        self.batches.push(batch);
+        self.tail.statistics.push(batch_statistics(&batch));
+        self.tail.batches.push(batch);
+        self.tail.wal_lsns.push(meta.wal_lsn_max);
         self.metas.push(meta);
+        if self.tail.batches.len() == APPEND_RUN_LEN {
+            self.runs.push(self.tail.seal());
+        }
         self.last_insert_at = Instant::now();
     }
 
@@ -1415,8 +1422,22 @@ impl MemtableBucket {
     /// `(shard_id, seal_id)` pair is what the memtable registers in the
     /// hot-source registry. Producing both from one value is what keeps a
     /// published member's ordinal equal to its registered one.
-    fn freeze(self, seal_id: u64, shard_id: usize) -> FrozenMemtable {
-        let batches = self.batches;
+    ///
+    /// The generation's batches and bounds are concatenated from the sealed
+    /// runs and the tail once here, so the generation is shared by reference
+    /// from then on.
+    fn freeze(mut self, seal_id: u64, shard_id: usize) -> FrozenMemtable {
+        self.runs.push(self.tail.seal());
+        let batches = self
+            .runs
+            .iter()
+            .flat_map(|run| run.batches.iter().cloned())
+            .collect();
+        let statistics = self
+            .runs
+            .iter()
+            .flat_map(|run| run.statistics.iter().cloned())
+            .collect();
 
         let opened_at = self.first_insert_at;
         let closed_at = Instant::now();
@@ -1428,7 +1449,7 @@ impl MemtableBucket {
             seal_key: self.seal_key,
             schema: self.schema,
             batches,
-            statistics: self.statistics,
+            statistics,
             metas: self.metas,
             opened_at,
             closed_at,
@@ -1438,12 +1459,18 @@ impl MemtableBucket {
     }
 
     /// Captures this active bucket's batches for projection outside the lock.
+    ///
+    /// The sealed runs are shared by reference; only the tail's fewer than
+    /// [`APPEND_RUN_LEN`] appends are copied.
     fn readable_source(&self) -> ReadableSource {
+        let mut runs = Vec::with_capacity(self.runs.len() + 1);
+        runs.extend(self.runs.iter().cloned());
+        if !self.tail.batches.is_empty() {
+            runs.push(self.tail.run());
+        }
         ReadableSource::capture(
             &self.schema,
-            &self.batches,
-            &self.statistics,
-            &self.metas,
+            runs,
             self.seal_key.clone(),
             None,
             &self.charge,
@@ -1509,6 +1536,9 @@ pub struct ImmutableEntry {
     pub wal_lsn_max: crate::scribe::wal::WalLsn,
     /// Lifecycle state.
     pub state: ImmutableState,
+    /// Maximum WAL LSN of each append, index-aligned with the frozen
+    /// batches and derived once so a live capture shares it.
+    wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
 }
 
 impl ImmutableEntry {
@@ -1545,9 +1575,34 @@ impl ImmutableEntry {
                 .map(|meta| meta.wal_lsn_max)
                 .max()
                 .unwrap_or_else(|| crate::scribe::wal::WalLsn::new(0)),
+            wal_lsns: frozen.metas.iter().map(|meta| meta.wal_lsn_max).collect(),
             frozen,
             state: ImmutableState::PendingCommit,
         }
+    }
+
+    /// Captures this immutable generation's batches for projection outside
+    /// the lock, sharing its batches, bounds, and WAL positions by reference.
+    ///
+    /// Every batch is tagged with `generation`, the registry identity of this
+    /// generation, so a caller can tell which generations the cut served and
+    /// must not also read from their staged runs.
+    fn readable_source(
+        &self,
+        generation: crate::scribe::hot_source::GenerationOrdinal,
+    ) -> ReadableSource {
+        let run = AppendRun {
+            batches: Arc::clone(&self.frozen.batches),
+            statistics: Arc::clone(&self.frozen.statistics),
+            wal_lsns: Arc::clone(&self.wal_lsns),
+        };
+        ReadableSource::capture(
+            &self.frozen.schema,
+            vec![run],
+            self.frozen.seal_key.clone(),
+            Some(generation),
+            &self.frozen.charge,
+        )
     }
 
     fn is_pending(&self) -> bool {
@@ -1631,13 +1686,14 @@ pub struct FrozenMemtable {
     pub shard_id: usize,
     /// Arrow schema shared by all append batches.
     pub schema: SchemaRef,
-    /// Original append batches, preserved for LSN-granular live tail reads.
-    pub batches: Vec<RecordBatch>,
+    /// Original append batches, preserved for LSN-granular live tail reads
+    /// and shared by reference with every live capture.
+    pub batches: Arc<[RecordBatch]>,
     /// Exact column bounds of each batch, index-aligned with `batches`.
     ///
     /// A batch without an entry, as in a hand-built test generation, reads
     /// with unknown bounds and is never pruned.
-    pub statistics: Vec<Arc<Statistics>>,
+    pub statistics: Arc<[Arc<Statistics>]>,
     /// Per-append metadata derived from WAL record headers.
     pub metas: Vec<ScribeAppendMeta>,
     /// Monotonic time at which the active generation first received a row.
@@ -1657,27 +1713,6 @@ impl FrozenMemtable {
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.batches.iter().map(RecordBatch::num_rows).sum()
-    }
-
-    /// Captures this immutable generation's batches for projection outside
-    /// the lock.
-    ///
-    /// Every batch is tagged with `generation`, the registry identity of this
-    /// generation, so a caller can tell which generations the cut served and
-    /// must not also read from their staged runs.
-    fn readable_source(
-        &self,
-        generation: crate::scribe::hot_source::GenerationOrdinal,
-    ) -> ReadableSource {
-        ReadableSource::capture(
-            &self.schema,
-            &self.batches,
-            &self.statistics,
-            &self.metas,
-            self.seal_key.clone(),
-            Some(generation),
-            &self.charge,
-        )
     }
 }
 
@@ -1855,7 +1890,7 @@ impl LiveCapture {
         // Sized once: growing one batch at a time reallocates into fresh
         // pages on every query while writes keep many batches live.
         let mut batches =
-            Vec::with_capacity(in_range.iter().map(|source| source.batches.len()).sum());
+            Vec::with_capacity(in_range.iter().map(|source| source.batch_count()).sum());
         let mut charges = Vec::with_capacity(in_range.len());
         for source in in_range {
             source.project(required, pruning, &mut batches)?;
@@ -1906,23 +1941,73 @@ pub(crate) struct CapturedRead {
     pub(crate) lease: Option<Arc<crate::scribe::hot_source::StagedSourceLease>>,
 }
 
+/// Most appends a writable bucket's tail holds before it seals into a shared
+/// [`AppendRun`].
+///
+/// A live capture shares every sealed run and copies only the tail, so this
+/// bounds the per-capture copy while keeping a bucket's run count small.
+const APPEND_RUN_LEN: usize = 64;
+
+/// Consecutive appends shared by reference between the bucket or generation
+/// that retains them and every live capture of them.
+///
+/// Cloning a run clones three handles, never a batch, so a capture taken
+/// under the memtable read locks costs a few pointer copies per run.
+#[derive(Debug, Clone)]
+struct AppendRun {
+    /// The appended batches, in append order.
+    batches: Arc<[RecordBatch]>,
+    /// Exact bounds of each batch, index-aligned with `batches`; a batch
+    /// without an entry reads with unknown bounds.
+    statistics: Arc<[Arc<Statistics>]>,
+    /// Maximum WAL LSN of each append, index-aligned with `batches`.
+    wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
+}
+
+/// A writable bucket's appends after its last sealed [`AppendRun`].
+#[derive(Debug, Default)]
+struct AppendTail {
+    /// The appended batches, in append order.
+    batches: Vec<RecordBatch>,
+    /// Exact bounds of each batch, index-aligned with `batches`.
+    statistics: Vec<Arc<Statistics>>,
+    /// Maximum WAL LSN of each append, index-aligned with `batches`.
+    wal_lsns: Vec<crate::scribe::wal::WalLsn>,
+}
+
+impl AppendTail {
+    /// Copies the tail into a run a capture holds while the bucket keeps
+    /// appending.
+    fn run(&self) -> AppendRun {
+        AppendRun {
+            batches: self.batches.as_slice().into(),
+            statistics: self.statistics.as_slice().into(),
+            wal_lsns: self.wal_lsns.as_slice().into(),
+        }
+    }
+
+    /// Moves the tail into a sealed run, leaving it empty.
+    fn seal(&mut self) -> AppendRun {
+        AppendRun {
+            batches: std::mem::take(&mut self.batches).into(),
+            statistics: std::mem::take(&mut self.statistics).into(),
+            wal_lsns: std::mem::take(&mut self.wal_lsns).into(),
+        }
+    }
+}
+
 /// One bucket's or generation's batches, captured under the memtable read
 /// locks and projected only after they are released.
 ///
-/// Capturing copies reference-counted batches and bounds and each append's
-/// WAL position, never row data, so the locks are held for a few pointer
-/// copies per batch.
+/// Capturing shares each [`AppendRun`] by reference and copies only a
+/// writable bucket's tail, never row data, so the locks are held for a few
+/// pointer copies per run.
 #[derive(Debug)]
 struct ReadableSource {
     /// Arrow schema shared by every batch.
     schema: SchemaRef,
-    /// The captured append batches.
-    batches: Vec<RecordBatch>,
-    /// Exact bounds of each batch, index-aligned with `batches`; a batch
-    /// without an entry reads with unknown bounds.
-    statistics: Vec<Arc<Statistics>>,
-    /// Maximum WAL LSN of each append, index-aligned with `batches`.
-    wal_lsns: Vec<crate::scribe::wal::WalLsn>,
+    /// The captured appends, in append order.
+    runs: Vec<AppendRun>,
     /// Complete seal key owning every batch; its generation ordinals are
     /// unique only within it.
     seal_key: SealKey,
@@ -1934,32 +2019,37 @@ struct ReadableSource {
 }
 
 impl ReadableSource {
-    /// Captures `batches` and their bounds and WAL positions by reference,
-    /// sharing `charge`, the accounting owner of those batches.
+    /// Captures `runs`, sharing `charge`, the accounting owner of their
+    /// batches.
     fn capture(
         schema: &SchemaRef,
-        batches: &[RecordBatch],
-        statistics: &[Arc<Statistics>],
-        metas: &[ScribeAppendMeta],
+        runs: Vec<AppendRun>,
         seal_key: SealKey,
         generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
         charge: &Arc<crate::scribe::memory::RetainedArrowCharge>,
     ) -> Self {
         Self {
             schema: Arc::clone(schema),
-            batches: batches.to_vec(),
-            statistics: statistics.to_vec(),
-            wal_lsns: metas.iter().map(|meta| meta.wal_lsn_max).collect(),
+            runs,
             seal_key,
             generation,
             charge: Arc::clone(charge),
         }
     }
 
+    /// Returns how many batches the source captured.
+    fn batch_count(&self) -> usize {
+        self.runs.iter().map(|run| run.batches.len()).sum()
+    }
+
     /// Returns the bytes `scope` reads from the captured batches, measured by
-    /// [`crate::scan_sizing::ScanSizer::batch_bytes`].
+    /// [`crate::scan_sizing::ScanSizer::batch_bytes`] run by run.
     fn scoped_bytes(&self, scope: &crate::scan_sizing::ScanScope) -> u64 {
-        crate::scan_sizing::ScanSizer::new(scope, &self.schema).batch_bytes(&self.statistics)
+        let sizer = crate::scan_sizing::ScanSizer::new(scope, &self.schema);
+        self.runs
+            .iter()
+            .map(|run| sizer.batch_bytes(&run.statistics))
+            .fold(0_u64, u64::saturating_add)
     }
 
     /// Appends each captured batch `pruning` keeps, projected to `required`,
@@ -2011,8 +2101,11 @@ impl ReadableSource {
                 .iter()
                 .enumerate()
                 .all(|(at, column)| *column == Some(at));
-        let statistics: Vec<Arc<Statistics>> = (0..self.batches.len())
-            .map(|index| match self.statistics.get(index) {
+        let statistics: Vec<Arc<Statistics>> = self
+            .runs
+            .iter()
+            .flat_map(|run| (0..run.batches.len()).map(|index| run.statistics.get(index)))
+            .map(|recorded| match recorded {
                 Some(bounds) if whole => Arc::clone(bounds),
                 Some(bounds) => Arc::new(Statistics {
                     num_rows: bounds.num_rows,
@@ -2029,11 +2122,11 @@ impl ReadableSource {
                 None => Arc::new(Statistics::new_unknown(&schema)),
             })
             .collect();
-        let keep = pruning.map(|pruning| pruning.keep(&statistics, self.batches.len()));
+        let keep = pruning.map(|pruning| pruning.keep(&statistics, statistics.len()));
         for (index, ((batch, wal_lsn_max), statistics)) in self
-            .batches
+            .runs
             .iter()
-            .zip(self.wal_lsns.iter().copied())
+            .flat_map(|run| run.batches.iter().zip(run.wal_lsns.iter().copied()))
             .zip(statistics)
             .enumerate()
         {
@@ -2303,6 +2396,63 @@ mod tests {
         assert_eq!(lsns(None), vec![1, 2]);
     }
 
+    /// A capture shares a bucket's sealed runs and a generation's batches by
+    /// reference and copies only the bucket's unsealed tail, while freezing
+    /// keeps every append in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a capture copies a sealed run or a frozen generation, or a
+    /// read or freeze loses or reorders an append.
+    #[test]
+    fn captures_share_sealed_runs_and_frozen_generations() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let appends = u64::try_from(APPEND_RUN_LEN + 1).expect("append count");
+        for lsn in 1..=appends {
+            memtable
+                .insert(&key, make_test_meta(lsn), make_test_batch(1))
+                .expect("active insert");
+        }
+        let partitions = key.partition.time()..=key.partition.time();
+        let lsns = |capture: &LiveCapture| -> Vec<u64> {
+            capture
+                .read(&partitions, &[], None)
+                .expect("capture read")
+                .batches
+                .iter()
+                .map(|readable| readable.wal_lsn_max.as_u64())
+                .collect()
+        };
+        let take = || {
+            LiveCapture::take([&memtable], key.tenant, &key.table, None)
+                .expect("locks")
+                .expect("no registry to wait on")
+        };
+
+        let active = take();
+        {
+            let writable = memtable.writable.read().expect("writable lock");
+            let bucket = &writable[&key];
+            let runs = &active.memory[0].runs;
+            assert_eq!(runs.len(), 2, "one sealed run and the copied tail");
+            assert!(Arc::ptr_eq(&runs[0].batches, &bucket.runs[0].batches));
+            assert!(Arc::ptr_eq(&runs[0].statistics, &bucket.runs[0].statistics));
+            assert_eq!(runs[1].batches.len(), 1);
+        }
+        assert_eq!(lsns(&active), (1..=appends).collect::<Vec<_>>());
+
+        let frozen = memtable.freeze(&key).expect("freeze");
+        assert_eq!(frozen.batches.len(), APPEND_RUN_LEN + 1);
+        let captured = take();
+        assert!(Arc::ptr_eq(
+            &captured.memory[0].runs[0].batches,
+            &frozen.batches
+        ));
+        assert_eq!(lsns(&captured), (1..=appends).collect::<Vec<_>>());
+        assert_eq!(lsns(&active), (1..=appends).collect::<Vec<_>>());
+    }
+
     /// A capture read that projects every written column, in order and
     /// uncast, shares each batch's recorded bounds instead of copying them,
     /// and a narrower projection copies only its columns' bounds. Either read
@@ -2335,7 +2485,7 @@ mod tests {
             .expect("locks")
             .expect("no registry to wait on");
         let partitions = key.partition.time()..=key.partition.time();
-        let recorded = Arc::clone(&capture.memory[0].statistics[0]);
+        let recorded = Arc::clone(&capture.memory[0].runs[0].statistics[0]);
         let read = |fields: &[FieldRef]| {
             let mut batches = capture
                 .read(&partitions, fields, None)
@@ -3130,7 +3280,7 @@ mod tests {
             let memory: Vec<_> = capture
                 .memory
                 .iter()
-                .map(|source| (source.seal_key.clone(), source.batches.len()))
+                .map(|source| (source.seal_key.clone(), source.batch_count()))
                 .collect();
             let staged: Vec<_> = capture
                 .staged

@@ -608,3 +608,33 @@ do not decode OTLP and moved within their spreads.
 |---|---|---|---|
 | Two passes per message | `Scanned` in `otlp_decode.rs`; trace and log decoders | the table above | PASS |
 | Exact capacity, last-wins, merges and malformed refusals preserved | fill pass keeps every `wrong_wire` arm; split singulars use `decode_merged_*` | 56 `otlp` lib tests, including `otlp_decode::tests::trace_fixed_decode_keeps_last_strings_and_refuses_wrong_wire_types`, `trace_fixed_decode_has_no_spare_collection_capacity`, `trace_fixed_decode_merges_split_singular_messages`, `logs_fixed_decode_merges_duplicate_singular_fields`; fmt, lints, `git diff --check` | PASS |
+
+### Item 7(d) attribution: the remaining SHA-256 caller
+
+The 2026-10-27 profile's binary had been rebuilt, so it could not be
+symbolized. A new profiled run on 3adfc0c14 code
+(`target/benchmarks/bifrost/writes-parquet/20261027T200319Z`, VALID, build id
+matched) was symbolized with `addr2line`, and samples were bucketed into 5 s
+windows.
+
+| Window | `prepare_slice` → `logical_data_identity` | Gate `LogicalIdentity::of` | share of window CPU (slice digest) |
+|---|---|---|---|
+| otlp spans c64 | 935 | 786 | 2.1% |
+| otlp 1 KiB spans c64 | 857 | 816 | 2.2% |
+| otlp logs c64 | 1,570 | 1,564 | 4.4% |
+| native writes c64 | 3,166 | 0 | 7.9% |
+
+The caller is `scribe::preprocess::prepare_slice`. It recomputes
+`logical_data_identity` for every OTLP slice even though the Gate computed one,
+because `LogicalIdentity::for_rows` never matches an OTLP batch. Scribe decode
+(`stamp_correlation_columns`) adds the correlation columns `run_id`,
+`sub_principal_id`, `act_principal_id` and `workload_card_uid`, and may
+overwrite dimension columns. Those columns are non-volatile, so the slice
+digest hashes field names and bytes the Gate's batch never contained. The two
+digests cover different bytes. Native slices have no Gate digest at all.
+
+Result: the remaining caller repeats no digest of the same bytes, so per
+REQ-025 it is not removed and identity semantics are unchanged. No code
+change, so no before/after run. Other SHA-256 users in the same profile
+(WAL append, Parquet artifact sealing, staging, remote verification, Forge
+promotion) digest different data and are outside 7(d).

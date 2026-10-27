@@ -213,20 +213,42 @@ not promised savings.
 
 **Order/dependency.** After item 7, one change and measurement at a time.
 
-## 9. 64-client write tail
+## 9. Single-shard write throughput and shard scaling
 
 **Intent and evidence.** On d86cf238e, client p99 at 64 clients is 170 ms for
-spans, 289 ms for logs and 615 ms for native writes.
+spans, 289 ms for logs and 615 ms for native writes. Item 6 phase timing on
+3adfc0c14 attributes the tail to Scribe shard wait and the group cycle (WAL
+write and commit, sync, fence), while the server uses 6–9 of 32 vCPUs. Every
+write record so far runs the default single shard
+(`WYRD_SCRIBE_SHARD_COUNT`, default 1), so all clients queue on one serial
+group cycle.
 
-**REQ-026 — Diagnose write tails before changing code.** Use item 6 phase
-timing to locate the cause of each tail, separating client duration, shard
-wait and server work. Choose a change only after the timing supports its cause;
-preserve durability, ordering and exact accounting.
+**REQ-026 — Single-shard throughput, then shard scaling.**
 
-**Acceptance.** Retain phase evidence explaining each affected path and a
-causal diagnosis before a fix. Measure any resulting change separately, before and after, showing client/server tails and CPU rather than hiding queued work.
+- (a) **Shard scaling.** `writes-parquet` gains a shard-count variable. A
+  declared run takes the 64-client steps at 1, 2, 4, 8 and 16 shards and
+  records the shard count in each record; the default stays 1, so ordinary
+  records stay comparable.
+- (b) **Single-shard throughput.** At one shard and 64 clients, use phase
+  timing to locate each serial cost of the group cycle (WAL write and commit,
+  sync, fence, insert, ack) and reduce them one change at a time, each
+  measured individually before and after, unprofiled. Overlapping a group's
+  WAL write with the previous group's sync and fence is permitted, replacing
+  the rule that one group cycle completes before the next begins, when the
+  diagnosis supports it. Preserve: no acknowledgement before WAL sync and the
+  durable fence commit, WAL record order, replay, and exact memory
+  accounting.
+- (c) Repeat (a) on the optimized single shard.
 
-**Order/dependency.** After item 8; depends on item 6 timing.
+**Acceptance.** (a) and (c): rows per second at 64 clients rises with shard
+count until a named limit (CPU, disk sync or PostgreSQL fence), which the
+record evidence identifies. (b): retained phase evidence and a causal
+diagnosis before each change; each change has its own comparable
+before/after result for throughput, client and server tails and CPU, plus
+proof that durability, ordering, replay and accounting are unchanged.
+
+**Order/dependency.** After item 8; depends on item 6 timing. (a), then each
+(b) change, then (c).
 
 ## 10. Fix 4: memtable Variant shredding
 

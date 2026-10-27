@@ -5,7 +5,7 @@
 //! authenticated tenant in its footer rather than in any column, and takes its
 //! partition day from the seal-key (never from row min/max).
 
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -506,6 +506,64 @@ impl<'a> ParquetBatchEncoder<'a> {
     }
 }
 
+/// Bytes a scratch artifact may accumulate unsynced before [`SyncingFile`]
+/// forces them to disk.
+const ARTIFACT_SYNC_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A scratch artifact file that syncs its data every
+/// [`ARTIFACT_SYNC_INTERVAL_BYTES`] as it is written.
+///
+/// A generation can stage a ~100 MB artifact. Left to the page cache, that
+/// whole file is dirty when the stager's final fsync runs, and the WAL's
+/// group-commit `fdatasync` on the same filesystem queues behind the
+/// writeback, stalling every write on the shard for hundreds of
+/// milliseconds. Syncing in bounded steps keeps the dirty backlog small, so
+/// a WAL sync waits behind at most one interval. Encoding runs on the
+/// staging rayon pool, so these blocking syncs never hold an async worker.
+struct SyncingFile {
+    /// The scratch artifact being written.
+    file: std::fs::File,
+    /// Bytes written since the last data sync.
+    unsynced: u64,
+}
+
+impl SyncingFile {
+    /// Wraps a freshly created scratch artifact with nothing unsynced.
+    const fn new(file: std::fs::File) -> Self {
+        Self { file, unsynced: 0 }
+    }
+}
+
+impl Write for SyncingFile {
+    /// Writes to the file and syncs its data once the unsynced backlog
+    /// reaches [`ARTIFACT_SYNC_INTERVAL_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the file's write error, or its `fdatasync` error when the
+    /// backlog sync fails; the written bytes then stay counted as unsynced.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(buf)?;
+        self.unsynced = self
+            .unsynced
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        if self.unsynced >= ARTIFACT_SYNC_INTERVAL_BYTES {
+            self.file.sync_data()?;
+            self.unsynced = 0;
+        }
+        Ok(written)
+    }
+
+    /// Flushes the file; durability stays with the stager's final fsync.
+    ///
+    /// # Errors
+    ///
+    /// Returns the file's flush error.
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 /// One artifact that is open for appended ordered batches.
 struct OpenArtifact {
     /// Contiguous generation-global ordinal already assigned to this artifact.
@@ -520,7 +578,7 @@ struct OpenArtifact {
     /// shredded object keeps the identity of its logical table schema.
     schema: Arc<Schema>,
     /// Open Parquet encoder owning the buffered sink.
-    writer: ArrowWriter<BufWriter<std::fs::File>>,
+    writer: ArrowWriter<BufWriter<SyncingFile>>,
     /// Rows appended so far across every batch.
     rows: usize,
 }
@@ -702,7 +760,7 @@ impl<'a> RollingArtifactWriter<'a> {
             None => Arc::clone(&schema),
         };
         let writer = ArrowWriter::try_new(
-            BufWriter::new(file),
+            BufWriter::new(SyncingFile::new(file)),
             physical,
             Some(bifrost_writer_properties_with_metadata(
                 Vec::new(),
@@ -1045,6 +1103,29 @@ mod tests {
     use crate::catalog::TableRef;
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::seal_key::{SealKey, TimePartition};
+
+    /// A scratch artifact syncs and resets its backlog once it crosses the
+    /// sync interval, and keeps counting below it.
+    ///
+    /// # Panics
+    /// Panics when the scratch file cannot be written or the backlog is
+    /// not reset at the interval.
+    #[test]
+    fn syncing_file_resets_backlog_at_interval() {
+        let scratch = tempfile::tempdir().expect("syncing scratch");
+        let file = std::fs::File::create(scratch.path().join("artifact.parquet"))
+            .expect("scratch artifact");
+        let mut syncing = SyncingFile::new(file);
+        let chunk = vec![0_u8; 1024 * 1024];
+        for _ in 0..7 {
+            syncing.write_all(&chunk).expect("write below interval");
+        }
+        assert_eq!(syncing.unsynced, 7 * 1024 * 1024);
+        syncing.write_all(&chunk).expect("write to interval");
+        assert_eq!(syncing.unsynced, 0);
+        syncing.write_all(&[1]).expect("write past interval");
+        assert_eq!(syncing.unsynced, 1);
+    }
 
     /// Builds one metadata-light stored batch with the requested row count.
     fn candidate_batch(rows: usize) -> RecordBatch {

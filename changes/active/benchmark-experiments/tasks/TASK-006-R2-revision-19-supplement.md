@@ -690,9 +690,9 @@ revision 19 figures cannot be reproduced. Every current share is below the
 comparable measurement. With the maintainer's agreement, item 8 makes no code
 change and records no measured improvement.
 
-### Item 9(a) shard scaling: the named limit is device write bandwidth
+### Item 9(a) shard scaling: diagnosis
 
-Median rows/s across 3 repetitions at 64 clients. `WYRD_SCRIBE_SHARD_COUNT` is set, `wal_io_threads` is 4, and every record is VALID and under `target/benchmarks/bifrost/writes-parquet/` (`20261027T211631Z`, `211841Z`, `212050Z`, `212301Z`, `212517Z`):
+Median rows/s across 3 repetitions at 64 clients, with `WYRD_SCRIBE_SHARD_COUNT` set and `wal_io_threads` at the default of 4. All records are VALID, under `target/benchmarks/bifrost/writes-parquet/` (`20261027T211631Z`, `211841Z`, `212050Z`, `212301Z`, `212517Z`):
 
 | Shards | spans | 1 KiB spans | logs | native |
 |---|---|---|---|---|
@@ -702,8 +702,20 @@ Median rows/s across 3 repetitions at 64 clients. `WYRD_SCRIBE_SHARD_COUNT` is s
 | 8 | 463k | 199k | 266k | 4.96M |
 | 16 | 332k | 195k | 230k | 3.48M |
 
-- **IO pool.** From 8 shards on, `wal_append` p50 grows (native 34→114 ms) because the 4-thread WAL IO pool queues every shard's writes. With `wal_io_threads = 16` (`212910Z`, `213126Z`), `wal_append` p50 drops below 4 ms, but rows/s still does not rise (16 shards: spans 534k, 1k 201k, logs 263k, native 4.18M). The pool is a queue in front of the limit, not the limit.
-- **Device.** The WAL is in the driver's temporary directory on `/dev/mapper/data-root`: ext4 on LVM on dm-crypt, on `nvme1n1` with a write-back cache. During the native and 1 KiB steps (`213647Z` at 1 shard, `213814Z` at 16 shards), `/sys/block/dm-1/stat` shows a peak device write rate of 285–306 MiB/s at 1 shard and 294–315 MiB/s at 16 shards. The 16-shard run moves the same bytes, with 2–3× the in-flight write time. On this volume, one Python `write(256 KiB)` + `fdatasync` loop per file reaches 69 MiB/s with 1 file and 160 MiB/s with 16 files.
-- **Not CPU or PostgreSQL.** The server uses 4–12 of 32 cores. The PostgreSQL fence (`visibility`) p50 stays at 2–8 ms and falls as shards are added.
+**Decrease (a defect).**
+- **Symptom:** at 8 and 16 shards, rows/s falls below the 1-shard rate.
+- **Evidence:** `wal_append` p50 at 16 shards is 36 ms for spans and 116 ms for native. At 1 shard it is 1.2 ms and 36 ms.
+- **Cause:** every shard submits both its WAL writes and its `SyncWal` (`shards.rs` `submit(ScribeWalIoOp::SyncWal)`) to one `ScribeWalIoPool` of `wal_io_threads` = 4 threads (`scribe/mod.rs` default). Each `fdatasync` holds a thread for 15–60 ms. At 16 shards, at most 4 shards can be in WAL IO at once, so the other shards' writes queue behind those syncs.
+- **Confirmation:** with `wal_io_threads = 16` (`212910Z`, `220802Z`), `wal_append` p50 falls to 0.2–3.9 ms. 16 shards then match or beat 1 shard: spans 534k and 532k against 477–494k.
+- **Fix site:** the pool size in the Scribe lane config. It must be no smaller than the shard count.
 
-A single shard already uses this host's synced-write bandwidth, so extra shards add queueing (in `wal_sync` and `shard_wait`) and no rows. On this host, the evidence shows the limit is disk sync bandwidth.
+**Why the rise is sublinear (the named limit).** Every shard's WAL is on one ext4 filesystem (`/dev/mapper/data-root`, which is dm-crypt on `nvme1n1`). On ext4, an `fdatasync` of an appended file completes through the single jbd2 journal commit of that filesystem, and each commit ends in one device flush. Sampling `/sys/block/nvme1n1/stat` during `220635Z` (1 shard) and `220802Z` (16 shards), both with `wal_io_threads = 16`:
+
+| Shards | device flushes/s | ms per flush | peak device write MiB/s | mean MiB/s, busy seconds |
+|---|---|---|---|---|
+| 1 | 20–53 | 4–10 | 277 | 189 |
+| 16 | 25–79 | 3–26 | 353 | 238 |
+
+The flush rate does not grow with shard count, so shards parallelize the CPU work and the group cycles but share one journal commit stream. That commit stream is the limit on this host. The server uses 4–14 of 32 cores. The PostgreSQL fence (`visibility`) p50 is 2–8 ms and falls as shards are added.
+
+**Variance.** The same configuration ranges widely between repetitions. For native at 16 shards with `wal_io_threads = 16`, rows/s is 4.25–6.47M, and 1-shard native `wal_sync` p50 is 61 ms in `211631Z` and 93 ms in `220635Z`. The disk's latency moves between runs, so a single before/after native comparison needs a gap larger than this spread before it can be called an improvement.

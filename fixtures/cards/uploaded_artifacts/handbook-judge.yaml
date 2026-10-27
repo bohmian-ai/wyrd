@@ -14,19 +14,4 @@ spec:
     messages:
       - role: user
         content: "HANDBOOK JUDGE: read /inputs/handbook.json with fs.read and cite the line that answers: {{question}}"
-    response_format:
-      type: object
-      properties:
-        outcome: {type: string, enum: [passed, failed, inconclusive]}
-        reason: {type: string}
-        citations:
-          type: array
-          items:
-            type: object
-            properties:
-              slot: {type: string}
-              locator: {type: object}
-            required: [slot, locator]
-            additionalProperties: false
-      required: [outcome, reason, citations]
-      additionalProperties: false
+    response_format: verdict

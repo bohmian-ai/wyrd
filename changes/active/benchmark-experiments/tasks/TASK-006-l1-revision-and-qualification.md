@@ -29,6 +29,13 @@ all unchanged limits, correctness and validity checks pass.
 foundation and historical evidence, not a claim that its blocked qualification
 or L2 obligations completed. No additional task is created by this packet.
 
+**Superseded by revision 19:** reference qualification is removed. The
+`--qualify-baseline` suites, `capacity reference`, the `baselines.toml` review
+and every comparison against references in V8–V10 and the acceptance rows that
+cite them no longer apply; each record stands on its own and reports its own
+per-core metrics. A run is VALID or INVALID only, and performance targets are
+reported, never exit conditions.
+
 ## What Changes and What Must Stay True
 
 This is the single revision task required by revision 11's Delivery and

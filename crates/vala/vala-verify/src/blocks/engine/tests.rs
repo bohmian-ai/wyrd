@@ -80,6 +80,8 @@ enum Behavior {
     Together(Arc<Barrier>, Value),
     /// Never finish; notify when the call is dropped.
     Hang(Arc<Notify>),
+    /// Panic with this message.
+    Panic(&'static str),
 }
 
 /// Notifies when the hanging call that owns it is dropped.
@@ -133,7 +135,7 @@ impl ActionExecutor for Script {
     ///
     /// # Panics
     /// Panics when another call panicked while holding the log or attempts
-    /// lock.
+    /// lock, and with the scripted message for a `Panic` step.
     ///
     /// # Cancellation
     /// A `Together` call waits at its barrier and a `Hang` call never
@@ -167,6 +169,7 @@ impl ActionExecutor for Script {
                 let _signal = DropSignal(Arc::clone(dropped));
                 std::future::pending().await
             }
+            Some(Behavior::Panic(message)) => panic!("{message}"),
         }
     }
 }
@@ -489,6 +492,45 @@ async fn independent_actions_overlap_within_the_concurrency_bound() {
         matches!(serial, Err(EngineError::DeadlineExceeded)),
         "{serial:?}"
     );
+}
+
+/// A panicking block fails the run with [`EngineError::Join`] carrying its
+/// message, and the rest of its stage is dropped rather than left running.
+///
+/// # Panics
+/// Panics when the run does not fail with the block's message or the
+/// sibling block is not dropped.
+#[tokio::test(start_paused = true)]
+async fn a_panicking_block_fails_the_run_and_drops_its_stage() {
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [
+            {"id": "a", "action": code_action(json!({"x": "inputs.answer"}))},
+            {"id": "b", "action": code_action(json!({"x": "inputs.answer"}))}
+        ],
+        "requirements": [{"id": "ran", "statement": "Ran", "check": {"kind": "assert", "path": "steps.a.output.ok", "operator": "equals", "expected": true}}]
+    }));
+    let dropped = Arc::new(Notify::new());
+    let script = Arc::new(Script {
+        actions: HashMap::from([
+            ("a", Behavior::Hang(Arc::clone(&dropped))),
+            ("b", Behavior::Panic("block exploded")),
+        ]),
+        ..Script::default()
+    });
+    let ran = run(
+        &engine(&script, InMemoryTraceSource::new(), 2),
+        &spec,
+        json!({"answer": 1}),
+    )
+    .await;
+    assert!(
+        matches!(&ran, Err(EngineError::Join(message)) if message == "block exploded"),
+        "{ran:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+        .await
+        .expect("the hanging sibling is dropped");
 }
 
 /// A dependent waits for its upstream action and that step's requirements;

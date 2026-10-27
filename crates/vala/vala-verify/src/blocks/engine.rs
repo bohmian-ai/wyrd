@@ -175,7 +175,7 @@ pub enum EngineError {
     /// A requirement's actual value could not be captured.
     #[error("a requirement actual value cannot be captured: {0}")]
     Capture(#[from] ExecError),
-    /// A block task panicked or was aborted.
+    /// A block panicked; the rest of its stage was dropped.
     #[error("a verification block task stopped unexpectedly: {0}")]
     Join(String),
     /// A block was refused process capacity at admission
@@ -437,7 +437,7 @@ impl VerificationEngine {
                     })
                     .collect()
             },
-            |error| EngineError::Join(error.to_string()),
+            EngineError::Join,
         )
         .await
     }

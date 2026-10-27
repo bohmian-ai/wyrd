@@ -504,3 +504,36 @@ kept: it is correct and adds no cost.
 |---|---|---|---|
 | Own before/after result for CPU per row, row and wire throughput, latency | the table above | two VALID unprofiled writes-parquet records | PASS (no improvement observed) |
 | Correctness for malformed and boundary varints | fast path only for a present byte below 0x80 | `otlp_decode::tests::varints_read_boundaries_and_refuse_malformed_input` (0, 0x7f/0x80, 0x3fff/0x4000, u32::MAX, u64::MAX; empty, truncated, tenth-byte overflow, eleven bytes); 55 `otlp` lib tests | PASS |
+
+### Item 7(b) acceptance: server-built Variants
+
+Change: `a8cf9e95a`. `finish_variant` (`tables/signal.rs`) calls the new
+`EncodedVariant::from_builder` (`wyrd-queue/src/variant.rs`): it takes the
+`VariantBuilder` itself, keeps the size check and the bounded
+`scan_encoded` walk, and skips upstream's recursive re-validation and the two
+byte copies of `from_bytes`. External bytes still go through `from_bytes`.
+Before: `writes-parquet/20261027T182756Z-76bcfa75a`; after:
+`writes-parquet/20261027T184447Z-a8cf9e95a` (VALID, unprofiled). Medians of
+three repetitions.
+
+| Step | rows/cpu-s | wire MiB/cpu-s | server p50 / p99 ms |
+|---|---|---|---|
+| otlp-spans-c1 | 56.24k → 59.68k | 18.1 → 19.3 | 11.2/19.1 → 10.4/17.2 |
+| otlp-spans-c64 | 48.34k → 51.23k | 15.6 → 16.5 | 27.7/133.0 → 36.2/143.3 |
+| otlp-spans-1k-c1 | 29.62k → 31.05k | 29.8 → 31.2 | 18.4/30.1 → 17.8/29.0 |
+| otlp-spans-1k-c64 | 22.45k → 23.38k | 22.6 → 23.5 | 61.2/205.3 → 48.2/178.4 |
+| otlp-logs-c1 | 48.36k → 46.15k | 57.8 → 55.1 | 12.2/22.6 → 12.4/32.7 |
+| otlp-logs-c64 | 36.67k → 34.25k | 43.8 → 40.9 | 89.7/258.7 → 64.7/197.8 |
+| native-write-c64 | 672k → 766k | — | 173.4/557.3 → 142.5/409.2 |
+
+Result: every span step rose 3–6% in rows/cpu-s, at or just above the
+spread of the four earlier records (spans-c1 55.9k–58.5k; 1k-c1
+29.6k–30.2k); logs fell within its spread (46.1k–51.6k at c1). Native writes
+build no OTLP Variants, so their change is run-to-run variation. Scribe
+`preprocess` p50 is unchanged. This is suggestive for spans, not a measured
+improvement beyond noise.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Own before/after result | the table above | two VALID unprofiled writes-parquet records | PASS (spans +3–6%, at the noise edge) |
+| Size and depth limits preserved exactly, plus the numeric domain | same `within_size_limit` and `scan_encoded` as `from_bytes` | `variant::tests::built_variants_match_full_byte_validation` (accepted object, NaN in a list, root infinity, size + 1, depth 66: identical result and path to `from_bytes`; the four refusals are refusals); 23 `variant::` and 47 `tables::` lib tests | PASS |

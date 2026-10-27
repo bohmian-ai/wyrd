@@ -24,8 +24,8 @@ use crate::query::run::{Admission, Bench, Outcome, Sender, WRONG_RESULT, ask};
 use crate::query::telemetry::{self, Telemetry};
 use crate::query::workload::{Case, Fixture, Rows, TABLE};
 use crate::query::{
-    Experiment, Lane, PAIR, Read, Residence, SETTLED, Scale, WriteOp, client, lanes, parquet_bytes,
-    read_op, start, table_files,
+    Experiment, Lane, PAIR, Read, Residence, SETTLED, SPLIT, Scale, WriteOp, client, lanes,
+    parquet_bytes, read_op, start, table_files,
 };
 
 /// Concurrent writers loading the read fixture.
@@ -262,17 +262,27 @@ impl Isolated {
                     write.name()
                 ));
             }
-            repetition.set("rows", Reading::count(outcome.rows - outcome.late_rows));
+            let rows = outcome.rows - outcome.late_rows;
+            let wire_bytes = outcome.wire_bytes - outcome.late_wire_bytes;
+            repetition.set("rows", Reading::count(rows));
             repetition.set("late_rows", Reading::count(outcome.late_rows));
             repetition.set("retained_mib", Reading::exact(inserted / MIB));
-            repetition.set(
-                "wire_bytes",
-                if write == WriteOp::Native {
-                    Reading::missing("native writes send Arrow IPC, not OTLP")
-                } else {
-                    Reading::count(outcome.wire_bytes - outcome.late_wire_bytes)
-                },
-            );
+            if write == WriteOp::Native {
+                for metric in ["wire_bytes", "wire_bytes_per_row"] {
+                    repetition.set(
+                        metric,
+                        Reading::missing("native writes send Arrow IPC, not OTLP"),
+                    );
+                }
+            } else {
+                repetition.set("wire_bytes", Reading::count(wire_bytes));
+                repetition.set(
+                    "wire_bytes_per_row",
+                    Reading::exact(
+                        wire_bytes.to_f64().unwrap_or(0.0) / rows.max(1).to_f64().unwrap_or(1.0),
+                    ),
+                );
+            }
             repetition.set(
                 "visibility_p99_ms",
                 Reading::missing(
@@ -419,6 +429,7 @@ async fn settled(
         bench,
         Telemetry {
             spans: crate::query::WRITE_FIXTURE_ROWS,
+            wide: false,
         }
         .span_window(spans),
     )
@@ -430,7 +441,7 @@ async fn settled(
         }
     };
     let mut facts = vec![shredding, pruned];
-    for op in WriteOp::ALL {
+    for (op, _) in SPLIT {
         let ratio = samples
             .iter()
             .find(|(sampled, ..)| *sampled == op)
@@ -508,7 +519,7 @@ impl Workload for Isolated {
             let rows = match op {
                 WriteOp::Spans => self.scale.spans,
                 WriteOp::Native | WriteOp::Logs if parquet => self.scale.storage,
-                WriteOp::Native | WriteOp::Logs => continue,
+                WriteOp::Native | WriteOp::Logs | WriteOp::WideSpans => continue,
             };
             let stored = parquet_bytes(&root, op.table());
             let before = server.metrics().await.map_err(ExperimentError::workload)?;

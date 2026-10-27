@@ -475,7 +475,7 @@ mod tests {
             };
             let factor = match step.text("op") {
                 Some("native-write") => 2.0,
-                Some("otlp-spans") => 1.0,
+                Some("otlp-spans" | "otlp-spans-1k") => 1.0,
                 Some("otlp-logs") => 0.5,
                 _ => {
                     if step.id == "point-c64" {
@@ -579,7 +579,12 @@ mod tests {
         assert_eq!(steps(&writes, true), measured);
         assert_eq!(
             steps(&writes, false),
-            ["otlp-spans-peak", "otlp-logs-peak", "native-write-peak"]
+            [
+                "otlp-spans-peak",
+                "otlp-spans-1k-peak",
+                "otlp-logs-peak",
+                "native-write-peak"
+            ]
         );
         let windows = |declaration: &Declaration| -> Vec<(String, u64)> {
             declaration
@@ -599,6 +604,7 @@ mod tests {
             windows(&writes),
             [
                 ("otlp-spans-c1".to_owned(), 10),
+                ("otlp-spans-1k-c1".to_owned(), 10),
                 ("native-write-c1".to_owned(), 10),
                 ("native-write-c64".to_owned(), 10)
             ],
@@ -917,6 +923,7 @@ mod tests {
                     "rows",
                     "retained_mib",
                     "wire_bytes",
+                    "wire_bytes_per_row",
                     "published_files",
                     "published_mib",
                     "memtable_backlog_mib",

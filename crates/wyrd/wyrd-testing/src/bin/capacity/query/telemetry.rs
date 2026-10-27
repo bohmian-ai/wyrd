@@ -360,11 +360,16 @@ pub(crate) fn attribute(key: &str, value: Value) -> KeyValue {
     }
 }
 
-/// One telemetry fixture size and every span derived from it.
+/// One telemetry fixture size and payload, and every span derived from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Telemetry {
     /// Spans written to `bifrost.traces.spans`; a multiple of [`SPANS_PER_TRACE`].
     pub spans: i64,
+    /// Whether each span carries about 1 KiB of OTLP wire: Kubernetes and SDK
+    /// resource attributes, twelve more span attributes, and
+    /// a prompt and a log event on every span. Wide ids differ from the
+    /// small spans' in their first byte, so the two never share a trace.
+    pub wide: bool,
 }
 
 impl Telemetry {
@@ -400,12 +405,7 @@ impl Telemetry {
                 .into_iter()
                 .map(|(service, spans)| ResourceSpans {
                     resource: Some(Resource {
-                        attributes: vec![
-                            text("service.name", service_name(service)),
-                            text("service.version", format!("1.{}.0", service % 5)),
-                            text("deployment.environment.name", "prod"),
-                            text("host.name", format!("host-{}", service % 6)),
-                        ],
+                        attributes: self.resource(service),
                         ..Resource::default()
                     }),
                     scope_spans: vec![ScopeSpans {
@@ -423,8 +423,46 @@ impl Telemetry {
         }
     }
 
-    /// Builds span `index`: its identity, timing, status, attributes, and an
-    /// `exception` event when it failed.
+    /// The resource attributes of service `service`'s spans.
+    fn resource(self, service: i64) -> Vec<KeyValue> {
+        let mut attributes = vec![
+            text("service.name", service_name(service)),
+            text("service.version", format!("1.{}.0", service % 5)),
+            text("deployment.environment.name", "prod"),
+            text("host.name", format!("host-{}", service % 6)),
+        ];
+        if self.wide {
+            attributes.extend([
+                text("service.namespace", "wyrd-bench"),
+                text(
+                    "service.instance.id",
+                    format!("{}-{}", service_name(service), service % 3),
+                ),
+                text("k8s.namespace.name", "bench-prod"),
+                text(
+                    "k8s.pod.name",
+                    format!("{}-7f9c5d-{:05}", service_name(service), service * 37),
+                ),
+                text("k8s.node.name", format!("node-pool-a-{}", service % 6)),
+                text("cloud.provider", "aws"),
+                text("cloud.region", "us-east-1"),
+                text("telemetry.sdk.name", "opentelemetry"),
+                text("telemetry.sdk.language", "python"),
+                text("telemetry.sdk.version", "1.27.0"),
+            ]);
+        }
+        attributes
+    }
+
+    /// Span `index`'s id: [`span_id`], its first byte flipped when wide.
+    fn span_id(self, index: i64) -> Vec<u8> {
+        let mut id = span_id(index);
+        id[0] ^= u8::from(self.wide) << 7;
+        id.to_vec()
+    }
+
+    /// Builds span `index`: its identity, timing, status, attributes, an
+    /// `exception` event when it failed, and the wide events when wide.
     fn span(self, index: i64) -> Span {
         let role = Role::of(index);
         let start = self.start_nanos(index);
@@ -445,38 +483,74 @@ impl Telemetry {
         let failed = is_error(index);
         let exception = EXCEPTIONS[index.to_usize().unwrap_or(0) % EXCEPTIONS.len()];
         let message = format!("{exception}: request {} failed", index % 997);
+        let mut trace_id = trace_id(trace(index));
+        trace_id[0] ^= u8::from(self.wide) << 7;
+        let mut events = if failed {
+            vec![Event {
+                time_unix_nano: u64::try_from(start + (end - start) / 2).unwrap_or_default(),
+                name: "exception".to_owned(),
+                attributes: vec![
+                    text("exception.type", exception),
+                    text("exception.message", message.clone()),
+                    text(
+                        "exception.stacktrace",
+                        format!(
+                            "{exception}: {message}\n  at handler (app/r{route:02}.py:{})\n  \
+                             at dispatch (app/server.py:212)\n  at main (app/main.py:40)",
+                            index % 400
+                        ),
+                    ),
+                ],
+                ..Event::default()
+            }]
+        } else {
+            Vec::new()
+        };
+        if self.wide {
+            let time = u64::try_from(start).unwrap_or_default();
+            events.extend([
+                Event {
+                    time_unix_nano: time,
+                    name: "gen_ai.user.message".to_owned(),
+                    attributes: vec![
+                        text("gen_ai.system", "anthropic"),
+                        text(
+                            "content",
+                            format!(
+                                "Summarize the open orders for customer c-{:05} on route /api/r{route:02} \
+                                 and list any delayed shipment.",
+                                trace(index) % 50_000
+                            ),
+                        ),
+                    ],
+                    ..Event::default()
+                },
+                Event {
+                    time_unix_nano: time + 1_000,
+                    name: "log".to_owned(),
+                    attributes: vec![
+                        text("log.severity", "INFO"),
+                        text(
+                            "log.message",
+                            format!("handled request {} in worker {} with {} cached rows", index % 997, index % 16, index % 64),
+                        ),
+                    ],
+                    ..Event::default()
+                },
+            ]);
+        }
         Span {
-            trace_id: trace_id(trace(index)).to_vec(),
-            span_id: span_id(index).to_vec(),
+            trace_id: trace_id.to_vec(),
+            span_id: self.span_id(index),
             parent_span_id: role
                 .parent()
-                .map_or_else(Vec::new, |parent| span_id(trace_start + parent).to_vec()),
+                .map_or_else(Vec::new, |parent| self.span_id(trace_start + parent)),
             name,
             kind: role.kind(),
             start_time_unix_nano: u64::try_from(start).unwrap_or_default(),
             end_time_unix_nano: u64::try_from(end).unwrap_or_default(),
             attributes: self.attributes(index, role, model, route),
-            events: if failed {
-                vec![Event {
-                    time_unix_nano: u64::try_from(start + (end - start) / 2).unwrap_or_default(),
-                    name: "exception".to_owned(),
-                    attributes: vec![
-                        text("exception.type", exception),
-                        text("exception.message", message.clone()),
-                        text(
-                            "exception.stacktrace",
-                            format!(
-                                "{exception}: {message}\n  at handler (app/r{route:02}.py:{})\n  \
-                                 at dispatch (app/server.py:212)\n  at main (app/main.py:40)",
-                                index % 400
-                            ),
-                        ),
-                    ],
-                    ..Event::default()
-                }]
-            } else {
-                Vec::new()
-            },
+            events,
             status: Some(Status {
                 message: if failed { message } else { String::new() },
                 code: if failed {
@@ -581,6 +655,40 @@ impl Telemetry {
                 _ => Value::DoubleValue(((tail >> 20) % 10_000) as f64 / 100.0),
             };
             attributes.push(attribute(&format!("{TAIL_PREFIX}k{key:04}"), value));
+        }
+        if self.wide {
+            attributes.extend([
+                text(
+                    "code.function.name",
+                    format!("app.handlers.r{route:02}.handle"),
+                ),
+                text("code.file.path", format!("app/handlers/r{route:02}.py")),
+                attribute("code.line.number", Value::IntValue(40 + index % 400)),
+                text("thread.name", format!("worker-{}", index % 16)),
+                text("server.address", "api.internal.example"),
+                attribute("server.port", Value::IntValue(8443)),
+                text(
+                    "client.address",
+                    format!("10.{}.{}.{}", index % 4, index % 256, index % 251),
+                ),
+                text("user_agent.original", "python-httpx/0.27.2"),
+                text(
+                    "session.id",
+                    format!("sess-{:016x}", draw(trace(index), salt::SPAN)),
+                ),
+                text(
+                    "request.id",
+                    format!("req-{:016x}", draw(index, salt::SPAN)),
+                ),
+                text(
+                    "tenant.tier",
+                    PLANS[(draw(index, salt::USER) >> 40) as usize % PLANS.len()],
+                ),
+                attribute(
+                    "http.response.body.size",
+                    Value::IntValue(512 + index % 4_096),
+                ),
+            ]);
         }
         attributes
     }
@@ -768,6 +876,7 @@ fn shredded_keys(path: &std::path::Path) -> std::result::Result<Option<Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wyrd_tonic::prost::Message as _;
 
     /// Spans in the shape test's fixture, as many as the events fixture's
     /// rows.
@@ -782,6 +891,7 @@ mod tests {
     fn carries(index: i64, key: &str) -> bool {
         Telemetry {
             spans: STANDARD_SPANS,
+            wide: false,
         }
         .span(index)
         .attributes
@@ -800,6 +910,7 @@ mod tests {
     fn telemetry_spans_are_deterministic_trees_straddling_the_threshold() {
         let fixture = Telemetry {
             spans: STANDARD_SPANS,
+            wide: false,
         };
         let request = fixture.request(0, 16);
         let spans: Vec<&Span> = request
@@ -838,6 +949,44 @@ mod tests {
         assert!(
             (0..sample).map(duration_nanos).max() > Some(100_000_000),
             "the duration tail reaches past 100 ms"
+        );
+    }
+
+    /// The small and wide fixtures send about 340 B and 1 KiB of OTLP wire
+    /// per span in an SDK-sized export, with twelve more attributes and
+    /// two more events per wide span, and never share an id.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a payload size or the ids' separation drifts.
+    #[test]
+    fn wide_spans_carry_about_one_kib_with_distinct_ids() {
+        let fixture = |wide| Telemetry {
+            spans: STANDARD_SPANS,
+            wide,
+        };
+        let per_span = |wide| {
+            fixture(wide).request(0, REQUEST_SPANS).encoded_len() as f64 / REQUEST_SPANS as f64
+        };
+        let (small, wide) = (per_span(false), per_span(true));
+        assert!(
+            (300.0..400.0).contains(&small),
+            "small spans at {small:.0} B"
+        );
+        assert!(
+            (900.0..1_200.0).contains(&wide),
+            "wide spans at {wide:.0} B"
+        );
+        let (narrow, broad) = (fixture(false).span(9), fixture(true).span(9));
+        assert_eq!(broad.attributes.len(), narrow.attributes.len() + 12);
+        assert_eq!(broad.events.len(), narrow.events.len() + 2);
+        assert_ne!(narrow.trace_id, broad.trace_id);
+        assert_ne!(narrow.span_id, broad.span_id);
+        assert_ne!(narrow.parent_span_id, broad.parent_span_id);
+        assert_eq!(
+            fixture(true).span(9),
+            broad,
+            "the same wide span every time"
         );
     }
 
@@ -883,7 +1032,10 @@ mod tests {
         assert_eq!(rows, vec![vec![carried.to_i64().expect("count")]]);
         assert!(carried > 0 && carried < 200, "on {carried} spans");
         let (_, rows) = Telemetry::all_spans(written);
-        let fixture = Telemetry { spans: 160_000 };
+        let fixture = Telemetry {
+            spans: 160_000,
+            wide: false,
+        };
         let (_, window) = fixture.span_window(written);
         assert!(window[0][0] > 0 && window[0][0] < rows[0][0]);
     }

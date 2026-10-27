@@ -104,14 +104,16 @@ What each engine covers:
 
 - **Bifrost.**
   - L1 is three experiments at 1 and 64 clients, each with its own record:
-    - `writes-parquet`: 2M-row OTLP spans, OTLP logs, and native writes
-      under the production rotation and
+    - `writes-parquet`: 2M-row OTLP spans of about 340 B (`otlp-spans`)
+      and about 1 KiB (`otlp-spans-1k`) of wire each, OTLP logs, and
+      native writes under the production rotation and
       a 30 s retention, complete at their durable acknowledgement with no
       wait for publication. Each path after the first starts once every
       earlier row has published, outside every window, so no path's server
       CPU pays another path's backlog; native runs last because its backlog
       is the largest. Each window records the files and MiB it published
-      and the memtable and staged backlog at its stop; it is not a
+      and the memtable and staged backlog at its stop, and each OTLP
+      window its measured `wire_bytes_per_row`; it is not a
       publication-latency or sustained-throughput measurement.
     - `hot`: 10M events rows and 1M spans held in memtables (a staged or
       published row is INVALID); point lookups at 1/64, with p99 below 5 ms

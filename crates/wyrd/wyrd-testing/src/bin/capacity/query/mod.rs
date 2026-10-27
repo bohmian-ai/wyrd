@@ -261,13 +261,16 @@ const PARQUET_READS: [(&str, Read, &[u64]); 6] = [
     ("span-long-tail", Read::LongTail, &ONE),
 ];
 
-/// The three ingest paths an experiment writes through.
+/// The ingest paths an experiment writes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOp {
     /// Native Arrow writes into `bifrost.datasets.events_ingest`.
     Native,
-    /// OTLP spans into `bifrost.traces.spans`.
+    /// OTLP spans of about 340 wire bytes into `bifrost.traces.spans`.
     Spans,
+    /// OTLP spans of about 1 KiB of wire into `bifrost.traces.spans`, the
+    /// wide [`telemetry::Telemetry`] fixture; L1 only, never in [`SPLIT`].
+    WideSpans,
     /// OTLP bulky Kubernetes logs into `bifrost.logs.records`.
     Logs,
 }
@@ -275,14 +278,14 @@ pub enum WriteOp {
 impl WriteOp {
     /// Every path, in L1 sweep order: native last, so no later path's
     /// warmup waits for its far larger backlog to publish.
-    pub const ALL: [Self; 3] = [Self::Spans, Self::Logs, Self::Native];
+    pub const ALL: [Self; 4] = [Self::Spans, Self::WideSpans, Self::Logs, Self::Native];
 
     /// The table this path writes, as `vala.<segment>.<name>`.
     #[must_use]
     pub const fn table(self) -> &'static str {
         match self {
             Self::Native => workload::INGEST_TABLE,
-            Self::Spans => telemetry::TABLE,
+            Self::Spans | Self::WideSpans => telemetry::TABLE,
             Self::Logs => "bifrost.logs.records",
         }
     }
@@ -293,6 +296,7 @@ impl WriteOp {
         match self {
             Self::Native => "native-write",
             Self::Spans => "otlp-spans",
+            Self::WideSpans => "otlp-spans-1k",
             Self::Logs => "otlp-logs",
         }
     }
@@ -309,7 +313,7 @@ impl WriteOp {
     pub const fn boundary(self) -> &'static str {
         match self {
             Self::Native => "bifrost.gate.write",
-            Self::Spans => "bifrost.otlp.traces",
+            Self::Spans | Self::WideSpans => "bifrost.otlp.traces",
             Self::Logs => "bifrost.otlp.logs",
         }
     }
@@ -470,6 +474,7 @@ fn write_fixture() -> Value {
     json!({
         "native": format!("native-2m: events rows into bifrost.datasets.events_ingest, {WRITE_FIXTURE_ROWS} rows per day, fresh ids every window"),
         "spans": format!("spans-2m: GenAI/HTTP spans into bifrost.traces.spans, {WRITE_FIXTURE_ROWS} spans per day, fresh ids every window"),
+        "spans_1k": format!("spans-1k-2m: the spans-2m spans at about 1 KiB of OTLP wire each (Kubernetes and SDK resource attributes, twelve more span attributes, a prompt and a log event per span) into bifrost.traces.spans, {WRITE_FIXTURE_ROWS} spans per day, ids distinct from spans-2m, fresh ids every window"),
         "logs": format!("logs-2m: bulky Kubernetes logs into bifrost.logs.records, {WRITE_FIXTURE_ROWS} records per day, fresh ids every window"),
     })
 }
@@ -554,6 +559,11 @@ fn isolated_metrics() -> Vec<Metric> {
             "wire_bytes",
             "B",
             "encoded OTLP protobuf bytes of acknowledged exports, before framing and compression; OTLP steps only",
+        ),
+        Metric::raw(
+            "wire_bytes_per_row",
+            "B/row",
+            "`wire_bytes` per durably acknowledged row of the same window: the measured OTLP payload size; OTLP steps only",
         ),
         Metric::raw(
             "published_files",
@@ -912,12 +922,16 @@ fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration 
 /// its latency percentile's sample floor at TASK-005's observed rates:
 /// Parquet c1 aggregates (~930 per 5 s against 1,000) and span trace
 /// lookups (~930), c1 native and OTLP spans writes (~150 and ~190 against
-/// 200), and c64 native writes (~1,090 against 1,000).
+/// 200; 1 KiB spans send fewer requests still), and c64 native writes
+/// (~1,090 against 1,000).
 fn windowed(experiment: Experiment, id: &str, mut params: Value) -> Step {
     let long = match experiment {
         Experiment::Parquet => matches!(id, "small-aggregate-c1" | "span-trace-c1"),
         Experiment::WritesParquet => {
-            matches!(id, "native-write-c1" | "otlp-spans-c1" | "native-write-c64")
+            matches!(
+                id,
+                "native-write-c1" | "otlp-spans-c1" | "otlp-spans-1k-c1" | "native-write-c64"
+            )
         }
         Experiment::Hot => false,
     };
@@ -1361,10 +1375,11 @@ async fn lanes(client: &WyrdClient, ops: &[WriteOp]) -> Result<Vec<Lane>> {
                 )
                 .await?
             }
-            WriteOp::Spans => run::Sender::Spans(
+            WriteOp::Spans | WriteOp::WideSpans => run::Sender::Spans(
                 otlp.clone(),
                 telemetry::Telemetry {
                     spans: WRITE_FIXTURE_ROWS,
+                    wide: *op == WriteOp::WideSpans,
                 },
             ),
             WriteOp::Logs => run::Sender::Logs(

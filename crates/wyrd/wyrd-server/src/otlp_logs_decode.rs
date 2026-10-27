@@ -9,11 +9,11 @@ use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 
 use crate::otlp_decode::{
-    AnyValueBodies, GROUP_FAN_OUT, OtlpDecodePlan, ProjectedOutput, RESOURCE_FAN_OUT, WireFields,
-    WireValue, decode_key_value, decode_merged_any_value, decode_merged_resource,
-    decode_merged_scope, enforce_expanded_ceiling, fixed_bytes, fixed_string,
-    last_bytes_across_messages, last_bytes_field, malformed, protobuf_i32, protobuf_u32,
-    repeated_message_count, select_any_value_bodies, wrong_wire,
+    AnyValueBodies, GROUP_FAN_OUT, OtlpDecodePlan, ProjectedOutput, RESOURCE_FAN_OUT, Scanned,
+    WireFields, WireValue, decode_any_value, decode_key_value, decode_merged_any_value,
+    decode_merged_resource, decode_merged_scope, decode_resource, decode_scope,
+    enforce_expanded_ceiling, last_bytes_across_messages, last_bytes_field, malformed,
+    protobuf_i32, protobuf_u32, repeated_message_count, select_any_value_bodies, wrong_wire,
 };
 
 /// Bounded counters accumulated while walking one logs export.
@@ -435,13 +435,10 @@ pub(crate) fn decode_logs_protobuf(bytes: &[u8]) -> Result<ExportLogsServiceRequ
 ///
 /// Returns a malformed refusal for invalid framing, UTF-8, or wire types.
 fn decode_resource_logs(bytes: &[u8]) -> Result<ResourceLogs, IngestError> {
-    let resource = decode_merged_resource(bytes, 1)?;
-    let count = repeated_message_count(bytes, 2)?;
-    let mut scope_logs = Vec::with_capacity(count);
-    let schema_url = last_bytes_field(bytes, 3)?
-        .map(fixed_string)
-        .transpose()?
-        .unwrap_or_default();
+    let scanned = Scanned::<4>::of(bytes)?;
+    let resource = scanned.singular(1, decode_resource, decode_merged_resource)?;
+    let mut scope_logs = Vec::with_capacity(scanned.count(2));
+    let schema_url = scanned.string(3)?;
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
@@ -464,13 +461,10 @@ fn decode_resource_logs(bytes: &[u8]) -> Result<ResourceLogs, IngestError> {
 ///
 /// Returns a malformed refusal for invalid framing, UTF-8, or wire types.
 fn decode_scope_logs(bytes: &[u8]) -> Result<ScopeLogs, IngestError> {
-    let scope = decode_merged_scope(bytes, 1)?;
-    let count = repeated_message_count(bytes, 2)?;
-    let mut log_records = Vec::with_capacity(count);
-    let schema_url = last_bytes_field(bytes, 3)?
-        .map(fixed_string)
-        .transpose()?
-        .unwrap_or_default();
+    let scanned = Scanned::<4>::of(bytes)?;
+    let scope = scanned.singular(1, decode_scope, decode_merged_scope)?;
+    let mut log_records = Vec::with_capacity(scanned.count(2));
+    let schema_url = scanned.string(3)?;
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
@@ -493,24 +487,14 @@ fn decode_scope_logs(bytes: &[u8]) -> Result<ScopeLogs, IngestError> {
 ///
 /// Returns a malformed refusal for invalid framing, UTF-8, or known wire types.
 fn decode_log_record(bytes: &[u8]) -> Result<LogRecord, IngestError> {
-    let body = decode_merged_any_value(bytes, 5)?;
+    let scanned = Scanned::<13>::of(bytes)?;
     let mut record = LogRecord {
-        severity_text: last_bytes_field(bytes, 3)?
-            .map(fixed_string)
-            .transpose()?
-            .unwrap_or_default(),
-        body,
-        attributes: Vec::with_capacity(repeated_message_count(bytes, 6)?),
-        trace_id: last_bytes_field(bytes, 9)?
-            .map(fixed_bytes)
-            .unwrap_or_default(),
-        span_id: last_bytes_field(bytes, 10)?
-            .map(fixed_bytes)
-            .unwrap_or_default(),
-        event_name: last_bytes_field(bytes, 12)?
-            .map(fixed_string)
-            .transpose()?
-            .unwrap_or_default(),
+        severity_text: scanned.string(3)?,
+        body: scanned.singular(5, decode_any_value, decode_merged_any_value)?,
+        attributes: Vec::with_capacity(scanned.count(6)),
+        trace_id: scanned.owned_bytes(9),
+        span_id: scanned.owned_bytes(10),
+        event_name: scanned.string(12)?,
         ..LogRecord::default()
     };
     let mut fields = WireFields::new(bytes);

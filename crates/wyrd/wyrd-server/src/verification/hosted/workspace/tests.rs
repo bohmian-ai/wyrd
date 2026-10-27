@@ -335,7 +335,12 @@ fn workspace_search_matches_lines() {
     };
     assert_eq!(hit["locator"], loc(Locator::Lines { start: 2, end: 2 }));
     assert_eq!(hit["sources"], json!(["evidence"]));
-    assert!(hit["snippet"].as_str().expect("snippet").starts_with("REFUND é"));
+    assert!(
+        hit["snippet"]
+            .as_str()
+            .expect("snippet")
+            .starts_with("REFUND é")
+    );
     assert!(found.to_string().len() <= HostedLimits::default().tool_result_max_bytes);
 }
 

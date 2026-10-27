@@ -1940,6 +1940,10 @@ pub(super) fn project_plan_by_name(
 
 /// Projects one physical batch to the pinned schema by field name.
 ///
+/// Each field is first matched at its own position and found by name only
+/// when that position holds a different field, so a batch already in the
+/// pinned order costs no per-field schema scan.
+///
 /// The row count is carried explicitly rather than inferred from the columns,
 /// because a projected schema is legitimately allowed to be empty: an output
 /// projection for `count(*)` has zero columns and a real row count. Arrow
@@ -1954,16 +1958,23 @@ pub(super) fn project_batch(
     batch: &RecordBatch,
     schema: SchemaRef,
 ) -> DataFusionResult<RecordBatch> {
+    let source = batch.schema_ref().fields();
     let columns = schema
         .fields()
         .iter()
-        .map(|field| {
-            let index = batch.schema().index_of(field.name()).map_err(|_| {
-                DataFusionError::Execution(format!(
-                    "hot file is missing required field `{}`",
-                    field.name()
-                ))
-            })?;
+        .enumerate()
+        .map(|(position, field)| {
+            // Hot batches normally arrive already projected in the target
+            // order, so the same position is checked before a name scan.
+            let index = match source.get(position) {
+                Some(candidate) if candidate.name() == field.name() => position,
+                _ => batch.schema_ref().index_of(field.name()).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "hot file is missing required field `{}`",
+                        field.name()
+                    ))
+                })?,
+            };
             let column = batch.column(index);
             if column.data_type() == field.data_type() {
                 Ok(Arc::clone(column))
@@ -3751,6 +3762,56 @@ pub(super) mod tests {
     /// # Panics
     /// Panics if provider construction, scan planning, or execution violates
     /// the closure contract this owner pins.
+    /// A batch is projected to the pinned schema by name whether its fields
+    /// already sit at their pinned positions or not.
+    ///
+    /// The positional match is taken only when the field at a position has
+    /// the pinned name; a reordered batch falls back to the name lookup, and a
+    /// missing field is still refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a fixture batch cannot be built or a projection picks a
+    /// column other than the one its name names.
+    #[test]
+    fn project_batch_matches_positions_then_names() {
+        let pinned = Arc::new(Schema::new(vec![
+            Field::new("duration_ms", DataType::Int64, true),
+            Field::new("status_code", DataType::Utf8, true),
+        ]));
+        let durations = Arc::new(Int64Array::from(vec![41_i64])) as ArrayRef;
+        let statuses = Arc::new(StringArray::from(vec!["STATUS_CODE_OK"])) as ArrayRef;
+        let ordered = RecordBatch::try_new(
+            Arc::clone(&pinned),
+            vec![Arc::clone(&durations), Arc::clone(&statuses)],
+        )
+        .expect("ordered batch");
+        let reordered = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("status_code", DataType::Utf8, true),
+                Field::new("duration_ms", DataType::Int64, true),
+            ])),
+            vec![Arc::clone(&statuses), Arc::clone(&durations)],
+        )
+        .expect("reordered batch");
+        for batch in [&ordered, &reordered] {
+            let projected = project_batch(batch, Arc::clone(&pinned)).expect("projects");
+            assert_eq!(projected.schema(), pinned);
+            assert!(Arc::ptr_eq(projected.column(0), &durations));
+            assert!(Arc::ptr_eq(projected.column(1), &statuses));
+        }
+        let missing = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "duration_ms",
+                DataType::Int64,
+                true,
+            )])),
+            vec![durations],
+        )
+        .expect("narrow batch");
+        assert!(project_batch(&missing, pinned).is_err());
+    }
+
     /// Sizing and the physical scan share one file plan per pushed filters.
     ///
     /// A second plan under the same filters returns the memoized plan rather

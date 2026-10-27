@@ -478,3 +478,29 @@ Commands: `cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scri
 `cargo nextest run --locked -p wyrd-server --lib -E 'test(/^grpc::otlp::tests::/)'`;
 the capacity lane (61 passed); `mise run fmt`, `mise run lints`,
 `git diff --check`; `mise run bench:l1:bifrost:writes` twice.
+
+### Item 7(a) acceptance: single-byte varint fast path
+
+Change: `76bcfa75a`, `WireFields::read_varint` (`otlp_decode.rs`) returns a
+byte below 0x80 before the general loop. Before:
+`writes-parquet/20261027T181224Z-a76039813`; after:
+`writes-parquet/20261027T182756Z-76bcfa75a` (VALID, unprofiled). Medians of
+three repetitions.
+
+| Step | otlp_decode p50 ms | rows/cpu-s | wire MiB/cpu-s | server p50 / p99 ms |
+|---|---|---|---|---|
+| otlp-spans-c1 | 1.36 → 1.32 | 55.95k → 56.24k | 18.1 → 18.1 | 11.1/18.7 → 11.2/19.1 |
+| otlp-spans-c64 | 1.89 → 1.89 | 47.09k → 48.34k | 15.2 → 15.6 | 36.4/148.0 → 27.7/133.0 |
+| otlp-spans-1k-c1 | 3.64 → 3.69 | 30.20k → 29.62k | 30.4 → 29.8 | 18.3/30.1 → 18.4/30.1 |
+| otlp-spans-1k-c64 | 4.51 → 4.45 | 22.75k → 22.45k | 22.9 → 22.6 | 62.4/204.3 → 61.2/205.3 |
+| otlp-logs-c1 | 0.99 → 0.97 | 51.63k → 48.36k | 61.7 → 57.8 | 12.0/19.4 → 12.2/22.6 |
+| otlp-logs-c64 | 1.67 → 1.51 | 34.94k → 36.67k | 41.7 → 43.8 | 68.7/203.6 → 89.7/258.7 |
+
+Result: no measurable improvement. Decode time and CPU per row move in both
+directions within the run-to-run spread recorded for item 6. The change is
+kept: it is correct and adds no cost.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Own before/after result for CPU per row, row and wire throughput, latency | the table above | two VALID unprofiled writes-parquet records | PASS (no improvement observed) |
+| Correctness for malformed and boundary varints | fast path only for a present byte below 0x80 | `otlp_decode::tests::varints_read_boundaries_and_refuse_malformed_input` (0, 0x7f/0x80, 0x3fff/0x4000, u32::MAX, u64::MAX; empty, truncated, tenth-byte overflow, eleven bytes); 55 `otlp` lib tests | PASS |

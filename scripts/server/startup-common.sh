@@ -57,8 +57,8 @@ start_app() {
 # sign-in with tenant acme's key opens the tenant's page.
 ui_sign_in() {
   local key=$1 jar="$work/ui-cookies" answer
-  curl -fsS -H 'accept: text/html' "$http/" | grep -qi '<html' || fail "UI root through nginx"
-  curl -fsS "$http/auth/device?tenant=acme" | grep -q 'Approve a Wyrd CLI login' \
+  curl -fsS -H 'accept: text/html' "$http/" | grep -i '<html' >/dev/null || fail "UI root through nginx"
+  curl -fsS "$http/auth/device?tenant=acme" | grep 'Approve a Wyrd CLI login' >/dev/null \
     || fail "device page at the UI origin through nginx"
   answer="$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' -c "$jar" \
     -H "origin: $http" -H 'accept: text/html' --data-urlencode "apiKey=$key" \

@@ -381,6 +381,33 @@ impl<'a> ParquetBatchEncoder<'a> {
         })
     }
 
+    /// Returns the decoded bytes `candidate`'s gathered output holds.
+    ///
+    /// The gather writes every column densely, so its size is each stored
+    /// column's slice size, which the memtable recorded per batch on append.
+    /// Summing those numbers avoids walking every small stored batch's Arrow
+    /// buffers on the persistence lane. A batch without a recorded size, as
+    /// in a hand-built test generation, falls back to measuring the
+    /// allocations the candidate's batches retain.
+    fn output_bytes(&self, candidate: FileCandidate) -> usize {
+        self.frozen
+            .statistics
+            .get(candidate.start..candidate.end)
+            .and_then(|statistics| {
+                statistics
+                    .iter()
+                    .flat_map(|batch| &batch.column_statistics)
+                    .map(|column| column.byte_size.get_value().copied())
+                    .try_fold(0_usize, |total, bytes| Some(total.saturating_add(bytes?)))
+            })
+            .unwrap_or_else(|| {
+                crate::scribe::memory::unshared_arrow_bytes(
+                    &self.frozen.batches[candidate.start..candidate.end],
+                    &[],
+                )
+            })
+    }
+
     /// Validates physical identity and gathers the candidate's rows in sort order.
     ///
     /// Only the sort-key columns are concatenated across the candidate's
@@ -434,7 +461,7 @@ impl<'a> ParquetBatchEncoder<'a> {
             crate::scribe::memory::MemoryCategory::Persistence,
             key_bytes
                 .saturating_add(position_bytes)
-                .saturating_add(crate::scribe::memory::unshared_arrow_bytes(sources, &[])),
+                .saturating_add(self.output_bytes(candidate)),
         )?;
         let materialize = |error: arrow::error::ArrowError| ScribeError::Internal {
             detail: format!("failed to gather frozen memtable in sort order: {error}"),
@@ -2617,7 +2644,8 @@ mod tests {
 
     /// Proves a candidate's sort keys, positions, and gathered output are
     /// admitted against the shared root before anything is built: a root
-    /// that can hold the output alone refuses the candidate as retryable
+    /// that can hold the output alone, sized from the column bytes the
+    /// memtable recorded on append, refuses the candidate as retryable
     /// pressure, the same candidate gathers once the pressure clears, and
     /// gathering returns every working byte it held.
     ///
@@ -2627,7 +2655,12 @@ mod tests {
     /// `IngestBusy`, the relieved candidate fails, or working bytes leak.
     #[test]
     fn gathered_sort_respects_persistence_admission() {
-        let (frozen, layout) = gather_fixture();
+        let (mut frozen, layout) = gather_fixture();
+        frozen.statistics = frozen
+            .batches
+            .iter()
+            .map(crate::scribe::memtable::batch_statistics)
+            .collect();
         let memory = crate::resources::ScribeResources::for_test();
         let used = || {
             memory
@@ -2636,7 +2669,12 @@ mod tests {
                 .governed_memory_used_bytes
         };
         let baseline = used();
-        let output = crate::scribe::memory::unshared_arrow_bytes(&frozen.batches, &[]);
+        let output = frozen
+            .statistics
+            .iter()
+            .flat_map(|batch| &batch.column_statistics)
+            .map(|column| *column.byte_size.get_value().expect("recorded size"))
+            .sum::<usize>();
         let pressure = memory
             .try_reserve_maintenance(
                 crate::scribe::memory::MemoryCategory::Persistence,

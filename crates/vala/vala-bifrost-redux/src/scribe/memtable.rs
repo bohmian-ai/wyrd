@@ -896,7 +896,7 @@ impl Memtable {
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         let mut batches = Vec::new();
         for source in self.readable_sources(tenant, table, partitions)? {
-            source.project(required, &mut batches)?;
+            source.project(required, None, &mut batches)?;
         }
         Ok(batches)
     }
@@ -1821,10 +1821,14 @@ impl LiveCapture {
         partitions.into_iter().collect()
     }
 
-    /// Reads one partition range of the capture: its memory batches projected
-    /// to `required`, the accounting owners of those batches, its
-    /// staged run paths in merge order, and the lease that keeps those runs on
-    /// disk.
+    /// Reads one partition range of the capture: its memory batches `pruning`
+    /// keeps, projected to `required`, the accounting owners of those
+    /// batches, its staged run paths in merge order, and the lease that keeps
+    /// those runs on disk.
+    ///
+    /// Pruning never changes which generations the read serves: the staged
+    /// half was fixed when the capture was taken, so a generation whose every
+    /// batch is pruned is still not read again from its staged runs.
     ///
     /// Projection shares the captured Arrow buffers, so the caller must hold
     /// the returned charges for as long as any returned batch lives, and the
@@ -1838,12 +1842,13 @@ impl LiveCapture {
         &self,
         partitions: &std::ops::RangeInclusive<crate::catalog::layout::TimePartition>,
         required: &[FieldRef],
+        pruning: Option<&crate::scan_sizing::BatchPruning>,
     ) -> Result<CapturedRead, ScribeError> {
         let mut batches = Vec::new();
         let mut charges = Vec::new();
         for source in &self.memory {
             if partitions.contains(&source.seal_key.partition.time()) {
-                source.project(required, &mut batches)?;
+                source.project(required, pruning, &mut batches)?;
                 charges.push(Arc::clone(&source.charge));
             }
         }
@@ -1948,14 +1953,19 @@ impl ReadableSource {
         crate::scan_sizing::ScanSizer::new(scope, &self.schema).batch_bytes(&self.statistics)
     }
 
-    /// Appends each captured batch, projected to `required`, to `output`,
-    /// with its bounds projected like its columns.
+    /// Appends each captured batch `pruning` keeps, projected to `required`,
+    /// to `output`, with its bounds projected like its columns.
     ///
     /// Each required field resolves by field id (see [`projection_indices`]),
     /// so rows admitted under an earlier schema revision are emitted under the
     /// required field's current name and type. A required field the batch
     /// predates is filled with nulls and has unknown bounds. An empty
     /// `required` keeps every column.
+    ///
+    /// `pruning` is planned over `required` and runs on the projected bounds
+    /// of every captured batch before any batch is projected, so a batch the
+    /// query's predicate rules out is never cast or assembled. `None` keeps
+    /// every batch.
     ///
     /// # Errors
     ///
@@ -1964,6 +1974,7 @@ impl ReadableSource {
     fn project(
         &self,
         required: &[FieldRef],
+        pruning: Option<&crate::scan_sizing::BatchPruning>,
         output: &mut Vec<ReadableBatch>,
     ) -> Result<(), ScribeError> {
         let internal = |error: arrow::error::ArrowError| ScribeError::Internal {
@@ -1977,31 +1988,56 @@ impl ReadableSource {
                 .collect::<Vec<_>>(),
             self.schema.metadata().clone(),
         ));
-        for (index, (batch, wal_lsn_max)) in self
+        // A source column keeps its recorded bounds only when it is read
+        // unchanged; a cast or null-filled column's bounds are unknown.
+        let kept: Vec<Option<usize>> = projection
+            .iter()
+            .map(|(field, source)| {
+                source.filter(|column| self.schema.field(*column).data_type() == field.data_type())
+            })
+            .collect();
+        let statistics: Vec<Arc<Statistics>> = (0..self.batches.len())
+            .map(|index| {
+                Arc::new(self.statistics.get(index).map_or_else(
+                    || Statistics::new_unknown(&schema),
+                    |bounds| {
+                        Statistics {
+                            num_rows: bounds.num_rows,
+                            total_byte_size: Precision::Absent,
+                            column_statistics: kept
+                                .iter()
+                                .map(|column| {
+                                    column.map_or_else(ColumnStatistics::new_unknown, |column| {
+                                        bounds.column_statistics[column].clone()
+                                    })
+                                })
+                                .collect(),
+                        }
+                    },
+                ))
+            })
+            .collect();
+        let keep = pruning.map(|pruning| pruning.keep(&statistics, self.batches.len()));
+        for (index, ((batch, wal_lsn_max), statistics)) in self
             .batches
             .iter()
             .zip(self.wal_lsns.iter().copied())
+            .zip(statistics)
             .enumerate()
         {
+            if keep.as_ref().is_some_and(|keep| !keep[index]) {
+                continue;
+            }
             let rows = batch.num_rows();
-            // A source column keeps its recorded bounds only when it is read
-            // unchanged; a cast or null-filled column's bounds are unknown.
-            let mut kept = Vec::with_capacity(projection.len());
             let columns = projection
                 .iter()
-                .map(|(field, source)| match source {
-                    Some(column) if batch.column(*column).data_type() == field.data_type() => {
-                        kept.push(Some(*column));
-                        Ok(Arc::clone(batch.column(*column)))
-                    }
-                    Some(column) => {
-                        kept.push(None);
+                .zip(&kept)
+                .map(|((field, source), kept)| match (source, kept) {
+                    (Some(column), Some(_)) => Ok(Arc::clone(batch.column(*column))),
+                    (Some(column), None) => {
                         arrow::compute::cast(batch.column(*column), field.data_type())
                     }
-                    None => {
-                        kept.push(None);
-                        Ok(arrow::array::new_null_array(field.data_type(), rows))
-                    }
+                    (None, _) => Ok(arrow::array::new_null_array(field.data_type(), rows)),
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(internal)?;
@@ -2011,23 +2047,6 @@ impl ReadableSource {
                 &arrow::array::RecordBatchOptions::new().with_row_count(Some(rows)),
             )
             .map_err(internal)?;
-            let statistics = Arc::new(self.statistics.get(index).map_or_else(
-                || Statistics::new_unknown(batch.schema_ref()),
-                |bounds| {
-                    Statistics {
-                        num_rows: bounds.num_rows,
-                        total_byte_size: Precision::Absent,
-                        column_statistics: kept
-                            .iter()
-                            .map(|column| {
-                                column.map_or_else(ColumnStatistics::new_unknown, |column| {
-                                    bounds.column_statistics[column].clone()
-                                })
-                            })
-                            .collect(),
-                    }
-                },
-            ));
             output.push(ReadableBatch {
                 partition_day: self.seal_key.partition.time(),
                 wal_lsn_max,
@@ -2215,6 +2234,61 @@ mod tests {
         .expect("named projection");
         assert_eq!(by_name[0].0.data_type(), &DataType::Utf8);
         assert!(projection_indices(&captured, &[with_id("a", "2"), with_id("b", "2")]).is_err());
+    }
+
+    /// A capture read prunes its memory batches by the query's predicate,
+    /// planned over the required fields, before projecting them: a batch
+    /// whose bounds exclude the key is never returned, the matching one is,
+    /// and every batch is kept without a predicate.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capture cannot be taken or read, the excluded batch is
+    /// kept, or the matching batch is dropped.
+    #[test]
+    fn capture_read_prunes_batches_before_projecting() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        memtable
+            .insert(&key, make_test_meta(1), make_test_batch(2))
+            .expect("generation insert");
+        memtable.freeze(&key).expect("frozen generation");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let matching = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![50_i64]))],
+        )
+        .expect("matching batch");
+        memtable
+            .insert(&key, make_test_meta(2), matching)
+            .expect("active insert");
+        let pruning = crate::scan_sizing::BatchPruning::try_new(
+            &schema,
+            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                datafusion::physical_expr::expressions::col("id", &schema).expect("id column"),
+                datafusion::logical_expr::Operator::Eq,
+                datafusion::physical_expr::expressions::lit(50_i64),
+            )),
+        )
+        .expect("pruning plans");
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = key.partition.time()..=key.partition.time();
+        let lsns = |pruning| {
+            let mut lsns = capture
+                .read(&partitions, schema.fields(), pruning)
+                .expect("capture read")
+                .batches
+                .iter()
+                .map(|batch| batch.wal_lsn_max.as_u64())
+                .collect::<Vec<_>>();
+            lsns.sort_unstable();
+            lsns
+        };
+
+        assert_eq!(lsns(Some(&pruning)), vec![2]);
+        assert_eq!(lsns(None), vec![1, 2]);
     }
 
     /// An append batch's bounds are exact for a primitive column and unknown

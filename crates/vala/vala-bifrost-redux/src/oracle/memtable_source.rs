@@ -15,21 +15,17 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::AsArray as _;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::Statistics;
-use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::source::DataSource;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::Operator;
-use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr, Column, Literal};
 use datafusion::physical_expr::projection::ProjectionExprs;
-use datafusion::physical_expr::utils::{collect_columns, conjunction};
+use datafusion::physical_expr::utils::conjunction;
 use datafusion::physical_expr::{DynamicFilterTracking, EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_expr_common::physical_expr::is_volatile;
 use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
@@ -147,7 +143,8 @@ impl MemtableSource {
     /// partition whose bounds cannot be evaluated, keeps every batch it
     /// covers. A source carrying a fetch or projection is never pruned, since
     /// rebuilding would drop it. Each kept batch is then marked fully matching when
-    /// [`fully_matching`] proves the held filter true on all of its rows.
+    /// [`BatchPruning::fully_matching`] proves the held filter true on all
+    /// of its rows.
     ///
     /// # Errors
     ///
@@ -194,7 +191,9 @@ impl MemtableSource {
         source.matched = source
             .statistics
             .iter()
-            .map(|bounds| fully_matching(&filter, &source.inner.original_schema(), bounds))
+            .map(|bounds| {
+                BatchPruning::fully_matching(&source.inner.original_schema(), &filter, bounds)
+            })
             .collect();
         source.filter = Some(filter);
         Ok(Some(source))
@@ -226,7 +225,7 @@ impl MemtableSource {
                 if matched {
                     Ok(batch)
                 } else {
-                    filter_batch(&batch, &filter)
+                    datafusion::physical_plan::filter::batch_filter(&batch, &filter)
                 }
             })
             .filter(|batch| batch.as_ref().map_or(true, |batch| batch.num_rows() > 0));
@@ -237,109 +236,6 @@ impl MemtableSource {
             ),
         )))
     }
-}
-
-/// Returns, per batch of `statistics`, whether its bounds prove `filter`
-/// true on every row.
-///
-/// The filter's negation is pruned against the bounds: a batch the negation
-/// cannot match on any row matches the filter on all of them. That holds only
-/// under two-valued logic, so a batch qualifies only when every column the
-/// filter reads has an exact null count of zero, and [`negation`] accepts
-/// only comparisons of columns and non-null literals that cannot themselves
-/// produce a null. Anything else is evaluated row by row.
-fn fully_matching(
-    filter: &Arc<dyn PhysicalExpr>,
-    schema: &SchemaRef,
-    statistics: &[Arc<Statistics>],
-) -> Vec<bool> {
-    let Some(pruning) = negation(filter).and_then(|negated| BatchPruning::try_new(schema, negated))
-    else {
-        return vec![false; statistics.len()];
-    };
-    let columns: Vec<usize> = collect_columns(filter).iter().map(Column::index).collect();
-    pruning
-        .keep(statistics, statistics.len())
-        .into_iter()
-        .zip(statistics)
-        .map(|(negation_possible, bounds)| {
-            !negation_possible
-                && columns.iter().all(|column| {
-                    bounds
-                        .column_statistics
-                        .get(*column)
-                        .is_some_and(|bounds| bounds.null_count == Precision::Exact(0))
-                })
-        })
-        .collect()
-}
-
-/// Returns the logical negation of `filter`, or `None` when it is not a
-/// combination of comparisons this source can negate exactly.
-///
-/// `AND` and `OR` negate by De Morgan's laws and a comparison by its
-/// opposite operator. Each comparison side must be a column, a column cast,
-/// or a non-null literal: those never produce a null from non-null input,
-/// which [`fully_matching`] requires of the columns themselves.
-fn negation(filter: &Arc<dyn PhysicalExpr>) -> Option<Arc<dyn PhysicalExpr>> {
-    let binary = filter.downcast_ref::<BinaryExpr>()?;
-    let operator = match binary.op() {
-        Operator::And => Operator::Or,
-        Operator::Or => Operator::And,
-        comparison @ (Operator::Eq
-        | Operator::NotEq
-        | Operator::Lt
-        | Operator::LtEq
-        | Operator::Gt
-        | Operator::GtEq) => {
-            if !(null_free(binary.left()) && null_free(binary.right())) {
-                return None;
-            }
-            return Some(Arc::new(BinaryExpr::new(
-                Arc::clone(binary.left()),
-                comparison.negate()?,
-                Arc::clone(binary.right()),
-            )));
-        }
-        _ => return None,
-    };
-    Some(Arc::new(BinaryExpr::new(
-        negation(binary.left())?,
-        operator,
-        negation(binary.right())?,
-    )))
-}
-
-/// Reports whether `side` is a column, a cast of a column, or a non-null
-/// literal: a comparison operand that is null only where a column is.
-fn null_free(side: &Arc<dyn PhysicalExpr>) -> bool {
-    if side.downcast_ref::<Column>().is_some() {
-        return true;
-    }
-    if let Some(literal) = side.downcast_ref::<Literal>() {
-        return !literal.value().is_null();
-    }
-    side.downcast_ref::<CastExpr>()
-        .is_some_and(|cast| cast.expr().downcast_ref::<Column>().is_some())
-}
-
-/// Filters `batch` by `filter`, keeping the rows it evaluates true on.
-///
-/// # Errors
-///
-/// Returns the `DataFusion` error raised when the filter cannot be evaluated
-/// on the batch or does not evaluate to booleans.
-fn filter_batch(
-    batch: &RecordBatch,
-    filter: &Arc<dyn PhysicalExpr>,
-) -> DataFusionResult<RecordBatch> {
-    let mask = filter.evaluate(batch)?.into_array(batch.num_rows())?;
-    let mask = mask.as_boolean_opt().ok_or_else(|| {
-        datafusion::error::DataFusionError::Internal(
-            "memtable filter did not evaluate to booleans".to_owned(),
-        )
-    })?;
-    Ok(arrow::compute::filter_record_batch(batch, mask)?)
 }
 
 impl DataSource for MemtableSource {

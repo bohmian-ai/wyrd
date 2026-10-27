@@ -499,8 +499,8 @@ fn record_fallback(fallback: SizingFallback, cause: &str) {
 /// reads exactly those batches. Parquet row groups prune with the same
 /// [`PruningPredicate`](datafusion::physical_optimizer::pruning::PruningPredicate)
 /// through [`Self::predicate`].
-#[derive(Debug)]
-pub(crate) struct BatchPruning(datafusion::physical_optimizer::pruning::PruningPredicate);
+#[derive(Debug, Clone)]
+pub struct BatchPruning(datafusion::physical_optimizer::pruning::PruningPredicate);
 
 impl BatchPruning {
     /// Plans `predicate` against `schema`, or `None` when it does not plan
@@ -515,6 +515,45 @@ impl BatchPruning {
             .try_build(predicate)
             .ok()
             .map(Self)
+    }
+
+    /// Returns, per batch of `statistics`, whether its bounds prove `filter`
+    /// true on every row of a batch written under `schema`.
+    ///
+    /// The filter's negation is pruned against the bounds: a batch the
+    /// negation cannot match on any row matches the filter on all of them.
+    /// That holds only under two-valued logic, so a batch qualifies only when
+    /// every column the filter reads has an exact null count of zero, and
+    /// [`negation`] accepts only comparisons of columns and non-null literals
+    /// that cannot themselves produce a null. Anything else is evaluated row
+    /// by row.
+    #[must_use]
+    pub(crate) fn fully_matching(
+        schema: &arrow::datatypes::SchemaRef,
+        filter: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        statistics: &[Arc<datafusion::common::Statistics>],
+    ) -> Vec<bool> {
+        let Some(pruning) = negation(filter).and_then(|negated| Self::try_new(schema, negated))
+        else {
+            return vec![false; statistics.len()];
+        };
+        let columns: Vec<usize> = datafusion::physical_expr::utils::collect_columns(filter)
+            .iter()
+            .map(datafusion::physical_expr::expressions::Column::index)
+            .collect();
+        pruning
+            .keep(statistics, statistics.len())
+            .into_iter()
+            .zip(statistics)
+            .map(|(negation_possible, bounds)| {
+                !negation_possible
+                    && columns.iter().all(|column| {
+                        bounds.column_statistics.get(*column).is_some_and(|bounds| {
+                            bounds.null_count == datafusion::common::stats::Precision::Exact(0)
+                        })
+                    })
+            })
+            .collect()
     }
 
     /// Returns the planned predicate, for pruning Parquet row groups.
@@ -552,6 +591,60 @@ impl BatchPruning {
             ))
             .unwrap_or_else(|_| vec![true; batches])
     }
+}
+
+/// Returns the logical negation of `filter`, or `None` when it is not a
+/// combination of comparisons that negates exactly.
+///
+/// `AND` and `OR` negate by De Morgan's laws and a comparison by its
+/// opposite operator. Each comparison side must be a column, a column cast,
+/// or a non-null literal: those never produce a null from non-null input,
+/// which [`BatchPruning::fully_matching`] requires of the columns themselves.
+fn negation(
+    filter: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+) -> Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::BinaryExpr;
+    let binary = filter.downcast_ref::<BinaryExpr>()?;
+    let operator = match binary.op() {
+        Operator::And => Operator::Or,
+        Operator::Or => Operator::And,
+        comparison @ (Operator::Eq
+        | Operator::NotEq
+        | Operator::Lt
+        | Operator::LtEq
+        | Operator::Gt
+        | Operator::GtEq) => {
+            if !(null_free(binary.left()) && null_free(binary.right())) {
+                return None;
+            }
+            return Some(Arc::new(BinaryExpr::new(
+                Arc::clone(binary.left()),
+                comparison.negate()?,
+                Arc::clone(binary.right()),
+            )));
+        }
+        _ => return None,
+    };
+    Some(Arc::new(BinaryExpr::new(
+        negation(binary.left())?,
+        operator,
+        negation(binary.right())?,
+    )))
+}
+
+/// Reports whether `side` is a column, a cast of a column, or a non-null
+/// literal: a comparison operand that is null only where a column is.
+fn null_free(side: &Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> bool {
+    use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
+    if side.downcast_ref::<Column>().is_some() {
+        return true;
+    }
+    if let Some(literal) = side.downcast_ref::<Literal>() {
+        return !literal.value().is_null();
+    }
+    side.downcast_ref::<CastExpr>()
+        .is_some_and(|cast| cast.expr().downcast_ref::<Column>().is_some())
 }
 
 #[cfg(test)]

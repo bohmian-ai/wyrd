@@ -425,3 +425,56 @@ these changes and measure subsequent work separately.
   `write_phases_read_back_with_populations_and_labelled_gaps` records an
   unlabelled append and proves it is excluded. Gate and OTLP boundary readings
   are reconciled by cohort and were unaffected.
+
+### Item 6 acceptance (REQ-024)
+
+Before: `writes-parquet/20261027T173358Z-eaa8ad209`. After:
+`writes-parquet/20261027T181224Z-a76039813` (VALID, unprofiled). Medians of
+three repetitions; 180214Z-074033fa1 is a second after-sample of end-to-end
+timing (its phase readings predate the population fix and the record is
+discarded).
+
+| Step | server p50 ms before / 180214Z / after | server p99 ms | rows/cpu-s |
+|---|---|---|---|
+| otlp-spans-c1 | 10.8 / 10.8 / 11.1 | 19.1 / 20.5 / 18.7 | 56.6k / 58.5k / 56.0k |
+| otlp-spans-c64 | 35.3 / 25.7 / 36.4 | 137.1 / 141.4 / 148.0 | 48.8k / 47.6k / 47.1k |
+| otlp-spans-1k-c1 | 18.4 / 18.8 / 18.3 | 32.0 / 34.1 / 30.1 | 29.7k / 29.6k / 30.2k |
+| otlp-spans-1k-c64 | 56.2 / 61.2 / 62.4 | 183.6 / 197.5 / 204.3 | 22.6k / 21.9k / 22.8k |
+| otlp-logs-c1 | 12.1 / 12.3 / 12.0 | 24.4 / 34.4 / 19.4 | 47.9k / 47.6k / 51.6k |
+| otlp-logs-c64 | 61.0 / 86.1 / 68.7 | 189.1 / 259.8 / 203.6 | 34.8k / 36.4k / 34.9k |
+| native-write-c1 | 13.4 / 13.5 / 13.7 | 74.4 / 76.5 / 113.3 | 641k / 652k / 651k |
+| native-write-c64 | 175.0 / 170.7 / 168.4 | 780.7 / 542.6 / 543.7 | 778k / 795k / 931k |
+
+End-to-end timing and CPU per row show no consistent direction across the
+two after-runs: each step's after-values bracket or sit within the
+run-to-run spread (logs-c64 p50 86.1 then 68.7; native-c1 p99 76.5 then
+113.3, an fsync tail). The added cost is one timing-registry lock per
+acknowledged write, only when benchmark timing is enabled.
+
+Phase p50/p99 ms, repetition 1 of the after record (`phase_<name>_*_ms`):
+
+| Step | scribe | preprocess | shard_wait | wal_append | wal_sync | visibility | otlp_decode |
+|---|---|---|---|---|---|---|---|
+| otlp-spans-c1 | 6.7/18.4 | 0.9/1.5 | 0.1/6.9 | 0.1/0.2 | 3.6/9.0 | 1.3/2.5 | 1.3/2.1 |
+| otlp-spans-c64 | 23.2/137.2 | 1.1/1.9 | 7.2/101.5 | 2.2/9.1 | 7.1/31.4 | 4.1/7.4 | 1.9/3.2 |
+| otlp-spans-1k-c1 | 8.1/20.7 | 1.4/2.2 | 0.1/8.4 | 0.2/0.3 | 4.1/10.2 | 1.3/2.1 | 3.6/4.6 |
+| otlp-spans-1k-c64 | 20.9/77.4 | 1.6/2.7 | 5.4/48.8 | 1.3/26.3 | 7.5/34.9 | 3.2/10.9 | 4.5/7.4 |
+| otlp-logs-c1 | 7.9/13.1 | 2.1/2.9 | 0.1/3.8 | 0.2/0.4 | 3.6/7.0 | 1.3/2.2 | 1.0/1.4 |
+| otlp-logs-c64 | 54.5/188.9 | 2.7/4.4 | 15.7/126.1 | 6.8/47.3 | 19.6/64.4 | 5.1/8.6 | 1.6/3.1 |
+| native-write-c1 | 13.5/70.0 | 5.4/7.3 | 0.1/20.3 | 0.5/1.2 | 5.1/41.6 | 1.7/2.8 | unavailable |
+| native-write-c64 | 168.2/537.9 | 9.7/18.9 | 58.5/399.0 | 31.5/99.9 | 57.7/344.5 | 8.3/12.1 | unavailable |
+
+Admission, Scribe decode and ack stay below 1.7 ms p99 on every path.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Native, span and log records at 1 and 64 clients expose applicable phase distributions | `WriteProfile::record_timing` (`scribe/profile.rs`), `timed_decode` (`grpc/otlp.rs`), `set_write_phases` (`query/isolated.rs`), `WRITE_PHASES` (`query/mod.rs`) | 181224Z-a76039813: every write step carries 20 phase readings | PASS |
+| Correct populations | `set_write_phases` reads `Population::only(case, phase)` | each repetition's phase `samples` equals its reconciled cohort (e.g. spans-c64 4633 = 4633); `write_phases_read_back_with_populations_and_labelled_gaps` excludes an unlabelled append | PASS |
+| Labelled unavailable phases, no fabricated samples | OTLP decode on native is missing with its reason | same test; native records carry `samples: null` with the Arrow IPC reason | PASS |
+| Controlled timing and record/readback exercise the real collector | real Scribe append and timing registry | `scribe::ingress::tests::acknowledged_append_records_each_write_phase_once`, `grpc::otlp::tests::decode_timing_records_only_successful_decodes`, the readback test | PASS |
+| End-to-end timing remains unchanged | timing only when `timing::enabled()` | the table above: no consistent shift over two after-runs | PASS |
+
+Commands: `cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::ingress::tests::acknowledged_append_records_each_write_phase_once)'`;
+`cargo nextest run --locked -p wyrd-server --lib -E 'test(/^grpc::otlp::tests::/)'`;
+the capacity lane (61 passed); `mise run fmt`, `mise run lints`,
+`git diff --check`; `mise run bench:l1:bifrost:writes` twice.

@@ -7,8 +7,10 @@
 //! workload runs. [`run`] then checks quiet-host eligibility, prepares the
 //! [`Workload`], discards each step's warmup, measures three repetitions,
 //! samples the host again, and judges every applicable criterion into a
-//! [`Record`]. The record is published append-only under
-//! `benchmarks/<engine>/<experiment>/` and every report is rendered from it.
+//! [`Record`]. A clean, unprofiled full run of the whole plan publishes its
+//! record append-only under [`HISTORY_DIRECTORY`]`/<engine>/<experiment>/`,
+//! any other full run under [`LOCAL_DIRECTORY`], and every report is
+//! rendered from it.
 //! A [`Mode::Smoke`] runs that same workflow at reduced declared controls
 //! and keeps its record under [`SMOKE_DIRECTORY`].
 //!
@@ -56,6 +58,14 @@ pub const REPETITIONS: u8 = 3;
 /// Where smoke records and evidence live, under the repository root:
 /// local build output, never committed history.
 pub const SMOKE_DIRECTORY: &str = "target/benchmarks/smoke";
+
+/// Where history lives, under the repository root: the worktree of the
+/// `benchmark-records` branch, holding `<engine>/<experiment>/` records.
+pub const HISTORY_DIRECTORY: &str = "benchmarks/history";
+
+/// Where a full run that may not enter history keeps its record, under the
+/// repository root, beside its raw artifacts.
+pub const LOCAL_DIRECTORY: &str = "target/benchmarks";
 
 /// How long a workload may take to stop and drain after measurement before
 /// the run gives up waiting and records the overrun.
@@ -776,34 +786,6 @@ impl Invocation {
                 })
                 .collect(),
         }
-    }
-
-    /// Why this invocation is a diagnostic rather than an ordinary
-    /// measurement: `--profile`, an operator trace export endpoint, sample
-    /// ratio, trace filter or export timeout, or a server log filter other
-    /// than `info`. `None` for an ordinary measurement.
-    #[must_use]
-    pub fn diagnostic(&self) -> Option<String> {
-        const TELEMETRY: [&str; 4] = [
-            "WYRD_OTLP_ENDPOINT",
-            "WYRD_OTLP_SAMPLE_RATIO",
-            "WYRD_TRACE_FILTER",
-            "WYRD_OTLP_EXPORT_TIMEOUT_MS",
-        ];
-        let mut causes: Vec<String> = Vec::new();
-        if self.args.iter().any(|argument| argument == "--profile") {
-            causes.push("--profile".to_owned());
-        }
-        causes.extend(
-            TELEMETRY
-                .iter()
-                .filter(|name| self.config.contains_key(**name))
-                .map(|name| format!("{name} is set")),
-        );
-        if let Some(log) = self.config.get("WYRD_LOG").filter(|log| *log != "info") {
-            causes.push(format!("WYRD_LOG={log}"));
-        }
-        (!causes.is_empty()).then(|| causes.join(", "))
     }
 }
 
@@ -2540,23 +2522,30 @@ impl Record {
         }
     }
 
-    /// Publishes the record under `root/benchmarks/<engine>/<experiment>/`,
-    /// or a smoke's under `root/target/benchmarks/smoke/<engine>/<experiment>/`
-    /// outside committed history: written to a temporary file in that
-    /// directory, synced, then linked to the first free collision-numbered
-    /// name, so history is never overwritten and a partial file never
-    /// appears complete.
+    /// Publishes the record under `<engine>/<experiment>/` of
+    /// `root/`[`HISTORY_DIRECTORY`] when it may enter history
+    /// ([`Record::historical`]), of `root/`[`SMOKE_DIRECTORY`] for a smoke,
+    /// and of `root/`[`LOCAL_DIRECTORY`] otherwise: written to a temporary
+    /// file in that directory, synced, then linked to the first free
+    /// collision-numbered name, so history is never overwritten and a
+    /// partial file never appears complete.
     ///
     /// # Errors
     ///
     /// Returns [`ExperimentError::Persist`] when the directory, write, sync,
     /// or rename fails.
     pub fn publish(&self, root: &Path) -> Result<PathBuf, ExperimentError> {
-        let history = match self.mode {
-            Mode::Full => root.join("benchmarks"),
-            Mode::Smoke => root.join(SMOKE_DIRECTORY),
+        let base = if self.historical() {
+            HISTORY_DIRECTORY
+        } else if self.mode == Mode::Smoke {
+            SMOKE_DIRECTORY
+        } else {
+            LOCAL_DIRECTORY
         };
-        let directory = history.join(self.engine.name()).join(&self.experiment);
+        let directory = root
+            .join(base)
+            .join(self.engine.name())
+            .join(&self.experiment);
         let fail = |path: &Path| {
             let path = path.to_path_buf();
             move |source| ExperimentError::Persist { path, source }
@@ -2587,6 +2576,21 @@ impl Record {
                 }
             }
         }
+    }
+
+    /// Whether the record enters history: a full run of the whole plan from
+    /// a clean source without `--profile`, VALID or INVALID. A `--steps`,
+    /// `--profile`, `--allow-dirty`, or `--smoke` run never does.
+    #[must_use]
+    pub fn historical(&self) -> bool {
+        self.mode == Mode::Full
+            && self.controls.selection.is_none()
+            && !self.dirty
+            && !self
+                .command
+                .args
+                .iter()
+                .any(|argument| argument == "--profile")
     }
 
     /// Reads a record file.
@@ -4308,12 +4312,14 @@ mod tests {
     /// and no temporary residue, fail honestly when the directory cannot be
     /// written, refuse unsupported versions and malformed input, keep nulls
     /// for missing values, store the dirty digest, and never carry a secret
-    /// configuration value.
+    /// configuration value. Only a clean, unprofiled full run of the whole
+    /// plan enters `benchmarks/history/`, VALID or INVALID; a dirty,
+    /// profiled, or `--steps` run stays under `target/benchmarks/`.
     ///
     /// # Panics
     ///
     /// Panics when history is overwritten, a failure succeeds, a reader is
-    /// permissive, or a sentinel leaks.
+    /// permissive, a sentinel leaks, or an ineligible run enters history.
     #[tokio::test(start_paused = true)]
     async fn history_is_append_only_private_and_versioned() {
         let root = tempfile::tempdir().expect("root");
@@ -4361,7 +4367,13 @@ mod tests {
                 .to_string_lossy()
                 .contains(&format!("-{}", &complete.commit[..9]))
         );
-        assert!(first.starts_with(root.path().join("benchmarks/verification/direct-verify")));
+        assert!(
+            first.starts_with(
+                root.path()
+                    .join("target/benchmarks/verification/direct-verify")
+            ),
+            "a dirty run never enters history"
+        );
         let entries: Vec<PathBuf> = std::fs::read_dir(first.parent().expect("parent"))
             .expect("listing")
             .map(|entry| entry.expect("entry").path())
@@ -4373,6 +4385,32 @@ mod tests {
             "no temporary residue: {entries:?}"
         );
         assert_eq!(entries.len(), 3);
+        let clean = execute(
+            declaration(),
+            &mut Scripted::always(&good()),
+            [Some(quiet()), Some(quiet())],
+            &options,
+        )
+        .await;
+        let mut invalid = clean.clone();
+        invalid.verdict = Verdict::Invalid;
+        let mut profiled = clean.clone();
+        profiled.command = Invocation::new(&["l1".to_owned(), "--profile".to_owned()], &[]);
+        let mut selected = clean.clone();
+        selected.controls.selection = Some(vec!["op-64".to_owned()]);
+        for (record, base) in [
+            (&clean, "benchmarks/history"),
+            (&invalid, "benchmarks/history"),
+            (&profiled, "target/benchmarks"),
+            (&selected, "target/benchmarks"),
+        ] {
+            let path = record.publish(root.path()).expect("publish");
+            assert!(
+                path.starts_with(root.path().join(base).join("verification/direct-verify")),
+                "{}",
+                path.display()
+            );
+        }
 
         for (path, original) in [(&first, &complete), (&third, &partial)] {
             let text = std::fs::read_to_string(path).expect("record text");

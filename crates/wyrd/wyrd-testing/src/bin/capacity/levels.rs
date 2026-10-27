@@ -6,10 +6,9 @@
 //! production calls. This module fills the declaration's source, build, host,
 //! and invocation, applies `--steps`, `--allow-dirty`, `--profile`,
 //! and `--smoke`, runs
-//! [`wyrd_testing::experiment::run`], publishes the record under
-//! `benchmarks/<engine>/<experiment>/` (a smoke's under
-//! [`SMOKE_DIRECTORY`]), prints the report, and returns the verdict's exit
-//! code.
+//! [`wyrd_testing::experiment::run`], publishes the record
+//! ([`wyrd_testing::experiment::Record::publish`]), prints the report, and
+//! returns the verdict's exit code.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,8 +20,8 @@ use wyrd_testing::capacity::{
     binary_identity, release_binary, timer_resolution_ns, timing_declaration,
 };
 use wyrd_testing::experiment::{
-    Declaration, Engine, HostRecord, Invocation, Level, Mode, Options, Record, SMOKE_DIRECTORY,
-    Source, Validity, Verdict, Workload, run,
+    Declaration, Engine, HISTORY_DIRECTORY, HostRecord, Invocation, LOCAL_DIRECTORY, Level, Mode,
+    Options, Record, SMOKE_DIRECTORY, Source, Validity, Verdict, Workload, run,
 };
 use wyrd_testing::profile::SAMPLY;
 use wyrd_testing::release_server::{Host, HostLoad};
@@ -78,7 +77,7 @@ impl Context<'_> {
         let history = if self.smoke() {
             SMOKE_DIRECTORY
         } else {
-            "target/benchmarks"
+            LOCAL_DIRECTORY
         };
         self.root.join(history).join(engine.name()).join(experiment)
     }
@@ -217,7 +216,7 @@ pub async fn execute(plan: Plan, root: &Path, profile: bool) -> u8 {
         mut workload,
     } = plan;
     let history = match declaration.mode {
-        Mode::Full => "target/benchmarks",
+        Mode::Full => LOCAL_DIRECTORY,
         Mode::Smoke => SMOKE_DIRECTORY,
     };
     let artifacts = root
@@ -365,7 +364,7 @@ const RESULTS_PAGE: &str = include_str!("results.html");
 const RESULTS_SLOT: &str = "/*RECORDS*/[]";
 
 /// Writes one self-contained HTML page of every record in `root`'s
-/// `benchmarks/<engine>/<experiment>/` history to `out` and returns how
+/// [`HISTORY_DIRECTORY`]`/<engine>/<experiment>/` to `out` and returns how
 /// many it holds. The page renders each record and compares the runs of
 /// one experiment in chronological order; it reads nothing else.
 ///
@@ -378,7 +377,7 @@ const RESULTS_SLOT: &str = "/*RECORDS*/[]";
 /// Returns a message when the history cannot be listed, a file cannot be
 /// read or is not JSON, or the page cannot be written.
 pub fn results(root: &Path, out: &Path) -> Result<usize, String> {
-    let history = root.join("benchmarks");
+    let history = root.join(HISTORY_DIRECTORY);
     let mut paths = Vec::new();
     for engine in children(&history)? {
         for experiment in children(&engine)? {

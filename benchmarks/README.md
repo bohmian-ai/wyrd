@@ -2,8 +2,8 @@
 
 Wyrd's benchmarks are opt-in experiments. Each one asks a single declared
 question of a release `wyrd-server` on a quiet host, then keeps the answer as
-an append-only record in this directory. They are not part of any test lane,
-`gate`, verify lane, or CI job.
+an append-only record in [`history/`](#history). They are not part of any test
+lane, `gate`, verify lane, or CI job.
 
 ```bash
 mise run bench:smoke                 # every default plan at smoke scale
@@ -26,7 +26,7 @@ mise run bench:results               # every record as one HTML page
 publication waits, every selected step and phase, measured stop, drain,
 exact reconciliation, judgment, record, timing evidence and report) at
 smoke-scale fixtures with one short warmup and one repetition per step. It
-records `"mode": "smoke"` under `target/benchmarks/smoke/`, never here, and a
+records `"mode": "smoke"` under `target/benchmarks/smoke/`, never in history, and a
 smoke record is never a calibration wherever it is moved. A
 smoke judges no criterion: every reading, errors and target misses included,
 is recorded beside an inapplicable criterion, so a smoke is VALID or INVALID.
@@ -209,11 +209,16 @@ every experiment exits 0, else 2.
 ## Records and reports
 
 Each run appends one JSON record, schema version 3; a reader refuses any
-other version:
+other version. A clean, unprofiled full run of the whole plan, VALID or
+INVALID, appends to history:
 
 ```text
-benchmarks/<engine>/<experiment>/YYYYMMDDTHHMMSSZ-<sha9>.json
+benchmarks/history/<engine>/<experiment>/YYYYMMDDTHHMMSSZ-<sha9>.json
 ```
+
+A `--steps`, `--profile`, or `--allow-dirty` run writes the same record under
+`target/benchmarks/<engine>/<experiment>/` and a smoke under
+`target/benchmarks/smoke/`; neither ever enters history.
 
 The file is published atomically and never overwritten; a name collision gets
 a `-<n>` suffix. A record holds:
@@ -225,19 +230,34 @@ a `-<n>` suffix. A record holds:
   CPU;
 - every criterion's outcome, every reason, and the verdict.
 
-Raw evidence stays under `target/benchmarks/<engine>/<experiment>/`:
-the server log sits beside any profiles. The next run of that experiment replaces
-it. The report printed at the end is regenerated from the record alone, so it
+Raw evidence stays under `target/benchmarks/<engine>/<experiment>/<UTC
+start>/`: the server log sits beside any profiles. The report printed at the end is regenerated from the record alone, so it
 can be reproduced after `target/` is gone:
 
 ```bash
-target/profiling/release/capacity report benchmarks/bifrost/parquet/<record>.json
+target/profiling/release/capacity report benchmarks/history/bifrost/parquet/<record>.json
 ```
 
-Commit records worth keeping. The history in this directory is how results
-are compared over time.
+## History
 
-`mise run bench:results` writes every record here into one self-contained
+History is the `benchmark-records` branch, which shares no commits with the
+code. A checkout that runs benchmarks mounts it as a worktree at
+`benchmarks/history/`, which code branches ignore:
+
+```bash
+git worktree add benchmarks/history benchmark-records
+```
+
+Git checks a branch out in one worktree at a time; to use history from
+another checkout, move it there with `git worktree move`. The recorder writes
+history and `bench:results` and the Bifrost L2 calibration read it only
+there; neither reads any other location.
+
+To keep a run's record, commit it inside `benchmarks/history/` (on the
+`benchmark-records` branch) and push that branch. Never commit records on a
+code branch.
+
+`mise run bench:results` writes every record in history into one self-contained
 page, `target/benchmarks/results.html`, read from the records alone. For
 each experiment it shows the question, the method (host, build, timing,
 validity rules, workload), every step's results with each repetition, the

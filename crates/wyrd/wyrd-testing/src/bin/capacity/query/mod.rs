@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{GlobalConfig, WyrdClient};
 use wyrd_testing::experiment::{
-    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Mode, Op, Reason, Record,
-    Status, Step, Verdict, WINDOW_SECONDS,
+    Criterion, Declaration, Derive, Direction, Engine, HISTORY_DIRECTORY, Level, Metric, Mode, Op,
+    Reason, Record, Status, Step, Verdict, WINDOW_SECONDS,
 };
 use wyrd_testing::release_server::{LocalServer, SERVER_URL};
 
@@ -394,7 +394,7 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
 /// The Bifrost declaration over `base`: the L1 `experiment`, or L2 when
 /// `None`, reading `--server-cores` and `--smoke` from `arguments` (program
 /// name first), and, at L2, the L1 records under
-/// `root/benchmarks/bifrost/writes-parquet/`. Pure otherwise: it starts
+/// `root/benchmarks/history/bifrost/writes-parquet/`. Pure otherwise: it starts
 /// nothing.
 ///
 /// A missing or unusable calibration is a declaration refusal
@@ -443,11 +443,12 @@ fn server_cores(arguments: &[String]) -> std::result::Result<f64, String> {
         .ok_or_else(|| "--server-cores takes a positive number of cores".to_owned())
 }
 
-/// Every readable record under `root/benchmarks/bifrost/writes-parquet/`;
-/// an unreadable one is skipped, since calibration only needs a valid one.
+/// Every readable record under
+/// `root/`[`HISTORY_DIRECTORY`]`/bifrost/writes-parquet/`; an unreadable
+/// one is skipped, since calibration only needs a valid one.
 fn l1_records(root: &Path) -> Vec<Record> {
     let directory = root
-        .join("benchmarks")
+        .join(HISTORY_DIRECTORY)
         .join(Engine::Bifrost.name())
         .join(Experiment::WritesParquet.name());
     std::fs::read_dir(directory)

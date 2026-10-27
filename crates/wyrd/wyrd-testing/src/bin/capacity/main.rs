@@ -9,14 +9,16 @@
 //! - `l2 <engine>`: competing open-loop work through capacity, overload, and
 //!   recovery, through `mise run bench:l2:<engine>`.
 //! - `report <record.json>`: regenerates a persisted record's report.
-//! - `results`: writes every recorded run of `benchmarks/` into one HTML
+//! - `results`: writes every recorded run of `benchmarks/history/` into one HTML
 //!   page at `target/benchmarks/results.html`, through
 //!   `mise run bench:results`.
 //!
 //! Every experiment shares one lifecycle ([`levels`] over
 //! `wyrd_testing::experiment`): a sealed declaration, quiet-host checks,
 //! warmup and three repetitions, judgment, an append-only record under
-//! `benchmarks/<engine>/<experiment>/`, and exit 0 (VALID) or 2 (INVALID);
+//! `benchmarks/history/<engine>/<experiment>/` (a `--steps`, `--profile`,
+//! or `--allow-dirty` run's under `target/benchmarks/`), and exit 0 (VALID)
+//! or 2 (INVALID);
 //! a missed performance target is reported and never changes the exit.
 //! `--profile` adds optional samply captures, `--allow-dirty` records a
 //! dirty source, `--steps` selects declared steps, and `--smoke` runs the
@@ -1196,7 +1198,9 @@ mod tests {
         smoked.mode = Mode::Smoke;
         let relocated = tempfile::tempdir().expect("relocated");
         let smoke_path = smoked.publish(relocated.path()).expect("publish smoke");
-        let history = relocated.path().join("benchmarks/bifrost/writes-parquet");
+        let history = relocated
+            .path()
+            .join("benchmarks/history/bifrost/writes-parquet");
         std::fs::create_dir_all(&history).expect("history");
         std::fs::rename(&smoke_path, history.join("moved.json")).expect("relocate");
         let relocated_l2 = declare(Engine::Bifrost, Level::Two, &[], HOST, relocated.path());
@@ -1218,8 +1222,30 @@ mod tests {
         assert!(smoke_l2.controls["calibration"].get("smoke").is_some());
         assert!(smoke_l2.variables["ingest_rows_per_s"].as_f64() > Some(0.0));
 
+        let old = tempfile::tempdir().expect("old layout");
+        let moved = old.path().join("benchmarks/bifrost/writes-parquet");
+        std::fs::create_dir_all(&moved).expect("old history");
+        std::fs::write(
+            moved.join("old.json"),
+            serde_json::to_vec(&l1).expect("record json"),
+        )
+        .expect("old record");
+        assert!(
+            declare(Engine::Bifrost, Level::Two, &[], HOST, old.path())
+                .refusals()
+                .iter()
+                .any(|reason| reason.code == "calibration.missing"),
+            "calibration never falls back to benchmarks/<engine>/<experiment>/"
+        );
+
         let root = tempfile::tempdir().expect("root");
-        l1.publish(root.path()).expect("publish L1");
+        let published = l1.publish(root.path()).expect("publish L1");
+        assert!(
+            published.starts_with(
+                root.path()
+                    .join("benchmarks/history/bifrost/writes-parquet")
+            )
+        );
         let bifrost = declare(
             Engine::Bifrost,
             Level::Two,
@@ -1547,7 +1573,7 @@ mod tests {
             "the invalid Verification run decides the aggregate"
         );
         for path in &published {
-            assert!(path.starts_with(root.path().join("benchmarks")));
+            assert!(path.starts_with(root.path().join("benchmarks/history")));
             let record = Record::read(path).expect("record");
             let report = levels::report(path).expect("report");
             assert_eq!(report, record.render());
@@ -1557,14 +1583,21 @@ mod tests {
 
         let stale = root
             .path()
-            .join("benchmarks/verification/direct-verify/19990101T000000Z-000000000.json");
+            .join("benchmarks/history/verification/direct-verify/19990101T000000Z-000000000.json");
         std::fs::write(
             &stale,
             br#"{"schema_version": 2, "engine": "verification", "note": "</script><b>"}"#,
         )
         .expect("write");
+        let old = root.path().join("benchmarks/verification/direct-verify");
+        std::fs::create_dir_all(&old).expect("old layout");
+        std::fs::copy(&published[1], old.join("old.json")).expect("old record");
         let page = root.path().join("results.html");
-        assert_eq!(levels::results(root.path(), &page), Ok(4));
+        assert_eq!(
+            levels::results(root.path(), &page),
+            Ok(4),
+            "results read benchmarks/history only, never the old layout"
+        );
         let html = std::fs::read_to_string(&page).expect("page");
         assert!(!html.contains("/*RECORDS*/"), "the records fill the slot");
         assert_eq!(

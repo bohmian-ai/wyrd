@@ -30,7 +30,7 @@ import json
 import secrets
 import subprocess
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -855,23 +855,43 @@ def snapshot(root: Path) -> dict[str, bytes]:
     }
 
 
-def fresh(prefix: str) -> str:
-    """A Card name no other journey registers."""
-    return f"{prefix}-{secrets.token_hex(4)}"
-
-
 def wyrd(*args: str) -> subprocess.CompletedProcess[str]:
     """Run the real ``wyrd`` CLI against the session server the environment names."""
     return subprocess.run([str(WYRD_CLI), *args], capture_output=True, text=True, check=False)
 
 
+INVALID = "WYRD_LOADER_400_INVALID_ENVELOPE"
+"""The stable code of an upload the loader refuses before declaring anything."""
+
+HANDBOOK = {"type": "str", "value": "handbook"}
+"""An authored ``spec.metadata`` value, in its tagged non-secret form."""
+
+
+def pinned_upload(name: str) -> dict[str, str]:
+    """The metadata uploading ``name`` at version 1.0.0."""
+    return {"name": name, "version": "1.0.0"}
+
+
+def refusal(call: Callable[[], object]) -> tuple[str, object]:
+    """The code and details of the ``WyrdError`` ``call`` raises."""
+    with pytest.raises(WyrdError) as refused:
+        call()
+    return refused.value.code, refused.value.details
+
+
+def refused_upload(call: Callable[[], object]) -> tuple[str, str]:
+    """The code of the ``WyrdError`` an upload ``call`` raises, with its first diagnostic's code or its rule."""
+    code, details = refusal(call)
+    found = cast("dict[str, Any]", details)
+    return code, found["diagnostics"][0]["code"] if "diagnostics" in found else found["rule"]
+
+
 def test_artifact_upload_preserves_files_and_versions(cards: Cards, tmp_path: Path) -> None:
     single = tree(tmp_path / "single", {"notes.txt": "one\n", "ignored.txt": "sibling\n"})
-    name = fresh("notes")
 
-    ref = cards.upload_artifact(single / "notes.txt", name=name, version="1.0.0")
+    ref = cards.upload_artifact(single / "notes.txt", pinned_upload("upload-notes"))
 
-    assert (ref.kind, ref.name, ref.version) == (CardKind.Artifact, name, "1.0.0")
+    assert (ref.kind, ref.name, ref.version) == (CardKind.Artifact, "upload-notes", "1.0.0")
     assert ref.uid is not None
     assert inventory(cards, ref) == {"notes.txt": 4}
     card = cards.get(ref)
@@ -884,41 +904,72 @@ def test_artifact_upload_preserves_files_and_versions(cards: Cards, tmp_path: Pa
         "policy.pdf": CORRUPT_PDF,
     }
     collection = tree(tmp_path / "collection", files)
-    name = fresh("collection")
-    ref = cards.upload_artifact(collection, name=name, version="1.0.0", artifact_kind="policies")
+    authored = {
+        **pinned_upload("upload-collection"),
+        "labels": {"team": "support"},
+        "annotations": {"acme.com/owner": "refund-desk"},
+    }
+    spec = {"artifact_kind": "policies", "metadata": {"source": HANDBOOK}}
+    ref = cards.upload_artifact(collection, authored, spec=spec)
     assert inventory(cards, ref) == {path: len(content) for path, content in files.items()}
-    assert cards.get(ref).spec["artifact_kind"] == "policies"
+    held = cards.get(ref)
+    assert (held.spec["artifact_kind"], held.spec["metadata"]) == ("policies", spec["metadata"])
+    assert held.metadata["labels"] == {"team": "support"}, held.metadata
+    assert held.metadata["annotations"]["acme.com/owner"] == "refund-desk", held.metadata
     pulled = cards.pull(ref, tmp_path / "pulled").destination
-    [held] = list(pulled.rglob("data.bin"))
-    assert snapshot(held.parents[2]) == {
+    [data] = list(pulled.rglob("data.bin"))
+    assert snapshot(data.parents[2]) == {
         path: (content.encode() if isinstance(content, str) else content)
         for path, content in files.items()
     }
 
-    again = cards.upload_artifact(collection, name=name, version="1.0.0", artifact_kind="policies")
+    again = cards.upload_artifact(collection, authored, spec=spec)
     assert again == ref, "an unchanged upload of a pinned version is the same Card"
     (collection / "policy.pdf").write_bytes(CORRUPT_PDF + b"!")
-    with pytest.raises(WyrdError) as conflict:
-        cards.upload_artifact(collection, name=name, version="1.0.0", artifact_kind="policies")
-    assert "409" in conflict.value.code, conflict.value
+    assert refusal(lambda: cards.upload_artifact(collection, authored, spec=spec))[0] == (
+        "WYRD_REGISTRY_409_SPEC_DRIFT"
+    )
     bumped = cards.upload_artifact(
-        collection, name=name, version_bump=VersionBump.Patch, artifact_kind="policies"
+        collection, {"name": "upload-collection"}, version_bump=VersionBump.Patch, spec=spec
     )
     assert bumped.version == "1.0.1"
     assert inventory(cards, bumped)["policy.pdf"] == len(CORRUPT_PDF) + 1
 
     (tmp_path / "link.txt").symlink_to(single / "notes.txt")
     (tmp_path / "empty").mkdir()
-    for source, kind in (
-        (single / "notes.txt", " "),
-        (tmp_path / "link.txt", "file"),
-        (tmp_path / "missing.txt", "file"),
-        (tmp_path / "empty", "file"),
+    refused = {
+        name: refused_upload(
+            lambda source=source, kind=kind, name=name: cards.upload_artifact(
+                source, pinned_upload(name), spec={"artifact_kind": kind}
+            )
+        )
+        for name, source, kind in (
+            ("blank-kind-upload", single / "notes.txt", " "),
+            ("linked-upload", tmp_path / "link.txt", "file"),
+            ("missing-upload", tmp_path / "missing.txt", "file"),
+            ("empty-upload", tmp_path / "empty", "file"),
+        )
+    }
+    assert refused == {
+        "blank-kind-upload": ("WYRD_SPEC_400_VALIDATION", "artifact_kind"),
+        "linked-upload": (INVALID, INVALID),
+        "missing-upload": (INVALID, "WYRD_LOADER_400_IO"),
+        "empty-upload": (INVALID, INVALID),
+    }
+    for name in refused:
+        assert not cards.list(kind="Artifact", name=name).refs, name
+
+    offline = Cards(WyrdClient(server_url="http://127.0.0.1:9", credential="unused"))
+    for metadata, field in (
+        ({"name": "Not A Name", "version": "1.0.0"}, "metadata.name"),
+        ({"name": "upload-bump", "bump": "patch"}, "metadata.bump"),
+        ({"name": "upload-extra", "colour": "red"}, "metadata"),
     ):
-        refused = fresh("refused")
-        with pytest.raises(WyrdError):
-            cards.upload_artifact(source, name=refused, version="1.0.0", artifact_kind=kind)
-        assert not cards.list(kind="Artifact", name=refused).refs, source
+        code, details = refusal(lambda metadata=metadata: offline.upload_artifact(single, metadata))
+        assert (code, cast("dict[str, object]", details)["field"]) == (
+            "WYRD_SPEC_400_VALIDATION",
+            field,
+        ), "a caller mistake is refused before any request"
 
 
 def test_artifact_upload_extracts_before_registration(cards: Cards, tmp_path: Path) -> None:
@@ -929,9 +980,11 @@ def test_artifact_upload_extracts_before_registration(cards: Cards, tmp_path: Pa
     }
     source = tree(tmp_path / "source", files)
     before = snapshot(source)
-    name = fresh("handbook")
+    spec = {"artifact_kind": "file", "metadata": {"source": HANDBOOK}}
 
-    ref = cards.upload_artifact(source, name=name, version="1.0.0", extract=True)
+    ref = cards.upload_artifact(
+        source, pinned_upload("extracted-handbook"), spec=spec, extract=True
+    )
 
     assert snapshot(source) == before, "the source tree is never written"
     held = inventory(cards, ref)
@@ -942,7 +995,9 @@ def test_artifact_upload_extracts_before_registration(cards: Cards, tmp_path: Pa
         "extracted/handbook.md.json",
         "extracted/nested/rates.csv.json",
     }
-    report = cards.get(ref).spec["metadata"]["extraction"]
+    metadata = cards.get(ref).spec["metadata"]
+    assert metadata["source"] == HANDBOOK, "authored spec metadata survives extraction"
+    report = metadata["extraction"]
     assert "extracted/handbook.md.json" in json.dumps(report), report
     assert "logo.bin" in json.dumps(report), "the unsupported file is reported skipped"
     pulled = cards.pull(ref, tmp_path / "pulled").destination
@@ -951,25 +1006,39 @@ def test_artifact_upload_extracts_before_registration(cards: Cards, tmp_path: Pa
         "format": "markdown",
         "text": "# Handbook\nEscalate to the duty lead.\n",
     }
-    plain = cards.upload_artifact(source, name=fresh("raw"), version="1.0.0")
+    plain = cards.upload_artifact(source, pinned_upload("raw-handbook"))
     assert not any(path.startswith("extracted/") for path in inventory(cards, plain))
 
-    refused = fresh("corrupt")
+    authored_report = {
+        "artifact_kind": "file",
+        "metadata": {"extraction": {"type": "object", "value": {}}},
+    }
     (source / "policy.pdf").write_bytes(CORRUPT_PDF)
-    with pytest.raises(WyrdError):
-        cards.upload_artifact(source, name=refused, version="1.0.0", extract=True)
-    assert not cards.list(kind="Artifact", name=refused).refs
+    corrupt = refused_upload(
+        lambda: cards.upload_artifact(source, pinned_upload("corrupt-handbook"), extract=True)
+    )
     (source / "policy.pdf").unlink()
+    reported = refused_upload(
+        lambda: cards.upload_artifact(
+            source, pinned_upload("reported-handbook"), spec=authored_report, extract=True
+        )
+    )
     (source / "extracted").mkdir()
     (source / "extracted/handbook.md.json").write_text("{}")
-    with pytest.raises(WyrdError):
-        cards.upload_artifact(source, name=refused, version="1.0.0", extract=True)
-    assert not cards.list(kind="Artifact", name=refused).refs
+    colliding = refused_upload(
+        lambda: cards.upload_artifact(source, pinned_upload("colliding-handbook"), extract=True)
+    )
     (source / "extracted/handbook.md.json").unlink()
     (source / "extracted").rmdir()
+    assert (corrupt, reported, colliding) == (
+        (INVALID, INVALID),
+        ("WYRD_SPEC_400_VALIDATION", "extraction_report"),
+        (INVALID, INVALID),
+    )
+    for name in ("corrupt-handbook", "reported-handbook", "colliding-handbook"):
+        assert not cards.list(kind="Artifact", name=name).refs, name
 
-    named = fresh("cli")
-    pinned = ("--name", named, "--version", "1.0.0")
+    pinned = ("--name", "cli-handbook", "--version", "1.0.0")
     uploaded = wyrd("artifact", "upload", str(source), *pinned, "--extract")
     assert uploaded.returncode == 0, uploaded.stderr
     assert "extracted/handbook.md.json" in uploaded.stdout, uploaded.stdout
@@ -991,7 +1060,7 @@ def test_uploaded_artifacts_are_reused_by_service_judges(
             "rota.txt": "never mounted\n",
         },
     )
-    handbook = cards.upload_artifact(source, name="staff-handbook", version="1.0.0", extract=True)
+    handbook = cards.upload_artifact(source, pinned_upload("staff-handbook"), extract=True)
     assert "extracted/handbook.md.json" in inventory(cards, handbook)
     configure_gateway(WyrdClient())
     declare(cards, "cards/uploaded_artifacts/handbook-desk.yaml")
@@ -1026,76 +1095,11 @@ def test_uploaded_artifacts_are_reused_by_service_judges(
     assert not any("rota" in json.dumps(body) for body in judges), "unselected files stay out"
 
 
-def write_probe(home: Path, workspace: Mapping[str, object], tools: Sequence[str]) -> str:
-    """Write a probe Service under ``home`` mounting ``workspace`` for ``tools``; return its name."""
-    probe = fresh("probe")
-    documents = {
-        "agent.yaml": {
-            "kind": "Agent",
-            "spec": {
-                "execution_route": {"kind": "wyrd_gateway", "deployment": "openai"},
-                "tool_names": list(tools),
-                "run_config": {"max_iterations": 24},
-                "prompt": {
-                    "provider": "openai",
-                    "model": "gpt-4o",
-                    "messages": [{"role": "user", "content": "FS PROBE: {{script}}"}],
-                    "response_format": {
-                        "type": "object",
-                        "properties": {"done": {"type": "boolean"}, "results": {"type": "array"}},
-                        "required": ["done", "results"],
-                    },
-                },
-            },
-        },
-        "verifier.yaml": {
-            "kind": "Verifier",
-            "spec": {
-                "inputs": {"script": {"type": "json", "schema": {"type": "array"}}},
-                "steps": [
-                    {
-                        "id": "probe",
-                        "action": {
-                            "kind": "agent",
-                            "agent": "./agent.yaml",
-                            "inputs": {"script": "inputs.script"},
-                            "workspace": workspace,
-                        },
-                    }
-                ],
-                "requirements": [
-                    {
-                        "id": "probed",
-                        "statement": "The probe played its script",
-                        "check": {
-                            "kind": "assert",
-                            "path": "steps.probe.output.done",
-                            "operator": "equals",
-                            "expected": True,
-                        },
-                    }
-                ],
-            },
-        },
-        "service.yaml": {
-            "kind": "Service",
-            "spec": {"verified_by": [{"verifier": "./verifier.yaml"}]},
-        },
-    }
-    home.mkdir()
-    for file, document in documents.items():
-        name = probe if file == "service.yaml" else f"{probe}-{file[:-5]}"
-        card = {"apiVersion": "wyrd/v1", "metadata": {"name": name, "version": "1.0.0"}}
-        (home / file).write_text(json.dumps({**card, **document}))
-    return probe
-
-
 class Probe:
-    """A Service whose one Verifier's Agent plays a scripted list of file tool calls.
+    """A checked-in Service whose ``<service>-check`` Verifier's Agent plays a scripted list of file tool calls.
 
-    The Agent mounts ``workspace`` and declares ``tools``; the local model
-    makes one scripted call per turn and answers every tool result, so each
-    journey reads exactly what the real tools returned.
+    The local model makes one scripted call per turn and answers every tool
+    result, so each journey reads exactly what the real tools returned.
     """
 
     def __init__(
@@ -1103,42 +1107,25 @@ class Probe:
         cards: Cards,
         server: WyrdTestServer,
         home: Path,
-        workspace: Mapping[str, object],
-        tools: Sequence[str],
-        granted: str | dict[str, object] | None = None,
+        service: str,
+        granted: str | dict[str, object] = "all",
     ) -> None:
-        """Register the probe Service under ``home`` as a key granted ``granted`` tools, else ``tools``."""
-        self.name = write_probe(home, workspace, tools)
+        """Register ``cards/artifact_workspaces/<service>.yaml`` and run it as a key granted ``granted`` tools."""
         configure_gateway(WyrdClient())
-        cards.declare_from_path(home / "service.yaml")
-        bundle = pull(cards, self.name, home / "bundle")
-        scope: str | dict[str, object] = granted or (
-            "all" if len(tools) > 1 else {"tool": tools[0]}
-        )
-        key = server.scoped_api_key(self.name.replace("-", "_"), grants(scope))
+        declare(cards, f"cards/artifact_workspaces/{service}.yaml")
+        bundle = pull(cards, service, home)
+        key = server.scoped_api_key(service.replace("-", "_"), grants(granted))
+        self.verifier = f"{service}-check"
         self.state = WyrdState.from_path(bundle, WyrdClient(credential=key))
 
     def play(self, *script: tuple[str, dict[str, object]]) -> tuple[list[Any], StepResult]:
         """Run ``script`` and return each call's tool result beside the step record."""
         calls = [{"tool": tool, "arguments": arguments} for tool, arguments in script]
-        result = self.state.run().observe.verify(f"{self.name}-verifier", script=calls)
+        result = self.state.run().observe.verify(self.verifier, script=calls)
         probe = step(result, "probe")
         assert probe["status"] == "succeeded", probe
         output = cast("dict[str, Any]", probe.get("output"))
         return output["results"], probe
-
-
-def pinned(card: CardRef) -> dict[str, str]:
-    """``card`` as the exact reference a workspace selection names."""
-    return {"kind": "Artifact", "name": card.name, "version": card.version}
-
-
-def selected(card: CardRef, path: str | None = None) -> dict[str, object]:
-    """The workspace source mounting ``path`` of ``card``, or all of it."""
-    selection: dict[str, object] = {"card": pinned(card)}
-    if path is not None:
-        selection["path"] = path
-    return {"artifact": selection}
 
 
 def lines(read: dict[str, Any]) -> list[tuple[int, str]]:
@@ -1149,6 +1136,11 @@ def lines(read: dict[str, Any]) -> list[tuple[int, str]]:
 def hits(found: dict[str, Any]) -> list[tuple[str, int]]:
     """Each ``fs.search`` match as its path and line number."""
     return [(hit["path"], hit["locator"]["lines"]["start"]) for hit in found["matches"]]
+
+
+def tools_called(record: StepResult) -> list[str]:
+    """The tools ``record``'s Agent called, in call order."""
+    return [call["tool"] for call in record.get("tool_calls", [])]
 
 
 def test_artifact_workspace_selects_files_and_directories(
@@ -1165,20 +1157,8 @@ def test_artifact_workspace_selects_files_and_directories(
             "unselected.txt": "x" * 100_000,
         },
     )
-    name = fresh("library")
-    first = cards.upload_artifact(source, name=name, version="1.0.0")
-    probe = Probe(
-        cards,
-        wyrd_server,
-        tmp_path / "probe",
-        {
-            "/inputs/guide.md": selected(first, "docs/guide.md"),
-            "/inputs/docs": selected(first, "docs"),
-            "/inputs/policy.pdf": selected(first, "policy.pdf"),
-            "/inputs/blob.bin": selected(first, "blob.bin"),
-        },
-        ["fs.list", "fs.read"],
-    )
+    cards.upload_artifact(source, pinned_upload("workspace-library"))
+    probe = Probe(cards, wyrd_server, tmp_path / "probe", "library-desk")
 
     [listed, read, nested] = probe.play(
         ("fs.list", {"path": "/inputs"}),
@@ -1198,9 +1178,19 @@ def test_artifact_workspace_selects_files_and_directories(
     assert [len(each["sources"]) for each in listed["files"]] == [1] * 5
 
     (source / "docs/guide.md").write_text("# Guide\nsecond release\n")
-    cards.upload_artifact(source, name=name, version="1.0.1")
+    cards.upload_artifact(source, {"name": "workspace-library", "version": "1.0.1"})
     [read] = probe.play(("fs.read", {"path": "/inputs/guide.md"}))[0]
     assert lines(read)[1] == (2, "first release"), "a new version never retargets the pin"
+
+
+TOOL_FAILED = "SKALD_TOOL_500_CALL"
+"""The stable code of a tool call the tool itself refused, carried in its result."""
+
+OPAQUE = b"\xff\xfe\x00LIMIT"
+"""Bytes no text tool reads, which ``code.run`` still reads from the mount."""
+
+OPAQUE_HEX = "from pathlib import Path\nPath('/inputs/data/blob.bin').read_bytes().hex()"
+"""``code.run`` source returning the mounted opaque file's bytes as hex."""
 
 
 def test_agent_file_tools_read_without_extraction(
@@ -1210,31 +1200,21 @@ def test_agent_file_tools_read_without_extraction(
     body = "".join(f"line {number}\n" for number in range(1, 2001))
     source = tree(
         tmp_path / "source",
-        {
-            "policy.json": raw,
-            "long.txt": body,
-            "policy.pdf": CORRUPT_PDF,
-            "blob.bin": b"\xff\xfe\x00LIMIT",
-        },
+        {"policy.json": raw, "long.txt": body, "policy.pdf": CORRUPT_PDF, "blob.bin": OPAQUE},
     )
-    ref = cards.upload_artifact(source, name=fresh("raw"), version="1.0.0")
-    probe = Probe(
-        cards,
-        wyrd_server,
-        tmp_path / "probe",
-        {"/inputs/data": selected(ref)},
-        ["fs.list", "fs.read", "fs.search"],
-    )
+    cards.upload_artifact(source, pinned_upload("raw-records"))
+    probe = Probe(cards, wyrd_server, tmp_path / "probe", "raw-desk")
 
-    results = probe.play(
+    results, record = probe.play(
         ("fs.read", {"path": "/inputs/data/policy.json"}),
         ("fs.read", {"path": "/inputs/data/long.txt"}),
         ("fs.read", {"path": "/inputs/data"}),
         ("fs.read", {"path": "/inputs/data/blob.bin"}),
         ("fs.read", {"path": "/inputs/data/policy.pdf"}),
         ("fs.search", {"query": "LIMIT"}),
-    )[0]
-    [policy, first_page, directory, blob, pdf, found] = results
+        ("code.run", {"source": OPAQUE_HEX}),
+    )
+    [policy, first_page, directory, blob, pdf, found, ran] = results
 
     assert lines(policy) == list(enumerate(raw.splitlines(), start=1))
     assert policy["next"] is None, policy
@@ -1244,10 +1224,17 @@ def test_agent_file_tools_read_without_extraction(
         ("fs.read", {"path": "/inputs/data/long.txt", "start": first_page["next"]})
     )[0]
     assert lines(resumed)[0] == (len(page) + 1, f"line {len(page) + 1}")
-    for refused in (directory, blob):
-        assert "error" in refused, refused
+    assert {"directory": directory, "blob": blob} == {
+        "directory": {
+            "code": TOOL_FAILED,
+            "error": directory.get("error"),
+        },
+        "blob": {"code": TOOL_FAILED, "error": blob.get("error")},
+    }
     assert lines(pdf) == [(1, "%PDF-1.7"), (2, "not a document")], "reading never extracts"
     assert hits(found) == [("/inputs/data/policy.json", 2)], "binary bytes are never searched"
+    assert ran["value"] == repr(OPAQUE.hex()), "code.run reads the opaque mounted bytes"
+    assert tools_called(record)[-1] == "code.run"
 
 
 def test_agent_file_search_supports_regex_across_files(
@@ -1264,19 +1251,8 @@ def test_agent_file_search_supports_regex_across_files(
             "many.txt": "match\n" * 4000,
         },
     )
-    ref = cards.upload_artifact(source, name=fresh("code"), version="1.0.0")
-    probe = Probe(
-        cards,
-        wyrd_server,
-        tmp_path / "probe",
-        {
-            "/inputs/src": selected(ref, "src"),
-            "/inputs/.hidden": selected(ref, ".hidden"),
-            "/inputs/blob.bin": selected(ref, "blob.bin"),
-            "/inputs/many.txt": selected(ref, "many.txt"),
-        },
-        ["fs.search", "fs.read", "fs.extract"],
-    )
+    cards.upload_artifact(source, pinned_upload("code-tree"))
+    probe = Probe(cards, wyrd_server, tmp_path / "probe", "search-desk")
 
     results, record = probe.play(
         ("fs.search", {"query": "refund"}),
@@ -1328,18 +1304,31 @@ def test_agent_file_search_supports_regex_across_files(
     assert hits(single) == [(py, 1), (py, 2), (py, 3)]
     assert hits(basename) == [(py, 1), (py, 2), (py, 3)]
     assert hits(recursive) == [(txt, 1)]
-    for refused in (bad_regex, bad_glob, bad_scope):
-        assert "error" in refused, refused
+    assert [each.get("code") for each in (bad_regex, bad_glob, bad_scope)] == [TOOL_FAILED] * 3
     assert none == {"matches": [], "truncated": False}
     assert many["truncated"] is True and 0 < len(many["matches"]) < 4000, len(many["matches"])
     [(path, _)] = hits(scratch)
     assert path == "/work/rules.json" and scratch["matches"][0]["sources"] == []
     assert lines(context)[1] == (2, "    return REFUND_LIMIT")
-    assert [call["tool"] for call in record.get("tool_calls", [])][-3:] == [
-        "fs.extract",
-        "fs.search",
-        "fs.read",
-    ]
+    assert tools_called(record)[-3:] == ["fs.extract", "fs.search", "fs.read"]
+
+    wyrd_server.flush_bifrost()
+    query: dict[str, object] = {
+        "sql": "SELECT count(*) AS judged FROM bifrost.verification.results "
+        "WHERE service_name = 'search-desk'",
+        "max_rows": 1,
+    }
+    [found, read, queried], record = probe.play(
+        ("fs.search", {"query": "REFUND_LIMIT"}),
+        ("fs.read", {"path": "/inputs/src/refunds.py", "start": 1}),
+        ("bifrost.query", query),
+    )
+    assert hits(found) == [(py, 2)]
+    assert lines(read)[0] == (2, "    return REFUND_LIMIT"), "the read starts at the hit"
+    assert (queried["columns"][0]["name"], queried["rows"]) == ("judged", [[1]]), (
+        "the earlier probe is retained and queryable"
+    )
+    assert tools_called(record) == ["fs.search", "fs.read", "bifrost.query"]
 
 
 def test_agent_extract_tool_writes_explicit_output(
@@ -1349,14 +1338,8 @@ def test_agent_extract_tool_writes_explicit_output(
         tmp_path / "source",
         {"handbook.md": "# Handbook\nEscalate.\n", "policy.pdf": CORRUPT_PDF, "blob.bin": b"\x00"},
     )
-    ref = cards.upload_artifact(source, name=fresh("extractable"), version="1.0.0")
-    probe = Probe(
-        cards,
-        wyrd_server,
-        tmp_path / "probe",
-        {"/inputs/docs": selected(ref)},
-        ["fs.extract", "fs.read", "fs.list"],
-    )
+    cards.upload_artifact(source, pinned_upload("extractable-docs"))
+    probe = Probe(cards, wyrd_server, tmp_path / "probe", "extract-desk")
 
     results = probe.play(
         ("fs.extract", {"path": "/inputs/docs/handbook.md", "output_path": "/work/handbook.json"}),
@@ -1369,22 +1352,15 @@ def test_agent_extract_tool_writes_explicit_output(
         ("fs.extract", {"path": "/inputs/docs/handbook.md", "output_path": "/work/../x.json"}),
         ("fs.list", {"path": "/work"}),
     )[0]
-    [extracted, read, overwrite, malformed, unsupported, directory, outside, escape, listed] = (
-        results
-    )
+    [extracted, read, *refused, listed] = results
 
     assert extracted["output_path"] == "/work/handbook.json"
     assert len(extracted["sources"]) == 1 and extracted["extractor_version"], extracted
     text = "\n".join(text for _, text in lines(read))
     assert json.loads(text) == {"format": "markdown", "text": "# Handbook\nEscalate.\n"}
     assert all(not unit.get("sources") for unit in read["units"]), "scratch is no citation source"
-    for refused in (overwrite, malformed, unsupported, directory, outside, escape):
-        assert "error" in refused, refused
+    assert [each.get("code") for each in refused] == [TOOL_FAILED] * 6
     assert [each["path"] for each in listed["files"]] == ["/work/handbook.json"]
-
-
-REFUSED = ("WYRD_LOADER_400_INVALID_ENVELOPE", "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY")
-"""The codes a refused workspace declaration carries: an invalid Card, or an unresolved Artifact."""
 
 
 def test_artifact_workspace_refusals_preserve_authority(
@@ -1396,42 +1372,28 @@ def test_artifact_workspace_refusals_preserve_authority(
 ) -> None:
     secret = f"SECRET-{secrets.token_hex(8)}"
     source = tree(tmp_path / "source", {"docs/guide.md": f"{secret}\n", "notes.txt": "n\n"})
-    ref = cards.upload_artifact(source, name=fresh("guarded"), version="1.0.0")
+    ref = cards.upload_artifact(source, pinned_upload("guarded-docs"))
     asked = len(receiver.to("/v1/chat/completions"))
 
-    for case, workspace in (
-        (
-            "wrong kind",
-            {"/inputs/x": {"artifact": {"card": {**pinned(ref), "kind": "Model"}}}},
-        ),
-        (
-            "missing card",
-            {
-                "/inputs/x": {
-                    "artifact": {
-                        "card": {"kind": "Artifact", "name": fresh("absent"), "version": "1.0.0"}
-                    }
-                }
-            },
-        ),
-        ("outside inputs", {"/work/guide.md": selected(ref, "docs/guide.md")}),
-        (
-            "colliding mounts",
-            {
-                "/inputs/docs": selected(ref, "docs"),
-                "/inputs/docs/guide.md": selected(ref, "notes.txt"),
-            },
-        ),
-        (
-            "unknown field",
-            {"/inputs/x": {"artifact": {"card": pinned(ref), "glob": "*"}}},
-        ),
-    ):
-        home = tmp_path / case.replace(" ", "-")
-        write_probe(home, workspace, ["fs.read"])
-        with pytest.raises(WyrdError) as refused:
-            cards.declare_from_path(home / "service.yaml")
-        assert refused.value.code in REFUSED, (case, refused.value.code)
+    refused = {
+        case: refusal(lambda case=case: declare(cards, f"cards/artifact_workspaces/{case}.yaml"))[0]
+        for case in (
+            "wrong-kind-check",
+            "missing-card-check",
+            "outside-inputs-check",
+            "colliding-mounts-check",
+            "unknown-field-check",
+        )
+    }
+    assert refused == {
+        "wrong-kind-check": "WYRD_LOADER_400_INVALID_ENVELOPE",
+        "missing-card-check": "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY",
+        "outside-inputs-check": "WYRD_LOADER_400_INVALID_ENVELOPE",
+        "colliding-mounts-check": "WYRD_LOADER_400_INVALID_ENVELOPE",
+        "unknown-field-check": "WYRD_LOADER_400_INVALID_ENVELOPE",
+    }
+    for case in refused:
+        assert not cards.list(kind="Verifier", name=case).refs, case
     foreign = Cards(
         WyrdClient(
             credential=wyrd_server.bootstrap_service_in_tenant(
@@ -1439,41 +1401,34 @@ def test_artifact_workspace_refusals_preserve_authority(
             )
         )
     )
-    home = tmp_path / "foreign"
-    write_probe(home, {"/inputs/guide.md": selected(ref, "docs/guide.md")}, ["fs.read"])
-    with pytest.raises(WyrdError):
-        foreign.declare_from_path(home / "service.yaml")
-    with pytest.raises(WyrdError):
-        foreign.list_artifacts(ref)
+    assert {
+        "declare": refusal(
+            lambda: declare(foreign, "cards/artifact_workspaces/denied-desk-check.yaml")
+        )[0],
+        "inventory": refusal(lambda: foreign.list_artifacts(ref))[0],
+    } == {
+        "declare": "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY",
+        "inventory": "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+    }
 
-    probe = Probe(
-        cards, wyrd_server, tmp_path / "prefix", {"/inputs/x": selected(ref, "doc")}, ["fs.read"]
-    )
-    with pytest.raises(WyrdError) as refused:
-        probe.play(("fs.read", {"path": "/inputs/x"}))
-    assert "no file at the selected path" in str(refused.value), "a prefix stops at a / boundary"
+    probe = Probe(cards, wyrd_server, tmp_path / "prefix", "prefix-desk")
+    code, _ = refusal(lambda: probe.play(("fs.read", {"path": "/inputs/x"})))
+    assert code == "WYRD_VERIFICATION_400_INPUT_INVALID", "a prefix stops at a / boundary"
 
-    probe = Probe(
-        cards,
-        wyrd_server,
-        tmp_path / "denied",
-        {"/inputs/guide.md": selected(ref, "docs/guide.md")},
-        ["fs.read", "fs.search", "fs.extract"],
-        granted={"tool": "fs.search"},
-    )
+    probe = Probe(cards, wyrd_server, tmp_path / "denied", "denied-desk", {"tool": "fs.search"})
     [read, found, ungranted], record = probe.play(
         ("fs.read", {"path": "/inputs/guide.md"}),
         ("fs.search", {"query": "nothing"}),
         ("fs.extract", {"path": "/inputs/guide.md", "output_path": "/inputs/guide.md"}),
     )
-    assert DENIED in json.dumps(read), read
+    assert read.get("code") == DENIED, read
     assert found == {"matches": [], "truncated": False}
-    assert DENIED in json.dumps(ungranted), "a declared tool still needs its grant"
+    assert ungranted.get("code") == DENIED, "a declared tool still needs its grant"
     undeclared = probe.state.run().observe.verify(
-        f"{probe.name}-verifier", script=[{"tool": "fs.list", "arguments": {"path": "/inputs"}}]
+        probe.verifier, script=[{"tool": "fs.list", "arguments": {"path": "/inputs"}}]
     )
     assert "is not attached" in step(undeclared, "probe").get("reason", ""), undeclared.steps
     assert all(
         secret not in json.dumps(each.body) for each in receiver.to("/v1/chat/completions")[asked:]
     ), "no refused path hands the protected line to the model"
-    assert [call["tool"] for call in record.get("tool_calls", [])][:2] == ["fs.read", "fs.search"]
+    assert tools_called(record)[:2] == ["fs.read", "fs.search"]

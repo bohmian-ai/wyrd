@@ -33,7 +33,7 @@ use wyrd_client::state::{ConfigureOptions, DeclareOptions, TelemetryFlushFailure
 
 use crate::bifrost::PyTableConfig;
 use crate::client::PyWyrdClient;
-use crate::observe::PyRun;
+use crate::observe::{PyRun, invalid_argument, json_value};
 
 /// Python state hydration boundary and all-or-nothing holder owner.
 mod hydrator;
@@ -2006,47 +2006,56 @@ impl PyCards {
     /// the GIL released: a file keeps its basename, a directory keeps every
     /// regular file at its relative path, and `extract=True` also publishes
     /// `extracted/P.json` for each supported document `P` and records
-    /// `spec.metadata.extraction`.
+    /// `spec.metadata.extraction`. Every argument is validated before any
+    /// request is sent.
     ///
     /// # Arguments
     /// * `source` - The regular file or directory to publish.
-    /// * `name` - The Artifact Card name.
-    /// * `version` - An exact version or version scope, or `None` to let the
-    ///   server assign one.
-    /// * `version_bump` - A `VersionBump` the server applies, or `None`.
-    /// * `artifact_kind` - The Artifact kind; must not be blank.
+    /// * `metadata` - The Card `Metadata` mapping: `name`, an optional exact
+    ///   `version` or version scope, and any `labels` or `annotations`.
+    /// * `version_bump` - A `VersionBump` the server applies, or `None`; the
+    ///   bump is never read from `metadata`.
+    /// * `spec` - The `ArtifactSpec` mapping; defaults to
+    ///   `{"artifact_kind": "file"}`.
     /// * `extract` - Prepare extraction outputs before declaring.
     ///
     /// # Returns
     /// The exact Active `CardRef`, UID included.
     ///
     /// # Errors
-    /// Returns a Wyrd error for an invalid name, version, kind, or source, a
-    /// refused extraction, or a failed declaration.
-    #[pyo3(signature = (source, *, name, version=None, version_bump=None, artifact_kind="file", extract=false))]
+    /// Returns `WYRD_SPEC_400_VALIDATION` naming the field for an invalid
+    /// metadata, name, bump, or spec, and a Wyrd error for an invalid
+    /// source, a refused extraction, or a failed declaration.
+    #[pyo3(signature = (source, metadata, *, version_bump=None, spec=None, extract=false))]
     fn upload_artifact(
         slf: &Bound<'_, Self>,
         source: PathBuf,
-        name: &str,
-        version: Option<&str>,
+        metadata: &Bound<'_, PyAny>,
         version_bump: Option<&Bound<'_, PyAny>>,
-        artifact_kind: &str,
+        spec: Option<&Bound<'_, PyAny>>,
         extract: bool,
     ) -> CardPyResult<CardRefPy> {
-        let mut metadata: Metadata = serde_json::from_value(serde_json::json!({ "name": name }))?;
-        metadata.version = version
-            .map(str::parse::<VersionSpec>)
-            .transpose()
-            .map_err(|error| WyrdError::Validation {
-                message: format!("version: {error}"),
-                details: serde_json::json!({ "rule": "version", "path": "version" }),
-            })?;
-        metadata.bump = version_bump.map(parse_version_bump).transpose()?;
-        let spec = wyrd_spec::card::artifact::ArtifactSpec {
-            artifact_kind: artifact_kind.to_owned(),
-            ..wyrd_spec::card::artifact::ArtifactSpec::default()
-        };
         let py = slf.py();
+        let authored = json_value(py, "metadata", metadata)?;
+        if authored.get("bump").is_some() {
+            return Err(invalid_argument("metadata.bump", "pass version_bump instead").into());
+        }
+        let name = authored
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        CardName::new(name).map_err(|error| invalid_argument("metadata.name", error))?;
+        let mut metadata: Metadata = serde_json::from_value(authored)
+            .map_err(|error| invalid_argument("metadata", error))?;
+        metadata.bump = version_bump.map(parse_version_bump).transpose()?;
+        let spec = match spec {
+            Some(value) => serde_json::from_value(json_value(py, "spec", value)?)
+                .map_err(|error| invalid_argument("spec", error))?,
+            None => wyrd_spec::card::artifact::ArtifactSpec {
+                artifact_kind: "file".to_owned(),
+                ..wyrd_spec::card::artifact::ArtifactSpec::default()
+            },
+        };
         let this = slf.borrow();
         let cards = this.cards(py)?;
         crate::trace::block_on(py, cards.upload_artifact(&source, metadata, spec, extract))

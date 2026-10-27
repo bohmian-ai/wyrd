@@ -1,0 +1,23 @@
+# Mounts all of raw-records 1.0.0 unextracted.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: raw-desk-check
+  version: 1.0.0
+spec:
+  inputs:
+    script: {type: json, schema: {type: array}}
+  steps:
+    - id: probe
+      action:
+        kind: agent
+        agent: ./file-probe.yaml
+        inputs: {script: inputs.script}
+        workspace:
+          /inputs/data:
+            artifact:
+              card: {kind: Artifact, name: raw-records, version: 1.0.0}
+  requirements:
+    - id: probed
+      statement: The probe played its script
+      check: {kind: assert, path: steps.probe.output.done, operator: equals, expected: true}

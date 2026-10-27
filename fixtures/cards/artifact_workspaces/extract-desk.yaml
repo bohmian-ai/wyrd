@@ -1,0 +1,9 @@
+# A Service whose one Verifier plays a file probe; see extract-desk-check.yaml.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: extract-desk
+  version: 1.0.0
+spec:
+  verified_by:
+    - verifier: ./extract-desk-check.yaml

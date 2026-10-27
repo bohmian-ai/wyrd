@@ -521,11 +521,10 @@ class Cards:
     def upload_artifact(
         self,
         source: str | PathLike[str],
+        metadata: Mapping[str, object],
         *,
-        name: str,
-        version: str | None = None,
         version_bump: VersionBump | None = None,
-        artifact_kind: str = "file",
+        spec: Mapping[str, object] | None = None,
         extract: bool = False,
     ) -> CardRef:
         """Publish one file or directory as an Artifact Card.
@@ -538,22 +537,36 @@ class Cards:
         records the extractor version, the source/output pairs, and the
         skipped paths. The source tree is never written.
 
+        Example:
+            ```python
+            ref = cards.upload_artifact(
+                "policies/",
+                {"name": "refund-policies", "version": "1.0.0"},
+                spec={"artifact_kind": "policies"},
+                extract=True,
+            )
+            ```
+
         Args:
             source: The regular file or directory to publish.
-            name: The Artifact Card name.
-            version: An exact version or version scope; omitted, the server
-                assigns one.
-            version_bump: How the server bumps the latest version.
-            artifact_kind: The Artifact kind; must not be blank.
+            metadata: The Card metadata: ``name``, an optional exact
+                ``version`` or version scope (omitted, the server assigns
+                one), and any ``labels`` or ``annotations``.
+            version_bump: How the server bumps the latest version; never
+                read from ``metadata``.
+            spec: The Artifact spec; defaults to ``{"artifact_kind": "file"}``.
             extract: Prepare extraction outputs before declaring.
 
         Returns:
             The exact Active reference, UID included.
 
         Raises:
-            WyrdError: For a blank kind, an invalid source, a symlink, an
-                output path that collides with a source, a document the
-                extractor refuses, or a failed declaration.
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` naming the field for
+                invalid metadata, name, or spec, before anything is sent;
+                otherwise for a blank kind, an invalid source, a symlink, an
+                output path that collides with a source, an authored
+                extraction report, a document the extractor refuses, or a
+                failed declaration.
         """
         ...
 

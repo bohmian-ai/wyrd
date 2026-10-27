@@ -1,0 +1,9 @@
+# A Service whose one Verifier plays the guarded probe; see denied-desk-check.yaml.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: denied-desk
+  version: 1.0.0
+spec:
+  verified_by:
+    - verifier: ./denied-desk-check.yaml

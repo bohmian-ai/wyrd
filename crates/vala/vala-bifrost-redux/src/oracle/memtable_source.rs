@@ -188,13 +188,11 @@ impl MemtableSource {
             schema,
         )?;
         let filter = conjunction(self.filter.iter().cloned().chain(absorbed));
-        source.matched = source
-            .statistics
-            .iter()
-            .map(|bounds| {
-                BatchPruning::fully_matching(&source.inner.original_schema(), &filter, bounds)
-            })
-            .collect();
+        source.matched = BatchPruning::fully_matching(
+            &source.inner.original_schema(),
+            &filter,
+            &source.statistics,
+        );
         source.filter = Some(filter);
         Ok(Some(source))
     }

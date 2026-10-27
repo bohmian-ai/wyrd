@@ -517,8 +517,11 @@ impl BatchPruning {
             .map(Self)
     }
 
-    /// Returns, per batch of `statistics`, whether its bounds prove `filter`
-    /// true on every row of a batch written under `schema`.
+    /// Returns, per batch of each partition of `partitions`, whether its
+    /// bounds prove `filter` true on every row of a batch written under
+    /// `schema`.
+    ///
+    /// The proof is planned once and applied to every partition.
     ///
     /// The filter's negation is pruned against the bounds: a batch the
     /// negation cannot match on any row matches the filter on all of them.
@@ -531,27 +534,36 @@ impl BatchPruning {
     pub(crate) fn fully_matching(
         schema: &arrow::datatypes::SchemaRef,
         filter: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-        statistics: &[Arc<datafusion::common::Statistics>],
-    ) -> Vec<bool> {
+        partitions: &[Vec<Arc<datafusion::common::Statistics>>],
+    ) -> Vec<Vec<bool>> {
         let Some(pruning) = negation(filter).and_then(|negated| Self::try_new(schema, negated))
         else {
-            return vec![false; statistics.len()];
+            return partitions
+                .iter()
+                .map(|statistics| vec![false; statistics.len()])
+                .collect();
         };
         let columns: Vec<usize> = datafusion::physical_expr::utils::collect_columns(filter)
             .iter()
             .map(datafusion::physical_expr::expressions::Column::index)
             .collect();
-        pruning
-            .keep(statistics, statistics.len())
-            .into_iter()
-            .zip(statistics)
-            .map(|(negation_possible, bounds)| {
-                !negation_possible
-                    && columns.iter().all(|column| {
-                        bounds.column_statistics.get(*column).is_some_and(|bounds| {
-                            bounds.null_count == datafusion::common::stats::Precision::Exact(0)
-                        })
+        partitions
+            .iter()
+            .map(|statistics| {
+                pruning
+                    .keep(statistics, statistics.len())
+                    .into_iter()
+                    .zip(statistics)
+                    .map(|(negation_possible, bounds)| {
+                        !negation_possible
+                            && columns.iter().all(|column| {
+                                bounds.column_statistics.get(*column).is_some_and(|bounds| {
+                                    bounds.null_count
+                                        == datafusion::common::stats::Precision::Exact(0)
+                                })
+                            })
                     })
+                    .collect()
             })
             .collect()
     }

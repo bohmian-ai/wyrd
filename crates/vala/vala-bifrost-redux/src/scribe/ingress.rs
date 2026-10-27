@@ -807,8 +807,9 @@ impl ScribeImpl {
         if let Some(accepted) = completion.accepted_under {
             return Ok(Dispatched::AcceptedUnder(accepted));
         }
-        metrics::histogram!("bifrost_scribe_ack_seconds")
-            .record(append_started.elapsed().as_secs_f64());
+        let elapsed = append_started.elapsed();
+        metrics::histogram!("bifrost_scribe_ack_seconds").record(elapsed.as_secs_f64());
+        profile.record_timing(elapsed, completion.sent.elapsed());
         Ok(Dispatched::Admitted(FrameAdmission {
             batch_id: frame.batch_id,
             rows_accepted: completion.rows,
@@ -1285,6 +1286,7 @@ mod tests {
     };
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::memory::MemoryCategory;
+    use crate::scribe::profile::WRITE_TIMING;
     use arrow::array::{StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
@@ -1536,6 +1538,59 @@ mod tests {
             "the decode charge was transferred and resized, not retained"
         );
         assert_eq!(after.scribe_total_bytes, baseline + memtable);
+        scribe
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+    }
+
+    /// One acknowledged append records Scribe's write boundary and each of
+    /// its phases once, through the real benchmark timing collector.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the write is refused or a boundary's observation count is
+    /// not exactly one.
+    #[tokio::test]
+    async fn acknowledged_append_records_each_write_phase_once() {
+        use wyrd_telemetry::timing;
+
+        timing::enable();
+        let before = timing::snapshot();
+        let scribe = ScribeImpl::new();
+        let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("random tenant is valid");
+        let principal = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            PermissionSet::new(),
+        );
+        Scribe::ingest_frame(
+            &scribe,
+            decoded_size_frame(tenant, &principal, "v".to_owned()),
+        )
+        .await
+        .expect("the canonical write is admitted");
+        let interval = timing::snapshot().since(&before).expect("one process");
+        for boundary in [
+            WRITE_TIMING,
+            "bifrost.scribe.write.admission",
+            "bifrost.scribe.write.decode",
+            "bifrost.scribe.write.preprocess",
+            "bifrost.scribe.write.shard_wait",
+            "bifrost.scribe.write.wal_append",
+            "bifrost.scribe.write.wal_sync",
+            "bifrost.scribe.write.visibility",
+            "bifrost.scribe.write.ack",
+        ] {
+            let count: u64 = interval
+                .series
+                .iter()
+                .filter(|series| series.boundary == boundary && series.outcome == "success")
+                .map(|series| series.count)
+                .sum();
+            assert_eq!(count, 1, "{boundary}: {:?}", interval.series);
+        }
         scribe
             .shutdown(Instant::now() + Duration::from_secs(1))
             .await;

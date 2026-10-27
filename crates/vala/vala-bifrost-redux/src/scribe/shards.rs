@@ -3243,6 +3243,7 @@ impl ShardOwner {
                     rows,
                     first_commit: state.inserted_batch_ids.contains(batch_id),
                     accepted_under: None,
+                    sent: std::time::Instant::now(),
                 }));
             }
             drop(append.reservation);
@@ -3821,6 +3822,7 @@ impl ShardOwner {
                         version,
                         verdict,
                     }),
+                    sent: std::time::Instant::now(),
                 }))
                 .is_ok()
         });

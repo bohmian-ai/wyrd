@@ -46,6 +46,9 @@ pub(crate) struct DurableCompletion {
     /// accepting version, and the shard holds the append's tenant group
     /// uncommitted until it answers.
     pub accepted_under: Option<AcceptedUnder>,
+    /// When the shard owner sent this completion, so the waiter times its
+    /// delivery.
+    pub sent: Instant,
 }
 
 /// A batch id the durable fence accepted under another table version, held

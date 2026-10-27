@@ -242,6 +242,33 @@ fn timed(
     })
 }
 
+/// Runs one export's protobuf `decode` and, on success, records its time
+/// through [`wyrd_telemetry::record_timing`] at `boundary` under the current
+/// request's benchmark classification. Without benchmark timing it only
+/// runs `decode`: no clock or span is read.
+///
+/// # Errors
+///
+/// Returns `decode`'s error unchanged, unrecorded.
+fn timed_decode<T>(
+    boundary: &'static str,
+    decode: impl FnOnce() -> Result<T, Status>,
+) -> Result<T, Status> {
+    if !wyrd_telemetry::timing::enabled() {
+        return decode();
+    }
+    let started = std::time::Instant::now();
+    let decoded = decode()?;
+    wyrd_telemetry::record_timing(
+        &tracing::Span::current(),
+        boundary,
+        "success",
+        started.elapsed(),
+        None,
+    );
+    Ok(decoded)
+}
+
 /// Unary trace handler that preserves Gate authentication and response semantics.
 struct TraceExportUnary {
     /// Gate selected during server boot.
@@ -442,7 +469,9 @@ impl Decoder for TraceRequestDecoder {
             .reserve_otlp_decode(plan.reservation_bytes())
             .map_err(ingest_status)?;
         record_codec_activity("decode");
-        let request = decode_trace_protobuf(bytes).map_err(ingest_status)?;
+        let request = timed_decode("bifrost.otlp.traces.decode", || {
+            decode_trace_protobuf(bytes).map_err(ingest_status)
+        })?;
         source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
     }
@@ -798,7 +827,9 @@ impl Decoder for LogsRequestDecoder {
             .reserve_otlp_decode(plan.reservation_bytes())
             .map_err(ingest_status)?;
         record_codec_activity("decode");
-        let request = decode_logs_protobuf(bytes).map_err(ingest_status)?;
+        let request = timed_decode("bifrost.otlp.logs.decode", || {
+            decode_logs_protobuf(bytes).map_err(ingest_status)
+        })?;
         source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
     }
@@ -855,5 +886,29 @@ mod tests {
             lowest >= 29_000_000,
             "through the acknowledgement: {lowest} ns"
         );
+    }
+
+    /// A decode is one `success` observation of its own boundary; a refused
+    /// decode is returned unchanged and records nothing.
+    ///
+    /// # Panics
+    /// Panics when the decoded value, error, or observation count is wrong.
+    #[test]
+    fn decode_timing_records_only_successful_decodes() {
+        timing::enable();
+        let before = timing::snapshot();
+        let boundary = "bifrost.otlp.traces.decode";
+        assert_eq!(timed_decode(boundary, || Ok(7)).expect("decoded"), 7);
+        let refused = timed_decode::<()>(boundary, || Err(Status::invalid_argument("malformed")))
+            .expect_err("refused");
+        assert_eq!(refused.code(), wyrd_tonic::tonic::Code::InvalidArgument);
+        let interval = timing::snapshot().since(&before).expect("one process");
+        let observed: Vec<_> = interval
+            .series
+            .iter()
+            .filter(|series| series.boundary == boundary)
+            .map(|series| (series.outcome.as_str(), series.count))
+            .collect();
+        assert_eq!(observed, [("success", 1)]);
     }
 }

@@ -16,7 +16,7 @@ use wyrd_testing::release_server::PEAK_SAMPLE_INTERVAL_MS;
 
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
-use wyrd_testing::capacity::{Expected, Population, Selection, Window};
+use wyrd_testing::capacity::{Expected, NANOS_PER_MS, Population, Selection, Window};
 use wyrd_testing::experiment::{ExperimentError, Phase, Reading, Repetition, Step, Workload};
 use wyrd_testing::release_server::LocalServer;
 
@@ -24,8 +24,8 @@ use crate::query::run::{Admission, Bench, Outcome, Sender, WRONG_RESULT, ask};
 use crate::query::telemetry::{self, Telemetry};
 use crate::query::workload::{Case, Fixture, Rows, TABLE};
 use crate::query::{
-    Experiment, Lane, PAIR, Read, Residence, SETTLED, SPLIT, Scale, WriteOp, client, lanes,
-    parquet_bytes, read_op, start, table_files,
+    Experiment, Lane, OTLP_DECODE_PHASE, PAIR, PHASE_STATISTICS, Read, Residence, SETTLED, SPLIT,
+    Scale, WRITE_PHASES, WriteOp, client, lanes, parquet_bytes, read_op, start, table_files,
 };
 
 /// Concurrent writers loading the read fixture.
@@ -283,6 +283,7 @@ impl Isolated {
                     ),
                 );
             }
+            set_write_phases(&mut repetition, &population, write);
             repetition.set(
                 "visibility_p99_ms",
                 Reading::missing(
@@ -368,6 +369,37 @@ async fn scanned(
     ask(&bench.queries(), sql, &expected).await?;
     let after = server.metrics().await.map_err(|error| error.to_string())?;
     Ok(SCANNED.map(|family| after.sum(family, &[]) - before.sum(family, &[])))
+}
+
+/// Sets each [`WRITE_PHASES`] phase, then the OTLP decode phase, at each
+/// [`PHASE_STATISTICS`] statistic, milliseconds, over the window's
+/// successful observations of the phase's boundary. A phase the window did
+/// not time is missing with its reason; phases are diagnostic, so that never
+/// makes the repetition invalid.
+fn set_write_phases(repetition: &mut Repetition, population: &Population, write: WriteOp) {
+    let decode = write
+        .decode_boundary()
+        .ok_or("native writes send Arrow IPC, timed as Scribe's `decode`");
+    for (phase, boundary) in WRITE_PHASES
+        .into_iter()
+        .map(|(phase, boundary)| (phase, Ok(boundary)))
+        .chain([(OTLP_DECODE_PHASE, decode)])
+    {
+        let distribution =
+            boundary.map(|boundary| population.elapsed(boundary, SUCCESS).ok_or(boundary));
+        for (statistic, q) in PHASE_STATISTICS {
+            repetition.set(
+                &format!("phase_{phase}_{statistic}_ms"),
+                match &distribution {
+                    Err(reason) => Reading::missing(*reason),
+                    Ok(Err(boundary)) => {
+                        Reading::missing(format!("no successful `{boundary}` time in the window"))
+                    }
+                    Ok(Ok(distribution)) => Reading::quantile(distribution, q, NANOS_PER_MS),
+                },
+            );
+        }
+    }
 }
 
 /// Sets the client readings every closed-loop step shares: requests
@@ -632,5 +664,65 @@ impl Workload for Isolated {
             .await
             .map(|_| ())
             .map_err(ExperimentError::workload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Proof that write steps read their phases from the real collector.
+
+    use std::time::Duration;
+
+    use wyrd_telemetry::timing;
+    use wyrd_testing::capacity::Population;
+    use wyrd_testing::experiment::Repetition;
+
+    use super::set_write_phases;
+    use crate::query::WriteOp;
+
+    /// A native append's recorded Scribe phases read back with their one
+    /// sample, an untimed phase is missing with its boundary, and OTLP
+    /// decode is labelled unavailable for native writes, never fabricated.
+    ///
+    /// # Panics
+    /// Panics when a phase reading's samples, bounds, or reason are wrong.
+    #[test]
+    fn write_phases_read_back_with_populations_and_labelled_gaps() {
+        timing::enable();
+        let before = timing::snapshot();
+        wyrd_telemetry::record_timing_parts(
+            &tracing::Span::none(),
+            "bifrost.scribe.write",
+            "success",
+            Duration::from_millis(4),
+            None,
+            &[("bifrost.scribe.write.wal_sync", Duration::from_millis(3))],
+        );
+        let population = Population::between(&before, timing::snapshot()).expect("one process");
+        let mut repetition = Repetition::default();
+        set_write_phases(&mut repetition, &population, WriteOp::Native);
+
+        let sync = repetition.reading("phase_wal_sync_p99_ms");
+        assert_eq!(sync.samples, Some(1));
+        assert!(
+            sync.value.is_some_and(|ms| (3.0..3.1).contains(&ms)),
+            "{sync:?}"
+        );
+        assert_eq!(repetition.reading("phase_scribe_p50_ms").samples, Some(1));
+        assert_eq!(
+            repetition
+                .reading("phase_admission_p50_ms")
+                .reason
+                .as_deref(),
+            Some("no successful `bifrost.scribe.write.admission` time in the window")
+        );
+        let decode = repetition.reading("phase_otlp_decode_p99_ms");
+        assert_eq!((decode.value, decode.samples), (None, None));
+        assert!(
+            decode
+                .reason
+                .is_some_and(|reason| reason.contains("Arrow IPC"))
+        );
+        assert!(repetition.invalid.is_empty());
     }
 }

@@ -318,7 +318,44 @@ impl WriteOp {
             Self::Logs => "bifrost.otlp.logs",
         }
     }
+
+    /// The server timing boundary of this path's OTLP protobuf decode, or
+    /// `None` for native writes, whose Arrow IPC decode is Scribe's
+    /// `decode` phase.
+    #[must_use]
+    pub const fn decode_boundary(self) -> Option<&'static str> {
+        match self {
+            Self::Native => None,
+            Self::Spans | Self::WideSpans => Some("bifrost.otlp.traces.decode"),
+            Self::Logs => Some("bifrost.otlp.logs.decode"),
+        }
+    }
 }
+
+/// Each Scribe write phase the server times beside a write step's boundary,
+/// as the `phase_<id>_*` metric segment it fills and its benchmark timing
+/// boundary. `scribe` is Scribe's whole part of one acknowledged append;
+/// `wal_append`, `wal_sync`, and `visibility` are group stages every append
+/// of the group carries whole, so phases overlap and are never summed.
+pub const WRITE_PHASES: [(&str, &str); 9] = [
+    ("scribe", "bifrost.scribe.write"),
+    ("admission", "bifrost.scribe.write.admission"),
+    ("decode", "bifrost.scribe.write.decode"),
+    ("preprocess", "bifrost.scribe.write.preprocess"),
+    ("shard_wait", "bifrost.scribe.write.shard_wait"),
+    ("wal_append", "bifrost.scribe.write.wal_append"),
+    ("wal_sync", "bifrost.scribe.write.wal_sync"),
+    ("visibility", "bifrost.scribe.write.visibility"),
+    ("ack", "bifrost.scribe.write.ack"),
+];
+
+/// The `phase_<id>_*` metric segment of an OTLP step's protobuf decode,
+/// timed at [`WriteOp::decode_boundary`].
+pub const OTLP_DECODE_PHASE: &str = "otlp_decode";
+
+/// The statistics each write phase reports, as the metric id suffix and
+/// nearest-rank quantile.
+pub const PHASE_STATISTICS: [(&str, f64); 2] = [("p50", 0.5), ("p99", 0.99)];
 
 /// The read an `op` step parameter names.
 fn read_op(name: &str) -> Option<Read> {
@@ -501,7 +538,8 @@ fn limits(settings: &[(&str, &str)]) -> Value {
     ))
 }
 
-/// The metrics every L1 step reads, raw or derived.
+/// The metrics every L1 step reads, raw or derived, then each write
+/// phase's [`PHASE_STATISTICS`].
 fn isolated_metrics() -> Vec<Metric> {
     let derived = |id: &str, unit: &str, boundary: &str, direction, derive| {
         Metric::derived(id, unit, boundary, direction, derive)
@@ -511,7 +549,7 @@ fn isolated_metrics() -> Vec<Metric> {
     let per_vcpu = |(work, scale): (String, f64)| Derive::PerVcpu { work, scale };
     let cpu_per = |(work, scale): (String, f64)| Derive::CpuPer { work, scale };
     let rate = |(work, scale): (String, f64)| Derive::Rate { work, scale };
-    vec![
+    let mut metrics = vec![
         Metric::cores(),
         Metric::raw(
             "requests",
@@ -692,7 +730,26 @@ fn isolated_metrics() -> Vec<Metric> {
             Direction::Higher,
             per_cpu(work("wire_bytes", 1.0 / 1_048_576.0)),
         ),
-    ]
+    ];
+    let phases = WRITE_PHASES
+        .iter()
+        .map(|(phase, boundary)| (*phase, format!("`{boundary}`")))
+        .chain([(
+            OTLP_DECODE_PHASE,
+            "`bifrost.otlp.traces.decode` or `bifrost.otlp.logs.decode`".to_owned(),
+        )]);
+    for (phase, boundary) in phases {
+        for (statistic, _) in PHASE_STATISTICS {
+            metrics.push(Metric::raw(
+                &format!("phase_{phase}_{statistic}_ms"),
+                "ms",
+                &format!(
+                    "server diagnostic: nearest-rank {statistic} of the window's successful {boundary} times, its histogram bucket's bounds and sample count; one observation per Scribe append or OTLP export, group stages shared by every append of the group, so phases overlap and are never summed; write steps only"
+                ),
+            ));
+        }
+    }
+    metrics
 }
 
 /// The boundary of every judged Bifrost request time.

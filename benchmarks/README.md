@@ -115,7 +115,12 @@ What each engine covers:
       is the largest. Each window records the files and MiB it published
       and the memtable and staged backlog at its stop, and each OTLP
       window its measured `wire_bytes_per_row`; it is not a
-      publication-latency or sustained-throughput measurement.
+      publication-latency or sustained-throughput measurement. Each write
+      window also reports server phase p50/p99 (`phase_<phase>_*_ms`, with
+      sample counts) from the `bifrost.scribe.write.*` timings, plus OTLP
+      protobuf decode, which is labelled unavailable for native writes.
+      Group stages are shared by every append of a group, so phases overlap
+      and are never summed.
     - `hot`: 10M events rows and 1M spans held in memtables (a staged or
       published row is INVALID); point lookups at 1/64, with p99 below 5 ms
       at 64, a small aggregate and a shredded-attribute span filter at 1.

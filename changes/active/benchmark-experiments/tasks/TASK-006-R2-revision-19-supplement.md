@@ -69,22 +69,32 @@ An actual overrun still invalidates rather than truncating evidence silently.
 
 **Order/dependency.** After item 1; before item 4.
 
-## 3. Profiled runs never enter history
+## 3. History location, and profiled runs never enter it
 
 **Intent and evidence.** Profiled writes-parquet records
-`benchmarks/bifrost/writes-parquet/20261027T134553Z-f96c23fa2.json` and
-`benchmarks/bifrost/writes-parquet/20261027T140216Z-f96c23fa2.json`, and matching
-profiled hot and parquet records from those runs, entered history contrary to
-its complete, clean, unprofiled rule.
+`20261027T134553Z-f96c23fa2.json` and `20261027T140216Z-f96c23fa2.json`, and
+matching profiled hot and parquet records from those runs, entered history
+contrary to its complete, clean, unprofiled rule; they are already deleted.
+Records committed on the code branch also made code review carry about 264,000
+lines of run data, so history now lives on the `benchmark-records` branch. That
+branch already holds every earlier eligible record, and the code branch no
+longer tracks any.
 
-**Requirement.** Enforce REQ-013 for profiled runs: the recorder writes them
-only under `target/benchmarks/`, regardless of validity or completeness. Delete
-the misplaced profiled records, including the matching hot and parquet records.
-This is correction of ineligible history, not permission to delete slow results.
+**Requirement.** Enforce REQ-013. The recorder writes history only under
+`benchmarks/history/<engine>/<experiment>/`, and every reader of history uses
+that same directory: the `capacity results` page, the L2 calibration that reads
+the newest compatible `writes-parquet` record, and their tests. No reader
+falls back to the old `benchmarks/<engine>/<experiment>/` location. The
+recorder writes profiled runs only under `target/benchmarks/`, regardless of
+validity or completeness. `benchmarks/README.md` explains the
+`benchmark-records` worktree and how to keep a record. This is correction of
+ineligible history, not permission to delete slow results.
 
-**Acceptance.** A profiled full execution creates no history record. History
-contains none of the identified profiled records; ordinary eligible full runs
-still enter history regardless of target misses.
+**Acceptance.** An eligible full run writes its record under
+`benchmarks/history/`, and `capacity results` and L2 calibration read it from
+there. A profiled full execution creates no history record. Ordinary eligible
+full runs still enter history regardless of target misses. History on
+`benchmark-records` contains none of the identified profiled records.
 
 **Order/dependency.** After item 2.
 

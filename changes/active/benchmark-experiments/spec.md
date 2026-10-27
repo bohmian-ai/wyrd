@@ -15,8 +15,9 @@ part of a run, its record or its validity; the reference file, qualification
 mode and regression criteria are removed. It also fixes the writes budget and
 history eligibility, adds realistic spans and write-phase timing, orders the
 measured optimizations, and approves designing and implementing memtable
-Variant shredding; cross-query plan reuse remains parked. The maintainer
-approved this on 2026-10-27.
+Variant shredding; cross-query plan reuse remains parked. Record history moves
+off the code branches to the `benchmark-records` branch, checked out at
+`benchmarks/history/`. The maintainer approved this on 2026-10-27.
 
 Revision 18 measures the production binary and judges lost evidence. The
 measured `wyrd-server` builds in its own cargo invocation, so the driver's
@@ -137,7 +138,8 @@ throughput per provisioned vCPU and work per server CPU-second used, with
 explicit denominators. Absolute latency objectives measure server handling time.
 
 The costs are three measured repetitions per step, explicit validity checking,
-portable resource accounting, and growing committed summary history. High-resolution
+portable resource accounting, and growing summary history on the
+`benchmark-records` branch. High-resolution
 histograms have bounded memory and recording cost; distributions and optional
 trace/profile artifacts remain outside Git in `target/`. Collection stays bounded
 and overflow invalidates the affected measurement. Normalized metrics do not remove differences in CPU architecture,
@@ -682,7 +684,7 @@ following history. A run with `--steps`, `--profile`, `--allow-dirty` or
 history:
 
 ```text
-benchmarks/<engine>/<experiment>/<UTC timestamp>-<short sha>.json
+benchmarks/history/<engine>/<experiment>/<UTC timestamp>-<short sha>.json
 ```
 
 Engines are exactly `bifrost`, `verification`, `gateway`. Experiment identifiers
@@ -690,9 +692,14 @@ are stable lowercase path-safe names. Filenames are
 `YYYYMMDDTHHMMSSZ-<9-char sha>.json`, using UTC and the first nine commit hex
 digits; the full SHA is authoritative in JSON. Never overwrite a run: append
 `-2`, then `-3`, etc. before `.json` on collision, retaining the actual start.
-Records are intended to be committed
-for historical audit through normal contributor review; running a benchmark
-never stages or commits automatically. Full histogram distributions, diagnostic traces, logs and profiles remain
+History is the `benchmark-records` branch. It shares no commits with the
+code and holds only `<engine>/<experiment>/` records and a README. Each
+checkout mounts it as a worktree at `benchmarks/history/`, which the code
+branches ignore (`git worktree add benchmarks/history benchmark-records`).
+Records are committed and pushed on that branch through normal contributor
+review, never in a code change; running a benchmark never stages or commits
+automatically. Without the worktree, the recorder creates the directory and
+writes the record there all the same; it is simply not yet kept. Full histogram distributions, diagnostic traces, logs and profiles remain
 under `target/` with optional record references, not embedded in the summary.
 
 Schema version 3 is the persisted contract. Readers reject every other version;
@@ -1043,22 +1050,32 @@ An actual overrun still invalidates rather than truncating evidence silently.
 
 **Order/dependency.** After item 1; before item 4.
 
-### 3. Profiled runs never enter history
+### 3. History location, and profiled runs never enter it
 
 **Intent and evidence.** Profiled writes-parquet records
-`benchmarks/bifrost/writes-parquet/20261027T134553Z-f96c23fa2.json` and
-`benchmarks/bifrost/writes-parquet/20261027T140216Z-f96c23fa2.json`, and matching
-profiled hot and parquet records from those runs, entered history contrary to
-its complete, clean, unprofiled rule.
+`20261027T134553Z-f96c23fa2.json` and `20261027T140216Z-f96c23fa2.json`, and
+matching profiled hot and parquet records from those runs, entered history
+contrary to its complete, clean, unprofiled rule; they are already deleted.
+Records committed on the code branch also made code review carry about 264,000
+lines of run data, so history now lives on the `benchmark-records` branch. That
+branch already holds every earlier eligible record, and the code branch no
+longer tracks any.
 
-**Requirement.** Enforce REQ-013 for profiled runs: the recorder writes them
-only under `target/benchmarks/`, regardless of validity or completeness. Delete
-the misplaced profiled records, including the matching hot and parquet records.
-This is correction of ineligible history, not permission to delete slow results.
+**Requirement.** Enforce REQ-013. The recorder writes history only under
+`benchmarks/history/<engine>/<experiment>/`, and every reader of history uses
+that same directory: the `capacity results` page, the L2 calibration that reads
+the newest compatible `writes-parquet` record, and their tests. No reader
+falls back to the old `benchmarks/<engine>/<experiment>/` location. The
+recorder writes profiled runs only under `target/benchmarks/`, regardless of
+validity or completeness. `benchmarks/README.md` explains the
+`benchmark-records` worktree and how to keep a record. This is correction of
+ineligible history, not permission to delete slow results.
 
-**Acceptance.** A profiled full execution creates no history record. History
-contains none of the identified profiled records; ordinary eligible full runs
-still enter history regardless of target misses.
+**Acceptance.** An eligible full run writes its record under
+`benchmarks/history/`, and `capacity results` and L2 calibration read it from
+there. A profiled full execution creates no history record. Ordinary eligible
+full runs still enter history regardless of target misses. History on
+`benchmark-records` contains none of the identified profiled records.
 
 **Order/dependency.** After item 2.
 
@@ -1353,7 +1370,8 @@ not a reason to weaken coverage.
   separate convenience; references and regression criteria removed), and the
   twelve ordered supplement items, including memtable shredding (design shown
   to the maintainer before code); cross-query reuse remains parked unless
-  profiling justifies it.
+  profiling justifies it. Record history moves to the orphan
+  `benchmark-records` branch, mounted at `benchmarks/history/`.
 
 - Revision 1 — 2026-10-23: Initial draft from decided maintainer intent; current
   owners and historical provenance checked, with unresolved constants and

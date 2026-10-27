@@ -1312,13 +1312,30 @@ pub(crate) struct OracleTableProvider {
     /// own scope; the routes are set once, before the physical plan reads
     /// them in [`TableProvider::scan`].
     live: std::sync::OnceLock<super::live::LiveTableRoutes>,
-    /// The published files Iceberg last listed and the pushed filters it
-    /// listed them with.
+    /// The files last planned and the pushed filters they were planned with.
     ///
-    /// Sizing lists a scan's files before the physical plan does; the scan
-    /// with the same filters reuses that listing instead of reading the
-    /// manifests twice.
-    listed: std::sync::Mutex<Option<(Vec<Expr>, Vec<HotFileSource>)>>,
+    /// Sizing plans a scan's files before the physical plan does; the scan
+    /// with the same filters reuses them instead of listing the manifests,
+    /// rebuilding every file's statistics, and looking every footer up in
+    /// the node's footer cache again.
+    planned: std::sync::Mutex<Option<(Vec<Expr>, Arc<PlannedFiles>)>>,
+}
+
+/// One scan's files as planned for its pushed filters, shared by sizing and
+/// the physical scan.
+///
+/// Each kept file's statistics are built and its footer looked up once per
+/// query here rather than once per caller.
+#[derive(Debug)]
+struct PlannedFiles {
+    /// Every file the scan reads: the published files Iceberg keeps under the
+    /// pushed filters, then the hot files.
+    files: Vec<HotFileSource>,
+    /// The files whose declared bounds leave them possibly matching the
+    /// pushed filters; a footer is read only for these.
+    kept: Vec<HotFileSource>,
+    /// Each kept file's footer in `kept` order, `None` for one not read.
+    footers: Vec<Option<Arc<ParquetMetaData>>>,
 }
 
 impl fmt::Debug for OracleTableProvider {
@@ -1406,7 +1423,7 @@ impl OracleTableProvider {
             context,
             table: table_name,
             live: live.map(std::sync::OnceLock::from).unwrap_or_default(),
-            listed: std::sync::Mutex::new(None),
+            planned: std::sync::Mutex::new(None),
         })
     }
 }
@@ -1470,24 +1487,29 @@ impl OracleTableProvider {
             .await
     }
 
+    /// Plans the files one scan under the pushed `filters` reads, reusing
+    /// the previous plan when it was made with the same filters.
+    ///
     /// Lists the pinned snapshot's published files Iceberg keeps under
-    /// `filters`, reusing the previous listing when it was made with the same
-    /// filters.
+    /// `filters` and appends the hot files, keeps those [`Self::keep`] cannot
+    /// rule out under `filters`, and loads the kept files' footers through
+    /// [`Self::cache_footers`]. Sizing and the physical scan both call this,
+    /// so one query lists, prunes, and looks its footers up once.
     ///
     /// # Errors
     ///
     /// Returns a `DataFusion` error when Iceberg cannot list the snapshot's
     /// files or a listed file is refused (see [`published_files`]).
-    async fn listed_files(
+    async fn planned_files(
         &self,
         state: &dyn Session,
         filters: &[Expr],
-    ) -> DataFusionResult<Vec<HotFileSource>> {
-        if let Ok(listed) = self.listed.lock()
-            && let Some((listed_filters, files)) = listed.as_ref()
-            && listed_filters.as_slice() == filters
+    ) -> DataFusionResult<Arc<PlannedFiles>> {
+        if let Ok(planned) = self.planned.lock()
+            && let Some((planned_filters, files)) = planned.as_ref()
+            && planned_filters.as_slice() == filters
         {
-            return Ok(files.clone());
+            return Ok(Arc::clone(files));
         }
         let published = self.iceberg.scan(state, None, filters, None).await?;
         let published = published
@@ -1495,11 +1517,32 @@ impl OracleTableProvider {
             .ok_or_else(|| {
                 DataFusionError::Plan("Oracle requires the pinned IcebergTableScan".to_owned())
             })?;
-        let files = published_files(published).await?;
-        if let Ok(mut listed) = self.listed.lock() {
-            *listed = Some((filters.to_vec(), files.clone()));
+        let mut files = published_files(published).await?;
+        files.extend(self.hot_files.iter().cloned());
+        let pushed = crate::scan_sizing::ScanScope {
+            columns: Vec::new(),
+            filters: filters.to_vec(),
+        };
+        let keep = self.keep(
+            &files,
+            &crate::scan_sizing::ScanSizer::new(&pushed, &self.physical_schema),
+        );
+        let kept: Vec<HotFileSource> = files
+            .iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(file, _)| file.clone())
+            .collect();
+        let footers = self.cache_footers(&kept, state.config().options()).await;
+        let planned = Arc::new(PlannedFiles {
+            files,
+            kept,
+            footers,
+        });
+        if let Ok(mut memo) = self.planned.lock() {
+            *memo = Some((filters.to_vec(), Arc::clone(&planned)));
         }
-        Ok(files)
+        Ok(planned)
     }
 
     /// Returns the canonical name of the table this provider reads.
@@ -1516,11 +1559,12 @@ impl OracleTableProvider {
     /// Estimates what one scan of this table reads, before its physical plan
     /// exists: the bytes, and the row groups of its Parquet files.
     ///
-    /// The files are the published ones Iceberg keeps under `pushed` plus the
-    /// hot files, the same files [`Self::persisted_input`] scans, less those
-    /// [`Self::kept_files`] rules out by their declared bounds. Each kept
-    /// file is sized by [`crate::scan_sizing::ScanSizer::file_size`] from
-    /// its cached footer, and the live routes count the bytes Scribe reported
+    /// The files are those [`Self::planned_files`] keeps under `pushed`, the
+    /// same files [`Self::persisted_input`] scans, less those [`Self::keep`]
+    /// rules out under the scope's filters, which may add conjuncts evaluated
+    /// above the scan. Each remaining file is sized by
+    /// [`crate::scan_sizing::ScanSizer::file_size`] from the footer planning
+    /// already loaded, and the live routes count the bytes Scribe reported
     /// for the same scope; live data has no row groups.
     ///
     /// # Errors
@@ -1534,12 +1578,14 @@ impl OracleTableProvider {
         scope: &crate::scan_sizing::ScanScope,
     ) -> DataFusionResult<crate::scan_sizing::ScanSize> {
         let sizer = crate::scan_sizing::ScanSizer::new(scope, &self.physical_schema);
-        let files = self.kept_files(&self.scanned_files(state, pushed).await?, &sizer);
-        let footers = self.cache_footers(&files, state.config().options()).await;
-        let persisted = files
+        let planned = self.planned_files(state, pushed).await?;
+        let persisted = planned
+            .kept
             .iter()
-            .zip(&footers)
-            .map(|(file, footer)| {
+            .zip(&planned.footers)
+            .zip(self.keep(&planned.kept, &sizer))
+            .filter(|(_, keep)| *keep)
+            .map(|((file, footer), _)| {
                 sizer.file_size(
                     footer.as_deref(),
                     u64::try_from(file.size_bytes).unwrap_or(u64::MAX),
@@ -1560,17 +1606,18 @@ impl OracleTableProvider {
         }))
     }
 
-    /// Returns the `files` whose declared bounds leave them possibly matching
-    /// `sizer`'s filters, by [`crate::scan_sizing::ScanSizer::keep`].
+    /// Returns, in `files` order, whether each file's declared bounds leave
+    /// it possibly matching `sizer`'s filters, by
+    /// [`crate::scan_sizing::ScanSizer::keep`].
     ///
     /// These are the bounds the scan's file pruner excludes a file by before
     /// its footer is opened, so a footer is fetched only for a file the scan
     /// may read.
-    fn kept_files(
+    fn keep(
         &self,
         files: &[HotFileSource],
         sizer: &crate::scan_sizing::ScanSizer<'_>,
-    ) -> Vec<HotFileSource> {
+    ) -> Vec<bool> {
         let statistics: Vec<_> = files
             .iter()
             .map(|file| {
@@ -1580,30 +1627,7 @@ impl OracleTableProvider {
                 )
             })
             .collect();
-        let keep = sizer.keep(&statistics, files.len());
-        files
-            .iter()
-            .zip(keep)
-            .filter(|(_, keep)| *keep)
-            .map(|(file, _)| file.clone())
-            .collect()
-    }
-
-    /// Returns the files one persisted scan reads: the published files
-    /// Iceberg keeps under `filters`, then the hot files.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` error when Iceberg cannot list the snapshot's
-    /// files or a listed file is refused (see [`published_files`]).
-    async fn scanned_files(
-        &self,
-        state: &dyn Session,
-        filters: &[Expr],
-    ) -> DataFusionResult<Vec<HotFileSource>> {
-        let mut files = self.listed_files(state, filters).await?;
-        files.extend(self.hot_files.iter().cloned());
-        Ok(files)
+        sizer.keep(&statistics, files.len())
     }
 
     /// Builds this cut's persisted leaf: one `DataFusion` Parquet scan over
@@ -1625,26 +1649,17 @@ impl OracleTableProvider {
         filters: &[Expr],
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let options = state.config().options();
-        let files = self.scanned_files(state, filters).await?;
+        let planned = self.planned_files(state, filters).await?;
         // The row groups of the files the pushed filters keep, whose footers
-        // were cached when the scan was sized; one not read leaves the row
+        // were loaded when the scan was sized; one not read leaves the row
         // groups unknown and the scan every partition.
-        let pushed = crate::scan_sizing::ScanScope {
-            columns: Vec::new(),
-            filters: filters.to_vec(),
-        };
-        let kept = self.kept_files(
-            &files,
-            &crate::scan_sizing::ScanSizer::new(&pushed, &self.physical_schema),
-        );
-        let max_partitions = self
-            .cache_footers(&kept, options)
-            .await
+        let max_partitions = planned
+            .footers
             .iter()
             .map(|footer| footer.as_ref().map(|footer| footer.num_row_groups()))
             .sum();
         hot_parquet_scan(
-            files,
+            planned.files.clone(),
             HotObjects::Warehouse(Arc::clone(&self.objects)),
             self.context.data_tenant_id,
             required_schema,
@@ -3736,6 +3751,44 @@ pub(super) mod tests {
     /// # Panics
     /// Panics if provider construction, scan planning, or execution violates
     /// the closure contract this owner pins.
+    /// Sizing and the physical scan share one file plan per pushed filters.
+    ///
+    /// A second plan under the same filters returns the memoized plan rather
+    /// than listing, pruning, and looking footers up again; different filters
+    /// plan afresh and replace it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixture provider cannot plan its files or the memo is
+    /// not reused exactly when the filters match.
+    #[tokio::test]
+    async fn planned_files_are_reused_for_the_same_pushed_filters() {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::logical_expr::{col, lit};
+
+        let (provider, _) = projection_closure_provider(DataTenantId::new_v7(), None).await;
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
+        let error = [col("status_code").eq(lit("STATUS_CODE_ERROR"))];
+        let first = provider
+            .planned_files(&session, &error)
+            .await
+            .expect("first plan");
+        let again = provider
+            .planned_files(&session, &error)
+            .await
+            .expect("same filters plan");
+        assert!(Arc::ptr_eq(&first, &again));
+        let ok = [col("status_code").eq(lit("STATUS_CODE_OK"))];
+        let other = provider
+            .planned_files(&session, &ok)
+            .await
+            .expect("other filters plan");
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
+
     #[tokio::test]
     async fn projected_leaf_union_outputs_the_requested_closure() {
         use datafusion::execution::context::SessionContext;

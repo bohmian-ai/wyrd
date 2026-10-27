@@ -319,3 +319,21 @@ cache landed in f96c23fa2, path-only Variant validation in 432d186bb, and
 Kafka-style Scribe lane linger with a byte-bounded outbox in edc1f2eac. Preserve
 these changes and measure subsequent work separately.
 
+
+## Implementation evidence
+
+### Diagnosis: item 4 smoke, unclassified 1 KiB spans
+
+- **Symptom:** the `bench:l1:bifrost:writes -- --smoke` run on 80167c4ed
+  (`target/benchmarks/smoke/bifrost/writes-parquet/20261027T164637Z-80167c4ed.json`)
+  was INVALID: `otlp-spans-1k-c1` and `-c64` had no `bifrost.otlp.traces`
+  population.
+- **Evidence:** the reasons read "143 requests declared an unknown benchmark
+  case or phase" and "0 `bifrost.otlp.traces` timing observations of case
+  otlp-spans-1k". Every other step was classified.
+- **Cause:** the server classifies only cases in the closed set
+  `wyrd_telemetry::timing::CASES` (`crates/shared/wyrd-telemetry/src/timing.rs`),
+  which did not contain `otlp-spans-1k`.
+- **Fix site:** that closed set, the one owner every engine's labels pass
+  through. The new `query::tests::every_benchmark_case_is_declared_to_the_server`
+  checks every write and read case the capacity driver declares (4bab4d7ff).

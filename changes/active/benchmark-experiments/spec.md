@@ -1,10 +1,18 @@
 ---
 id: SPEC-benchmark-experiments
-revision: 16
+revision: 17
 status: approved
 ---
 
 # Benchmarks as experiments
+
+Revision 17 makes the benchmark simple enough to read without this document.
+It is defined by the nine lines below. A requirement that says more says how,
+never something different. The verdict is PASS or FAIL: a FAIL either missed
+a limit or could not be trusted. Driver CPU is reported, never judged. Each
+measurement is stored once and every answer is derived from it. Only complete,
+clean, unprofiled runs enter history. The maintainer approved this on
+2026-10-26.
 
 Revision 16 puts the slow tail of Verification in the record. Each
 `direct-verify` repetition records its maximum overhead, how many executions
@@ -57,6 +65,28 @@ CPU baseline. After: bounded server-side high-resolution histograms measure all
 operations, while sampled operator traces and tenant-visible traces retain their
 separate production purposes.
 
+## The benchmark in nine lines
+
+1. Each benchmark asks one question. It also checks that every answer was
+   correct and nothing errored.
+2. Each step warms up and is then measured three times, back to back.
+3. The record stores each measurement once. The answer is worked out from it
+   when the record is read.
+4. The report shows the observed number beside the limit, then PASS or FAIL
+   and why.
+5. A FAIL either missed the limit, or couldn't be trusted: the host was busy,
+   there were too few samples for a p99, or the measurement broke.
+6. Driver CPU is shown, never judged.
+7. `benchmarks/` keeps only complete runs from a clean tree with no profiler,
+   failures included. Everything else goes to `target/`.
+8. One HTML page shows each benchmark's answers over time, with each run's
+   report.
+9. Old records are deleted.
+
+The three repetitions are back-to-back windows on one server process. Their
+spread shows stability within a run, not between server starts, builds or
+days; only the history across runs shows that.
+
 ## Problem, proposed change, and value
 
 Wyrd's Bifrost, Verification, and Gateway benchmarks ask related capacity and
@@ -73,8 +103,8 @@ engines. Engine workloads retain their production workflows and fixtures.
 
 For example, today a client-queue stress step can print a problem without
 failing the command. After this change every step has declared criteria and a
-verdict. A valid criterion miss exits 1; a saturated load driver discards the
-measurement as INVALID and exits 2. Both leave a compact historical record.
+verdict. A missed limit is FAIL and exits 1; evidence that cannot be trusted, such as
+a busy host, is FAIL and exits 2. Both leave a compact historical record.
 
 Level 1 gives opt-in feedback within 5 minutes per experiment command.
 Bifrost has separately runnable hot reads, Parquet reads and
@@ -139,41 +169,43 @@ part of no gate or verification lane.
   applicability. Controls include source commit and dirty flag, profile and
   build flags, host fingerprint, fixture identity/size/seed, server limits,
   workload mix, warmup/repetition durations, validity thresholds, and budget.
-  Missing declarations refuse measurement as INVALID; observed performance
+  Missing declarations refuse measurement as untrusted; observed performance
   cannot choose or weaken the criteria afterward.
 - **REQ-002 — Validity.** The shared runner checks quiet-host eligibility before
   workload execution, generalizing Forge's free-CPU discard to all engines.
-  It also records driver CPU/scheduling health, scheduled/sent/completed/missed
+  It also records driver CPU as context, scheduled/sent/completed/missed
   arrivals, sample sufficiency, source cleanliness, measurement availability,
-  and elapsed budget. Busy host, CPU-bound driver, missed open-loop arrivals,
+  and elapsed budget. Busy host, missed open-loop arrivals,
   too few samples, dirty tree without explicit override, missing required
-  resource readings, or over-budget execution is INVALID. A dirty override is
+  resource readings, or over-budget execution is untrusted. A dirty override is
   declared before execution and stored. REQ-008 defines smoke's sole sample-floor
   applicability exception; other validity checks are not bypassed.
   Sample host CPU for 10 seconds before the run and again after it. Either
   sample showing non-benchmark processes using more than 10% of logical CPUs
-  invalidates the run. Driver use above 80% of its declared CPU budget is
-  INVALID. Open-loop traffic is INVALID on any missed arrival or send-lateness
+  invalidates the run. Driver CPU is never judged. Open-loop traffic is untrusted on any missed arrival or send-lateness
   p99 above 5 ms (Gateway's existing `LATENESS_LIMIT_US`). Each repetition needs
   ≥1,000 samples for each p99 criterion and ≥200 for each p95 criterion;
-  fewer is INVALID. A judged slow-step percentile, including L2 heavy scans,
+  fewer is untrusted. A judged slow-step percentile, including L2 heavy scans,
   uses p95 with ≥200 samples per repetition; there is no heavy-scan p99 exception.
   Send lateness is solely a driver-validity check, never a server latency SLO.
 - **REQ-003 — Repetitions.** Every full-run step has a discarded warmup followed by three
   measured repetitions with the same controls. L1 discards 5 seconds of warmup
   then measures 3 × 5 seconds, or 3 × 10 seconds for a case whose 5-second
   window cannot meet its sample floor (REQ-008); L2 discards 2 minutes of warmup then measures
-  3 × 6 minutes. Preserve each repetition's
-  metrics, median, minimum, maximum, and sample counts; never merge the samples
-  into a percentile and call it the median repetition. Warmup contributes no
+  3 × 6 minutes. Store each repetition's
+  metrics and sample counts once; the record reader derives the median, minimum
+  and maximum. Never merge the samples into a percentile and call it the median
+  repetition. Warmup contributes no
   measured work, CPU, latency, or sample count. A missing/invalid repetition
   invalidates the step; do not silently select the fastest repetition.
-- **REQ-004 — Judgment.** In full mode, every measured step and every applicable criterion
-  yields PASS, FAIL, or INVALID. PASS means valid evidence meets its criteria;
-  FAIL means valid evidence misses at least one criterion; INVALID means the
-  experiment did not measure what it claims. An invalid step invalidates the
-  run, even if another valid step fails; otherwise any failed step fails the
-  run. Exit codes are PASS=0, FAIL=1, INVALID/discarded=2. An aggregate L1
+- **REQ-004 — Judgment.** The record reader judges every measured step and every
+  applicable criterion PASS or FAIL. PASS means trusted evidence meets its
+  criteria. FAIL says why: the evidence missed a limit, or it could not be
+  trusted (untrusted) because the experiment did not measure what it claims. A
+  step that did not run is `not run` with its reason and has no verdict. Any
+  untrusted step makes the run an untrusted FAIL, even if another step missed a
+  limit; otherwise any failed step fails the run. Exit codes are PASS=0, FAIL
+  on a missed limit=1, untrusted FAIL=2. An aggregate L1
   invocation uses the same precedence across engines and preserves their
   individual records. Invalidity reasons and any valid failures remain visible.
   REQ-008 defines smoke's plumbing-only verdict and inapplicable production
@@ -181,7 +213,7 @@ part of no gate or verification lane.
 - **REQ-005 — Complete steps.** No sustained-only gate or report-only stress
   step remains. Overload steps declare expected rejections, queue/capture loss
   accounting, recovery, and bounds in advance; a successfully measured overload
-  is not inherently INVALID or FAIL. Accidental request errors, wrong results,
+  is not inherently a FAIL. Accidental request errors, wrong results,
   or undeclared loss in a valid full run fail correctness criteria. Expected server
   admission rejection differs from a driver that failed to issue arrivals.
 
@@ -191,7 +223,7 @@ full-run repetition. Smoke enforces measurement/evidence validity under REQ-008,
 without judging the measured production outcomes against these criteria.
 Repetition spread never excuses an absolute SLO miss. Conditions
 such as capture saturation are recorded observations, not additional verdicts.
-A runner failure after declaration retains partial evidence as INVALID and
+A runner failure after declaration retains partial evidence as untrusted and
 marks unmeasured declared steps explicitly; it never fabricates zero metrics.
 
 ### Metrics and their meanings
@@ -207,10 +239,10 @@ collector is a declared helper, separate from server and driver CPU accounting;
 quiet-host checks exclude its known PID. Diagnostic export loss is reported but
 cannot invalidate independent, complete histogram measurements. Counter reset, process
 loss, unavailable accounting, or a zero denominator makes derived efficiency
-unavailable and the required measurement INVALID.
+unavailable and the required measurement untrusted.
 
 Use `sysinfo`, already a workspace dependency, for process CPU time and sampled
-peak resident memory. Quiet-host and driver-saturation checks use the same
+peak resident memory. The quiet-host check and driver CPU context use the same
 portable readings. Reuse the process readings in `release_server/os.rs` and
 host sampling in Forge's `host.rs`; missing readings must not count as zero use.
 Use one portable implementation on macOS arm64 and Linux x86_64/arm64. No
@@ -258,7 +290,7 @@ resolution, population, outcome, histogram parameters and collection method.
 Keep the full interval distribution under target/ for percentile regeneration.
 Nanosecond representation is not a claim of nanosecond clock accuracy. A value
 outside the configured range, a failed recording, overflow, counter reset or an
-unreconciled population makes the affected measurement INVALID; never clamp.
+unreconciled population makes the affected measurement untrusted; never clamp.
 Zero-duration observations must remain represented and counted explicitly.
 
 Verification `direct-verify` also records, per repetition and from the same
@@ -306,14 +338,14 @@ checked. Drain warmup before the starting snapshot. Retain completions during
 measurement separately from completions after admission stops: same-window
 throughput/CPU excludes drain completions, while the measured request cohort's
 latency distribution includes their final outcomes. Record both populations,
-CPU windows, drain work and drain duration; incomplete cohorts are INVALID.
+CPU windows, drain work and drain duration; incomplete cohorts are untrusted.
 The snapshot mechanism must prove concurrent recording does not lose or count
 an observation twice. Stage timings explain latency; they are not summed when
 overlapping. An unavailable optional phase is labelled, never fabricated.
 
 Strict absolute limits use histogram quantization bounds: PASS only when the
 entire percentile value interval satisfies the comparison, FAIL when it wholly
-violates it, and INVALID with a precision reason when it straddles the limit.
+violates it, and untrusted with a precision reason when it straddles the limit.
 Percentile rank and value bounds are recorded. Do not silently round a value
 onto the passing side. The bounds apply to approximation error, not statistical
 confidence. Each outcome is counted; failures and timeouts retain their duration
@@ -362,7 +394,7 @@ server overhead, not CPU time.
 
 Compute each residual before recording it: never subtract aggregated percentiles
 or cross-process clocks. Negative/inconsistent residuals or missing required
-components are INVALID, not zero. Existing timer calculations stay with their
+components are untrusted, not zero. Existing timer calculations stay with their
 engine owners. Async span busy time and ordinary span timestamps are not a
 substitute. Preserve counters for expected timing components and outcomes so
 histogram counts can be reconciled without retaining per-request records.
@@ -385,7 +417,7 @@ windows in total, split across their three commands. Individual cases
 and experiments remain available for fast optimization feedback. Build binaries and prepare external prerequisites before
 starting the experiment clock; the clock includes quiet-host checking, server
 startup, fixture loading, warmups, repetitions, and drain. An overrun is stopped
-and recorded INVALID. Artifact finalization after stopping must still retain
+and recorded untrusted. Artifact finalization after stopping must still retain
 the overrun and actual finish time. No compilation during execution.
 
 Use closed-loop clients (a client sends its next operation after completion),
@@ -394,7 +426,7 @@ one fixed fixture configuration per experiment, and isolated operations:
 | Engine | Required L1 coverage |
 |---|---|
 | Bifrost `writes-parquet` | Native Arrow, OTLP spans and OTLP logs at 1 and 64 clients: 6 measured cases. Reuse the 2M-row generators and fresh identities. The server uses production default rotation sizes and a 30 s retention; no write experiment overrides rotation. Measure durable acknowledgement, not publication. Include actual staging/publication CPU in Parquet-configured windows, record its activity and backlog, and do not claim storage-maintenance cost if none occurred. |
-| Bifrost `hot` | Reads while every row stays in the memtable: the server runs with memtable and on-disk rotation sizes of 16,384 MB and a 24-hour retention, the earlier hot tier's declared settings, so nothing stages or publishes; a staged or published row makes the experiment INVALID. Fixtures: the standard 10M-row events fixture and 1M telemetry spans. Events point lookup at 1 and 64 clients; events small aggregate at 1; span filter on a shredded attribute key at 1. |
+| Bifrost `hot` | Reads while every row stays in the memtable: the server runs with memtable and on-disk rotation sizes of 16,384 MB and a 24-hour retention, the earlier hot tier's declared settings, so nothing stages or publishes; a staged or published row makes the experiment untrusted. Fixtures: the standard 10M-row events fixture and 1M telemetry spans. Events point lookup at 1 and 64 clients; events small aggregate at 1; span filter on a shredded attribute key at 1. |
 | Bifrost `parquet` | Reads after every row is published as Parquet: default rotation sizes and a declared 30 s retention, then one settlement until nothing remains in a memtable, staging or claim. Fixtures: the standard 10M-row events fixture, 1M telemetry spans, and one 200,000-row sample per write path, all settled together. This record holds each write path's storage ratio; both write records report it as inapplicable with that reason. Events point lookup at 1 and 64 clients; events small aggregate and full scan at 1; span lookup by `trace_id`, a declared Bloom column, at 1 and 64; span filters on a shredded attribute key and on a long-tail key below the shredding threshold at 1. Two correctness checks run once after settlement, outside every measured window: the published span files shred exactly the expected attribute keys and none below the threshold, and a span-time window scans fewer files than the whole table. |
 | Verification `direct-verify` | Two direct-verify cases at 1 and 64 clients: existing four assertion checks over 2 KiB JSON, alternating expected pass/fail judgments. Expected failing judgments are correct completed verifications, not transport errors. Record elapsed, Verifier wait and server overhead, CPU/verification and scaling. |
 | Gateway `overhead` | Six cases: buffered chat with metadata capture, streamed chat with metadata capture, and buffered chat with payload capture, each at 1 and 64 clients. Reuse the local controlled provider, 1 KiB metadata shapes/32 stream events and 64 KiB request/response payload-capture shape. Record header/final overhead where applicable, calls/s, CPU/call, capture bytes and memory. |
@@ -416,7 +448,7 @@ experiment, whose bounded fixture is loaded once and never grows; an override
 that lets an unbounded write workload accumulate in memory is not allowed. The telemetry span fixture is deterministic, with attribute keys
 straddling the 10% shredding threshold. The former request-only release preflight
 is replaced by the following real-path smoke contract.
-A settled Parquet read without required scan facts remains INVALID.
+A settled Parquet read without required scan facts remains untrusted.
 
 **Smoke mode.** `--smoke` on the normal L1/L2 commands runs the same shared
 experiment workflow, engine plans and selected steps as a full run. Without
@@ -446,11 +478,10 @@ boundary and missing or inconsistent evidence.
 Smoke uses the shared runner, judgment entry and report machinery with production
 criteria explicitly inapplicable. Record all observed values and reasons,
 including dropped/refused calls, server errors, incorrect returned results,
-capture shedding and missed performance targets. Those observations, and a
-saturated driver, do not fail smoke. For example, accurately accounting for
+capture shedding and missed performance targets. Those observations do not fail smoke. For example, accurately accounting for
 10 dropped calls is successful plumbing; losing those 10 calls from the outcome
 totals is a reconciliation failure. Smoke is PASS/exit 0 when its plumbing works
-and INVALID/exit 2 when it does not; PASS never claims production criteria passed.
+and FAIL/exit 2 when it does not; PASS never claims production criteria passed.
 Every required measured population remains nonempty. Full runs retain all normal
 criteria, sample floors, durations, repetitions, references and FAIL/exit 1 rules.
 
@@ -497,7 +528,7 @@ subset records its selection and cannot claim the omitted coverage passed.
 
 **REQ-009 — Level 2, workload.** Each engine's complete workload targets 20–30
 minutes with a hard 30-minute budget under the same clock rules; exceeding it
-is INVALID. A successful complete workload includes at least 20 minutes of
+is untrusted. A successful complete workload includes at least 20 minutes of
 experiment execution. Use open-loop traffic (arrivals follow the declared rate,
 independent of response completion), a declared target rate, background work,
 and concurrent observation of all applicable SLOs in each of three repetitions.
@@ -530,7 +561,7 @@ most one second of offered work over a declared calibration window. Measured
 repetitions then run at 70% of that rate. The record keeps each calibration
 step's offered and achieved rate and backlog, the selected sustainable rate
 and the resulting load. A calibration that cannot find a sustainable rate, or
-whose search exceeds its declared share of the budget, is INVALID; no
+whose search exceeds its declared share of the budget, is untrusted; no
 historical or isolated L1 rate substitutes for it. The search bounds, window
 length and step size, and the small/1m split within the 25% dashboard share,
 are run controls fixed before execution. Isolated L1 write capacity overstates
@@ -543,7 +574,7 @@ Concurrent Bifrost L2 criteria: point lookup p99 <5 ms; small aggregate
 p95 <100 ms; 1m aggregate p95 <300 ms; heavy scan p95 <2 s (≥200 samples per repetition); server write
 acknowledgement p99 ≤100 ms. The 5% heavy-scan population needs at least 200
 completed samples in each six-minute repetition, rather than the infeasible
-1,000-sample p99 requirement; insufficient evidence remains INVALID. Declare
+1,000-sample p99 requirement; insufficient evidence remains untrusted. Declare
 an offered query rate capable of at least 200 scans per repetition (at least
 4,000 total queries at the unchanged mix), and check actual completions.
 Write-to-query visibility, including the historical p99 ≤5 s target, is
@@ -609,7 +640,7 @@ spread. Use the median of the six repetition values (mean of the two central
 values when sorted) as the reference; latency references retain value bounds. Require
 both suites to meet absolute/correctness/validity criteria. Reference promotion
 is an explicit reviewed TOML change; it never happens automatically during a
-benchmark. No reference is created from FAIL, INVALID, partial, dirty, profiled
+benchmark. No reference is created from a FAIL, partial, dirty, profiled
 or diagnostic-capture runs. Source records and exact method identifiers remain
 linked. `--qualify-baseline` is an explicit L1-only invocation mode declared
 before measurement. It requires full coverage, clean non-profiled source and
@@ -617,8 +648,9 @@ ordinary telemetry configuration. It omits relative criteria, records
 baseline-unavailable and regression-coverage=false, and may PASS only the
 absolute/correctness/validity criteria. Such a PASS is eligible qualification
 evidence, not proof against regression. Two such suites establish initial
-references. Normal L1 requires compatible references for every applicable
-metric/case; absence is INVALID, not an implicit qualification run. L1 full-scan
+references. A missing compatible reference leaves that regression comparison
+unchecked: the report says so in one line and the verdict is unaffected. It is
+not an implicit qualification run. L1 full-scan
 latency remains descriptive as above; its CPU/throughput references are required.
 
 Match engine/case, concurrency, fixture size/seed/schema/payload, storage state,
@@ -627,7 +659,7 @@ measurement method/range/precision/boundary and telemetry policy. A deliberately
 incompatible comparison is advisory only. Never relabel historical work/CPU-s
 as throughput per available core. Preserve decimal MB to MiB conversion where
 historical values are displayed. Store baseline identity/operands before work;
-a declared comparison with missing or incompatible operands is INVALID.
+a comparison with missing or incompatible operands is unchecked, as above.
 
 **REQ-012 — Noise-aware regression.** A baseline criterion fails only when
 W/C efficiency or throughput per provisioned core is more than 10% below
@@ -642,7 +674,7 @@ rule requires all three repetitions beyond the percentage limit and a shift
 larger than their spread. It does not establish statistical confidence or hide
 an absolute SLO/correctness failure. Record the operands and both comparisons. Apply latency comparison
 conservatively using quantization intervals; an approximation-boundary ambiguity
-is INVALID, not a favorable rounding. Preserve absolute objectives separately.
+is untrusted, not a favorable rounding. Preserve absolute objectives separately.
 
 Example, baseline 100 work/CPU-second: `[75,80,85]` fails (20% median drop,
 spread 10, even the best repetition below 90); `[70,85,100]` passes the
@@ -655,9 +687,11 @@ a single throughput number. This resolves D-4's comparison decision.
 
 ### Record and report contract
 
-**REQ-013 — One persisted record.** The shared recorder writes each completed,
-failed, or discarded full experiment to the following history; smoke uses the
-separate local destination in REQ-008 through the same recorder:
+**REQ-013 — One persisted record.** The shared recorder writes each complete,
+clean, unprofiled full run of the whole plan, passed or failed, to the
+following history. A run with `--steps`, `--profile`, `--allow-dirty` or
+`--smoke` writes the same record under `target/benchmarks/` and never enters
+history:
 
 ```text
 benchmarks/<engine>/<experiment>/<UTC timestamp>-<short sha>.json
@@ -673,55 +707,54 @@ for historical audit through normal contributor review; running a benchmark
 never stages or commits automatically. Full histogram distributions, diagnostic traces, logs and profiles remain
 under `target/` with optional record references, not embedded in the summary.
 
-Schema version 2 is the revised persisted contract. Retain read/report support
-for existing version-1 records with their original raw-sample meaning; do not
-rewrite them or compare their method silently against version 2. Unknown
-versions are rejected. The following field names
+Schema version 3 is the persisted contract. Readers reject every other version;
+earlier records are deleted, not read. The following field names
 and meanings are proposed; nested metric/criterion entries carry
 stable identifiers and explicit units rather than formatted table strings.
 
 | Required JSON field | Meaning |
 |---|---|
-| `schema_version` | Integer 2 for new records; legacy 1 remains readable. Breaking semantic/shape changes require a new version; readers reject unsupported versions explicitly. |
+| `schema_version` | Integer 3. Breaking semantic/shape changes require a new version; readers reject unsupported versions explicitly. |
 | `engine`, `experiment`, `level`, `question` | Declared identity, level integer 1/2, and question. |
 | `mode` | `full` or `smoke` for new records; absent on older records retains their original full-run meaning. Smoke is never an eligible baseline, independently of filename/location. |
-| `started_at`, `finished_at` | UTC RFC 3339 instants, including partial/INVALID runs. Elapsed budgeting uses monotonic time, also stored. |
+| `started_at`, `finished_at` | UTC RFC 3339 instants, including partial/untrusted runs. Elapsed budgeting uses monotonic time, also stored. |
 | `commit`, `dirty`, `dirty_override` | Full measured-source SHA, source dirtiness at declaration, explicit override state. Dirty runs store `dirty: true` and `diff_sha256`, SHA-256 of the bytes from `git diff HEAD`. Output created by this run does not retroactively dirty its source. |
 | `host` | OS/version, architecture, CPU model/logical count, physical memory, and declared storage context; record available provisioned vCPUs P per server host and combined scope separately from mean used cores C/T. P supplies throughput per provisioned vCPU; C supplies work/CPU-s. |
 | `build` | Profile, feature/compiler flags, compiler and binary identities; detect a stale binary rather than attribute it to the current tree. Existing build stale-binary detection applies; no additional source-to-binary correspondence validity rule is required. The diff digest does not make a dirty run baseline-eligible. |
 | `command` | Exact invocation as argument values plus the non-secret configuration needed to reproduce it. |
 | `variables`, `controls`, `criteria` | Sweep and fixed controls, validity/budget declarations, metric definitions (including latency clock/resolution, histogram method/range/precision, quantization interval, population and expected/recorded counts) and criterion IDs/operators/limits/units/applicability, chosen baseline snapshots. |
-| `steps` | Ordered declared steps: IDs/params, timings, metrics with units, three repetition summaries in full mode or one in smoke mode, median/min/max spread, per-criterion observed values/verdicts/reasons and explicit applicability, step verdict. Missing observations are null with reasons, never NaN or infinity. |
-| `validity`, `verdict`, `reasons` | Check observations, overall PASS/FAIL/INVALID, structured reasons for a literal agent reader. |
+| `steps` | Ordered declared steps: IDs/params, timings, status (`measured`, or `not run` with its reason), and each repetition's measurements, sample counts and measurement problems (three in full mode, one in smoke mode). Each value is stored once; no summary, observed value, verdict or reason is stored. Missing observations are null with reasons, never NaN or infinity. |
+| `validity` | Host samples and other check observations, stored once. The record reader derives every verdict and reason for both human and agent readers. |
 | `artifacts` | Optional local `target/` references and capture completeness; historical summaries remain readable without them. |
 
 Recording failure cannot produce a successful result: exit 2 with an explicit
 persistence error and any salvageable local evidence. Complete records are
-published by writing a temporary file then renaming to the collision-safe destination. A caught interruption retains partial INVALID evidence;
+published by writing a temporary file then renaming to the collision-safe destination. A caught interruption retains partial untrusted evidence;
 an abrupt kill/power loss cannot guarantee a final record and must not leave
 a partial JSON document masquerading as complete evidence.
 
-**REQ-014 — One report.** Render every human report from the persisted record,
-including invalidity reasons, spread, and overall verdict. The common columns
-are exactly:
+**REQ-014 — One report.** One record reader renders every report from the
+persisted record; the console, the regenerated report and the HTML page show
+the same thing. A report fits on one screen, in this order:
 
-```text
-| step | params | rate | p50/p95/p99 ms | errors | server CPU | peak mem | driver CPU | criterion | observed | verdict |
-```
+1. The experiment, PASS or FAIL, and why.
+2. The question, the observed value beside its limit, correctness (errors and
+   wrong answers), and one line when a regression comparison is unchecked.
+3. Source commit, build, host, fixture and method, with a plain definition of
+   each judged metric and of a client.
+4. One row per step: the judged metric, throughput and server CPU per
+   operation, each the median of the repetitions with [min–max], 3 significant
+   digits and units. Driver CPU is one line of context. A step that did not run
+   says `not run` and why.
 
-Use one row per step/criterion when needed. Units accompany values; server CPU
-shows consumed seconds, mean used cores and provisioned vCPUs, and driver CPU is separate. Rate cells/supporting detail label both work/s/vCPU and work/CPU-s; queries also show scanned rows/bytes per query alongside server time. Client timing diagnostics cannot populate judged latency columns. A
-non-applicable value is `—` with a reason. Additional engine metrics and spread
-are rendered from the same record as supporting detail. Reports can be
-regenerated without rerunning the experiment or loading full distributions. Console
-and regenerated summaries must agree with JSON, including FAIL and INVALID.
+Repetitions, CPU normalizations, histogram bounds, per-phase timings and tail
+counts sit under details. Display rounding never changes stored values or
+judgment. Client timing diagnostics never stand in for judged latency.
 
 `capacity results` renders every record under `benchmarks/` into one
-self-contained HTML page under `target/`, read from the records alone. It
-states each experiment's question, method, per-step results with every
-repetition, criteria and verdict; charts any metric of any step across runs in
-chronological order against its limit; and compares selected runs side by side.
-A file that does not read as a current record is shown as stored and marked.
+self-contained HTML page under `target/`, read from the records alone. For
+each experiment it charts the judged metric of each step across runs in
+chronological order against its limit, and opens each run's report.
 
 ### Shared owner and retirement
 
@@ -738,7 +771,7 @@ optional diagnostic evidence requested with `--profile`, captured by external
 perf events on Linux and natively on macOS; the harness has no direct `perf`
 dependency. Profiles never participate in criteria or verdicts and never supply
 the CPU denominator. A missing profiler or unusable capture only disables
-profiling with a recorded summary/report note; it never makes a run INVALID or
+profiling with a recorded summary/report note; it never makes a run
 FAIL and cannot waive required measurements. The runner never changes OS
 permissions or limits to obtain a profile. See portability research
 for current-source evidence and diagnostic limitations.
@@ -930,8 +963,8 @@ constraints; private implementation choices remain open.
    platforms; plain-child servers, sysinfo readings and optional samply
    diagnostics, without OS resource envelopes. Required real evidence is Linux
    x86_64 only; the other two platforms require unchanged runnable behavior.
-7. **Validity versus failure:** in full mode, INVALID has precedence and exit 2;
-   valid criterion misses exit 1; every step is judged, including overload/recovery.
+7. **Validity versus failure:** in full mode, an untrusted FAIL has precedence
+   and exit 2; a missed limit exits 1; every step is judged, including overload/recovery.
    Smoke checks plumbing with production criteria explicitly inapplicable.
 
 8. **Smoke:** the actual experiment workflow with reduced declared controls,
@@ -958,15 +991,15 @@ MCP API that would require a new product-surface projection.
 | AC-001 — Engineer runs one engine's L1 | Each engine command is exercised separately, and each Bifrost experiment (`writes-parquet`, `hot`, `parquet`) within its 5-minute budget, without running a smoke first; `hot` reads show no staged or published rows and `parquet` reads show nothing left in a memtable, staging or claim. Within its budget the full matrix runs with discarded warmup and three repetitions. Engineer reads question, controls, units, per-step criteria and verdict; opens the printed JSON path and regenerates an identical report. Real Linux x86_64 release-process journey, record and report comparison. Recompute server latency bounds from retained interval histograms; changing client network delay, polling cadence or scheduled-time latency cannot change server latency judgment (driver send lateness still checks validity); verify exact values just below, equal to and above strict SLO limits, and reject missing/overflowed timing evidence and ambiguous threshold bounds; coarse monitoring buckets cannot judge latency. Operator export disabled or lossy cannot erase complete benchmark timing. | REQ-001, REQ-003, REQ-007, REQ-008, REQ-010, REQ-013, REQ-014 |
 | AC-002 — Engineer compares a valid regression with its baseline | W/C baseline 100, repetitions 75/80/85: criterion FAIL and exit 1; a CPU/operation case beyond +15% and spread also fails. Exact percentage boundaries pass. Deterministic judgment cases plus an eligible compatible replacement-baseline-to-run integration journey preserve operands and provenance. | REQ-011, REQ-012 |
 | AC-003 — Engineer encounters noisy results | Baseline 100, repetitions 70/85/100: regression criterion PASS with spread visible; another absolute SLO miss still makes the run FAIL. Shared-judgment cases prove noise cannot excuse latency/correctness. | REQ-004, REQ-012 |
-| AC-004 — Engineer cannot obtain valid evidence | Independently exercise busy preflight/post-run host (10-second samples, >10% non-benchmark CPU), driver above 80% budget, any missed arrival or p99 send lateness >5 ms, insufficient samples (<1,000 p99 / <200 p95), dirty source without override, missing/reset CPU and budget overrun: INVALID, exit 2, reasons and partial record, no fabricated successful step. Declared dirty override is visible. Combine an invalid step and valid failure: overall INVALID retains both. Injected resource/clock observations and runner integration; no synthetic host load. | REQ-002, REQ-004, REQ-006, INV-005, INV-007 |
+| AC-004 — Engineer cannot obtain valid evidence | Independently exercise busy preflight/post-run host (10-second samples, >10% non-benchmark CPU), any missed arrival or p99 send lateness >5 ms, insufficient samples (<1,000 p99 / <200 p95), dirty source without override, missing/reset CPU and budget overrun: untrusted, exit 2, reasons and partial record, no fabricated successful step. Declared dirty override is visible. Combine an invalid step and valid failure: overall untrusted retains both. Injected resource/clock observations and runner integration; no synthetic host load. | REQ-002, REQ-004, REQ-006, INV-005, INV-007 |
 | AC-005 — Engineer runs and compares supported platforms | Prove real CPU accounting and every L1 and L2 experiment for all three engines on Linux x86_64. Inspect portability of the same commands, schema v2 and measurement paths on macOS arm64 and Linux arm64; real runs there are optional and missing runs do not block completion. Recompute (W/T)/P, W/C and C/W from records, with distinct labels and recorded P; results agree and never substitute removed quotas. Verify write rows and uncompressed MiB in both normalizations and query scan rows/bytes per query alongside server time. Cross-host and cross-OS comparisons show both OS/architecture fingerprints and remain advisory, never same-host regression proof. Exercise `--profile` on Linux x86_64 and missing/unusable profiler cases: capture or an explicit note is recorded without affecting judgment; required accounting stays mandatory. Real release-process journeys/records plus deterministic arithmetic, provenance and diagnostic-failure checks. Static command/source review confirms both levels and all experiments lack OS-specific paths and resource envelopes. | REQ-006, REQ-010, REQ-011, REQ-013, REQ-015, REQ-016, INV-004, INV-009 |
-| AC-006 — Agent reads history without prose parsing | Agent discovers engine/experiment records, validates new v2 and legacy v1 fields, reads numeric values/units, repetitions, baseline snapshot and typed verdict/reasons, and identifies omitted/invalid steps. Unsupported version refuses interpretation. Report regeneration works without target artifacts; same-second/SHA collisions use -2/-3 and cannot overwrite history; temp-write/rename failure cannot return PASS. A dirty override records the SHA-256 of `git diff HEAD`. Record-reader/writer integration and malformed/unsupported input cases. | REQ-013, REQ-014, INV-008 |
+| AC-006 — Agent reads history without prose parsing | Agent discovers engine/experiment records, reads schema v3 fields, reads numeric values/units, repetitions, baseline snapshot and typed verdict/reasons, and identifies omitted/invalid steps. Unsupported version refuses interpretation. Report regeneration works without target artifacts; same-second/SHA collisions use -2/-3 and cannot overwrite history; temp-write/rename failure cannot return PASS. A dirty override records the SHA-256 of `git diff HEAD`. Record-reader/writer integration and malformed/unsupported input cases. | REQ-013, REQ-014, INV-008 |
 | AC-007 — Engineer runs L2 with competing work | For each engine, observe real overlapping foreground/background work during each repetition, offered versus achieved arrivals, concurrently evaluated SLOs, bounded backlog and drain. Bifrost records its contended calibration steps, selected sustainable rate, 70% load and 32 query clients; Verification includes evidence writes; Gateway overload/recovery judges capture accounting. A missed concurrent criterion fails despite an isolated case passing. Real workload journeys, timelines and records. | REQ-005, REQ-009 |
 | AC-008 — Contributor adds an experiment | Contributor declares question/variables/controls/metrics/criteria and supplies workload behavior to the existing shared experiment owner. The same validity, repetitions, report, record and verdict behavior applies without another measurement/report implementation. One small representative integration experiment and source review demonstrate reuse. | REQ-015 |
 | AC-009 — Maintainer checks migration and discoverability | README and TESTING explain invocation and records; coverage mapping has no lost workload; old tasks/aliases, dead thresholds/SloGate/load exports and duplicate code are gone. Every client-queue step judges criteria; Gateway has declared capacity SLO constants. Static consumer/task/docs inventory plus relevant existing correctness lanes; no benchmark added to CI/gates. | REQ-010, REQ-016 |
 | AC-010 — Operator checks preserved production guarantees | Wrong results and unexpected loss fail valid runs; tenant-negative journeys cannot expose data; acknowledged writes survive existing durability checks; audit stays non-blocking and accounted; fixture cleanup remains scoped and credentials never enter summaries. Existing security/storage journeys and focused record privacy/cancellation checks are credible evidence. | INV-001, INV-002, INV-003, INV-006 |
 | AC-011 — Operator changes logging/sampling or loses its backend | Production-initialized tests prove independent log/operator policies and SDK overflow/shutdown loss reporting and accurate failed-export-batch counters; real authenticated client → gateway → tenant timeline journeys retain catalog IDs/links at ratio zero/no endpoint, with tenant-negative readback. All shipped language surfaces retain their existing journeys at integrated review. | REQ-017, REQ-018, INV-010 |
-| AC-012 — Engineer smoke-tests the actual benchmark without trace export | Real release commands exercise every default L1/L2 plan for all engines, including all three Bifrost L1 experiments, through actual loading/publication, selected steps/phases, measured stop/drain, exact outcome reconciliation, record/full timing evidence and report. Read the record and regenerate its report; verify retained histograms reproduce recorded readings. Accurately recorded production errors, dropped/refused calls, capture shedding, wrong answers and target misses do not fail smoke. Missing measurements/counters, mismatched populations, zero CPU, missing applicable scan facts and failed evidence/report handling are plumbing failures. Production criteria remain explicitly inapplicable with observed values retained; smoke PASS claims plumbing only. A separate deterministic full-mode test proves a controlled criterion miss survives judgment, record/readback, report and exit 1, and invalidity retains precedence/exit 2. Selected-step proof remains; a saturated driver does not invalidate a smoke, and a full run runs no smoke. Mode round-trips, output stays outside history and smoke cannot become a baseline after relocation. Deterministic interval/quantization/overflow/reset/drain proof and bounded known-delay, known-CPU and instrumentation-cost calibration use the actual measurement path with independent references and justified tolerances, without synthetic host load or a side runner. Normal readout absence, non-loopback refusal and snapshot privacy remain. | REQ-007, REQ-008, REQ-013, REQ-015, INV-006, INV-010 |
+| AC-012 — Engineer smoke-tests the actual benchmark without trace export | Real release commands exercise every default L1/L2 plan for all engines, including all three Bifrost L1 experiments, through actual loading/publication, selected steps/phases, measured stop/drain, exact outcome reconciliation, record/full timing evidence and report. Read the record and regenerate its report; verify retained histograms reproduce recorded readings. Accurately recorded production errors, dropped/refused calls, capture shedding, wrong answers and target misses do not fail smoke. Missing measurements/counters, mismatched populations, zero CPU, missing applicable scan facts and failed evidence/report handling are plumbing failures. Production criteria remain explicitly inapplicable with observed values retained; smoke PASS claims plumbing only. A separate deterministic full-mode test proves a controlled criterion miss survives judgment, record/readback, report and exit 1, and invalidity retains precedence/exit 2. Selected-step proof remains; a full run runs no smoke. Mode round-trips, output stays outside history and smoke cannot become a baseline after relocation. Deterministic interval/quantization/overflow/reset/drain proof and bounded known-delay, known-CPU and instrumentation-cost calibration use the actual measurement path with independent references and justified tolerances, without synthetic host load or a side runner. Normal readout absence, non-loopback refusal and snapshot privacy remain. | REQ-007, REQ-008, REQ-013, REQ-015, INV-006, INV-010 |
 | AC-014 — Maintainer checks the engine limits | Clean full L1 on the reference host passes Verification 64-client latency, Bifrost hot and Parquet point-lookup p99 <5 ms at 64 clients, the OTLP spans ≥30 MiB/CPU-s floor and Gateway <500 µs overhead at 64 clients, with unchanged limits, exact results and existing tenancy/durability journeys green. Before/after records and the diagnostic run that located each cost. | REQ-021, INV-001, INV-002 |
 | AC-013 — Maintainer establishes regression evidence | Only after AC-014 passes, two clean full suites establish reviewed same-method references; latency/throughput-core/CPU-work regression cases fail correctly. The same-build export comparison quantifies overhead; diagnostic traces and profile reproduce the documented investigation workflow without becoming references. | REQ-011, REQ-012, REQ-019, REQ-020 |
 
@@ -1153,6 +1186,14 @@ not a reason to invent a reference or weaken coverage.
   over-threshold counts and per-phase p99/max from server HDR timing, and one
   HTML page renders and compares history from records only. Approved by the
   maintainer on 2026-10-26.
+- Revision 17 — 2026-10-26: The maintainer could not read the benchmarks.
+  INVALID hid measured failures, an unenforced driver-core budget refused real
+  runs, each measurement was copied into four places, and profiled, partial and
+  dirty runs sat in history. The maintainer decided the nine-line definition:
+  PASS or FAIL with why, driver CPU as context only, measurements stored once in
+  schema v3 with every answer derived by one reader, history of complete clean
+  unprofiled runs only, a one-screen report, and old records deleted. Approved by
+  the maintainer on 2026-10-26.
 
 Authority (plain repository references):
 

@@ -112,9 +112,10 @@ pub const NATIVE_PEAK_FLOOR: f64 = 200_000.0;
 pub const OTLP_PEAK_FLOOR: f64 = 30.0;
 
 /// The `writes-parquet` budget, seconds: its measured windows, the
-/// publication each path waits for before the next, and its drain take
-/// about 311 s, over the L1 300 s every other experiment keeps.
-const WRITES_BUDGET_SECONDS: u64 = 420;
+/// publication each path after the first waits for (about 62 s each),
+/// and its drain take about 433 s, over the L1 300 s every other
+/// experiment keeps.
+const WRITES_BUDGET_SECONDS: u64 = 480;
 
 /// The L2 experiment and step id.
 pub const COMPETING: &str = "competing";

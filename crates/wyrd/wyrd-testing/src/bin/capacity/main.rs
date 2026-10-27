@@ -532,7 +532,7 @@ mod tests {
         let writes = experiment(query::Experiment::WritesParquet, &[], HOST);
         let hot = experiment(query::Experiment::Hot, &[], HOST);
         let parquet = experiment(query::Experiment::Parquet, &[], HOST);
-        for (bifrost, budget) in [(&writes, 420), (&hot, 300), (&parquet, 300)] {
+        for (bifrost, budget) in [(&writes, 480), (&hot, 300), (&parquet, 300)] {
             assert!(bifrost.refusals().is_empty(), "{:?}", bifrost.refusals());
             assert_eq!(
                 bifrost.timing,
@@ -540,7 +540,7 @@ mod tests {
                     budget_seconds: budget,
                     ..timing
                 },
-                "writes-parquet fits 420 s and every other L1 experiment 300 s"
+                "writes-parquet fits 480 s and every other L1 experiment 300 s"
             );
             for control in ["fixture", "limits", "workload", "timing"] {
                 assert!(bifrost.controls.contains_key(control), "{control}");
@@ -719,7 +719,7 @@ mod tests {
             measured.len() * 4,
             "a warmup and three repetitions per step"
         );
-        assert!(record.elapsed_seconds <= 420.0);
+        assert!(record.elapsed_seconds <= 480.0);
         let peak = record
             .steps
             .iter()

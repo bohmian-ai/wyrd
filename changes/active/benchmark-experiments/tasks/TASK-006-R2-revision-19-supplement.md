@@ -57,13 +57,14 @@ and README wording agree. No benchmark becomes a CI or verification gate.
 seconds on commits f96c23fa2 and d86cf238e against 300 seconds. Both are always
 INVALID under that budget, and native-write-c64 loses a repetition.
 
-**Requirement.** REQ-008 gives writes-parquet 420 seconds, enough for the
-current 311 seconds plus item 4's two added steps, retains 300 seconds for hot
-and parquet, and updates the Bifrost L1 aggregate maximum to 1,020 seconds. Keep the same clock boundaries and full coverage; do not shorten or
+**Requirement.** REQ-008 gives writes-parquet 480 seconds: the 433 seconds
+measured on 434aaf5c1 with item 4's added path, whose own publication settle
+takes about 62 seconds, plus margin. It retains 300 seconds for hot and
+parquet, and updates the Bifrost L1 aggregate maximum to 1,080 seconds. Keep the same clock boundaries and full coverage; do not shorten or
 omit repetitions to fit.
 
 **Acceptance.** A complete writes-parquet record contains every repetition,
-including native-write-c64, and reports its actual elapsed time against 420
+including native-write-c64, and reports its actual elapsed time against 480
 seconds. The aggregate's stated maximum agrees with its component budgets.
 An actual overrun still invalidates rather than truncating evidence silently.
 

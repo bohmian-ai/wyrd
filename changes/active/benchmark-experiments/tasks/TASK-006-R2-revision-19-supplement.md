@@ -689,3 +689,21 @@ revision 19 figures cannot be reproduced. Every current share is below the
 ~3% run-to-run spread of a before/after record, so no change could produce a
 comparable measurement. With the maintainer's agreement, item 8 makes no code
 change and records no measured improvement.
+
+### Item 9(a) shard scaling: the named limit is device write bandwidth
+
+Median rows/s across 3 repetitions at 64 clients. `WYRD_SCRIBE_SHARD_COUNT` is set, `wal_io_threads` is 4, and every record is VALID and under `target/benchmarks/bifrost/writes-parquet/` (`20261027T211631Z`, `211841Z`, `212050Z`, `212301Z`, `212517Z`):
+
+| Shards | spans | 1 KiB spans | logs | native |
+|---|---|---|---|---|
+| 1 | 494k | 185k | 220k | 4.59M |
+| 2 | 506k | 192k | 257k | 5.24M |
+| 4 | 515k | 199k | 269k | 5.01M |
+| 8 | 463k | 199k | 266k | 4.96M |
+| 16 | 332k | 195k | 230k | 3.48M |
+
+- **IO pool.** From 8 shards on, `wal_append` p50 grows (native 34→114 ms) because the 4-thread WAL IO pool queues every shard's writes. With `wal_io_threads = 16` (`212910Z`, `213126Z`), `wal_append` p50 drops below 4 ms, but rows/s still does not rise (16 shards: spans 534k, 1k 201k, logs 263k, native 4.18M). The pool is a queue in front of the limit, not the limit.
+- **Device.** The WAL is in the driver's temporary directory on `/dev/mapper/data-root`: ext4 on LVM on dm-crypt, on `nvme1n1` with a write-back cache. During the native and 1 KiB steps (`213647Z` at 1 shard, `213814Z` at 16 shards), `/sys/block/dm-1/stat` shows a peak device write rate of 285–306 MiB/s at 1 shard and 294–315 MiB/s at 16 shards. The 16-shard run moves the same bytes, with 2–3× the in-flight write time. On this volume, one Python `write(256 KiB)` + `fdatasync` loop per file reaches 69 MiB/s with 1 file and 160 MiB/s with 16 files.
+- **Not CPU or PostgreSQL.** The server uses 4–12 of 32 cores. The PostgreSQL fence (`visibility`) p50 stays at 2–8 ms and falls as shards are added.
+
+A single shard already uses this host's synced-write bandwidth, so extra shards add queueing (in `wal_sync` and `shard_wait`) and no rows. On this host, the evidence shows the limit is disk sync bandwidth.

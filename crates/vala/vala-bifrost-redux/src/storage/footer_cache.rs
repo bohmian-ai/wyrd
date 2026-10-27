@@ -15,7 +15,7 @@ use object_store::path::Path;
 /// instead: lookups read a sharded map and record recency in a buffer the
 /// cache drains in batches. Entries are weighed by
 /// [`CachedFileMetadataEntry::size`] against a byte limit fixed at
-/// construction, because [`super::BifrostStorage::with_metadata_cache`]
+/// construction, because [`super::BifrostStorage::with_oracle_caches`]
 /// charges that whole limit to the Oracle memory root up front.
 pub(crate) struct FooterCache {
     /// Footers by object path, weighed in bytes.

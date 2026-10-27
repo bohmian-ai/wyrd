@@ -1017,10 +1017,20 @@ query's own ceiling, and the root's single tracked spill-fair pool, bounded by
 the shared Bifrost memory cap that Scribe, Forge, and in-flight transport also
 charge, arbitrates what all live queries hold together. No role holds a fixed
 share or a precharge, with one exception: when an Oracle-serving node sets up
-`DataFusion`'s Parquet footer cache at composition, it charges the cache's
-whole `metadata_cache_bytes` budget to the Oracle memory root and holds it for
-the storage owner's life, because that cache reports no per-entry charge; a
-zero budget sets up no cache and charges nothing. Apart from that standing
+`DataFusion`'s Parquet footer cache and its Parquet byte-range cache at
+composition, it charges each cache's whole budget, `metadata_cache_bytes` and
+`data_cache_bytes`, to the Oracle memory root and holds it for the storage
+owner's life, because neither cache reports a per-entry charge; a zero budget
+sets up no cache and charges nothing. Each budget defaults to a twentieth of
+managed memory within 32 MiB..512 MiB and may never exceed an eighth of it.
+
+The byte-range cache keeps the exact byte ranges Oracle scans read from
+warehouse objects, which are written once under unique names and never
+rewritten, so a cached range never goes stale; staged scratch objects are read
+uncached. A scan answered from the cache still counts the bytes in
+`bytes_scanned`, and before its first cached range of an object it confirms the
+object exists, so a pinned object that vanished still fails the attempt as a
+stale object rather than being answered from memory. Apart from that standing
 charge an idle role holds nothing, and every charge returns when its owner
 ends. Aggregate governed reservations therefore cannot sum above
 the Bifrost cap.
@@ -1639,9 +1649,11 @@ across a restart; durable batch, file, and task rows answer that question.
   `forge`. A file with no Variant bytes records nothing. A rising share means layouts are missing keys. Forge
   reads each output footer once after the rewrite and logs, never fails on, a
   footer it cannot read. Recovery-stage runs are not measured.
-- **Storage.** Bifrost emits no storage metrics of its own. Parquet footers
-  are cached in `DataFusion`'s node-wide metadata cache, whose whole budget is
-  charged to the Oracle memory root at composition.
+- **Storage.** Parquet footers are cached in `DataFusion`'s node-wide metadata
+  cache and warehouse byte ranges in the node's byte-range cache, each charged
+  in whole to the Oracle memory root at composition.
+  `bifrost_footer_cache_{hits,misses}_total` and
+  `bifrost_range_cache_{hits,misses}_total` count their lookups.
 - **Traces.** A query is one trace: `bifrost.gate.query.stream` spans the
   client-facing stream through terminal or drop, with `bifrost.gate.query`
   dispatch as its child; `bifrost.oracle.stream` spans Oracle execution through

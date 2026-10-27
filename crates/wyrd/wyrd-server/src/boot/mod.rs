@@ -418,7 +418,7 @@ async fn build_bifrost_external_dependencies(
     .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     if let Some(oracle) = resources.oracle() {
         bifrost_storage = bifrost_storage
-            .with_metadata_cache(&oracle.metadata())
+            .with_oracle_caches(&oracle.metadata())
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     }
     let bifrost_storage = Arc::new(bifrost_storage);

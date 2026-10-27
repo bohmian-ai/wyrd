@@ -4904,7 +4904,7 @@ impl WyrdTestServerBuilder {
         let object_reads = object_reads.expect("the probe wraps the store it was given");
         if let Some(oracle) = bifrost_resources.oracle() {
             bifrost_storage = bifrost_storage
-                .with_metadata_cache(&oracle.metadata())
+                .with_oracle_caches(&oracle.metadata())
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         }
         let bifrost_storage = Arc::new(bifrost_storage);

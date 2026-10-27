@@ -3,6 +3,7 @@
 mod error;
 mod footer_cache;
 mod policy;
+mod range_cache;
 
 use std::sync::Arc;
 
@@ -16,12 +17,13 @@ use wyrd_storage::CloudStore;
 
 use crate::resources::{BifrostResourceError, MetadataReservation, OracleMetadataResources};
 use crate::storage::footer_cache::FooterCache;
+pub(crate) use crate::storage::range_cache::RangeCache;
 
 pub use crate::storage::error::BifrostStorageError;
 pub(crate) use crate::storage::error::error_chain_contains_not_found;
 pub use crate::storage::policy::{BifrostStorageConfig, BifrostStoragePolicy};
 
-/// The node's one Bifrost object store and Parquet footer cache.
+/// The node's one Bifrost object store and its Parquet footer and byte-range caches.
 ///
 /// Every Bifrost role reads and writes through [`Self::objects`]: Scribe
 /// uploads, Oracle's `DataFusion` scans, Forge rewrites and cleanup, and the
@@ -47,6 +49,13 @@ pub struct BifrostStorage {
     /// The whole cache budget, charged once to the Oracle memory root and held
     /// for the owner's life, so footers are never an ungoverned second pool.
     metadata_charge: Option<MetadataReservation>,
+    /// The node-wide cache of Parquet byte ranges Oracle scans read from
+    /// warehouse objects; absent on a node that serves no Oracle or has a zero
+    /// budget.
+    data_cache: Option<Arc<RangeCache>>,
+    /// The whole `data_cache_bytes` budget, charged and held as
+    /// `metadata_charge` is.
+    data_charge: Option<MetadataReservation>,
 }
 
 impl BifrostStorage {
@@ -75,6 +84,8 @@ impl BifrostStorage {
             policy,
             metadata_cache: None,
             metadata_charge: None,
+            data_cache: None,
+            data_charge: None,
         })
     }
 
@@ -127,32 +138,38 @@ impl BifrostStorage {
         }
     }
 
-    /// Gives this owner its node-wide Parquet footer cache, a [`FooterCache`].
+    /// Gives this owner its node-wide Parquet footer cache, a [`FooterCache`],
+    /// and its byte-range cache, a [`RangeCache`].
     ///
-    /// Called once at composition on an Oracle-serving node. The cache's
-    /// whole byte limit, `metadata_cache_bytes`, is charged to the Oracle
-    /// memory root up front and held for the owner's life, because the
-    /// cache reports no per-entry charge. A zero budget leaves
-    /// the owner without a cache and charges nothing.
+    /// Called once at composition on an Oracle-serving node. Each cache's
+    /// whole byte limit, `metadata_cache_bytes` and `data_cache_bytes`, is
+    /// charged to the Oracle memory root up front and held for the owner's
+    /// life, because neither cache reports a per-entry charge. A zero budget
+    /// leaves the owner without that cache and charges nothing for it.
     ///
     /// # Errors
     /// Returns the [`BifrostResourceError`] of a refused root charge, or
-    /// [`BifrostResourceError::Unavailable`] when the budget does not fit this
+    /// [`BifrostResourceError::Unavailable`] when a budget does not fit this
     /// platform's `usize`.
-    pub fn with_metadata_cache(
+    pub fn with_oracle_caches(
         mut self,
         resources: &OracleMetadataResources,
     ) -> Result<Self, BifrostResourceError> {
-        if self.policy.metadata_cache_bytes() == 0 {
-            return Ok(self);
+        let budget = |bytes: u64| {
+            usize::try_from(bytes).map_err(|_| BifrostResourceError::Unavailable {
+                detail: "an Oracle cache budget does not fit this platform".to_owned(),
+            })
+        };
+        let footers = budget(self.policy.metadata_cache_bytes())?;
+        let ranges = budget(self.policy.data_cache_bytes())?;
+        if footers > 0 {
+            self.metadata_charge = Some(resources.try_reserve_metadata(footers)?);
+            self.metadata_cache = Some(Arc::new(FooterCache::new(footers)));
         }
-        let bytes = usize::try_from(self.policy.metadata_cache_bytes()).map_err(|_| {
-            BifrostResourceError::Unavailable {
-                detail: "the metadata cache budget does not fit this platform".to_owned(),
-            }
-        })?;
-        self.metadata_charge = Some(resources.try_reserve_metadata(bytes)?);
-        self.metadata_cache = Some(Arc::new(FooterCache::new(bytes)));
+        if ranges > 0 {
+            self.data_charge = Some(resources.try_reserve_metadata(ranges)?);
+            self.data_cache = Some(Arc::new(RangeCache::new(ranges)));
+        }
         Ok(self)
     }
 
@@ -172,6 +189,12 @@ impl BifrostStorage {
     #[must_use]
     pub fn metadata_cache(&self) -> Option<&Arc<FileMetadataCache>> {
         self.metadata_cache.as_ref()
+    }
+
+    /// Returns the node-wide Parquet byte-range cache, when this node has one.
+    #[must_use]
+    pub(crate) fn data_cache(&self) -> Option<&Arc<RangeCache>> {
+        self.data_cache.as_ref()
     }
 
     /// Returns the validated policy this owner applies.
@@ -198,12 +221,12 @@ impl BifrostStorage {
     ///
     /// Composed the way production composes: a local store, the default
     /// policy resolved for the fixture's Oracle-serving decision, and, on an
-    /// Oracle-serving fixture, the footer cache charged to a 1 GiB test Oracle
-    /// composition.
+    /// Oracle-serving fixture, the footer and byte-range caches charged to a
+    /// 1 GiB test Oracle composition.
     ///
     /// # Panics
     /// Panics when the root, the default storage policy, or the test
-    /// composition's footer-cache charge is invalid, which would mean the
+    /// composition's cache charges are invalid, which would mean the
     /// fixture itself is unusable.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
@@ -232,8 +255,8 @@ impl BifrostStorage {
         .expect("the composed test roles include Oracle");
         Arc::new(
             owner
-                .with_metadata_cache(&oracle.metadata())
-                .expect("the test Oracle composition covers the footer cache"),
+                .with_oracle_caches(&oracle.metadata())
+                .expect("the test Oracle composition covers the Oracle caches"),
         )
     }
 }

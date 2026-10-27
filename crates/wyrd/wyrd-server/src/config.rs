@@ -1336,6 +1336,9 @@ pub struct BifrostStorageIoConfig {
     /// Decoded Parquet metadata cache budget in bytes; zero disables it.
     #[serde(default)]
     pub metadata_cache_bytes: Option<u64>,
+    /// Parquet byte-range cache budget in bytes; zero disables it.
+    #[serde(default)]
+    pub data_cache_bytes: Option<u64>,
 }
 
 impl BifrostStorageIoConfig {
@@ -1352,6 +1355,7 @@ impl BifrostStorageIoConfig {
             max_retry_elapsed_ms: self.max_retry_elapsed_ms,
             max_concurrent_requests: self.max_concurrent_requests,
             metadata_cache_bytes: self.metadata_cache_bytes,
+            data_cache_bytes: self.data_cache_bytes,
         }
     }
 }

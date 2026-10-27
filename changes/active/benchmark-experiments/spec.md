@@ -693,9 +693,12 @@ are stable lowercase path-safe names. Filenames are
 digits; the full SHA is authoritative in JSON. Never overwrite a run: append
 `-2`, then `-3`, etc. before `.json` on collision, retaining the actual start.
 History is the `benchmark-records` branch. It shares no commits with the
-code and holds only `<engine>/<experiment>/` records and a README. Each
-checkout mounts it as a worktree at `benchmarks/history/`, which the code
-branches ignore (`git worktree add benchmarks/history benchmark-records`).
+code and holds only `<engine>/<experiment>/` records and a README. The
+checkout that runs benchmarks mounts it as a worktree at `benchmarks/history/`,
+which the code branches ignore
+(`git worktree add benchmarks/history benchmark-records`); Git checks a branch
+out in one worktree at a time, so another checkout takes it over with
+`git worktree move`.
 Records are committed and pushed on that branch through normal contributor
 review, never in a code change; running a benchmark never stages or commits
 automatically. Without the worktree, the recorder creates the directory and

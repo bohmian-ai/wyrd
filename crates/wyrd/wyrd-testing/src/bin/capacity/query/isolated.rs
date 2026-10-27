@@ -283,7 +283,7 @@ impl Isolated {
                     ),
                 );
             }
-            set_write_phases(&mut repetition, &population, write);
+            set_write_phases(&mut repetition, &population, write, case, phase.label());
             repetition.set(
                 "visibility_p99_ms",
                 Reading::missing(
@@ -373,10 +373,19 @@ async fn scanned(
 
 /// Sets each [`WRITE_PHASES`] phase, then the OTLP decode phase, at each
 /// [`PHASE_STATISTICS`] statistic, milliseconds, over the window's
-/// successful observations of the phase's boundary. A phase the window did
+/// successful observations of the phase's boundary from the step's own
+/// `case` requests admitted in `phase`; the server's own appends, such as
+/// audit publication, are unlabelled and excluded. A phase the window did
 /// not time is missing with its reason; phases are diagnostic, so that never
 /// makes the repetition invalid.
-fn set_write_phases(repetition: &mut Repetition, population: &Population, write: WriteOp) {
+fn set_write_phases(
+    repetition: &mut Repetition,
+    population: &Population,
+    write: WriteOp,
+    case: &str,
+    phase: &str,
+) {
+    let population = population.only(case, phase);
     let decode = write
         .decode_boundary()
         .ok_or("native writes send Arrow IPC, timed as Scribe's `decode`");
@@ -681,7 +690,8 @@ mod tests {
     use crate::query::WriteOp;
 
     /// A native append's recorded Scribe phases read back with their one
-    /// sample, an untimed phase is missing with its boundary, and OTLP
+    /// sample while an unlabelled server append is excluded, an untimed
+    /// phase is missing with its boundary, and OTLP
     /// decode is labelled unavailable for native writes, never fabricated.
     ///
     /// # Panics
@@ -690,17 +700,37 @@ mod tests {
     fn write_phases_read_back_with_populations_and_labelled_gaps() {
         timing::enable();
         let before = timing::snapshot();
-        wyrd_telemetry::record_timing_parts(
-            &tracing::Span::none(),
-            "bifrost.scribe.write",
-            "success",
-            Duration::from_millis(4),
-            None,
-            &[("bifrost.scribe.write.wal_sync", Duration::from_millis(3))],
+        let _registry = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let request = tracing::info_span!("request");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            timing::CASE_HEADER,
+            http::HeaderValue::from_static("native-write"),
         );
+        headers.insert(
+            timing::PHASE_HEADER,
+            http::HeaderValue::from_static("repetition-1"),
+        );
+        timing::label_request(&request, &headers);
+        for (span, sync) in [(request, 3), (tracing::Span::none(), 90)] {
+            wyrd_telemetry::record_timing_parts(
+                &span,
+                "bifrost.scribe.write",
+                "success",
+                Duration::from_millis(4),
+                None,
+                &[("bifrost.scribe.write.wal_sync", Duration::from_millis(sync))],
+            );
+        }
         let population = Population::between(&before, timing::snapshot()).expect("one process");
         let mut repetition = Repetition::default();
-        set_write_phases(&mut repetition, &population, WriteOp::Native);
+        set_write_phases(
+            &mut repetition,
+            &population,
+            WriteOp::Native,
+            "native-write",
+            "repetition-1",
+        );
 
         let sync = repetition.reading("phase_wal_sync_p99_ms");
         assert_eq!(sync.samples, Some(1));

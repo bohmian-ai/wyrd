@@ -1536,9 +1536,9 @@ pub struct ImmutableEntry {
     pub wal_lsn_max: crate::scribe::wal::WalLsn,
     /// Lifecycle state.
     pub state: ImmutableState,
-    /// Maximum WAL LSN of each append, index-aligned with the frozen
-    /// batches and derived once so a live capture shares it.
-    wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
+    /// The frozen generation's appends as one run, built once so every live
+    /// capture shares it and its alignment is checked at insertion.
+    run: AppendRun,
 }
 
 impl ImmutableEntry {
@@ -1560,6 +1560,12 @@ impl ImmutableEntry {
         }
     }
 
+    /// Tracks `frozen` as a generation awaiting its durable commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `frozen` does not carry one append meta per batch (see
+    /// [`AppendRun::new`]).
     fn pending(frozen: FrozenMemtable) -> Self {
         Self {
             seal_id: frozen.seal_id,
@@ -1575,7 +1581,11 @@ impl ImmutableEntry {
                 .map(|meta| meta.wal_lsn_max)
                 .max()
                 .unwrap_or_else(|| crate::scribe::wal::WalLsn::new(0)),
-            wal_lsns: frozen.metas.iter().map(|meta| meta.wal_lsn_max).collect(),
+            run: AppendRun::new(
+                Arc::clone(&frozen.batches),
+                Arc::clone(&frozen.statistics),
+                frozen.metas.iter().map(|meta| meta.wal_lsn_max).collect(),
+            ),
             frozen,
             state: ImmutableState::PendingCommit,
         }
@@ -1591,14 +1601,9 @@ impl ImmutableEntry {
         &self,
         generation: crate::scribe::hot_source::GenerationOrdinal,
     ) -> ReadableSource {
-        let run = AppendRun {
-            batches: Arc::clone(&self.frozen.batches),
-            statistics: Arc::clone(&self.frozen.statistics),
-            wal_lsns: Arc::clone(&self.wal_lsns),
-        };
         ReadableSource::capture(
             &self.frozen.schema,
-            vec![run],
+            vec![self.run.clone()],
             self.frozen.seal_key.clone(),
             Some(generation),
             &self.frozen.charge,
@@ -1964,6 +1969,35 @@ struct AppendRun {
     wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
 }
 
+impl AppendRun {
+    /// Builds a run over index-aligned appends.
+    ///
+    /// `statistics` may be shorter than `batches`, as in a hand-built test
+    /// generation; those batches read with unknown bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `wal_lsns` does not carry exactly one WAL position per
+    /// batch. A live read pairs batches with positions run by run, so a
+    /// mismatch would misalign every later run's bounds and pruning.
+    fn new(
+        batches: Arc<[RecordBatch]>,
+        statistics: Arc<[Arc<Statistics>]>,
+        wal_lsns: Arc<[crate::scribe::wal::WalLsn]>,
+    ) -> Self {
+        assert_eq!(
+            batches.len(),
+            wal_lsns.len(),
+            "an append run carries exactly one WAL position per batch"
+        );
+        Self {
+            batches,
+            statistics,
+            wal_lsns,
+        }
+    }
+}
+
 /// A writable bucket's appends after its last sealed [`AppendRun`].
 #[derive(Debug, Default)]
 struct AppendTail {
@@ -1979,20 +2013,20 @@ impl AppendTail {
     /// Copies the tail into a run a capture holds while the bucket keeps
     /// appending.
     fn run(&self) -> AppendRun {
-        AppendRun {
-            batches: self.batches.as_slice().into(),
-            statistics: self.statistics.as_slice().into(),
-            wal_lsns: self.wal_lsns.as_slice().into(),
-        }
+        AppendRun::new(
+            self.batches.as_slice().into(),
+            self.statistics.as_slice().into(),
+            self.wal_lsns.as_slice().into(),
+        )
     }
 
     /// Moves the tail into a sealed run, leaving it empty.
     fn seal(&mut self) -> AppendRun {
-        AppendRun {
-            batches: std::mem::take(&mut self.batches).into(),
-            statistics: std::mem::take(&mut self.statistics).into(),
-            wal_lsns: std::mem::take(&mut self.wal_lsns).into(),
-        }
+        AppendRun::new(
+            std::mem::take(&mut self.batches).into(),
+            std::mem::take(&mut self.statistics).into(),
+            std::mem::take(&mut self.wal_lsns).into(),
+        )
     }
 }
 
@@ -2397,31 +2431,63 @@ mod tests {
     }
 
     /// A capture shares a bucket's sealed runs and a generation's batches by
-    /// reference and copies only the bucket's unsealed tail, while freezing
-    /// keeps every append in order.
+    /// reference and copies only the bucket's unsealed tail; every read and
+    /// freeze keeps each append's rows paired with its WAL position, in order.
+    ///
+    /// Each append's single `id` row equals its LSN, so a reordered or
+    /// misaligned batch is caught. The bucket is captured at exactly one full
+    /// run (no tail), then again after more appends span two sealed runs and
+    /// a tail; the earlier capture keeps its rows. Pruning keeps exactly the
+    /// batches whose bounds match across a run boundary, and freezing shares
+    /// one concatenated generation with all its bounds.
     ///
     /// # Panics
     ///
     /// Panics when a capture copies a sealed run or a frozen generation, or a
-    /// read or freeze loses or reorders an append.
+    /// read, prune, or freeze loses, reorders, or misaligns an append.
     #[test]
     fn captures_share_sealed_runs_and_frozen_generations() {
+        use arrow::array::Array as _;
+
         let memtable = Memtable::new();
         let key = make_test_seal_key();
-        let appends = u64::try_from(APPEND_RUN_LEN + 1).expect("append count");
-        for lsn in 1..=appends {
-            memtable
-                .insert(&key, make_test_meta(lsn), make_test_batch(1))
-                .expect("active insert");
-        }
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let insert = |lsns: std::ops::RangeInclusive<u64>| {
+            for lsn in lsns {
+                let value = i64::try_from(lsn).expect("lsn value");
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![value]))],
+                )
+                .expect("valued batch");
+                memtable
+                    .insert(&key, make_test_meta(lsn), batch)
+                    .expect("active insert");
+            }
+        };
         let partitions = key.partition.time()..=key.partition.time();
-        let lsns = |capture: &LiveCapture| -> Vec<u64> {
+        let lsns = |capture: &LiveCapture, pruning| -> Vec<u64> {
             capture
-                .read(&partitions, &[], None)
+                .read(&partitions, schema.fields(), pruning)
                 .expect("capture read")
                 .batches
                 .iter()
-                .map(|readable| readable.wal_lsn_max.as_u64())
+                .map(|readable| {
+                    let lsn = readable.wal_lsn_max.as_u64();
+                    let ids = readable
+                        .batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id column");
+                    assert_eq!(ids.len(), 1);
+                    assert_eq!(
+                        u64::try_from(ids.value(0)).ok(),
+                        Some(lsn),
+                        "rows follow their LSN"
+                    );
+                    lsn
+                })
                 .collect()
         };
         let take = || {
@@ -2429,28 +2495,81 @@ mod tests {
                 .expect("locks")
                 .expect("no registry to wait on")
         };
-
-        let active = take();
-        {
+        let shares_sealed = |capture: &LiveCapture, sealed: usize| {
             let writable = memtable.writable.read().expect("writable lock");
             let bucket = &writable[&key];
-            let runs = &active.memory[0].runs;
-            assert_eq!(runs.len(), 2, "one sealed run and the copied tail");
-            assert!(Arc::ptr_eq(&runs[0].batches, &bucket.runs[0].batches));
-            assert!(Arc::ptr_eq(&runs[0].statistics, &bucket.runs[0].statistics));
-            assert_eq!(runs[1].batches.len(), 1);
-        }
-        assert_eq!(lsns(&active), (1..=appends).collect::<Vec<_>>());
+            assert_eq!(bucket.runs.len(), sealed);
+            for (captured, owned) in capture.memory[0].runs.iter().zip(&bucket.runs) {
+                assert!(Arc::ptr_eq(&captured.batches, &owned.batches));
+                assert!(Arc::ptr_eq(&captured.statistics, &owned.statistics));
+                assert!(Arc::ptr_eq(&captured.wal_lsns, &owned.wal_lsns));
+            }
+        };
+        let full = u64::try_from(APPEND_RUN_LEN).expect("run length");
+        let total = 2 * full + 2;
+
+        insert(1..=full);
+        let exact = take();
+        assert_eq!(exact.memory[0].runs.len(), 1, "a full run leaves no tail");
+        shares_sealed(&exact, 1);
+        assert_eq!(lsns(&exact, None), (1..=full).collect::<Vec<_>>());
+
+        insert(full + 1..=total);
+        let active = take();
+        assert_eq!(
+            active.memory[0].runs.len(),
+            3,
+            "two sealed runs and the tail"
+        );
+        shares_sealed(&active, 2);
+        assert_eq!(active.memory[0].runs[2].batches.len(), 2);
+        assert_eq!(lsns(&active, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(
+            lsns(&exact, None),
+            (1..=full).collect::<Vec<_>>(),
+            "an earlier capture keeps its rows"
+        );
+
+        let bound = |operator, value: u64| {
+            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                datafusion::physical_expr::expressions::col("id", &schema).expect("id column"),
+                operator,
+                datafusion::physical_expr::expressions::lit(
+                    i64::try_from(value).expect("bound value"),
+                ),
+            ))
+        };
+        let pruning = crate::scan_sizing::BatchPruning::try_new(
+            &schema,
+            Arc::new(datafusion::physical_expr::expressions::BinaryExpr::new(
+                bound(datafusion::logical_expr::Operator::GtEq, full - 2),
+                datafusion::logical_expr::Operator::And,
+                bound(datafusion::logical_expr::Operator::LtEq, full + 3),
+            )),
+        )
+        .expect("pruning plans");
+        assert_eq!(
+            lsns(&active, Some(&pruning)),
+            (full - 2..=full + 3).collect::<Vec<_>>(),
+            "pruning keeps exactly the matching batches across the run boundary"
+        );
 
         let frozen = memtable.freeze(&key).expect("freeze");
-        assert_eq!(frozen.batches.len(), APPEND_RUN_LEN + 1);
+        let appended = usize::try_from(total).expect("append count");
+        assert_eq!(frozen.batches.len(), appended);
+        assert_eq!(frozen.statistics.len(), appended);
         let captured = take();
         assert!(Arc::ptr_eq(
             &captured.memory[0].runs[0].batches,
             &frozen.batches
         ));
-        assert_eq!(lsns(&captured), (1..=appends).collect::<Vec<_>>());
-        assert_eq!(lsns(&active), (1..=appends).collect::<Vec<_>>());
+        assert_eq!(lsns(&captured, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(
+            lsns(&captured, Some(&pruning)),
+            (full - 2..=full + 3).collect::<Vec<_>>()
+        );
+        assert_eq!(lsns(&active, None), (1..=total).collect::<Vec<_>>());
+        assert_eq!(lsns(&exact, None), (1..=full).collect::<Vec<_>>());
     }
 
     /// A capture read that projects every written column, in order and

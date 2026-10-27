@@ -1,0 +1,17 @@
+# Reads the mounted handbook extraction and cites the line answering the question.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: handbook-judge
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [fs.read]
+  run_config: {max_iterations: 3}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "HANDBOOK JUDGE: read /inputs/handbook.json with fs.read and cite the line that answers: {{question}}"
+    response_format: verdict

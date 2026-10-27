@@ -75,7 +75,7 @@ pub(crate) fn decode<T: DeserializeOwned>(
 /// `wyrd_client::gateway_credential`, which this binding never constructs, so
 /// no Python value — however it is built at runtime — can reach a managed
 /// secret write from here. Reads, deployments, policies, and invocation stay.
-#[pyclass(module = "wyrd._wyrd.gateway", name = "Gateway")]
+#[pyclass(module = "wyrd._wyrd.gateway_admin", name = "Gateway")]
 pub struct PyGateway {
     /// The one native connection every call delegates to, connected on the
     /// first server operation (or by `connect`).
@@ -344,6 +344,6 @@ impl PyGateway {
 /// # Errors
 ///
 /// Returns `PyO3` registration errors.
-pub fn register_gateway(module: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register_gateway_admin(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyGateway>()
 }

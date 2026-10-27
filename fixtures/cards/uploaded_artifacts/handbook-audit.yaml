@@ -1,0 +1,23 @@
+# Judges a question against the uploaded staff-handbook 1.0.0, mounted at a
+# path the judge's prompt names.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: handbook-audit
+  version: 1.0.0
+spec:
+  description: The staff handbook answers the question, with a cited line.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  requirements:
+    - id: handbook-answers
+      statement: The handbook answers the question
+      check:
+        kind: agent
+        agent: ./handbook-judge.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/handbook.json:
+            artifact:
+              card: {kind: Artifact, name: staff-handbook, version: 1.0.0}
+              path: extracted/handbook.md.json

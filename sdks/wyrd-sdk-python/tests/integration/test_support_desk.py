@@ -34,7 +34,7 @@ from wyrd import WyrdError
 from wyrd.bifrost import TableConfig
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 

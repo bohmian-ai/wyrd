@@ -52,12 +52,16 @@ impl Fixtures {
         fixtures
     }
 
-    /// Decodes one Card by kind.
+    /// Decodes one Card by kind, skipping Cards headed `# Refused:`, which
+    /// journeys declare to prove the server rejects them.
     ///
     /// # Panics
     /// Panics when the Card cannot be read, parsed, or decoded.
     fn add(&mut self, path: &Path) {
         let text = fs::read_to_string(path).expect("fixture is readable");
+        if text.starts_with("# Refused:") {
+            return;
+        }
         let card: Value = serde_yaml::from_str(&text).expect("fixture is YAML");
         let spec = &card["spec"];
         match card["kind"].as_str() {

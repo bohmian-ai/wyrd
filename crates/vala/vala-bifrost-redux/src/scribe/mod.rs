@@ -2385,8 +2385,8 @@ impl ScribeImpl {
                 });
             }
         }
-        for (shard, bytes) in transient_by_shard.into_iter().enumerate() {
-            memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
+        for (shard, bytes) in transient_by_shard.iter().enumerate() {
+            memory_by_shard[shard] = memory_by_shard[shard].saturating_add(*bytes);
         }
         Ok(ScribeInspectionSnapshot {
             shard_task_count: self.shards.shard_count(),
@@ -2397,6 +2397,7 @@ impl ScribeImpl {
             immutable_bucket_count: stats.immutable_buckets,
             memory_by_category: memory.categories,
             memory_by_shard,
+            transient_memory_by_shard: transient_by_shard,
             memory_by_bucket,
             total_accounted_memory: memory.total_bytes(),
             parent_used_memory: memory.bifrost_total_bytes,
@@ -2454,6 +2455,36 @@ impl ScribeImpl {
             .map_or(0, |bucket| bucket.row_count)
     }
 
+    /// Freezes every active bucket and waits until each is a durable staged member.
+    ///
+    /// This is the first half of [`Self::flush_staged`] taken on its own, so a
+    /// harness can query rows served by staged runs before anything publishes
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a shard cannot freeze its writable
+    /// generations; those rows stay appendable and WAL-authoritative.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn stage_writable_for_test(&self) -> Result<(), ScribeError> {
+        self.stage_writable().await
+    }
+
+    /// Freezes every active bucket and waits for the persistence queue to stage it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a shard cannot freeze its writable
+    /// generations.
+    async fn stage_writable(&self) -> Result<(), ScribeError> {
+        self.shards.flush_all().await?;
+        self.shards.drain().await;
+        if let Some(persistence) = &self.persistence {
+            persistence.drain().await;
+        }
+        Ok(())
+    }
+
     /// Flushes every active bucket through the staged and claim lifecycle.
     ///
     /// This is the one flush: it drives the same path a full pod does, so what
@@ -2477,12 +2508,10 @@ impl ScribeImpl {
     /// retirement pass. Members that did not publish stay durable and staged
     /// and the WAL stays authoritative for their rows, so the caller may retry.
     pub async fn flush_staged(&self) -> Result<usize, ScribeError> {
-        self.shards.flush_all().await?;
-        self.shards.drain().await;
+        self.stage_writable().await?;
         let Some(persistence) = &self.persistence else {
             return Ok(0);
         };
-        persistence.drain().await;
         let published = persistence
             .publish_residue(crate::scribe::assembly::ClaimCause::Drain)
             .await?;

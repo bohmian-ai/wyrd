@@ -1,5 +1,5 @@
-//! The one format extraction path behind `extract` actions and the
-//! filesystem tools.
+//! The one format extraction path behind `extract` actions, `fs.extract`,
+//! citation validation, and client-side Artifact extraction.
 //!
 //! [`Extraction::run`] turns pinned original bytes into the locked
 //! [`ExtractOutput`] shape. PDF text comes from `lopdf`, XLSX cells from
@@ -7,8 +7,9 @@
 //! `zip` and `quick-xml`. Every OOXML container first passes [`zip_guard`],
 //! which streams each entry under the archive byte, entry, and ratio limits
 //! so no parser sees an archive bomb. [`units`] projects an output into the
-//! located text units that `fs.read`, `fs.search`, and citation validation
-//! share. Extraction is text and structure only.
+//! located text units citation validation checks, and [`lines`] numbers the
+//! actual lines `fs.read` and `fs.search` serve. Extraction is text and
+//! structure only.
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
@@ -16,18 +17,59 @@ use std::io::{Cursor, Read};
 use calamine::{Data, Reader as _, Xlsx};
 use quick_xml::events::Event;
 use serde_json::{Number, Value};
-use skald_spec::MediaFormat;
-use vala_verify::blocks::BlockError;
+use wyrd_spec::MediaFormat;
 use wyrd_spec::card::verifier::extract::{
     CellValue, DocxBlock, ExtractOutput, PdfPage, PptxSlide, Table, XlsxCell, XlsxSheet,
 };
 use wyrd_spec::verification::execution::Locator;
 use zip::ZipArchive;
 
-use super::HostedLimits;
-
 /// The extractor identity recorded as `extract` provenance.
 pub const EXTRACT_VERSION: &str = "wyrd-extract/1";
+
+/// The archive and extraction limits one [`Extraction`] enforces.
+///
+/// Defaults are the approved Deployment limits; the server projects its
+/// configured limits into this shape and client-side extraction uses the
+/// defaults, so both sides refuse the same documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtractLimits {
+    /// Largest decompressed bytes per archive, including OOXML containers.
+    pub archive_max_bytes: u64,
+    /// Most entries per archive.
+    pub archive_max_entries: usize,
+    /// Largest decompressed/compressed ratio per archive.
+    pub archive_max_ratio: u64,
+    /// Most PDF pages or PPTX slides per extraction.
+    pub extract_max_pages: usize,
+    /// Most extracted text bytes per extraction.
+    pub extract_text_max_bytes: usize,
+}
+
+impl Default for ExtractLimits {
+    /// The approved Deployment limit defaults.
+    fn default() -> Self {
+        Self {
+            archive_max_bytes: 200 * 1024 * 1024,
+            archive_max_entries: 10_000,
+            archive_max_ratio: 100,
+            extract_max_pages: 500,
+            extract_text_max_bytes: 10 * 1024 * 1024,
+        }
+    }
+}
+
+/// A document the extractor refuses: a non-extractable format, bytes that do
+/// not parse as the declared format, or a limit breach.
+///
+/// Every refusal is final for these bytes; retrying cannot succeed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct ExtractError(
+    /// Why the bytes were refused, naming the format or limit; the error
+    /// displays exactly this text.
+    pub String,
+);
 
 /// Word's table column limit; a DOCX row spanning more is malformed.
 const DOCX_MAX_COLUMNS: usize = 63;
@@ -35,10 +77,10 @@ const DOCX_MAX_COLUMNS: usize = 63;
 /// One extraction under the Deployment limits.
 ///
 /// Owns the running extracted-text total so every string the parsers emit is
-/// charged against [`HostedLimits::extract_text_max_bytes`].
+/// charged against [`ExtractLimits::extract_text_max_bytes`].
 pub struct Extraction<'a> {
     /// The limits in force.
-    limits: &'a HostedLimits,
+    limits: &'a ExtractLimits,
     /// Extracted text bytes so far.
     text_bytes: usize,
 }
@@ -46,7 +88,7 @@ pub struct Extraction<'a> {
 impl<'a> Extraction<'a> {
     /// An extraction under `limits`.
     #[must_use]
-    pub const fn new(limits: &'a HostedLimits) -> Self {
+    pub const fn new(limits: &'a ExtractLimits) -> Self {
         Self {
             limits,
             text_bytes: 0,
@@ -56,10 +98,10 @@ impl<'a> Extraction<'a> {
     /// Extract `bytes` of `format` into the locked output shape.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a non-extractable format, a file
+    /// Returns [`ExtractError`] for a non-extractable format, a file
     /// that does not parse as `format`, an encrypted PDF, a document above
     /// the page or text limit, or an OOXML container failing [`zip_guard`].
-    pub fn run(mut self, bytes: &[u8], format: MediaFormat) -> Result<ExtractOutput, BlockError> {
+    pub fn run(mut self, bytes: &[u8], format: MediaFormat) -> Result<ExtractOutput, ExtractError> {
         match format {
             MediaFormat::Pdf => self.pdf(bytes),
             MediaFormat::Pptx => self.pptx(bytes),
@@ -111,8 +153,8 @@ impl<'a> Extraction<'a> {
     /// Charge `len` extracted text bytes.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] once the text limit is exceeded.
-    fn charge(&mut self, len: usize) -> Result<(), BlockError> {
+    /// Returns [`ExtractError`] once the text limit is exceeded.
+    fn charge(&mut self, len: usize) -> Result<(), ExtractError> {
         self.text_bytes = self.text_bytes.saturating_add(len);
         if self.text_bytes > self.limits.extract_text_max_bytes {
             return Err(terminal(format!(
@@ -126,8 +168,8 @@ impl<'a> Extraction<'a> {
     /// Charge and return `text`.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] once the text limit is exceeded.
-    fn text(&mut self, text: String) -> Result<String, BlockError> {
+    /// Returns [`ExtractError`] once the text limit is exceeded.
+    fn text(&mut self, text: String) -> Result<String, ExtractError> {
         self.charge(text.len())?;
         Ok(text)
     }
@@ -135,9 +177,9 @@ impl<'a> Extraction<'a> {
     /// Charge and decode UTF-8 source text.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for invalid UTF-8 or text over the
+    /// Returns [`ExtractError`] for invalid UTF-8 or text over the
     /// limit.
-    fn utf8(&mut self, bytes: &[u8], format: MediaFormat) -> Result<String, BlockError> {
+    fn utf8(&mut self, bytes: &[u8], format: MediaFormat) -> Result<String, ExtractError> {
         let text = std::str::from_utf8(bytes).map_err(|error| refused(format, &error))?;
         self.text(text.to_owned())
     }
@@ -145,8 +187,8 @@ impl<'a> Extraction<'a> {
     /// Refuse a document with more than the page limit.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] above [`HostedLimits::extract_max_pages`].
-    fn pages(&self, count: usize, what: &str) -> Result<(), BlockError> {
+    /// Returns [`ExtractError`] above [`ExtractLimits::extract_max_pages`].
+    fn pages(&self, count: usize, what: &str) -> Result<(), ExtractError> {
         if count > self.limits.extract_max_pages {
             return Err(terminal(format!(
                 "the document has {count} {what}, above the {}-{what} extraction limit",
@@ -160,9 +202,9 @@ impl<'a> Extraction<'a> {
     /// limit.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for an unparseable or encrypted PDF
+    /// Returns [`ExtractError`] for an unparseable or encrypted PDF
     /// or one over the page or text limit.
-    fn pdf(&mut self, bytes: &[u8]) -> Result<ExtractOutput, BlockError> {
+    fn pdf(&mut self, bytes: &[u8]) -> Result<ExtractOutput, ExtractError> {
         let document =
             lopdf::Document::load_mem(bytes).map_err(|error| refused(MediaFormat::Pdf, &error))?;
         if document.is_encrypted() {
@@ -187,9 +229,9 @@ impl<'a> Extraction<'a> {
     /// and speaker notes.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a container failing
+    /// Returns [`ExtractError`] for a container failing
     /// [`zip_guard`], missing or malformed parts, or limits.
-    fn pptx(&mut self, bytes: &[u8]) -> Result<ExtractOutput, BlockError> {
+    fn pptx(&mut self, bytes: &[u8]) -> Result<ExtractOutput, ExtractError> {
         let mut parts = Parts::open(bytes, MediaFormat::Pptx, self.limits)?;
         let presentation = parts.xml("ppt/presentation.xml")?;
         let rels = parts.rels("ppt/presentation.xml")?;
@@ -259,7 +301,7 @@ impl<'a> Extraction<'a> {
                         .collect::<Result<_, _>>()?;
                     Ok(Table { rows })
                 })
-                .collect::<Result<_, BlockError>>()?;
+                .collect::<Result<_, ExtractError>>()?;
             slides.push(PptxSlide {
                 number: u32::try_from(index + 1).unwrap_or(u32::MAX),
                 title,
@@ -274,9 +316,9 @@ impl<'a> Extraction<'a> {
     /// DOCX paragraphs and tables in body order.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a container failing
+    /// Returns [`ExtractError`] for a container failing
     /// [`zip_guard`], a missing or malformed document part, or limits.
-    fn docx(&mut self, bytes: &[u8]) -> Result<ExtractOutput, BlockError> {
+    fn docx(&mut self, bytes: &[u8]) -> Result<ExtractOutput, ExtractError> {
         let document =
             Parts::open(bytes, MediaFormat::Docx, self.limits)?.xml("word/document.xml")?;
         let body = document
@@ -296,13 +338,13 @@ impl<'a> Extraction<'a> {
     /// row is checked against Word's column limit before expanding.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] once the text limit is exceeded or a
+    /// Returns [`ExtractError`] once the text limit is exceeded or a
     /// row's spans are invalid or exceed [`DOCX_MAX_COLUMNS`].
     fn docx_blocks(
         &mut self,
         parent: &Node,
         blocks: &mut Vec<DocxBlock>,
-    ) -> Result<(), BlockError> {
+    ) -> Result<(), ExtractError> {
         for node in parent.nodes() {
             match node.name.as_str() {
                 "p" => blocks.push(DocxBlock::Paragraph {
@@ -364,9 +406,9 @@ impl<'a> Extraction<'a> {
     /// values, formulas, and errors.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a container failing
+    /// Returns [`ExtractError`] for a container failing
     /// [`zip_guard`], an unreadable workbook, or the text limit.
-    fn xlsx(&mut self, bytes: &[u8]) -> Result<ExtractOutput, BlockError> {
+    fn xlsx(&mut self, bytes: &[u8]) -> Result<ExtractOutput, ExtractError> {
         zip_guard(bytes, self.limits)?;
         let mut workbook =
             Xlsx::new(Cursor::new(bytes)).map_err(|error| refused(MediaFormat::Xlsx, &error))?;
@@ -415,8 +457,8 @@ impl<'a> Extraction<'a> {
     /// integral numbers serialize as integers.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] once the text limit is exceeded.
-    fn cell(&mut self, data: &Data) -> Result<Option<CellValue>, BlockError> {
+    /// Returns [`ExtractError`] once the text limit is exceeded.
+    fn cell(&mut self, data: &Data) -> Result<Option<CellValue>, ExtractError> {
         // Rust prints integral floats without a fraction, so `30.0` parses back
         // as the integer `30` and compares equal to an authored `30`.
         let number = |value: f64| value.to_string().parse().ok().map(CellValue::Number);
@@ -442,9 +484,9 @@ type CellParts<'w> = (Option<&'w Data>, Option<&'w String>);
 /// so a header that understates an entry's size cannot exceed it.
 ///
 /// # Errors
-/// Returns [`BlockError::Terminal`] for an unreadable archive or one over a
+/// Returns [`ExtractError`] for an unreadable archive or one over a
 /// limit.
-pub fn zip_guard(bytes: &[u8], limits: &HostedLimits) -> Result<(), BlockError> {
+pub fn zip_guard(bytes: &[u8], limits: &ExtractLimits) -> Result<(), ExtractError> {
     let mut archive =
         ZipArchive::new(Cursor::new(bytes)).map_err(|error| refused(MediaFormat::Zip, &error))?;
     if archive.len() > limits.archive_max_entries {
@@ -474,8 +516,8 @@ pub fn zip_guard(bytes: &[u8], limits: &HostedLimits) -> Result<(), BlockError> 
     Ok(())
 }
 
-/// Located text units of `output`, shared by `fs.read`, `fs.search`, and
-/// citation validation.
+/// Located text units of `output`, the locations citation validation
+/// accepts.
 ///
 /// PDF pages and PPTX slides are page and slide units; DOCX and XLSX text
 /// fields are JSON-pointer units into the canonical output; JSON leaves are
@@ -517,21 +559,27 @@ pub fn units(output: &ExtractOutput, source: &[u8]) -> Vec<(Locator, String)> {
         ExtractOutput::Csv { .. }
         | ExtractOutput::Text { .. }
         | ExtractOutput::Markdown { .. }
-        | ExtractOutput::Html { .. } => String::from_utf8_lossy(source)
-            .lines()
-            .enumerate()
-            .map(|(index, line)| {
-                let number = u32::try_from(index + 1).unwrap_or(u32::MAX);
-                (
-                    Locator::Lines {
-                        start: number,
-                        end: number,
-                    },
-                    line.to_owned(),
-                )
-            })
-            .collect(),
+        | ExtractOutput::Html { .. } => lines(&String::from_utf8_lossy(source)),
     }
+}
+
+/// One-line units of `text`, numbered from 1: the locators `fs.read`,
+/// `fs.search`, and citations of ordinary text files share.
+#[must_use]
+pub fn lines(text: &str) -> Vec<(Locator, String)> {
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let number = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            (
+                Locator::Lines {
+                    start: number,
+                    end: number,
+                },
+                line.to_owned(),
+            )
+        })
+        .collect()
 }
 
 /// Whether `locator` names a location in `units`.
@@ -602,16 +650,13 @@ impl<'a> Parts<'a> {
     /// Open `bytes` as an OOXML container after [`zip_guard`].
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a container failing the guard.
+    /// Returns [`ExtractError`] for a container failing the guard.
     fn open(
         bytes: &'a [u8],
         format: MediaFormat,
-        limits: &HostedLimits,
-    ) -> Result<Self, BlockError> {
-        zip_guard(bytes, limits).map_err(|error| match error {
-            BlockError::Terminal { reason } => terminal(format!("{format}: {reason}")),
-            other @ (BlockError::Retryable { .. } | BlockError::Busy { .. }) => other,
-        })?;
+        limits: &ExtractLimits,
+    ) -> Result<Self, ExtractError> {
+        zip_guard(bytes, limits).map_err(|error| terminal(format!("{format}: {error}")))?;
         let archive =
             ZipArchive::new(Cursor::new(bytes)).map_err(|error| refused(format, &error))?;
         Ok(Self { archive, format })
@@ -620,8 +665,8 @@ impl<'a> Parts<'a> {
     /// Parse part `name`.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a missing or malformed part.
-    fn xml(&mut self, name: &str) -> Result<Node, BlockError> {
+    /// Returns [`ExtractError`] for a missing or malformed part.
+    fn xml(&mut self, name: &str) -> Result<Node, ExtractError> {
         let mut bytes = Vec::new();
         self.archive
             .by_name(name)
@@ -633,8 +678,8 @@ impl<'a> Parts<'a> {
     /// The relationship targets of part `name` by ID, as container paths.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a malformed relationships part.
-    fn rels(&mut self, name: &str) -> Result<BTreeMap<String, String>, BlockError> {
+    /// Returns [`ExtractError`] for a malformed relationships part.
+    fn rels(&mut self, name: &str) -> Result<BTreeMap<String, String>, ExtractError> {
         let (dir, file) = name.rsplit_once('/').unwrap_or(("", name));
         let path = format!("{dir}/_rels/{file}.rels");
         if self.archive.index_for_name(&path).is_none() {
@@ -700,12 +745,12 @@ fn address(row: u32, col: u32) -> String {
 }
 
 /// A terminal error with `reason`.
-const fn terminal(reason: String) -> BlockError {
-    BlockError::Terminal { reason }
+const fn terminal(reason: String) -> ExtractError {
+    ExtractError(reason)
 }
 
 /// The refusal of a file that does not parse as `format`.
-fn refused(format: MediaFormat, error: &dyn std::fmt::Display) -> BlockError {
+fn refused(format: MediaFormat, error: &dyn std::fmt::Display) -> ExtractError {
     terminal(format!("the file is not a readable {format}: {error}"))
 }
 

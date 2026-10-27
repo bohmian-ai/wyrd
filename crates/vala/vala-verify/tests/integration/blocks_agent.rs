@@ -761,25 +761,45 @@ async fn check_agent_rejects_non_verdict() {
     assert!(matches!(error, BlockError::Terminal { .. }), "{error}");
 }
 
-/// A check Agent declaring a tool other than `bifrost.query` is refused
-/// before any model call.
+/// A check Agent reads its workspace through its declared tools, and a
+/// citation into a slot reachable only through that workspace survives.
 ///
 /// # Panics
-/// Panics when the check runs or the refusal does not name the allowed tool.
+/// Panics when the check is refused or the workspace citation is dropped.
 #[tokio::test(flavor = "multi_thread")]
-async fn check_agent_refuses_tools_other_than_bifrost_query() {
-    let executor = executor(Vec::new()).with_toolset(Arc::new(FixedToolset));
-    let error = check(
+async fn check_agent_reads_its_workspace_through_declared_tools() {
+    let executor = executor(vec![
+        read_call(),
+        openai_text_response(
+            &json!({"outcome": "passed", "reason": "read", "citations": [{"slot": "deck", "locator": {"page": 3}}]})
+                .to_string(),
+        ),
+    ])
+    .with_toolset(Arc::new(FixedToolset))
+    .with_evidence(Arc::new(PinnedDeck));
+    let id = tid("grounded");
+    let block = Check::Agent(agent(verdict_prompt(), &["fs.read"]));
+    let output = CheckExecutor::execute(
         &executor,
-        &agent(verdict_prompt(), &["fs.read"]),
-        input("response", json!("ok")),
+        BlockCall {
+            id: &id,
+            position: Position::VerifierCheck,
+            block: &block,
+            inputs: input("response", json!("ok")),
+            workspace: BTreeMap::from([(
+                "/inputs/report.txt".to_owned(),
+                CallInput {
+                    value: CallValue::Json(json!("report")),
+                    sources: BTreeSet::from([SlotName::new("deck").expect("slot")]),
+                },
+            )]),
+            deadline: Instant::now() + Duration::from_secs(30),
+        },
     )
     .await
-    .expect_err("check Agents may declare only bifrost.query");
-    assert!(
-        matches!(&error, BlockError::Terminal { reason } if reason.contains("bifrost.query")),
-        "{error}"
-    );
+    .expect("the check runs");
+    assert_eq!(output.verdict.outcome, VerificationVerdict::Passed);
+    assert_eq!(output.verdict.citations.len(), 1);
 }
 
 /// A per-call route override replaces the declared route: a gateway override

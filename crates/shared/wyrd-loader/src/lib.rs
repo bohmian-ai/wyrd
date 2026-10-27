@@ -8,11 +8,13 @@
 mod config;
 mod diagnose;
 mod error;
+mod extract;
 mod manifest;
 mod order;
 mod parse;
 mod path;
 mod resolve;
+mod upload;
 mod validate;
 
 use std::collections::BTreeMap;
@@ -20,8 +22,12 @@ use std::path::{Path, PathBuf};
 
 pub use diagnose::{Diagnostic, Severity, SourceSpan, emit_json};
 pub use error::LoadError;
+pub use extract::{
+    EXTRACT_VERSION, ExtractError, ExtractLimits, Extraction, lines, locates, units, zip_guard,
+};
 pub use manifest::{ArtifactManifest, build_artifact_manifest};
 pub use parse::AuthoredCard;
+pub use upload::ArtifactUpload;
 pub use wyrd_spec::registry::{CardSubmission, RelativeArtifactPath};
 
 /// The local input passed from authoring surfaces to a registration engine.

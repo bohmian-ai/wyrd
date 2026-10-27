@@ -15,7 +15,7 @@ from anthropic.types import MessageParam, TextBlock
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.testing import WyrdTestServer
 
 from ..support import Receiver, client_of

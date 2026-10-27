@@ -17,8 +17,8 @@ from typing import Any, Literal
 
 from ...cards import DeclarationReceipt
 from ...client import WyrdClient
-from ...gateway import ProviderCredentialView
-from ._commands import get, pull
+from ...gateway_admin import ProviderCredentialView
+from ._commands import artifact_files, artifact_upload, get, pull
 
 class CheckCard:
     """One Card a check would declare, identified as authored."""
@@ -221,6 +221,8 @@ __all__ = [
     "CheckReport",
     "McpHostReport",
     "McpInstallReport",
+    "artifact_files",
+    "artifact_upload",
     "declare",
     "declare_check",
     "delete_provider_credential",

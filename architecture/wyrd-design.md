@@ -474,6 +474,21 @@ spec:
   metadata: { string: NonSecretValue }
 ```
 
+`wyrd artifact upload SOURCE --name N [--version V | --bump LEVEL]
+[--artifact-kind K] [--extract]`, `Cards.upload_artifact`, and TypeScript
+`uploadArtifact` publish one regular file (at its basename) or every regular
+file of a directory (at its relative path) unchanged through the ordinary
+declaration lifecycle; symlinks, other non-regular sources, empty directories,
+and a blank `artifact_kind` are refused, and version decisions stay with the
+registry. Nothing is parsed by default. With extraction, the client runs the
+shared `wyrd-loader` extractor on each supported document `P`, publishes its
+output beside the original as `extracted/P.json`, and records
+`metadata.extraction = {version, files: [{source, output}], skipped}`; a
+caller-supplied report, an output colliding with an original, a refused
+document, or a source changing during preparation fails before anything is
+declared. `wyrd artifact files`, `list_artifacts`, and `listArtifacts` read
+the stored inventory.
+
 ### Experiment
 Run grouping for comparison and lineage.
 ```yaml
@@ -1452,7 +1467,7 @@ never a refusal: checks that need it are inconclusive.
 |---|---|
 | `assert` | A typed comparison operator over `path`, or every element of an `each` selector |
 | `trace` | Span existence, order, and attributes over a `trace` slot |
-| `agent` | An Agent, tool-less unless it explicitly declares `bifrost.query`, returning the closed Verdict schema `{outcome, reason, citations}` its Prompt declares, plus `data` when that format declares it |
+| `agent` | An Agent, with its declared tools and optional `workspace` as in a step, returning the closed Verdict schema `{outcome, reason, citations}` its Prompt declares, plus `data` when that format declares it |
 | `code` | Sandboxed Python returning the same Verdict schema; an optional `response_format` on the check declares its `data` |
 | `drift` | The existing PSI, SPC, or Custom decision over one `samples` slot, with full statistical detail |
 
@@ -1505,9 +1520,11 @@ ordinary call; a mismatch is `WYRD_SDK_422_VERIFICATION_DATA_INVALID` naming the
 requirement with the data root's empty `path` (a deeper path could hold a
 returned dictionary key), and never reruns or changes the result.
 
-A citation names an original input slot and a typed locator (`page`, `slide`,
-`lines`, `json_pointer`, or page `region`); workspace paths map back to their
-slots. The server validates every citation against the pinned evidence, and a
+A citation names an original input slot, or a fixed workspace file's
+`attachment_<n>` slot as the `fs.*` tools report it in `sources`, and a typed
+locator (`page`, `slide`, `lines`, `json_pointer`, or page `region`);
+workspace paths map back to their slots, and `/work` scratch is never a
+source. The server validates every citation against the pinned evidence, and a
 passed Agent check without a valid citation becomes inconclusive.
 
 Verifiers judge one of two evidence modes, fixed at declaration; mixing them
@@ -1789,17 +1806,33 @@ is charged to the subject.
 
 Agent owns Prompt, tools, run configuration, and `execution_route`;
 server-hosted calls require `wyrd_gateway`. Overrides are keyed by step or
-requirement ID and replace that call's route whole. A check-position Agent is
-tool-less unless it explicitly declares `bifrost.query`, its only permitted
-tool: each call needs the ordinary tool-invoke, query and payload permissions,
-there is no workspace and no mutating tool, and span data it reads live stays
-outside the pinned snapshot. A step Agent may declare a `workspace` mapping read-only `/inputs`
-paths to evidence; `/work` is bounded scratch for that invocation only.
+requirement ID and replace that call's route whole. Step and check Agents
+follow the same tool rules; span data a judge reads live stays outside the
+pinned snapshot. An Agent may declare a `workspace` mapping read-only `/inputs`
+paths to evidence: an execution-scope reference such as `inputs.policy`, or
+`{artifact: {card, path?}}`, which selects an exact inventory file, a
+directory prefix matched on `/` boundaries, or the whole collection of an
+Artifact Card that registration pins to an exact version and UID. Fixed
+selections are part of the Verifier version, so execution input cannot
+replace them and a newer Artifact version never retargets them; overlapping
+destinations are refused at declaration, and a selection matching no file is
+refused before any model call. Only selected files are staged, unparsed;
+each is a citable attachment slot counted with the other inputs. `/work` is
+bounded scratch for that invocation only.
 
 `AgentSpec.tool_names` selects server-owned built-ins: `cards.list`,
 `cards.get`, `bifrost.list_tables`,
 `bifrost.describe_table`, `bifrost.query`, `fs.list`, `fs.read`, `fs.search`,
-and `code.run`. The Invoker resolves them before the first model call through
+`fs.extract`, and `code.run`. `fs.read` returns a UTF-8 file's actual lines
+with `lines` locators and a resumable `next`, refusing directories and
+non-UTF-8 files. `fs.search` returns one bounded hit per matching line across
+visible inputs and scratch, in path order, skipping non-text files: a
+case-insensitive literal by default, with `regex`, `case_sensitive`, a `path`
+file or directory scope, and a filename `glob` (the basename, or the path
+relative to the scope when it contains `/`); an invalid pattern or scope is
+refused and a cut result says `truncated`. `fs.extract` takes one input
+`path` and a new `/work` `output_path`, writes the shared extractor's JSON
+without overwriting, and returns `{output_path, sources, extractor_version}`. The Invoker resolves them before the first model call through
 the existing `ToolResolver`/`ToolRegistry`; an unknown name fails, and
 filesystem tools and a workspace require each other. There is no fetch tool.
 Every call first needs `{"resource":"tool","action":"invoke"}` with scope

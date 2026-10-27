@@ -299,6 +299,7 @@ BuiltinTool: TypeAlias = Literal[
     "fs.list",
     "fs.read",
     "fs.search",
+    "fs.extract",
     "code.run",
 ]
 

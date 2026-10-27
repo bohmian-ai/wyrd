@@ -77,12 +77,15 @@ pub enum BuiltinTool {
     /// List workspace files.
     #[serde(rename = "fs.list")]
     FsList,
-    /// Read bounded workspace text with locators.
+    /// Read bounded UTF-8 workspace text with line locators.
     #[serde(rename = "fs.read")]
     FsRead,
-    /// Search workspace files for matching locations.
+    /// Search workspace text files for matching lines.
     #[serde(rename = "fs.search")]
     FsSearch,
+    /// Extract one workspace document into JSON under `/work`.
+    #[serde(rename = "fs.extract")]
+    FsExtract,
     /// Run sandboxed Python over the workspace.
     #[serde(rename = "code.run")]
     CodeRun,
@@ -90,7 +93,7 @@ pub enum BuiltinTool {
 
 impl BuiltinTool {
     /// Every built-in, in catalog order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::CardsList,
         Self::CardsGet,
         Self::BifrostListTables,
@@ -99,6 +102,7 @@ impl BuiltinTool {
         Self::FsList,
         Self::FsRead,
         Self::FsSearch,
+        Self::FsExtract,
         Self::CodeRun,
     ];
 
@@ -114,6 +118,7 @@ impl BuiltinTool {
             Self::FsList => "fs.list",
             Self::FsRead => "fs.read",
             Self::FsSearch => "fs.search",
+            Self::FsExtract => "fs.extract",
             Self::CodeRun => "code.run",
         }
     }
@@ -128,7 +133,10 @@ impl BuiltinTool {
     /// True for the `fs.*` tools, which read only a declared workspace.
     #[must_use]
     pub const fn is_filesystem(self) -> bool {
-        matches!(self, Self::FsList | Self::FsRead | Self::FsSearch)
+        matches!(
+            self,
+            Self::FsList | Self::FsRead | Self::FsSearch | Self::FsExtract
+        )
     }
 }
 

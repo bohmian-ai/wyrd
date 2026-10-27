@@ -21,7 +21,7 @@ import pytest
 from wyrd.bifrost import Bifrost, TableConfig
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
@@ -105,11 +105,14 @@ READ_POLICY = {
         {
             "id": "call-read-policy",
             "type": "function",
-            "function": {"name": "fs_read", "arguments": '{"path":"/inputs/policy.pdf"}'},
+            "function": {
+                "name": "fs_extract",
+                "arguments": '{"path":"/inputs/policy.pdf","output_path":"/work/policy.json"}',
+            },
         }
     ],
 }
-"""The refund reader's first turn: read its workspace copy of the policy as ``fs_read``."""
+"""The refund reader's first turn: extract its workspace copy of the policy as ``fs_extract``."""
 
 
 INVESTIGATE = {
@@ -191,6 +194,86 @@ NO_BADGE = (
 """The frame judge's Verdict for the frame showing no badge."""
 
 
+MARKER = re.compile("MARKER-[0-9a-f]{16}")
+"""The fresh source marker a handbook carries; no prompt or fixed reply ever holds one."""
+
+READ_HANDBOOK = {
+    "role": "assistant",
+    "content": None,
+    "tool_calls": [
+        {
+            "id": "call-handbook",
+            "type": "function",
+            "function": {"name": "fs_read", "arguments": '{"path":"/inputs/handbook.json"}'},
+        }
+    ],
+}
+"""The handbook judge's first turn: read its mounted handbook as ``fs_read``."""
+
+
+def handbook_verdict(messages: list[dict]) -> str:
+    """The handbook judge's Verdict once ``messages`` carry its ``fs.read`` result.
+
+    It cites the one read line holding a fresh ``MARKER`` on the slot the read
+    named, and answers no Verdict when the call ID, path, or marker is absent
+    or the read failed.
+    """
+    [read] = [each for each in messages if each.get("role") == "tool"]
+    try:
+        output = json.loads(read["content"])
+    except ValueError:
+        return "not a verdict"
+    if read.get("tool_call_id") != "call-handbook" or output.get("path") != "/inputs/handbook.json":
+        return "not a verdict"
+    hits = [
+        (unit, found)
+        for unit in output.get("units", [])
+        if (found := MARKER.search(unit["text"])) is not None
+    ]
+    if len(hits) != 1 or len(output["sources"]) != 1:
+        return "not a verdict"
+    [(unit, found)] = hits
+    citation = {"slot": output["sources"][0], "locator": unit["locator"]}
+    reason = f"the handbook names {found[0]}"
+    return json.dumps({"outcome": "passed", "reason": reason, "citations": [citation]})
+
+
+def probe_turn(messages: list[dict]) -> dict:
+    """The file probe's next turn: the next call of its prompt's script, else every result.
+
+    The prompt carries ``FS PROBE: <script>``, a JSON list of
+    ``{"tool", "arguments"}`` calls made one per turn. Once each has
+    returned, the probe answers ``done`` with every tool message's content,
+    decoded when it is JSON.
+    """
+    [prompt] = [each["content"] for each in messages if each.get("role") == "user"]
+    script = json.loads(prompt.split("FS PROBE: ", 1)[1])
+    returned = [each["content"] for each in messages if each.get("role") == "tool"]
+    if len(returned) < len(script):
+        call = script[len(returned)]
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"probe-{len(returned)}",
+                    "type": "function",
+                    "function": {
+                        "name": call["tool"].replace(".", "_"),
+                        "arguments": json.dumps(call["arguments"]),
+                    },
+                }
+            ],
+        }
+    results: list[object] = []
+    for content in returned:
+        try:
+            results.append(json.loads(content))
+        except ValueError:
+            results.append(content)
+    return {"role": "assistant", "content": json.dumps({"done": True, "results": results})}
+
+
 SLOW_SECONDS = 15.0
 """How long the ``SLOW-READER`` reader waits to answer, past its step's five-second deadline."""
 
@@ -200,7 +283,7 @@ def completion(body: dict) -> tuple[int, dict]:
 
     The refund reader fails its provider on ``PROVIDER-DOWN``, breaks its
     schema on ``OFF-SCHEMA``, and answers after ``SLOW_SECONDS`` on
-    ``SLOW-READER``; otherwise it first calls ``fs.read`` and, once the tool
+    ``SLOW-READER``; otherwise it first calls ``fs.extract`` and, once the tool
     result is back, answers a 100-dollar limit. The investigator calls each
     of its tools once and finishes once the results are back. The coding
     judge reads the trace's spans live through ``bifrost_query`` and passes,
@@ -210,7 +293,9 @@ def completion(body: dict) -> tuple[int, dict]:
     ``UNCITED`` without a citation, answers ``JUDGE-MALFORMED`` with no
     Verdict, cites a foreign pointer on ``JUDGE-FOREIGN-CITE``, and otherwise
     passes citing the answer text. The scored judge (its prompt carries
-    ``SCORE:``) answers ``scored``; every other judge agrees.
+    ``SCORE:``) answers ``scored``. The handbook judge reads its mount and
+    answers ``handbook_verdict``; the file probe plays ``probe_turn``. Every
+    other judge agrees.
     """
     text = json.dumps(body)
     returned = any(message.get("role") == "tool" for message in body.get("messages", []))
@@ -225,6 +310,14 @@ def completion(body: dict) -> tuple[int, dict]:
         elif "SLOW-READER" in text:
             time.sleep(SLOW_SECONDS)
             message = {"role": "assistant", "content": '{"max_refund":100}'}
+    elif "HANDBOOK JUDGE" in text:
+        message = (
+            {"role": "assistant", "content": handbook_verdict(body["messages"])}
+            if returned
+            else READ_HANDBOOK
+        )
+    elif "FS PROBE: " in text:
+        message = probe_turn(body["messages"])
     elif "INVESTIGATE" in text:
         message = {"role": "assistant", "content": '{"done":true}'} if returned else INVESTIGATE
     elif FRAME_CLAIM in text:

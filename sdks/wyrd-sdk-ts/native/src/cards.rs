@@ -162,6 +162,72 @@ impl NativeCards {
         })
     }
 
+    /// Publishes one file or directory as an Artifact Card through the shared
+    /// `Cards::upload_artifact`, resolving its exact Active reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The regular file or directory to publish.
+    /// * `metadata_json` - The serialized Card `Metadata`.
+    /// * `spec_json` - The serialized `ArtifactSpec`.
+    /// * `extract` - Prepare extraction outputs before declaring.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the reference cannot be serialized;
+    /// malformed metadata or spec (`WYRD_SPEC_400_VALIDATION`), preparation,
+    /// and registry failures are returned in the result.
+    #[napi]
+    pub fn upload_artifact<'env>(
+        &self,
+        env: &'env Env,
+        source: String,
+        metadata_json: String,
+        spec_json: String,
+        extract: bool,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let cards = self.cards.clone();
+        crate::trace::spawn(env, async move {
+            let invalid = |field: &str, error: serde_json::Error| WyrdError::Validation {
+                message: format!("{field} is invalid: {error}"),
+                details: serde_json::json!({ "field": field }),
+            };
+            let parsed = (
+                serde_json::from_str(&metadata_json).map_err(|error| invalid("metadata", error)),
+                serde_json::from_str(&spec_json).map_err(|error| invalid("spec", error)),
+            );
+            let result = match parsed {
+                (Ok(metadata), Ok(spec)) => {
+                    Box::pin(cards.upload_artifact(&source, metadata, spec, extract)).await
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
+    /// Lists the server inventory of one Card by exact reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the inventory cannot be serialized; an
+    /// invalid reference or registry failure is returned in the result.
+    #[napi]
+    pub fn list_artifacts<'env>(
+        &self,
+        env: &'env Env,
+        card_ref: String,
+    ) -> napi::Result<PromiseRaw<'env, NativeLifecycleResult>> {
+        let cards = self.cards.clone();
+        crate::trace::spawn(env, async move {
+            let result = match parse_card_ref(&card_ref) {
+                Ok(card_ref) => cards.list_artifacts(CardSelector::exact(card_ref)).await,
+                Err(error) => Err(error),
+            };
+            NativeLifecycleResult::outcome(result)
+        })
+    }
+
     /// Fetches one Card envelope by exact reference.
     ///
     /// # Errors

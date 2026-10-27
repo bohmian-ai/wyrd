@@ -349,6 +349,23 @@ pub(super) async fn head_watermark(fixture: &PromotionIntegrationFixture) -> (i6
         .expect("a promotion left a current snapshot")
 }
 
+/// Counts the fixture table's Iceberg snapshots.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded.
+pub(super) async fn snapshot_count(fixture: &PromotionIntegrationFixture) -> usize {
+    fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table")
+        .metadata()
+        .snapshots()
+        .count()
+}
+
 /// Promotes twice so the older snapshot is replaced and expirable.
 ///
 /// # Panics
@@ -365,12 +382,19 @@ pub(super) async fn expirable_table(name: &str) -> ExpirableTable {
         Arc::clone(&store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
         clock,
     );
-    // Two real promotion commits leave two snapshots, so the replaced first
-    // one is expirable as soon as nothing reads the table.
-    supervised.run_one_success().await;
+    // Two real promotion commits on the leader's passes leave two snapshots,
+    // so the replaced first one is expirable as soon as nothing reads the
+    // table. The worker is stopped first: compaction it would run between the
+    // passes adds snapshots and expirable objects the scenarios do not plan.
+    supervised.join_worker().await;
+    supervised.schedule_only().await;
     fixture.seal_more(2).await;
-    supervised.restart_worker();
-    supervised.run_one_success().await;
+    supervised.schedule_only().await;
+    assert_eq!(
+        snapshot_count(&fixture).await,
+        2,
+        "setup leaves exactly the two promotion snapshots"
+    );
     // Snapshot expiry has no age rule; this advance only puts the Forge clock
     // past the orphan TTL, so a never-published object seeded afterwards is
     // old enough for orphan collection.

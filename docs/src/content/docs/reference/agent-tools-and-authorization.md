@@ -19,8 +19,9 @@ A Verifier's Agent calls server built-in tools, named in its `tool_names`. There
 | `bifrost.describe_table` | Reads one table's schema | `bifrost_table:read` |
 | `bifrost.query` | Runs one read-only SQL query | `bifrost_query:read` on every table it reads |
 | `fs.list` | Lists workspace files | Workspace only |
-| `fs.read` | Reads a bounded span of a workspace file, with locators | Workspace only |
-| `fs.search` | Finds matching locations in workspace files | Workspace only |
+| `fs.read` | Reads a UTF-8 workspace file's actual lines, with `lines` locators and a resumable `next` | Workspace only |
+| `fs.search` | Finds matching lines: literal and case-insensitive by default, or `regex`, `case_sensitive`, a `path` file or directory scope, and a filename `glob` | Workspace only |
+| `fs.extract` | Extracts one supported `/inputs` document to a new `/work` `output_path` as extraction JSON | Workspace only |
 | `code.run` | Runs sandboxed Python against the workspace | Workspace only |
 
 Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/reference/verification-runtime-limits/)). Each call is recorded in the step's `tool_calls` as `tool`, `arguments`, `output_sha256` (absent when nothing was returned), `returned_bytes`, and `error` (present when the call failed).
@@ -28,7 +29,8 @@ Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/referen
 ## Rules
 
 - A step Agent with `fs.*` or `code.run` needs a `workspace`, and a `workspace` needs one of them.
-- A check Agent may declare only `bifrost.query` and has no workspace.
+- Step and check Agents follow the same rules: a check Agent may declare any tool and a `workspace`, and each call still needs its grants.
+- Nothing is parsed unless the Agent calls `fs.extract`; `fs.read` and `fs.search` serve raw text and refuse or skip binary files.
 
 ## Permissions
 
@@ -47,6 +49,5 @@ The scope is `all` or one exact tool name, never a pattern. A call runs as the p
 | --- | --- |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | The principal lacks `tool:invoke` or the resource permission; the call returns no data |
 | `WYRD_SPEC_400_VALIDATION`, rule `agent_tools` | Unknown tool name, `fs.*` without a workspace, or a workspace without `fs.*` or `code.run` |
-| `WYRD_SPEC_400_VALIDATION`, rule `check_agent_tools` | A check Agent declares a tool other than `bifrost.query` |
-| `WYRD_SPEC_400_VALIDATION`, rule `check_agent_workspace` | A check Agent has a workspace |
-| `WYRD_SPEC_400_VALIDATION`, rule `workspace_path` | A `workspace` key is not `/inputs/<name>[/<name>...]`, or contains `.` or `..` |
+| `WYRD_SPEC_400_VALIDATION`, rule `workspace_path` | A `workspace` key is not `/inputs/<name>[/<name>...]`, contains `.` or `..`, or overlaps another mount |
+| `WYRD_SPEC_400_VALIDATION`, rule `workspace_artifact` | A workspace `artifact` selection does not reference an Artifact Card |

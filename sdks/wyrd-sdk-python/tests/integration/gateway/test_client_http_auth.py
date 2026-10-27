@@ -25,7 +25,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from wyrd import WyrdError
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.state import WyrdState
 
 from ..support import Receiver, client_of, declare, pull, service_key

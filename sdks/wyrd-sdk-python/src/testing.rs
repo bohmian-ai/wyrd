@@ -553,21 +553,67 @@ impl WyrdTestServer {
         )
     }
 
-    /// Flush the server-owned Scribe after a public client drain.
+    /// Move every accepted Bifrost row as far as `to`, then confirm it is there.
     ///
-    /// The harness bounds the flush, so a Scribe that cannot settle its
-    /// staged rows fails the calling journey instead of blocking the
-    /// interpreter thread forever.
+    /// `to` is where the next query reads the rows from:
+    ///
+    /// - `published` (the default): the outbox settles, every generation
+    ///   freezes and stages, and the staged runs publish as hot objects;
+    /// - `staged`: the outbox settles and every generation freezes into a
+    ///   durable staged run, and nothing publishes; or
+    /// - `memtable`: only the outbox settles, so every row is still in the
+    ///   writable memtable.
+    ///
+    /// For `staged` and `memtable` the harness then reads where Scribe serves
+    /// each generation from and refuses a state other than the one asked for,
+    /// so a query that follows really reads that state. The harness bounds
+    /// every step, so a Scribe that cannot settle fails the calling journey
+    /// instead of blocking the interpreter thread forever.
     ///
     /// # Errors
-    /// Raises a Wyrd Python error when the context manager is inactive, the
-    /// production Scribe seal path cannot commit its buffered rows, or the
-    /// flush does not settle within the harness bound.
-    fn flush_bifrost(&self) -> WyrdPyResult<()> {
+    /// Raises a harness error for an unknown `to` or when the rows are not in
+    /// the requested state, and a Wyrd Python error when the context manager
+    /// is inactive, the production Scribe path cannot commit its buffered
+    /// rows, or a step does not settle within the harness bound.
+    #[pyo3(signature = (to = "published"))]
+    fn flush_bifrost(&self, to: &str) -> WyrdPyResult<()> {
         let server = self.started()?;
-        wyrd_runtime::runtime()
-            .block_on(server.flush_bifrost())
-            .map_err(py_error)
+        let runtime = wyrd_runtime::runtime();
+        match to {
+            "published" => runtime.block_on(server.flush_bifrost()).map_err(py_error),
+            "staged" => {
+                runtime
+                    .block_on(server.settle_bifrost_outbox())
+                    .map_err(py_error)?;
+                runtime
+                    .block_on(server.stage_bifrost_writable_for_test())
+                    .map_err(py_error)?;
+                let found = hot_authorities(server)?;
+                if found.is_empty() || found.iter().any(|label| *label != "staged_run") {
+                    return Err(harness_error(format!(
+                        "expected every generation in a staged run, found {found:?}"
+                    )));
+                }
+                Ok(())
+            }
+            "memtable" => {
+                runtime
+                    .block_on(server.settle_bifrost_outbox())
+                    .map_err(py_error)?;
+                // Scribe lists a generation only once it freezes, so an empty
+                // list means every row is still in the writable memtable.
+                let found = hot_authorities(server)?;
+                if !found.is_empty() {
+                    return Err(harness_error(format!(
+                        "expected every row in the writable memtable, found {found:?}"
+                    )));
+                }
+                Ok(())
+            }
+            other => Err(harness_error(format!(
+                "flush_bifrost(to={other:?}): expected \"memtable\", \"staged\", or \"published\""
+            ))),
+        }
     }
 
     /// Bring a binding's schedule cursor to database time, so the
@@ -735,6 +781,20 @@ fn machine_key(bootstrap: Bootstrap, unexpected: &str) -> WyrdPyResult<String> {
 /// Projects one harness failure onto the shared Wyrd boundary adapter.
 fn py_error(error: WyrdTestServerError) -> WyrdPyError {
     WyrdPyError::from(WyrdError::from(error))
+}
+
+/// Where Scribe serves each frozen generation from, as its lifecycle label.
+///
+/// # Errors
+/// Raises a Wyrd Python error when the server owns no Scribe.
+fn hot_authorities(server: &TestServer) -> WyrdPyResult<Vec<&'static str>> {
+    let authorities = server
+        .bifrost_live_authorities_for_test()
+        .map_err(py_error)?;
+    Ok(authorities
+        .iter()
+        .map(|live| live.authority.label())
+        .collect())
 }
 
 /// Builds the harness-start failure raised for a boundary-side refusal.

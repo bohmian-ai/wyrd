@@ -1,15 +1,17 @@
-//! Bounded per-call scratch workspaces for step Agents and code.
+//! Bounded per-call scratch workspaces for Agent calls and code.
 //!
 //! [`Workspaces`] admits at most [`HostedLimits::max_workspaces`] concurrent
 //! workspaces per process and refuses, rather than queues, the next one. [`Workspaces::open`] reads each declared file
 //! through [`TenantEvidence`], then materializes it under a fresh temporary
-//! directory: files and JSON under `inputs/`, archives unpacked in place
-//! after [`zip_guard`] or the equivalent tar.gz checks, and an empty
-//! `work/`. Every `/inputs` file is extracted once into the located units
-//! that `fs.read` and `fs.search` serve and keeps the original slots it came
-//! from, so tool output stays citable against original evidence. Dropping
-//! the [`Workspace`] removes the directory and releases its admission, on
-//! success, failure, or cancellation alike.
+//! directory: files and JSON under `inputs/`, uploaded evidence declared as
+//! an archive unpacked in place after [`zip_guard`] or the equivalent tar.gz
+//! checks, and an empty `work/`. Artifact files are staged unchanged. No
+//! file is parsed when mounted: `fs.read` and `fs.search` serve the actual
+//! UTF-8 lines of a file, and only `fs.extract` runs the extractor, on
+//! request, into a new `/work` file. Every `/inputs` file keeps the
+//! original slots it came from, so tool output stays citable against
+//! original evidence. Dropping the [`Workspace`] removes the directory and
+//! releases its admission, on success, failure, or cancellation alike.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
@@ -19,15 +21,18 @@ use std::sync::Arc;
 use monty_pool::{MountSpec, MountSpecMode};
 use serde_json::{Value, json};
 use skald_spec::MediaFormat;
+use skald_tool::ToolError;
 use tempfile::TempDir;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vala_verify::blocks::{BlockError, CallInput, CallValue};
+use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, zip_guard};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
-use wyrd_spec::verification::execution::Locator;
+use wyrd_spec::verification::execution::InputDeclaration;
 
-use super::HostedLimits;
 use super::evidence::TenantEvidence;
-use super::extract::{Extraction, units, zip_guard};
+use super::tools::{invocation, structured};
+use super::{HostedLimits, extract_refused};
 
 /// Process-wide admission of scratch workspaces.
 pub struct Workspaces {
@@ -52,7 +57,9 @@ impl Workspaces {
     /// Admission never waits: with every workspace taken the open is refused
     /// at once, so no waiter queue can grow toward execution deadlines and
     /// the execution is deferred instead. Evidence is read and verified
-    /// first, then written and extracted on the blocking pool.
+    /// first, then written on the blocking pool. An Artifact file keeps its
+    /// stored content type only as a hint for `fs.extract`; it is never
+    /// unpacked.
     ///
     /// # Errors
     /// Returns [`BlockError::Busy`] when every workspace is taken, the
@@ -76,9 +83,16 @@ impl Workspaces {
             let (bytes, format) = match &input.value {
                 CallValue::Json(value) => (
                     serde_json::to_vec_pretty(value).unwrap_or_default(),
-                    MediaFormat::Json,
+                    Some(MediaFormat::Json),
                 ),
-                CallValue::Evidence(declaration) => evidence.read(declaration).await?,
+                CallValue::Evidence(InputDeclaration::Artifact { artifact, path }) => {
+                    let (bytes, format) = evidence.artifact(artifact, path.as_deref()).await?;
+                    (bytes, format.filter(|format| !format.is_archive()))
+                }
+                CallValue::Evidence(declaration) => {
+                    let (bytes, format) = evidence.read(declaration).await?;
+                    (bytes, Some(format))
+                }
             };
             total = total.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
             if total > self.limits.files_max_bytes {
@@ -90,7 +104,7 @@ impl Workspaces {
             staged.push(Staged {
                 path: path.clone(),
                 bytes,
-                format: Some(format),
+                format,
                 sources: input.sources.clone(),
             });
         }
@@ -119,8 +133,8 @@ pub struct Staged {
 struct Input {
     /// Original slots behind the file.
     sources: BTreeSet<SlotName>,
-    /// Located text units; `None` for binary files with no text.
-    units: Option<Vec<(Locator, String)>>,
+    /// The declared or stored format, the format `fs.extract` reads it as.
+    format: Option<MediaFormat>,
 }
 
 /// One invocation's scratch directory.
@@ -141,13 +155,12 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Write and extract `staged` into a fresh directory.
+    /// Write `staged` into a fresh directory.
     ///
     /// # Errors
     /// Returns [`BlockError::Terminal`] for an invalid path, a duplicate
-    /// path, an unsafe or oversized archive, scratch over the limit, or an
-    /// extraction refusal, and [`BlockError::Retryable`] for a local IO
-    /// failure.
+    /// path, an unsafe or oversized archive, or scratch over the limit, and
+    /// [`BlockError::Retryable`] for a local IO failure.
     pub fn materialize(
         staged: Vec<Staged>,
         limits: HostedLimits,
@@ -184,12 +197,11 @@ impl Workspace {
         Ok(workspace)
     }
 
-    /// Write one file at virtual `path` and extract its units.
+    /// Write one file at virtual `path`, unparsed.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a duplicate path, scratch over the
-    /// limit, or an extraction refusal of a known format, and
-    /// [`BlockError::Retryable`] for a local IO failure.
+    /// Returns [`BlockError::Terminal`] for a duplicate path or scratch over
+    /// the limit, and [`BlockError::Retryable`] for a local IO failure.
     fn place(
         &mut self,
         path: String,
@@ -208,19 +220,9 @@ impl Workspace {
                 self.limits.scratch_max_bytes
             )));
         }
-        let format = format.or_else(|| {
-            std::str::from_utf8(&bytes)
-                .is_ok()
-                .then_some(MediaFormat::Text)
-        });
-        let units = match format {
-            Some(format) if format.is_extractable() => {
-                let output = Extraction::new(&self.limits).run(&bytes, format)?;
-                Some(units(&output, &bytes))
-            }
-            _ => None,
-        };
-        let host = self.host(&path)?;
+        let host = self
+            .host(&path)
+            .ok_or_else(|| terminal(format!("{path} is not under /inputs or /work")))?;
         if let Some(parent) = host.parent() {
             std::fs::create_dir_all(parent).map_err(io)?;
         }
@@ -229,7 +231,7 @@ impl Workspace {
             path,
             Input {
                 sources: sources.clone(),
-                units,
+                format,
             },
         );
         Ok(())
@@ -241,7 +243,7 @@ impl Workspace {
     /// Returns [`BlockError::Terminal`] for a guarded limit, an entry that is
     /// a link or escapes the archive, or a file over the file limit.
     fn unzip(&mut self, file: &Staged, scratch: &mut u64) -> Result<(), BlockError> {
-        zip_guard(&file.bytes, &self.limits)?;
+        zip_guard(&file.bytes, &self.limits.extract()).map_err(extract_refused)?;
         let mut archive = zip::ZipArchive::new(Cursor::new(file.bytes.as_slice()))
             .map_err(|error| terminal(format!("{}: {error}", file.path)))?;
         for index in 0..archive.len() {
@@ -366,16 +368,13 @@ impl Workspace {
         )
     }
 
-    /// The host path of a virtual `/inputs` or `/work` path.
-    ///
-    /// # Errors
-    /// Returns [`BlockError::Terminal`] for any other or unsafe path.
-    fn host(&self, path: &str) -> Result<PathBuf, BlockError> {
+    /// The host path of a virtual `/inputs` or `/work` path, or `None` for
+    /// any other or unsafe path.
+    fn host(&self, path: &str) -> Option<PathBuf> {
         let (dir, rest) = relative(path, "/inputs/")
             .map(|rest| ("inputs", rest))
-            .or_else(|| relative(path, "/work/").map(|rest| ("work", rest)))
-            .ok_or_else(|| terminal(format!("{path} is not under /inputs or /work")))?;
-        Ok(self.root.path().join(dir).join(rest))
+            .or_else(|| relative(path, "/work/").map(|rest| ("work", rest)))?;
+        Some(self.root.path().join(dir).join(rest))
     }
 
     /// The host directory mounted at `/inputs`.
@@ -409,31 +408,36 @@ impl Workspace {
     /// # Errors
     /// Returns [`BlockError::Retryable`] when a mount directory cannot open.
     pub fn mounts(&self) -> Result<Vec<MountSpec>, BlockError> {
-        let held: u64 = walkdir(&self.work_dir(), usize::MAX)
-            .0
-            .iter()
-            .map(|(_, size)| size)
-            .sum();
         let unopened = |error: monty_pool::PoolError| BlockError::Retryable {
             reason: format!("a workspace mount failed: {error}"),
         };
         let mut work =
             MountSpec::new("/work", self.work_dir(), MountSpecMode::ReadWrite).map_err(unopened)?;
-        work.write_bytes_limit = Some(
-            self.limits
-                .work_write_max_bytes
-                .min(
-                    self.limits
-                        .scratch_max_bytes
-                        .saturating_sub(self.inputs_bytes),
-                )
-                .saturating_sub(held),
-        );
+        work.write_bytes_limit = Some(self.work_room());
         Ok(vec![
             MountSpec::new("/inputs", self.inputs_dir(), MountSpecMode::ReadOnly)
                 .map_err(unopened)?,
             work,
         ])
+    }
+
+    /// The bytes `/work` may still grow by: the smaller of the `/work` write
+    /// limit and the scratch left after inputs, less what `/work` holds now,
+    /// measured from disk. Call it while holding [`Self::writer`].
+    fn work_room(&self) -> u64 {
+        let held: u64 = walkdir(&self.work_dir(), usize::MAX)
+            .0
+            .iter()
+            .map(|(_, size)| size)
+            .sum();
+        self.limits
+            .work_write_max_bytes
+            .min(
+                self.limits
+                    .scratch_max_bytes
+                    .saturating_sub(self.inputs_bytes),
+            )
+            .saturating_sub(held)
     }
 
     /// Original slots behind `/inputs` file `path`.
@@ -450,11 +454,12 @@ impl Workspace {
     /// costs no more than the result it fills; `truncated` says so.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a path outside the workspace.
-    pub fn list(&self, dir: &str) -> Result<Value, BlockError> {
+    /// Returns a `workspace_path` [`invalid`] refusal for a path outside the
+    /// workspace.
+    pub fn list(&self, dir: &str) -> Result<Value, ToolError> {
         let prefix = format!("{}/", dir.trim_end_matches('/'));
-        if prefix != "/inputs/" && prefix != "/work/" {
-            self.host(&prefix)?;
+        if prefix != "/inputs/" && prefix != "/work/" && self.host(dir).is_none() {
+            return Err(outside(dir));
         }
         let mut files = Collected::new(
             &json!({"files": [], "truncated": false}),
@@ -466,7 +471,10 @@ impl Workspace {
             .range(prefix.clone()..)
             .take_while(|(path, _)| path.starts_with(&prefix))
         {
-            let size = std::fs::metadata(self.host(path)?).map_or(0, |meta| meta.len());
+            let size = self
+                .host(path)
+                .and_then(|host| std::fs::metadata(host).ok())
+                .map_or(0, |meta| meta.len());
             if !files.push(json!({"path": path, "size_bytes": size, "sources": input.sources})) {
                 truncated = true;
                 break;
@@ -488,29 +496,22 @@ impl Workspace {
         Ok(json!({"files": files.items, "truncated": truncated}))
     }
 
-    /// `fs.read`: located text units of `path` from piece `start`, bounded
-    /// by the tool result limit by their actual JSON size; `next` resumes.
+    /// `fs.read`: the UTF-8 lines of `path` from piece `start`, each with
+    /// its line locator, bounded by the tool result limit by their actual
+    /// JSON size; `next` resumes.
     ///
-    /// Units longer than an eighth of the result budget are split into
-    /// pieces that keep the unit's original locator, so every character of
-    /// a long line or page is reachable by following `next`. Piece indices
-    /// depend only on the file and the limits. `sources` names the original
-    /// slots of an `/inputs` file and is empty for `/work` files.
+    /// Lines longer than an eighth of the result budget are split into
+    /// pieces that keep the line's locator, so every character of a long
+    /// line is reachable by following `next`. Piece indices depend only on
+    /// the file and the limits. `sources` names the original slots of an
+    /// `/inputs` file and is empty for `/work` files. Nothing is parsed.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for an unknown, binary, linked, or
-    /// unreadable path, or a path too long for any piece to fit the limit.
-    pub fn read(&self, path: &str, start: usize) -> Result<Value, BlockError> {
-        let owned;
-        let (units, sources) = if let Some(input) = self.inputs.get(path) {
-            let units = input.units.as_deref().ok_or_else(|| {
-                terminal(format!("{path} is binary; bind it as native media instead"))
-            })?;
-            (units, json!(input.sources))
-        } else {
-            owned = self.work_units(path)?;
-            (owned.as_slice(), json!([]))
-        };
+    /// Returns [`Self::text`]'s errors and a `result_limit` [`invalid`]
+    /// refusal for a path too long for any piece to fit the limit.
+    pub fn read(&self, path: &str, start: usize) -> Result<Value, ToolError> {
+        let (text, sources) = self.text(path)?;
+        let units = lines(&text);
         let mut out = Collected::new(
             &json!({"path": path, "sources": sources, "units": [], "next": usize::MAX}),
             self.limits.tool_result_max_bytes,
@@ -523,10 +524,16 @@ impl Workspace {
         for (index, (locator, text)) in pieces.enumerate().skip(start) {
             if !out.push(json!({"locator": locator, "text": text})) {
                 if out.items.is_empty() {
-                    return Err(terminal(format!(
-                        "{path} cannot be read within the {}-byte tool result limit",
-                        self.limits.tool_result_max_bytes
-                    )));
+                    return Err(invalid(
+                        "result_limit",
+                        "path",
+                        path,
+                        format!(
+                            "{path} cannot be read within the {}-byte tool result limit",
+                            self.limits.tool_result_max_bytes
+                        ),
+                        "a shorter path",
+                    ));
                 }
                 next = Some(index);
                 break;
@@ -535,53 +542,227 @@ impl Workspace {
         Ok(json!({"path": path, "sources": sources, "units": out.items, "next": next}))
     }
 
-    /// `fs.search`: case-insensitive literal matches of `query` with their
-    /// locators and original slots, across `/inputs` and text files in
-    /// `/work`, bounded by the tool result limit.
+    /// `fs.search`: one hit per text line matching `search`, with its line
+    /// locator, a bounded snippet, and the file's original slots, across
+    /// `/inputs` and readable `/work` text in path then line order, bounded
+    /// by the tool result limit.
     ///
+    /// A literal query matches as written; `regex` reads it as Rust regex
+    /// syntax. Both ignore case unless `case_sensitive`. `path` scopes the
+    /// search to one file or, recursively, one directory; `glob` keeps the
+    /// files whose basename (a pattern without `/`) or path relative to the
+    /// scoped directory (the file's parent for a file scope, the workspace
+    /// root without a scope) it matches, `*` within one segment and `**`
+    /// across segments. Binary and non-UTF-8 files are skipped unparsed.
     /// Files are visited lazily and the `/work` walk is capped like
     /// [`Self::list`], so the search stops as soon as the result is full.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for an empty query.
-    pub fn search(&self, query: &str) -> Result<Value, BlockError> {
-        let needle = query.to_lowercase();
-        if needle.is_empty() {
-            return Err(terminal("the search query is empty".to_owned()));
+    /// Returns an [`invalid`] refusal: `search_query` for an empty query,
+    /// `search_pattern` for an invalid pattern, [`glob`]'s refusals, and
+    /// [`Self::scope`]'s.
+    pub fn search(&self, search: &Search) -> Result<Value, ToolError> {
+        if search.query.is_empty() {
+            return Err(invalid(
+                "search_query",
+                "query",
+                "",
+                "the search query is empty".to_owned(),
+                "non-empty text or regex",
+            ));
         }
+        let pattern = if search.regex {
+            search.query.clone()
+        } else {
+            regex::escape(&search.query)
+        };
+        let matcher = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(!search.case_sensitive)
+            .build()
+            .map_err(|error| {
+                invalid(
+                    "search_pattern",
+                    "query",
+                    &search.query,
+                    format!("the search pattern is invalid: {error}"),
+                    "Rust regex syntax",
+                )
+            })?;
+        let scope = search
+            .path
+            .as_deref()
+            .map(|path| self.scope(path))
+            .transpose()?;
+        let glob = search.glob.as_deref().map(glob).transpose()?;
+        let base = match &scope {
+            None => "/".to_owned(),
+            Some(Scope::File(path)) => path
+                .rsplit_once('/')
+                .map_or_else(String::new, |(parent, _)| format!("{parent}/")),
+            Some(Scope::Dir(prefix)) => prefix.clone(),
+        };
         let mut matches = Collected::new(
             &json!({"matches": [], "truncated": false}),
             self.limits.tool_result_max_bytes,
         );
         let (work, cut) = walkdir(&self.work_dir(), self.walk_limit());
-        let inputs = self.inputs.iter().filter_map(|(path, input)| {
-            Some((
-                path.clone(),
-                json!(input.sources),
-                std::borrow::Cow::Borrowed(input.units.as_deref()?),
-            ))
-        });
-        let work = work.into_iter().filter_map(|(path, _)| {
-            let path = format!("/work/{path}");
-            let units = self.work_units(&path).ok()?;
-            Some((path, json!([]), std::borrow::Cow::Owned(units)))
-        });
-        for (path, sources, units) in inputs.chain(work) {
-            for (locator, text) in units.iter() {
-                if let Some(at) = text.to_lowercase().find(&needle) {
-                    let found = json!({
-                        "path": path,
-                        "locator": locator,
-                        "snippet": snippet(text, at, needle.len()),
-                        "sources": sources,
-                    });
-                    if !matches.push(found) {
-                        return Ok(json!({"matches": matches.items, "truncated": true}));
-                    }
+        let candidates = self
+            .inputs
+            .keys()
+            .cloned()
+            .chain(work.into_iter().map(|(path, _)| format!("/work/{path}")))
+            .filter(|path| match &scope {
+                None => true,
+                Some(Scope::File(file)) => path == file,
+                Some(Scope::Dir(prefix)) => path.starts_with(prefix.as_str()),
+            })
+            .filter(|path| {
+                glob.as_ref().is_none_or(|(pattern, nested)| {
+                    let name = if *nested {
+                        path.strip_prefix(base.as_str()).unwrap_or(path)
+                    } else {
+                        path.rsplit('/').next().unwrap_or(path)
+                    };
+                    pattern.matches_with(
+                        name,
+                        glob::MatchOptions {
+                            case_sensitive: true,
+                            require_literal_separator: true,
+                            require_literal_leading_dot: false,
+                        },
+                    )
+                })
+            });
+        for path in candidates {
+            let Ok((text, sources)) = self.text(&path) else {
+                continue;
+            };
+            for (locator, line) in lines(&text) {
+                let Some(found) = matcher.find(&line) else {
+                    continue;
+                };
+                let hit = json!({
+                    "path": path,
+                    "locator": locator,
+                    "snippet": snippet(&line, found.start()),
+                    "sources": sources,
+                });
+                if !matches.push(hit) {
+                    return Ok(json!({"matches": matches.items, "truncated": true}));
                 }
             }
         }
         Ok(json!({"matches": matches.items, "truncated": cut}))
+    }
+
+    /// `fs.extract`: run the shared extractor over workspace file `path` and
+    /// write its `ExtractOutput` JSON to the new `/work` file `output_path`.
+    ///
+    /// The document's format is its declared or stored format, else its
+    /// extension. The output is written to a temporary file outside `/work`
+    /// and moved into place only when complete and never over an existing
+    /// file, so a failure leaves no usable destination. Call it while
+    /// holding [`Self::writer`] so the `/work` budget it checks stays true.
+    ///
+    /// # Errors
+    /// Returns [`Self::file`]'s errors and an [`invalid`] refusal:
+    /// `extractable_document` for an unextractable file,
+    /// `extraction_refused` when the extractor refuses it, `output_path`
+    /// for an output outside `/work`, `output_exists` for one already
+    /// present, and `work_budget` for one over the `/work` budget. A local
+    /// IO or serialization failure is an [`invocation`] failure.
+    pub fn extract(&self, path: &str, output_path: &str) -> Result<Value, ToolError> {
+        let (host, sources) = self.file(path)?;
+        let format = self
+            .inputs
+            .get(path)
+            .and_then(|input| input.format)
+            .or_else(|| {
+                path.rsplit_once('.')
+                    .and_then(|(_, extension)| extension.parse().ok())
+            })
+            .filter(|format: &MediaFormat| format.is_extractable())
+            .ok_or_else(|| {
+                invalid(
+                    "extractable_document",
+                    "path",
+                    path,
+                    format!("{path} is not an extractable document"),
+                    "a PDF, DOCX, PPTX, XLSX, HTML, or other extractable document",
+                )
+            })?;
+        let new_path = |message: String| {
+            invalid(
+                "output_path",
+                "output_path",
+                output_path,
+                message,
+                "a new file path under /work",
+            )
+        };
+        let exists = || {
+            invalid(
+                "output_exists",
+                "output_path",
+                output_path,
+                format!("{output_path} already exists"),
+                "a /work path that does not exist yet",
+            )
+        };
+        let rest = relative(output_path, "/work/")
+            .ok_or_else(|| new_path(format!("{output_path} is not a new file path under /work")))?;
+        let target = self.work_dir().join(rest);
+        if target.symlink_metadata().is_ok() {
+            return Err(exists());
+        }
+        let bytes = std::fs::read(&host).map_err(failed)?;
+        let output = Extraction::new(&self.limits.extract())
+            .run(&bytes, format)
+            .map_err(|error| {
+                invalid(
+                    "extraction_refused",
+                    "path",
+                    path,
+                    format!("{path} cannot be extracted: {}", error.0),
+                    "a well-formed document within the extraction limits",
+                )
+            })?;
+        let json = serde_json::to_vec_pretty(&output)
+            .map_err(|error| invocation(format!("the extraction does not serialize: {error}")))?;
+        if u64::try_from(json.len()).unwrap_or(u64::MAX) > self.work_room() {
+            return Err(invalid(
+                "work_budget",
+                "output_path",
+                output_path,
+                format!("{output_path} would exceed the /work write budget"),
+                "fewer or smaller /work files",
+            ));
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(failed)?;
+            let confined = parent
+                .canonicalize()
+                .ok()
+                .zip(self.work_dir().canonicalize().ok())
+                .is_some_and(|(parent, work)| parent.starts_with(work));
+            if !confined {
+                return Err(new_path(format!("{output_path} escapes /work")));
+            }
+        }
+        let mut staged = tempfile::NamedTempFile::new_in(self.root.path()).map_err(failed)?;
+        std::io::Write::write_all(&mut staged, &json).map_err(failed)?;
+        staged.persist_noclobber(&target).map_err(|error| {
+            if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                exists()
+            } else {
+                failed(error.error)
+            }
+        })?;
+        Ok(json!({
+            "output_path": output_path,
+            "sources": sources,
+            "extractor_version": EXTRACT_VERSION,
+        }))
     }
 
     /// Most `/work` entries a list or search visits: no result could show
@@ -590,26 +771,175 @@ impl Workspace {
         self.limits.tool_result_max_bytes / 16
     }
 
-    /// Line units of a UTF-8 `/work` file.
+    /// The search scope `path` names: one workspace file, or a directory as
+    /// its `/`-terminated prefix.
     ///
     /// # Errors
-    /// Returns [`BlockError::Terminal`] for a path outside `/work`, a link,
-    /// a missing, oversized, or non-UTF-8 file.
-    fn work_units(&self, path: &str) -> Result<Vec<(Locator, String)>, BlockError> {
-        relative(path, "/work/").ok_or_else(|| terminal(format!("{path} does not exist")))?;
-        let host = self.host(path)?;
-        let meta = std::fs::symlink_metadata(&host)
-            .map_err(|_| terminal(format!("{path} does not exist")))?;
+    /// Returns a `workspace_missing` [`invalid`] refusal for a path naming
+    /// neither.
+    fn scope(&self, path: &str) -> Result<Scope, ToolError> {
+        if self.file(path).is_ok() {
+            return Ok(Scope::File(path.to_owned()));
+        }
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let input_dir = prefix == "/inputs/"
+            || self
+                .inputs
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|(input, _)| input.starts_with(&prefix));
+        let work_dir = prefix == "/work/"
+            || relative(path.trim_end_matches('/'), "/work/").is_some_and(|rest| {
+                self.work_dir()
+                    .join(rest)
+                    .symlink_metadata()
+                    .is_ok_and(|meta| meta.is_dir())
+            });
+        if input_dir || work_dir {
+            Ok(Scope::Dir(prefix))
+        } else {
+            Err(missing(path))
+        }
+    }
+
+    /// The UTF-8 text and sources of workspace file `path`.
+    ///
+    /// # Errors
+    /// Returns [`Self::file`]'s errors, a `utf8_text` [`invalid`] refusal
+    /// for bytes that are not UTF-8 text, and an [`invocation`] failure for
+    /// a local IO failure.
+    fn text(&self, path: &str) -> Result<(String, Value), ToolError> {
+        let (host, sources) = self.file(path)?;
+        let text = String::from_utf8(std::fs::read(&host).map_err(failed)?).map_err(|_| {
+            invalid(
+                "utf8_text",
+                "path",
+                path,
+                format!(
+                    "{path} is not UTF-8 text; extract it with fs.extract or read it with code.run"
+                ),
+                "a UTF-8 text file",
+            )
+        })?;
+        Ok((text, sources))
+    }
+
+    /// The host path and sources of regular workspace file `path`: a
+    /// materialized `/inputs` file, or a `/work` file within the work budget.
+    ///
+    /// # Errors
+    /// Returns an [`invalid`] refusal: `workspace_path` for a path outside
+    /// the workspace, `workspace_missing` for a missing file,
+    /// `regular_file` for a directory or link, and `work_budget` for an
+    /// oversized file.
+    fn file(&self, path: &str) -> Result<(PathBuf, Value), ToolError> {
+        if let Some(input) = self.inputs.get(path) {
+            return Ok((
+                self.host(path).ok_or_else(|| outside(path))?,
+                json!(input.sources),
+            ));
+        }
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let directory = || {
+            invalid(
+                "regular_file",
+                "path",
+                path,
+                format!("{path} is a directory; list it with fs.list"),
+                "a regular file",
+            )
+        };
+        if prefix == "/inputs/"
+            || prefix == "/work/"
+            || self
+                .inputs
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|(input, _)| input.starts_with(&prefix))
+        {
+            return Err(directory());
+        }
+        let host = self.host(path).ok_or_else(|| outside(path))?;
+        let meta = relative(path, "/work/")
+            .and_then(|_| host.symlink_metadata().ok())
+            .ok_or_else(|| missing(path))?;
+        if meta.is_dir() {
+            return Err(directory());
+        }
         if !meta.is_file() {
-            return Err(terminal(format!("{path} is not a regular file")));
+            return Err(invalid(
+                "regular_file",
+                "path",
+                path,
+                format!("{path} is not a regular file"),
+                "a regular file",
+            ));
         }
         if meta.len() > self.limits.work_write_max_bytes {
-            return Err(terminal(format!("{path} exceeds the work budget")));
+            return Err(invalid(
+                "work_budget",
+                "path",
+                path,
+                format!("{path} exceeds the work budget"),
+                "a file within the /work write budget",
+            ));
         }
-        let bytes = std::fs::read(&host).map_err(io)?;
-        let output = Extraction::new(&self.limits).run(&bytes, MediaFormat::Text)?;
-        Ok(units(&output, &bytes))
+        Ok((host, json!([])))
     }
+}
+
+/// The arguments of one `fs.search`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Search {
+    /// The text, or with `regex` the pattern, a line must contain.
+    pub query: String,
+    /// Read `query` as Rust regex syntax instead of literal text.
+    #[serde(default)]
+    pub regex: bool,
+    /// Match case exactly instead of ignoring it.
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// One workspace file or directory to search instead of all of them.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// A filename pattern the searched files must match.
+    #[serde(default)]
+    pub glob: Option<String>,
+}
+
+/// What one `fs.search` scope names.
+enum Scope {
+    /// Exactly this workspace file.
+    File(String),
+    /// Every file under this `/`-terminated directory prefix.
+    Dir(String),
+}
+
+/// `pattern` compiled as a filename glob, and whether it matches whole
+/// relative paths (it holds a `/`) rather than basenames.
+///
+/// # Errors
+/// Returns a `search_glob` [`invalid`] refusal for an absolute, `..`, or
+/// malformed pattern.
+fn glob(pattern: &str) -> Result<(glob::Pattern, bool), ToolError> {
+    let refused = |message: String| {
+        invalid(
+            "search_glob",
+            "glob",
+            pattern,
+            message,
+            "a relative glob without .. segments",
+        )
+    };
+    if pattern.starts_with('/') || pattern.split('/').any(|segment| segment == "..") {
+        return Err(refused(format!(
+            "the glob {pattern} must be relative without .. segments"
+        )));
+    }
+    let compiled = glob::Pattern::new(pattern)
+        .map_err(|error| refused(format!("the glob {pattern} is invalid: {error}")))?;
+    Ok((compiled, pattern.contains('/')))
 }
 
 /// The relative remainder of `path` under `prefix` when every segment is
@@ -704,10 +1034,12 @@ impl Collected {
     }
 }
 
-/// About 80 bytes of `text` around the match at byte `at`.
-fn snippet(text: &str, at: usize, len: usize) -> String {
+/// At most 160 bytes of `text` from 40 before the match at byte `at`,
+/// cut on UTF-8 boundaries and independent of the match's length, so a
+/// regex spanning a long line still yields a hit that fits the result.
+fn snippet(text: &str, at: usize) -> String {
     let text = &text[text.floor_char_boundary(at.saturating_sub(40))..];
-    text[..text.floor_char_boundary(80 + len)].to_owned()
+    text[..text.floor_char_boundary(160)].to_owned()
 }
 
 /// A terminal error with `reason`.
@@ -720,6 +1052,42 @@ fn io(error: std::io::Error) -> BlockError {
     BlockError::Retryable {
         reason: format!("workspace IO failed: {error}"),
     }
+}
+
+/// A local IO failure during a tool call.
+fn failed(error: std::io::Error) -> ToolError {
+    invocation(format!("workspace IO failed: {error}"))
+}
+
+/// A tool call the model can repair: Validation naming the violated `rule`,
+/// the argument `field`, its `value`, and what was `expected`.
+fn invalid(rule: &str, field: &str, value: &str, message: String, expected: &str) -> ToolError {
+    structured(&WyrdError::Validation {
+        message,
+        details: json!({"rule": rule, "field": field, "value": value, "expected": expected}),
+    })
+}
+
+/// A path outside `/inputs` and `/work`, or with an unsafe segment.
+fn outside(path: &str) -> ToolError {
+    invalid(
+        "workspace_path",
+        "path",
+        path,
+        format!("{path} is not under /inputs or /work"),
+        "a path under /inputs or /work without empty, . or .. segments",
+    )
+}
+
+/// A workspace path naming no file or directory.
+fn missing(path: &str) -> ToolError {
+    invalid(
+        "workspace_missing",
+        "path",
+        path,
+        format!("{path} does not exist"),
+        "a path fs.list reports",
+    )
 }
 
 #[cfg(test)]

@@ -1,0 +1,12 @@
+# A Service judged twice against one uploaded Artifact: each Verifier's judge
+# mounts the prepared extraction of the staff handbook, reads it with fs.read,
+# and cites the line it found.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: handbook-desk
+  version: 1.0.0
+spec:
+  verified_by:
+    - verifier: ./handbook-review.yaml
+    - verifier: ./handbook-audit.yaml

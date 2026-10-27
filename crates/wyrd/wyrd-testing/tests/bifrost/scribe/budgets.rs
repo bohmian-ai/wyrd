@@ -127,9 +127,14 @@ async fn scribe_shards_obey_global_and_tenant_budgets() {
         .iter()
         .map(|bucket| bucket.writable_bytes + bucket.immutable_bytes)
         .sum();
+    // A span or audit copy staged after the settle can still be in flight, so
+    // the shards account for exactly their buckets plus that transient ingest.
+    let transient: usize = loaded.transient_memory_by_shard.iter().sum();
     assert_eq!(
-        by_shard, by_bucket,
-        "per-shard ownership {by_shard} must account for exactly the buckets {by_bucket}"
+        by_shard,
+        by_bucket + transient,
+        "per-shard ownership {by_shard} must account for exactly the buckets {by_bucket} \
+         and transient ingest {transient}"
     );
     assert!(
         by_bucket > 0 && by_bucket <= loaded.total_accounted_memory,

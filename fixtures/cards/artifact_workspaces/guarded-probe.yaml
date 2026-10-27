@@ -1,0 +1,22 @@
+# A file probe declaring no fs.list, so a call to it is refused as unattached.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: guarded-probe
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [fs.read, fs.search, fs.extract]
+  run_config: {max_iterations: 24}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "FS PROBE: {{script}}"
+    response_format:
+      type: object
+      properties:
+        done: {type: boolean}
+        results: {type: array}
+      required: [done, results]

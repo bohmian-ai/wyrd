@@ -3,7 +3,8 @@
 Two states over one Service are configured for ``prod`` and ``staging``. Each
 starts telemetry and, inside one Run, verifies, submits, calls the gateway,
 and emits a span, a log record, and a metric point. Querying any table by a
-context column alone then returns exactly the records written under it.
+context column alone then returns exactly the records written under it, whether
+the rows are still in Scribe's memtable, staged, or published.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 from http.server import ThreadingHTTPServer
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 import openai
@@ -24,7 +25,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from wyrd import verify
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.otel import span_exporter
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
@@ -161,8 +162,12 @@ def contexts(server: WyrdTestServer, table: str, where: str) -> list[dict[str, A
     return query(server, f"SELECT DISTINCT {CONTEXT} FROM {table} WHERE {where}")
 
 
+@pytest.mark.parametrize("storage_state", ["memtable", "staged", "published"])
 def test_configure_stamps_every_table_and_each_context_column_finds_the_records(
-    server: WyrdTestServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: WyrdTestServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    storage_state: Literal["memtable", "staged", "published"],
 ) -> None:
     bundle, key, _ = configured_service(server, tmp_path)
 
@@ -182,7 +187,7 @@ def test_configure_stamps_every_table_and_each_context_column_finds_the_records(
         deployment_environment="staging",
     )
     staging_run, staging_verified, staging_submitted = run_the_agent(staging, server)
-    server.flush_bifrost()
+    server.flush_bifrost(to=storage_state)
 
     service = str(prod.root_ref.uid)
     agent = str(prod.card_ref("agent").uid)

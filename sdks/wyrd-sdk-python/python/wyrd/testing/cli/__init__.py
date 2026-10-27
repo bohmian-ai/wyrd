@@ -22,7 +22,7 @@ from wyrd._wyrd.testing.cli import (
     revoke_provider_credential,
 )
 
-from ._commands import get, pull
+from ._commands import artifact_files, artifact_upload, get, pull
 
 __all__ = [
     "CheckCard",
@@ -30,6 +30,8 @@ __all__ = [
     "CheckReport",
     "McpHostReport",
     "McpInstallReport",
+    "artifact_files",
+    "artifact_upload",
     "declare",
     "declare_check",
     "delete_provider_credential",

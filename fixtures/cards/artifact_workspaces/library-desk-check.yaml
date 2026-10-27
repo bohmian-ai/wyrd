@@ -1,0 +1,36 @@
+# Mounts one file, one directory, a document, and opaque bytes of workspace-library 1.0.0.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: library-desk-check
+  version: 1.0.0
+spec:
+  inputs:
+    script: {type: json, schema: {type: array}}
+  steps:
+    - id: probe
+      action:
+        kind: agent
+        agent: ./file-probe.yaml
+        inputs: {script: inputs.script}
+        workspace:
+          /inputs/guide.md:
+            artifact:
+              card: {kind: Artifact, name: workspace-library, version: 1.0.0}
+              path: docs/guide.md
+          /inputs/docs:
+            artifact:
+              card: {kind: Artifact, name: workspace-library, version: 1.0.0}
+              path: docs
+          /inputs/policy.pdf:
+            artifact:
+              card: {kind: Artifact, name: workspace-library, version: 1.0.0}
+              path: policy.pdf
+          /inputs/blob.bin:
+            artifact:
+              card: {kind: Artifact, name: workspace-library, version: 1.0.0}
+              path: blob.bin
+  requirements:
+    - id: probed
+      statement: The probe played its script
+      check: {kind: assert, path: steps.probe.output.done, operator: equals, expected: true}

@@ -1,6 +1,6 @@
 ---
 title: Recipes
-description: Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, grouped sessions, and drift.
+description: Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
 pillar: wyrd
 section: Build and verify
 topic: Verify
@@ -17,6 +17,7 @@ Pick the check you need, bind its Verifier under `verified_by` to what it checks
 | Logic an operator cannot express | [Python check](#python-check) |
 | Meaning, tone, or policy | [Model judge](#model-judge) |
 | An answer against a document | [Multi-step](#multi-step) |
+| An answer against files you upload once | [Uploaded files](#uploaded-files) |
 | A whole conversation, not one reply | [Grouped session](#grouped-session) |
 | Inputs or outputs shifting over time | [Drift](#drift) |
 
@@ -372,6 +373,49 @@ for step in result.steps:  # each step's status, for debugging
 </Tabs>
 
 Steps can also be `agent` actions, which read files with built-in tools. [Actions](/reference/verifier-card/#actions) lists each kind.
+
+## Uploaded files
+
+Upload a file or directory once as an Artifact Card, then mount the exact files a judge needs into its workspace.
+
+```bash
+wyrd artifact upload ./handbook --name staff-handbook --version 1.0.0 --extract
+```
+
+The command prints the exact Active reference, UID included. Each file keeps its path relative to `./handbook`, byte for byte. Nothing is parsed unless you pass `--extract`; then each supported document `P` is also published as `extracted/P.json` before the Card is declared, and `spec.metadata.extraction` records the report.
+
+The version follows the ordinary rules: uploading the same bytes to a pinned version returns the same Card, changed bytes under it are refused with `WYRD_REGISTRY_409_SPEC_DRIFT`, and `--bump patch` without `--version` publishes the next version. List what a version holds from the server:
+
+```bash
+wyrd artifact files --kind Artifact --name staff-handbook --version 1.0.0
+```
+
+The SDKs run the same upload:
+
+| Language | Upload | Inventory |
+| --- | --- | --- |
+| Python | `Cards().upload_artifact(source, {"name": ..., "version": ...}, version_bump=None, spec=None, extract=False)` | `Cards().list_artifacts(card_ref)` |
+| Rust | `Cards::upload_artifact(source, metadata, spec, extract)` | `Cards::list_artifacts(selector)` |
+| TypeScript | `cards.uploadArtifact(source, { metadata, spec, extract })` | `cards.listArtifacts(ref)` |
+
+`metadata` takes `labels` and `annotations` too, and `spec` defaults to `{artifact_kind: file}`.
+
+Mount the uploaded files by exact reference in an Agent's `workspace`, here the extraction of one handbook:
+
+<Tabs>
+<Tab label="handbook-review.yaml">
+
+<CodeFromFile file="fixtures/cards/uploaded_artifacts/handbook-review.yaml" lang="yaml" title="handbook-review.yaml" />
+
+</Tab>
+<Tab label="handbook-judge.yaml">
+
+<CodeFromFile file="fixtures/cards/uploaded_artifacts/handbook-judge.yaml" lang="yaml" title="handbook-judge.yaml" />
+
+</Tab>
+</Tabs>
+
+Without `path`, every file of the version is mounted. The judge reads with `fs.read` and cites the `attachment_<n>` slot the tool reports. Uploading a new version never changes what this Verifier mounts. [Agent tools and authorization](/reference/agent-tools-and-authorization/) lists the file tools and the grants each call needs.
 
 ## Grouped session
 

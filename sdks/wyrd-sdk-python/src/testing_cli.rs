@@ -15,17 +15,18 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use wyrd_cards::card_ref::CardRefPy;
 use wyrd_cli::commands::{
-    self, CheckCard, CheckReport, McpHostReport, McpInstallReport, SelectorArgs,
+    self, BumpLevel, CheckCard, CheckReport, McpHostReport, McpInstallReport, SelectorArgs,
 };
 use wyrd_cli::{Diagnostic, Severity};
 use wyrd_client::WyrdClient;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::ProviderCredentialWrite;
-use wyrd_utils::py::WyrdPyResult;
+use wyrd_utils::py::{WyrdPyResult, json_to_pyobject};
 
 use crate::client::PyWyrdClient;
-use crate::gateway::{PyGateway, decode};
+use crate::gateway_admin::{PyGateway, decode};
 use crate::state::{PyCardEnvelope, PyDeclarationReceipt, PyPullSummary};
 
 /// Run one shared command future on the Wyrd runtime with the GIL released.
@@ -301,6 +302,77 @@ fn pull(
     Ok(PyPullSummary::from(inner))
 }
 
+/// Artifact upload identity fields in `(name, version, bump)` order.
+///
+/// The public `wyrd.testing.cli.artifact_upload` wrapper passes its identity
+/// keywords as this tuple; `bump` is one of the executable's `--bump` levels.
+type UploadFields = (String, Option<String>, Option<String>);
+
+/// Publish one file or directory as an Artifact Card (`wyrd artifact upload`).
+///
+/// # Errors
+///
+/// Raises `WyrdError` with `WYRD_SPEC_400_VALIDATION` for a `bump` other than
+/// `major`, `minor`, or `patch`, an invalid name or version, the upload
+/// preparation's refusals, a missing credential or bad endpoint, or the
+/// server's refusal.
+#[pyfunction]
+#[pyo3(signature = (source, fields, artifact_kind, extract, client))]
+fn artifact_upload(
+    py: Python<'_>,
+    source: PathBuf,
+    fields: UploadFields,
+    artifact_kind: String,
+    extract: bool,
+    client: Option<&Bound<'_, PyWyrdClient>>,
+) -> WyrdPyResult<CardRefPy> {
+    let (name, version, bump) = fields;
+    let bump = bump
+        .map(|level| match level.as_str() {
+            "major" => Ok(BumpLevel::Major),
+            "minor" => Ok(BumpLevel::Minor),
+            "patch" => Ok(BumpLevel::Patch),
+            _ => Err(WyrdError::Validation {
+                message: format!("bump: {level} is not major, minor, or patch"),
+                details: serde_json::json!({ "field": "bump", "value": level }),
+            }),
+        })
+        .transpose()?;
+    let client = rust_client(client);
+    let root = block_on(
+        py,
+        commands::artifact_upload(
+            &source,
+            &name,
+            version.as_deref(),
+            bump,
+            &artifact_kind,
+            extract,
+            client,
+        ),
+    )?;
+    Ok(CardRefPy(root))
+}
+
+/// List the files one Card holds (`wyrd artifact files`).
+///
+/// # Errors
+///
+/// Raises `WyrdError` for an invalid selector, a missing credential or bad
+/// endpoint, or a failed read.
+#[pyfunction]
+#[pyo3(signature = (fields, client))]
+fn artifact_files(
+    py: Python<'_>,
+    fields: SelectorFields,
+    client: Option<&Bound<'_, PyWyrdClient>>,
+) -> WyrdPyResult<Py<PyAny>> {
+    let selector = selector(fields);
+    let client = rust_client(client);
+    let inventory = block_on(py, commands::artifact_files(&selector, client))?;
+    Ok(json_to_pyobject(py, &serde_json::to_value(inventory)?)?)
+}
+
 /// Create or rotate one provider credential (`wyrd gateway credential put`).
 ///
 /// `write` may carry a provider key; a decode failure never quotes it, and
@@ -397,6 +469,8 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(declare, module)?)?;
     module.add_function(wrap_pyfunction!(get, module)?)?;
     module.add_function(wrap_pyfunction!(pull, module)?)?;
+    module.add_function(wrap_pyfunction!(artifact_upload, module)?)?;
+    module.add_function(wrap_pyfunction!(artifact_files, module)?)?;
     module.add_function(wrap_pyfunction!(mcp_install, module)?)?;
     module.add_function(wrap_pyfunction!(put_provider_credential, module)?)?;
     module.add_function(wrap_pyfunction!(revoke_provider_credential, module)?)?;

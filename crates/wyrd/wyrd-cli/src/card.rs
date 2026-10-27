@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use clap::{Args, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
 use wyrd_client::WyrdClient;
 use wyrd_client::cards::DeclarationReceipt;
@@ -187,6 +187,259 @@ pub struct DeleteArgs {
     /// Output encoding.
     #[arg(long, default_value_t)]
     pub format: OutputFormat,
+}
+
+/// `wyrd artifact` verbs: publish files as an Artifact Card and list a
+/// Card's files.
+#[derive(Debug, Subcommand)]
+pub enum ArtifactCommand {
+    /// Publish one file or directory as an Artifact Card and print its exact
+    /// reference; --extract also publishes `extracted/P.json` for each
+    /// supported document `P`.
+    Upload(UploadArgs),
+    /// List the files a Card holds, with their sizes and digests.
+    Files(FilesArgs),
+}
+
+/// Arguments for `wyrd artifact upload`.
+#[derive(Debug, Args)]
+#[command(disable_version_flag = true)]
+pub struct UploadArgs {
+    /// Regular file or directory to publish.
+    #[arg(value_name = "SOURCE")]
+    pub source: PathBuf,
+    /// Artifact Card name.
+    #[arg(long, value_name = "NAME")]
+    pub name: String,
+    /// Exact version or version scope; the server assigns one when omitted.
+    #[arg(long, value_name = "VERSION")]
+    pub version: Option<String>,
+    /// Version bump the server applies to the latest version.
+    #[arg(long, value_name = "LEVEL")]
+    pub bump: Option<BumpLevel>,
+    /// Artifact kind, an open vocabulary.
+    #[arg(long, value_name = "KIND", default_value = "file")]
+    pub artifact_kind: String,
+    /// Extract supported documents locally and publish the outputs too.
+    #[arg(long)]
+    pub extract: bool,
+    /// Wyrd server and credential options.
+    #[command(flatten)]
+    pub connection: ConnectionArgs,
+    /// Output encoding.
+    #[arg(long, default_value_t)]
+    pub format: OutputFormat,
+}
+
+/// A `--bump` level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BumpLevel {
+    /// Increment major.
+    Major,
+    /// Increment minor.
+    Minor,
+    /// Increment patch.
+    Patch,
+}
+
+/// Arguments for `wyrd artifact files`.
+#[derive(Debug, Args)]
+#[command(disable_version_flag = true)]
+pub struct FilesArgs {
+    /// Card selector whose files are listed; `--kind` defaults to `Artifact`.
+    #[command(flatten)]
+    pub selector: SelectorArgs,
+    /// Wyrd server and credential options.
+    #[command(flatten)]
+    pub connection: ConnectionArgs,
+    /// Output encoding.
+    #[arg(long, default_value_t)]
+    pub format: OutputFormat,
+}
+
+/// Run one `wyrd artifact` verb.
+///
+/// # Errors
+/// Returns invalid-argument errors for a bad version or selector, the
+/// upload preparation's refusals, credential errors, and the server's
+/// errors.
+pub async fn dispatch_artifact(command: ArtifactCommand) -> Result<ExitCode, WyrdCliError> {
+    match command {
+        ArtifactCommand::Upload(args) => {
+            let server = args.connection.server.as_deref();
+            let (root, upload) = upload_artifact(
+                &args.source,
+                &args.name,
+                args.version.as_deref(),
+                args.bump,
+                &args.artifact_kind,
+                args.extract,
+                || crate::client::from_global(server),
+            )
+            .await?;
+            match args.format {
+                OutputFormat::Text => {
+                    println!("uploaded: {root}");
+                    for (source, output) in &upload.extracted {
+                        println!("  extracted {source} -> {output}");
+                    }
+                    for source in &upload.skipped {
+                        println!("  skipped {source}");
+                    }
+                }
+                OutputFormat::Json => print_json(&root)?,
+            }
+        }
+        ArtifactCommand::Files(args) => {
+            let server = args.connection.server.as_deref();
+            let inventory =
+                list_artifact_files(&args.selector, || crate::client::from_global(server)).await?;
+            match args.format {
+                OutputFormat::Text => {
+                    for file in &inventory.artifacts {
+                        println!("{}\t{}", file.relative_path, file.size_bytes);
+                    }
+                }
+                OutputFormat::Json => print_json(&inventory)?,
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Publish one file or directory as an Artifact Card.
+///
+/// The in-process form of `wyrd artifact upload`; the returned reference is
+/// exactly what `wyrd artifact upload --format json` prints. `extract` also
+/// publishes `extracted/P.json` for each supported document `P`. Runs as
+/// `client`, or, when it is omitted, as a client built from the ambient
+/// credential chain.
+///
+/// # Arguments
+/// - `source`: the regular file or directory to publish.
+/// - `name`: the Artifact Card name.
+/// - `version`: an exact version or version scope; `None` lets the server
+///   assign one.
+/// - `bump`: the version bump the server applies to the latest version.
+/// - `artifact_kind`: the Artifact kind, an open vocabulary.
+/// - `extract`: extract supported documents locally and publish the outputs.
+/// - `client`: the principal to declare as; `None` resolves the ambient chain.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` for an invalid name or version, the
+/// upload preparation's refusals, a `WYRD_CLIENT_*` error when configuration
+/// or credentials fail, or the server's stable error when declaration fails.
+pub async fn artifact_upload(
+    source: &Path,
+    name: &str,
+    version: Option<&str>,
+    bump: Option<BumpLevel>,
+    artifact_kind: &str,
+    extract: bool,
+    client: Option<WyrdClient>,
+) -> Result<CardRef, WyrdError> {
+    upload_artifact(source, name, version, bump, artifact_kind, extract, || {
+        crate::client::explicit_or_ambient(client)
+    })
+    .await
+    .map(|(root, _)| root)
+    .map_err(WyrdError::from)
+}
+
+/// Validate and prepare an upload, then declare it.
+///
+/// Arguments and the source are checked before the client is built, so an
+/// invalid request never resolves credentials. The prepared upload is
+/// returned beside the root so its extraction report outlives declaration.
+///
+/// # Errors
+/// Returns a CLI argument error for an invalid name or version, the
+/// preparation's refusal, the error of `connect`, or a server error.
+async fn upload_artifact(
+    source: &Path,
+    name: &str,
+    version: Option<&str>,
+    bump: Option<BumpLevel>,
+    artifact_kind: &str,
+    extract: bool,
+    connect: impl FnOnce() -> Result<WyrdClient, WyrdCliError>,
+) -> Result<(CardRef, wyrd_loader::ArtifactUpload), WyrdCliError> {
+    let version = version
+        .map(|value| {
+            value
+                .parse::<wyrd_semver::VersionSpec>()
+                .map_err(|error| invalid_argument("version", value, &error.to_string()))
+        })
+        .transpose()?;
+    let bump = bump.map(|level| match level {
+        BumpLevel::Major => wyrd_semver::VersionBump::Major,
+        BumpLevel::Minor => wyrd_semver::VersionBump::Minor,
+        BumpLevel::Patch => wyrd_semver::VersionBump::Patch,
+    });
+    let metadata = wyrd_spec::envelope::Metadata {
+        version,
+        bump,
+        ..serde_json::from_value(serde_json::json!({ "name": name }))
+            .map_err(|error| invalid_argument("name", name, &error.to_string()))?
+    };
+    let spec = wyrd_spec::card::artifact::ArtifactSpec {
+        artifact_kind: artifact_kind.to_owned(),
+        ..wyrd_spec::card::artifact::ArtifactSpec::default()
+    };
+    let upload = wyrd_loader::ArtifactUpload::prepare(source, metadata, spec, extract)?;
+    let receipt = Cards::connect_with(&connect()?)
+        .await?
+        .declare(&upload.input)
+        .await?;
+    Ok((receipt.root, upload))
+}
+
+/// List the files one Card holds, from the server inventory.
+///
+/// The in-process form of `wyrd artifact files`; the inventory is exactly
+/// what `wyrd artifact files --format json` prints. The selector's kind
+/// defaults to `Artifact`. Reads run as `client`, or, when it is omitted, as
+/// a client built from the ambient credential chain.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` for an invalid selector, a
+/// `WYRD_CLIENT_*` error when configuration or credentials fail, or the
+/// server's stable error when the read fails.
+pub async fn artifact_files(
+    selector: &SelectorArgs,
+    client: Option<WyrdClient>,
+) -> Result<wyrd_client::cards::ArtifactInventoryResponse, WyrdError> {
+    list_artifact_files(selector, || crate::client::explicit_or_ambient(client))
+        .await
+        .map_err(WyrdError::from)
+}
+
+/// Validate a selector, defaulting its kind to `Artifact`, then read its
+/// file inventory.
+///
+/// # Errors
+/// Returns a CLI argument error for an invalid selector, the error of
+/// `connect`, or a server error when the read fails.
+async fn list_artifact_files(
+    selector: &SelectorArgs,
+    connect: impl FnOnce() -> Result<WyrdClient, WyrdCliError>,
+) -> Result<wyrd_client::cards::ArtifactInventoryResponse, WyrdCliError> {
+    let selector = SelectorArgs {
+        kind: Some(
+            selector
+                .kind
+                .clone()
+                .unwrap_or_else(|| "Artifact".to_owned()),
+        ),
+        name: selector.name.clone(),
+        version: selector.version.clone(),
+        uid: selector.uid.clone(),
+    };
+    let selector = selector_from_args(&selector, false)?;
+    Ok(Cards::connect_with(&connect()?)
+        .await?
+        .list_artifacts(selector)
+        .await?)
 }
 
 /// Local declaration check: the result of `wyrd declare --check`, which

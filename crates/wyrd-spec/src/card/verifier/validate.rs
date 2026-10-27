@@ -15,7 +15,7 @@ use super::reference::{OrderBy, Reference, ReferenceRoot, SourceField};
 use super::schema_path::{admits, fits};
 use super::{
     Action, AgentCall, Check, CheckEvidence, CodeCall, CodeSource, Condition, Decide, DriftCheck,
-    InputSlot, MAX_STEP_RETRIES, Requirement, Step, VerifierSpec,
+    InputSlot, MAX_STEP_RETRIES, Requirement, Step, VerifierSpec, WorkspaceSource,
 };
 use crate::card::agent::{AgentSpec, BuiltinTool};
 use crate::card::drift::DriftSignal;
@@ -171,7 +171,11 @@ fn step_references(step: &Step) -> impl Iterator<Item = &Reference> {
         Action::Agent(call) => call
             .inputs
             .values()
-            .chain(call.workspace.values())
+            .chain(
+                call.workspace
+                    .values()
+                    .filter_map(WorkspaceSource::reference),
+            )
             .collect(),
         Action::Code(call) => call.inputs.values().collect(),
     };
@@ -495,11 +499,14 @@ where
     /// Validates an Agent call: kind, references, workspace, and — when the
     /// Agent resolves — placeholders, media formats, tools, and schema.
     ///
+    /// Steps and checks share every workspace and tool rule; a check must
+    /// also produce a Verdict.
+    ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] with rule `agent_kind`,
-    /// `check_agent_workspace`, `workspace_path`, `agent_tools`,
-    /// `check_agent_tools`, or `check_agent_schema`, or any refusal of a
-    /// reference or placeholder binding.
+    /// `workspace_path`, `workspace_artifact`, `agent_tools`, or
+    /// `check_agent_schema`, or any refusal of a reference or placeholder
+    /// binding.
     fn validate_agent(
         &self,
         call: &'a AgentCall,
@@ -517,68 +524,47 @@ where
                 "agent must reference an Agent Card",
             ));
         }
-        for reference in call.inputs.values().chain(call.workspace.values()) {
+        for reference in call.inputs.values().chain(
+            call.workspace
+                .values()
+                .filter_map(WorkspaceSource::reference),
+        ) {
             self.validate_reference(reference, position, false, path)?;
         }
-        let in_step = matches!(position, Position::Step(_));
-        if !in_step && !call.workspace.is_empty() {
-            return Err(invalid(
-                "check_agent_workspace",
-                path,
-                "check Agents have no workspace",
-            ));
-        }
-        if let Some(bad) = call.workspace.keys().find(|key| !valid_workspace_path(key)) {
-            return Err(invalid(
-                "workspace_path",
-                path,
-                format!("{bad} must be /inputs/<name>[/<name>...] without . or .. segments"),
-            ));
-        }
+        validate_workspace(&call.workspace, path)?;
         let Some(resolved) = (self.resolve)(&call.agent) else {
             return Ok(());
         };
         self.validate_placeholders(call, resolved.prompt, path)?;
         let tools = &resolved.agent.tool_names;
-        if in_step {
-            let mut builtins = Vec::with_capacity(tools.len());
-            for name in tools {
-                let Some(tool) = BuiltinTool::from_name(name) else {
-                    return Err(invalid(
-                        "agent_tools",
-                        path,
-                        format!("{name} is not a built-in tool"),
-                    ));
-                };
-                builtins.push(tool);
-            }
-            let fs_tool = builtins.iter().any(|tool| tool.is_filesystem());
-            if fs_tool && call.workspace.is_empty() {
+        let mut builtins = Vec::with_capacity(tools.len());
+        for name in tools {
+            let Some(tool) = BuiltinTool::from_name(name) else {
                 return Err(invalid(
                     "agent_tools",
                     path,
-                    "filesystem tools require a workspace",
+                    format!("{name} is not a built-in tool"),
                 ));
-            }
-            let workspace_tool = fs_tool || builtins.contains(&BuiltinTool::CodeRun);
-            if !call.workspace.is_empty() && !workspace_tool {
-                return Err(invalid(
-                    "agent_tools",
-                    path,
-                    "a workspace requires a filesystem or code.run tool",
-                ));
-            }
-        } else {
-            if tools
-                .iter()
-                .any(|name| name != BuiltinTool::BifrostQuery.as_str())
-            {
-                return Err(invalid(
-                    "check_agent_tools",
-                    path,
-                    "check Agents may declare only the bifrost.query tool",
-                ));
-            }
+            };
+            builtins.push(tool);
+        }
+        let fs_tool = builtins.iter().any(|tool| tool.is_filesystem());
+        if fs_tool && call.workspace.is_empty() {
+            return Err(invalid(
+                "agent_tools",
+                path,
+                "filesystem tools require a workspace",
+            ));
+        }
+        let workspace_tool = fs_tool || builtins.contains(&BuiltinTool::CodeRun);
+        if !call.workspace.is_empty() && !workspace_tool {
+            return Err(invalid(
+                "agent_tools",
+                path,
+                "a workspace requires a filesystem or code.run tool",
+            ));
+        }
+        if !matches!(position, Position::Step(_)) {
             let named = resolved.prompt.authored().is_ok_and(|authored| {
                 matches!(authored.response_format, Some(ResponseFormat::Named(_)))
             });
@@ -930,10 +916,79 @@ fn validate_operator(
 
 /// Returns whether a workspace key is `/inputs/` plus safe path segments.
 fn valid_workspace_path(key: &str) -> bool {
-    key.strip_prefix("/inputs/").is_some_and(|rest| {
-        rest.split('/')
-            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
-    })
+    key.strip_prefix("/inputs/").is_some_and(safe_relative)
+}
+
+/// Returns whether `path` is one or more `/`-separated segments, none empty,
+/// `.`, or `..`.
+fn safe_relative(path: &str) -> bool {
+    path.split('/')
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+/// Validates workspace destinations and fixed Artifact selections.
+///
+/// Every destination is a safe `/inputs/...` path and none lies beneath
+/// another, so no file can shadow a directory mount; Artifact selections
+/// name an Artifact Card and a safe relative inventory path.
+///
+/// # Errors
+/// Returns [`WyrdError::Validation`] with rule `workspace_path` or
+/// `workspace_artifact`.
+fn validate_workspace(
+    workspace: &BTreeMap<String, WorkspaceSource>,
+    path: &str,
+) -> Result<(), WyrdError> {
+    if let Some(bad) = workspace.keys().find(|key| !valid_workspace_path(key)) {
+        return Err(invalid(
+            "workspace_path",
+            path,
+            format!("{bad} must be /inputs/<name>[/<name>...] without . or .. segments"),
+        ));
+    }
+    for (outer, inner) in workspace
+        .keys()
+        .flat_map(|outer| workspace.keys().map(move |inner| (outer, inner)))
+    {
+        if inner
+            .strip_prefix(outer.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+        {
+            return Err(invalid(
+                "workspace_path",
+                path,
+                format!("{inner} conflicts with the mount at {outer}"),
+            ));
+        }
+    }
+    for (key, source) in workspace {
+        let WorkspaceSource::Artifact { artifact } = source else {
+            continue;
+        };
+        if artifact
+            .card
+            .as_card_ref()
+            .is_some_and(|card| card.kind != CardKind::Artifact)
+        {
+            return Err(invalid(
+                "workspace_artifact",
+                path,
+                format!("{key} must reference an Artifact Card"),
+            ));
+        }
+        if artifact
+            .path
+            .as_deref()
+            .is_some_and(|file| !safe_relative(file))
+        {
+            return Err(invalid(
+                "workspace_artifact",
+                path,
+                format!("{key}: the Artifact path must be relative without . or .. segments"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Computes each step's transitive upstream steps in stage order.
@@ -1491,7 +1546,7 @@ mod tests {
     }
 
     /// Agent calls follow their Prompt placeholders and position rules; a
-    /// check Agent may declare `bifrost.query` and no other tool.
+    /// check Agent's tools and workspace follow the step rules.
     ///
     /// # Panics
     /// Panics when an Agent rule is not enforced.
@@ -1544,7 +1599,7 @@ mod tests {
                         Some(verdict_schema()),
                     ),
                 ),
-                "check_agent_tools",
+                "agent_tools",
             ),
             (
                 with(
@@ -1562,7 +1617,28 @@ mod tests {
                     "/requirements/2/check/workspace",
                     json!({"/inputs/p.pdf": "inputs.policy"}),
                 ),
-                "check_agent_workspace",
+                "agent_tools",
+            ),
+            (
+                with(
+                    "/steps/1/action/workspace",
+                    json!({"/inputs/a": "inputs.policy", "/inputs/a-b": "inputs.policy", "/inputs/a/b": "inputs.policy"}),
+                ),
+                "workspace_path",
+            ),
+            (
+                with(
+                    "/steps/1/action/workspace",
+                    json!({"/inputs/kit": {"artifact": {"card": {"kind": "Data", "name": "kit", "version": "1.0.0"}}}}),
+                ),
+                "workspace_artifact",
+            ),
+            (
+                with(
+                    "/steps/1/action/workspace",
+                    json!({"/inputs/kit": {"artifact": {"card": {"kind": "Artifact", "name": "kit", "version": "1.0.0"}, "path": "a/../b"}}}),
+                ),
+                "workspace_artifact",
             ),
             (
                 with("/steps/1/action/agent/tool_names", json!(["http.fetch"])),
@@ -1602,6 +1678,26 @@ mod tests {
         parse(&live_query)
             .validate()
             .expect("a check Agent may query Bifrost live");
+        let mut reader = with(
+            "/requirements/2/check/agent",
+            agent(
+                &["fs.read", "fs.search"],
+                json!([{"type": "document", "source": "${media:policy}"}, {"type": "text", "text": "{{claim}} {{answer}} {{findings}}"}]),
+                Some(verdict_schema()),
+            ),
+        );
+        reader["requirements"][2]["check"]["workspace"] = json!({
+            "/inputs/kit": {"artifact": {"card": {"kind": "Artifact", "name": "kit", "version": "1.0.0"}, "path": "extracted"}},
+            "/inputs/kit-copy": {"artifact": {"card": {"kind": "Artifact", "name": "kit", "version": "1.0.0"}}},
+            "/inputs/policy.pdf": "inputs.policy",
+        });
+        parse(&reader)
+            .validate()
+            .expect("a check Agent reads a workspace through declared file tools");
+        let mut unknown = reader;
+        unknown["requirements"][2]["check"]["workspace"]["/inputs/kit"]["artifact"]["extra"] =
+            json!(1);
+        assert!(serde_json::from_value::<VerifierSpec>(unknown).is_err());
     }
 
     /// Every built-in tool validates on a step Agent, with a workspace only

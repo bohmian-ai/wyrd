@@ -44,7 +44,8 @@ pub use cli::{Cli, Command};
 /// does. No credential is ever a string argument.
 pub mod commands {
     pub use crate::card::{
-        CheckCard, CheckReport, SelectorArgs, declare, declare_check, get, pull,
+        BumpLevel, CheckCard, CheckReport, SelectorArgs, artifact_files, artifact_upload, declare,
+        declare_check, get, pull,
     };
     pub use crate::gateway::{
         delete_provider_credential, put_provider_credential, revoke_provider_credential,

@@ -119,7 +119,7 @@ fn require_string_keys(field: &str, mapping: &Bound<'_, PyAny>) -> WyrdPyResult<
 /// # Errors
 /// Raises `WYRD_SPEC_400_VALIDATION` naming `field` for a value JSON cannot
 /// represent.
-fn json_value(
+pub(crate) fn json_value(
     py: Python<'_>,
     field: &str,
     value: &Bound<'_, PyAny>,

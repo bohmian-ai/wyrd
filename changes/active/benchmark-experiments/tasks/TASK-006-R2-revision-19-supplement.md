@@ -560,3 +560,16 @@ With the maintainer's agreement, the duplicate copies were deleted before
 
 1,079 lines deleted. All 55 `otlp` lib tests pass (the count is unchanged)
 and lints are clean. The next writes run measures 7(a) for logs.
+
+7(a) for logs: before `writes-parquet/20261027T184447Z-a8cf9e95a`, after
+`writes-parquet/20261027T191939Z-916be62bb` (VALID, unprofiled; traces
+unchanged by the deduplication).
+
+| Step | otlp_decode p50 ms | rows/cpu-s | wire MiB/cpu-s |
+|---|---|---|---|
+| otlp-logs-c1 | 1.05 → 0.96 | 46.15k → 49.36k | 55.1 → 59.0 |
+| otlp-logs-c64 | 1.66 → 1.60 | 34.25k → 36.14k | 40.9 → 43.2 |
+
+Result: no measurable improvement. Both moves sit inside the logs spread of
+the earlier records (c1 46.1k–51.6k rows/cpu-s; decode p50 0.97–1.05 ms).
+Span and native steps moved within their spreads.

@@ -2854,19 +2854,25 @@ impl Record {
                     .join("; ")
             },
         );
-        let latency = ["p50_ms", "p95_ms", "p99_ms"]
-            .iter()
-            .map(|id| {
-                median(id).map_or_else(
-                    || "—".to_owned(),
-                    |reading| reading.cell("").trim().to_owned(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let latency = if latency.iter().all(|cell| cell == "—") {
-            "— no request latency for this step".to_owned()
-        } else {
-            latency.join(" / ")
+        let triple = |prefix: &str| {
+            let cells: Vec<String> = ["p50_ms", "p95_ms", "p99_ms"]
+                .iter()
+                .map(|id| {
+                    median(&format!("{prefix}{id}")).map_or_else(
+                        || "—".to_owned(),
+                        |reading| reading.cell("").trim().to_owned(),
+                    )
+                })
+                .collect();
+            (!cells.iter().all(|cell| cell == "—")).then(|| cells.join(" / "))
+        };
+        let latency = match (triple(""), triple("client_")) {
+            (None, None) => "— no request latency for this step".to_owned(),
+            (server, client) => format!(
+                "{} (client {})",
+                server.as_deref().unwrap_or("—"),
+                client.as_deref().unwrap_or("—")
+            ),
         };
         let errors = median("errors").map_or_else(
             || "— not counted".to_owned(),
@@ -2951,7 +2957,7 @@ fn middle(repetitions: &[Repetition]) -> Option<&Repetition> {
 }
 
 /// The common report header, exactly.
-pub const REPORT_HEADER: &str = "| step | params | rate | p50/p95/p99 ms | errors | server CPU | peak mem | driver CPU | criterion | observed | outcome |";
+pub const REPORT_HEADER: &str = "| step | params | rate | server p50/p95/p99 ms (client) | errors | server CPU | peak mem | driver CPU | criterion | observed | outcome |";
 
 #[cfg(test)]
 mod tests {
@@ -3010,6 +3016,7 @@ mod tests {
             ]),
             metrics: vec![
                 Metric::raw("p99_ms", "ms", "server arrival to staging"),
+                Metric::raw("client_p99_ms", "ms", "client send to acknowledgement"),
                 Metric::raw("errors", "requests", "unexpected errors"),
                 Metric::raw("rate", "ops/s", "successful operations per second"),
                 Metric::raw("ops", "ops", "successful operations"),
@@ -4887,6 +4894,7 @@ mod tests {
         let options = options(&artifacts);
         let mut slow = good();
         slow.set("p99_ms", Reading::exact(0.7).with_samples(2_000));
+        slow.set("client_p99_ms", Reading::exact(0.9));
         let mut workload = Scripted::always(&good());
         workload.script = std::iter::repeat_n(Ok(good()), 4)
             .chain(std::iter::repeat_n(Ok(slow.clone()), 4))
@@ -4964,7 +4972,7 @@ mod tests {
         );
         let report = failed.render();
         assert!(
-            report.contains("| op-64 | clients=64 | 100 ops/s; 500 ops/cpu-s | — / — / 0.7 |"),
+            report.contains("| op-64 | clients=64 | 100 ops/s; 500 ops/cpu-s | — / — / 0.7 (client — / — / 0.9) |"),
             "{report}"
         );
         assert!(report.contains("2 s / 0.2 cores"));

@@ -77,8 +77,9 @@ configuration declares server limits.
   P vCPU`: cores used is measured, P is what the host offered. Only work
   completed before the window end counts as W, and later completions are
   reported apart. In L2, C is the server's total CPU, so every class's `W/C`
-  also pays for the competing work. References compare `W/C`,
-  `C/W`, and `(W/T)/P`.
+  also pays for the competing work. Each report row stands on its own:
+  its rate cell carries every `(W/T)/P`, `W/C`, and `C/W` metric, and its
+  latency cell the server and client p50/p95/p99.
 - **Bytes have declared sources.** Writes report rows, retained Arrow MiB
   (uncompressed), and encoded OTLP wire MiB. Queries report the mean scanned
   rows and bytes of each query's own executed plan, from the same snapshots. The L1

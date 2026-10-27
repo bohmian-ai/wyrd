@@ -34,7 +34,7 @@ from wyrd import WyrdError
 from wyrd.bifrost import TableConfig
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
@@ -110,7 +110,7 @@ def upstream_answering(answers: tuple[tuple[str, str], ...]) -> Generator[Receiv
         upstream.shutdown()
 
 
-@pytest.mark.usefixtures("fresh_tracer_provider")
+@pytest.mark.usefixtures("fresh_telemetry_providers")
 def test_support_desk_answers_verifies_and_explains_every_request(tmp_path: Path) -> None:
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), DeskUpstream)
     recorded = Receiver(url=f"http://127.0.0.1:{upstream.server_address[1]}")
@@ -265,7 +265,7 @@ def poll(read: Any, done: Any, timeout: float = 120.0) -> Any:
         time.sleep(0.5)
 
 
-@pytest.mark.usefixtures("fresh_tracer_provider")
+@pytest.mark.usefixtures("fresh_telemetry_providers")
 def test_published_quickstart_declares_observes_and_verifies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

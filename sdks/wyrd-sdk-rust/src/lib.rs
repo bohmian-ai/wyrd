@@ -127,7 +127,7 @@
 
 pub use wyrd_client::{
     Bifrost, Gateway, GlobalConfig, OperatorConnections, Platform, Principals, QueueConfig,
-    WyrdClient, bifrost, cards, client, config, environment, error, gateway, global_config,
+    WyrdClient, bifrost, cards, client, config, environment, error, gateway_admin, global_config,
     observe, operator_connections, platform, state, verify,
 };
 

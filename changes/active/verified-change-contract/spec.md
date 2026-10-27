@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 70
+revision: 71
 status: approved
 ---
 
@@ -1622,7 +1622,13 @@ table on `(data_tenant_id, result_id)`.
 - **REQ-195**: `WyrdTestServer` in all three SDKs documents exactly three
   test controls, each test-only and backed by the production code path:
   - `flush_bifrost()`: publish every accepted row now, so the next query
-    sees it;
+    sees it. (revised in revision 71) Python's `flush_bifrost(to=...)` also
+    takes `"staged"`, which freezes every accepted row into a staged run and
+    publishes nothing, or `"memtable"`, which only waits until the server's
+    background writes reach Scribe so every row stays in the writable
+    memtable; the harness refuses a state other than the one asked for. The
+    default, `"published"`, is the behavior above. TypeScript and Rust keep
+    the no-argument form until a journey of theirs needs the other states;
   - `wait_for_baseline(verifier, timeout)`: return once the named Drift
     Verifier's baseline is ready, or fail at the deadline with the last
     observed baseline state; and
@@ -2938,6 +2944,11 @@ published image pinned by an immutable registry digest before release.
 
 ## Open material decisions
 
+Revision 71:
+
+- None. The user approved on 2026-10-26 extending `flush_bifrost` with
+  `to` in Python instead of adding test controls.
+
 Revision 70:
 
 - None. The user approved on 2026-10-07 naming Python and TypeScript
@@ -3008,6 +3019,14 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Revision history
 
+- **Revision 71 Hot-state flush targets (2026-10-26, approved by the user):**
+  - **Trigger.** The configured-context journey must prove each context
+    column filter on rows still in Scribe's memtable or staged runs, not only
+    on published rows, and `flush_bifrost()` always publishes.
+  - **Decision (REQ-195).** Python's `flush_bifrost` takes
+    `to="memtable" | "staged" | "published"`, so the harness keeps exactly
+    three controls. TypeScript and Rust gain `to` when a journey of theirs
+    needs it.
 - **Revision 70 Arrow table adapter (2026-10-07, approved by the user):**
   - **Trigger.** The final TASK-017-R2 parity pass left one row: Python and
     TypeScript `QueryResult.to_arrow` return an Arrow table, and Rust has

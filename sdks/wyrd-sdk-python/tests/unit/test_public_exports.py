@@ -13,7 +13,7 @@ PUBLIC_MODULES = [
     "wyrd.client",
     "wyrd.config",
     "wyrd.data",
-    "wyrd.gateway",
+    "wyrd.gateway_admin",
     "wyrd.model",
     "wyrd.observe",
     "wyrd.operators",

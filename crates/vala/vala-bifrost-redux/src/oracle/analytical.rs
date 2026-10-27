@@ -2968,6 +2968,107 @@ fn install_graph_runtime(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Distributed rewrites retain executable ordering and distribution
+    /// requirements, including the per-task scans hidden behind leaf variants.
+    ///
+    /// Uses real Parquet metadata and the pinned planner without opening peer
+    /// channels. Every query must actually distribute before it is checked.
+    ///
+    /// # Panics
+    /// Panics if fixtures, planning, or final physical properties are invalid.
+    #[tokio::test]
+    async fn distributed_rewrites_preserve_physical_requirements() {
+        use datafusion::common::tree_node::TreeNode as _;
+        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+        use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
+        use datafusion::prelude::ParquetReadOptions;
+        use datafusion_distributed::{DistributedExec, DistributedLeafExec};
+        use parquet::arrow::ArrowWriter;
+
+        let directory = tempfile::tempdir().expect("the Parquet directory opens");
+        let (schema, batch) = fixture_batch();
+        for index in 0..3 {
+            let file = std::fs::File::create(directory.path().join(format!("{index}.parquet")))
+                .expect("the Parquet file opens");
+            let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
+                .expect("the Parquet writer opens");
+            writer.write(&batch).expect("the batch writes");
+            writer.close().expect("the Parquet footer writes");
+        }
+
+        let mut config = crate::resources::OracleSessionShape::new(4).session_config();
+        config.set_distributed_worker_resolver(AnalyticalWorkerResolver {
+            urls: (1..=3)
+                .map(|port| Url::parse(&format!("http://127.0.0.1:{port}")).expect("fixture URL"))
+                .collect(),
+        });
+        config
+            .set_distributed_file_scan_config_bytes_per_partition(1)
+            .expect("the small scan requests multiple tasks");
+        config
+            .set_distributed_children_isolator_unions(false)
+            .expect("Oracle's union configuration applies");
+        let state = super::super::live::LiveUnionBoundary::install(
+            SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(config),
+        )
+        .with_distributed_planner()
+        .build();
+        let context = SessionContext::new_with_state(state);
+        context
+            .register_parquet(
+                "rewrite_input",
+                directory
+                    .path()
+                    .to_str()
+                    .expect("the temporary path is UTF-8"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("the Parquet table registers");
+
+        for sql in [
+            "SELECT value FROM rewrite_input ORDER BY value",
+            "SELECT value FROM rewrite_input ORDER BY value LIMIT 2 OFFSET 1",
+            "SELECT value, count(*) FROM rewrite_input GROUP BY value ORDER BY value",
+            "SELECT a.value FROM rewrite_input a JOIN rewrite_input b ON a.value = b.value ORDER BY a.value",
+            "SELECT value FROM rewrite_input UNION ALL SELECT value FROM rewrite_input ORDER BY value LIMIT 2",
+            "SELECT value, row_number() OVER (ORDER BY value) FROM rewrite_input ORDER BY value",
+        ] {
+            let plan = context
+                .sql(sql)
+                .await
+                .expect("the SQL plans")
+                .create_physical_plan()
+                .await
+                .expect("distributed rewriting succeeds");
+            assert!(
+                plan.is::<DistributedExec>(),
+                "must exercise distribution: {sql}"
+            );
+            let options = context.copied_config().options().clone();
+            let checker = SanityCheckPlan::new();
+            checker
+                .optimize(Arc::clone(&plan), &options)
+                .unwrap_or_else(|error| {
+                    panic!("invalid distributed plan for {sql}: {error}");
+                });
+            let mut variants = 0;
+            plan.apply(|node| {
+                if let Some(leaf) = node.downcast_ref::<DistributedLeafExec>() {
+                    for variant in leaf.variants() {
+                        checker.optimize(Arc::clone(variant), &options)?;
+                        variants += 1;
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap_or_else(|error| panic!("invalid task variant for {sql}: {error}"));
+            assert!(variants > 1, "must inspect multiple task variants: {sql}");
+        }
+    }
+
     /// Names one full-grant execution over `runtime` for fixtures that do not vary the grant.
     fn fixture_execution(runtime: Arc<RuntimeEnv>) -> OracleExecution {
         OracleExecution::new(runtime, crate::resources::ORACLE_PARTITION_MEMORY_BYTES, 4)
@@ -6672,11 +6773,12 @@ impl AnalyticalExecutionHandle {
                 .set_distributed_file_scan_config_bytes_per_partition(bytes)
                 .map_err(|_| BifrostError::QueryExecutionFailed)?;
         }
-        let state = datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
-            local.state(),
+        let state = super::live::LiveUnionBoundary::install(
+            datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
+                local.state(),
+            )
+            .with_config(config),
         )
-        .with_config(config)
-        .with_physical_optimizer_rule(Arc::new(super::live::LiveUnionBoundary))
         .with_distributed_planner()
         .build();
         Ok(SessionContext::new_with_state(state))

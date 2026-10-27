@@ -20,7 +20,9 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
 use wyrd_client::bifrost::BifrostOptions;
 use wyrd_client::config::ClientConfig;
-use wyrd_client::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayPayloadField};
+use wyrd_client::gateway_admin::{
+    GatewayCaptureMode, GatewayCapturePolicyWrite, GatewayPayloadField,
+};
 use wyrd_client::{Bifrost, Gateway, GlobalConfig, Principals, WyrdClient};
 use wyrd_spec::auth::CreateServicePrincipalRequest;
 use wyrd_testing::release_server::{SERVER_URL, SetupTenant};

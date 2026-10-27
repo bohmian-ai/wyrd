@@ -21,8 +21,8 @@ use wyrd_testing::bifrost::{
 };
 
 use super::support::{
-    append_values, published_rows, register_table, sorted_values, start_scribe_server,
-    tenant_client, unique_table,
+    append_values, endpoint_client, published_rows, register_table, sorted_values,
+    start_scribe_server, tenant_client, tenant_key, unique_table,
 };
 
 /// The complete client-to-server Scribe contract, end to end.
@@ -1163,7 +1163,8 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
     let tenant = server.data_tenant_id();
     let name = unique_table("stage_pressure_restart");
     let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
-    let client = tenant_client(&server, tenant).await;
+    let key = tenant_key(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
 
     let batch_id = uuid::Uuid::now_v7();
     let rows: Vec<i64> = (0..MAX_REQUEST_ROWS).collect();
@@ -1227,17 +1228,19 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("the pod restarts on its retained data root");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_eq!(
         sorted_values(&client, &table).await,
         rows,
         "restart serves exactly the acknowledged rows"
     );
-    let resent = append_values(&client, &table, batch_id, &rows).await;
+    append_values(&client, &table, batch_id, &rows)
+        .await
+        .expect("a resent acknowledged batch is acknowledged");
     assert_eq!(
         sorted_values(&client, &table).await,
         rows,
-        "a resent acknowledged batch may not duplicate its rows: {resent:?}"
+        "a resent acknowledged batch may not duplicate its rows"
     );
     server
         .flush_bifrost()
@@ -1332,7 +1335,8 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
     let tenant = server.data_tenant_id();
     let name = unique_table("composite_lifecycle");
     let table = register_composite_table(&server, tenant, &name).await;
-    let client = tenant_client(&server, tenant).await;
+    let key = tenant_key(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     let batch_id = uuid::Uuid::now_v7();
     super::support::append_batch(&client, &table, batch_id, &composite_batch())
         .await
@@ -1342,7 +1346,7 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("restarts");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_composite_reads(&client, &table, "replayed").await;
 
     let scribe = server.bifrost_scribe().expect("the server owns a Scribe");
@@ -1354,7 +1358,7 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("restarts");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_composite_reads(&client, &table, "restored staged").await;
 
     server.flush_bifrost().await.expect("publishes");
@@ -1367,10 +1371,12 @@ async fn composite_partitions_survive_lifecycle_and_peers() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("restarts");
-    let client = tenant_client(&server, tenant).await;
-    let resent = super::support::append_batch(&client, &table, batch_id, &composite_batch()).await;
+    let client = endpoint_client(&server, &key);
+    super::support::append_batch(&client, &table, batch_id, &composite_batch())
+        .await
+        .expect("a resent acknowledged batch is acknowledged");
     server.flush_bifrost().await.expect("drains");
-    assert_composite_reads(&client, &table, &format!("resent {resent:?}")).await;
+    assert_composite_reads(&client, &table, "resent").await;
     assert_eq!(
         published_rows(&server, tenant, &name).await,
         COMPOSITE_ROWS as u64
@@ -1431,7 +1437,8 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
     let name = unique_table("accepted_revision");
     let table = register_composite_table(&server, tenant, &name).await;
     let table_ref = vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &name);
-    let client = tenant_client(&server, tenant).await;
+    let key = tenant_key(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     let accepted = uuid::Uuid::now_v7();
     super::support::append_batch(&client, &table, accepted, &composite_batch())
         .await
@@ -1490,7 +1497,7 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("restarts");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_eq!(
         read_all(client.clone()).await,
         all,
@@ -1558,7 +1565,7 @@ async fn accepted_batch_revision_survives_alteration_and_restart() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("replay suppresses the provisional attempt the fence never accepted");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_eq!(
         read_all(client.clone()).await,
         all,
@@ -1598,7 +1605,8 @@ async fn mixed_runtime_specifications_preserve_rows_and_pins() {
     let name = unique_table("mixed_specs");
     let table = register_composite_table(&server, tenant, &name).await;
     let table_ref = vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &name);
-    let client = tenant_client(&server, tenant).await;
+    let key = tenant_key(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     super::support::append_batch(&client, &table, uuid::Uuid::now_v7(), &composite_batch())
         .await
         .expect("the spec-0 batch is acknowledged");
@@ -1628,7 +1636,7 @@ async fn mixed_runtime_specifications_preserve_rows_and_pins() {
     let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("restarts");
-    let client = tenant_client(&server, tenant).await;
+    let client = endpoint_client(&server, &key);
     assert_mixed_reads(&client, &table, "restored").await;
     server.flush_bifrost().await.expect("publishes");
     assert_mixed_reads(&client, &table, "published").await;

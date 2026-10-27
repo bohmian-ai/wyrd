@@ -41,10 +41,6 @@ fn span(trace: u8, span: u8, offset: i64, links: &[u8]) -> Row {
         ("duration_nano", Cell::Int64(1_000)),
         ("scope_name", Cell::Text("wyrd.timeline".to_owned())),
         (
-            "service_name",
-            Cell::Text("wyrd.timeline.service".to_owned()),
-        ),
-        (
             "links",
             Cell::Rows(
                 links

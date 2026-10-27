@@ -67,7 +67,7 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::vala::managed_columns::{
     ACT_PRINCIPAL_ID, RUN_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID,
-    WYRD_INGESTED_AT,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::TaskId;
@@ -482,7 +482,12 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         .await?
         .write_batch(
             "bifrost.drift.observations",
-            &observation_batch(&record, &subject, observed_in_current_month(Utc::now())?)?,
+            &observation_batch(
+                &record,
+                &subject,
+                observed_in_current_month(Utc::now())?,
+                3.0,
+            )?,
         )
         .await?;
     seed.activate(client, &subject).await?;
@@ -604,8 +609,8 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
 }
 
 /// One Drift observation `record` of the Card `subject` at `event_time`: a
-/// drifting `score` and a `latency` feature, as the SDK's tall projection
-/// writes them.
+/// `score` feature valued `score` and a `latency` feature, as the SDK's tall
+/// projection writes them.
 ///
 /// The batch carries the table's own authored columns, its shared dimensions
 /// left null for the server to derive, and the `subject_card_uid` correlation.
@@ -618,6 +623,7 @@ fn observation_batch(
     record: &str,
     subject: &CardUid,
     event_time: DateTime<Utc>,
+    score: f64,
 ) -> Result<RecordBatch, ServerJourneyError> {
     use vala_bifrost_redux::tables::DomainTable;
     use vala_bifrost_redux::tables::drift::ObservationsTable;
@@ -631,7 +637,7 @@ fn observation_batch(
             match field.name().as_str() {
                 "record_id" => Arc::new(StringArray::from(vec![record, record])),
                 "series" => Arc::new(StringArray::from(vec!["score", "latency"])),
-                "num_value" => Arc::new(Float64Array::from(vec![3.0, 120.0])),
+                "num_value" => Arc::new(Float64Array::from(vec![score, 120.0])),
                 "created_at" => Arc::new(
                     TimestampMicrosecondArray::from(vec![event_time, event_time])
                         .with_data_type(field.data_type().clone()),
@@ -800,13 +806,93 @@ enum Report {
     Unscored,
 }
 
-/// Oracle scan evidence for one query: files and row groups scanned.
-#[derive(Debug, Clone, Copy)]
+/// Production Oracle query families a measured read prints as its evidence:
+/// query count, end-to-end query duration, files, row groups, pruning, bytes,
+/// rows, and the per-step profile nanoseconds that separate cut discovery,
+/// planning, admission, and operator time.
+const WORK_FAMILIES: &[&str] = &[
+    "oracle_query_profiles_total",
+    "oracle_query_duration_seconds",
+    "oracle_query_files_scanned_total",
+    "oracle_query_row_groups_scanned_total",
+    "oracle_query_row_groups_pruned_total",
+    "oracle_query_row_groups_pruned_bloom_total",
+    "oracle_query_rows_pruned_page_index_total",
+    "oracle_query_bytes_scanned_total",
+    "oracle_query_rows_total",
+    "oracle_query_profile_nanoseconds_total",
+    "scribe_write_profiles_total",
+    "scribe_write_profile_nanoseconds_total",
+    "scribe_write_profile_count_total",
+    "bifrost_parquet_upload_bytes",
+    "bifrost_parquet_upload_duration_seconds",
+    "bifrost_scribe_persistence_encoded_bytes_total",
+];
+
+/// Oracle work one measured read did, from the cluster's production query
+/// counters.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ScanEvidence {
+    /// `oracle_query_profiles_total` delta: settled query attempts.
+    queries: f64,
     /// `oracle_query_files_scanned_total` delta.
     files: f64,
     /// `oracle_query_row_groups_scanned_total` delta.
     row_groups: f64,
+    /// `oracle_query_row_groups_pruned_bloom_total` delta.
+    bloom_pruned: f64,
+    /// `oracle_query_bytes_scanned_total` delta.
+    bytes: f64,
+    /// Wall seconds the whole measured future took, as its caller saw it.
+    elapsed: f64,
+}
+
+impl ScanEvidence {
+    /// Whether the integral counter delta `value` is `expected`.
+    fn is(value: f64, expected: u32) -> bool {
+        (value - f64::from(expected)).abs() < 0.5
+    }
+
+    /// Await `read` and return its value with the Oracle work done while it
+    /// ran, printing that work under `label` as one evidence line.
+    ///
+    /// The window is the whole future, so a read that issues several
+    /// statements reports their sum and its statement count.
+    ///
+    /// # Errors
+    /// Returns the read's error or a telemetry error.
+    async fn of<T>(
+        cluster: &WyrdTestCluster,
+        label: &str,
+        read: impl Future<Output = Result<T, ServerJourneyError>>,
+    ) -> Result<(T, Self), ServerJourneyError> {
+        let telemetry = cluster.telemetry();
+        let checkpoint = telemetry.checkpoint()?;
+        let value = read.await?;
+        let delta = telemetry.delta_since(&checkpoint)?;
+        let sum = |family: &str| -> f64 {
+            delta
+                .metrics
+                .iter()
+                .filter(|sample| sample.family == family)
+                .map(|sample| sample.value)
+                .sum()
+        };
+        let evidence = Self {
+            queries: sum("oracle_query_profiles_total"),
+            files: sum("oracle_query_files_scanned_total"),
+            row_groups: sum("oracle_query_row_groups_scanned_total"),
+            bloom_pruned: sum("oracle_query_row_groups_pruned_bloom_total"),
+            bytes: sum("oracle_query_bytes_scanned_total"),
+            elapsed: delta.interval_seconds,
+        };
+        println!(
+            "work {label}: {evidence:?} {} {}",
+            delta.resources(),
+            delta.evidence(WORK_FAMILIES)
+        );
+        Ok((value, evidence))
+    }
 }
 
 /// The single-node cluster, tenant, and SYSTEM writer the layout journey
@@ -953,25 +1039,12 @@ impl<'a> ResultLayoutJourney<'a> {
     /// # Errors
     /// Returns the telemetry or query error, or a row-count mismatch.
     async fn scan(&self, sql: String, rows: usize) -> Result<ScanEvidence, ServerJourneyError> {
-        let telemetry = self.cluster.telemetry();
-        let checkpoint = telemetry.checkpoint()?;
-        let read = self.texts(sql.clone()).await?;
+        let (read, evidence) =
+            ScanEvidence::of(self.cluster, &sql, self.texts(sql.clone())).await?;
         if read.len() != rows {
             return Err(format!("{sql} expected {rows} rows, read {read:?}").into());
         }
-        let delta = telemetry.delta_since(&checkpoint)?;
-        let sum = |family: &str| -> f64 {
-            delta
-                .metrics
-                .iter()
-                .filter(|sample| sample.family == family)
-                .map(|sample| sample.value)
-                .sum()
-        };
-        Ok(ScanEvidence {
-            files: sum("oracle_query_files_scanned_total"),
-            row_groups: sum("oracle_query_row_groups_scanned_total"),
-        })
+        Ok(evidence)
     }
 
     /// Require a physical Bloom filter on every default Bloom column of each
@@ -6108,5 +6181,1581 @@ async fn late_trace_spans_require_new_verification() -> Result<(), ServerJourney
     );
     assert_eq!(published_results(&server, &id).await?, failed);
     server.shutdown().await?;
+    Ok(())
+}
+
+/// One attributable table the exploration journey writes and filters: its
+/// FQN, its time column, and whether rows keep landing while it is read.
+struct Explored {
+    /// The table's FQN.
+    table: &'static str,
+    /// The time column every row carries, which bounds a filter in time.
+    time: &'static str,
+    /// Whether every read itself adds rows, as each permission decision a
+    /// read makes lands in the audit log. Such a table is read up to one
+    /// settled instant, so its ground truth stays fixed while it is filtered.
+    grows: bool,
+}
+
+/// `at` as a microsecond UTC `TIMESTAMP` literal.
+fn timestamp(at: DateTime<Utc>) -> String {
+    format!(
+        "TIMESTAMP '{}'",
+        at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    )
+}
+
+/// The audit log's FQN.
+const AUDIT_LOG: &str = "bifrost.system.audit_log";
+
+/// The nine attributable built-ins with the time column each partitions on.
+const EXPLORED: [Explored; 9] = [
+    Explored {
+        table: SPANS,
+        time: "start_time_unix_nano",
+        grows: false,
+    },
+    Explored {
+        table: RECORDS,
+        time: "time_unix_nano",
+        grows: false,
+    },
+    Explored {
+        table: POINTS,
+        time: "time_unix_nano",
+        grows: false,
+    },
+    Explored {
+        table: "bifrost.gateway.calls",
+        time: "started_at",
+        grows: false,
+    },
+    Explored {
+        table: DRIFT_OBSERVATIONS,
+        time: "created_at",
+        grows: false,
+    },
+    Explored {
+        table: "bifrost.verification.results",
+        time: "ended_at",
+        grows: false,
+    },
+    Explored {
+        table: EXECUTION_INPUTS,
+        time: "recorded_at",
+        grows: false,
+    },
+    Explored {
+        table: "bifrost.drift.result_features",
+        time: WYRD_INGESTED_AT,
+        grows: false,
+    },
+    Explored {
+        table: AUDIT_LOG,
+        time: "created_at",
+        grows: true,
+    },
+];
+
+/// The attribution of one stored row, as the exploration ground truth reads
+/// it with no predicate.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Attributed {
+    /// `service_name`.
+    service: Option<String>,
+    /// `service_version`.
+    version: Option<String>,
+    /// `deployment_environment`.
+    environment: Option<String>,
+    /// `subject_kind`.
+    kind: Option<String>,
+    /// `subject_name`.
+    name: Option<String>,
+    /// `workload_card_uid` as text.
+    workload: Option<String>,
+    /// `subject_card_uid` as text.
+    subject: Option<String>,
+    /// `subject_version`.
+    subject_version: Option<String>,
+}
+
+impl Attributed {
+    /// The attribution of one JSON row read through [`ATTRIBUTED`].
+    ///
+    /// A row omits its null columns, so each column is read by name and an
+    /// absent one is null.
+    fn of(row: &Value) -> Self {
+        let text = |column: &str| row.get(column).and_then(Value::as_str).map(str::to_owned);
+        Self {
+            service: text("service_name"),
+            version: text("service_version"),
+            environment: text("deployment_environment"),
+            kind: text("subject_kind"),
+            name: text("subject_name"),
+            workload: text("workload_card_uid"),
+            subject: text("subject_card_uid"),
+            subject_version: text("subject_version"),
+        }
+    }
+}
+
+/// The projection reading [`Attributed`] in field order.
+const ATTRIBUTED: &str = "service_name, service_version, deployment_environment, subject_kind, \
+     subject_name, CAST(workload_card_uid AS VARCHAR) AS workload_card_uid, \
+     CAST(subject_card_uid AS VARCHAR) AS subject_card_uid, subject_version";
+
+/// One exploration filter: its SQL predicate and the same predicate over the
+/// ground truth.
+struct Filter {
+    /// Name printed beside its work evidence.
+    label: &'static str,
+    /// SQL predicate.
+    sql: String,
+    /// The predicate over one ground-truth row.
+    keeps: Box<dyn Fn(&Attributed) -> bool>,
+}
+
+/// Exploration filters an attributed writer's rows must answer with a
+/// nonempty population: every one but the empty and unattributed filters.
+const POSITIVE: [&str; 10] = [
+    "service family",
+    "exact release",
+    "release name and version",
+    "environment",
+    "subject kind and name",
+    "exact subject",
+    "subject name and version",
+    "service and subject",
+    "time bounded",
+    "unbounded",
+];
+
+/// The audit log's accountability lookup keys, its default Bloom columns.
+const AUDIT_KEYS: [&str; 4] = [
+    SUB_PRINCIPAL_ID,
+    ACT_PRINCIPAL_ID,
+    WYRD_REQUEST_ID,
+    "resource",
+];
+
+/// Bloom filters stored in published Parquet files under a storage root.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StoredBlooms {
+    /// Files carrying at least one Bloom filter.
+    filtered: usize,
+    /// Files carrying none.
+    bare: usize,
+    /// Bytes of every stored Bloom filter.
+    filter_bytes: i64,
+    /// Bytes of every file.
+    file_bytes: u64,
+}
+
+impl StoredBlooms {
+    /// Walk `root` and total the Bloom filters of every Parquet file, apart
+    /// for the audit log, whose writes follow reads rather than the writers.
+    ///
+    /// Returns the eight writer tables' total, then the audit log's.
+    ///
+    /// # Errors
+    /// Returns a filesystem or Parquet footer error.
+    fn read(root: &std::path::Path) -> Result<(Self, Self), ServerJourneyError> {
+        let (mut tables, mut audit) = (Self::default(), Self::default());
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path
+                    .extension()
+                    .is_none_or(|extension| extension != "parquet")
+                {
+                    continue;
+                }
+                let file = std::fs::File::open(&path)?;
+                let length = file.metadata()?.len();
+                let reader = SerializedFileReader::new(file)?;
+                let metadata = reader.metadata();
+                let stored = if metadata
+                    .file_metadata()
+                    .schema_descr()
+                    .columns()
+                    .iter()
+                    .any(|column| column.name() == "sub_principal_kind")
+                {
+                    &mut audit
+                } else {
+                    &mut tables
+                };
+                stored.file_bytes += length;
+                let bytes: i64 = metadata
+                    .row_groups()
+                    .iter()
+                    .flat_map(parquet::file::metadata::RowGroupMetaData::columns)
+                    .filter_map(parquet::file::metadata::ColumnChunkMetaData::bloom_filter_length)
+                    .map(i64::from)
+                    .sum();
+                stored.filter_bytes += bytes;
+                if bytes > 0 {
+                    stored.filtered += 1;
+                } else {
+                    stored.bare += 1;
+                }
+            }
+        }
+        Ok((tables, audit))
+    }
+
+    /// What was stored after `earlier` was read: the files and bytes one
+    /// write window added.
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            filtered: self.filtered.saturating_sub(earlier.filtered),
+            bare: self.bare.saturating_sub(earlier.bare),
+            filter_bytes: self.filter_bytes - earlier.filter_bytes,
+            file_bytes: self.file_bytes.saturating_sub(earlier.file_bytes),
+        }
+    }
+}
+
+/// One Service release writing in one environment: the exploration's writer.
+struct Release {
+    /// The Service Card UID.
+    uid: CardUid,
+    /// Its family runtime account, which stages its verification rows.
+    account: PrincipalId,
+    /// Its runtime account's access token rooted at this release, which
+    /// invokes the gateway.
+    token: String,
+    /// The accepted deployment environment.
+    environment: &'static str,
+    /// How many separately flushed rounds it writes: skew across Services.
+    rounds: usize,
+}
+
+/// Exact Service and subject filters keep their populations on all nine
+/// attributable tables under full, partial, and empty Bloom declarations,
+/// and the Oracle reports the work each filter costs (REQ-026, REQ-049–053;
+/// AC-008, AC-016, AC-017, AC-024).
+///
+/// Three Service releases write through the public native ingest, the public
+/// gateway, and the production result builder: `lookup-billing` 1.0.0 in
+/// prod over four flushed rounds, `lookup-billing` 2.0.0 in staging and
+/// `lookup-checkout` 1.0.0 in prod over one each, so one Service family spans
+/// two concurrent releases and environments and one Service is low-volume.
+/// Each round observes a shared Agent and a Model of the same name, so Card
+/// kinds stay apart. Spans, logs, metric points, drift observations,
+/// execution inputs, results, and result features carry the accepted
+/// attribution, and each release's runtime account calls the gateway once
+/// per subject under its release root, so captured calls carry it too. The
+/// audit log holds the permission decisions all of that made, attributed
+/// only where a decision truthfully was.
+///
+/// Every table answers Service-name aggregation across versions, exact
+/// workload UID and the same release by name and version, environment,
+/// subject kind and name across versions, exact subject UID and the same
+/// subject by name and version, a combined Service-and-subject filter, an
+/// empty filter, an unattributed filter, a time-bounded filter, and no filter
+/// with exactly the rows the unfiltered ground truth selects, printing each
+/// filter's Oracle work. Each writer table answers every positive filter with
+/// rows, and each UID filter with the same rows as its name-and-version
+/// filter. The audit log, read up to a settled instant, also answers each of
+/// its decision-pair, request, and resource keys. Each declaration stage —
+/// the defaults, the leading half of each table's defaults, and none — writes
+/// one equal round, answers every filter while the round is live and once it
+/// is published, and prints the round's writer resources and stored Bloom
+/// bytes. The verification results table answers each of its ten default
+/// Bloom columns exactly.
+///
+/// # Errors
+/// Returns cluster, seeding, ingest, gateway, publication, alteration, or
+/// query errors, or the first filter whose answer differs from the ground
+/// truth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn exploration_filters_keep_exact_populations() -> Result<(), ServerJourneyError> {
+    /// The role the release runtime accounts invoke the gateway with.
+    const INVOKER: &str = "lookup_invoker";
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(GatewayCapture::completion()),
+        )
+        .mount(&upstream)
+        .await;
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::one_mixed()
+            .with_gateway_provider_root_for_test(url::Url::parse(&upstream.uri())?),
+    )
+    .await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let tenant = cluster.data_tenant_id();
+    for table in vala_bifrost_redux::tables::builtin_tables() {
+        server
+            .ensure_builtin_table_for_test(tenant, table.namespace, table.name)
+            .await?;
+    }
+    server
+        .deploy_gateway_model_for_test("gpt-4o", INVOKER)
+        .await?;
+    let Bootstrap::User {
+        jwt: gateway_admin, ..
+    } = server
+        .bootstrap_user("lookup-gateway-admin", &["admin"])
+        .await?
+    else {
+        return Err("a user bootstraps as a user".into());
+    };
+    let captured = server
+        .oneshot_authenticated(
+            &gateway_admin,
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/v1/admin/gateway/capture-policy")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({ "mode": "metadata", "payload_fields": [] }).to_string(),
+                ))?,
+        )
+        .await?;
+    if !captured.status().is_success() {
+        return Err(format!("the capture policy was refused: {}", captured.status()).into());
+    }
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    seed.declare(
+        "Prompt",
+        "lookup-prompt",
+        &json!({
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "Answer." }],
+        }),
+    )
+    .await?;
+    let agent = seed
+        .declare(
+            "Agent",
+            "lookup-component",
+            &json!({
+                "prompt": { "kind": "Prompt", "name": "lookup-prompt", "version": "1.0.0" },
+                "execution_route": { "kind": "native" },
+            }),
+        )
+        .await?;
+    let model = seed
+        .declare(
+            "Model",
+            "lookup-component",
+            &json!({
+                "interface": { "kind": "Custom", "meta": {
+                    "framework_version": "0.1.0", "loader_module": "lookup",
+                    "loader_class": "Lookup", "extra": {} } },
+                "task_type": "Other",
+                "signature": {
+                    "inputs": [{ "name": "x", "dtype": "float64" }],
+                    "outputs": [{ "name": "y", "dtype": "float64" }],
+                },
+            }),
+        )
+        .await?;
+    let verifier = seed.drift_verifier("lookup-drift").await?;
+    let component = |alias: &str, kind: &str, uid: &CardUid| {
+        json!({ "alias": alias, "ref": {
+            "kind": kind, "name": "lookup-component", "version": "1.0.0", "uid": uid } })
+    };
+    let components = json!({ "components": [
+        component("agent", "Agent", &agent),
+        component("model", "Model", &model),
+    ] });
+    let mut releases = Vec::new();
+    for (name, version, environment, rounds) in [
+        ("lookup-billing", "1.0.0", "prod", 4),
+        ("lookup-billing", "2.0.0", "staging", 1),
+        ("lookup-checkout", "1.0.0", "prod", 1),
+    ] {
+        let (uid, account) = seed.release_with(name, version, &components).await?;
+        let card: CardRef = format!("Service/{name}@{version}#{uid}").parse()?;
+        let runtime = server
+            .credential_registered_service(&card, &[INVOKER])
+            .await?;
+        let token = server
+            .exchange_api_key_for_workload(
+                runtime.api_key().ok_or("the runtime has an API key")?,
+                &uid,
+            )
+            .await?;
+        releases.push(Release {
+            uid,
+            account,
+            token,
+            environment,
+            rounds,
+        });
+    }
+    let admin = server.bootstrap_service("lookup-admin", &["admin"]).await?;
+    let admin = native_client(
+        server,
+        admin
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let Bootstrap::User { jwt, .. } = server.bootstrap_user("lookup-writer", &["editor"]).await?
+    else {
+        return Err("a user bootstraps as a user".into());
+    };
+    let writer = native_client(server, &jwt)?;
+    let mut schemas = HashMap::new();
+    for table in [SPANS, RECORDS, POINTS, DRIFT_OBSERVATIONS] {
+        schemas.insert(
+            table,
+            Arc::clone(
+                TableConfig::describe_with(&admin, table)
+                    .await?
+                    .user_schema(),
+            ),
+        );
+    }
+    let query = Bifrost::query_only(&admin);
+    let rows = async |sql: String| -> Result<Vec<Value>, ServerJourneyError> {
+        Ok(query.sql_as(&sql, &[]).await?)
+    };
+    let texts = async |sql: String| -> Result<Vec<Vec<Option<String>>>, ServerJourneyError> {
+        Ok(rows(sql)
+            .await?
+            .iter()
+            .map(|row| {
+                row.as_object()
+                    .into_iter()
+                    .flat_map(|row| row.values())
+                    .map(|value| match value {
+                        Value::Null => None,
+                        Value::String(text) => Some(text.clone()),
+                        other => Some(other.to_string()),
+                    })
+                    .collect()
+            })
+            .collect())
+    };
+    let http = reqwest::Client::new();
+    let base = server.base_url().ok_or("missing HTTP URL")?;
+    let calls = std::cell::Cell::new(0_usize);
+    // A call's capture lands after its caller has the answer, so a round's
+    // calls are read back before anything reads or publishes them.
+    let landed = async || -> Result<(), ServerJourneyError> {
+        let expected = vec![vec![Some(calls.get().to_string())]];
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let counted =
+                texts("SELECT COUNT(*) AS n FROM bifrost.gateway.calls".to_owned()).await?;
+            if counted == expected {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("captured calls {counted:?}, expected {expected:?}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let started = Utc::now() - chrono::Duration::hours(1);
+    let round = async |release: &Release, flush: bool| -> Result<(), ServerJourneyError> {
+        let client = writer.for_service(release.uid.clone(), Some(release.environment.to_owned()));
+        let now = Utc::now();
+        let nanos = now.timestamp_nanos_opt().unwrap_or(0);
+        for subject in [&agent, &model] {
+            let frames = [
+                (
+                    SPANS,
+                    canonical_signals::spans(&schemas[SPANS], "lookup", nanos),
+                ),
+                (
+                    RECORDS,
+                    canonical_signals::logs(&schemas[RECORDS], "lookup", nanos),
+                ),
+                (
+                    POINTS,
+                    canonical_signals::points(&schemas[POINTS], "lookup", nanos),
+                ),
+                (
+                    DRIFT_OBSERVATIONS,
+                    drift_observation(&schemas[DRIFT_OBSERVATIONS])?,
+                ),
+            ];
+            for (table, batch) in frames {
+                RawIngest::connect(&client)
+                    .await?
+                    .insert(
+                        table,
+                        uuid::Uuid::now_v7(),
+                        ipc(&with_text(
+                            &batch,
+                            SUBJECT_CARD_UID,
+                            Some(subject.as_str()),
+                        )?)?,
+                    )
+                    .await?;
+            }
+            let answer = http
+                .post(format!("{base}/v1/chat/completions"))
+                .bearer_auth(&release.token)
+                .header("wyrd-card-uid", subject.as_str())
+                .header("x-wyrd-deployment-environment", release.environment)
+                .json(&json!({ "model": "openai/gpt-4o",
+                    "messages": [{ "role": "user", "content": "hi" }] }))
+                .send()
+                .await?;
+            if !answer.status().is_success() {
+                return Err(format!(
+                    "the attributed gateway call failed: {} {}",
+                    answer.status(),
+                    answer.text().await?
+                )
+                .into());
+            }
+            calls.set(calls.get() + 1);
+            let window = DriftWindow {
+                start: now - chrono::Duration::hours(1),
+                end: now,
+            };
+            let builder = ResultPayloadBuilder::new(
+                ResultRun {
+                    execution_id: ExecutionId::new_v7(),
+                    run_id: None,
+                    verifier_version: "1.0.0",
+                    card_uid: subject,
+                    owner_card_uid: Some(&release.uid),
+                    group_id: None,
+                    deployment_environment: Some(release.environment),
+                    binding_id: Some(BindingId::new_v7()),
+                    trigger: None,
+                    window: Some(&window),
+                },
+                &verifier,
+                now,
+                now,
+            );
+            let attribution = Attribution::direct(release.account);
+            let outbox = server.state().bifrost.scribe_outbox();
+            outbox.stage(
+                tenant,
+                ScribeWrite::ExecutionInputs {
+                    row: builder.inputs(&BTreeMap::new(), None)?,
+                    attribution,
+                    queued: None,
+                },
+            );
+            outbox.stage(
+                tenant,
+                ScribeWrite::Result {
+                    payload: builder.build(&drift_outcome(Some(two_feature_report()?))?)?,
+                    attribution,
+                },
+            );
+        }
+        if flush {
+            landed().await?;
+            server.flush_bifrost().await?;
+        }
+        Ok(())
+    };
+    for release in &releases[..2] {
+        for _ in 0..release.rounds {
+            round(release, true).await?;
+        }
+    }
+    cluster.refresh_oracle_snapshots().await?;
+
+    let text = |value: &str| Some(value.to_owned());
+    let (billing2, agent_uid) = (releases[1].uid.to_string(), agent.to_string());
+    let filters = |explored: &Explored| -> Vec<Filter> {
+        let (billing2, agent_uid) = (billing2.clone(), agent_uid.clone());
+        let agent_too = agent_uid.clone();
+        vec![
+            Filter {
+                label: "service family",
+                sql: "service_name = 'lookup-billing'".to_owned(),
+                keeps: Box::new(move |row| row.service == text("lookup-billing")),
+            },
+            Filter {
+                label: "exact release",
+                sql: format!("workload_card_uid = '{billing2}'"),
+                keeps: Box::new(move |row| row.workload.as_deref() == Some(billing2.as_str())),
+            },
+            Filter {
+                label: "release name and version",
+                sql: "service_name = 'lookup-billing' AND service_version = '2.0.0'".to_owned(),
+                keeps: Box::new(move |row| {
+                    row.service == text("lookup-billing") && row.version == text("2.0.0")
+                }),
+            },
+            Filter {
+                label: "environment",
+                sql: "deployment_environment = 'prod'".to_owned(),
+                keeps: Box::new(move |row| row.environment == text("prod")),
+            },
+            Filter {
+                label: "subject kind and name",
+                sql: "subject_kind = 'Agent' AND subject_name = 'lookup-component'".to_owned(),
+                keeps: Box::new(move |row| {
+                    row.kind == text("Agent") && row.name == text("lookup-component")
+                }),
+            },
+            Filter {
+                label: "exact subject",
+                sql: format!("subject_card_uid = '{agent_uid}'"),
+                keeps: Box::new(move |row| row.subject.as_deref() == Some(agent_uid.as_str())),
+            },
+            Filter {
+                label: "subject name and version",
+                sql: "subject_kind = 'Agent' AND subject_name = 'lookup-component' \
+                      AND subject_version = '1.0.0'"
+                    .to_owned(),
+                keeps: Box::new(move |row| {
+                    row.kind == text("Agent")
+                        && row.name == text("lookup-component")
+                        && row.subject_version == text("1.0.0")
+                }),
+            },
+            Filter {
+                label: "service and subject",
+                sql: format!(
+                    "service_name = 'lookup-checkout' AND subject_card_uid = '{agent_too}'"
+                ),
+                keeps: Box::new(move |row| {
+                    row.service == text("lookup-checkout")
+                        && row.subject.as_deref() == Some(agent_too.as_str())
+                }),
+            },
+            Filter {
+                label: "empty",
+                sql: "service_name = 'lookup-absent'".to_owned(),
+                keeps: Box::new(|_| false),
+            },
+            Filter {
+                label: "unattributed",
+                sql: "service_name IS NULL".to_owned(),
+                keeps: Box::new(|row| row.service.is_none()),
+            },
+            Filter {
+                label: "time bounded",
+                sql: format!("{} >= {}", explored.time, timestamp(started)),
+                keeps: Box::new(|_| true),
+            },
+            Filter {
+                label: "unbounded",
+                sql: "true".to_owned(),
+                keeps: Box::new(|_| true),
+            },
+        ]
+    };
+    let compare = async |stage: &str| -> Result<(), ServerJourneyError> {
+        cluster.await_audit_retained().await?;
+        let settled = timestamp(Utc::now());
+        for explored in &EXPLORED {
+            let bound = if explored.grows {
+                format!(" AND {} < {settled}", explored.time)
+            } else {
+                String::new()
+            };
+            let mut expected: Vec<_> = rows(format!(
+                "SELECT {ATTRIBUTED} FROM {} WHERE true{bound}",
+                explored.table
+            ))
+            .await?
+            .iter()
+            .map(Attributed::of)
+            .collect();
+            expected.sort();
+            if expected.is_empty() {
+                return Err(format!("{stage} {}: no rows to filter", explored.table).into());
+            }
+            let mut answers = BTreeMap::new();
+            for filter in filters(explored) {
+                let sql = format!(
+                    "SELECT {ATTRIBUTED} FROM {} WHERE {}{bound}",
+                    explored.table, filter.sql
+                );
+                let label = format!("{stage} {} {}", explored.table, filter.label);
+                let (read, _) = ScanEvidence::of(&cluster, &label, rows(sql)).await?;
+                let mut read: Vec<_> = read.iter().map(Attributed::of).collect();
+                read.sort();
+                let want: Vec<_> = expected
+                    .iter()
+                    .filter(|row| (filter.keeps)(row))
+                    .cloned()
+                    .collect();
+                if read != want {
+                    return Err(format!("{label}: read {read:?}, expected {want:?}").into());
+                }
+                answers.insert(filter.label, read);
+            }
+            if explored.grows {
+                continue;
+            }
+            if let Some(label) = POSITIVE
+                .iter()
+                .find(|label| answers.get(*label).is_none_or(Vec::is_empty))
+            {
+                return Err(format!("{stage} {} {label}: no rows", explored.table).into());
+            }
+            for (uid, named) in [
+                ("exact release", "release name and version"),
+                ("exact subject", "subject name and version"),
+            ] {
+                if answers.get(uid) != answers.get(named) {
+                    return Err(format!(
+                        "{stage} {}: {uid} and {named} differ: {:?} vs {:?}",
+                        explored.table,
+                        answers.get(uid),
+                        answers.get(named)
+                    )
+                    .into());
+                }
+            }
+        }
+        let decisions = rows(format!(
+            "SELECT {} FROM {AUDIT_LOG} WHERE created_at < {settled}",
+            AUDIT_KEYS
+                .map(|key| format!("CAST({key} AS VARCHAR) AS {key}"))
+                .join(", ")
+        ))
+        .await?;
+        for key in AUDIT_KEYS {
+            let value = |row: &Value| row.get(key).and_then(Value::as_str).map(str::to_owned);
+            let first = decisions
+                .iter()
+                .find_map(value)
+                .ok_or_else(|| format!("{stage}: no audited decision carries {key}"))?;
+            let expected = decisions
+                .iter()
+                .filter(|row| value(row).as_deref() == Some(first.as_str()))
+                .count();
+            let label = format!("{stage} {AUDIT_LOG} {key}");
+            let (rows, _) = ScanEvidence::of(
+                &cluster,
+                &label,
+                texts(format!(
+                    "SELECT operation FROM {AUDIT_LOG} \
+                     WHERE {key} = '{first}' AND created_at < {settled}"
+                )),
+            )
+            .await?;
+            if rows.len() != expected {
+                return Err(format!("{label}: {} rows, expected {expected}", rows.len()).into());
+            }
+        }
+        let versions = texts(
+            "SELECT service_version, COUNT(*) AS n FROM bifrost.traces.spans \
+             WHERE service_name = 'lookup-billing' GROUP BY service_version \
+             ORDER BY service_version"
+                .to_owned(),
+        )
+        .await?;
+        if versions.len() != 2 {
+            return Err(
+                format!("{stage}: billing aggregates two releases, saw {versions:?}").into(),
+            );
+        }
+        Ok(())
+    };
+    let checkout = &releases[2];
+    // One equal checkout round per declaration, measured as it is written and
+    // published, then filtered while live and once published.
+    let declared = async |name: &str| -> Result<(StoredBlooms, StoredBlooms), ServerJourneyError> {
+        let (tables, audit) = StoredBlooms::read(cluster.storage_root())?;
+        ScanEvidence::of(
+            &cluster,
+            &format!("checkout ingest {name}"),
+            round(checkout, false),
+        )
+        .await?;
+        landed().await?;
+        compare(&format!("live {name}")).await?;
+        ScanEvidence::of(&cluster, &format!("checkout publish {name}"), async {
+            Ok(server.flush_bifrost().await?)
+        })
+        .await?;
+        cluster.refresh_oracle_snapshots().await?;
+        compare(&format!("published {name}")).await?;
+        let (tables_after, audit_after) = StoredBlooms::read(cluster.storage_root())?;
+        let added = (tables_after.since(tables), audit_after.since(audit));
+        println!(
+            "stored by {name}: writer tables {:?}; audit log {:?}",
+            added.0, added.1
+        );
+        Ok(added)
+    };
+    let full = declared("with default blooms").await?;
+
+    let results: Vec<_> = rows(format!(
+        "SELECT {ATTRIBUTED} FROM bifrost.verification.results"
+    ))
+    .await?
+    .iter()
+    .map(Attributed::of)
+    .collect();
+    if results.len() != 12 || results.iter().any(|row| row.service.is_none()) {
+        return Err(format!("twelve attributed results expected, saw {results:?}").into());
+    }
+    let result_row = texts(
+        "SELECT CAST(result_id AS VARCHAR), CAST(execution_id AS VARCHAR), \
+         CAST(verifier_card_uid AS VARCHAR), CAST(binding_id AS VARCHAR) \
+         FROM bifrost.verification.results LIMIT 1"
+            .to_owned(),
+    )
+    .await?;
+    let [result_id, execution_id, verifier_uid, binding_id] =
+        <[Option<String>; 4]>::try_from(result_row.first().cloned().ok_or("one result row")?)
+            .map_err(|row| format!("{row:?}"))?;
+    for (column, value, expected) in [
+        ("result_id", result_id, 1),
+        ("execution_id", execution_id, 1),
+        ("verifier_card_uid", verifier_uid, 12),
+        ("binding_id", binding_id, 1),
+        ("service_name", text("lookup-checkout"), 2),
+        ("subject_name", text("lookup-component"), 12),
+        ("workload_card_uid", Some(billing2.clone()), 2),
+        ("subject_card_uid", Some(agent.to_string()), 6),
+        ("run_id", None, 0),
+        ("group_id", None, 0),
+    ] {
+        let predicate = value.map_or_else(
+            || format!("{column} = 'absent-{column}'"),
+            |value| format!("{column} = '{value}'"),
+        );
+        let label = format!("results bloom column {column}");
+        let (rows, _) = ScanEvidence::of(
+            &cluster,
+            &label,
+            texts(format!(
+                "SELECT outcome FROM bifrost.verification.results WHERE {predicate}"
+            )),
+        )
+        .await?;
+        if rows.len() != expected {
+            return Err(format!("{label}: {} rows, expected {expected}", rows.len()).into());
+        }
+    }
+
+    let bifrost = Bifrost::connect_with(&admin, BifrostOptions::default()).await?;
+    // Keep each table's leading `kept(n)` of its `n` current Bloom columns.
+    let relayout = async |kept: fn(usize) -> usize| -> Result<(), ServerJourneyError> {
+        for explored in &EXPLORED {
+            let (namespace, name) = explored
+                .table
+                .rsplit_once('.')
+                .ok_or("the FQN names its table")?;
+            let before = bifrost.describe_table(namespace, name).await?;
+            let current = &before.physical_layout.bloom_columns;
+            let blooms = current[..kept(current.len())].to_vec();
+            println!("{} blooms {current:?} -> {blooms:?}", explored.table);
+            bifrost
+                .alter_table(
+                    namespace,
+                    name,
+                    &wyrd_spec::vala::api::AlterTableRequest {
+                        expected_table_version: before.table_version,
+                        physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutEdit {
+                            bloom_columns: Some(blooms),
+                            ..wyrd_spec::vala::api::PhysicalLayoutEdit::default()
+                        }),
+                        add_columns: None,
+                        rename_columns: None,
+                    },
+                )
+                .await?;
+        }
+        Ok(())
+    };
+    relayout(|n| n / 2).await?;
+    for explored in &EXPLORED {
+        let (namespace, name) = explored
+            .table
+            .rsplit_once('.')
+            .ok_or("the FQN names its table")?;
+        let kept = bifrost
+            .describe_table(namespace, name)
+            .await?
+            .physical_layout
+            .bloom_columns;
+        if kept.is_empty() {
+            return Err(format!("{}: half its defaults kept no Bloom", explored.table).into());
+        }
+    }
+    let partial = declared("with half the default blooms").await?;
+    relayout(|_| 0).await?;
+    let empty = declared("without blooms").await?;
+    if full.0.bare != 0
+        || partial.0.bare != 0
+        || partial.0.filter_bytes >= full.0.filter_bytes
+        || empty.0.filtered != 0
+        || empty.0.bare == 0
+    {
+        return Err(format!(
+            "each declaration stores its own Bloom set: full {full:?}, partial {partial:?}, \
+             empty {empty:?}"
+        )
+        .into());
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Run the production runtime on `server` until the tenant holds `count`
+/// executions and every one settles, and return their rows.
+///
+/// # Errors
+/// Returns the runtime, fixture, or timeout error.
+async fn settle_all(
+    server: &WyrdTestServer,
+    seed: &VerificationFixture,
+    count: usize,
+) -> Result<Vec<ExecutionRow>, ServerJourneyError> {
+    let runtime = VerificationRuntime::builder(server.state())
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let rows = loop {
+        let mut rows = Vec::with_capacity(count);
+        for execution in seed.executions().await? {
+            rows.push(seed.execution(execution).await?);
+        }
+        if rows.len() == count
+            && rows
+                .iter()
+                .all(|row| !["pending", "running", "retrying"].contains(&row.status.as_str()))
+        {
+            break rows;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{count} executions never settled: {rows:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    Ok(rows)
+}
+
+/// A completed execution's status returns its own canonical result through
+/// one exact result read, whatever other results its tenant retains
+/// (REQ-026, REQ-040; AC-008, AC-014).
+///
+/// Results of the same tenant are published today, yesterday, and three
+/// days ago. Two queued trace executions of one Verifier and subject judge
+/// different traces, one passing and one failing. While they are pending,
+/// each status carries no result and costs no Oracle read. The runtime then
+/// collects each trace once. After publication each status, read through the
+/// Rust SDK, returns its own verdict and execution with one Oracle statement
+/// that scans no more files than the day-partitioned result table holds
+/// results for that execution; another execution's result never substitutes.
+/// Another tenant's caller and an unknown execution are refused as not found.
+///
+/// # Errors
+/// Returns cluster, fixture, ingest, runtime, SDK, or query errors, or the
+/// first status that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn completed_result_lookup_preserves_evidence() -> Result<(), ServerJourneyError> {
+    use wyrd_client::verify::Execution;
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let tenant = cluster.data_tenant_id();
+    server
+        .ensure_builtin_table_for_test(tenant, "traces", "spans")
+        .await?;
+    let older = ResultLayoutJourney::start(&cluster).await?;
+    let now = Utc::now();
+    for days in [0, 1, 3] {
+        older
+            .publish(now - chrono::Duration::days(days), Report::Drift, false)
+            .await?;
+    }
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (checkout, _) = seed.service("result-checkout").await?;
+    let (admin, schema) = span_writer(server).await?;
+    let verifier = seed
+        .verifier(
+            "result-lookup",
+            &trace_spec(&[("names", "$.spans[*].name", json!("retrieve"))]),
+        )
+        .await?;
+    let (passing, failing) = (fresh_trace()?, fresh_trace()?);
+    let start = nanos_from_now(0);
+    for (trace, name) in [(passing, "retrieve"), (failing, "rank")] {
+        native_spans(
+            &admin,
+            uuid::Uuid::now_v7(),
+            &trace_batch(&schema, trace, &[(1, name, start)]),
+        )
+        .await?;
+    }
+    server.flush_bifrost().await?;
+    let mut executions = Vec::new();
+    for trace in [passing, failing] {
+        let accepted: Value = admin
+            .request_json(
+                reqwest::Method::POST,
+                "/v1/verification/enqueue",
+                Some(&trace_body(&verifier, &checkout, trace)),
+            )
+            .await?;
+        executions.push(await_queued(&seed, &accepted).await?);
+    }
+    for execution in &executions {
+        let (pending, work) = ScanEvidence::of(&cluster, "pending status", async {
+            Ok(Execution::connect_with(*execution, &admin)
+                .await?
+                .status()
+                .await?)
+        })
+        .await?;
+        if pending.result.is_some() || !ScanEvidence::is(work.queries, 0) {
+            return Err(format!("a pending status read a result: {pending:?} {work:?}").into());
+        }
+    }
+
+    let (rows, collection) = ScanEvidence::of(
+        &cluster,
+        "two trace executions",
+        settle_all(server, &seed, executions.len()),
+    )
+    .await?;
+    if rows
+        .iter()
+        .any(|row| row.status != "completed" || row.attempts != 1 || row.result_id.is_none())
+    {
+        return Err(format!("both executions complete on attempt one: {rows:?}").into());
+    }
+    if !ScanEvidence::is(collection.queries, 2) {
+        return Err(format!("each execution collects its trace once: {collection:?}").into());
+    }
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    for (execution, verdict) in executions.iter().zip(["passed", "failed"]) {
+        let (state, work) = ScanEvidence::of(&cluster, &format!("{verdict} status"), async {
+            Ok(Execution::connect_with(*execution, &admin)
+                .await?
+                .status()
+                .await?)
+        })
+        .await?;
+        let result = state
+            .result
+            .ok_or("a completed status carries its result")?;
+        let read = serde_json::to_value(&result.outcome)?;
+        if result.execution_id != *execution || read["verdict"] != verdict {
+            return Err(format!("{execution} read another result: {read}").into());
+        }
+        if !ScanEvidence::is(work.queries, 1) || work.files > 1.0 {
+            return Err(format!("one exact result read scans one file: {work:?}").into());
+        }
+    }
+
+    let other = server.seed_tenant("result-lookup-other").await?;
+    let outsider = server
+        .bootstrap_service_in_tenant(other, "result-outsider", &["admin"])
+        .await?;
+    let outsider = native_client(
+        server,
+        outsider
+            .api_key()
+            .ok_or("the outsider has an API key")?
+            .expose_secret(),
+    )?;
+    for (caller, execution) in [(&outsider, executions[0]), (&admin, ExecutionId::new_v7())] {
+        let refused = match Execution::connect_with(execution, caller)
+            .await?
+            .status()
+            .await
+        {
+            Ok(state) => return Err(format!("{execution} is visible: {state:?}").into()),
+            Err(refused) => refused,
+        };
+        if !matches!(refused, WyrdError::VerificationExecutionNotFound { .. }) {
+            return Err(format!("not-found expected, saw {refused:?}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// A scheduled Custom Drift window scores exactly its own subject's `score`
+/// rows in `[start, end)` with one Oracle statement per execution
+/// (REQ-026, REQ-040; AC-008, AC-014).
+///
+/// Three Card-bound Services are bound monthly to one Custom Drift Verifier
+/// whose score is the window mean. `inside` writes `score` 3 at the inclusive
+/// month start and 5 a minute ago, plus 1000 a microsecond before the start
+/// and an hour after the due end; `other` writes 50 in the window; `empty`
+/// writes nothing. Every record also carries a `latency` series. The
+/// production runtime then scores `inside` at 4 and `other` at 50, while
+/// `empty` stays unscored with no feature row, and the three executions cost
+/// three Oracle statements.
+///
+/// # Errors
+/// Returns cluster, seeding, client, runtime, or query errors, or the first
+/// population that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn window_lookup_preserves_population() -> Result<(), ServerJourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let tenant = cluster.data_tenant_id();
+    server
+        .ensure_builtin_table_for_test(tenant, "drift", "observations")
+        .await?;
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let verifier = seed
+        .custom_drift_verifier("window-mean", "score", 0.0, 1000.0)
+        .await?;
+    let now = Utc::now();
+    let start = now
+        .date_naive()
+        .with_day(1)
+        .and_then(|day| day.and_hms_opt(0, 0, 0))
+        .ok_or("the current month has no first instant")?
+        .and_utc();
+    let inside_scores = [
+        (start, 3.0),
+        (observed_in_current_month(now)?, 5.0),
+        (start - chrono::Duration::microseconds(1), 1000.0),
+        (now + chrono::Duration::hours(1), 1000.0),
+    ];
+    let mut bindings = Vec::new();
+    for (name, scores) in [
+        ("window-inside", &inside_scores[..]),
+        (
+            "window-other",
+            &[(observed_in_current_month(now)?, 50.0)][..],
+        ),
+        ("window-empty", &[][..]),
+    ] {
+        let card = server
+            .bootstrap_service_in_tenant(tenant, name, &[])
+            .await?
+            .card_ref()
+            .ok_or("a service bootstrap returned a user")?
+            .clone();
+        let Bootstrap::Machine { id, api_key, .. } = server
+            .credential_registered_service(&card, &["admin"])
+            .await?
+        else {
+            return Err("a service credential returned a user".into());
+        };
+        let subject = card.uid.clone().ok_or("the subject Card has no UID")?;
+        let writer = Bifrost::connect_with(
+            &native_client(server, api_key.expose_secret())?.for_workload(subject.clone()),
+            BifrostOptions::default(),
+        )
+        .await?;
+        for (at, score) in scores {
+            let record = format!("{name}-{}", uuid::Uuid::now_v7());
+            writer
+                .write_batch(
+                    DRIFT_OBSERVATIONS,
+                    &observation_batch(&record, &subject, *at, *score)?,
+                )
+                .await?;
+        }
+        seed.activate(id, &subject).await?;
+        let binding = seed
+            .bind_schedule(&subject, &subject, &verifier, MONTHLY, Vec::new())
+            .await?;
+        seed.make_binding_due(binding).await?;
+        bindings.push(binding);
+    }
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let (rows, work) = ScanEvidence::of(
+        &cluster,
+        "three drift windows",
+        settle_all(server, &seed, bindings.len()),
+    )
+    .await?;
+    if rows
+        .iter()
+        .any(|row| row.status != "completed" || row.result_id.is_none())
+    {
+        return Err(format!("every window completes with a result: {rows:?}").into());
+    }
+    if !ScanEvidence::is(work.queries, 3) {
+        return Err(format!("each window is one statement: {work:?}").into());
+    }
+    let unwritten = server
+        .state()
+        .bifrost
+        .scribe_outbox()
+        .settle(std::time::Instant::now() + WAIT)
+        .await;
+    if unwritten != 0 {
+        return Err(format!("{unwritten} results were never written").into());
+    }
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+    for (binding, expected) in bindings.iter().zip([Some("4.0"), Some("50.0"), None]) {
+        let scores = query_texts(
+            server,
+            tenant,
+            format!(
+                "SELECT CAST(score AS VARCHAR) FROM bifrost.drift.result_features \
+                 WHERE binding_id = '{binding}' AND feature = 'score'"
+            ),
+        )
+        .await?;
+        let scored: Vec<_> = expected
+            .map(|score| vec![Some(score.to_owned())])
+            .into_iter()
+            .collect();
+        if scores != scored {
+            return Err(format!("binding {binding} scored {scores:?}, not {expected:?}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Interleaved support conversations each form their own group snapshot of
+/// exactly their turns, in recorded order, with one Oracle statement per
+/// group (REQ-026, REQ-040; AC-008, AC-014).
+///
+/// The `support` Service declares a per-turn `turn-check` and a `group_end`
+/// `conversation-verifier` whose `turns` slot reads turn inputs and whose
+/// `answered` slot reads turn results. The Service enqueues conversation
+/// `long` (`a`, a blank answer, `c`) interleaved with conversation `short`
+/// (`z`). The production runtime judges the four turns, then hands each
+/// expired group off once: `long` lists its three turns in order under both
+/// slots and fails on the blank turn, `short` lists only its turn and
+/// passes, and the whole runtime pass costs one statement per group, since
+/// the turns read no warehouse evidence.
+///
+/// # Errors
+/// Returns cluster, declaration, credential, route, runtime, or SDK
+/// errors, or the first snapshot that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn group_lookup_preserves_source_occurrences() -> Result<(), ServerJourneyError> {
+    use wyrd_client::verify::Execution;
+
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let tenant = cluster.data_tenant_id();
+    for table in ["execution_inputs", "results"] {
+        server
+            .ensure_builtin_table_for_test(tenant, "verification", table)
+            .await?;
+    }
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let admin = server.bootstrap_service("group-admin", &["admin"]).await?;
+    let admin = native_client(
+        server,
+        admin
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let receipt = Box::pin(
+        wyrd_client::cards::Cards::connect_with(&admin)
+            .await?
+            .declare_from_path(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../fixtures/cards/verify_in_real_time/support.yaml"
+            )),
+    )
+    .await?;
+    let uid = |name: &str| {
+        receipt
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.card_ref.name.as_str() == name)
+            .and_then(|outcome| outcome.card_ref.uid.clone())
+            .ok_or(format!("the receipt names {name}"))
+    };
+    let (agent, turn_check) = (uid("assistant-agent")?, uid("turn-check")?);
+    let root = receipt.root.uid.clone().ok_or("the Service has a UID")?;
+    let machine = server
+        .credential_registered_service(&receipt.root, &["editor"])
+        .await?;
+    let token = server
+        .exchange_api_key_for_workload(
+            machine.api_key().ok_or("the Service has an API key")?,
+            &root,
+        )
+        .await?;
+    let service = native_client(server, &token)?;
+    let mut turns: BTreeMap<&str, Vec<ExecutionId>> = BTreeMap::new();
+    for (group, answer) in [("long", "a"), ("short", "z"), ("long", ""), ("long", "c")] {
+        let accepted: Value = service
+            .request_json(
+                reqwest::Method::POST,
+                "/v1/verification/enqueue",
+                Some(&json!({
+                    "verifier_card_uid": turn_check,
+                    "card_uid": agent,
+                    "group_id": group,
+                    "inputs": {"turn": {"kind": "json", "value": {"answer": answer}}},
+                })),
+            )
+            .await?;
+        turns
+            .entry(group)
+            .or_default()
+            .push(await_queued(&seed, &accepted).await?);
+    }
+
+    let (rows, work) = ScanEvidence::of(
+        &cluster,
+        "four turns and two groups",
+        settle_all(server, &seed, 6),
+    )
+    .await?;
+    if rows.iter().any(|row| row.status != "completed") {
+        return Err(format!("every execution completes: {rows:?}").into());
+    }
+    if !ScanEvidence::is(work.queries, 2) {
+        return Err(format!("each group is read by one statement: {work:?}").into());
+    }
+    let mut groups = BTreeMap::new();
+    for execution in seed.executions().await? {
+        let state = Execution::connect_with(execution, &admin)
+            .await?
+            .status()
+            .await?;
+        if let (Some(group), Some(snapshot)) = (state.group_id.clone(), state.group.clone()) {
+            let verdict =
+                serde_json::to_value(&state.result.ok_or("a group result")?.outcome)?["verdict"]
+                    .clone();
+            let listed: BTreeMap<String, Vec<ExecutionId>> = snapshot
+                .sources
+                .into_iter()
+                .map(|(slot, source)| (slot.to_string(), source.execution_ids))
+                .collect();
+            groups.insert(group.to_string(), (listed, verdict));
+        }
+    }
+    for (group, verdict) in [("long", "failed"), ("short", "passed")] {
+        let own = &turns[group];
+        let expected = (
+            BTreeMap::from([
+                ("answered".to_owned(), own.clone()),
+                ("turns".to_owned(), own.clone()),
+            ]),
+            json!(verdict),
+        );
+        if groups.get(group) != Some(&expected) {
+            return Err(format!("{group} snapshot differs: {groups:?}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Call MCP `bifrost.query` on `server` as `token` with `arguments`, and
+/// return the structured content and whether the call was a tool error.
+///
+/// Hosted Agent `bifrost.query` and MCP `bifrost.query` collect through the
+/// same bounded query owner, so this is the declared-SQL path an Agent check
+/// reaches, minus its `tool:invoke` authorization.
+///
+/// # Errors
+/// Returns the transport error, or a description when the call carries no
+/// structured content.
+async fn mcp_query(
+    server: &WyrdTestServer,
+    token: &str,
+    arguments: Value,
+) -> Result<(Value, bool), ServerJourneyError> {
+    use rmcp::ClientServiceExt as _;
+    use rmcp::transport::StreamableHttpClientTransport;
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+    let base_url = server
+        .base_url()
+        .ok_or("the server has no public listener")?;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp"));
+    config.allow_stateless = true;
+    config.custom_headers.insert(
+        http::HeaderName::from_static("x-wyrd-access-token"),
+        http::HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+    let client = ()
+        .serve_with_lifecycle(
+            StreamableHttpClientTransport::with_client(reqwest::Client::new(), config),
+            rmcp::ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await?;
+    let result = client
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("bifrost.query").with_arguments(
+                arguments
+                    .as_object()
+                    .ok_or("query arguments are an object")?
+                    .clone(),
+            ),
+        )
+        .await?;
+    Ok((
+        result
+            .structured_content
+            .ok_or("bifrost.query returns structured content")?,
+        result.is_error == Some(true),
+    ))
+}
+
+/// Declared SQL over a custom table returns exactly its own filtered,
+/// projected rows from live, published, Bloom-absent and Bloom-added data,
+/// with the filter reaching the scan, and its bounds still refuse rather than
+/// truncate (REQ-026, REQ-040; AC-008, AC-014).
+///
+/// The admin writes `eu` rows 1 and 2 and `us` row 3 as two published files
+/// with no Bloom column, adds a `region` Bloom column, publishes `eu` row 4
+/// and `us` row 5 as two more files, and leaves `eu` row 6 live. A
+/// workload-bound Service selecting `region = 'eu'` over MCP reads rows 1, 2,
+/// 4 and 6, in order, although none of them carries its workload, reading
+/// only the two `eu` files' row groups, and with `LIMIT 3` reads exactly rows
+/// 1, 2 and 4. The same statement under three rows or ten bytes, past a
+/// one-millisecond deadline, or as a caller with no read grant is refused
+/// with no rows.
+///
+/// # Errors
+/// Returns cluster, registration, ingest, credential, or MCP errors, or the
+/// first answer or refusal that differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn custom_query_preserves_evidence_and_limits() -> Result<(), ServerJourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let key = |name: &'static str, roles: &'static [&'static str]| async move {
+        let service = server.bootstrap_service(name, roles).await?;
+        let uid = service
+            .card_ref()
+            .and_then(|card| card.uid.clone())
+            .ok_or("the Service has a Card UID")?;
+        let key = service
+            .api_key()
+            .ok_or("the Service has an API key")?
+            .clone();
+        Ok::<_, ServerJourneyError>((uid, key))
+    };
+    let (_, admin_key) = key("custom-admin", &["admin"]).await?;
+    let admin = native_client(server, admin_key.expose_secret())?;
+    let fqn = format!(
+        "bifrost.datasets.custom_lookup_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+    let bifrost = Bifrost::connect_with(
+        &admin,
+        BifrostOptions {
+            table: Some(TableConfig::from_arrow(&fqn, Arc::clone(&schema))?),
+            ..BifrostOptions::default()
+        },
+    )
+    .await?;
+    bifrost.register().await?;
+    let write = |ids: Vec<i64>, region: &'static str| {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(ids.clone())),
+                Arc::new(StringArray::from(vec![region; ids.len()])),
+            ],
+        );
+        let (bifrost, fqn) = (&bifrost, &fqn);
+        async move {
+            bifrost.write_batch(fqn, &batch?).await?;
+            Ok::<_, ServerJourneyError>(())
+        }
+    };
+    write(vec![1, 2], "eu").await?;
+    server.flush_bifrost().await?;
+    write(vec![3], "us").await?;
+    server.flush_bifrost().await?;
+    let (namespace, name) = fqn.rsplit_once('.').ok_or("the FQN names its table")?;
+    let before = bifrost.describe_table(namespace, name).await?;
+    bifrost
+        .alter_table(
+            namespace,
+            name,
+            &wyrd_spec::vala::api::AlterTableRequest {
+                expected_table_version: before.table_version,
+                physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutEdit {
+                    bloom_columns: Some(vec!["region".to_owned()]),
+                    ..wyrd_spec::vala::api::PhysicalLayoutEdit::default()
+                }),
+                add_columns: None,
+                rename_columns: None,
+            },
+        )
+        .await?;
+    write(vec![4], "eu").await?;
+    server.flush_bifrost().await?;
+    write(vec![5], "us").await?;
+    server.flush_bifrost().await?;
+    write(vec![6], "eu").await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let (agent, agent_key) = key("custom-agent", &["admin"]).await?;
+    let agent = server
+        .exchange_api_key_for_workload(&agent_key, &agent)
+        .await?;
+    let sql = format!("SELECT id FROM {fqn} WHERE region = 'eu' ORDER BY id");
+    let ((answer, refused), work) = ScanEvidence::of(
+        &cluster,
+        "custom eu lookup",
+        mcp_query(server, &agent, json!({ "sql": sql })),
+    )
+    .await?;
+    if refused || answer["rows"] != json!([[1], [2], [4], [6]]) {
+        return Err(format!("the declared SQL changed meaning: {answer}").into());
+    }
+    // The file count subtracts open-time statistics skips, which may land
+    // after the terminal; the two `eu` files' row groups are exact.
+    if !ScanEvidence::is(work.queries, 1) || !ScanEvidence::is(work.row_groups, 2) {
+        return Err(format!("the region filter reaches the scan: {work:?}").into());
+    }
+    let (top, refused) =
+        mcp_query(server, &agent, json!({ "sql": format!("{sql} LIMIT 3") })).await?;
+    if refused || top["rows"] != json!([[1], [2], [4]]) {
+        return Err(format!("the limit keeps the lowest ids: {top}").into());
+    }
+
+    let (_, outsider_key) = key("custom-outsider", &[]).await?;
+    let outsider = server.exchange_api_key(&outsider_key).await?;
+    for (caller, arguments, code) in [
+        (
+            &agent,
+            json!({ "sql": sql, "max_rows": 3 }),
+            "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+        ),
+        (
+            &agent,
+            json!({ "sql": sql, "max_bytes": 10 }),
+            "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+        ),
+        (&agent, json!({ "sql": sql, "deadline_ms": 1 }), "504"),
+        (&outsider, json!({ "sql": sql }), "403"),
+    ] {
+        let (problem, refused) = mcp_query(server, caller, arguments.clone()).await?;
+        let seen = problem["code"].as_str().unwrap_or_default();
+        if !refused || !seen.contains(code) || problem.get("rows").is_some() {
+            return Err(format!("{arguments} must refuse with {code}: {problem}").into());
+        }
+    }
+    cluster.shutdown().await?;
     Ok(())
 }

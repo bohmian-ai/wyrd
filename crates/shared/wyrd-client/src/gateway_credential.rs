@@ -1,7 +1,7 @@
 //! Provider-credential mutation, kept off the gateway administration handle.
 //!
 //! Creating, rotating, revoking, and deleting a provider credential all live
-//! here rather than on [`crate::gateway::Gateway`], because none of them can
+//! here rather than on [`crate::gateway_admin::Gateway`], because none of them can
 //! be offered to a first-class SDK without also offering ManagedSecret
 //! mutation. Submission is obvious: the write body can hold the secret itself
 //! in [`ProviderCredentialWriteSource::ManagedSecret`]. Revocation and
@@ -31,7 +31,7 @@ use wyrd_spec::gateway::{
 use wyrd_spec::ids::ProviderCredentialName;
 
 use crate::WyrdClient;
-use crate::gateway::{DEPLOYMENTS, credential_path};
+use crate::gateway_admin::{DEPLOYMENTS, credential_path};
 
 /// Mutates provider credentials over one shared [`WyrdClient`].
 ///

@@ -55,9 +55,10 @@ pub struct AuthContext {
     /// [`Self::principal`], while the chain travels with it so the operation's
     /// audit record can name who was acting for whom.
     pub delegation_chain: Vec<DelegationStep>,
-    /// The request's accepted `x-wyrd-deployment-environment`, stamped as
-    /// every admitted row's `deployment_environment`; `None` when the request
-    /// sent none, so telemetry keeps its resource environment.
+    /// A native batch request's accepted `x-wyrd-deployment-environment`,
+    /// stamped as every admitted row's `deployment_environment`; `None` when
+    /// the request sent none and for OTLP, whose rows keep their resource
+    /// environment.
     pub deployment_environment: Option<String>,
 }
 
@@ -69,22 +70,10 @@ impl AuthContext {
     /// verified gRPC caller passes through here, so this also routes the
     /// current request's tenant span copies to that tenant and principal; a
     /// request that did not continue a sampled client trace is not routed.
-    /// The deployment environment is read from `metadata` here too.
-    ///
-    /// # Errors
-    /// Returns [`IngestError::RequestContext`] when the deployment environment
-    /// is repeated, empty, or not UTF-8.
-    pub fn from_verified(
-        verified: VerifiedToken,
-        metadata: &MetadataMap,
-    ) -> Result<Self, IngestError> {
-        let deployment_environment = deployment_environment_selector(
-            metadata
-                .get_all(DEPLOYMENT_ENVIRONMENT_HEADER)
-                .iter()
-                .map(wyrd_tonic::tonic::metadata::MetadataValue::as_bytes),
-        )
-        .map_err(IngestError::RequestContext)?;
+    /// The context names no deployment environment; native ingest adds its
+    /// request's through [`Self::with_request_environment`].
+    #[must_use]
+    pub fn from_verified(verified: VerifiedToken, metadata: &MetadataMap) -> Self {
         wyrd_telemetry::bind_tenant_route(wyrd_telemetry::TenantSpanRoute {
             tenant: verified.principal.tenant_id,
             attribution: wyrd_runtime::delegated_attribution(
@@ -92,12 +81,33 @@ impl AuthContext {
                 &verified.delegation_chain,
             ),
         });
-        Ok(Self {
+        Self {
             tenant: verified.principal.tenant_id,
             principal: verified.principal,
             request_id: read_or_mint_request_id(metadata),
             delegation_chain: verified.delegation_chain,
+            deployment_environment: None,
+        }
+    }
+
+    /// This context with the native batch request's accepted
+    /// `x-wyrd-deployment-environment` read from `metadata`, or none when the
+    /// request sent none.
+    ///
+    /// # Errors
+    /// Returns [`IngestError::RequestContext`] when the deployment environment
+    /// is repeated, empty, or not UTF-8.
+    pub fn with_request_environment(self, metadata: &MetadataMap) -> Result<Self, IngestError> {
+        let deployment_environment = deployment_environment_selector(
+            metadata
+                .get_all(DEPLOYMENT_ENVIRONMENT_HEADER)
+                .iter()
+                .map(wyrd_tonic::tonic::metadata::MetadataValue::as_bytes),
+        )
+        .map_err(IngestError::RequestContext)?;
+        Ok(Self {
             deployment_environment,
+            ..self
         })
     }
 
@@ -196,7 +206,7 @@ pub fn read_or_mint_request_id(metadata: &MetadataMap) -> RequestId {
 /// Returns [`IngestError::Unauthenticated`] when the bearer is missing, does not
 /// name a tenant, or fails signature, issuer, audience, expiry, or tenant
 /// verification, and [`IngestError::RequestContext`] for a malformed,
-/// mismatched, or unresolvable selector or a malformed deployment environment.
+/// mismatched, or unresolvable selector.
 pub fn authenticate(
     verifier: &TokenVerifier,
     metadata: &MetadataMap,
@@ -229,7 +239,7 @@ pub fn authenticate(
             details: serde_json::json!({ "workload_uid": root }),
         }));
     }
-    AuthContext::from_verified(verified_token, metadata)
+    Ok(AuthContext::from_verified(verified_token, metadata))
 }
 
 /// The Gate's handle on the shared tenant token verifier.

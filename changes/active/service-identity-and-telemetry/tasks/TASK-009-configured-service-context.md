@@ -33,9 +33,10 @@ existing local bundle validation; no registration/authentication during load or
 configure. Multiple configured states retain independent context and buffers.
 
 Carry optional deployment_environment as typed invocation context.
-HTTP/OTLP/gRPC use the optional
-x-wyrd-deployment-environment header/metadata; typed verification/MCP requests
-use deployment_environment. No principal or tenant input is introduced. Preserve
+Gateway calls and native Bifrost
+gRPC writes use the optional x-wyrd-deployment-environment header/metadata; OTLP
+uses the deployment.environment.name resource attribute; typed verification/MCP
+requests use deployment_environment. No principal or tenant input is introduced. Preserve
 the accepted value through gateway capture, queues, delegation/origin handling
 and restart; token refresh cannot substitute a new environment. Activity stays
 Service/account scoped, with no environment fanout or new group key. Table

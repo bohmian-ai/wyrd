@@ -1353,19 +1353,19 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// `start_telemetry` found a process-global tracer provider Wyrd did not
-    /// install for this state: the application's own, or one bound to
-    /// another state's configured Service.
+    /// `start_telemetry` found a process-global tracer, meter, or logger
+    /// provider Wyrd did not install for this state: the application's own,
+    /// or one bound to another state's configured Service.
     ///
     /// Replacing an application's own provider would silently redirect or
-    /// drop its spans, and reusing another state's would export under the
+    /// drop its telemetry, and reusing another state's would export under the
     /// wrong Service, so Wyrd refuses instead.
     #[error("[WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS] {message}")]
     #[wyrd_error(
         code = "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS",
         status = 409,
-        title = "A tracer provider is already installed",
-        remediation = "Add each state's Wyrd span exporter to the application's own provider instead of calling start_telemetry."
+        title = "An OpenTelemetry provider is already installed",
+        remediation = "Add each state's Wyrd span, log, and metric exporters to the application's own providers instead of calling start_telemetry."
     )]
     SdkTelemetryProviderExists {
         /// Human-readable error message.

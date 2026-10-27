@@ -18,7 +18,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::bifrost::QueryParam;
 use wyrd_ai::cards::Cards;
 use wyrd_ai::cli;
-use wyrd_ai::gateway::{
+use wyrd_ai::gateway_admin::{
     DeploymentAccess, GatewayOperation, ProviderAdapter, ProviderAuth, ProviderCredentialName,
     ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
     ProviderDeploymentName, ProviderId,
@@ -26,17 +26,19 @@ use wyrd_ai::gateway::{
 use wyrd_ai::observe::Run;
 use wyrd_ai::operator_connections::SecretBearer;
 use wyrd_ai::otel::{Telemetry, start_telemetry};
-use wyrd_ai::state::WyrdState;
+use wyrd_ai::state::{ConfigureOptions, WyrdState};
 use wyrd_ai::{Bifrost, Gateway, VerificationVerdict, WyrdClient};
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 use crate::support::{Deployment, declare, pull};
 
-/// One evidence row: which Card it is attributed to.
+/// One evidence row: which Card and environment it is attributed to.
 #[derive(Debug, Deserialize)]
 struct Attributed {
     /// The stamped Card UID.
     subject_card_uid: Option<String>,
+    /// The stamped deployment environment.
+    deployment_environment: Option<String>,
 }
 
 /// The local upstream every Gateway call and its server.
@@ -109,6 +111,12 @@ pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
     let bundle = pull(&cards, &assistant.root).await;
     let state = WyrdState::from_path_with(bundle.path().join("bundle"), client.clone())
         .expect("the bundle loads");
+    state
+        .configure(ConfigureOptions {
+            deployment_environment: Some("local".to_owned()),
+            ..ConfigureOptions::default()
+        })
+        .expect("the environment configures");
     state.start_bifrost().await.expect("Bifrost starts");
 
     assert_eq!(invoke(deployment, client).await, "hi");
@@ -169,13 +177,21 @@ pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
     ] {
         let rows: Vec<Attributed> = bifrost
             .sql_as(
-                &format!("SELECT subject_card_uid FROM {table} WHERE run_id = $1"),
+                &format!(
+                    "SELECT subject_card_uid, deployment_environment FROM {table} \
+                     WHERE run_id = $1"
+                ),
                 &[QueryParam::String(run_id.clone())],
             )
             .await
             .unwrap_or_else(|error| panic!("{table} reads back: {error}"));
         assert_eq!(rows.len(), 1, "{table}: {rows:?}");
         assert_eq!(rows[0].subject_card_uid.as_ref(), Some(uid), "{table}");
+        assert_eq!(
+            rows[0].deployment_environment.as_deref(),
+            Some("local"),
+            "{table}"
+        );
     }
     Worked {
         state,

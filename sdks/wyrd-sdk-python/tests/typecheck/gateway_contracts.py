@@ -7,7 +7,7 @@ contract shape without an `Any` hop. It sits outside pytest collection.
 
 from __future__ import annotations
 
-from wyrd.gateway import (
+from wyrd.gateway_admin import (
     GatewayCapturePolicy,
     GatewayFallbackPolicy,
     GatewayGovernancePolicy,
@@ -76,7 +76,9 @@ def managed_secrets_are_readable_but_not_submittable() -> ProviderCredentialView
     Credential mutation is a CLI and scoped MCP administration path, so the
     package exposes a source view and no write body at all.
     """
-    from wyrd.gateway import ProviderCredentialWrite  # ty: ignore[unresolved-import]  # noqa: F401
+    from wyrd.gateway_admin import (
+        ProviderCredentialWrite,  # ty: ignore[unresolved-import]  # noqa: F401
+    )
 
     source: ProviderCredentialSourceView = "managed_secret"
     view: ProviderCredentialView = {

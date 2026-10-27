@@ -17,7 +17,7 @@ from typing import Any, Literal
 
 from ...cards import DeclarationReceipt
 from ...client import WyrdClient
-from ...gateway import ProviderCredentialView
+from ...gateway_admin import ProviderCredentialView
 from ._commands import get, pull
 
 class CheckCard:

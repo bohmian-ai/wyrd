@@ -11,7 +11,7 @@ import pytest
 from wyrd.bifrost import Bifrost
 from wyrd.cards import CardRef, Cards
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 

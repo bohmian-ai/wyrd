@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from wyrd._wyrd.gateway import Gateway
+from wyrd._wyrd.gateway_admin import Gateway
 
 from ._policy import (
     ApiKeyHeaderAuth,

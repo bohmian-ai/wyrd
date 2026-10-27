@@ -20,7 +20,7 @@ from typing import Literal
 
 import pytest
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway, GatewayOperation, ProviderAuth, ProviderDeployment
+from wyrd.gateway_admin import Gateway, GatewayOperation, ProviderAuth, ProviderDeployment
 from wyrd.testing import WyrdTestServer, cli
 
 # Every provider this lane sweeps.

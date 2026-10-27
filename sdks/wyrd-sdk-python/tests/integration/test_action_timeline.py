@@ -53,7 +53,7 @@ def test_service_action_timeline_is_one_connected_tree(
     wyrd_server: WyrdTestServer,
     assistant_bundle: Path,
     assistant_key: str,
-    fresh_tracer_provider: None,
+    fresh_telemetry_providers: None,
     metadata_capture: None,
     bifrost: Bifrost,
 ) -> None:

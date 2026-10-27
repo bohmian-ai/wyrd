@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler
 from typing import Any, Literal
 
 from wyrd.bifrost import Bifrost
-from wyrd.gateway import Gateway, ProviderAdapter, ProviderAuth
+from wyrd.gateway_admin import Gateway, ProviderAdapter, ProviderAuth
 from wyrd.testing import WyrdTestServer, cli
 
 from ..support import Delivery, Receiver, client_of

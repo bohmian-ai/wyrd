@@ -729,15 +729,14 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// # Errors
     ///
     /// Returns the ingress-closed refusal when the Gate is closed or its
-    /// Scribe is not ready, and [`IngestError::RequestContext`] for a
-    /// malformed deployment environment.
+    /// Scribe is not ready.
     pub fn admit_verified(
         &self,
         verified: VerifiedToken,
         metadata: &MetadataMap,
     ) -> Result<AuthContext, IngestError> {
         self.ensure_open()?;
-        AuthContext::from_verified(verified, metadata)
+        Ok(AuthContext::from_verified(verified, metadata))
     }
 
     /// Mount the Gate on the shared tonic router.
@@ -1202,6 +1201,7 @@ impl<A: GateAudit + 'static> Gate<A> {
                 }
                 None => self.authenticate(request.metadata()),
             }
+            .and_then(|auth| auth.with_request_environment(request.metadata()))
             .inspect_err(|_| record_gate_rejection("write", "auth"))
             .map_err(Status::from)?;
             let frame = request.into_inner();

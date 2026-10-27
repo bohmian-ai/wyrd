@@ -258,10 +258,8 @@ iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev =
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
 iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "c213af00eac40377d800e24f3ed68945034e7de4" }
-# Test-only. Pinned to an immutable revision so the Bifrost integration target can
-# prove that Wyrd's Oracle SessionState composes with the distributed planner over
-# one shared native DataFusion 55 universe. Wyrd ships no distributed query path.
-# The Wyrd fork carries the Arrow 60 port; upstream is still on Arrow 59.
+# Oracle's distributed query planner and worker runtime. Pinned to an immutable
+# revision over the one shared native DataFusion 55 universe. The Wyrd fork carries the Arrow 60 port; upstream is still on Arrow 59.
 datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distributed", rev = "bbbd1d9af4633499b736a98da62868ce32bc3d16" }
 
 # One tested revision of the Wyrd DataFusion fork (v55.1.0 rebased onto apache

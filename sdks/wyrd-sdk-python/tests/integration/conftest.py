@@ -21,7 +21,7 @@ import pytest
 from wyrd.bifrost import Bifrost, TableConfig
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.operators import OperatorConnections
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
@@ -42,7 +42,9 @@ from .support import (
     declare,
     hydrated,
     pull,
+    reset_telemetry_providers,
     service_key,
+    shut_down_telemetry_providers,
 )
 from .test_local_development import configure_gateway
 
@@ -257,17 +259,14 @@ def completion(body: dict) -> tuple[int, dict]:
 
 
 @pytest.fixture
-def fresh_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unset OpenTelemetry's once-only global tracer provider for one test.
+def fresh_telemetry_providers(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """Unset OpenTelemetry's once-only global providers for one test, then shut down the ones it installed.
 
-    The API lets a process install its global provider once; restoring the two
-    module globals afterwards keeps each telemetry test's install its own.
+    Request it before any state that starts telemetry, so the state shuts down first.
     """
-    from opentelemetry import trace
-    from opentelemetry.util._once import Once
-
-    monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
-    monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
+    reset_telemetry_providers(monkeypatch)
+    yield
+    shut_down_telemetry_providers()
 
 
 @contextmanager

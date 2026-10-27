@@ -32,7 +32,6 @@ from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.util._once import Once
 from wyrd import WyrdError
 from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
@@ -42,7 +41,7 @@ from wyrd.otel import _EXPORTER_EXTRA, install_run_correlation, span_exporter
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
-from .support import hydrated, stale_bundle, timeline
+from .support import hydrated, reset_telemetry_providers, stale_bundle, timeline
 
 pytestmark = pytest.mark.integration
 
@@ -77,12 +76,6 @@ def drift(server: WyrdTestServer, bifrost: Bifrost, run_ids: list[str]) -> dict[
     for row in rows.to_arrow().to_pylist():
         stored.setdefault(row["run_id"], set()).add((row["num_value"], row["subject_card_uid"]))
     return stored
-
-
-def reset_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unset OpenTelemetry's once-only global tracer provider."""
-    monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
-    monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
 
 
 @asynccontextmanager
@@ -185,6 +178,7 @@ def closed(state: WyrdState) -> bool:
     return False
 
 
+@pytest.mark.usefixtures("fresh_telemetry_providers")
 def test_asgi_lifespan(
     observed_bundle: Path,
     observed_key: str,
@@ -215,7 +209,7 @@ def test_asgi_lifespan(
 
     # Startup starts the writer and telemetry before the application starts;
     # the application's shutdown evidence is drained after it.
-    reset_tracer_provider(monkeypatch)
+    reset_telemetry_providers(monkeypatch)
     state, events = fresh(), []
     replies = cycle(app(state, events))
     assert [reply["type"] for reply in replies] == [
@@ -238,7 +232,7 @@ def test_asgi_lifespan(
 
     # An application-owned provider refuses default telemetry, the started
     # writer is closed, and the application's provider stays installed.
-    reset_tracer_provider(monkeypatch)
+    reset_telemetry_providers(monkeypatch)
     owned = TracerProvider()
     trace.set_tracer_provider(owned)
     state, events = fresh(), []
@@ -293,7 +287,7 @@ def test_asgi_lifespan(
         faulty = Faulty(fresh(), RuntimeError(SECRET), "shutdown")
         replies = cycle(app(faulty, [], telemetry=False))
         assert replies[1]["type"] == "lifespan.shutdown.failed"
-        reset_tracer_provider(monkeypatch)
+        reset_telemetry_providers(monkeypatch)
         trace.set_tracer_provider(TracerProvider())
         [cleanup] = cycle(app(Faulty(fresh(), RuntimeError(SECRET), "shutdown"), []))
     messages = [failed["message"], replies[1]["message"], cleanup["message"], caplog.text]
@@ -304,7 +298,7 @@ def test_asgi_lifespan(
     assert cleanup["message"].startswith("WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS: ")
 
     # The missing otel extra keeps its install remedy.
-    reset_tracer_provider(monkeypatch)
+    reset_telemetry_providers(monkeypatch)
     [failed] = cycle(app(Faulty(fresh(), ImportError(_EXPORTER_EXTRA), "start_telemetry"), []))
     assert failed["message"] == _EXPORTER_EXTRA
 
@@ -423,7 +417,7 @@ def test_asgi_run_isolation(
     }
 
 
-@pytest.mark.usefixtures("fresh_tracer_provider")
+@pytest.mark.usefixtures("fresh_telemetry_providers")
 def test_asgi_telemetry_ownership(
     observed_bundle: Path,
     observed_key: str,
@@ -464,7 +458,7 @@ def test_asgi_telemetry_ownership(
     assert {span["attributes"].get("wyrd.card_uid") for span in spans} == {root}
 
     # telemetry=False: the application installs, exports, and flushes its own provider.
-    reset_tracer_provider(monkeypatch)
+    reset_telemetry_providers(monkeypatch)
     client = WyrdClient(credential=observed_key).for_workload(root)
     owned, local = TracerProvider(), InMemorySpanExporter()
     owned.add_span_processor(SimpleSpanProcessor(local))
@@ -482,7 +476,7 @@ def test_asgi_telemetry_ownership(
     owned.shutdown()
 
 
-@pytest.mark.usefixtures("fresh_tracer_provider")
+@pytest.mark.usefixtures("fresh_telemetry_providers")
 def test_fastapi_example(
     wyrd_server: WyrdTestServer, bifrost: Bifrost, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

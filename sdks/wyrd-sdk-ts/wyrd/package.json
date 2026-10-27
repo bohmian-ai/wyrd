@@ -68,6 +68,7 @@
     "@opentelemetry/exporter-logs-otlp-proto": "^0.222.0",
     "@opentelemetry/exporter-metrics-otlp-proto": "^0.222.0",
     "@opentelemetry/exporter-trace-otlp-proto": "^0.222.0",
+    "@opentelemetry/resources": "^2.11.0",
     "@opentelemetry/sdk-trace-base": "^2.11.0"
   },
   "peerDependenciesMeta": {
@@ -90,6 +91,9 @@
       "optional": true
     },
     "@opentelemetry/exporter-trace-otlp-proto": {
+      "optional": true
+    },
+    "@opentelemetry/resources": {
       "optional": true
     },
     "@opentelemetry/sdk-trace-base": {

@@ -15,7 +15,7 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_ai::Gateway;
 use wyrd_ai::cli;
-use wyrd_ai::gateway::{
+use wyrd_ai::gateway_admin::{
     DeploymentAccess, GatewayOperation, ProviderAdapter, ProviderAuth, ProviderCredentialName,
     ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
     ProviderDeploymentName, ProviderId,

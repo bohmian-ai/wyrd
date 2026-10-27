@@ -17,7 +17,7 @@ pub mod config;
 pub(crate) mod credentials_file;
 pub mod environment;
 pub mod error;
-pub mod gateway;
+pub mod gateway_admin;
 pub mod gateway_credential;
 pub mod global_config;
 pub mod observe;
@@ -32,7 +32,7 @@ pub mod verify;
 
 pub use bifrost::{Bifrost, QueueConfig};
 pub use client::WyrdClient;
-pub use gateway::Gateway;
+pub use gateway_admin::Gateway;
 pub use global_config::GlobalConfig;
 pub use operator_connections::OperatorConnections;
 pub use platform::Platform;

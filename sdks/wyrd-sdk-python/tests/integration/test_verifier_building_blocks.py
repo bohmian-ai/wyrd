@@ -374,7 +374,10 @@ def assert_tools(
 
 
 def test_policy_review_runs_every_action_and_check_kind(
-    desk: WyrdState, wyrd_server: WyrdTestServer, receiver: Receiver, fresh_tracer_provider: None
+    fresh_telemetry_providers: None,
+    desk: WyrdState,
+    wyrd_server: WyrdTestServer,
+    receiver: Receiver,
 ) -> None:
     trace_id = record_trace(desk, wyrd_server, "lookup-policy", "draft-answer", "refunds")
     asked = len(receiver.to("/v1/chat/completions"))
@@ -454,7 +457,7 @@ def test_forbidden_code_access_cannot_pass_dependent_work(desk: WyrdState) -> No
 
 
 def test_trace_check_fails_a_guess_and_needs_its_trace(
-    desk: WyrdState, wyrd_server: WyrdTestServer, fresh_tracer_provider: None
+    fresh_telemetry_providers: None, desk: WyrdState, wyrd_server: WyrdTestServer
 ) -> None:
     guessed = record_trace(desk, wyrd_server, "guess-policy", "draft-answer", "refunds")
 
@@ -521,7 +524,7 @@ def test_submitted_review_is_judged_in_the_background(
 
 
 def test_trace_evidence_keeps_whole_trace_and_waits_when_submitted(
-    desk: WyrdState, wyrd_server: WyrdTestServer, fresh_tracer_provider: None
+    fresh_telemetry_providers: None, desk: WyrdState, wyrd_server: WyrdTestServer
 ) -> None:
     whole = record_whole_trace(desk, wyrd_server)
     assert desk.run().observe.verify("whole-trace", trace=whole).verdict == "passed"
@@ -588,7 +591,7 @@ def test_failed_code_step_leaves_its_assertion_inconclusive(desk: WyrdState) -> 
 
 
 def test_trace_check_judges_span_order_and_attributes(
-    desk: WyrdState, wyrd_server: WyrdTestServer, fresh_tracer_provider: None
+    fresh_telemetry_providers: None, desk: WyrdState, wyrd_server: WyrdTestServer
 ) -> None:
     drafted_first = record_trace(desk, wyrd_server, "draft-answer", "lookup-policy", "refunds")
     shipping = record_trace(desk, wyrd_server, "lookup-policy", "draft-answer", "shipping")

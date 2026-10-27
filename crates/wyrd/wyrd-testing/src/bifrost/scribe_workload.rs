@@ -1076,6 +1076,10 @@ pub struct ScribeWorkloadTenantBinding {
     pub tenant: DataTenantId,
     /// The tenant's declared slug, used to key evidence.
     pub slug: String,
+    /// The API key of the one service principal every append, replay, and
+    /// read of this tenant uses, because the principal pair is part of a
+    /// batch's identity and a replay under another principal is another batch.
+    pub api_key: secrecy::SecretString,
 }
 
 /// One executed workload: its evidence and the identities it ran against.
@@ -1143,9 +1147,22 @@ impl crate::WyrdTestServer {
                 )
                 .await?;
             }
+            let api_key = self
+                .bootstrap_service_in_tenant(
+                    tenant,
+                    &format!("scribe-workload-{}", Uuid::now_v7().simple()),
+                    &["admin"],
+                )
+                .await?
+                .api_key()
+                .cloned()
+                .ok_or_else(|| {
+                    crate::WyrdTestServerError::Auth("workload requires a service key".to_owned())
+                })?;
             bindings.push(ScribeWorkloadTenantBinding {
                 tenant,
                 slug: declared.slug.clone(),
+                api_key,
             });
             debug_assert_eq!(bindings.len(), ordinal + 1);
         }
@@ -1205,7 +1222,7 @@ impl crate::WyrdTestServer {
         for (tenant, binding) in bindings.iter().enumerate() {
             for (table, declared) in workload.tenants[tenant].tables.iter().enumerate() {
                 for value in self
-                    .read_workload_table_for_test(binding.tenant, &declared.fqn())
+                    .read_workload_table_for_test(binding, &declared.fqn())
                     .await?
                 {
                     rows.push((tenant, table, value));
@@ -1225,17 +1242,17 @@ impl crate::WyrdTestServer {
     ///
     /// # Errors
     ///
-    /// Returns an error when the tenant credential, Arrow IPC encoding, client
-    /// construction, or the public insert fails.
+    /// Returns an error when Arrow IPC encoding, client construction, or the
+    /// public insert fails.
     pub async fn append_workload_batch_for_test(
         &self,
-        tenant: DataTenantId,
+        binding: &ScribeWorkloadTenantBinding,
         table_fqn: &str,
         batch_id: Uuid,
         rows: &[i64],
         event_time_micros: i64,
     ) -> Result<(), crate::WyrdTestServerError> {
-        let client = self.workload_client(tenant).await?;
+        let client = self.workload_client(&binding.api_key)?;
         let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
             workload_time_field(),
@@ -1274,14 +1291,14 @@ impl crate::WyrdTestServer {
     ///
     /// # Errors
     ///
-    /// Returns an error when the tenant credential, query start, or batch
+    /// Returns an error when client construction, query start, or batch
     /// streaming fails, or when the returned column is not the declared type.
     pub async fn read_workload_table_for_test(
         &self,
-        tenant: DataTenantId,
+        binding: &ScribeWorkloadTenantBinding,
         table_fqn: &str,
     ) -> Result<Vec<i64>, crate::WyrdTestServerError> {
-        let client = self.workload_client(tenant).await?;
+        let client = self.workload_client(&binding.api_key)?;
         let query = wyrd_client::Bifrost::query_only(&client);
         let mut stream = query
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
@@ -1312,26 +1329,17 @@ impl crate::WyrdTestServer {
         Ok(values)
     }
 
-    /// Builds one authenticated SDK client bound to a workload tenant.
+    /// Builds one authenticated SDK client for a workload tenant's `api_key`
+    /// against this pod's public endpoints.
     ///
     /// # Errors
     ///
-    /// Returns an error when the service principal, its API key, or the
-    /// server's public endpoints are unavailable.
-    async fn workload_client(
+    /// Returns an error when the server's public endpoints are unavailable or
+    /// the client configuration is refused.
+    fn workload_client(
         &self,
-        tenant: DataTenantId,
+        api_key: &secrecy::SecretString,
     ) -> Result<wyrd_client::WyrdClient, crate::WyrdTestServerError> {
-        let bootstrap = self
-            .bootstrap_service_in_tenant(
-                tenant,
-                &format!("scribe-workload-{}", Uuid::now_v7().simple()),
-                &["admin"],
-            )
-            .await?;
-        let api_key = bootstrap.api_key().cloned().ok_or_else(|| {
-            crate::WyrdTestServerError::Auth("workload requires a service key".to_owned())
-        })?;
         wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
             grpc: wyrd_client::transport::GrpcConfig {
                 endpoint: self.grpc_url().ok_or_else(|| {
@@ -1349,7 +1357,7 @@ impl crate::WyrdTestServer {
                     .to_owned(),
                 ..wyrd_client::transport::HttpConfig::default()
             },
-            credential: Some(api_key),
+            credential: Some(api_key.clone()),
             ..wyrd_client::config::ClientConfig::default()
         })
         .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))
@@ -1519,7 +1527,7 @@ impl crate::bifrost::WyrdTestCluster {
                     let declared = table_at(workload, *tenant, *table)?;
                     running_pod(cluster.as_ref())?
                         .append_workload_batch_for_test(
-                            binding.tenant,
+                            binding,
                             &declared.fqn(),
                             *batch_id,
                             rows,
@@ -1545,7 +1553,7 @@ impl crate::bifrost::WyrdTestCluster {
                     let binding = binding_at(&bindings, *tenant)?;
                     let declared = table_at(workload, *tenant, *table)?;
                     for value in running_pod(cluster.as_ref())?
-                        .read_workload_table_for_test(binding.tenant, &declared.fqn())
+                        .read_workload_table_for_test(binding, &declared.fqn())
                         .await?
                     {
                         read_since_checkpoint.push((*tenant, *table, value));
@@ -1587,7 +1595,7 @@ impl crate::bifrost::WyrdTestCluster {
                             let declared = table_at(workload, *tenant, *table)?;
                             running_pod(cluster.as_ref())?
                                 .append_workload_batch_for_test(
-                                    binding.tenant,
+                                    binding,
                                     &declared.fqn(),
                                     *batch_id,
                                     rows,

@@ -1121,7 +1121,6 @@ async fn mixed_specifications_preserve_partition_and_sort_truth() {
         ))
         .expect("the journey table resolves to its physical binding"),
     };
-    crate::public_support::enable_compaction(server, &table.binding).await;
 
     // Two batches per layout, each flushed to its own objects, so every
     // physical partition holds a real rewrite candidate under both specs.
@@ -1225,6 +1224,10 @@ async fn mixed_specifications_preserve_partition_and_sort_truth() {
         "promotion keeps each object under the spec and sort order it was written with"
     );
 
+    server
+        .forge_clock()
+        .advance(chrono::Duration::hours(1))
+        .expect("the default compaction interval passes");
     crate::live_rewrite::await_committed_rewrites(&cluster, &observer, &[&table.binding]).await;
     crate::live_rewrite::assert_public_rows(&client, &table, &expected, "compacted").await;
     let compacted = assert_live_layout_truth(server, &table.binding, "compacted").await;

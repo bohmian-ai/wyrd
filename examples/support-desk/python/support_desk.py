@@ -31,7 +31,7 @@ from opentelemetry import trace
 from wyrd import verify
 from wyrd.cards import Cards, DeclarationReceipt
 from wyrd.client import WyrdClient
-from wyrd.gateway import Gateway
+from wyrd.gateway_admin import Gateway
 from wyrd.observe import Run
 from wyrd.state import WyrdState
 

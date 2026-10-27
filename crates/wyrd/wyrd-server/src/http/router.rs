@@ -179,8 +179,11 @@ pub fn build_router(state: AppState) -> Router {
 /// as the matched route template (never the raw path), and
 /// `http.response.status_code`, which [`record_response`] fills in. A
 /// continued trace stages its tenant span copies on this server's
-/// `tenant_spans` sink.
-fn request_span(
+/// `tenant_spans` sink. A benchmark server attaches its declared benchmark
+/// headers to the span as it opens
+/// ([`wyrd_telemetry::timing::label_request`]); they select a timing
+/// series only and carry no authority.
+pub(crate) fn request_span(
     request: &Request,
     tenant_spans: Option<&Arc<dyn wyrd_telemetry::TenantSpanSink>>,
 ) -> Span {
@@ -202,6 +205,7 @@ fn request_span(
         wyrd_telemetry::inbound_context(request.headers()).as_ref(),
         tenant_spans,
     );
+    wyrd_telemetry::timing::label_request(&span, request.headers());
     span
 }
 

@@ -278,7 +278,7 @@ impl EvidenceInvestigation {
             ("bifrost.logs", "records", "span_id"),
             ("bifrost.datasets", "investigation_events", "value"),
             ("bifrost.verification", "results", "verifier_card_uid"),
-            ("bifrost.drift", "result_features", "score"),
+            ("bifrost.verification", "execution_outputs", "output"),
         ] {
             assert!(
                 tables
@@ -331,7 +331,7 @@ impl EvidenceInvestigation {
     /// # Panics
     /// Panics when a Verifier Card reads back another name or UID, a query is
     /// not a successful terminal, the subject's results are not both failed
-    /// judgments, or the Drift result lacks its single drifted feature row.
+    /// judgments, or the Drift result's output lacks its single drifted feature.
     pub(super) async fn follow_subject_and_results(&self) -> Result<(), McpJourneyError> {
         for reference in [&self.drift_verifier, &self.assertion_verifier] {
             let response: GetCardResponse = serde_json::from_value(structured(
@@ -356,8 +356,14 @@ impl EvidenceInvestigation {
             rows,
             json!(expected.map(|result_id| json!([result_id, "failed"])))
         );
-        let rows = self.query(&format!("SELECT feature, score, threshold, verdict FROM bifrost.drift.result_features WHERE result_id = '{}' LIMIT 20", self.drift_result)).await?;
-        assert_eq!(rows, json!([["latency", 3.0, 1.0, "drift"]]));
+        let rows = self.query(&format!("SELECT o.output FROM bifrost.verification.results r JOIN bifrost.verification.execution_outputs o ON o.result_id = r.result_id WHERE r.result_id = '{}' LIMIT 20", self.drift_result)).await?;
+        let features = &rows[0][0]["requirements"][0]["detail"]["drift"]["features"];
+        assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+        assert_eq!(
+            features,
+            &json!({"latency": {"feature": "latency", "score": 3.0, "threshold": 1.0, "verdict": "Drift"}}),
+            "{rows}"
+        );
         Ok(())
     }
 

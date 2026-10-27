@@ -18,6 +18,8 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::cards::Cards;
@@ -27,9 +29,12 @@ use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_declaration_input, load};
 use wyrd_runtime::principal::PrincipalId;
+use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::scribe_outbox::ScribeWrite;
-use wyrd_server::verification::authority::BackgroundAuthority;
+use wyrd_server::verification::authority::{BackgroundAuthority, SystemReadAuthority};
+use wyrd_server::verification::drift::DriftEngine;
 use wyrd_server::verification::groups::GroupPoller;
+use wyrd_server::verification::inputs::InputResolver;
 use wyrd_server::verification::results::{ResultPayload, ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::scheduler::{GroupHandoff, VerificationScheduler};
 use wyrd_spec::ids::{CardUid, ExecutionId, GroupId, SlotName};
@@ -194,6 +199,7 @@ impl Support {
             self.server.operator_pool(),
             VerifierExecutionQueue::default(),
             BackgroundAuthority::new(state.auth.tenant_issuer(state.bifrost.scribe_outbox())),
+            DriftEngine::new(state.clone(), Duration::from_secs(30)),
             Duration::from_secs(1),
         )
         .with_groups(
@@ -215,6 +221,7 @@ impl Support {
             self.server.operator_pool(),
             VerifierExecutionQueue::default(),
             authority,
+            DriftEngine::new(state.clone(), Duration::from_secs(30)),
             Duration::from_secs(1),
         )
         .with_groups(
@@ -237,7 +244,7 @@ impl Support {
     }
 
     /// The errored group executions of `group` with their error codes, and
-    /// whether each asserts no authority, inputs, snapshot, or result.
+    /// whether each asserts no authority, snapshot, or result.
     ///
     /// # Panics
     /// Panics when the read fails.
@@ -245,8 +252,7 @@ impl Support {
         let mut conn = self.conn().await;
         sqlx::query_as(
             "SELECT error ->> 'code',
-                    authority IS NULL AND inputs IS NULL AND group_sources IS NULL
-                    AND group_snapshot_sha256 IS NULL AND result_id IS NULL
+                    authority IS NULL AND group_snapshot_sha256 IS NULL AND result_id IS NULL
                FROM wyrd.verifier_executions
               WHERE origin = 'group' AND group_id = $1 AND status = 'errored'
               ORDER BY created_at",
@@ -371,14 +377,65 @@ impl Support {
         serde_json::from_value(result).expect("a verification result")
     }
 
-    /// The group snapshot of the group execution `outcome` created.
+    /// The value list the claimed group execution `claimed` resolves for
+    /// `slot` from its selector record, read as the runner reads it.
     ///
     /// # Panics
-    /// Panics when `outcome` created nothing or the execution has no group.
+    /// Panics when `claimed` is no group execution, its records are not
+    /// visible, or it lacks the slot.
+    async fn values(&self, claimed: &ClaimedExecution, slot: &str) -> Value {
+        assert!(
+            matches!(claimed.input, ExecutionInput::Grouped),
+            "{:?}",
+            claimed.input
+        );
+        let state = self.server.state();
+        let tenant = self.server.data_tenant_id();
+        let mut conn = self.conn().await;
+        let system = system_principal_id(&mut conn)
+            .await
+            .expect("SYSTEM reads")
+            .map(PrincipalId::new);
+        drop(conn);
+        let tables = ["execution_inputs", "execution_outputs"]
+            .map(|name| TableRef::new(BifrostNamespace::Verification, name));
+        let read = SystemReadAuthority::resolve(state, tenant, system, &tables)
+            .await
+            .expect("SYSTEM read authority resolves")
+            .serving(&claimed.authority);
+        let query =
+            ScheduledQueryCaller::new(state.clone(), read.into_context(), CancellationToken::new());
+        let records = InputResolver::new(&query, None);
+        let row = records
+            .record(claimed.lease.execution_id)
+            .await
+            .expect("the record reads")
+            .expect("the selector record is visible");
+        let evidence = records
+            .evidence(&row)
+            .await
+            .expect("evidence reads")
+            .expect("every selected record is visible");
+        let Some(InputDeclaration::Json { value }) =
+            evidence.get(&SlotName::new(slot).expect("a valid slot"))
+        else {
+            panic!("no {slot} list: {evidence:?}");
+        };
+        value.clone()
+    }
+
+    /// The group snapshot of the group execution `outcome` created, read
+    /// once its selector record, staged after the handoff commits, is
+    /// published.
+    ///
+    /// # Panics
+    /// Panics when `outcome` created nothing, Bifrost does not flush, or the
+    /// execution has no group.
     async fn snapshot(&self, outcome: &GroupHandoff) -> Value {
         let GroupHandoff::Enqueued(execution) = outcome else {
             panic!("the poll did not create a group execution: {outcome:?}");
         };
+        self.server.flush_bifrost().await.expect("Bifrost flushes");
         let execution = self.execution(*execution).await;
         execution["group"].clone()
     }
@@ -458,22 +515,6 @@ fn client(base_url: &str, jwt: &str) -> WyrdClient {
     .expect("client auth builds");
     let transport = HttpTransport::new(&config.http, Arc::clone(&auth)).expect("transport builds");
     WyrdClient::from_parts(auth, transport, config.grpc)
-}
-
-/// The value list `claimed` group execution pins for `slot`.
-///
-/// # Panics
-/// Panics when `claimed` is no group execution or lacks the slot.
-fn values(claimed: &ClaimedExecution, slot: &str) -> Value {
-    let ExecutionInput::Grouped { inputs, .. } = &claimed.input else {
-        panic!("not a group execution: {:?}", claimed.input);
-    };
-    let Some(InputDeclaration::Json { value }) =
-        inputs.get(&SlotName::new(slot).expect("a valid slot"))
-    else {
-        panic!("no {slot} list: {inputs:?}");
-    };
-    value.clone()
 }
 
 /// The execution IDs a snapshot's `slot` lists.
@@ -584,9 +625,17 @@ async fn available_rows_form_expiring_group_snapshots() {
         "{snapshot}"
     );
     let judging = support.claim_group(&handed[0]).await;
-    assert_eq!(values(&judging, "answered"), json!(["passed", null]));
+    support
+        .server
+        .flush_bifrost()
+        .await
+        .expect("Bifrost flushes");
     assert_eq!(
-        values(&judging, "turns"),
+        support.values(&judging, "answered").await,
+        json!(["passed", null])
+    );
+    assert_eq!(
+        support.values(&judging, "turns").await,
         json!([{"answer": "yes"}, {"answer": "later"}])
     );
 
@@ -706,13 +755,12 @@ async fn incomplete_snapshots_retry_then_error() {
         "nothing errors yet"
     );
 
-    support
-        .exec(
-            "UPDATE wyrd.verification_group_pending
-                SET due_at = statement_timestamp() - INTERVAL '301 seconds'",
-        )
-        .await;
-    let expired = scheduler.group_pass(&stop).await.expect("the pass runs");
+    let expired = support
+        .scheduler(&capacity)
+        .with_overdue_groups()
+        .group_pass(&stop)
+        .await
+        .expect("the pass runs");
     let [GroupHandoff::Errored(errored)] = expired.as_slice() else {
         panic!("an expired incomplete group records one error: {expired:?}");
     };
@@ -799,10 +847,6 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         support.pending("debounce").await.is_none(),
         "the handoff consumes it"
     );
-    support.server.fail_next_query_after_batch();
-    let idle = scheduler.group_pass(&stop).await.expect("the pass runs");
-    assert!(idle.is_empty(), "no activity, no handoff: {idle:?}");
-
     support.turn("debounce", "three", None).await;
     support
         .server
@@ -813,6 +857,9 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
         support.pending("debounce").await.is_some(),
         "new activity reschedules"
     );
+    support.server.fail_next_query_after_batch();
+    let idle = scheduler.group_pass(&stop).await.expect("the pass runs");
+    assert!(idle.is_empty(), "nothing due, no handoff: {idle:?}");
     support.make_due().await;
     let faulted = scheduler.group_pass(&stop).await.expect("the pass runs");
     assert!(
@@ -890,7 +937,8 @@ async fn pending_groups_debounce_and_stop_after_handoff() {
             let outcome = poller
                 .poll(&mut claimer, &queue, &due, &authority, system)
                 .await
-                .expect("the snapshot pins");
+                .expect("the snapshot pins")
+                .outcome;
             assert!(
                 matches!(outcome, EnqueueOutcome::Enqueued(_)),
                 "{outcome:?}"

@@ -23,6 +23,7 @@ use wyrd_tonic::frame_codec::FrameEncoder;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::edge_timeout::EdgeTimer;
+use crate::http::middleware::metrics::RequestArrival;
 use crate::query::service;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
@@ -76,6 +77,73 @@ fn encode_query_frame(
     FrameEncoder::encode(&wyrd_tonic::wyrd::v1::QueryStreamFrame::from(frame))
         .map(Bytes::from)
         .map_err(|error| query_body_error(QueryBodyFailure::FrameEncoding, error))
+}
+
+/// One public query's server timing, recorded once through
+/// [`wyrd_telemetry::record_timing`] at boundary `bifrost.query` when
+/// dropped: from its HTTP arrival through the handoff of its terminal frame
+/// to the response body, or through its refusal.
+///
+/// The outcome is `success` or `failed` from the terminal frame, `failed`
+/// for a late stream error, `rejected` for a refusal before the stream, and
+/// `cancelled` for a body dropped before its terminal. A query without an
+/// arrival records nothing.
+struct QueryTiming {
+    /// The request span whose benchmark classification the timing takes.
+    parent: tracing::Span,
+    /// When the request reached the server.
+    arrival: Option<std::time::Instant>,
+    /// The outcome recorded on drop.
+    outcome: &'static str,
+}
+
+impl QueryTiming {
+    /// Starts the timing of a query that arrived at `arrival`, under the
+    /// current span; without benchmark timing it holds neither, so it
+    /// records nothing.
+    fn new(arrival: Option<RequestArrival>) -> Self {
+        let enabled = wyrd_telemetry::timing::enabled();
+        Self {
+            parent: if enabled {
+                tracing::Span::current()
+            } else {
+                tracing::Span::none()
+            },
+            arrival: arrival.filter(|_| enabled).map(RequestArrival::instant),
+            outcome: "cancelled",
+        }
+    }
+
+    /// Notes the outcome `frame` settles, if it is a terminal or an error.
+    fn observe(&mut self, frame: &Result<wyrd_spec::vala::api::QueryStreamFrame, BifrostError>) {
+        use wyrd_spec::vala::api::{QueryStreamFrame, QueryTerminalOutcome};
+        match frame {
+            Ok(QueryStreamFrame::Terminal(terminal)) => {
+                self.outcome = if terminal.outcome == QueryTerminalOutcome::Success {
+                    "success"
+                } else {
+                    "failed"
+                };
+            }
+            Err(_) => self.outcome = "failed",
+            Ok(_) => {}
+        }
+    }
+}
+
+impl Drop for QueryTiming {
+    /// Records the timing with the outcome observed so far.
+    fn drop(&mut self) {
+        if let Some(arrival) = self.arrival {
+            wyrd_telemetry::record_timing(
+                &self.parent,
+                "bifrost.query",
+                self.outcome,
+                arrival.elapsed(),
+                None,
+            );
+        }
+    }
 }
 
 /// Standalone query router for the `/v1` group.
@@ -282,17 +350,24 @@ pub(crate) async fn cancel_running_query(
 ///
 /// Body collection, authentication, and admission are bounded by the server
 /// request timeout; once the query is dispatched, its own deadline governs.
+/// The query's server time, arrival through terminal handoff or refusal, is
+/// recorded once by [`QueryTiming`].
 pub(crate) async fn sync_query(
     State(state): State<AppState>,
     edge_timer: Option<Extension<EdgeTimer>>,
+    arrival: Option<Extension<RequestArrival>>,
     caller: Caller,
     Json(body): Json<BifrostQueryRequest>,
 ) -> Response {
+    let mut timing = QueryTiming::new(arrival.map(|Extension(arrival)| arrival));
     let edge_timer = edge_timer.map(|Extension(timer)| timer);
     let result = match service::stream_query(state.clone(), caller, body, edge_timer.as_ref()).await
     {
         Ok(result) => result,
-        Err(error) => return query_error_response(error),
+        Err(error) => {
+            timing.outcome = "rejected";
+            return query_error_response(error);
+        }
     };
     #[cfg(feature = "test-support")]
     let fault = state
@@ -325,7 +400,7 @@ pub(crate) async fn sync_query(
     let fault = None;
     #[cfg(not(feature = "test-support"))]
     let stall = None;
-    query_stream_response_with_fault(result, fault, stall)
+    query_stream_response_with_fault(result, fault, stall, timing)
 }
 
 /// Converts an admitted Oracle stream into the stable HTTP frame transport.
@@ -340,7 +415,7 @@ pub(crate) async fn sync_query(
 /// response construction failures return the stable internal problem response.
 #[cfg(test)]
 pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response {
-    query_stream_response_with_fault(result, None, None)
+    query_stream_response_with_fault(result, None, None, QueryTiming::new(None))
 }
 
 /// Drop guard notifying test waiters after the stalled body releases its stream.
@@ -371,6 +446,7 @@ fn query_stream_response_with_fault(
     result: OracleQueryStream,
     fault: Option<crate::state::QueryStreamFault>,
     stall: Option<std::sync::Arc<crate::state::QueryStreamStall>>,
+    mut timing: QueryTiming,
 ) -> Response {
     let schema_fingerprint = result.schema_fingerprint.clone();
     let deadline_ms = result.deadline_ms;
@@ -385,6 +461,7 @@ fn query_stream_response_with_fault(
             Some(query) => query.frames.next().await,
             None => None,
         } {
+            timing.observe(&frame);
             let frame = encode_query_frame(frame);
             yield frame;
             emitted = emitted.saturating_add(1);
@@ -433,12 +510,14 @@ fn query_stream_response_with_fault(
     result: OracleQueryStream,
     _fault: Option<()>,
     _stall: Option<()>,
+    mut timing: QueryTiming,
 ) -> Response {
     let schema_fingerprint = result.schema_fingerprint;
     let deadline_ms = result.deadline_ms;
     let mut frames = result.frames;
     let body = Body::from_stream(async_stream::stream! {
         while let Some(frame) = frames.next().await {
+            timing.observe(&frame);
             let frame = encode_query_frame(frame);
             yield frame;
         }
@@ -778,6 +857,7 @@ mod tests {
             let response = sync_query(
                 State(state_without_oracle().await),
                 None,
+                None,
                 query_caller(),
                 Json(BifrostQueryRequest {
                     params: Vec::new(),
@@ -889,5 +969,115 @@ mod tests {
             dropped.load(Ordering::Acquire),
             "transport body drop must release Oracle stream guards"
         );
+    }
+
+    /// Without benchmark timing a query's timing holds neither the request
+    /// span nor its arrival, so it clones no span and records nothing.
+    ///
+    /// # Panics
+    /// Panics when timing is on in this process or the timing holds either.
+    #[test]
+    fn query_timing_holds_nothing_while_benchmark_timing_is_off() {
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let span = tracing::info_span!("request");
+            let _entered = span.enter();
+            assert!(!wyrd_telemetry::timing::enabled());
+            let timing = QueryTiming::new(Some(RequestArrival(std::time::Instant::now())));
+            assert!(timing.parent.is_none(), "no span is cloned");
+            assert_eq!(timing.arrival, None, "no arrival is kept");
+        });
+    }
+
+    /// A query's `bifrost.query` observation spans its arrival through the
+    /// handoff of its terminal frame to the body, so a terminal that comes
+    /// 30 ms after the batch is inside it; a stream error is `failed` and a
+    /// body dropped before its terminal is `cancelled`.
+    ///
+    /// # Panics
+    /// Panics when an outcome, count, or elapsed bound is wrong.
+    #[tokio::test]
+    async fn histograms_cover_arrival_through_terminal_handoff() {
+        use wyrd_telemetry::timing;
+
+        timing::enable();
+        let before = timing::snapshot();
+        let arrived = || QueryTiming {
+            parent: tracing::Span::none(),
+            arrival: std::time::Instant::now().checked_sub(std::time::Duration::from_millis(20)),
+            outcome: "cancelled",
+        };
+        let respond = |frames: Vec<Result<QueryStreamFrame, BifrostError>>, delay| {
+            let frames = futures_util::stream::iter(frames).then(move |frame| async move {
+                if matches!(frame, Ok(QueryStreamFrame::Terminal(_))) {
+                    tokio::time::sleep(delay).await;
+                }
+                frame
+            });
+            query_stream_response_with_fault(
+                OracleQueryStream::test_new(
+                    "abcd".to_owned(),
+                    Box::pin(frames),
+                    tokio_util::sync::CancellationToken::new(),
+                ),
+                None,
+                None,
+                arrived(),
+            )
+        };
+        let schema = || {
+            Ok(QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "abcd".to_owned(),
+                arrow_ipc_schema: vec![1],
+            }))
+        };
+        let terminal = Ok(QueryStreamFrame::Terminal(QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Success,
+            query_class: wyrd_spec::vala::api::QueryClass::Interactive,
+            row_count: 0,
+            warnings: Vec::new(),
+            source_completion: complete_sources(),
+            error: None,
+            arrow_ipc_eos: EOS.to_vec(),
+        }));
+        let delay = std::time::Duration::from_millis(30);
+        respond(vec![schema(), terminal], delay)
+            .into_body()
+            .collect()
+            .await
+            .expect("a complete body");
+        let failed = respond(
+            vec![schema(), Err(BifrostError::QueryExecutionFailed)],
+            delay,
+        );
+        assert!(failed.into_body().collect().await.is_err());
+        drop(respond(vec![schema()], delay));
+        let interval = timing::snapshot().since(&before).expect("one process");
+        let count = |outcome: &str| {
+            interval
+                .series
+                .iter()
+                .filter(|series| series.boundary == "bifrost.query" && series.outcome == outcome)
+                .map(|series| series.count)
+                .sum::<u64>()
+        };
+        assert_eq!(
+            (count("success"), count("failed"), count("cancelled")),
+            (1, 1, 1)
+        );
+        let success = interval
+            .series
+            .iter()
+            .find(|series| series.outcome == "success")
+            .expect("the success series");
+        let lowest = success
+            .elapsed
+            .quantile(0.0)
+            .expect("one observation")
+            .lowest;
+        assert!(
+            lowest >= 49_000_000,
+            "arrival through the delayed terminal: {lowest} ns"
+        );
+        assert!(success.excluded.is_none(), "a query excludes no wait");
     }
 }

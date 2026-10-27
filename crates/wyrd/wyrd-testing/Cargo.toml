@@ -87,9 +87,11 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tokio-stream = "0.1"
 tokio-util = { workspace = true }
+# Benchmark baselines are declared in `benchmarks/<engine>/baselines.toml`.
+toml = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
@@ -145,19 +147,12 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 
-# The opt-in server capacity benchmark (REQ-171). Run only through
-# `mise run bench:capacity`; only its unit tests run in a lane, with the
-# crate's other tests.
+# The opt-in benchmark experiments. Run only through `mise run bench:l1*` and
+# `mise run bench:l2:*`; only their unit tests run in a lane, with the crate's
+# other tests.
 [[bin]]
 name = "capacity"
 path = "src/bin/capacity/main.rs"
-bench = false
-
-# The opt-in Forge capacity benchmark. Run only through
-# `mise run bench:bifrost:forge-capacity`; only its unit tests run in a lane.
-[[bin]]
-name = "bifrost_forge_capacity"
-path = "src/bin/bifrost_forge_capacity/main.rs"
 bench = false
 
 [lints]

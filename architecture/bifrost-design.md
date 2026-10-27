@@ -354,22 +354,39 @@ typed columns:
   `http_response_status_code`, `url_full`, and the `exception_*` columns of the
   span's last `exception` event on spans; the record's own `exception_*`
   attributes and `body_text` (the body when it is a string) on logs.
-- `bifrost.verification.results` carries the generic outcome of one execution:
-  execution, Run, Verifier, subject, and binding identity, the verdict, and the
-  requirement, step, evidence, and provenance breakdown as the `outcome`
-  Variant. A requirement's custom Verdict `data` stays inside that outcome,
-  with no column of its own. A drift requirement's typed detail lives in that outcome; its
-  per-feature method, score, threshold, and verdict are also projected one row
-  per feature into `bifrost.drift.result_features`, joined on `result_id` and
-  `requirement_id`.
-  Published correlation columns are `execution_id`, nullable `binding_id`,
-  and nullable application `run_id`; result timing remains `started_at` and
-  `ended_at`. A verification execution is never relabelled as an application
-  Run.
-- `bifrost.verification.execution_inputs` holds each execution's pinned input
-  declarations (JSON values, file digests, Artifact and trace references) and
-  its server-owned `queue_execution` marker: false for `verify`, true for
-  `submit`. Only a `true` record activates queued work.
+- Three tables hold each verification fact once. A result read assembles the
+  public `VerificationResult` from them: the verdict from `results`,
+  `requirements` and `steps` from `execution_outputs` by `result_id`, and
+  `evidence` from `execution_inputs` by `execution_id`. Detail is never
+  copied between them, and no other table projects drift detail.
+- `bifrost.verification.results` is the payload-free summary of one result:
+  result, execution, Run, Verifier, subject, binding, group, trigger, and
+  window identity, execution status, the verdict, and timing. It carries no
+  Variant. Published correlation columns are `execution_id`, nullable
+  `binding_id`, and nullable application `run_id`; result timing remains
+  `started_at` and `ended_at`. A verification execution is never relabelled
+  as an application Run.
+- `bifrost.verification.execution_outputs` holds one result's detailed
+  judgment, keyed by `result_id` with its `execution_id` and `ended_at`: the
+  sensitive `output` Variant holds exactly `requirements` and `steps`,
+  including scores, reasons, computed `actual` values, citations, check and
+  provenance detail, custom Verdict `data`, a drift requirement's per-feature
+  detail, and captured step outputs. It never holds the evidence map or a
+  second verdict. It is staged with its summary in one write, before it.
+- `bifrost.verification.execution_inputs` holds each execution's one input
+  record and its closed `origin`: `direct` (`verify`), `submitted`
+  (`submit`), `group`, or `schedule`. The `inputs` Variant holds the named
+  input declarations (JSON values, file digests, Artifact and trace
+  references) for `direct` and `submitted`, and an internal selector for
+  `group` and `schedule`. A group selector records its half-open
+  `wyrd_ingested_at` range and, per source slot, its authored reference and
+  ordered source execution IDs with each selected result ID or null; a
+  schedule selector records its `[previous boundary, due)` window and the
+  selected observation `record_id`s. Selectors reference live logical rows,
+  never copy their values, and are resolved on every execution, retry, and
+  read. The server-owned `queue_execution` marker is true only for
+  `submitted`, which alone activates queued work; its `activation` holds the
+  accepted route overrides, idempotency key, request digest, and authority.
   Its published input timestamp is `recorded_at`, the server-recorded input
   time, distinct from execution timing or sample/window time. It uses the
   same execution/binding/application-Run correlation names where applicable.
@@ -381,8 +398,8 @@ typed columns:
   SQL null for an absent Struct on hot and published data alike. Admission
   refuses a batch with a partial Struct before ACK with
   `WYRD_VALA_400_SCHEMA_PARSE` naming the row and child.
-- The `bifrost.verification.results` breakdown, the
-  `bifrost.verification.execution_inputs` declarations,
+- The `bifrost.verification.execution_outputs` output, the
+  `bifrost.verification.execution_inputs` inputs and activation,
   `bifrost.gateway.calls` `request_payload` and `response_payload`, and
   `bifrost.system.audit_log` `detail` are Variant.
 
@@ -692,7 +709,11 @@ ImmutableArrow
   -> Retired
 ```
 
-`ScribeHotStage` bounded-sorts a member into immutable local Parquet runs,
+`ScribeHotStage` bounded-sorts a member into immutable local Parquet runs:
+each bounded candidate's order is computed from its sort-key columns alone,
+and each payload column is gathered once from the candidate's source batches
+into the sorted output, so the unsorted payload is never concatenated first.
+It
 fsyncs the file, manifest, and directory, verifies checksum/schema/layout/footer,
 performs a bounded read preflight, and registers it as live-tail authority. The
 shared cohort WAL retires only after every member reaches that boundary.
@@ -996,10 +1017,20 @@ query's own ceiling, and the root's single tracked spill-fair pool, bounded by
 the shared Bifrost memory cap that Scribe, Forge, and in-flight transport also
 charge, arbitrates what all live queries hold together. No role holds a fixed
 share or a precharge, with one exception: when an Oracle-serving node sets up
-`DataFusion`'s Parquet footer cache at composition, it charges the cache's
-whole `metadata_cache_bytes` budget to the Oracle memory root and holds it for
-the storage owner's life, because that cache reports no per-entry charge; a
-zero budget sets up no cache and charges nothing. Apart from that standing
+`DataFusion`'s Parquet footer cache and its Parquet byte-range cache at
+composition, it charges each cache's whole budget, `metadata_cache_bytes` and
+`data_cache_bytes`, to the Oracle memory root and holds it for the storage
+owner's life, because neither cache reports a per-entry charge; a zero budget
+sets up no cache and charges nothing. Each budget defaults to a twentieth of
+managed memory within 32 MiB..512 MiB and may never exceed an eighth of it.
+
+The byte-range cache keeps the exact byte ranges Oracle scans read from
+warehouse objects, which are written once under unique names and never
+rewritten, so a cached range never goes stale; staged scratch objects are read
+uncached. A scan answered from the cache still counts the bytes in
+`bytes_scanned`, and before its first cached range of an object it confirms the
+object exists, so a pinned object that vanished still fails the attempt as a
+stale object rather than being answered from memory. Apart from that standing
 charge an idle role holds nothing, and every charge returns when its owner
 ends. Aggregate governed reservations therefore cannot sum above
 the Bifrost cap.
@@ -1199,14 +1230,24 @@ Python, TypeScript, and MCP.
 
 `bifrost.system.audit_log` is the authoritative retained audit history. Every
 audit event is staged in memory on the process Scribe outbox, whose one
-background writer groups a tenant slice by destination, encodes one Arrow
-frame per group with a batch id derived from its content, and submits it to
-the local Scribe or, from a pod without Scribe, to a Scribe pod over the
-mutually authenticated peer plane. Audit frames are submitted under the
+background writer cuts each tenant's writes into producer lanes keyed by
+request, Verifier execution, or a queued submission's idempotency key, lets a
+lane's slice linger until its oldest write is 50 ms old or it holds 4,096 writes,
+as a Kafka producer's `linger.ms` and `batch.size` do, groups a lane's slice by destination, and
+builds each group's rows once into dense Arrow batches from the owned values
+and encoded Variants each write staged, never one batch per write. Each frame
+is encoded as Arrow IPC, which sizes and splits it and derives its batch id
+from that content. The local Scribe receives the frame's rows in-process as
+server-built canonical batches under ordinary admission, without decoding or
+revalidating values the producer built; from a pod without Scribe, the IPC
+bytes travel to a Scribe pod over the mutually authenticated peer plane, which
+validates them in full. Both carry the same rows under the same batch id. Audit frames are submitted under the
 platform audit principal, the one principal Scribe admits for the reserved
 system owner's audit history. A retryable failure resubmits the identical
 slice, so Scribe's durable batch-id fence absorbs a write whose
-acknowledgement was lost; later arrivals wait for the next slice. A row carries
+acknowledgement was lost; later arrivals in that lane wait for the next slice.
+Producer lanes are independent of Scribe shards, which keep their own routing,
+WAL, and fence. A row carries
 only decision content: there is no chain, sequence, or publication progress,
 and readers order by decision time. Writes Scribe has not acknowledged are lost
 on abrupt process death or an expired shutdown deadline; observable loss is
@@ -1229,11 +1270,10 @@ date-range rather than recent-window queries, and retention measured in years
 rather than days.
 
 The four verification tables — `bifrost.drift.observations`,
-`bifrost.verification.execution_inputs`, `bifrost.verification.results`, and
-`bifrost.drift.result_features` — also partition by UTC day on each table's time
-column — `created_at` for observations, `ended_at` for results,
-`recorded_at` for execution inputs, and `wyrd_ingested_at` for result
-features —
+`bifrost.verification.execution_inputs`, `bifrost.verification.execution_outputs`,
+and `bifrost.verification.results` — also partition by UTC day on each table's
+time column — `created_at` for observations, `recorded_at` for execution
+inputs, and `ended_at` for execution outputs and results —
 never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
 not determine partition size.
 
@@ -1609,14 +1649,17 @@ across a restart; durable batch, file, and task rows answer that question.
   `forge`. A file with no Variant bytes records nothing. A rising share means layouts are missing keys. Forge
   reads each output footer once after the rewrite and logs, never fails on, a
   footer it cannot read. Recovery-stage runs are not measured.
-- **Storage.** Bifrost emits no storage metrics of its own. Parquet footers
-  are cached in `DataFusion`'s node-wide metadata cache, whose whole budget is
-  charged to the Oracle memory root at composition.
+- **Storage.** Parquet footers are cached in `DataFusion`'s node-wide metadata
+  cache and warehouse byte ranges in the node's byte-range cache, each charged
+  in whole to the Oracle memory root at composition.
+  `bifrost_footer_cache_{hits,misses}_total` and
+  `bifrost_range_cache_{hits,misses}_total` count their lookups.
 - **Traces.** A query is one trace: `bifrost.gate.query.stream` spans the
   client-facing stream through terminal or drop, with `bifrost.gate.query`
   dispatch as its child; `bifrost.oracle.stream` spans Oracle execution through
-  terminal cleanup, and `bifrost.oracle.peer.fragment{role,outcome}` spans each
-  remote fragment. Work `DataFusion` spawns inherits the query span, so remote
+  terminal cleanup and records the executed plan's final integer
+  `rows_scanned` and `bytes_scanned` when its scans report them, and
+  `bifrost.oracle.peer.fragment{role,outcome}` spans each remote fragment. Work `DataFusion` spawns inherits the query span, so remote
   fragments are child work of the query that dispatched them. Each operation
   span records exactly one `outcome`. A request that continues a sampled
   client trace keeps it: the Gate and Oracle spans join the caller's trace,
@@ -1702,7 +1745,7 @@ Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
 `bifrost.gateway.calls` and the three verification tables
 (`bifrost.verification.results`, `bifrost.verification.execution_inputs`, and
-`bifrost.drift.result_features`) accept no public write at all: Gate refuses every
+`bifrost.verification.execution_outputs`) accept no public write at all: Gate refuses every
 principal. Only the server-internal capture writer writes them, together with
 the capture spans in `bifrost.traces.spans`, and the tenant copies of server
 spans join them there through the same outbox; result rows carry the verified
@@ -1716,7 +1759,12 @@ the tenant `System` principal as actor for a queued result. A `submit`
 creates its queued `wyrd.verifier_executions` row only after Scribe
 acknowledges its `execution_inputs` batch, through the existing batched
 request outbox; staged inputs not yet acknowledged are lost on abrupt process
-death, and the execution then never becomes visible. A pod without
+death, and the execution then never becomes visible. The row stores no input
+values: the runner resolves them, and the accepted routes, from that input
+record. A group or schedule execution's selector record is staged on a slot
+reserved before its PostgreSQL commit and is staged right after it; a runner
+claiming the execution before the record is readable retries it as evidence
+unavailable. A pod without
 Scribe submits through `ScribeCapturePeerService.IngestCapture` on the peer
 listener, which the same `wyrd-peer` mTLS admits; the request names its
 tenant and one of those five tables or `bifrost.system.audit_log` explicitly,

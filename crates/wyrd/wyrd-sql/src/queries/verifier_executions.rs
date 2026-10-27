@@ -28,7 +28,6 @@ use wyrd_runtime::AcceptedAuthority;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
-use wyrd_spec::card::agent::ExecutionRoute;
 use wyrd_spec::card::operator::{DriftCounts, MAX_SUMMARY_CHARS};
 use wyrd_spec::card::verifier::SourceText;
 use wyrd_spec::error::WyrdError;
@@ -37,13 +36,10 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
 use wyrd_spec::verification::TaskId;
-use wyrd_spec::verification::execution::{
-    InputDeclaration, VerificationExecutionState, VerificationRequest,
-};
+use wyrd_spec::verification::execution::{VerificationExecutionState, VerificationRequest};
 use wyrd_spec::verification::{
-    DriftWindow, FrozenTarget, GroupEndSettings, GroupSnapshot, GroupSourceSnapshot,
-    OperatorDispatchState, VerificationBindingStatus, VerificationError, VerificationVerdict,
-    VerifierReadiness,
+    DriftWindow, FrozenTarget, GroupEndSettings, OperatorDispatchState, VerificationBindingStatus,
+    VerificationError, VerificationVerdict, VerifierReadiness,
 };
 
 use crate::queries::verification::{BindingSchedule, InactivityTimeout, binding_activity};
@@ -104,27 +100,25 @@ const EXISTING_OCCURRENCE_SQL: &str = r"
 const INSERT_SUBMISSIONS_SQL: &str = r"
     INSERT INTO wyrd.verifier_executions (
         execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
-        origin, run_id, inputs, route_overrides,
+        origin, run_id,
         sub_principal_id, act_principal_id, authority, cause_trace_id, cause_span_id,
         idempotency_key, request_sha256, status, error, max_attempts,
         next_attempt_at, settled_at, created_at, updated_at, cause_sampled, group_id,
         deployment_environment
     )
     SELECT r.execution_id, wyrd.current_tenant(), v.card_uid, v.version, s.card_uid,
-           'manual', r.run_id, r.inputs, r.route_overrides,
+           'manual', r.run_id,
            r.sub_principal_id, r.act_principal_id, r.authority, r.cause_trace_id,
            r.cause_span_id, r.idempotency_key, r.request_sha256,
-           CASE WHEN r.error IS NULL THEN 'pending' ELSE 'errored' END, r.error, $17,
+           CASE WHEN r.error IS NULL THEN 'pending' ELSE 'errored' END, r.error, $15,
            CASE WHEN r.error IS NULL THEN statement_timestamp() END,
            CASE WHEN r.error IS NOT NULL THEN statement_timestamp() END,
            statement_timestamp(), statement_timestamp(), r.cause_sampled, r.group_id,
            r.deployment_environment
-      FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::jsonb[],
-                  $6::jsonb[], $7::uuid[], $8::uuid[], $9::jsonb[], $10::bytea[],
-                  $11::bytea[], $12::text[], $13::bytea[], $14::jsonb[], $15::bool[],
-                  $16::text[], $18::text[])
-           AS r(execution_id, verifier_card_uid, card_uid, run_id, inputs,
-                route_overrides, sub_principal_id, act_principal_id, authority,
+      FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::uuid[],
+                  $6::uuid[], $7::jsonb[], $8::bytea[], $9::bytea[], $10::text[],
+                  $11::bytea[], $12::jsonb[], $13::bool[], $14::text[], $16::text[])
+           AS r(execution_id, verifier_card_uid, card_uid, run_id, sub_principal_id, act_principal_id, authority,
                 cause_trace_id, cause_span_id, idempotency_key, request_sha256,
                 error, cause_sampled, group_id, deployment_environment)
       JOIN wyrd.cards v ON v.card_uid = r.verifier_card_uid
@@ -195,7 +189,7 @@ const SCHEDULE_CLAIM_DELAY: Duration = Duration::seconds(30);
 /// clock rather than the scheduler process's, and judges missed occurrences
 /// and the next cursor on the same delayed clock that decides dueness.
 const DUE_BINDING_SQL: &str = r"
-    SELECT binding_id, schedule_cron, schedule_tz, next_run_at,
+    SELECT binding_id, verifier_card_uid, card_uid, schedule_cron, schedule_tz, next_run_at,
            statement_timestamp() - ($1::bigint * INTERVAL '1 millisecond') AS schedule_clock
       FROM wyrd.verification_bindings
      WHERE activation = 'schedule'
@@ -214,7 +208,9 @@ const DUE_BINDING_SQL: &str = r"
 /// `after` is the exact authored duration, at most the one year Trigger
 /// validation admits; it is added as elapsed seconds, so a day is always
 /// 86,400 seconds whatever the session time zone's daylight time. `DISTINCT` keeps one row per binding and group so the
-/// upsert never touches a row twice.
+/// upsert never touches a row twice, and rows are upserted in key order so
+/// concurrent writers of one tenant lock shared groups in the same order
+/// rather than deadlocking.
 const RECORD_GROUP_ACTIVITY_SQL: &str = r"
     INSERT INTO wyrd.verification_group_pending (data_tenant_id, binding_id, group_id, due_at)
     SELECT DISTINCT wyrd.current_tenant(), b.binding_id, a.group_id,
@@ -228,6 +224,7 @@ const RECORD_GROUP_ACTIVITY_SQL: &str = r"
            SELECT 1 FROM jsonb_each(b.group_end -> 'sources') AS s(slot, source)
             WHERE (s.source ->> 'card_uid')::uuid = a.card_uid
               AND (s.source ->> 'verifier_card_uid')::uuid = a.verifier_card_uid)
+     ORDER BY b.binding_id, a.group_id
     ON CONFLICT (data_tenant_id, binding_id, group_id)
     DO UPDATE SET due_at = EXCLUDED.due_at
 ";
@@ -237,7 +234,7 @@ const RECORD_GROUP_ACTIVITY_SQL: &str = r"
 /// PostgreSQL's clock, whether the group is more than five minutes past due,
 /// the bound on retrying an incomplete snapshot.
 const DUE_GROUP_SQL: &str = r"
-    SELECT binding_id, group_id,
+    SELECT binding_id, group_id, due_at,
            statement_timestamp() - due_at > INTERVAL '5 minutes' AS overdue
       FROM wyrd.verification_group_pending
      WHERE due_at <= statement_timestamp()
@@ -246,9 +243,10 @@ const DUE_GROUP_SQL: &str = r"
        FOR UPDATE SKIP LOCKED
 ";
 
-/// Read a pending group's binding owner and frozen `group_end` settings.
+/// Read a pending group's binding owner, frozen `group_end` settings, group
+/// Verifier, and subject.
 const GROUP_BINDING_SQL: &str = r"
-    SELECT owner_card_uid, group_end
+    SELECT owner_card_uid, group_end, verifier_card_uid, card_uid
       FROM wyrd.verification_bindings
      WHERE binding_id = $1
 ";
@@ -260,17 +258,17 @@ const CONSUME_GROUP_SQL: &str = r"
 ";
 
 /// Insert one group execution judging a pinned snapshot, due at PostgreSQL's
-/// statement time; a snapshot with the same content digest (`$12`) for the
+/// statement time; a snapshot with the same content digest (`$11`) for the
 /// binding and group conflicts on its unique index and inserts nothing.
 const INSERT_GROUP_SQL: &str = r"
     INSERT INTO wyrd.verifier_executions (
         execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
-        inputs, route_overrides, group_id, group_snapshot_sha256, group_sources,
+        group_id, group_snapshot_sha256,
         sub_principal_id, act_principal_id, authority,
         max_attempts, next_attempt_at, created_at, updated_at
     ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, 'group', $5, $6, $7, $8, $9,
-              $10, '{}'::jsonb, $11, $12, $13, $14, $15, $16, $17,
+              $10, $11, $12, $13, $14, $15,
               statement_timestamp(), statement_timestamp(), statement_timestamp())
     ON CONFLICT DO NOTHING
     RETURNING execution_id
@@ -410,10 +408,10 @@ const CLAIM_SQL: &str = r"
     RETURNING e.execution_id, e.lease_token, e.verifier_card_uid, e.verifier_version, e.card_uid,
               e.origin, e.owner_card_uid, e.binding_id, e.trigger_uid,
               e.trigger_digest, e.window_start, e.window_end,
-              e.run_id, e.inputs, e.route_overrides,
+              e.run_id,
               e.sub_principal_id, e.act_principal_id, e.authority, e.attempts,
               e.max_attempts, e.lease_expires_at, e.cause_trace_id, e.cause_span_id,
-              e.cause_sampled, e.group_id, e.group_sources, e.deployment_environment,
+              e.cause_sampled, e.group_id, e.deployment_environment,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - candidate.due_at)
                            * 1000)::bigint) AS queue_wait_ms,
               GREATEST(0, (EXTRACT(EPOCH FROM statement_timestamp() - e.created_at)
@@ -563,7 +561,7 @@ const RELEASE_SQL: &str = r"
 const STATUS_SQL: &str = r"
     SELECT execution_id, status, sub_principal_id, act_principal_id,
            verifier_card_uid, card_uid, result_id, error,
-           group_id, owner_card_uid, group_sources, deployment_environment
+           group_id, owner_card_uid, deployment_environment
       FROM wyrd.verifier_executions
      WHERE execution_id = $1
 ";
@@ -797,22 +795,15 @@ pub enum ExecutionInput {
         /// The occurrence's comparison window.
         window: DriftWindow,
     },
-    /// A caller submission, exactly as it was accepted.
+    /// A caller submission. Its declarations and route overrides live in
+    /// its Bifrost input record, never in PostgreSQL.
     Submitted {
         /// Application Run the execution belongs to, when the caller named one.
         run_id: Option<RunId>,
-        /// One declaration per named input slot.
-        inputs: BTreeMap<SlotName, InputDeclaration>,
-        /// Per-task execution route overrides.
-        route_overrides: BTreeMap<TaskId, ExecutionRoute>,
     },
-    /// A group snapshot pinned when the execution was enqueued.
-    Grouped {
-        /// One ordered JSON list per source slot, aligned to its snapshot.
-        inputs: BTreeMap<SlotName, InputDeclaration>,
-        /// The pinned source selections.
-        snapshot: GroupSnapshot,
-    },
+    /// A group snapshot. Its selector lives in the execution's Bifrost input
+    /// record; PostgreSQL holds only the snapshot digest.
+    Grouped,
 }
 
 /// Who one scheduled execution serves, who accepted it, and the authority it
@@ -1120,11 +1111,25 @@ pub struct DueBinding {
     pub binding_id: BindingId,
     /// The stored cursor that was due.
     pub due_at: DateTime<Utc>,
+    /// The binding's Verifier.
+    pub verifier_card_uid: CardUid,
+    /// The Card the binding verifies, whose observations a run judges.
+    pub card_uid: CardUid,
     /// What the occurrence calls for.
     decision: DueDecision,
 }
 
 impl DueBinding {
+    /// The window an execution of this occurrence judges, or `None` when the
+    /// occurrence creates none.
+    #[must_use]
+    pub const fn window(&self) -> Option<&DriftWindow> {
+        match &self.decision {
+            DueDecision::Run { window, .. } => Some(window),
+            DueDecision::InvalidSchedule | DueDecision::Skip { .. } => None,
+        }
+    }
+
     /// The family runtime account and exact owner root an execution would
     /// serve, or `None` when the occurrence creates none and needs no
     /// authority.
@@ -1172,8 +1177,15 @@ pub struct DueGroup {
     pub binding_id: BindingId,
     /// The caller group to judge.
     pub group_id: GroupId,
+    /// When the group fell due: the cutoff for its cumulative selection, so
+    /// only rows admitted before it are judged.
+    pub due_at: DateTime<Utc>,
     /// Binding owner whose attributed source rows form the group.
     pub owner_card_uid: CardUid,
+    /// The binding's group Verifier.
+    pub verifier_card_uid: CardUid,
+    /// The Card the group Verifier verifies.
+    pub card_uid: CardUid,
     /// The pinned Trigger duration and source bindings.
     pub settings: GroupEndSettings,
     /// The owner family's runtime account, whatever its status; `None` when
@@ -1200,17 +1212,16 @@ pub struct GroupActivity {
     pub group_id: GroupId,
 }
 
-/// One group snapshot to judge: its ordered source lists, their provenance,
-/// and the content digest that makes re-reading unchanged evidence enqueue
-/// nothing.
-#[derive(Debug, Clone, PartialEq)]
+/// One group snapshot to judge: its source selections and the content
+/// digest that makes re-reading unchanged evidence enqueue nothing. The
+/// selections are written to the execution's Bifrost input record; only the
+/// digest is stored in PostgreSQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedGroup {
     /// The judged group.
     pub group_id: GroupId,
-    /// One ordered JSON list per source slot.
-    pub inputs: BTreeMap<SlotName, InputDeclaration>,
-    /// The pinned source selections.
-    pub snapshot: GroupSnapshot,
+    /// The selection of each source slot.
+    pub sources: BTreeMap<SlotName, GroupSelection>,
     /// SHA-256 of the snapshot's canonical content.
     digest: [u8; 32],
 }
@@ -1227,53 +1238,34 @@ pub struct GroupSelection {
 }
 
 impl PinnedGroup {
-    /// Pin `inputs` selected as `selections` for `group_id` of `binding_id`.
+    /// Pin `sources` for `group_id` of `binding_id`.
     ///
     /// The digest is SHA-256 of the RFC 8785 canonical JSON of the binding,
-    /// group, each slot's ordered execution and selected result IDs, and the
-    /// exact input declarations, so a newly visible execution or result
-    /// changes it even at equal times or values, while poll time, row counts,
-    /// and execution status never do.
+    /// group, and each slot's ordered execution and selected result IDs, so a
+    /// newly visible execution or result changes it even at equal times or
+    /// values, while poll time, the selection cutoff, row counts, and
+    /// execution status never do.
     ///
     /// # Errors
     /// Returns [`SqlxError::Encode`] when the content cannot be serialized.
     pub fn new(
         binding_id: BindingId,
         group_id: GroupId,
-        inputs: BTreeMap<SlotName, InputDeclaration>,
-        selections: BTreeMap<SlotName, GroupSelection>,
+        sources: BTreeMap<SlotName, GroupSelection>,
     ) -> Result<Self, SqlxError> {
         let content = serde_json::json!({
             "binding_id": binding_id,
             "group_id": group_id,
-            "sources": selections
+            "sources": sources
                 .iter()
                 .map(|(slot, selection)| (slot, &selection.executions))
                 .collect::<BTreeMap<_, _>>(),
-            "inputs": inputs,
         });
         let canonical =
             serde_jcs::to_vec(&content).map_err(|error| SqlxError::Encode(error.into()))?;
-        let snapshot = GroupSnapshot {
-            sources: selections
-                .into_iter()
-                .map(|(slot, selection)| {
-                    let execution_ids =
-                        selection.executions.into_iter().map(|(id, _)| id).collect();
-                    (
-                        slot,
-                        GroupSourceSnapshot {
-                            reference: selection.reference,
-                            execution_ids,
-                        },
-                    )
-                })
-                .collect(),
-        };
         Ok(Self {
             group_id,
-            inputs,
-            snapshot,
+            sources,
             digest: Sha256::digest(canonical).into(),
         })
     }
@@ -1362,7 +1354,8 @@ pub struct ClaimedExecution {
     /// lease expiry for a reclaim. Telemetry only; never a coordination input.
     pub queue_wait: std::time::Duration,
     /// How long before this claim the execution was admitted: the claim
-    /// statement's PostgreSQL instant less `created_at`. Telemetry only.
+    /// statement's PostgreSQL instant less `created_at`. Telemetry, and the
+    /// runner's bound on waiting for the execution's input record to publish.
     pub age: std::time::Duration,
     /// The Verifier's ready fitted Drift baselines keyed by requirement ID,
     /// read in the claim transaction; empty when it has none.
@@ -1742,16 +1735,6 @@ impl VerifierExecutionQueue {
                     .collect::<Vec<_>>(),
             )
             .bind(
-                requests()
-                    .map(|request| Json(&request.inputs))
-                    .collect::<Vec<_>>(),
-            )
-            .bind(
-                requests()
-                    .map(|request| Json(&request.execution_route_overrides))
-                    .collect::<Vec<_>>(),
-            )
-            .bind(
                 attributions
                     .iter()
                     .map(|attribution| attribution.sub_principal_id.as_uuid())
@@ -1916,6 +1899,8 @@ impl VerifierExecutionQueue {
             };
             let due_at = due.next_run_at;
             let binding_id = stored(BindingId::new(due.binding_id))?;
+            let verifier_card_uid = stored(CardUid::from_uuid(due.verifier_card_uid))?;
+            let card_uid = stored(CardUid::from_uuid(due.card_uid))?;
             let occurrence = match BindingSchedule::parse(
                 &due.schedule_cron,
                 due.schedule_tz.as_deref(),
@@ -1928,6 +1913,8 @@ impl VerifierExecutionQueue {
                     return Ok(Some(DueBinding {
                         binding_id,
                         due_at,
+                        verifier_card_uid,
+                        card_uid,
                         decision: DueDecision::InvalidSchedule,
                     }));
                 }
@@ -1953,6 +1940,8 @@ impl VerifierExecutionQueue {
             Ok(Some(DueBinding {
                 binding_id,
                 due_at,
+                verifier_card_uid,
+                card_uid,
                 decision,
             }))
         })
@@ -2104,23 +2093,30 @@ impl VerifierExecutionQueue {
         conn: &mut TenantConn<'_>,
     ) -> Result<Option<DueGroup>, SqlxError> {
         timed("group_claim", async {
-            let due: Option<(Uuid, String, bool)> = sqlx::query_as(DUE_GROUP_SQL)
+            let due: Option<(Uuid, String, DateTime<Utc>, bool)> = sqlx::query_as(DUE_GROUP_SQL)
                 .fetch_optional(&mut **conn.transaction())
                 .await?;
-            let Some((binding_id, group_id, overdue)) = due else {
+            let Some((binding_id, group_id, due_at, overdue)) = due else {
                 return Ok(None);
             };
-            let (owner, Json(settings)): (Uuid, Json<GroupEndSettings>) =
-                sqlx::query_as(GROUP_BINDING_SQL)
-                    .bind(binding_id)
-                    .fetch_one(&mut **conn.transaction())
-                    .await?;
+            let (owner, Json(settings), verifier, subject): (
+                Uuid,
+                Json<GroupEndSettings>,
+                Uuid,
+                Uuid,
+            ) = sqlx::query_as(GROUP_BINDING_SQL)
+                .bind(binding_id)
+                .fetch_one(&mut **conn.transaction())
+                .await?;
             let binding_id = stored(BindingId::new(binding_id))?;
             let activity = binding_activity(conn, binding_id, self.inactivity).await?;
             Ok(Some(DueGroup {
                 binding_id,
                 group_id: stored(GroupId::new(group_id))?,
+                due_at,
                 owner_card_uid: stored(CardUid::from_uuid(owner))?,
+                verifier_card_uid: stored(CardUid::from_uuid(verifier))?,
+                card_uid: stored(CardUid::from_uuid(subject))?,
                 settings,
                 owner: activity.as_ref().and_then(|activity| activity.principal_id),
                 active: activity.is_some_and(|activity| activity.active),
@@ -2240,10 +2236,8 @@ impl VerifierExecutionQueue {
                 .bind(resolved.trigger_uid)
                 .bind(resolved.trigger_digest)
                 .bind(resolved.operators)
-                .bind(Json(&pinned.inputs))
                 .bind(pinned.group_id.as_str())
                 .bind(pinned.digest.as_slice())
-                .bind(Json(&pinned.snapshot.sources))
                 .bind(attribution.sub_principal_id.as_uuid())
                 .bind(attribution.act_principal_id.as_uuid())
                 .bind(Json(authority.authority()))
@@ -2646,9 +2640,7 @@ impl VerifierExecutionQueue {
                         .owner_card_uid
                         .map(|uid| stored(CardUid::from_uuid(uid)))
                         .transpose()?,
-                    group: row
-                        .group_sources
-                        .map(|Json(sources)| GroupSnapshot { sources }),
+                    group: None,
                 },
                 attribution: Attribution::new(
                     PrincipalId::new(row.sub_principal_id),
@@ -2962,10 +2954,6 @@ struct ClaimedRow {
     window_end: Option<DateTime<Utc>>,
     /// Submitted application Run.
     run_id: Option<String>,
-    /// Submitted input declarations.
-    inputs: Option<Json<BTreeMap<SlotName, InputDeclaration>>>,
-    /// Submitted route overrides.
-    route_overrides: Option<Json<BTreeMap<TaskId, ExecutionRoute>>>,
     /// Subject the execution serves.
     sub_principal_id: Uuid,
     /// Actor that accepted the execution.
@@ -2986,8 +2974,6 @@ struct ClaimedRow {
     cause_sampled: Option<bool>,
     /// Caller group the execution belongs to.
     group_id: Option<String>,
-    /// A group execution's pinned source selections.
-    group_sources: Option<Json<BTreeMap<SlotName, GroupSourceSnapshot>>>,
     /// Accepted deployment environment tag.
     deployment_environment: Option<String>,
     /// Milliseconds the execution was claimable before this claim.
@@ -3007,33 +2993,14 @@ impl ClaimedRow {
     /// negative.
     fn into_claimed(self) -> Result<ClaimedExecution, SqlxError> {
         let origin = ExecutionOrigin::parse(&self.origin)?;
-        let snapshot = self
-            .group_sources
-            .map(|Json(sources)| GroupSnapshot { sources });
-        let input = match (
-            self.window_start,
-            self.window_end,
-            self.inputs,
-            self.route_overrides,
-        ) {
-            (Some(start), Some(end), None, None) => ExecutionInput::Scheduled {
+        let input = match (origin, self.window_start, self.window_end) {
+            (ExecutionOrigin::Schedule, Some(start), Some(end)) => ExecutionInput::Scheduled {
                 window: DriftWindow { start, end },
             },
-            (None, None, Some(Json(inputs)), Some(_)) if origin == ExecutionOrigin::Group => {
-                ExecutionInput::Grouped {
-                    inputs,
-                    snapshot: snapshot.ok_or_else(|| {
-                        SqlxError::Decode("group execution has no pinned snapshot".into())
-                    })?,
-                }
-            }
-            (None, None, Some(Json(inputs)), Some(Json(route_overrides))) => {
-                ExecutionInput::Submitted {
-                    run_id: self.run_id.map(RunId::from_string),
-                    inputs,
-                    route_overrides,
-                }
-            }
+            (ExecutionOrigin::Group, None, None) => ExecutionInput::Grouped,
+            (ExecutionOrigin::Manual, None, None) => ExecutionInput::Submitted {
+                run_id: self.run_id.map(RunId::from_string),
+            },
             _ => {
                 return Err(SqlxError::Decode(
                     "verifier execution has no single frozen input".into(),
@@ -3103,6 +3070,10 @@ impl ClaimedRow {
 struct DueBindingRow {
     /// Binding identity.
     binding_id: Uuid,
+    /// The binding's Verifier.
+    verifier_card_uid: Uuid,
+    /// The Card the binding verifies.
+    card_uid: Uuid,
     /// Stored cron expression.
     schedule_cron: String,
     /// Stored IANA time zone, when the schedule names one.
@@ -3139,8 +3110,6 @@ struct StatusRow {
     group_id: Option<String>,
     /// Binding owner of a background execution.
     owner_card_uid: Option<Uuid>,
-    /// A group execution's pinned source selections.
-    group_sources: Option<Json<BTreeMap<SlotName, GroupSourceSnapshot>>>,
     /// Deployment environment tag supplied at acceptance.
     deployment_environment: Option<String>,
 }
@@ -3428,10 +3397,10 @@ mod pg_tests {
                  execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
                  origin, sub_principal_id, act_principal_id, authority, status, error,
                  max_attempts, created_at, updated_at, settled_at, idempotency_key,
-                 request_sha256, inputs, route_overrides)
+                 request_sha256)
              SELECT gen_random_uuid(), $1, gen_random_uuid(), '1.0.0', gen_random_uuid(),
                     'manual', $2, $2, '{}', 'errored', '{}', 3, now(), now(), now(),
-                    'key-' || g, '\\x00', '{}', '{}'
+                    'key-' || g, '\\x00'
                FROM generate_series(1, $3) AS g",
         )
         .await;
@@ -3474,10 +3443,10 @@ mod pg_tests {
             "INSERT INTO wyrd.verifier_executions (
                  execution_id, data_tenant_id, verifier_card_uid, verifier_version, card_uid,
                  origin, sub_principal_id, act_principal_id, authority, status,
-                 max_attempts, next_attempt_at, created_at, updated_at, inputs, route_overrides)
+                 max_attempts, next_attempt_at, created_at, updated_at)
              SELECT gen_random_uuid(), $1, gen_random_uuid(), '1.0.0', gen_random_uuid(),
                     'manual', $2, $2, '{}', 'pending', 3, now() - g * INTERVAL '1 ms',
-                    now(), now(), '{}', '{}'
+                    now(), now()
                FROM generate_series(1, $3) AS g",
         )
         .await;

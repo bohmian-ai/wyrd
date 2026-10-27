@@ -139,12 +139,9 @@ fn holds_in_order(names: &[&str], steps: &[fn(&str) -> bool]) -> bool {
 /// A Service action that records spans, writes a Run observation and a
 /// table row, calls a model through the Gateway, and verifies its answer
 /// with an LLM judge reads back as one connected, time-ordered tree
-/// rooted at the action's span. The queued writes are PRODUCER spans in that
-/// tree, and the same read returns the CONSUMER ingest span linking each
-/// producer as a linked trace. The operator's export holds every server span
-/// of the action's trace with the same ids, and the consumers too. Every
-/// request span is stamped with the Service as subject and actor, and the
-/// judge's Gateway call keeps the Service as subject under the system actor.
+/// rooted at the action's span, as [`act_and_read`] asserts. The operator's
+/// export holds every server span of the action's trace with the same ids,
+/// and the consumers too.
 ///
 /// # Panics
 /// Panics when a step fails or the timeline or operator export differs.
@@ -154,6 +151,77 @@ async fn service_action_timeline_is_one_connected_tree() {
     let assistant = Assistant::start().await;
     let (_guard, operator) = shared_process_telemetry_for_test().expect("process telemetry");
     let checkpoint = operator.checkpoint().expect("operator checkpoint");
+    let (trace, timeline) = act_and_read(&assistant).await;
+    let exported = operator.spans_since(&checkpoint);
+    for span in timeline
+        .iter()
+        .filter(|span| span.scope.name != SERVICE_SCOPE && span.scope.name != GATEWAY_SCOPE)
+    {
+        let parent = span.parent_span_id.map(|parent| parent.to_hex());
+        assert!(
+            exported.iter().any(|copy| copy.trace_id == trace
+                && copy.span_id == span.span_id.to_hex()
+                && Some(&copy.parent_span_id) == parent.as_ref()
+                && copy.name == span.name),
+            "the operator holds {} with the same ids",
+            span.name
+        );
+    }
+    for producer in producers(&timeline) {
+        let link = (trace.clone(), producer.span_id.to_hex());
+        assert!(
+            exported
+                .iter()
+                .any(|copy| copy.name == "bifrost.gate.write" && copy.links.contains(&link)),
+            "the operator holds a CONSUMER ingest span linking {link:?}"
+        );
+    }
+    assistant.deployment.shutdown().await;
+}
+
+/// The same action reads back as the same connected tree when the server
+/// runs the production telemetry with no operator endpoint, operator
+/// sampling at zero, and both log and operator trace filters at `error`:
+/// no operator setting removes the tenant's timeline.
+///
+/// # Panics
+/// Panics when telemetry does not install, a step fails, or the timeline
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_action_timeline_survives_a_quiet_operator_policy() {
+    let _telemetry = wyrd_telemetry::init(wyrd_telemetry::TelemetryConfig {
+        filter: "error".to_owned(),
+        trace_filter: "error".to_owned(),
+        sample_ratio: Some(0.0),
+        ..wyrd_telemetry::TelemetryConfig::default()
+    })
+    .expect("production telemetry installs");
+    let assistant = Assistant::start().await;
+    act_and_read(&assistant).await;
+    assistant.deployment.shutdown().await;
+}
+
+/// The queued writes' PRODUCER spans in `timeline`.
+fn producers(timeline: &[SpanRecord]) -> Vec<&SpanRecord> {
+    timeline
+        .iter()
+        .filter(|span| span.kind == SpanKind::Producer && span.name == "bifrost.enqueue")
+        .collect()
+}
+
+/// Run the Service action against `assistant` and read back its timeline,
+/// returning the action's trace id and its spans in that trace.
+///
+/// The read is time-ordered and holds one tree rooted at the action's span.
+/// The queued writes are PRODUCER spans in that tree, and the same read
+/// returns the CONSUMER ingest span linking each producer as a linked trace.
+/// Both Gateway attempts sit under their caller, every request span is
+/// stamped with the Service as subject and actor, and the judge's Gateway
+/// call keeps the Service as subject under the system actor.
+///
+/// # Panics
+/// Panics when a step fails or the timeline differs.
+async fn act_and_read(assistant: &Assistant) -> (String, Vec<SpanRecord>) {
     let admin = Bifrost::connect_with(
         &assistant.deployment.admin(),
         BifrostOptions {
@@ -262,10 +330,7 @@ async fn service_action_timeline_is_one_connected_tree() {
     }
     assert!(timeline.iter().any(|span| span.name == "answer"));
 
-    let producers: Vec<&SpanRecord> = timeline
-        .iter()
-        .filter(|span| span.kind == SpanKind::Producer && span.name == "bifrost.enqueue")
-        .collect();
+    let producers = producers(&timeline);
     assert!(
         producers.len() >= 2,
         "the observation and the row: {}",
@@ -349,22 +414,7 @@ async fn service_action_timeline_is_one_connected_tree() {
         "the judge call keeps the Service as subject under the system actor: {judge:?}"
     );
 
-    let exported = operator.spans_since(&checkpoint);
-    for span in timeline
-        .iter()
-        .filter(|span| span.scope.name != SERVICE_SCOPE && span.scope.name != GATEWAY_SCOPE)
-    {
-        let parent = span.parent_span_id.map(|parent| parent.to_hex());
-        assert!(
-            exported.iter().any(|copy| copy.trace_id == trace
-                && copy.span_id == span.span_id.to_hex()
-                && Some(&copy.parent_span_id) == parent.as_ref()
-                && copy.name == span.name),
-            "the operator holds {} with the same ids",
-            span.name
-        );
-    }
-    for producer in producers {
+    for producer in &producers {
         assert!(
             linked
                 .iter()
@@ -377,15 +427,8 @@ async fn service_action_timeline_is_one_connected_tree() {
             producer.span_id.to_hex(),
             outline(&linked)
         );
-        let link = (trace.clone(), producer.span_id.to_hex());
-        assert!(
-            exported
-                .iter()
-                .any(|copy| copy.name == "bifrost.gate.write" && copy.links.contains(&link)),
-            "the operator holds a CONSUMER ingest span linking {link:?}"
-        );
     }
-    assistant.deployment.shutdown().await;
+    (trace, timeline)
 }
 
 /// A request one tenant made under a caller's trace reads back to that

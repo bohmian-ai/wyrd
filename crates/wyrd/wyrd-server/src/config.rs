@@ -333,6 +333,7 @@ pub struct ScribeRuntimeConfig {
     /// retrying, and in flight. Verifier calls that would take reservations
     /// past three quarters of it are refused with retryable pressure; past
     /// all of it, unreserved writes such as audit decisions are counted lost.
+    /// Default 1,048,576, so `outbox_bytes` is the bound that normally binds.
     #[serde(default = "default_outbox_capacity")]
     pub outbox_capacity: usize,
     /// Most accounted bytes this process's Scribe outbox admits at once,
@@ -1335,6 +1336,9 @@ pub struct BifrostStorageIoConfig {
     /// Decoded Parquet metadata cache budget in bytes; zero disables it.
     #[serde(default)]
     pub metadata_cache_bytes: Option<u64>,
+    /// Parquet byte-range cache budget in bytes; zero disables it.
+    #[serde(default)]
+    pub data_cache_bytes: Option<u64>,
 }
 
 impl BifrostStorageIoConfig {
@@ -1351,6 +1355,7 @@ impl BifrostStorageIoConfig {
             max_retry_elapsed_ms: self.max_retry_elapsed_ms,
             max_concurrent_requests: self.max_concurrent_requests,
             metadata_cache_bytes: self.metadata_cache_bytes,
+            data_cache_bytes: self.data_cache_bytes,
         }
     }
 }
@@ -1691,6 +1696,12 @@ pub struct MetricsConfig {
     /// stays on loopback rather than inheriting the (possibly public) HTTP IP.
     #[serde(default)]
     pub bind: Option<SocketAddr>,
+    /// Whether the metrics listener also serves the read-only benchmark
+    /// timing snapshot, `GET /benchmark/timings`, and the process records
+    /// benchmark timing histograms. Defaults to false; only a
+    /// benchmark-owned server enables it, and it requires a loopback bind.
+    #[serde(default)]
+    pub benchmark_snapshot: bool,
 }
 
 fn default_metrics_enabled() -> bool {
@@ -1702,6 +1713,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: default_metrics_enabled(),
             bind: None,
+            benchmark_snapshot: false,
         }
     }
 }
@@ -3223,6 +3235,11 @@ impl WyrdServerConfig {
             self.metrics.enabled = parse_flag(&val, "WYRD_METRICS_ENABLED")?;
         }
 
+        // metrics.benchmark_snapshot
+        if let Some(val) = env_opt("WYRD_METRICS_BENCHMARK_SNAPSHOT")? {
+            self.metrics.benchmark_snapshot = parse_flag(&val, "WYRD_METRICS_BENCHMARK_SNAPSHOT")?;
+        }
+
         // metrics.bind
         if let Some(val) = env_opt("WYRD_METRICS_BIND")? {
             self.metrics.bind =
@@ -3402,6 +3419,18 @@ impl WyrdServerConfig {
             }
         }
 
+        // 1c. The benchmark snapshot is served only on an enabled loopback
+        // metrics listener: it is an unauthenticated local readout.
+        if self.metrics.benchmark_snapshot
+            && (!self.metrics.enabled || self.metrics.is_public_bind(self.http.bind))
+        {
+            return Err(ConfigError::Invalid {
+                message: "metrics.benchmark_snapshot requires metrics.enabled and a loopback \
+                          metrics.bind"
+                    .to_owned(),
+            });
+        }
+
         // 2. pools.max_connections >= 2
         if self.pools.max_connections < 2 {
             return Err(ConfigError::Invalid {
@@ -3521,13 +3550,9 @@ impl WyrdServerConfig {
         }
 
         // 15. telemetry.sample_ratio, when set, must be in [0.0, 1.0].
-        if let Some(ratio) = self.telemetry.sample_ratio
-            && !(0.0..=1.0).contains(&ratio)
-        {
-            return Err(ConfigError::Invalid {
-                message: format!("telemetry.sample_ratio must be in [0.0, 1.0], got {ratio}"),
-            });
-        }
+        self.telemetry
+            .operator_sample_ratio()
+            .map_err(|message| ConfigError::Invalid { message })?;
 
         // 16. Each trusted_issuers entry must have non-empty required fields and
         //     coherent client_auth (secret present iff secret_basic/secret_post).
@@ -5827,6 +5852,7 @@ minimum_slots = 2
         let explicit_public = MetricsConfig {
             enabled: true,
             bind: Some("0.0.0.0:9000".parse().unwrap()),
+            benchmark_snapshot: false,
         };
         assert!(
             explicit_public.is_public_bind(http_bind),
@@ -5852,6 +5878,38 @@ minimum_slots = 2
             matches!(err, ConfigError::BindCollision { .. }),
             "expected BindCollision, got {err:?}"
         );
+    }
+
+    // ── 40b. Benchmark snapshot requires a loopback metrics listener ────────
+
+    /// The benchmark snapshot is refused on an exposed or disabled metrics
+    /// listener and accepted on a loopback one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a configuration does not parse, or validation accepts an
+    /// exposed or absent listener or refuses a loopback one.
+    #[test]
+    fn benchmark_snapshot_requires_a_loopback_metrics_listener() {
+        for toml in [
+            "[metrics]\nbenchmark_snapshot = true\nbind = \"0.0.0.0:9000\"",
+            "[metrics]\nbenchmark_snapshot = true\nenabled = false",
+        ] {
+            let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
+            let err = cfg
+                .validate()
+                .expect_err("an exposed or absent snapshot listener must fail");
+            assert!(
+                err.to_string().contains("benchmark_snapshot"),
+                "expected the snapshot refusal, got {err:?}"
+            );
+        }
+        let cfg = from_toml_str_with_dev_oracle_opt_in(
+            "[metrics]\nbenchmark_snapshot = true\nbind = \"127.0.0.1:9000\"",
+        )
+        .expect("parses ok");
+        cfg.validate()
+            .expect("a loopback snapshot listener is valid");
     }
 
     // ── 41. ServeMode truth table ─────────────────────────────────────────────

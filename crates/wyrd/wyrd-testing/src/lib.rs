@@ -2,12 +2,12 @@
 
 pub mod bifrost;
 pub mod capacity;
+pub mod experiment;
 pub mod gateway_capture;
 pub mod human_login;
 pub mod interleaving;
 pub mod keys;
 pub mod listener_stall;
-pub mod load;
 pub mod logs;
 pub mod oidc_fixture;
 pub mod principal;

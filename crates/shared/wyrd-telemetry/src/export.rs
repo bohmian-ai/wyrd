@@ -44,7 +44,7 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{
     IdGenerator as _, RandomIdGenerator, Sampler, SdkTracerProvider, ShouldSample, Span, SpanData,
-    SpanProcessor,
+    SpanExporter, SpanProcessor,
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wyrd_spec::DataTenantId;
@@ -234,6 +234,77 @@ impl<P: SpanProcessor> SpanProcessor for OperatorExport<P> {
     }
 
     /// Give the operator's processor the process resource.
+    fn set_resource(&mut self, resource: &Resource) {
+        self.0.set_resource(resource);
+    }
+}
+
+/// Counter of operator export calls that returned an error.
+///
+/// One failed call is one failed batch, not a count of lost spans: the
+/// exporter may have retried it, and spans the processor's full queue drops
+/// never reach an export call. Tenant copies are counted by their own sink.
+pub const TRACE_EXPORT_FAILED_BATCHES_TOTAL: &str = "wyrd_trace_export_failed_batches_total";
+
+/// Wraps the operator's exporter and counts each export call that fails in
+/// [`TRACE_EXPORT_FAILED_BATCHES_TOTAL`].
+///
+/// The result is returned unchanged, and flush, shutdown, and resource
+/// calls go straight to the wrapped exporter.
+#[derive(Debug)]
+pub(crate) struct FailedBatches<E>(
+    /// The operator's exporter, which performs every call.
+    pub(crate) E,
+);
+
+impl<E: SpanExporter> SpanExporter for FailedBatches<E> {
+    /// Export `batch`, counting the call once if it fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped exporter's export failure unchanged.
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        let export = self.0.export(batch);
+        async move {
+            let result = export.await;
+            if result.is_err() {
+                metrics::counter!(TRACE_EXPORT_FAILED_BATCHES_TOTAL).increment(1);
+            }
+            result
+        }
+    }
+
+    /// Shut down the wrapped exporter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped exporter's shutdown failure.
+    fn shutdown(&mut self) -> OTelSdkResult {
+        self.0.shutdown()
+    }
+
+    /// Shut down the wrapped exporter within `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped exporter's shutdown failure.
+    fn shutdown_with_timeout(&mut self, timeout: Duration) -> OTelSdkResult {
+        self.0.shutdown_with_timeout(timeout)
+    }
+
+    /// Flush the wrapped exporter.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped exporter's flush failure.
+    fn force_flush(&mut self) -> OTelSdkResult {
+        self.0.force_flush()
+    }
+
+    /// Give the wrapped exporter the process resource.
     fn set_resource(&mut self, resource: &Resource) {
         self.0.set_resource(resource);
     }
@@ -502,7 +573,7 @@ impl SpanProcessor for TenantExport {
 /// captures attempts as their own rows, so nothing below an attempt is
 /// copied either), `bifrost.gate.*`,
 /// `bifrost.oracle.query`, and the OTLP ingest spans.
-fn in_catalog(name: &str) -> bool {
+pub(crate) fn in_catalog(name: &str) -> bool {
     matches!(
         name,
         "request"

@@ -2965,9 +2965,11 @@ mod tests {
             "cards:read".to_owned(),
             wyrd_spec::vala::api::AuditOutcome::Allowed,
         );
-        let rows =
-            crate::tables::audit::projection::project_audit_event(&event, chrono::Utc::now())
-                .expect("valid projection");
+        let rows = crate::tables::staged::StagedRow::project(&[
+            crate::tables::audit::projection::stage_audit_event(&event, chrono::Utc::now())
+                .expect("valid projection"),
+        ])
+        .expect("one row builds");
 
         let decoded = decode(
             ipc_payload(&rows),
@@ -3034,9 +3036,11 @@ mod tests {
             "cards:read".to_owned(),
             wyrd_spec::vala::api::AuditOutcome::Allowed,
         );
-        let projected =
-            crate::tables::audit::projection::project_audit_event(&event, chrono::Utc::now())
-                .expect("valid projection");
+        let projected = crate::tables::staged::StagedRow::project(&[
+            crate::tables::audit::projection::stage_audit_event(&event, chrono::Utc::now())
+                .expect("valid projection"),
+        ])
+        .expect("one row builds");
         let uid = || CardUid::new(Uuid::now_v7().to_string()).expect("card uid");
         let (subject, checkout, billing) = (uid(), uid(), uid());
         // Two rows, each naming its own workload and subject; every other

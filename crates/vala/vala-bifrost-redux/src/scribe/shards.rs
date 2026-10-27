@@ -8573,6 +8573,7 @@ mod tests {
             .read(
                 &(key.partition.time()..=key.partition.time()),
                 &crate::scribe::tail_rpc::tests::named_fields(["value"]),
+                None,
             )
             .expect("projected read");
         drop(active);
@@ -8658,6 +8659,7 @@ mod tests {
             .read(
                 &(key.partition.time()..=key.partition.time()),
                 &crate::scribe::tail_rpc::tests::named_fields(["value"]),
+                None,
             )
             .expect("projected read");
         let frozen = memtable.freeze(&key).expect("owner freeze");

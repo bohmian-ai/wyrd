@@ -8,12 +8,18 @@
 //! It never executes, publishes, or settles work; that is the runtime's job.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use chrono::Utc;
 
 use serde_json::Value;
 use sqlx::Error as SqlxError;
 use uuid::Uuid;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_runtime::{AcceptedAuthority, PermissionSet};
+use wyrd_server::AppState;
+use wyrd_server::scribe_outbox::{ScribeOutbox, ScribeWrite};
+use wyrd_server::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerifierSpec};
@@ -71,6 +77,9 @@ pub struct VerificationFixture {
     /// Wyrd Postgres owner; every statement runs in a tenant transaction it
     /// opens.
     postgres: WyrdPostgres,
+    /// The server's Scribe outbox, which stages each submission's input
+    /// record.
+    outbox: Arc<ScribeOutbox>,
     /// The tenant under test.
     tenant: DataTenantId,
     /// The tenant's SYSTEM writer, whose ID Scribe stamps on every published
@@ -84,15 +93,16 @@ impl VerificationFixture {
     /// Provision `tenant` for verification: built-in roles and the SYSTEM
     /// writer every result publication mints its token for.
     ///
-    /// Keeps a clone of `postgres`, the server's Wyrd Postgres owner, and
-    /// opens every later tenant transaction through it.
+    /// Keeps the server `state`'s Wyrd Postgres owner, opening every later
+    /// tenant transaction through it, and its Scribe outbox.
     ///
     /// # Errors
     /// Returns [`VerificationFixtureError`] when provisioning fails.
     pub async fn provision(
-        postgres: &WyrdPostgres,
+        state: &AppState,
         tenant: DataTenantId,
     ) -> Result<Self, VerificationFixtureError> {
+        let postgres = state.postgres.wyrd();
         let mut conn = postgres.tenant_conn(tenant).await?;
         wyrd_auth::seed::seed_builtin_roles_for_tenant(&mut conn, tenant)
             .await
@@ -105,6 +115,7 @@ impl VerificationFixture {
         conn.commit().await?;
         Ok(Self {
             postgres: postgres.clone(),
+            outbox: Arc::clone(state.bifrost.scribe_outbox()),
             tenant,
             system_principal,
             actor: Principal::new(
@@ -559,7 +570,9 @@ impl VerificationFixture {
 
     /// Accept one caller submission of `verifier` about `subject` over
     /// `inputs` into the queue, as the batched writer would once Scribe
-    /// acknowledged its inputs, due at database statement time.
+    /// acknowledged its inputs, due at database statement time. Its input
+    /// record is staged on the server's Scribe outbox first; a runner that
+    /// claims it before the record is visible defers it.
     ///
     /// The submission runs under the fixture actor's authority.
     ///
@@ -588,6 +601,34 @@ impl VerificationFixture {
             None,
         )
         .map_err(|error| VerificationFixtureError::NotEnqueued(error.to_string()))?;
+        let now = Utc::now();
+        let row = ResultPayloadBuilder::new(
+            ResultRun {
+                execution_id: submission.execution_id,
+                run_id: None,
+                verifier_version: "",
+                card_uid: subject,
+                owner_card_uid: None,
+                group_id: None,
+                deployment_environment: None,
+                binding_id: None,
+                trigger: None,
+                window: None,
+            },
+            verifier,
+            now,
+            now,
+        )
+        .inputs(InputRecord::Submitted(&submission))
+        .map_err(|error| VerificationFixtureError::NotEnqueued(error.to_string()))?;
+        self.outbox.stage(
+            self.tenant,
+            ScribeWrite::ExecutionInputs {
+                row,
+                attribution: Attribution::new(self.actor.id, self.actor.id),
+                queued: None,
+            },
+        );
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let outcomes = VerifierExecutionQueue::default()
             .accept_submissions(

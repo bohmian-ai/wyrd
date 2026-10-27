@@ -1008,9 +1008,17 @@ than becoming its children.
 
 Server spans export twice from one tracer provider:
 
-- The operator's configured trace backend receives every server span under
-  the server's own sampler. No client-supplied field, including the inbound
-  sampled flag and `tracestate`, changes what the operator receives.
+- The operator's configured trace backend (`WYRD_OTLP_ENDPOINT`) receives
+  the server spans its own sampler samples: 1% of traces by default, or the
+  validated `WYRD_OTLP_SAMPLE_RATIO` in `[0, 1]`, where `0` exports none and
+  `1` exports all. Without an endpoint nothing is exported to an operator.
+  No client-supplied field, including the inbound sampled flag, trace id,
+  and `tracestate`, changes what the operator receives. The operator's span
+  verbosity is `WYRD_TRACE_FILTER` (default `info`), separate from the log
+  filter `WYRD_LOG`/`RUST_LOG`; neither filter nor the ratio can remove a
+  tenant copy, because catalog spans and events at `info` or above always
+  record. Logs are written whatever the sampling decision, so an error in
+  an unsampled request is still logged inside its request span.
 - A server span whose parent or one of whose links is a sampled client span
   also writes, with its catalog descendants, to the requesting tenant's
   `bifrost.traces.spans` on the process Scribe outbox, with the same trace,
@@ -1032,7 +1040,19 @@ Server spans export twice from one tracer provider:
   attributes (`wyrd.*`, `gen_ai.*`, and HTTP, RPC, and error semantic
   conventions); the tenant id is never a span attribute. The copy is
   non-blocking and never fails the request, and it works with or without an
-  operator endpoint.
+  operator endpoint and at operator ratio `0`.
+
+Operator export uses the stock OpenTelemetry batch processor and its bounded,
+non-blocking queue; a full queue drops spans rather than delaying requests.
+The SDK logs one `BatchSpanProcessor.SpanDroppingStarted` warning at the
+first drop and the exact lifetime `dropped_span_count` at orderly shutdown.
+There is no live dropped-span count; filtering `opentelemetry_sdk` warnings
+or abrupt termination removes these signals. Each export call that fails
+increments `wyrd_trace_export_failed_batches_total`; a failed batch is not a
+count of lost spans. Export failure, stall, or saturation never changes a
+request's result or its tenant copy, whose loss is counted separately by the
+Scribe outbox. Head sampling cannot promise a trace for every failing
+request.
 
 `Bifrost::trace_timeline` (and its Python and TypeScript projections) reads
 one trace's spans from `bifrost.traces.spans`, plus traces linking directly to
@@ -1581,10 +1601,21 @@ capacity used by the runner (default 64). Full capacity leaves pending rows in
 PostgreSQL; no new concurrency option or distributed quota is introduced.
 
 A group item is claimed with `FOR UPDATE SKIP LOCKED`. While holding that
-scheduling-row lock, one bounded Bifrost snapshot query selects the currently
-visible source inputs/results. The same tenant transaction pins/enqueues the
-ordinary execution and deletes its scheduling row. An unchanged snapshot's
-content-identity conflict also consumes the pending row. Retryable runtime,
+scheduling-row lock, one bounded Bifrost query selects the group's settled
+history: the declared source inputs and results with `wyrd_ingested_at`
+before the claimed row's PostgreSQL `due_at`, its exclusive range end. The
+range start is the earliest selected admission time, equal to the end when
+nothing is selected. Each run selects cumulative history of its `group_id`
+and exact source scope through its own cutoff, never a disjoint next
+interval, so later-visible earlier evidence and later results join the next
+run. The same tenant transaction enqueues the ordinary execution, holding
+only the selection's content digest, and deletes its scheduling row; the
+selection itself — range, per-slot authored references, ordered source
+execution IDs and selected result IDs — is the execution's `group` input
+record in Bifrost, staged right after the commit on capacity reserved before
+it. The digest covers binding, group, membership, selected results and
+order, never the cutoff, so an unchanged selection's content-identity
+conflict also consumes the pending row. Retryable runtime,
 capacity, database and query failures retain pending and are traced. Genuine auth
 or owner-activity rejection, including an inactive/retired owner, records one
 terminal errored group execution and consumes pending atomically. Recording
@@ -1602,9 +1633,10 @@ execution. With no new activity, there is no pending row and no further Bifrost
 read for that group. Distinct later snapshots may overlap earlier executions.
 
 Source lists share execution ordering, with null for a missing outcome or an
-absent selected value. A visible result whose execution's input is not visible
-is an input not yet readable: the snapshot pins nothing and the pending row
-remains for retry. More than five minutes past the current due time, by
+absent selected value. A source result admitted after the cutoff is absent
+from that run even when its input was selected. A visible result whose
+execution's input or output is not visible is publication-incomplete: the
+selection records nothing and the pending row remains for retry. More than five minutes past the current due time, by
 PostgreSQL's `statement_timestamp()`, the scheduler instead records one terminal
 `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` group execution through the refusal
 path and consumes the pending row in the same transaction: no accepted
@@ -1619,14 +1651,20 @@ input later refused by the queue can participate. Ordinary source authorization
 and pre-staging pressure refusal still apply.
 
 The pending table contains scheduling metadata only, never source evidence,
-readiness inventories or revision state. Existing execution records hold the
-snapshot digest, pinned values and source identities. Ordinary queue claims and
-retries remain; no additional group crash-recovery protocol exists. Query
+readiness inventories or revision state. The execution row holds the
+selection digest; the Bifrost input record holds the selection, which every
+attempt and read resolves to the same values: source declarations from
+`execution_inputs`, requirement outcomes from the selected results'
+`execution_outputs`, and a group source's own values by resolving its
+selection in turn. Every group execution has its own input record, so another
+group can consume it. Ordinary queue claims and retries remain; no additional
+group crash-recovery protocol exists. Query
 admission/output/deadline bounds apply; failed or incomplete queries defer
 execution without truncated inputs or synthetic source-ceiling verdicts.
 
 Scribe acknowledgement schedules work but is not a query-completeness checkpoint.
-A snapshot uses what is visible when read; a later visibility change alone does
+A selection uses what is visible when read; `wyrd_ingested_at` is an admission
+time, not a completeness watermark, and a later visibility change alone does
 not schedule another execution. A process death between ACK and scheduling commit
 can lose the notification; there is no repair/history scan. Background retries
 can postpone expiration. Retention and outbox loss limit available evidence.
@@ -1652,7 +1690,7 @@ execution; scheduled executions have no `run_id`.
 | `PUT /v1/verification/evidence/local/{sha256}` | Local storage backend only: store one evidence body under the caller's tenant → `204` |
 | `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
 | `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
-| `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and pinned source snapshot |
+| `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and source selection once its input record is visible; a direct execution's completed status once its records are visible |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
@@ -1733,9 +1771,18 @@ A `VerificationResult` carries `execution_id`, optional `run_id`, the exact
 `duration_ms`, `reason`, `provenance`, `tool_calls`), and pinned `evidence`.
 Provenance records code hash and runtime, extraction version, Agent and Prompt
 versions, effective routes, drift baselines and windows, and input digests.
-`bifrost.verification.results` is the canonical analytical result surface and
-`bifrost.verification.execution_inputs` holds pinned input declarations and
-queued activation context.
+`bifrost.verification.results` is the canonical payload-free result summary,
+`bifrost.verification.execution_outputs` holds each result's `requirements`
+and `steps`, and `bifrost.verification.execution_inputs` holds each
+execution's one input record: declarations for direct and submitted work, a
+selector for group and schedule work, and queued activation context. A
+returned `VerificationResult` is assembled from the three by one reader:
+verdict from the summary, breakdown from outputs by result ID, evidence from
+inputs by execution ID (a group's resolved slot lists; an empty map for
+scheduled Drift). PostgreSQL stores no input values; a queued execution's
+selected `result_id` stays authoritative. A direct execution has no queue
+row: its status is read from records whose input origin is `direct`, and is
+`completed` once they are visible. Unknown IDs remain not found.
 
 Every work record names who the work was for (`sub_principal_id`) and who
 performed it (`act_principal_id`). A direct caller A records A/A and a
@@ -1748,8 +1795,8 @@ authority. Wyrd performs model calls, tool calls, input reads, and result
 writes as the tenant SYSTEM executor, recording the subject with SYSTEM as
 actor; SYSTEM is never a subject and authorizes nothing extra. The runtime's
 own reads that prepare an execution never depend on owner credentials. These
-are scheduled Drift observation reads and a group's snapshot of its recorded
-verification inputs and results. They run as the tenant's credentialless,
+are scheduled Drift observation reads and a group's selection of its recorded
+verification inputs, outputs, and results. They run as the tenant's credentialless,
 role-free internal read principal, which holds `bifrost_query:read` only on
 the tables that read needs, with owner and source filters in the statement.
 The owner's activity and authority are checked before such work starts. Gateway spend
@@ -2002,7 +2049,12 @@ group once it ends (see Grouped verification under Verifier).
 For `schedule`, each due occurrence creates one
 execution per active binding over that binding's subject window
 `[previous boundary, due)`, filling each `samples` slot from its own
-`features`. Missed occurrences are skipped, not backfilled. A Trigger never
+`features`. The scheduler freezes the window's observation `record_id`s for
+the subject when it enqueues the occurrence and records them, with the
+window, as the execution's `schedule` input record; every requirement and
+retry reads exactly that population, an empty window is a real empty
+selector, and later observations never change a prepared run. Missed
+occurrences are skipped, not backfilled. A Trigger never
 fires on its own: nothing runs merely because a Trigger Card is declared,
 and one schedule occurrence shared by two subjects creates two subject-scoped
 executions, never one mixed-subject execution.

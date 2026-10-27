@@ -8,14 +8,19 @@
 //! [`VerifierExecutionQueue::schedule_due`] settles it. The queue locks each binding with
 //! `SKIP LOCKED` and dedupes an occurrence's run, so concurrent schedulers on
 //! many processes, duplicate ticks, and a restart mid-pass never create a
-//! second run for one occurrence.
+//! second run for one occurrence. A newly enqueued run's observation
+//! population is frozen by [`DriftEngine::select`] in the same transaction,
+//! and its schedule input record is staged on a Scribe outbox slot reserved
+//! before the transaction, after the commit.
 //!
 //! In a process hosting Verifier blocks a separate group loop hands expired
 //! pending groups off through [`GroupPoller`]: per item it takes one permit
-//! of the shared execution capacity, then in one short transaction claims
-//! the pending row with [`VerifierExecutionQueue::claim_due_group`], pins
-//! and enqueues one snapshot, consumes the row, and commits; the permit is
-//! released at handoff, before any Verifier runs. An inactive owner or a
+//! of the shared execution capacity and one Scribe outbox slot, then in one
+//! short transaction claims the pending row with
+//! [`VerifierExecutionQueue::claim_due_group`], selects and enqueues one
+//! snapshot, consumes the row, and commits; a newly enqueued execution's
+//! selector record is staged on the reserved slot after the commit. The
+//! permit is released at handoff, before any Verifier runs. An inactive owner or a
 //! rejected owner authority is recorded as one terminal errored group
 //! execution in that same transaction, which also consumes the row. A
 //! retryable failure rolls back and ends that tenant's group pass, leaving
@@ -30,16 +35,21 @@ use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::ExecutionId;
+use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::VerificationError;
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::verifier_executions::{
-    DueGroup, EnqueueOutcome, QueueCounts, ScheduleOutcome, ScheduleSkip, ScheduleTick,
-    VerifierExecutionQueue,
+    DueBinding, DueGroup, EnqueueOutcome, ExecutionAuthority, QueueCounts, ScheduleOutcome,
+    ScheduleSkip, ScheduleTick, VerifierExecutionQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
 use super::authority::{AuthorityRefusal, BackgroundAuthority};
-use super::groups::{GroupPollError, GroupPoller};
+use super::drift::DriftEngine;
+use super::groups::{GroupPollError, GroupPoller, Polled};
+use super::inputs::ScheduleSelector;
+use super::results::{InputRecord, ResultPayloadBuilder, ResultPayloadError, ResultRun};
+use crate::scribe_outbox::ScribeWrite;
 
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
@@ -84,6 +94,8 @@ pub struct VerificationScheduler {
     queue: VerifierExecutionQueue,
     /// Resolves the owner/SYSTEM authority each scheduled run is accepted under.
     authority: BackgroundAuthority,
+    /// Freezes each scheduled run's observation population.
+    drift: DriftEngine,
     /// Idle wait between passes.
     poll_interval: Duration,
     /// Pending group handoff, present only where Verifier blocks are hosted.
@@ -91,11 +103,15 @@ pub struct VerificationScheduler {
     /// Test-only crash switch.
     #[cfg(feature = "test-support")]
     crash: Option<CapabilityCrash>,
+    /// Test-only: treat every claimed pending group as overdue.
+    #[cfg(feature = "test-support")]
+    overdue: bool,
 }
 
 impl VerificationScheduler {
     /// Build a scheduler over the Wyrd Postgres owner, the operator pool, the
-    /// queue, and the background authority resolver.
+    /// queue, the background authority resolver, and the Drift engine that
+    /// freezes each scheduled run's population.
     ///
     /// The scheduler carries no clock: every due decision is PostgreSQL's, and
     /// `poll_interval` is only this process's idle wait between passes.
@@ -105,6 +121,7 @@ impl VerificationScheduler {
         operator: OperatorPool,
         queue: VerifierExecutionQueue,
         authority: BackgroundAuthority,
+        drift: DriftEngine,
         poll_interval: Duration,
     ) -> Self {
         Self {
@@ -112,10 +129,13 @@ impl VerificationScheduler {
             operator,
             queue,
             authority,
+            drift,
             poll_interval,
             groups: None,
             #[cfg(feature = "test-support")]
             crash: None,
+            #[cfg(feature = "test-support")]
+            overdue: false,
         }
     }
 
@@ -133,6 +153,18 @@ impl VerificationScheduler {
     #[must_use]
     pub fn with_crash(mut self, crash: CapabilityCrash) -> Self {
         self.crash = Some(crash);
+        self
+    }
+
+    /// Treat every claimed pending group as more than five minutes past due.
+    ///
+    /// A group's due time is also its selection cutoff, so a test cannot age
+    /// a group past the incomplete-snapshot bound without excluding the rows
+    /// it wrote; this reaches that bound's error over current rows.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_overdue_groups(mut self) -> Self {
+        self.overdue = true;
         self
     }
 
@@ -297,6 +329,12 @@ impl VerificationScheduler {
     /// Commit up to [`TICKS_PER_TENANT`] due occurrences of `tenant`, one
     /// transaction each, appending every committed tick to `ticks`.
     ///
+    /// Each occurrence first reserves one Scribe outbox slot; none ends the
+    /// tenant's pass before any claim. A newly enqueued run's population is
+    /// selected inside the transaction and its input record staged on the
+    /// slot after the commit; a failed selection rolls the occurrence back,
+    /// leaving it due, and ends the tenant's pass.
+    ///
     /// Selecting an occurrence's commit is its linearization point. Opening
     /// the transaction and applying the atomic run insert and cursor advance
     /// race `stop`; if `stop` wins, the dropped transaction rolls back and the
@@ -319,6 +357,10 @@ impl VerificationScheduler {
         ticks: &mut Vec<ScheduleTick>,
     ) -> Result<(), SqlError> {
         for _ in 0..TICKS_PER_TENANT {
+            let Ok(slot) = self.drift.reserve() else {
+                tracing::warn!(%tenant, "the Scribe outbox share is full; occurrences stay due");
+                return Ok(());
+            };
             let applied = async {
                 let mut conn = self.postgres.tenant_conn(tenant).await?;
                 let Some(due) = self.queue.claim_due(&mut conn).await? else {
@@ -330,18 +372,40 @@ impl VerificationScheduler {
                     }
                     None => None,
                 };
-                let tick = self.queue.schedule_due(&mut conn, due, authority).await?;
-                Ok(Some((conn, tick)))
+                let prepared = due.clone();
+                let tick = self
+                    .queue
+                    .schedule_due(&mut conn, due, authority.clone())
+                    .await?;
+                let record = match (tick.outcome, prepared.window(), &authority) {
+                    (ScheduleOutcome::Enqueued(id), Some(window), Some(authority)) => {
+                        match self
+                            .selector(tenant, &prepared, *window, id, authority)
+                            .await
+                        {
+                            Ok(record) => Some(record),
+                            Err(error) => {
+                                tracing::warn!(%tenant, binding_id = %prepared.binding_id, %error, "scheduled population selection failed; the occurrence stays due");
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                Ok(Some((conn, tick, record)))
             };
             let applied = tokio::select! {
                 biased;
                 () = stop.cancelled() => return Ok(()),
                 applied = applied => applied?,
             };
-            let Some((conn, tick)) = applied else {
+            let Some((conn, tick, record)) = applied else {
                 return Ok(());
             };
             conn.commit().await?;
+            if let Some(record) = record {
+                slot.stage(tenant, record);
+            }
             metrics::counter!(
                 crate::app::metrics::VERIFICATION_SCHEDULE_TICKS_TOTAL,
                 "outcome" => tick_label(tick.outcome)
@@ -355,12 +419,61 @@ impl VerificationScheduler {
         Ok(())
     }
 
+    /// Freeze the population of `execution`, the run newly enqueued for
+    /// `due`'s `window` under `authority`, as its schedule input record.
+    ///
+    /// # Errors
+    /// Returns the selection read's failure, or the record's encoding
+    /// failure.
+    async fn selector(
+        &self,
+        tenant: DataTenantId,
+        due: &DueBinding,
+        window: DriftWindow,
+        execution: ExecutionId,
+        authority: &ExecutionAuthority,
+    ) -> Result<ScribeWrite, String> {
+        let record_ids = self
+            .drift
+            .select(tenant, authority, &due.card_uid, &window)
+            .await?;
+        let selector = ScheduleSelector { window, record_ids };
+        let now = chrono::Utc::now();
+        let row = ResultPayloadBuilder::new(
+            ResultRun {
+                execution_id: execution,
+                run_id: None,
+                // The inputs row records no Verifier version.
+                verifier_version: "",
+                card_uid: &due.card_uid,
+                owner_card_uid: due.owner().map(|(_, root)| root),
+                group_id: None,
+                deployment_environment: None,
+                binding_id: Some(due.binding_id),
+                trigger: None,
+                window: Some(&window),
+            },
+            &due.verifier_card_uid,
+            now,
+            now,
+        )
+        .inputs(InputRecord::Schedule(&selector))
+        .map_err(|error: ResultPayloadError| error.to_string())?;
+        Ok(ScribeWrite::ExecutionInputs {
+            row,
+            attribution: authority.attribution(),
+            queued: None,
+        })
+    }
+
     /// Hand off up to [`TICKS_PER_TENANT`] expired pending groups of
     /// `tenant`, one transaction each, appending every committed outcome to
     /// `handed`.
     ///
-    /// Each item first takes one permit of the shared execution capacity; no
-    /// permit ends the tenant's pass before any claim or read. The
+    /// Each item first takes one permit of the shared execution capacity and
+    /// reserves one Scribe outbox slot; no permit or slot ends the tenant's
+    /// pass before any claim or read. After the commit, a newly enqueued
+    /// execution's selector record is staged on that slot. The
     /// transaction claims one pending row, decides it through
     /// [`Self::hand_off`], consumes the row, and commits; the connection and
     /// permit are released before any Verifier runs. An item `hand_off`
@@ -385,11 +498,20 @@ impl VerificationScheduler {
             let Ok(_permit) = groups.capacity.try_acquire() else {
                 return Ok(());
             };
+            let Ok(slot) = groups.poller.reserve() else {
+                tracing::warn!(%tenant, "the Scribe outbox share is full; groups stay pending");
+                return Ok(());
+            };
             let started = Instant::now();
             let applied = async {
                 let mut conn = self.postgres.tenant_conn(tenant).await?;
                 let Some(due) = self.queue.claim_due_group(&mut conn).await? else {
                     return Ok::<_, SqlError>(None);
+                };
+                #[cfg(feature = "test-support")]
+                let due = DueGroup {
+                    overdue: due.overdue || self.overdue,
+                    ..due
                 };
                 let Some(handoff) = self.hand_off(groups, &mut conn, &due).await? else {
                     return Ok(None);
@@ -402,11 +524,14 @@ impl VerificationScheduler {
                 () = stop.cancelled() => return Ok(()),
                 applied = applied => applied,
             };
-            let (conn, handoff) = match applied {
+            let (conn, (handoff, record)) = match applied {
                 Ok(Some(applied)) => applied,
                 other => return record_pass("group_handoff", started, other.map(drop)),
             };
             record_pass("group_handoff", started, conn.commit().await)?;
+            if let Some(record) = record {
+                slot.stage(tenant, record);
+            }
             metrics::counter!(
                 crate::app::metrics::VERIFICATION_SCHEDULE_TICKS_TOTAL,
                 "outcome" => group_label(handoff)
@@ -421,7 +546,8 @@ impl VerificationScheduler {
     }
 
     /// Decide the claimed pending group `due` on `conn`, writing its
-    /// execution, or `None` to leave it pending.
+    /// execution and returning a newly enqueued execution's selector record
+    /// to stage after commit, or `None` to leave it pending.
     ///
     /// An active owner's recovered authority pins and enqueues one snapshot
     /// (or finds the identical snapshot's execution), read as the tenant's
@@ -429,7 +555,7 @@ impl VerificationScheduler {
     /// recorded through [`VerifierExecutionQueue::refuse_group`] as one
     /// terminal errored execution, serving the owner's stored principal and
     /// recorded by SYSTEM, as is a snapshot still incomplete (a result
-    /// visible without its input) more than five minutes past due, with
+    /// visible without its input or output) more than five minutes past due, with
     /// `WYRD_VERIFICATION_409_SNAPSHOT_INCOMPLETE` naming the executions.
     /// Everything else is a Wyrd-side blockage that is
     /// traced and leaves the group pending: an owner with no Card-bound
@@ -445,7 +571,7 @@ impl VerificationScheduler {
         groups: &Groups,
         conn: &mut TenantConn<'_>,
         due: &DueGroup,
-    ) -> Result<Option<GroupHandoff>, SqlError> {
+    ) -> Result<Option<(GroupHandoff, Option<ScribeWrite>)>, SqlError> {
         let pending = |label: &'static str, reason: &dyn std::fmt::Display| {
             metrics::counter!(
                 crate::app::metrics::VERIFICATION_GROUP_HANDOFFS_BLOCKED_TOTAL,
@@ -502,11 +628,20 @@ impl VerificationScheduler {
                 .poll(conn, &self.queue, due, &authority, system)
                 .await
             {
-                Ok(EnqueueOutcome::Enqueued(id)) => return Ok(Some(GroupHandoff::Enqueued(id))),
-                Ok(EnqueueOutcome::AlreadyEnqueued(id)) => {
-                    return Ok(Some(GroupHandoff::AlreadyEnqueued(id)));
+                Ok(Polled {
+                    outcome: EnqueueOutcome::Enqueued(id),
+                    record,
+                }) => return Ok(Some((GroupHandoff::Enqueued(id), record))),
+                Ok(Polled {
+                    outcome: EnqueueOutcome::AlreadyEnqueued(id),
+                    ..
+                }) => {
+                    return Ok(Some((GroupHandoff::AlreadyEnqueued(id), None)));
                 }
-                Ok(EnqueueOutcome::Refused(refusal)) => {
+                Ok(Polled {
+                    outcome: EnqueueOutcome::Refused(refusal),
+                    ..
+                }) => {
                     return Ok(pending("enqueue_refused", &format!("{refusal:?}")));
                 }
                 Err(GroupPollError::Sql(error)) => return Err(SqlError::from(error)),
@@ -514,8 +649,8 @@ impl VerificationScheduler {
                     let ids: Vec<_> = executions.iter().map(ToString::to_string).collect();
                     break 'refusal WyrdError::VerificationSnapshotIncomplete {
                         message: format!(
-                            "group snapshot still saw results without their inputs more than \
-                             five minutes past due for executions {}",
+                            "group snapshot still saw results without their inputs or outputs \
+                             more than five minutes past due for executions {}",
                             ids.join(", ")
                         ),
                         details: serde_json::json!({ "execution_ids": executions }),
@@ -548,7 +683,7 @@ impl VerificationScheduler {
             reason = %refusal,
             "group refused; recorded a terminal errored execution"
         );
-        Ok(Some(GroupHandoff::Errored(execution)))
+        Ok(Some((GroupHandoff::Errored(execution), None)))
     }
 
     /// Publish the cross-tenant queue depth gauges.

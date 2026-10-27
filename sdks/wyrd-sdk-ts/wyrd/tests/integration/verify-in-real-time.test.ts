@@ -178,7 +178,7 @@ function spanOf(call: z.infer<typeof JudgeCall>, spans: Awaited<ReturnType<typeo
   return spans.find((span) => span.attributes.gateway_call_id === call.call_id);
 }
 
-test("agent answer passes its verifier", async ({ state }) => {
+test("agent answer passes its verifier", async ({ server, state }) => {
   const run = state.run("agent");
 
   const result = await run.observe.verify("answer-check", { answer: "yes" });
@@ -188,6 +188,9 @@ test("agent answer passes its verifier", async ({ state }) => {
   expect(result.subject).toEqual(state.cardRef("agent"));
   expect(result.run_id).toBe(run.runId);
   expect(result.outcome.requirements.map((each) => [each.id, each.outcome])).toEqual([["says-yes", "passed"]]);
+  server.flushBifrost();
+  const resumed = await (await verify.Execution.connect(result.execution_id)).wait({ timeoutMs: WAIT_MS });
+  expect(resumed, "the direct execution reads back by its ID").toEqual(result);
 });
 
 test("agent answer fails its verifier", async ({ state }) => {

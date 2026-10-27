@@ -772,18 +772,32 @@ engine mechanics. Permissions are blocking; audits are non-blocking. Every
 audited surface stages its decision in memory on the one process Scribe outbox
 once the decision is known, outside the operation's transaction, and never
 waits for the write. The outbox admits a finite process capacity, by writes
-(`scribe.outbox_capacity`, default 65,536) and by accounted bytes
+(`scribe.outbox_capacity`, default 1,048,576, so bytes normally bind) and by accounted bytes
 (`scribe.outbox_bytes`, default 1 GiB, counting at least every captured
-payload and object a write holds), covering queued, waiting, retrying, and
-in-flight writes. An audit decision or gateway capture staged past its share
+payload and object a write holds and the Arrow memory its staged rows own,
+with an immutable column every write shares resident once for the process),
+covering queued, waiting, retrying, and in-flight writes. An audit decision or gateway capture staged past its share
 of either is shed, not queued: it is counted in
 `outbox_events_lost_total{outbox="scribe",reason="shed"}` and logged at most
 once per tenant per second with the count shed, and the operation is neither
 refused nor delayed. Its one background writer spreads each tenant's writes
-over a few lanes, keeping one request's decisions and capture in one lane and
-all Verifier evidence in one lane, groups each lane's slice by destination, encodes Arrow frames with
-content-derived batch ids, and submits them to the local Scribe or over the
-mutually authenticated peer plane to a Scribe pod. A retryable failure is
+over a few producer lanes, keeping one request's decisions and capture in one
+lane and one Verifier execution's inputs and result in one lane, so an
+execution's inputs commit no later than its result while different requests
+and executions are written concurrently; queued submissions sharing an
+idempotency key share a lane, so they are acknowledged in arrival order. As a
+Kafka producer lingers, a lane's slice waits until its oldest write is 50 ms old
+or it holds 4,096 writes before it is submitted, so writes staged one per
+request share one Scribe commit; producers never wait for it. It groups each lane's slice by
+destination, builds each group's server-projected rows once, encodes Arrow
+frames with content-derived batch ids, and submits them to the local Scribe or
+over the mutually authenticated peer plane to a Scribe pod. Only the local
+Scribe takes those rows in-process as server-built canonical batches, whose
+values are not revalidated; the trust follows from the in-process call, never
+from a flag a caller can set. Peer and native Arrow IPC is a trust boundary
+and is validated in full, and both paths keep tenant, schema, reserved-column,
+managed-envelope, and admission checks. Producer lanes are not Scribe shards: Scribe routes each admitted
+frame to its own shard and durability owner whichever lane submitted it. A retryable failure is
 logged with its tenant, counted in `outbox_write_failures_total{outbox="scribe"}`,
 and resubmitted as the identical slice, which Scribe's durable batch-id fence
 absorbs when the earlier acknowledgement was lost. A terminal rejection is

@@ -359,9 +359,27 @@ pub(crate) fn test_prometheus_handle() -> PrometheusHandle {
         .clone()
 }
 
+/// The metrics listener's read-only benchmark timing snapshot route.
+pub const BENCHMARK_TIMINGS_PATH: &str = "/benchmark/timings";
+
 /// Build the metrics router: `GET /metrics` renders the Prometheus snapshot.
-pub fn metrics_router(handle: PrometheusHandle) -> Router {
-    Router::new().route("/metrics", get(move || ready(handle.render())))
+///
+/// With `benchmark_snapshot`, which configuration allows only on a loopback
+/// listener, this process starts recording benchmark timing histograms and
+/// `GET` [`BENCHMARK_TIMINGS_PATH`] returns their cumulative
+/// [`wyrd_telemetry::timing::TimingSnapshot`] as JSON: bounded aggregate
+/// distributions and counters only, with no request identity, tenant,
+/// payload, query, or reset. The Prometheus recorder is untouched.
+pub fn metrics_router(handle: PrometheusHandle, benchmark_snapshot: bool) -> Router {
+    let router = Router::new().route("/metrics", get(move || ready(handle.render())));
+    if !benchmark_snapshot {
+        return router;
+    }
+    wyrd_telemetry::timing::enable();
+    router.route(
+        BENCHMARK_TIMINGS_PATH,
+        get(|| ready(axum::Json(wyrd_telemetry::timing::snapshot()))),
+    )
 }
 
 /// Serve the metrics router on an already-bound `listener` until `shutdown`.
@@ -491,7 +509,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_router_serves_metrics() {
         let handle = get_handle();
-        let router = metrics_router(handle.clone());
+        let router = metrics_router(handle.clone(), false);
 
         let response = router
             .oneshot(
@@ -515,6 +533,194 @@ mod tests {
         assert!(
             text.is_empty() || text.contains('#'),
             "body must be empty or valid Prometheus text format: {text:?}"
+        );
+    }
+
+    /// Fetches `path` with `method` from `router`, returning the status and
+    /// body text.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request cannot build, the router does not respond, or
+    /// the body is not collected UTF-8.
+    async fn fetch(router: &Router, method: &str, path: &str) -> (StatusCode, String) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("metrics router responds");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body collects");
+        (
+            status,
+            String::from_utf8(body.to_vec()).expect("UTF-8 body"),
+        )
+    }
+
+    /// The snapshot route of an enabled router, parsed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the route does not answer 200 with a `TimingSnapshot`.
+    async fn timings(router: &Router) -> wyrd_telemetry::timing::TimingSnapshot {
+        let (status, body) = fetch(router, "GET", BENCHMARK_TIMINGS_PATH).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_str(&body).expect("the snapshot is a TimingSnapshot")
+    }
+
+    /// The server's boundary timings reach the snapshot as separate
+    /// elapsed, excluded, and residual populations: the residual is
+    /// computed within each request (overlapping waits already unioned by
+    /// the owner, zero wait kept), the streaming head and final frame stay
+    /// distinct series, and an excluded wait beyond the elapsed time is a
+    /// reported problem, never a zero residual.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a population, residual, or problem is wrong.
+    #[tokio::test]
+    async fn benchmark_timings_preserve_server_boundaries() {
+        use std::time::Duration;
+        let router = metrics_router(get_handle().clone(), true);
+        let before = timings(&router).await;
+        let record = |boundary, elapsed: u64, excluded: Option<u64>| {
+            wyrd_telemetry::record_timing(
+                &tracing::Span::none(),
+                boundary,
+                "success",
+                Duration::from_nanos(elapsed),
+                excluded.map(Duration::from_nanos),
+            );
+        };
+        record("verification.direct", 900_000, Some(600_000));
+        record("verification.direct", 300_000, Some(0));
+        record("gateway.stream.head", 120_000_000, Some(100_000_000));
+        record("gateway.stream.end", 450_000_000, Some(430_000_000));
+        record("gateway.buffered", 1_000, Some(1_001));
+        record("bifrost.query", 2_000_000, None);
+        let interval = timings(&router)
+            .await
+            .since(&before)
+            .expect("one process, no reset");
+        let series = |boundary: &str| {
+            interval
+                .series
+                .iter()
+                .find(|series| series.boundary == boundary)
+                .unwrap_or_else(|| panic!("no {boundary} series"))
+        };
+        let verification = series("verification.direct");
+        assert!(
+            verification.problems().is_empty(),
+            "{:?}",
+            verification.problems()
+        );
+        let residual = verification.residual.as_ref().expect("residual population");
+        let low = residual.quantile(0.0).expect("residuals");
+        let high = residual.maximum().expect("residuals");
+        assert!(
+            low.lowest <= 300_000 && 300_000 <= low.highest,
+            "zero wait keeps the elapsed time"
+        );
+        assert!(
+            high.lowest <= 300_000 && 300_000 <= high.highest,
+            "900 µs less 600 µs"
+        );
+        assert_eq!(
+            verification
+                .excluded
+                .as_ref()
+                .map(wyrd_telemetry::timing::Distribution::len),
+            Some(2)
+        );
+        let head = series("gateway.stream.head")
+            .residual
+            .clone()
+            .expect("head residual");
+        let end = series("gateway.stream.end")
+            .residual
+            .clone()
+            .expect("end residual");
+        let head = head.maximum().expect("head");
+        let end = end.maximum().expect("end");
+        assert!(head.lowest <= 20_000_000 && 20_000_000 <= head.highest);
+        assert!(end.lowest <= 20_000_000 && 20_000_000 <= end.highest);
+        let negative = series("gateway.buffered").problems().join("; ");
+        assert!(
+            negative.contains("1 excluded waits exceeding elapsed time"),
+            "{negative}"
+        );
+        assert!(
+            negative.contains("0 residual observations for 1 requests"),
+            "{negative}"
+        );
+        let query = series("bifrost.query");
+        assert!(query.excluded.is_none() && query.residual.is_none());
+        assert!(query.problems().is_empty());
+    }
+
+    /// The benchmark snapshot is absent from an ordinary metrics router;
+    /// when enabled it is a GET-only, reset-free, cumulative readout of
+    /// bounded aggregates from one process identity, carrying no request
+    /// identity or payload, while `/metrics` still renders the recorder.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the route exists unrequested, accepts a mutation, resets,
+    /// leaks an identity, or replaces the Prometheus output.
+    #[tokio::test]
+    async fn benchmark_snapshots_are_local_read_only_and_opt_in() {
+        let handle = get_handle();
+        let ordinary = metrics_router(handle.clone(), false);
+        assert_eq!(
+            fetch(&ordinary, "GET", BENCHMARK_TIMINGS_PATH).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let router = metrics_router(handle.clone(), true);
+        let secret = "tenant-7f3a-trace-4bf92f3577b34da6a3ce929d0e0e4736";
+        let span = tracing::info_span!("request", tenant = secret);
+        wyrd_telemetry::record_timing(
+            &span,
+            "bifrost.gate.write",
+            "success",
+            std::time::Duration::from_micros(250),
+            None,
+        );
+        let first = timings(&router).await;
+        for method in ["POST", "PUT", "DELETE"] {
+            assert_eq!(
+                fetch(&router, method, BENCHMARK_TIMINGS_PATH).await.0,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} must not reach the readout"
+            );
+        }
+        let (status, reset) = fetch(&router, "GET", "/benchmark/timings?reset=true").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !reset.contains(secret),
+            "no request identity in the readout"
+        );
+        let second = timings(&router).await;
+        assert_eq!(second.process, first.process);
+        assert!(second.taken_ns >= first.taken_ns);
+        let interval = second.since(&first).expect("a query string resets nothing");
+        assert!(interval.series.is_empty(), "repeated reads record nothing");
+        assert!(second.series.len() <= wyrd_telemetry::timing::MAX_SERIES);
+        assert_eq!(second.method, wyrd_telemetry::timing::Method::current());
+        metrics::counter!(HTTP_REQUESTS_TOTAL).increment(1);
+        let (status, text) = fetch(&router, "GET", "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            text.contains(HTTP_REQUESTS_TOTAL),
+            "the recorder still renders"
         );
     }
 

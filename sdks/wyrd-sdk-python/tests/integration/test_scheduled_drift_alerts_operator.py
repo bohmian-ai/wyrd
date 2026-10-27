@@ -16,10 +16,12 @@ from collections.abc import Iterable
 from typing import Any, cast
 
 import pytest
+from pydantic import BaseModel
 from wyrd import WyrdError, verify
+from wyrd.bifrost import Bifrost
 from wyrd.cards import Cards
 
-from .support import FIXTURES, ON_CALL_TOKEN, Watch, scheduled_result
+from .support import FIXTURES, ON_CALL_TOKEN, Watch, client_of, scheduled_result
 
 pytestmark = pytest.mark.integration
 
@@ -31,6 +33,12 @@ QUIET_SECONDS = 5.0
 
 HOOK = "/hooks/latency-shift"
 """The path the Operator posts to on the connection's origin."""
+
+
+class Origin(BaseModel):
+    """One ``bifrost.verification.execution_inputs`` row's origin."""
+
+    origin: str
 
 
 def submit(watch: Watch, latencies: Iterable[int]) -> None:
@@ -86,6 +94,14 @@ def test_passing_window_alerts_no_one(latency_watch: Watch) -> None:
     result = scheduled_result(latency_watch.server, latency_watch.binding_id, WAIT_SECONDS)
 
     assert result.verdict == "passed"
+    [requirement] = result.requirements
+    assert requirement["detail"]["drift"]["features"]["latency"]["score"] is not None
+    records = Bifrost(client=client_of(latency_watch.server)).sql(
+        "SELECT origin FROM bifrost.verification.execution_inputs WHERE execution_id = $1",
+        [result.execution_id],
+        model=Origin,
+    )
+    assert [record.origin for record in records] == ["schedule"]
     assert_quiet(latency_watch)
 
 

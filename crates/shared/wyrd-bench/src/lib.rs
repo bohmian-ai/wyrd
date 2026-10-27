@@ -1,10 +1,9 @@
-//! Shared infrastructure for SLO-gated Criterion benches.
+//! Shared infrastructure for Wyrd Criterion benches.
 
 pub mod cluster;
 pub mod lane;
 pub mod recorder;
 pub mod report;
-pub mod slo;
 pub mod workload;
 
 pub use cluster::{
@@ -23,7 +22,6 @@ pub use report::{
     ScribeCompactCase, ScribeComponentReport, ScribeDistribution, compact_scribe_matrix,
     required_scribe_components, select_compact_scribe_cases,
 };
-pub use slo::{SloError, SloGate, SloMeasurement, SloResult, SloThreshold};
 pub use workload::{
     FaultPoint, SchemaWidth, TrafficShape, WorkloadCase, WorkloadError, WorkloadSpec,
 };

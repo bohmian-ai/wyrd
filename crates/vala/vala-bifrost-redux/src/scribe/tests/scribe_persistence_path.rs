@@ -295,7 +295,10 @@ fn assert_managed_columns_are_table_owned(stored: &[RecordBatch]) {
 /// same rows are submitted once as one canonical batch and once split across
 /// two record batches of one Arrow IPC stream, and the stream must behave as
 /// one request: one batch id, and one disjoint contiguous ordinal range over
-/// the whole stream rather than a range that restarts per record batch.
+/// the whole stream rather than a range that restarts per record batch. The
+/// dense row-attributed audit rows the server's Scribe outbox delivers in
+/// process take the same path as their peer-plane stream, which is still
+/// validated in full.
 ///
 /// # Panics
 ///
@@ -383,6 +386,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     let stored = live_rows(
         &scribe,
         &FetchLiveTailRequest {
+            pruning: None,
             binding,
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
@@ -407,10 +411,180 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
         total_rows,
     );
     assert_managed_columns_are_table_owned(&stored);
+    assert_producer_rows_share_the_wal_path(&scribe, tenant).await;
 
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .await;
+}
+
+/// Assert the dense row-attributed audit rows the server's Scribe outbox
+/// builds take the same managed WAL path in both payload modes: one dense
+/// canonical batch and the same rows as a two-batch Arrow IPC stream are each
+/// accepted whole and read back as identical decisions, while an IPC stream
+/// whose Variant detail bytes are corrupt is still refused by the full
+/// receiver-side validation.
+///
+/// # Panics
+///
+/// Panics when a frame's admission differs, a decision is not stored once
+/// per payload mode, or the corrupt stream is accepted.
+async fn assert_producer_rows_share_the_wal_path(scribe: &ScribeImpl, tenant: DataTenantId) {
+    use arrow::array::{BinaryArray, StructArray};
+    use arrow::util::display::array_value_to_string;
+
+    let definition =
+        crate::tables::builtin_table("system", "audit_log").expect("audit_log is built in");
+    let table = TableRef::new(BifrostNamespace::Audit, "audit_log");
+    let decided_at = chrono::Utc::now();
+    let decision = |operation: &str, detail| {
+        let mut event = wyrd_spec::vala::api::AuditEvent::new(
+            RequestId::now_v7(),
+            None,
+            operation.to_owned(),
+            "cards".to_owned(),
+            None,
+            wyrd_spec::auth::Attribution::new(
+                PrincipalId::new(Uuid::now_v7()),
+                PrincipalId::new(Uuid::now_v7()),
+            ),
+            wyrd_spec::auth::PrincipalKindTag::User,
+            "cards:read".to_owned(),
+            wyrd_spec::vala::api::AuditOutcome::Allowed,
+        );
+        event.detail = detail;
+        crate::tables::audit::projection::stage_audit_event(&event, decided_at)
+            .expect("the decision stages")
+    };
+    let rows = crate::tables::staged::StagedRow::project(&[
+        decision(
+            "cards.read",
+            Some(wyrd_spec::vala::AuditDetail::OracleAdmissionRecovery {
+                expired_lease_count: 1,
+                active_lease_count: 2,
+                interactive_slots: 3,
+                analytical_slots: 4,
+                total_slots: 7,
+            }),
+        ),
+        decision("cartes.lire \u{e9}", None),
+        decision("", None),
+    ])
+    .expect("the decisions build densely");
+    let fingerprint =
+        crate::schema::fingerprint::SchemaFingerprint((definition.schema_fingerprint)());
+    let frame = |payload: IngressPayload, wire: usize| ScribeIngressFrame {
+        attributed_cards: None,
+        dimensions: None,
+        workload: None,
+        attribution: crate::contracts::StampedAttribution::Rows,
+        authenticated_tenant: tenant,
+        principal: principal(tenant),
+        table: table.clone(),
+        expected_schema_fingerprint: Some(fingerprint),
+        table_version: None,
+        request_id: RequestId::now_v7(),
+        batch_id: Uuid::now_v7(),
+        measured_wire_bytes: wire,
+        payload,
+    };
+
+    let stream = ipc_stream(&[rows.slice(0, 1), rows.slice(1, rows.num_rows() - 1)]);
+    for payload in [
+        IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+            rows.clone(),
+        ])),
+        IngressPayload::ArrowIpc(bytes::Bytes::from(stream.clone())),
+    ] {
+        let admission = Scribe::ingest_frame(scribe, frame(payload, stream.len()))
+            .await
+            .expect("the producer rows reach the managed WAL path");
+        assert_eq!(
+            admission.rows_accepted,
+            u64::try_from(rows.num_rows()).expect("row count")
+        );
+    }
+
+    let detail = rows.schema().index_of("detail").expect("detail column");
+    let corrupt = RecordBatch::try_new(
+        rows.schema(),
+        rows.columns()
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                if index != detail {
+                    return Arc::clone(column);
+                }
+                let invalid = || {
+                    Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                        [0xff_u8].as_slice(),
+                        rows.num_rows(),
+                    ))) as ArrayRef
+                };
+                let DataType::Struct(children) = wyrd_types::variant::variant_storage_type() else {
+                    panic!("Variant storage is a struct");
+                };
+                Arc::new(StructArray::new(children, vec![invalid(), invalid()], None)) as ArrayRef
+            })
+            .collect(),
+    )
+    .expect("the corrupt batch assembles");
+    let corrupt = ipc_stream(&[corrupt]);
+    let refused = Scribe::ingest_frame(
+        scribe,
+        frame(
+            IngressPayload::ArrowIpc(bytes::Bytes::from(corrupt.clone())),
+            corrupt.len(),
+        ),
+    )
+    .await
+    .expect_err("a peer stream with corrupt Variant bytes is refused");
+    assert!(
+        !matches!(refused, ScribeError::IngestBusy { .. }),
+        "the refusal is a validation failure: {refused:?}"
+    );
+
+    let day = crate::catalog::TimeGranularity::Day
+        .bucket(decided_at)
+        .expect("the decision instant buckets into a day");
+    let fields = ["operation", "detail", "wyrd_request_id", "sub_principal_id"];
+    let stored = live_rows(
+        scribe,
+        &FetchLiveTailRequest {
+            pruning: None,
+            binding: TenantTableBinding::resolve((tenant, table)).expect("binding"),
+            target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
+            start_partition: day,
+            end_partition: day,
+            required_fields: crate::scribe::tail_rpc::tests::named_fields(fields),
+            query_id: Uuid::new_v4(),
+            capture_id: Uuid::nil(),
+        },
+        "audit snapshot",
+    )
+    .await;
+    let render = |batch: &RecordBatch, row: usize| {
+        fields
+            .iter()
+            .map(|name| {
+                let column = batch.column_by_name(name).expect("the column is stored");
+                array_value_to_string(column, row).expect("the value renders")
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut read = stored
+        .iter()
+        .flat_map(|batch| (0..batch.num_rows()).map(move |row| render(batch, row)))
+        .collect::<Vec<_>>();
+    read.sort();
+    let mut expected = (0..rows.num_rows())
+        .flat_map(|row| [render(&rows, row), render(&rows, row)])
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(
+        read, expected,
+        "each payload mode stores every decision once"
+    );
 }
 
 #[tokio::test]
@@ -490,6 +664,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let stream = StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1));
     let (start_partition, end_partition) = receipt_hours(since, chrono::Duration::zero());
     let request = FetchLiveTailRequest {
+        pruning: None,
         binding,
         target_stream: stream,
         start_partition,
@@ -612,6 +787,7 @@ fn value_read(
     stream: StreamIdentity,
 ) -> FetchLiveTailRequest {
     FetchLiveTailRequest {
+        pruning: None,
         binding: TenantTableBinding::resolve((tenant, table.clone())).expect("tail binding"),
         target_stream: stream,
         start_partition,

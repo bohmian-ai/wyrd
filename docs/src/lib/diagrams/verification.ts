@@ -42,7 +42,7 @@ export const verificationPaths: SequenceSpec = {
           to: 'bif',
           kind: 'best',
           label: 'inputs + result rows',
-          say: 'Before replying, the server stages the pinned inputs and the result on the Scribe outbox; Scribe writes them to <code>vala.verification.results</code> afterward. No work is queued.'
+          say: 'Before replying, the server stages the pinned inputs and the result on the Scribe outbox; Scribe writes them to <code>vala.verification.execution_inputs</code> and <code>vala.verification.results</code> afterward. No work is queued.'
         }
       ]
     },

@@ -1,29 +1,27 @@
-//! `bifrost.verification.results` — one row per produced Verifier result payload.
+//! `bifrost.verification.results` — one row per produced Verifier result.
 //!
-//! Owns the canonical result schema, its sensitive `outcome` Variant, and the
-//! Bloom columns a result lookup by id, execution, Verifier, or binding prunes
-//! on.
+//! Owns the canonical payload-free result summary and the Bloom columns a
+//! result lookup by id, execution, Verifier, or binding prunes on.
 
 use arrow::datatypes::Field;
 
-use wyrd_types::variant::variant_field;
-
 use crate::tables::fields::{ts_us_utc, utf8};
-use crate::tables::{
-    DomainTable, PayloadClass, attributed_layout, daily_layout, with_shared_dimensions,
-};
+use crate::tables::{DomainTable, attributed_layout, daily_layout, with_shared_dimensions};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
-/// `bifrost.verification.results` — one row per produced Verifier result payload.
+/// `bifrost.verification.results` — one row per produced Verifier result.
 ///
 /// Every Verifier writes this one surface whatever its checks, so a dashboard
-/// reads one result contract. Each payload carries its own `result_id`, and
+/// reads one result contract. Each result carries its own `result_id`, and
 /// `execution_id` correlates it with its execution. A queued result is staged
 /// before its execution completes, so an execution that is later abandoned or
 /// recovered can leave a row that is not its outcome; the queue's selected
 /// `result_id` on the completed execution is authoritative.
-/// [`OUTCOME`] holds the typed `VerificationOutcome` — verdict, requirement
-/// breakdown, step results, and original evidence identities — as one Variant.
+/// The row is a payload-free summary: the verdict, status, timing, and
+/// identities. The result's `requirements` and `steps` live in
+/// `bifrost.verification.execution_outputs` under the same `result_id`, and
+/// its evidence in `bifrost.verification.execution_inputs` under its
+/// `execution_id`.
 /// `execution_id` is the Verifier execution; the managed `run_id` is the
 /// application Run judged, null when there is none, as for scheduled drift;
 /// the managed `subject_card_uid` is the Card verified. The Verifier Card is
@@ -38,21 +36,11 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// execution served and who executed it.
 pub struct ResultsTable;
 
-/// Variant column holding the result's typed `VerificationOutcome`.
-///
-/// The outcome carries open actual values, step outputs, and citations, so it
-/// is stored as one Variant and classified sensitive.
-pub const OUTCOME: &str = "outcome";
-
 impl DomainTable for ResultsTable {
     /// Lives in `bifrost.verification`, the namespace the catalog registers it under.
     const NAMESPACE: &'static str = "verification";
     /// Table segment of the fixed `bifrost.verification.results` FQN.
     const NAME: &'static str = "results";
-    /// The outcome makes projecting this table require the elevated payload permission.
-    const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
-    /// The outcome column gated behind the elevated payload permission.
-    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[OUTCOME];
 
     /// Authored columns in order; managed correlation and system columns are appended by the catalog.
     fn arrow_fields() -> Vec<Field> {
@@ -70,7 +58,6 @@ impl DomainTable for ResultsTable {
             ts_us_utc("window_end", true),
             ts_us_utc("started_at", false),
             ts_us_utc("ended_at", false),
-            variant_field(OUTCOME, false),
         ])
     }
 

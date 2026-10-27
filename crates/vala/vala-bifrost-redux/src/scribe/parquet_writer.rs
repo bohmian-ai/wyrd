@@ -5,14 +5,16 @@
 //! authenticated tenant in its footer rather than in any column, and takes its
 //! partition day from the seal-key (never from row min/max).
 
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::array::Array;
 use arrow::compute::SortColumn;
-use arrow::compute::concat_batches;
+use arrow::compute::SortOptions;
+use arrow::compute::concat;
+use arrow::compute::interleave_record_batch;
 use arrow::compute::lexsort_to_indices;
-use arrow::compute::take;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use iceberg::writer::file_writer::variant_shredding::VariantLayout;
@@ -379,12 +381,49 @@ impl<'a> ParquetBatchEncoder<'a> {
         })
     }
 
-    /// Validates physical identity and builds the sorted candidate batch.
+    /// Returns the decoded bytes `candidate`'s gathered output holds.
+    ///
+    /// The gather writes every column densely, so its size is each stored
+    /// column's slice size, which the memtable recorded per batch on append.
+    /// Summing those numbers avoids walking every small stored batch's Arrow
+    /// buffers on the persistence lane. A batch without a recorded size, as
+    /// in a hand-built test generation, falls back to measuring the
+    /// allocations the candidate's batches retain.
+    fn output_bytes(&self, candidate: FileCandidate) -> usize {
+        self.frozen
+            .statistics
+            .get(candidate.start..candidate.end)
+            .and_then(|statistics| {
+                statistics
+                    .iter()
+                    .flat_map(|batch| &batch.column_statistics)
+                    .map(|column| column.byte_size.get_value().copied())
+                    .try_fold(0_usize, |total, bytes| Some(total.saturating_add(bytes?)))
+            })
+            .unwrap_or_else(|| {
+                crate::scribe::memory::unshared_arrow_bytes(
+                    &self.frozen.batches[candidate.start..candidate.end],
+                    &[],
+                )
+            })
+    }
+
+    /// Validates physical identity and gathers the candidate's rows in sort order.
+    ///
+    /// Only the sort-key columns are concatenated across the candidate's
+    /// stored batches; their order maps back to each row's source batch and
+    /// position, and every payload column is gathered once, straight into the
+    /// sorted output. While the keys, positions, and output are built they
+    /// hold one persistence lease sized to all three, so a candidate that
+    /// cannot fit is refused before anything is allocated. The output is
+    /// charged again, exactly, while it is written.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when identity, concatenation, or
-    /// sort-key validation fails.
+    /// Returns [`ScribeError::Internal`] when identity, sort-key resolution,
+    /// key materialization, sorting, or the gather fails, and
+    /// [`ScribeError::IngestBusy`] when the shared root cannot hold the
+    /// working memory.
     fn prepare_sorted_candidate(
         &self,
         candidate: FileCandidate,
@@ -407,15 +446,121 @@ impl<'a> ParquetBatchEncoder<'a> {
                 ),
             });
         }
-        let encoder_batch = concat_batches(
-            &self.frozen.schema,
-            &self.frozen.batches[candidate.start..candidate.end],
-        )
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("failed to materialize frozen memtable for encoding: {error}"),
-        })?;
-        debug_assert_eq!(encoder_batch.num_rows(), candidate.rows);
-        sort_batch(&encoder_batch, self.layout)
+        let sources = &self.frozen.batches[candidate.start..candidate.end];
+        let keys = sort_keys(&self.frozen.schema, self.layout)?;
+        let key_bytes = sources
+            .iter()
+            .flat_map(|batch| {
+                keys.iter()
+                    .map(|(index, _)| batch.column(*index).get_array_memory_size())
+            })
+            .sum::<usize>();
+        let position_bytes =
+            candidate.rows * (std::mem::size_of::<u32>() + std::mem::size_of::<(usize, usize)>());
+        let _working = self.memory.try_reserve_maintenance(
+            crate::scribe::memory::MemoryCategory::Persistence,
+            key_bytes
+                .saturating_add(position_bytes)
+                .saturating_add(self.output_bytes(candidate)),
+        )?;
+        let materialize = |error: arrow::error::ArrowError| ScribeError::Internal {
+            detail: format!("failed to gather frozen memtable in sort order: {error}"),
+        };
+        let columns = keys
+            .iter()
+            .map(|&(index, options)| {
+                let parts = sources
+                    .iter()
+                    .map(|batch| batch.column(index).as_ref())
+                    .collect::<Vec<&dyn Array>>();
+                Ok(SortColumn {
+                    values: concat(&parts)?,
+                    options: Some(options),
+                })
+            })
+            .collect::<Result<Vec<_>, arrow::error::ArrowError>>()
+            .map_err(materialize)?;
+        let order = lexsort_to_indices(&columns, None).map_err(materialize)?;
+        drop(columns);
+        let starts = sources
+            .iter()
+            .scan(0_usize, |next, batch| {
+                let start = *next;
+                *next += batch.num_rows();
+                Some(start)
+            })
+            .collect::<Vec<_>>();
+        let positions = order
+            .values()
+            .iter()
+            .map(|&row| {
+                let row = row as usize;
+                let batch = starts.partition_point(|&start| start <= row) - 1;
+                (batch, row - starts[batch])
+            })
+            .collect::<Vec<_>>();
+        let sorted = interleave_record_batch(&sources.iter().collect::<Vec<_>>(), &positions)
+            .map_err(materialize)?;
+        debug_assert_eq!(sorted.num_rows(), candidate.rows);
+        Ok(sorted)
+    }
+}
+
+/// Bytes a scratch artifact may accumulate unsynced before [`SyncingFile`]
+/// forces them to disk.
+const ARTIFACT_SYNC_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A scratch artifact file that syncs its data every
+/// [`ARTIFACT_SYNC_INTERVAL_BYTES`] as it is written.
+///
+/// A generation can stage a ~100 MB artifact. Left to the page cache, that
+/// whole file is dirty when the stager's final fsync runs, and the WAL's
+/// group-commit `fdatasync` on the same filesystem queues behind the
+/// writeback, stalling every write on the shard for hundreds of
+/// milliseconds. Syncing in bounded steps keeps the dirty backlog small, so
+/// a WAL sync waits behind at most one interval. Encoding runs on the
+/// staging rayon pool, so these blocking syncs never hold an async worker.
+struct SyncingFile {
+    /// The scratch artifact being written.
+    file: std::fs::File,
+    /// Bytes written since the last data sync.
+    unsynced: u64,
+}
+
+impl SyncingFile {
+    /// Wraps a freshly created scratch artifact with nothing unsynced.
+    const fn new(file: std::fs::File) -> Self {
+        Self { file, unsynced: 0 }
+    }
+}
+
+impl Write for SyncingFile {
+    /// Writes to the file and syncs its data once the unsynced backlog
+    /// reaches [`ARTIFACT_SYNC_INTERVAL_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the file's write error, or its `fdatasync` error when the
+    /// backlog sync fails; the written bytes then stay counted as unsynced.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(buf)?;
+        self.unsynced = self
+            .unsynced
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        if self.unsynced >= ARTIFACT_SYNC_INTERVAL_BYTES {
+            self.file.sync_data()?;
+            self.unsynced = 0;
+        }
+        Ok(written)
+    }
+
+    /// Flushes the file; durability stays with the stager's final fsync.
+    ///
+    /// # Errors
+    ///
+    /// Returns the file's flush error.
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
     }
 }
 
@@ -433,7 +578,7 @@ struct OpenArtifact {
     /// shredded object keeps the identity of its logical table schema.
     schema: Arc<Schema>,
     /// Open Parquet encoder owning the buffered sink.
-    writer: ArrowWriter<BufWriter<std::fs::File>>,
+    writer: ArrowWriter<BufWriter<SyncingFile>>,
     /// Rows appended so far across every batch.
     rows: usize,
 }
@@ -615,7 +760,7 @@ impl<'a> RollingArtifactWriter<'a> {
             None => Arc::clone(&schema),
         };
         let writer = ArrowWriter::try_new(
-            BufWriter::new(file),
+            BufWriter::new(SyncingFile::new(file)),
             physical,
             Some(bifrost_writer_properties_with_metadata(
                 Vec::new(),
@@ -728,18 +873,21 @@ fn variant_error(error: &iceberg::Error) -> ScribeError {
     }
 }
 
-/// Sort a `RecordBatch` by the table's registered physical sort order.
+/// Resolves the table's registered physical sort order against `schema`.
 ///
-/// The canonical order is the table's declared keys in declaration order, so
-/// the rows Scribe writes match the sort order stamped on the destination
-/// Iceberg table.
+/// The canonical order is the table's declared keys in declaration order, each
+/// with its declared direction and null placement, so the rows Scribe writes
+/// match the sort order stamped on the destination Iceberg table. Each key is
+/// returned as its column index and Arrow sort options.
 ///
 /// # Errors
 /// Returns [`ScribeError::Internal`] when a sort column named by the resolved
-/// layout is absent from the batch schema, or when the Arrow sort fails.
-fn sort_batch(batch: &RecordBatch, layout: &PhysicalLayout) -> Result<RecordBatch, ScribeError> {
-    let schema = batch.schema();
-    let sort_columns = layout
+/// layout is absent from `schema`.
+fn sort_keys(
+    schema: &Schema,
+    layout: &PhysicalLayout,
+) -> Result<Vec<(usize, SortOptions)>, ScribeError> {
+    layout
         .sort_keys()
         .iter()
         .map(|key| {
@@ -748,35 +896,15 @@ fn sort_batch(batch: &RecordBatch, layout: &PhysicalLayout) -> Result<RecordBatc
                 .map_err(|_| ScribeError::Internal {
                     detail: format!("sort column {} not found in sealed schema", key.column()),
                 })?;
-            Ok(SortColumn {
-                values: batch.column(index).clone(),
-                options: Some(arrow::compute::SortOptions {
+            Ok((
+                index,
+                SortOptions {
                     descending: key.is_descending(),
                     nulls_first: key.nulls_first(),
-                }),
-            })
+                },
+            ))
         })
-        .collect::<Result<Vec<_>, ScribeError>>()?;
-
-    // Compute sort indices
-    let indices = lexsort_to_indices(&sort_columns, None).map_err(|e| ScribeError::Internal {
-        detail: format!("failed to compute sort indices: {e}"),
-    })?;
-
-    // Reorder all columns using the indices
-    let sorted_columns: Result<Vec<_>, _> = batch
-        .columns()
-        .iter()
-        .map(|col| {
-            take(col.as_ref(), &indices, None).map_err(|e| ScribeError::Internal {
-                detail: format!("failed to reorder column during sort: {e}"),
-            })
-        })
-        .collect();
-
-    RecordBatch::try_new(batch.schema(), sorted_columns?).map_err(|e| ScribeError::Internal {
-        detail: format!("failed to rebuild sorted RecordBatch: {e}"),
-    })
+        .collect()
 }
 
 /// What re-reading one sealed artifact's footer proved about it.
@@ -962,7 +1090,9 @@ fn extract_row_group_time_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::AsArray;
     use arrow::array::{NullArray, RecordBatch, StringArray, TimestampMicrosecondArray};
+    use arrow::compute::concat_batches;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -973,6 +1103,29 @@ mod tests {
     use crate::catalog::TableRef;
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::seal_key::{SealKey, TimePartition};
+
+    /// A scratch artifact syncs and resets its backlog once it crosses the
+    /// sync interval, and keeps counting below it.
+    ///
+    /// # Panics
+    /// Panics when the scratch file cannot be written or the backlog is
+    /// not reset at the interval.
+    #[test]
+    fn syncing_file_resets_backlog_at_interval() {
+        let scratch = tempfile::tempdir().expect("syncing scratch");
+        let file = std::fs::File::create(scratch.path().join("artifact.parquet"))
+            .expect("scratch artifact");
+        let mut syncing = SyncingFile::new(file);
+        let chunk = vec![0_u8; 1024 * 1024];
+        for _ in 0..7 {
+            syncing.write_all(&chunk).expect("write below interval");
+        }
+        assert_eq!(syncing.unsynced, 7 * 1024 * 1024);
+        syncing.write_all(&chunk).expect("write to interval");
+        assert_eq!(syncing.unsynced, 0);
+        syncing.write_all(&[1]).expect("write past interval");
+        assert_eq!(syncing.unsynced, 1);
+    }
 
     /// Builds one metadata-light stored batch with the requested row count.
     fn candidate_batch(rows: usize) -> RecordBatch {
@@ -1139,8 +1292,8 @@ mod tests {
             seal_key,
             shard_id: 0,
             schema: batch.schema(),
-            batches: vec![batch],
-            statistics: Vec::new(),
+            batches: vec![batch].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1212,8 +1365,9 @@ mod tests {
             batches: vec![
                 whole_member_batch(0, 60 * 1024),
                 whole_member_batch(60 * 1024, 50 * 1024),
-            ],
-            statistics: Vec::new(),
+            ]
+            .into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1281,8 +1435,8 @@ mod tests {
             ),
             shard_id: 1,
             schema,
-            batches: vec![batch],
-            statistics: Vec::new(),
+            batches: vec![batch].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1524,11 +1678,12 @@ mod tests {
     fn parquet_footer_preserves_complete_claim_evidence() {
         let tenant = DataTenantId::new_v7();
         let mut frozen = incompressible_frozen(tenant, FILE_CANDIDATE_TARGET_ROWS + 16);
-        let whole = frozen.batches.remove(0);
+        let whole = frozen.batches[0].clone();
         frozen.batches = vec![
             whole.slice(0, FILE_CANDIDATE_TARGET_ROWS),
             whole.slice(FILE_CANDIDATE_TARGET_ROWS, 16),
-        ];
+        ]
+        .into();
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
         let scratch = tempfile::tempdir().expect("rolling scratch");
@@ -1790,8 +1945,8 @@ mod tests {
             ),
             shard_id: 0,
             schema: Arc::clone(&schema),
-            batches: vec![batch],
-            statistics: Vec::new(),
+            batches: vec![batch].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1896,8 +2051,8 @@ mod tests {
             ),
             shard_id: 4,
             schema: Arc::clone(&schema),
-            batches: vec![stored_batch(vec![40, 10]), stored_batch(vec![30, 20])],
-            statistics: Vec::new(),
+            batches: vec![stored_batch(vec![40, 10]), stored_batch(vec![30, 20])].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -2309,6 +2464,320 @@ mod tests {
         assert_eq!(encoded.append_metas[0].batch_id, meta.batch_id);
     }
 
+    /// Gathers stored batches `range` of `frozen` as one sorted candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`ParquetBatchEncoder::prepare_sorted_candidate`]
+    /// refuses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the frozen tenant has no table binding.
+    fn gather(
+        frozen: &FrozenMemtable,
+        layout: &PhysicalLayout,
+        memory: &crate::resources::ScribeResources,
+        range: std::ops::Range<usize>,
+    ) -> Result<RecordBatch, ScribeError> {
+        let tenant = frozen.seal_key.tenant;
+        let binding =
+            TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone())).expect("binding");
+        let rows = frozen.batches[range.clone()]
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        let candidate = FileCandidate {
+            start: range.start,
+            end: range.end,
+            rows,
+        };
+        ParquetBatchEncoder {
+            frozen,
+            binding: &binding,
+            seal_tenant: tenant,
+            candidates: vec![candidate],
+            first_ordinal: 0,
+            scratch_dir: Path::new("unused"),
+            object_base: "unused",
+            layout,
+            memory: memory.clone(),
+            target_object_bytes: u64::MAX,
+        }
+        .prepare_sorted_candidate(candidate)
+    }
+
+    /// The former whole-payload path, kept only as the equivalence reference:
+    /// concatenate every column of `batches`, then reorder each by the
+    /// layout's sort.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batches do not concatenate or a sort key is absent.
+    fn concatenated_reference(batches: &[RecordBatch], layout: &PhysicalLayout) -> RecordBatch {
+        let batch = concat_batches(batches[0].schema_ref(), batches).expect("reference concat");
+        let columns = sort_keys(batch.schema_ref(), layout)
+            .expect("reference keys")
+            .into_iter()
+            .map(|(index, options)| SortColumn {
+                values: Arc::clone(batch.column(index)),
+                options: Some(options),
+            })
+            .collect::<Vec<_>>();
+        let order = lexsort_to_indices(&columns, None).expect("reference order");
+        RecordBatch::try_new(
+            batch.schema(),
+            batch
+                .columns()
+                .iter()
+                .map(|column| arrow::compute::take(column, &order, None).expect("reference take"))
+                .collect(),
+        )
+        .expect("reference batch")
+    }
+
+    /// A frozen member of four stored batches for the gathered-sort tests.
+    ///
+    /// The layout sorts `service` descending, `tag` ascending with nulls first,
+    /// then `event_time`. Keys repeat within and across batches, both key
+    /// columns hold nulls, event times straddle an hour boundary, and each row
+    /// carries a distinct Variant object and integer list, so any tie broken
+    /// differently or row taken from the wrong batch shows in the payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture does not assemble.
+    fn gather_fixture() -> (FrozenMemtable, PhysicalLayout) {
+        /// One fixture row's `service`, `tag`, and `event_time` keys.
+        type FixtureKeys = (Option<&'static str>, Option<&'static str>, i64);
+
+        let hour = 3_600_000_000_i64;
+        let rows: [&[FixtureKeys]; 4] = [
+            &[
+                (Some("b"), None, hour),
+                (None, Some("x"), 1),
+                (Some("a"), Some("y"), hour - 1),
+            ],
+            &[(Some("b"), None, hour), (Some("b"), Some("x"), 1)],
+            &[
+                (None, None, 2),
+                (Some("a"), Some("y"), hour - 1),
+                (Some("c"), Some("x"), hour + 5),
+            ],
+            &[(Some("b"), Some("x"), 1)],
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service", DataType::Utf8, true),
+            Field::new("tag", DataType::Utf8, true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+            wyrd_types::variant::variant_field("v", true),
+            Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true))),
+                true,
+            ),
+        ]));
+        let mut ordinal = 0_i32;
+        let batches = rows
+            .iter()
+            .map(|rows| {
+                let json = rows
+                    .iter()
+                    .map(|_| {
+                        ordinal += 1;
+                        (ordinal % 3 != 0)
+                            .then(|| format!(r#"{{"row":{ordinal},"n":{{"k":[{ordinal}]}}}}"#))
+                    })
+                    .collect::<Vec<_>>();
+                let items = json
+                    .iter()
+                    .enumerate()
+                    .map(|(at, value)| {
+                        value.as_ref().map(|_| {
+                            vec![Some(ordinal), None, Some(i32::try_from(at).expect("small"))]
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let json: arrow::array::ArrayRef = Arc::new(StringArray::from(json));
+                let variant: arrow::array::ArrayRef =
+                    parquet_variant_compute::json_to_variant(&json)
+                        .expect("valid JSON")
+                        .into();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(StringArray::from(
+                            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                        )),
+                        Arc::new(StringArray::from(
+                            rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                        )),
+                        Arc::new(
+                            TimestampMicrosecondArray::from(
+                                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                            )
+                            .with_timezone("+00:00"),
+                        ),
+                        arrow::compute::cast(
+                            &variant,
+                            &wyrd_types::variant::variant_storage_type(),
+                        )
+                        .expect("Variant storage casts to the stored shape"),
+                        Arc::new(arrow::array::ListArray::from_iter_primitive::<
+                            arrow::datatypes::Int32Type,
+                            _,
+                            _,
+                        >(items)),
+                    ],
+                )
+                .expect("fixture batch")
+            })
+            .collect::<Vec<_>>();
+        let layout = PhysicalLayout::resolve(
+            "bifrost.bifrost.test",
+            &schema,
+            Some(&crate::tables::hourly_layout(
+                "event_time",
+                vec![
+                    crate::tables::sort_desc("service"),
+                    crate::tables::sort_asc_nulls_first("tag"),
+                    crate::tables::sort_asc("event_time"),
+                ],
+                &[],
+            )),
+        )
+        .expect("fixture layout");
+        let mut frozen = frozen_from_batch(
+            crate::test_support::day_partition(2026, 7, 14),
+            DataTenantId::new_v7(),
+            batches[0].clone(),
+        );
+        frozen.batches = batches.into();
+        (frozen, layout)
+    }
+
+    /// Proves gathering payloads from the candidate's own stored batches emits
+    /// exactly the rows, order, ties, nulls, and nested Variant and list
+    /// values of the former concatenate-then-sort path, for a whole member
+    /// and for candidates bounded on either side of a stored-batch boundary,
+    /// and that the key order is the declared one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a gathered candidate differs from the reference or the key
+    /// order is not the declared one.
+    #[test]
+    fn gathered_sort_matches_concatenated_reference() {
+        let (frozen, layout) = gather_fixture();
+        let memory = crate::resources::ScribeResources::for_test();
+        for range in [0..4, 0..2, 1..3, 2..4, 3..4] {
+            let gathered = gather(&frozen, &layout, &memory, range.clone()).expect("gathers");
+            assert_eq!(
+                gathered,
+                concatenated_reference(&frozen.batches[range.clone()], &layout),
+                "{range:?}"
+            );
+        }
+
+        let whole = gather(&frozen, &layout, &memory, 0..4).expect("gathers");
+        let text = |name: &str| {
+            whole
+                .column_by_name(name)
+                .expect("key column")
+                .as_string::<i32>()
+                .iter()
+                .map(|value| value.map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let times = whole
+            .column_by_name("event_time")
+            .expect("time column")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("timestamps")
+            .values()
+            .to_vec();
+        let hour = 3_600_000_000_i64;
+        let keys = text("service")
+            .into_iter()
+            .zip(text("tag"))
+            .zip(times)
+            .map(|((service, tag), time)| (service, tag, time))
+            .collect::<Vec<_>>();
+        let some = |value: &str| Some(value.to_owned());
+        assert_eq!(
+            keys,
+            [
+                (some("c"), some("x"), hour + 5),
+                (some("b"), None, hour),
+                (some("b"), None, hour),
+                (some("b"), some("x"), 1),
+                (some("b"), some("x"), 1),
+                (some("a"), some("y"), hour - 1),
+                (some("a"), some("y"), hour - 1),
+                (None, None, 2),
+                (None, some("x"), 1),
+            ]
+        );
+    }
+
+    /// Proves a candidate's sort keys, positions, and gathered output are
+    /// admitted against the shared root before anything is built: a root
+    /// that can hold the output alone, sized from the column bytes the
+    /// memtable recorded on append, refuses the candidate as retryable
+    /// pressure, the same candidate gathers once the pressure clears, and
+    /// gathering returns every working byte it held.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the constrained candidate is admitted, the refusal is not
+    /// `IngestBusy`, the relieved candidate fails, or working bytes leak.
+    #[test]
+    fn gathered_sort_respects_persistence_admission() {
+        let (mut frozen, layout) = gather_fixture();
+        frozen.statistics = frozen
+            .batches
+            .iter()
+            .map(crate::scribe::memtable::batch_statistics)
+            .collect();
+        let memory = crate::resources::ScribeResources::for_test();
+        let used = || {
+            memory
+                .snapshot()
+                .expect("snapshot")
+                .governed_memory_used_bytes
+        };
+        let baseline = used();
+        let output = frozen
+            .statistics
+            .iter()
+            .flat_map(|batch| &batch.column_statistics)
+            .map(|column| *column.byte_size.get_value().expect("recorded size"))
+            .sum::<usize>();
+        let pressure = memory
+            .try_reserve_maintenance(
+                crate::scribe::memory::MemoryCategory::Persistence,
+                memory.limit_bytes() - baseline - output,
+            )
+            .expect("the pressure fits the root");
+
+        let refused = gather(&frozen, &layout, &memory, 0..4).expect_err("no room for the keys");
+        assert!(
+            matches!(refused, ScribeError::IngestBusy { .. }),
+            "{refused:?}"
+        );
+
+        drop(pressure);
+        assert_eq!(used(), baseline);
+        let gathered = gather(&frozen, &layout, &memory, 0..4).expect("relieved");
+        assert_eq!(gathered.num_rows(), 9);
+        assert_eq!(used(), baseline, "gathering returns its working bytes");
+    }
+
     #[test]
     fn sort_batch_uses_one_key_for_every_table() {
         let schema = Arc::new(Schema::new(vec![
@@ -2332,7 +2801,19 @@ mod tests {
         .unwrap();
 
         let layout = crate::tables::hourly_test_layout(batch.schema().as_ref());
-        let sorted = sort_batch(&batch, &layout).unwrap();
+        let tenant = DataTenantId::new_v7();
+        let frozen = frozen_from_batch(
+            crate::test_support::day_partition(2026, 7, 14),
+            tenant,
+            batch,
+        );
+        let sorted = gather(
+            &frozen,
+            &layout,
+            &crate::resources::ScribeResources::for_test(),
+            0..1,
+        )
+        .unwrap();
         let services = sorted
             .column_by_name("service")
             .unwrap()
@@ -2510,7 +2991,7 @@ mod tests {
         let column = batch.column_by_name("v").expect("variant column");
         let variant = parquet_variant_compute::VariantArray::try_new(column.as_ref())
             .expect("variant storage");
-        let shredded = match variant.typed_value_column().map(|typed| typed.data_type()) {
+        let shredded = match variant.typed_value_column().map(Array::data_type) {
             Some(DataType::Struct(fields)) => fields.iter().map(|f| f.name().clone()).collect(),
             _ => Vec::new(),
         };
@@ -2561,8 +3042,8 @@ mod tests {
             ),
             shard_id: 0,
             schema: batch.schema(),
-            batches: vec![batch.clone()],
-            statistics: Vec::new(),
+            batches: vec![batch.clone()].into(),
+            statistics: Arc::default(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),

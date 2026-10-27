@@ -11,6 +11,13 @@
 //! dispatched first, so a busy tenant cannot hold every slot while another
 //! waits, and a slow tenant delays only its own items.
 //!
+//! A sink may set [`OutboxSink::LINGER`], as a Kafka producer sets
+//! `linger.ms`: a lane's backlog then waits until its oldest item is that old,
+//! or until it holds [`OutboxSink::BATCH_ITEMS`] items, before it is written,
+//! so items staged one at a time reach the sink as one write instead of one
+//! write each. Linger delays only when an item is written, never its
+//! producer, and a retry or a closed outbox writes at once.
+//!
 //! A failed write is never dropped. A write that returns an error or panics
 //! keeps its exact items as that lane's next write, apart from anything that
 //! arrived meanwhile, and the lane is retried after a backoff that starts at
@@ -156,6 +163,13 @@ pub trait OutboxSink: Send + Sync + 'static {
     /// concurrently; the default single lane writes a tenant one slice at a
     /// time.
     const LANES: usize = 1;
+    /// Longest a lane's oldest waiting item waits for more to join its write,
+    /// as Kafka's `linger.ms`. The default of zero writes as soon as a lane is
+    /// free.
+    const LINGER: Duration = Duration::ZERO;
+    /// Waiting items at which a lane writes without lingering further, as
+    /// Kafka's `batch.size`.
+    const BATCH_ITEMS: usize = usize::MAX;
 
     /// The lane `item` is written in, taken modulo [`Self::LANES`].
     ///
@@ -276,6 +290,8 @@ impl<S: OutboxSink> Outbox<S> {
                 sink: Arc::clone(&sink),
                 requests,
                 waiting: HashMap::new(),
+                since: HashMap::new(),
+                closed: false,
                 failed: HashMap::new(),
                 writing: JoinSet::new(),
                 in_flight: HashMap::new(),
@@ -743,6 +759,12 @@ struct OutboxWriter<S: OutboxSink> {
     requests: mpsc::UnboundedReceiver<Queued<S>>,
     /// Received items per lane, in arrival order, not being written.
     waiting: HashMap<Lane, Backlog<S::Item>>,
+    /// When each waiting lane's oldest item arrived, which starts its
+    /// [`OutboxSink::LINGER`].
+    since: HashMap<Lane, Instant>,
+    /// Whether the queue has closed, after which lanes write without
+    /// lingering so shutdown drains promptly.
+    closed: bool,
     /// The exact slice of each lane whose last write failed; it is that
     /// lane's next write, unmerged with `waiting`.
     failed: HashMap<Lane, Backlog<S::Item>>,
@@ -782,7 +804,7 @@ impl<S: OutboxSink> OutboxWriter<S> {
             {
                 return;
             }
-            let retry = self.next_retry();
+            let retry = self.next_wake();
             tokio::select! {
                 biased;
                 () = self.abandon.cancelled() => return,
@@ -791,10 +813,13 @@ impl<S: OutboxSink> OutboxWriter<S> {
                 }
                 count = self.requests.recv_many(&mut received, usize::MAX), if open => {
                     open = count != 0;
+                    self.closed = !open;
                     let lanes = S::LANES.max(1) as u64;
+                    let now = Instant::now();
                     for (tenant, item, load) in received.drain(..) {
                         // The remainder is below `LANES`, a `usize`.
                         let lane = usize::try_from(S::lane(&item) % lanes).unwrap_or_default();
+                        self.since.entry((tenant, lane)).or_insert(now);
                         let (items, backlog) = self.waiting.entry((tenant, lane)).or_default();
                         items.push(item);
                         backlog.add(load);
@@ -811,7 +836,8 @@ impl<S: OutboxSink> OutboxWriter<S> {
     }
 
     /// Starts one write for each lane that has items waiting, has no write
-    /// in flight, and is not backing off, while fewer than `concurrency` writes
+    /// in flight, is not backing off, and has lingered (see
+    /// [`Self::is_ready`]), while fewer than `concurrency` writes
     /// run. Ready lanes are taken in order of their tenant's writes in flight
     /// plus the lane's rank among that tenant's ready lanes, so every tenant's
     /// first lane goes before any tenant's second. A lane with a failed slice
@@ -850,11 +876,10 @@ impl<S: OutboxSink> OutboxWriter<S> {
             if self.writing.len() >= self.concurrency {
                 return;
             }
-            let Some((items, load)) = self
-                .failed
-                .remove(&lane)
-                .or_else(|| self.waiting.remove(&lane))
-            else {
+            let Some((items, load)) = self.failed.remove(&lane).or_else(|| {
+                self.since.remove(&lane);
+                self.waiting.remove(&lane)
+            }) else {
                 continue;
             };
             let (tenant, _) = lane;
@@ -895,24 +920,51 @@ impl<S: OutboxSink> OutboxWriter<S> {
         }
     }
 
-    /// Whether `lane` has no write in flight and its backoff has elapsed.
+    /// Whether `lane` has no write in flight, its backoff has elapsed, and
+    /// its next write may go now: a failed slice retries at once, and a
+    /// backlog goes once its oldest item has lingered [`OutboxSink::LINGER`],
+    /// it holds [`OutboxSink::BATCH_ITEMS`] items, or the queue has closed.
     fn is_ready(&self, lane: Lane, now: Instant) -> bool {
         !self.in_flight.values().any(|(busy, ..)| *busy == lane)
             && self.retry_at.get(&lane).is_none_or(|(at, _)| *at <= now)
+            && (self.closed || self.failed.contains_key(&lane) || self.lingered(lane, now))
     }
 
-    /// The earliest future retry time of a failed lane, or `None` when no
-    /// timer is needed because every write slot is busy or nobody backs off.
-    fn next_retry(&self) -> Option<Instant> {
+    /// Whether `lane`'s backlog has waited [`OutboxSink::LINGER`] or holds
+    /// [`OutboxSink::BATCH_ITEMS`] items.
+    fn lingered(&self, lane: Lane, now: Instant) -> bool {
+        self.linger_until(lane).is_none_or(|at| at <= now)
+            || self
+                .waiting
+                .get(&lane)
+                .is_some_and(|(items, _)| items.len() >= S::BATCH_ITEMS)
+    }
+
+    /// When `lane`'s oldest waiting item has lingered, or `None` when it has
+    /// nothing waiting.
+    fn linger_until(&self, lane: Lane) -> Option<Instant> {
+        self.since.get(&lane).map(|since| *since + S::LINGER)
+    }
+
+    /// The earliest future time a failed lane may retry or a lingering lane
+    /// may write, or `None` when no timer is needed because every write slot
+    /// is busy or nothing waits on time.
+    fn next_wake(&self) -> Option<Instant> {
         if self.writing.len() >= self.concurrency {
             return None;
         }
         let now = Instant::now();
-        self.retry_at
+        let retries = self
+            .retry_at
             .iter()
             .filter(|(lane, (at, _))| *at > now && self.failed.contains_key(*lane))
-            .map(|(_, (at, _))| *at)
-            .min()
+            .map(|(_, (at, _))| *at);
+        let lingering = self
+            .since
+            .keys()
+            .filter_map(|lane| self.linger_until(*lane))
+            .filter(|at| *at > now);
+        retries.chain(lingering).min()
     }
 
     /// Settles one finished write.
@@ -1252,6 +1304,75 @@ mod tests {
         let second = outbox.settle(Instant::now() + Duration::from_secs(2)).await;
         drop(gate);
         assert_eq!((first, second), (0, 0), "the next write waited for a drop");
+    }
+
+    /// A sink that lingers [`LingerSink::LINGER`] and writes at three items,
+    /// recording each written slice.
+    #[derive(Default)]
+    struct LingerSink {
+        /// Every written slice, in completion order.
+        written: Mutex<Vec<Vec<u32>>>,
+    }
+
+    impl OutboxSink for LingerSink {
+        type Item = u32;
+        type Error = MemoryError;
+        const NAME: &'static str = "linger";
+        const LINGER: Duration = Duration::from_millis(300);
+        const BATCH_ITEMS: usize = 3;
+
+        /// Records `items` once written.
+        ///
+        /// # Errors
+        ///
+        /// Never fails.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the record's lock is poisoned.
+        fn write(
+            &self,
+            _tenant: DataTenantId,
+            items: &[u32],
+        ) -> impl Future<Output = Result<(), MemoryError>> + Send {
+            self.written
+                .lock()
+                .expect("unpoisoned")
+                .push(items.to_vec());
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// Proves a lingering lane writes items staged one at a time as one
+    /// write once its oldest has lingered, and writes at once on reaching
+    /// `BATCH_ITEMS`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the trickled items are split across writes, a full batch
+    /// waits out the linger, or the outbox does not settle.
+    #[tokio::test]
+    async fn a_lingering_lane_batches_trickled_items_and_writes_a_full_batch_at_once() {
+        let outbox = Outbox::new(LingerSink::default(), 1, ROOMY);
+        let tenant = DataTenantId::new_v7();
+        outbox.stage(tenant, 1_u32);
+        outbox.stage(tenant, 2_u32);
+        assert_eq!(
+            outbox.settle(within(5)).await,
+            0,
+            "the lingering lane settles"
+        );
+        let started = Instant::now();
+        for item in 3_u32..=5 {
+            outbox.stage(tenant, item);
+        }
+        assert_eq!(outbox.settle(within(5)).await, 0, "the full batch settles");
+        assert!(
+            started.elapsed() < LingerSink::LINGER,
+            "a full batch waited out the linger"
+        );
+        let written = outbox.sink().written.lock().expect("unpoisoned").clone();
+        assert_eq!(written, [vec![1, 2], vec![3, 4, 5]]);
     }
 
     /// A two-lane sink, odd items in lane 1 and even in lane 0, that records

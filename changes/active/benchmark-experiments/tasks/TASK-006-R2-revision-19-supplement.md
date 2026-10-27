@@ -537,3 +537,26 @@ improvement beyond noise.
 |---|---|---|---|
 | Own before/after result | the table above | two VALID unprofiled writes-parquet records | PASS (spans +3–6%, at the noise edge) |
 | Size and depth limits preserved exactly, plus the numeric domain | same `within_size_limit` and `scan_encoded` as `from_bytes` | `variant::tests::built_variants_match_full_byte_validation` (accepted object, NaN in a list, root infinity, size + 1, depth 66: identical result and path to `from_bytes`; the four refusals are refusals); 23 `variant::` and 47 `tables::` lib tests | PASS |
+
+### Item 7(a) correction and decoder deduplication
+
+The 7(a) record above covers traces only. `otlp_logs_decode.rs` and
+`otlp_metrics_decode.rs` each held their own copy of `WireFields`, so the
+fast path in `otlp_decode.rs` did not reach logs: the logs rows of the 7(a)
+table measured unchanged code, and their movement is run-to-run variation.
+
+With the maintainer's agreement, the duplicate copies were deleted before
+7(c), so 7(c) changes one owner:
+
+- logs now use `otlp_decode.rs`'s `WireFields`/`WireValue`, count and
+  last-field helpers, `KeyValue`/`AnyValue` decode, and resource, scope and
+  entity-reference decode. These copies differed only in names, comments and
+  two error texts ("optional resource" and "optional instrumentation scope"
+  are now "resource" and "instrumentation scope"; same malformed refusal).
+- metrics use the shared `WireFields`/`WireValue` and leaf helpers
+  (`fixed_*`, `protobuf_*`, `wrong_wire`, `malformed`,
+  `validate_any_value_wire`). Their message decoders have diverged
+  (`MessageBodies`, `decode_last_string`) and stay in place.
+
+1,079 lines deleted. All 55 `otlp` lib tests pass (the count is unchanged)
+and lints are clean. The next writes run measures 7(a) for logs.

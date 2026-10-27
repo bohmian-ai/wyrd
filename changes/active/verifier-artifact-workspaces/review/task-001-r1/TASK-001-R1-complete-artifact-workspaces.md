@@ -210,3 +210,39 @@ generator changes are expected; run their owning checks only if the actual
 correction touches those outputs/contracts. Append exact results and diagnoses
 to this remediation task without claiming closure from uncommitted edits or
 unexecuted commands.
+
+## Implementation evidence
+
+Commits on top of reviewed candidate `da7622b52`: `a4cfc4057`, `dcf399532`,
+`e9c6e3109`, `c55123c49`, `a02288986`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| -1 bounded wide-regex hit | `hosted/workspace.rs` `snippet` takes 160 bytes from 40 before the match, independent of match length, on UTF-8 boundaries; regression added to `workspace_search_matches_lines` (70 KiB `é` line, `REFUND.*`) | RED: the new `[hit]` assertion failed before the fix; GREEN: exact nextest selector passes; all 7 `workspace::tests` pass (literal and many-hit cases intact) | PASS |
+| -2 full Python authoring, exact validation | `src/state/mod.rs` `upload_artifact(source, metadata, *, version_bump, spec, extract)` lowers Python mappings through the existing `observe::json_value` and maps failures to `WYRD_SPEC_400_VALIDATION` naming `metadata.name`, `metadata.bump`, `metadata` or `spec` before connecting; stub updated | upload journey: labels, annotations and spec metadata survive `get`; `extract=True` keeps authored spec metadata beside `extraction`; authored report refused with rule `extraction_report`; invalid name/bump/unknown field refused against an unreachable server with exact code and field | PASS |
+| -3 code.run and search→read→query | `raw-desk` probe calls `code.run` reading `/inputs/data/blob.bin`; `search-desk` second play runs `fs.search` → `fs.read` → `bifrost.query` after `flush_bifrost` | `ran["value"] == repr(OPAQUE.hex())`; hit `(refunds.py, 2)`, read starts at line 2, query `rows == [[1]]` for the earlier `search-desk` result, `tool_calls` order exact | PASS |
+| -4 exact refusal codes | every raised refusal asserts one code (plus first diagnostic code or rule); tool refusals assert `SKALD_TOOL_500_CALL` / `WYRD_PERMISSION_403_DENIED_RBAC`; no-Card, nondisclosure and before-model assertions retained | 8 journeys pass | PASS |
+| -5 checked-in Cards, fixed names | `fixtures/cards/artifact_workspaces/` (shared `file-probe`, `guarded-probe`, five story Services/Verifiers, five malformed Verifiers); `fresh`, `write_probe`, `pinned`, `selected` removed; uploads use fixed names; markers stay fresh data | 8 journeys pass | PASS |
+| -6 rustdoc | `ExtractError` field, `upload/tests.rs::paths` invariant and `# Panics`, `Cards::upload_artifact` `# Cancellation` (preparation abandoned, pending/partial/Active after submission, fresh idempotency key per call) | `mise run lints` | PASS |
+| -7 public upload/inventory docs | "Uploaded files" recipe in `verifier-recipes.md`: CLI upload, opt-in `--extract`, version rules incl. `WYRD_REGISTRY_409_SPEC_DRIFT`, `wyrd artifact files`, SDK signature table, journey-backed `CodeFromFile` of `fixtures/cards/uploaded_artifacts/`; `llms*.txt` regenerated | `mise run docs:check` | PASS |
+
+Commands: the remediation's exact 7-selector Python command plus
+`test_uploaded_artifacts_are_reused_by_service_judges` (its upload call
+changed) — 8 passed; exact wyrd-server nextest selector — passed;
+`fmt:check`, `lints`, `py:format:check`, `py:lints`, `py:typecheck`,
+`docs:check`, `git diff --check` — pass. No TS, wire or codegen output changed.
+
+Non-goals held: no new endpoint, scope, error variant, tool-result schema,
+parser, or harness; shared upload, preparation and declaration owners unchanged.
+Only the dirty TASK-007 edit remains outside the diff.
+
+Material limits:
+- Upload refusals for symlink, empty directory, corrupt document and output
+  collision all share `WYRD_LOADER_400_INVALID_ENVELOPE`, and their first
+  diagnostic codes are identical, so those cases are distinguished only by
+  message.
+- Tool refusals from the tool itself carry `SKALD_TOOL_500_CALL`, and a
+  missing selected path raises `WYRD_VERIFICATION_400_INPUT_INVALID`.
+- Per the remediation, no new error variant was added.
+- The original RED history is not reconstructed. Only FIND-1 has a fresh RED
+  run. The other findings carry verification-only proof.

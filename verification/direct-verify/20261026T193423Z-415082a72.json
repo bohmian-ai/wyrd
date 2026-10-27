@@ -1,0 +1,1740 @@
+{
+  "schema_version": 2,
+  "engine": "verification",
+  "experiment": "direct-verify",
+  "level": 1,
+  "question": "Does direct `observe().verify` keep the server's verification overhead p99 strictly under 0.5 ms at 64 closed-loop clients, answering every call with the expected verdict, and what does each verification cost the server per CPU-second at 1 and 64 clients?",
+  "started_at": "2026-10-26T19:34:23.486195761Z",
+  "finished_at": "2026-10-26T19:35:12.402858008Z",
+  "elapsed_seconds": 48.916647518,
+  "commit": "415082a72adcb9496450af21381ab536d3eb4542",
+  "dirty": true,
+  "dirty_override": true,
+  "diff_sha256": "8d2796aecf73378246185de1ab967cdd5bd7b8794bda2769ee83ede937fc783e",
+  "host": {
+    "os": "linux",
+    "os_version": "Linux (Pop!_OS 24.04)",
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_cpus": 32,
+    "memory_bytes": 98742132736,
+    "storage": "file:// store in a temporary directory on the local filesystem",
+    "fingerprint": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux"
+  },
+  "build": {
+    "profile": "release",
+    "rustflags": "-C force-frame-pointers=yes",
+    "debug": "line-tables-only",
+    "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "server": {
+      "name": "wyrd-server",
+      "bytes": 1220388368,
+      "modified": "2026-10-26T19:33:43.296982376Z"
+    },
+    "driver": {
+      "name": "capacity",
+      "bytes": 996802944,
+      "modified": "2026-10-26T19:33:34.528654208Z"
+    }
+  },
+  "command": {
+    "args": [
+      "l1",
+      "verification",
+      "--steps",
+      "direct-verify-c64",
+      "--allow-dirty"
+    ],
+    "config": {
+      "WYRD_DATABASE_URL": "<set>",
+      "WYRD_DB_MAX_CONNECTIONS": "8",
+      "WYRD_DB_MAX_CONNECTIONS_VALA": "8",
+      "WYRD_PLATFORM_DATABASE_URL": "<set>",
+      "WYRD_TEST_DATABASE_ADMIN_URL": "<set>"
+    }
+  },
+  "variables": {
+    "clients": [
+      1,
+      64
+    ]
+  },
+  "controls": {
+    "timing": {
+      "warmup_seconds": 5,
+      "repetition_seconds": 5,
+      "repetitions": 3,
+      "budget_seconds": 300,
+      "minimum_seconds": 0
+    },
+    "validity": {
+      "host_busy_fraction": 0.1,
+      "host_sample_seconds": 10,
+      "driver_cores": 8.0,
+      "driver_fraction": 0.8,
+      "lateness_p99_us": 5000.0,
+      "p99_samples": 1000,
+      "p95_samples": 200
+    },
+    "values": {
+      "baselines": "16 entries loaded, 0 eligible; L1 compares reviewed `reference.*` entries only",
+      "fixture": "one tenant: an assertion Verifier of four `equals` checks over one 2 KiB `context` slot, a Model, and one Service per application with its own Card-bound family runtime key; every odd arrival answers check `d` wrong, so both verdicts stay in every window",
+      "limits": "server defaults on the whole host; no resource quota",
+      "timing": {
+        "method": "server benchmark histograms: integer nanoseconds from the owning server boundary's std::time::Instant timers, recorded into bounded HDR histograms and read as cumulative snapshots from the loopback metrics listener; each window is the bucket-count difference of two snapshots of one process",
+        "clock": "std::time::Instant: the OS monotonic clock",
+        "precision": "3 significant digits; each percentile is judged on its whole bucket's bounds",
+        "range_ns": [
+          1,
+          137438953472
+        ],
+        "scan_range": [
+          1,
+          1125899906842624
+        ],
+        "max_series": 256,
+        "max_scan_series": 64,
+        "percentile": "nearest rank ceil(q * N) over the window's distribution",
+        "server_env": {
+          "WYRD_METRICS_BENCHMARK_SNAPSHOT": "1"
+        },
+        "tracing": "operator span export stays at its default (disabled); no span is required for timing",
+        "assignment": "every request carries its closed case and the repetition or admission phase that admitted it, attached when its request span opens; a window takes the observations recorded between its opening snapshot and one taken after its admitted cohort drained, so a late completion stays in its admitted cohort; each cohort's judged-outcome count must equal the completions the driver saw, other outcomes (retried or refused attempts) are counted beside it; a short or extra count, a dropped or out-of-range observation, an unknown label, a missing or negative component, scans that are not the answered cohort's, or a replaced process makes it invalid",
+        "measurement": "work, wall seconds, and server and driver CPU stop at the admission stop, before the requests then in flight drain; their completions count as late work beside the measured work, and their latency stays in the final cohort",
+        "evidence": "each window's full opening and drained snapshots are kept under the run's target artifacts as timings/<step>/<phase>.json; the record keeps each cohort's reconciliation and each percentile's rank and bucket bounds",
+        "timer_resolution_ns": 20
+      },
+      "workload": "closed-loop public-client `observe().verify` (direct mode), one application per client, each sending its next call once the last answers"
+    },
+    "selection": [
+      "direct-verify-c64"
+    ]
+  },
+  "criteria": {
+    "metrics": [
+      {
+        "id": "cores",
+        "unit": "cores",
+        "boundary": "C/T: server CPU-seconds of the declared processes per wall second of the window",
+        "direction": null,
+        "derive": {
+          "kind": "cores"
+        }
+      },
+      {
+        "id": "rate",
+        "unit": "verifications/s",
+        "boundary": "acknowledged verifications per wall second of the window",
+        "direction": "higher",
+        "derive": {
+          "kind": "rate",
+          "work": "verifications",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "verifications",
+        "unit": "verifications",
+        "boundary": "acknowledged direct and background calls in the window",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "errors",
+        "unit": "errors",
+        "boundary": "refused calls outside a declared overload admission refusal",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "verifications_per_s_per_vcpu",
+        "unit": "verifications/s/vCPU",
+        "boundary": "(W/T)/P: acknowledged verifications per wall second per provisioned vCPU",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_vcpu",
+          "work": "verifications",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "verifications_per_cpu_s",
+        "unit": "verifications/cpu-s",
+        "boundary": "W/C: acknowledged verifications per server CPU-second used",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_cpu",
+          "work": "verifications",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "cpu_us_per_verification",
+        "unit": "µs/verification",
+        "boundary": "server CPU per acknowledged verification",
+        "direction": "lower",
+        "derive": {
+          "kind": "cpu_per",
+          "work": "verifications",
+          "scale": 1000000.0
+        }
+      },
+      {
+        "id": "p50_ms",
+        "unit": "ms",
+        "boundary": "server: a direct execution's start until its result is ready (`verification.direct`, outcome `completed`), every acknowledged call; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "p95_ms",
+        "unit": "ms",
+        "boundary": "server: a direct execution's start until its result is ready (`verification.direct`, outcome `completed`), every acknowledged call; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "p99_ms",
+        "unit": "ms",
+        "boundary": "server: a direct execution's start until its result is ready (`verification.direct`, outcome `completed`), every acknowledged call; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p50_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: public-client `verify` call until its judged result, every acknowledged call; never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p95_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: public-client `verify` call until its judged result, every acknowledged call; never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p99_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: public-client `verify` call until its judged result, every acknowledged call; never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "wrong",
+        "unit": "verifications",
+        "boundary": "direct results whose verdict was not the expected one",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_p99_ms",
+        "unit": "ms",
+        "boundary": "server: per execution, `verification.direct` elapsed less the union of its own Verifier blocks; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_mean_ms",
+        "unit": "ms",
+        "boundary": "server: exact mean of the per-execution residuals",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "verifier_p99_ms",
+        "unit": "ms",
+        "boundary": "server: the union of an execution's own Verifier blocks; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "verifier_mean_ms",
+        "unit": "ms",
+        "boundary": "server: exact mean of the Verifier block unions",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "server_failures",
+        "unit": "verifications",
+        "boundary": "server: `verification.direct` timings whose outcome is not `completed`, counted in their own outcome series and never judged",
+        "direction": null,
+        "derive": null
+      }
+    ],
+    "criteria": [
+      {
+        "id": "overhead-p99",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "lt",
+          "limit": 0.5,
+          "over": "median"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "no-errors",
+        "metric": "errors",
+        "steps": [
+          "direct-verify-c1",
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "correct-verdicts",
+        "metric": "wrong",
+        "steps": [
+          "direct-verify-c1",
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.direct-verify.direct-verify-c1.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "direct-verify-c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.direct-verify.direct-verify-c1.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.direct-verify.direct-verify-c1.cpu_us_per_verification",
+        "metric": "cpu_us_per_verification",
+        "steps": [
+          "direct-verify-c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.direct-verify.direct-verify-c1.cpu_us_per_verification",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.direct-verify.direct-verify-c1.verifications_per_cpu_s",
+        "metric": "verifications_per_cpu_s",
+        "steps": [
+          "direct-verify-c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.direct-verify.direct-verify-c1.verifications_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.direct-verify.direct-verify-c1.verifications_per_s_per_vcpu",
+        "metric": "verifications_per_s_per_vcpu",
+        "steps": [
+          "direct-verify-c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.direct-verify.direct-verify-c1.verifications_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.direct-verify.direct-verify-c64.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.direct-verify.direct-verify-c64.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.direct-verify.direct-verify-c64.cpu_us_per_verification",
+        "metric": "cpu_us_per_verification",
+        "steps": [
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.direct-verify.direct-verify-c64.cpu_us_per_verification",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.direct-verify.direct-verify-c64.verifications_per_cpu_s",
+        "metric": "verifications_per_cpu_s",
+        "steps": [
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.direct-verify.direct-verify-c64.verifications_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.direct-verify.direct-verify-c64.verifications_per_s_per_vcpu",
+        "metric": "verifications_per_s_per_vcpu",
+        "steps": [
+          "direct-verify-c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.direct-verify.direct-verify-c64.verifications_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      }
+    ],
+    "references": [
+      {
+        "step": "direct-verify-c1",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:449c60626f052d5a"
+      },
+      {
+        "step": "direct-verify-c1",
+        "metric": "cpu_us_per_verification",
+        "percentile": null,
+        "method": "sha256:449c60626f052d5a"
+      },
+      {
+        "step": "direct-verify-c1",
+        "metric": "verifications_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:449c60626f052d5a"
+      },
+      {
+        "step": "direct-verify-c1",
+        "metric": "verifications_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:449c60626f052d5a"
+      },
+      {
+        "step": "direct-verify-c64",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:d86279f2cabaf545"
+      },
+      {
+        "step": "direct-verify-c64",
+        "metric": "cpu_us_per_verification",
+        "percentile": null,
+        "method": "sha256:d86279f2cabaf545"
+      },
+      {
+        "step": "direct-verify-c64",
+        "metric": "verifications_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:d86279f2cabaf545"
+      },
+      {
+        "step": "direct-verify-c64",
+        "metric": "verifications_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:d86279f2cabaf545"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "id": "direct-verify-c1",
+      "params": {
+        "clients": 1,
+        "op": "verify"
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 5,
+        "repetitions": 3,
+        "budget_seconds": 300,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "direct-verify-c64",
+      "params": {
+        "clients": 64,
+        "op": "verify"
+      },
+      "status": "measured",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 5,
+        "repetitions": 3,
+        "budget_seconds": 300,
+        "minimum_seconds": 0
+      },
+      "repetitions": [
+        {
+          "seconds": 5.003428529,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 102.66,
+          "peak_memory_bytes": 3113529344,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 26.359999999999996,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 1.112,
+              "above": null,
+              "samples": 257061,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 2.375,
+              "above": null,
+              "samples": 257061,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 3.348,
+              "above": null,
+              "samples": 257061,
+              "reason": null
+            },
+            "cores": {
+              "value": 20.517930735890403,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_verification": {
+              "value": 399.45991587450436,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.020569834,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 38.338559,
+              "above": 38.305791,
+              "samples": 257061,
+              "rank": 257061,
+              "reason": null
+            },
+            "overhead_max_ms": {
+              "value": 38.338559,
+              "above": 38.305791,
+              "samples": 257061,
+              "rank": 257061,
+              "reason": null
+            },
+            "overhead_mean_ms": {
+              "value": 0.29234845529660275,
+              "above": 0.29214418653549157,
+              "samples": 257061,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 1.148927,
+              "above": 1.147903,
+              "samples": 257061,
+              "rank": 254491,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 0.228863,
+              "above": 0.228735,
+              "samples": 257061,
+              "rank": 128531,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 0.629247,
+              "above": 0.628735,
+              "samples": 257061,
+              "rank": 244208,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 1.153023,
+              "above": 1.151999,
+              "samples": 257061,
+              "rank": 254491,
+              "reason": null
+            },
+            "rate": {
+              "value": 51364.17928435248,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications": {
+              "value": 256997.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_after_window": {
+              "value": 64.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_cpu_s": {
+              "value": 2503.380089616209,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_s_per_vcpu": {
+              "value": 1605.130602636015,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifier_mean_ms": {
+              "value": 0.002098512415341106,
+              "above": 0.002097972792450041,
+              "samples": 257061,
+              "reason": null
+            },
+            "verifier_p99_ms": {
+              "value": 0.005743,
+              "above": 0.005739,
+              "samples": 257061,
+              "rank": 254491,
+              "reason": null
+            },
+            "wrong": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 257061 observations in 1 series, 0 scanned queries",
+            "component phase_duration{phase=engine}: 0.1210 ms/call, 0.1210 ms mean over 257061",
+            "component outbox_write{outbox=scribe}: 0.0780 ms/call, 72.6086 ms mean over 276",
+            "component phase_duration{phase=stage}: 0.0666 ms/call, 0.0666 ms mean over 257061",
+            "component phase_duration{phase=admit}: 0.0210 ms/call, 0.0210 ms mean over 257061",
+            "component bifrost_scribe_lane_job{lane=persistence}: 0.0169 ms/call, 483.6855 ms mean over 9",
+            "component bifrost_scribe_lane_job{lane=ingress}: 0.0168 ms/call, 3.9062 ms mean over 1108",
+            "component bifrost_scribe_lane_job{lane=wal_io}: 0.0074 ms/call, 0.7397 ms mean over 2566",
+            "component bifrost_scribe_wal_fsync{outcome=success}: 0.0063 ms/call, 4.7616 ms mean over 338",
+            "component phase_duration{phase=load}: 0.0035 ms/call, 0.0035 ms mean over 257061",
+            "component block_duration{kind=assert}: 0.0021 ms/call, 0.0005 ms mean over 1028244",
+            "component bifrost_scribe_queue_wait: 0.0012 ms/call, 0.2703 ms mean over 1109",
+            "component bifrost_scribe_wal_append{outcome=success}: 0.0003 ms/call, 0.0333 ms mean over 2210",
+            "component store_duration{op=runnable_scan}: 0.0001 ms/call, 3.5062 ms mean over 5",
+            "component store_duration{op=due_group_scan}: 0.0001 ms/call, 2.9611 ms mean over 5",
+            "component store_duration{op=queue_depth}: 0.0001 ms/call, 2.9529 ms mean over 5"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "verification.direct",
+              "outcome": "completed",
+              "case": "direct-verify",
+              "phase": "repetition-1",
+              "expected": 257061,
+              "recorded": 257061
+            }
+          ]
+        },
+        {
+          "seconds": 5.001821504,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 102.9,
+          "peak_memory_bytes": 3263029248,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 25.349999999999994,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 1.188,
+              "above": null,
+              "samples": 241267,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 2.549,
+              "above": null,
+              "samples": 241267,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 3.57,
+              "above": null,
+              "samples": 241267,
+              "reason": null
+            },
+            "cores": {
+              "value": 20.57250541981756,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_verification": {
+              "value": 426.611609308342,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.02010687,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 31.260671,
+              "above": 31.244287,
+              "samples": 241267,
+              "rank": 241267,
+              "reason": null
+            },
+            "overhead_max_ms": {
+              "value": 31.244287,
+              "above": 31.227903,
+              "samples": 241267,
+              "rank": 241267,
+              "reason": null
+            },
+            "overhead_mean_ms": {
+              "value": 0.30872558543439427,
+              "above": 0.3085104178151177,
+              "samples": 241267,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 1.249279,
+              "above": 1.248255,
+              "samples": 241267,
+              "rank": 238855,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 0.241791,
+              "above": 0.241663,
+              "samples": 241267,
+              "rank": 120634,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 0.675839,
+              "above": 0.675327,
+              "samples": 241267,
+              "rank": 229204,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 1.252351,
+              "above": 1.251327,
+              "samples": 241267,
+              "rank": 238855,
+              "reason": null
+            },
+            "rate": {
+              "value": 48223.03231075077,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications": {
+              "value": 241203.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_after_window": {
+              "value": 64.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_cpu_s": {
+              "value": 2344.0524781341105,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_s_per_vcpu": {
+              "value": 1506.9697597109616,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifier_mean_ms": {
+              "value": 0.0021455387102256008,
+              "above": 0.0021449685742351834,
+              "samples": 241267,
+              "reason": null
+            },
+            "verifier_p99_ms": {
+              "value": 0.006123,
+              "above": 0.006119,
+              "samples": 241267,
+              "rank": 238855,
+              "reason": null
+            },
+            "wrong": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 241267 observations in 1 series, 0 scanned queries",
+            "component phase_duration{phase=engine}: 0.1288 ms/call, 0.1288 ms mean over 241267",
+            "component outbox_write{outbox=scribe}: 0.0826 ms/call, 79.3661 ms mean over 251",
+            "component phase_duration{phase=stage}: 0.0698 ms/call, 0.0698 ms mean over 241267",
+            "component bifrost_scribe_lane_job{lane=persistence}: 0.0244 ms/call, 589.3828 ms mean over 10",
+            "component phase_duration{phase=admit}: 0.0218 ms/call, 0.0218 ms mean over 241267",
+            "component bifrost_scribe_lane_job{lane=ingress}: 0.0172 ms/call, 4.1671 ms mean over 998",
+            "component bifrost_scribe_lane_job{lane=wal_io}: 0.0077 ms/call, 0.8020 ms mean over 2328",
+            "component bifrost_scribe_wal_fsync{outcome=success}: 0.0066 ms/call, 5.0616 ms mean over 315",
+            "component phase_duration{phase=load}: 0.0034 ms/call, 0.0034 ms mean over 241267",
+            "component block_duration{kind=assert}: 0.0022 ms/call, 0.0005 ms mean over 965068",
+            "component bifrost_scribe_queue_wait: 0.0013 ms/call, 0.3080 ms mean over 998",
+            "component bifrost_scribe_wal_append{outcome=success}: 0.0003 ms/call, 0.0344 ms mean over 2000",
+            "component store_duration{op=runnable_scan}: 0.0001 ms/call, 3.5613 ms mean over 5",
+            "component store_duration{op=due_group_scan}: 0.0001 ms/call, 3.5257 ms mean over 5",
+            "component store_duration{op=due_scan}: 0.0001 ms/call, 2.6506 ms mean over 5"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "verification.direct",
+              "outcome": "completed",
+              "case": "direct-verify",
+              "phase": "repetition-2",
+              "expected": 241267,
+              "recorded": 241267
+            }
+          ]
+        },
+        {
+          "seconds": 5.002796334,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 103.76,
+          "peak_memory_bytes": 3355852800,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 25.629999999999995,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 1.151,
+              "above": null,
+              "samples": 248816,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 2.471,
+              "above": null,
+              "samples": 248816,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 3.439,
+              "above": null,
+              "samples": 248816,
+              "reason": null
+            },
+            "cores": {
+              "value": 20.74040058253549,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_verification": {
+              "value": 417.12227439377375,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.026666585,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 35.356671,
+              "above": 35.323903,
+              "samples": 248816,
+              "rank": 248816,
+              "reason": null
+            },
+            "overhead_max_ms": {
+              "value": 35.323903,
+              "above": 35.291135,
+              "samples": 248816,
+              "rank": 248816,
+              "reason": null
+            },
+            "overhead_mean_ms": {
+              "value": 0.300948433734165,
+              "above": 0.30073834042424924,
+              "samples": 248816,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 1.218559,
+              "above": 1.217535,
+              "samples": 248816,
+              "rank": 246328,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 0.234751,
+              "above": 0.234623,
+              "samples": 248816,
+              "rank": 124408,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 0.653823,
+              "above": 0.653311,
+              "samples": 248816,
+              "rank": 236376,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 1.222655,
+              "above": 1.221631,
+              "samples": 248816,
+              "rank": 246328,
+              "reason": null
+            },
+            "rate": {
+              "value": 49722.5918051934,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications": {
+              "value": 248752.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_after_window": {
+              "value": 64.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_cpu_s": {
+              "value": 2397.3785659213568,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifications_per_s_per_vcpu": {
+              "value": 1553.8309939122937,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "verifier_mean_ms": {
+              "value": 0.00211037224696161,
+              "above": 0.002109833386920455,
+              "samples": 248816,
+              "reason": null
+            },
+            "verifier_p99_ms": {
+              "value": 0.006171,
+              "above": 0.006167,
+              "samples": 248816,
+              "rank": 246328,
+              "reason": null
+            },
+            "wrong": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 248816 observations in 1 series, 0 scanned queries",
+            "component phase_duration{phase=engine}: 0.1246 ms/call, 0.1246 ms mean over 248816",
+            "component outbox_write{outbox=scribe}: 0.0808 ms/call, 80.1420 ms mean over 251",
+            "component phase_duration{phase=stage}: 0.0683 ms/call, 0.0683 ms mean over 248816",
+            "component bifrost_scribe_lane_job{lane=persistence}: 0.0220 ms/call, 498.3166 ms mean over 11",
+            "component phase_duration{phase=admit}: 0.0214 ms/call, 0.0214 ms mean over 248816",
+            "component bifrost_scribe_lane_job{lane=ingress}: 0.0170 ms/call, 4.1941 ms mean over 1007",
+            "component bifrost_scribe_lane_job{lane=wal_io}: 0.0077 ms/call, 0.8226 ms mean over 2339",
+            "component bifrost_scribe_wal_fsync{outcome=success}: 0.0065 ms/call, 5.1084 ms mean over 315",
+            "component phase_duration{phase=load}: 0.0034 ms/call, 0.0034 ms mean over 248816",
+            "component block_duration{kind=assert}: 0.0021 ms/call, 0.0005 ms mean over 995264",
+            "component bifrost_scribe_queue_wait: 0.0012 ms/call, 0.3015 ms mean over 1006",
+            "component bifrost_scribe_wal_append{outcome=success}: 0.0003 ms/call, 0.0366 ms mean over 2010",
+            "component store_duration{op=runnable_scan}: 0.0001 ms/call, 4.3718 ms mean over 5",
+            "component store_duration{op=queue_depth}: 0.0001 ms/call, 3.5126 ms mean over 5",
+            "component store_duration{op=due_scan}: 0.0001 ms/call, 3.5116 ms mean over 5"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "verification.direct",
+              "outcome": "completed",
+              "case": "direct-verify",
+              "phase": "repetition-3",
+              "expected": 248816,
+              "recorded": 248816
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "client_p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 1.151,
+            "above": null,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": 1.112,
+          "max": 1.188,
+          "spread": 0.07599999999999985
+        },
+        "client_p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 2.471,
+            "above": null,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": 2.375,
+          "max": 2.549,
+          "spread": 0.17399999999999993
+        },
+        "client_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 3.439,
+            "above": null,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": 3.348,
+          "max": 3.57,
+          "spread": 0.22199999999999998
+        },
+        "cores": {
+          "unit": "cores",
+          "median": {
+            "value": 20.57250541981756,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 20.517930735890403,
+          "max": 20.74040058253549,
+          "spread": 0.22246984664508673
+        },
+        "cpu_us_per_verification": {
+          "unit": "µs/verification",
+          "median": {
+            "value": 417.12227439377375,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 399.45991587450436,
+          "max": 426.611609308342,
+          "spread": 27.151693433837636
+        },
+        "drain_seconds": {
+          "unit": "",
+          "median": {
+            "value": 0.020569834,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.02010687,
+          "max": 0.026666585,
+          "spread": 0.006559715000000001
+        },
+        "errors": {
+          "unit": "errors",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "max_ms": {
+          "unit": "",
+          "median": {
+            "value": 35.356671,
+            "above": 35.323903,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_max_ms": {
+          "unit": "",
+          "median": {
+            "value": 35.323903,
+            "above": 35.291135,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_mean_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.300948433734165,
+            "above": 0.30073834042424924,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 1.218559,
+            "above": 1.217535,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.234751,
+            "above": 0.234623,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.653823,
+            "above": 0.653311,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 1.222655,
+            "above": 1.221631,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "rate": {
+          "unit": "verifications/s",
+          "median": {
+            "value": 49722.5918051934,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 48223.03231075077,
+          "max": 51364.17928435248,
+          "spread": 3141.1469736017098
+        },
+        "server_failures": {
+          "unit": "verifications",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "verifications": {
+          "unit": "verifications",
+          "median": {
+            "value": 248752.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 241203.0,
+          "max": 256997.0,
+          "spread": 15794.0
+        },
+        "verifications_after_window": {
+          "unit": "",
+          "median": {
+            "value": 64.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 64.0,
+          "max": 64.0,
+          "spread": 0.0
+        },
+        "verifications_per_cpu_s": {
+          "unit": "verifications/cpu-s",
+          "median": {
+            "value": 2397.3785659213568,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 2344.0524781341105,
+          "max": 2503.380089616209,
+          "spread": 159.3276114820983
+        },
+        "verifications_per_s_per_vcpu": {
+          "unit": "verifications/s/vCPU",
+          "median": {
+            "value": 1553.8309939122937,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 1506.9697597109616,
+          "max": 1605.130602636015,
+          "spread": 98.16084292505343
+        },
+        "verifier_mean_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.00211037224696161,
+            "above": 0.002109833386920455,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "verifier_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 0.006123,
+            "above": 0.006119,
+            "samples": 241267,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wrong": {
+          "unit": "verifications",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        }
+      },
+      "criteria": [
+        {
+          "criterion": "overhead-p99",
+          "observed": {
+            "value": 1.218559,
+            "above": 1.217535,
+            "samples": 241267,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 1.148927,
+              "above": 1.147903,
+              "samples": 257061,
+              "rank": 254491,
+              "reason": null
+            },
+            {
+              "value": 1.249279,
+              "above": 1.248255,
+              "samples": 241267,
+              "rank": 238855,
+              "reason": null
+            },
+            {
+              "value": 1.218559,
+              "above": 1.217535,
+              "samples": 248816,
+              "rank": 246328,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "FAIL",
+          "reason": "median (1.218, 1.219] misses < 0.5",
+          "applicable": true
+        },
+        {
+          "criterion": "no-errors",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "PASS",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "correct-verdicts",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "PASS",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "reference.direct-verify.direct-verify-c64.overhead_p99_ms",
+          "observed": {
+            "value": 1.218559,
+            "above": 1.217535,
+            "samples": 241267,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 1.148927,
+              "above": 1.147903,
+              "samples": 257061,
+              "rank": 254491,
+              "reason": null
+            },
+            {
+              "value": 1.249279,
+              "above": 1.248255,
+              "samples": 241267,
+              "rank": 238855,
+              "reason": null
+            },
+            {
+              "value": 1.218559,
+              "above": 1.217535,
+              "samples": 248816,
+              "rank": 246328,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "baseline `reference.direct-verify.direct-verify-c64.overhead_p99_ms` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)",
+          "applicable": true
+        },
+        {
+          "criterion": "reference.direct-verify.direct-verify-c64.cpu_us_per_verification",
+          "observed": {
+            "value": 417.12227439377375,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 399.45991587450436,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 426.611609308342,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 417.12227439377375,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "baseline `reference.direct-verify.direct-verify-c64.cpu_us_per_verification` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)",
+          "applicable": true
+        },
+        {
+          "criterion": "reference.direct-verify.direct-verify-c64.verifications_per_cpu_s",
+          "observed": {
+            "value": 2397.3785659213568,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 2503.380089616209,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 2344.0524781341105,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 2397.3785659213568,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "baseline `reference.direct-verify.direct-verify-c64.verifications_per_cpu_s` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)",
+          "applicable": true
+        },
+        {
+          "criterion": "reference.direct-verify.direct-verify-c64.verifications_per_s_per_vcpu",
+          "observed": {
+            "value": 1553.8309939122937,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 1605.130602636015,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 1506.9697597109616,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 1553.8309939122937,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "baseline `reference.direct-verify.direct-verify-c64.verifications_per_s_per_vcpu` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)",
+          "applicable": true
+        }
+      ],
+      "verdict": "INVALID",
+      "reasons": [
+        {
+          "code": "criterion.failed",
+          "step": "direct-verify-c64",
+          "criterion": "overhead-p99",
+          "message": "median (1.218, 1.219] misses < 0.5"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "direct-verify-c64",
+          "criterion": "reference.direct-verify.direct-verify-c64.overhead_p99_ms",
+          "message": "baseline `reference.direct-verify.direct-verify-c64.overhead_p99_ms` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "direct-verify-c64",
+          "criterion": "reference.direct-verify.direct-verify-c64.cpu_us_per_verification",
+          "message": "baseline `reference.direct-verify.direct-verify-c64.cpu_us_per_verification` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "direct-verify-c64",
+          "criterion": "reference.direct-verify.direct-verify-c64.verifications_per_cpu_s",
+          "message": "baseline `reference.direct-verify.direct-verify-c64.verifications_per_cpu_s` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "direct-verify-c64",
+          "criterion": "reference.direct-verify.direct-verify-c64.verifications_per_s_per_vcpu",
+          "message": "baseline `reference.direct-verify.direct-verify-c64.verifications_per_s_per_vcpu` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        }
+      ]
+    }
+  ],
+  "validity": {
+    "thresholds": {
+      "host_busy_fraction": 0.1,
+      "host_sample_seconds": 10,
+      "driver_cores": 8.0,
+      "driver_fraction": 0.8,
+      "lateness_p99_us": 5000.0,
+      "p99_samples": 1000,
+      "p95_samples": 200
+    },
+    "host_before": {
+      "logical_cpus": 32,
+      "seconds": 10.033468671,
+      "other_cores": 0.8515364342927909,
+      "busiest": [
+        [
+          "qemu-system-x86",
+          0.19766027450561524
+        ],
+        [
+          "ghostty",
+          0.05490562915802002
+        ],
+        [
+          "qemu-system-x86",
+          0.053907346725463864
+        ],
+        [
+          "qemu-system-x86",
+          0.04991421222686768
+        ]
+      ]
+    },
+    "host_after": {
+      "logical_cpus": 32,
+      "seconds": 10.035380084,
+      "other_cores": 1.0242958119511625,
+      "busiest": [
+        [
+          "qemu-system-x86",
+          0.21185436248779296
+        ],
+        [
+          "ghostty",
+          0.10093060493469239
+        ],
+        [
+          "cosmic-comp",
+          0.06295671939849853
+        ],
+        [
+          "qemu-system-x86",
+          0.05895946502685547
+        ]
+      ]
+    },
+    "budget_seconds": 300,
+    "minimum_seconds": 0,
+    "elapsed_seconds": 48.916647518,
+    "reasons": []
+  },
+  "verdict": "INVALID",
+  "reasons": [
+    {
+      "code": "criterion.failed",
+      "step": "direct-verify-c64",
+      "criterion": "overhead-p99",
+      "message": "median (1.218, 1.219] misses < 0.5"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "direct-verify-c64",
+      "criterion": "reference.direct-verify.direct-verify-c64.overhead_p99_ms",
+      "message": "baseline `reference.direct-verify.direct-verify-c64.overhead_p99_ms` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "direct-verify-c64",
+      "criterion": "reference.direct-verify.direct-verify-c64.cpu_us_per_verification",
+      "message": "baseline `reference.direct-verify.direct-verify-c64.cpu_us_per_verification` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "direct-verify-c64",
+      "criterion": "reference.direct-verify.direct-verify-c64.verifications_per_cpu_s",
+      "message": "baseline `reference.direct-verify.direct-verify-c64.verifications_per_cpu_s` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "direct-verify-c64",
+      "criterion": "reference.direct-verify.direct-verify-c64.verifications_per_s_per_vcpu",
+      "message": "baseline `reference.direct-verify.direct-verify-c64.verifications_per_s_per_vcpu` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+    }
+  ],
+  "artifacts": {
+    "directory": "/home/thorrester/Documents/GitHub/wyrd-worktrees/benchmark-experiments/target/benchmarks/verification/direct-verify/20261026T193423Z",
+    "profile": {
+      "requested": false,
+      "complete": false,
+      "captures": [],
+      "notes": []
+    }
+  },
+  "mode": "full",
+  "prepass": {
+    "command": [
+      "l1",
+      "verification",
+      "--steps",
+      "direct-verify-c64",
+      "--allow-dirty",
+      "--smoke"
+    ],
+    "budget_seconds": 600,
+    "elapsed_seconds": 36.824085639,
+    "exit_code": 0,
+    "records": "/home/thorrester/Documents/GitHub/wyrd-worktrees/benchmark-experiments/target/benchmarks/smoke/verification/direct-verify"
+  },
+  "regression_coverage": "uncovered"
+}

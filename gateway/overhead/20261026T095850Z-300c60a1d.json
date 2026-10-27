@@ -1,0 +1,3676 @@
+{
+  "schema_version": 2,
+  "engine": "gateway",
+  "experiment": "overhead",
+  "level": 1,
+  "question": "What overhead does the gateway add to buffered, streamed, and payload-captured chat at 1, 4, 16, and 64 closed-loop clients, and is its p99 strictly under 0.5 ms at 64 clients at every handoff point with every call answered and captured exactly once?",
+  "started_at": "2026-10-26T09:58:50.819553569Z",
+  "finished_at": "2026-10-26T09:59:54.039160367Z",
+  "elapsed_seconds": 63.219600105,
+  "commit": "300c60a1dcc69db27c7d80238c4f87d06f62cebc",
+  "dirty": false,
+  "dirty_override": false,
+  "diff_sha256": null,
+  "host": {
+    "os": "linux",
+    "os_version": "Linux (Pop!_OS 24.04)",
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_cpus": 32,
+    "memory_bytes": 98742132736,
+    "storage": "file:// store in a temporary directory on the local filesystem",
+    "fingerprint": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux"
+  },
+  "build": {
+    "profile": "release",
+    "rustflags": "-C force-frame-pointers=yes",
+    "debug": "line-tables-only",
+    "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "server": {
+      "name": "wyrd-server",
+      "bytes": 1215012944,
+      "modified": "2026-10-26T04:06:29.890490618Z"
+    },
+    "driver": {
+      "name": "capacity",
+      "bytes": 992517752,
+      "modified": "2026-10-26T08:05:13.800903824Z"
+    }
+  },
+  "command": {
+    "args": [
+      "l1",
+      "gateway",
+      "--profile",
+      "--steps",
+      "chat-capture.c64"
+    ],
+    "config": {
+      "WYRD_DATABASE_URL": "<set>",
+      "WYRD_DB_MAX_CONNECTIONS": "8",
+      "WYRD_DB_MAX_CONNECTIONS_VALA": "8",
+      "WYRD_OTLP_ENDPOINT": "http://127.0.0.1:4317",
+      "WYRD_OTLP_SAMPLE_RATIO": "0.01",
+      "WYRD_PLATFORM_DATABASE_URL": "<set>",
+      "WYRD_TEST_DATABASE_ADMIN_URL": "<set>"
+    }
+  },
+  "variables": {
+    "case": [
+      "chat",
+      "chat-stream",
+      "chat-capture"
+    ],
+    "clients": [
+      1,
+      4,
+      16,
+      64
+    ]
+  },
+  "controls": {
+    "timing": {
+      "warmup_seconds": 5,
+      "repetition_seconds": 10,
+      "repetitions": 3,
+      "budget_seconds": 900,
+      "minimum_seconds": 0
+    },
+    "validity": {
+      "host_busy_fraction": 0.1,
+      "host_sample_seconds": 10,
+      "driver_cores": 8.0,
+      "driver_fraction": 0.8,
+      "lateness_p99_us": 5000.0,
+      "p99_samples": 1000,
+      "p95_samples": 200
+    },
+    "values": {
+      "fixture": "stub-provider: an instant local upstream answering a 1 KiB buffered completion, a 32-event stream, and a 64 KiB buffered completion",
+      "limits": {
+        "overhead_p99_ms_lt": 0.5,
+        "at_clients": 64,
+        "errors": 0,
+        "capture": "one staged capture per arrival; no drop, loss, or shedding",
+        "drain_seconds": 60
+      },
+      "server_processes": [
+        "wyrd-server"
+      ],
+      "timing": {
+        "method": "server benchmark histograms: integer nanoseconds from the owning server boundary's std::time::Instant timers, recorded into bounded HDR histograms and read as cumulative snapshots from the loopback metrics listener; each window is the bucket-count difference of two snapshots of one process",
+        "clock": "std::time::Instant: the OS monotonic clock",
+        "precision": "3 significant digits; each percentile is judged on its whole bucket's bounds",
+        "range_ns": [
+          1,
+          137438953472
+        ],
+        "scan_range": [
+          1,
+          1125899906842624
+        ],
+        "max_series": 256,
+        "max_scan_series": 64,
+        "percentile": "nearest rank ceil(q * N) over the window's distribution",
+        "server_env": {
+          "WYRD_METRICS_BENCHMARK_SNAPSHOT": "1"
+        },
+        "tracing": "operator span export stays at its default (disabled); no span is required for timing",
+        "assignment": "every request carries its closed case and the repetition or admission phase that admitted it, activated once its caller authenticated; a window takes the observations recorded between its opening snapshot and one taken after its admitted cohort drained, so a late completion stays in its admitted cohort; each cohort's judged-outcome count must equal the completions the driver saw, other outcomes (retried or refused attempts) are counted beside it; a short or extra count, a dropped or out-of-range observation, an unknown label, a missing or negative component, scans that are not the answered cohort's, or a replaced process makes it invalid",
+        "measurement": "work, wall seconds, and server and driver CPU stop at the admission stop, before the requests then in flight drain; their completions count as late work beside the measured work, and their latency stays in the final cohort",
+        "evidence": "each window's full opening and drained snapshots are kept under the run's target artifacts as timings/<step>/<phase>.json; the record keeps each cohort's reconciliation and each percentile's rank and bucket bounds",
+        "timer_resolution_ns": 10
+      },
+      "workload": "one tenant, one wyrd_sk_ key and keep-alive connection per closed-loop client; each client sends its next call when the last is validated; chat: metadata capture, chat-stream: metadata capture, chat-capture: request and response payload capture"
+    },
+    "selection": [
+      "chat-capture.c64"
+    ]
+  },
+  "criteria": {
+    "metrics": [
+      {
+        "id": "requests",
+        "unit": "requests",
+        "boundary": "client: calls that ended with a complete validated answer in the window",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "arrivals",
+        "unit": "requests",
+        "boundary": "client: calls sent in the window, whatever their outcome",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "errors",
+        "unit": "requests",
+        "boundary": "client: calls refused, timed out, failed, or answered invalidly in the window",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "server_failures",
+        "unit": "requests",
+        "boundary": "server: answer-handoff timings whose outcome is not `succeeded`, counted in their own outcome series and never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "first_event_p99_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: client send until a stream's first complete data event; streams only",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_p99_ms",
+        "unit": "ms",
+        "boundary": "server: per call, handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`) less the union of that call's own provider waits; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "overhead_end_p99_ms",
+        "unit": "ms",
+        "boundary": "server: per stream, handler entry until its final frame handoff (`gateway.stream.end`) less the union of its own provider waits; nearest-rank bucket bounds of the server's timing histograms; streams only",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "upstream_p99_ms",
+        "unit": "ms",
+        "boundary": "server: the union of a call's own provider waits until the answer handoff; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p50_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: client send until the complete validated answer (a stream's EOF), never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p95_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: client send until the complete validated answer (a stream's EOF), never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p99_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: client send until the complete validated answer (a stream's EOF), never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "capture_staged",
+        "unit": "captures",
+        "boundary": "server: wyrd_gateway_capture_total{outcome=staged}, baseline to post-drain scrape",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "capture_unstaged",
+        "unit": "captures",
+        "boundary": "server: |staged captures − arrivals|, arrivals without exactly one staged capture",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "capture_dropped",
+        "unit": "captures",
+        "boundary": "server: captures dropped before staging, any reason",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "capture_lost",
+        "unit": "items",
+        "boundary": "server: outbox_events_lost_total for every reason but accounted shedding",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "capture_shed",
+        "unit": "items",
+        "boundary": "server: outbox_events_lost_total{reason=shed}, items shed at an outbox's staging limit, accounted separately from loss",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "capture_bytes",
+        "unit": "bytes",
+        "boundary": "server: accounted bytes the Scribe outbox wrote from the window open to its measured stop, the CPU interval; drained writes are excluded",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "drain_s",
+        "unit": "s",
+        "boundary": "server: arrivals stopped until no gateway call is active and every outbox is empty",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "undrained",
+        "unit": "items",
+        "boundary": "server: active gateway calls plus pending outbox items still present when the drain limit passed",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "p50_ms",
+        "unit": "ms",
+        "boundary": "server: handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`), successful calls; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "p95_ms",
+        "unit": "ms",
+        "boundary": "server: handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`), successful calls; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "p99_ms",
+        "unit": "ms",
+        "boundary": "server: handler entry until the answer handoff (`gateway.buffered`, or a stream's head at `gateway.stream.head`), successful calls; nearest-rank bucket bounds of the server's timing histograms",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "cores",
+        "unit": "cores",
+        "boundary": "C/T: server CPU-seconds of the declared processes per wall second of the window",
+        "direction": null,
+        "derive": {
+          "kind": "cores"
+        }
+      },
+      {
+        "id": "rate",
+        "unit": "requests/s",
+        "boundary": "answered requests per measured second",
+        "direction": "higher",
+        "derive": {
+          "kind": "rate",
+          "work": "requests",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "requests_per_s_per_vcpu",
+        "unit": "requests/s/vCPU",
+        "boundary": "(W/T)/P: answered requests per wall second per provisioned vCPU",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_vcpu",
+          "work": "requests",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "requests_per_cpu_s",
+        "unit": "requests/cpu-s",
+        "boundary": "W/C: answered requests per server CPU-second used",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_cpu",
+          "work": "requests",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "cpu_us_per_request",
+        "unit": "µs/request",
+        "boundary": "server CPU microseconds per answered request",
+        "direction": "lower",
+        "derive": {
+          "kind": "cpu_per",
+          "work": "requests",
+          "scale": 1000000.0
+        }
+      },
+      {
+        "id": "capture_bytes_per_s_per_vcpu",
+        "unit": "B/s/vCPU",
+        "boundary": "(W/T)/P: accounted capture bytes the Scribe outbox wrote per wall second per provisioned vCPU",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_vcpu",
+          "work": "capture_bytes",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "capture_bytes_per_cpu_s",
+        "unit": "B/cpu-s",
+        "boundary": "W/C: accounted capture bytes the Scribe outbox wrote per server CPU-second used",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_cpu",
+          "work": "capture_bytes",
+          "scale": 1.0
+        }
+      }
+    ],
+    "criteria": [
+      {
+        "id": "overhead-p99",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat.c64",
+          "chat-stream.c64",
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "lt",
+          "limit": 0.5,
+          "over": "median"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "overhead-end-p99",
+        "metric": "overhead_end_p99_ms",
+        "steps": [
+          "chat-stream.c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "lt",
+          "limit": 0.5,
+          "over": "median"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "no-errors",
+        "metric": "errors",
+        "steps": [
+          "chat.c1",
+          "chat.c4",
+          "chat.c16",
+          "chat.c64",
+          "chat-stream.c1",
+          "chat-stream.c4",
+          "chat-stream.c16",
+          "chat-stream.c64",
+          "chat-capture.c1",
+          "chat-capture.c4",
+          "chat-capture.c16",
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "capture-per-arrival",
+        "metric": "capture_unstaged",
+        "steps": [
+          "chat.c1",
+          "chat.c4",
+          "chat.c16",
+          "chat.c64",
+          "chat-stream.c1",
+          "chat-stream.c4",
+          "chat-stream.c16",
+          "chat-stream.c64",
+          "chat-capture.c1",
+          "chat-capture.c4",
+          "chat-capture.c16",
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "capture-dropped",
+        "metric": "capture_dropped",
+        "steps": [
+          "chat.c1",
+          "chat.c4",
+          "chat.c16",
+          "chat.c64",
+          "chat-stream.c1",
+          "chat-stream.c4",
+          "chat-stream.c16",
+          "chat-stream.c64",
+          "chat-capture.c1",
+          "chat-capture.c4",
+          "chat-capture.c16",
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "capture-lost",
+        "metric": "capture_lost",
+        "steps": [
+          "chat.c1",
+          "chat.c4",
+          "chat.c16",
+          "chat.c64",
+          "chat-stream.c1",
+          "chat-stream.c4",
+          "chat-stream.c16",
+          "chat-stream.c64",
+          "chat-capture.c1",
+          "chat-capture.c4",
+          "chat-capture.c16",
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "capture-shed",
+        "metric": "capture_shed",
+        "steps": [
+          "chat.c1",
+          "chat.c4",
+          "chat.c16",
+          "chat.c64",
+          "chat-stream.c1",
+          "chat-stream.c4",
+          "chat-stream.c16",
+          "chat-stream.c64",
+          "chat-capture.c1",
+          "chat-capture.c4",
+          "chat-capture.c16",
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "drained",
+        "metric": "undrained",
+        "steps": [
+          "chat.c1",
+          "chat.c4",
+          "chat.c16",
+          "chat.c64",
+          "chat-stream.c1",
+          "chat-stream.c4",
+          "chat-stream.c16",
+          "chat-stream.c64",
+          "chat-capture.c1",
+          "chat-capture.c4",
+          "chat-capture.c16",
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c1.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c1.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat.c1.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c1.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c1.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c1.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c1.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c1.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c4.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c4.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat.c4.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c4.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c4.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c4.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c4.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c4.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c16.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c16.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat.c16.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c16.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c16.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c16.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c16.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c16.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c64.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c64.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat.c64.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c64.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c64.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c64.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat.c64.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat.c64.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c1.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat-stream.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c1.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-stream.c1.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat-stream.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c1.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c1.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat-stream.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c1.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c1.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat-stream.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c1.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c1.overhead_end_p99_ms",
+        "metric": "overhead_end_p99_ms",
+        "steps": [
+          "chat-stream.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c1.overhead_end_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-stream.c4.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat-stream.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c4.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-stream.c4.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat-stream.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c4.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c4.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat-stream.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c4.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c4.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat-stream.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c4.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c4.overhead_end_p99_ms",
+        "metric": "overhead_end_p99_ms",
+        "steps": [
+          "chat-stream.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c4.overhead_end_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-stream.c16.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat-stream.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c16.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-stream.c16.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat-stream.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c16.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c16.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat-stream.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c16.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c16.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat-stream.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c16.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c16.overhead_end_p99_ms",
+        "metric": "overhead_end_p99_ms",
+        "steps": [
+          "chat-stream.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c16.overhead_end_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-stream.c64.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat-stream.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c64.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-stream.c64.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat-stream.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c64.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c64.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat-stream.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c64.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c64.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat-stream.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c64.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-stream.c64.overhead_end_p99_ms",
+        "metric": "overhead_end_p99_ms",
+        "steps": [
+          "chat-stream.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-stream.c64.overhead_end_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-capture.c1.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat-capture.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c1.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-capture.c1.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat-capture.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c1.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c1.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat-capture.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c1.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c1.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat-capture.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c1.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c1.capture_bytes_per_cpu_s",
+        "metric": "capture_bytes_per_cpu_s",
+        "steps": [
+          "chat-capture.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c1.capture_bytes_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c1.capture_bytes_per_s_per_vcpu",
+        "metric": "capture_bytes_per_s_per_vcpu",
+        "steps": [
+          "chat-capture.c1"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c1.capture_bytes_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c4.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat-capture.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c4.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-capture.c4.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat-capture.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c4.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c4.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat-capture.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c4.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c4.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat-capture.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c4.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c4.capture_bytes_per_cpu_s",
+        "metric": "capture_bytes_per_cpu_s",
+        "steps": [
+          "chat-capture.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c4.capture_bytes_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c4.capture_bytes_per_s_per_vcpu",
+        "metric": "capture_bytes_per_s_per_vcpu",
+        "steps": [
+          "chat-capture.c4"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c4.capture_bytes_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c16.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat-capture.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c16.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-capture.c16.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat-capture.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c16.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c16.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat-capture.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c16.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c16.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat-capture.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c16.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c16.capture_bytes_per_cpu_s",
+        "metric": "capture_bytes_per_cpu_s",
+        "steps": [
+          "chat-capture.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c16.capture_bytes_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c16.capture_bytes_per_s_per_vcpu",
+        "metric": "capture_bytes_per_s_per_vcpu",
+        "steps": [
+          "chat-capture.c16"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c16.capture_bytes_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c64.overhead_p99_ms",
+        "metric": "overhead_p99_ms",
+        "steps": [
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c64.overhead_p99_ms",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": 99
+      },
+      {
+        "id": "reference.overhead.chat-capture.c64.cpu_us_per_request",
+        "metric": "cpu_us_per_request",
+        "steps": [
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c64.cpu_us_per_request",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c64.requests_per_cpu_s",
+        "metric": "requests_per_cpu_s",
+        "steps": [
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c64.requests_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c64.requests_per_s_per_vcpu",
+        "metric": "requests_per_s_per_vcpu",
+        "steps": [
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c64.requests_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c64.capture_bytes_per_cpu_s",
+        "metric": "capture_bytes_per_cpu_s",
+        "steps": [
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c64.capture_bytes_per_cpu_s",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      },
+      {
+        "id": "reference.overhead.chat-capture.c64.capture_bytes_per_s_per_vcpu",
+        "metric": "capture_bytes_per_s_per_vcpu",
+        "steps": [
+          "chat-capture.c64"
+        ],
+        "rule": {
+          "kind": "unusable",
+          "baseline": "reference.overhead.chat-capture.c64.capture_bytes_per_s_per_vcpu",
+          "reason": "no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        "percentile": null
+      }
+    ],
+    "references": [
+      {
+        "step": "chat.c1",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:d416f2d52fde59fc"
+      },
+      {
+        "step": "chat.c1",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:d416f2d52fde59fc"
+      },
+      {
+        "step": "chat.c1",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:d416f2d52fde59fc"
+      },
+      {
+        "step": "chat.c1",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:d416f2d52fde59fc"
+      },
+      {
+        "step": "chat.c4",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:4aebdd657e4a775f"
+      },
+      {
+        "step": "chat.c4",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:4aebdd657e4a775f"
+      },
+      {
+        "step": "chat.c4",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:4aebdd657e4a775f"
+      },
+      {
+        "step": "chat.c4",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:4aebdd657e4a775f"
+      },
+      {
+        "step": "chat.c16",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:ae61a56d14441741"
+      },
+      {
+        "step": "chat.c16",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:ae61a56d14441741"
+      },
+      {
+        "step": "chat.c16",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:ae61a56d14441741"
+      },
+      {
+        "step": "chat.c16",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:ae61a56d14441741"
+      },
+      {
+        "step": "chat.c64",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:cc23f3e4ecac368f"
+      },
+      {
+        "step": "chat.c64",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:cc23f3e4ecac368f"
+      },
+      {
+        "step": "chat.c64",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:cc23f3e4ecac368f"
+      },
+      {
+        "step": "chat.c64",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:cc23f3e4ecac368f"
+      },
+      {
+        "step": "chat-stream.c1",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:c496fc6c8446c9a0"
+      },
+      {
+        "step": "chat-stream.c1",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:c496fc6c8446c9a0"
+      },
+      {
+        "step": "chat-stream.c1",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:c496fc6c8446c9a0"
+      },
+      {
+        "step": "chat-stream.c1",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:c496fc6c8446c9a0"
+      },
+      {
+        "step": "chat-stream.c1",
+        "metric": "overhead_end_p99_ms",
+        "percentile": 99,
+        "method": "sha256:c496fc6c8446c9a0"
+      },
+      {
+        "step": "chat-stream.c4",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:a68c601355a9231c"
+      },
+      {
+        "step": "chat-stream.c4",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:a68c601355a9231c"
+      },
+      {
+        "step": "chat-stream.c4",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:a68c601355a9231c"
+      },
+      {
+        "step": "chat-stream.c4",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:a68c601355a9231c"
+      },
+      {
+        "step": "chat-stream.c4",
+        "metric": "overhead_end_p99_ms",
+        "percentile": 99,
+        "method": "sha256:a68c601355a9231c"
+      },
+      {
+        "step": "chat-stream.c16",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:a92f8ce72d1e178e"
+      },
+      {
+        "step": "chat-stream.c16",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:a92f8ce72d1e178e"
+      },
+      {
+        "step": "chat-stream.c16",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:a92f8ce72d1e178e"
+      },
+      {
+        "step": "chat-stream.c16",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:a92f8ce72d1e178e"
+      },
+      {
+        "step": "chat-stream.c16",
+        "metric": "overhead_end_p99_ms",
+        "percentile": 99,
+        "method": "sha256:a92f8ce72d1e178e"
+      },
+      {
+        "step": "chat-stream.c64",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:f2e39eda2121e0b9"
+      },
+      {
+        "step": "chat-stream.c64",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:f2e39eda2121e0b9"
+      },
+      {
+        "step": "chat-stream.c64",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:f2e39eda2121e0b9"
+      },
+      {
+        "step": "chat-stream.c64",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:f2e39eda2121e0b9"
+      },
+      {
+        "step": "chat-stream.c64",
+        "metric": "overhead_end_p99_ms",
+        "percentile": 99,
+        "method": "sha256:f2e39eda2121e0b9"
+      },
+      {
+        "step": "chat-capture.c1",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:87be229c93e95e0a"
+      },
+      {
+        "step": "chat-capture.c1",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:87be229c93e95e0a"
+      },
+      {
+        "step": "chat-capture.c1",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:87be229c93e95e0a"
+      },
+      {
+        "step": "chat-capture.c1",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:87be229c93e95e0a"
+      },
+      {
+        "step": "chat-capture.c1",
+        "metric": "capture_bytes_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:87be229c93e95e0a"
+      },
+      {
+        "step": "chat-capture.c1",
+        "metric": "capture_bytes_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:87be229c93e95e0a"
+      },
+      {
+        "step": "chat-capture.c4",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:0ce5c4ee5c69b428"
+      },
+      {
+        "step": "chat-capture.c4",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:0ce5c4ee5c69b428"
+      },
+      {
+        "step": "chat-capture.c4",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:0ce5c4ee5c69b428"
+      },
+      {
+        "step": "chat-capture.c4",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:0ce5c4ee5c69b428"
+      },
+      {
+        "step": "chat-capture.c4",
+        "metric": "capture_bytes_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:0ce5c4ee5c69b428"
+      },
+      {
+        "step": "chat-capture.c4",
+        "metric": "capture_bytes_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:0ce5c4ee5c69b428"
+      },
+      {
+        "step": "chat-capture.c16",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:d0046ae8f8593d4c"
+      },
+      {
+        "step": "chat-capture.c16",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:d0046ae8f8593d4c"
+      },
+      {
+        "step": "chat-capture.c16",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:d0046ae8f8593d4c"
+      },
+      {
+        "step": "chat-capture.c16",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:d0046ae8f8593d4c"
+      },
+      {
+        "step": "chat-capture.c16",
+        "metric": "capture_bytes_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:d0046ae8f8593d4c"
+      },
+      {
+        "step": "chat-capture.c16",
+        "metric": "capture_bytes_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:d0046ae8f8593d4c"
+      },
+      {
+        "step": "chat-capture.c64",
+        "metric": "overhead_p99_ms",
+        "percentile": 99,
+        "method": "sha256:d9c13b5e797b2a92"
+      },
+      {
+        "step": "chat-capture.c64",
+        "metric": "cpu_us_per_request",
+        "percentile": null,
+        "method": "sha256:d9c13b5e797b2a92"
+      },
+      {
+        "step": "chat-capture.c64",
+        "metric": "requests_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:d9c13b5e797b2a92"
+      },
+      {
+        "step": "chat-capture.c64",
+        "metric": "requests_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:d9c13b5e797b2a92"
+      },
+      {
+        "step": "chat-capture.c64",
+        "metric": "capture_bytes_per_cpu_s",
+        "percentile": null,
+        "method": "sha256:d9c13b5e797b2a92"
+      },
+      {
+        "step": "chat-capture.c64",
+        "metric": "capture_bytes_per_s_per_vcpu",
+        "percentile": null,
+        "method": "sha256:d9c13b5e797b2a92"
+      }
+    ]
+  },
+  "steps": [
+    {
+      "id": "chat.c1",
+      "params": {
+        "case": "chat",
+        "clients": 1,
+        "request_bytes": 1024,
+        "stream": false
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat.c4",
+      "params": {
+        "case": "chat",
+        "clients": 4,
+        "request_bytes": 1024,
+        "stream": false
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat.c16",
+      "params": {
+        "case": "chat",
+        "clients": 16,
+        "request_bytes": 1024,
+        "stream": false
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat.c64",
+      "params": {
+        "case": "chat",
+        "clients": 64,
+        "request_bytes": 1024,
+        "stream": false
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat-stream.c1",
+      "params": {
+        "case": "chat-stream",
+        "clients": 1,
+        "request_bytes": 1024,
+        "stream": true
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat-stream.c4",
+      "params": {
+        "case": "chat-stream",
+        "clients": 4,
+        "request_bytes": 1024,
+        "stream": true
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat-stream.c16",
+      "params": {
+        "case": "chat-stream",
+        "clients": 16,
+        "request_bytes": 1024,
+        "stream": true
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat-stream.c64",
+      "params": {
+        "case": "chat-stream",
+        "clients": 64,
+        "request_bytes": 1024,
+        "stream": true
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat-capture.c1",
+      "params": {
+        "case": "chat-capture",
+        "clients": 1,
+        "request_bytes": 65536,
+        "stream": false
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat-capture.c4",
+      "params": {
+        "case": "chat-capture",
+        "clients": 4,
+        "request_bytes": 65536,
+        "stream": false
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat-capture.c16",
+      "params": {
+        "case": "chat-capture",
+        "clients": 16,
+        "request_bytes": 65536,
+        "stream": false
+      },
+      "status": "omitted",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "chat-capture.c64",
+      "params": {
+        "case": "chat-capture",
+        "clients": 64,
+        "request_bytes": 65536,
+        "stream": false
+      },
+      "status": "measured",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 900,
+        "minimum_seconds": 0
+      },
+      "repetitions": [
+        {
+          "seconds": 10.006324948,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 216.04,
+          "peak_memory_bytes": 5840654336,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 48.05000000000001,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "arrivals": {
+              "value": 95117.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_bytes": {
+              "value": 1307196353.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_bytes_per_cpu_s": {
+              "value": 6050714.464913905,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_bytes_per_s_per_vcpu": {
+              "value": 4082406.502240847,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_dropped": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_lost": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_shed": {
+              "value": 170060.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_staged": {
+              "value": 95117.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_unstaged": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "client_p50_ms": {
+              "value": 6.408,
+              "above": null,
+              "samples": 95117,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 10.316,
+              "above": null,
+              "samples": 95117,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 12.475,
+              "above": null,
+              "samples": 95117,
+              "reason": null
+            },
+            "cores": {
+              "value": 21.590344219550925,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_request": {
+              "value": 2272.837259213281,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_s": {
+              "value": 0.31816161,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.02765638,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "first_event_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "inapplicable: a buffered call has no stream events"
+            },
+            "late_requests": {
+              "value": 64.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 44.990463,
+              "above": 44.957695,
+              "samples": 95117,
+              "rank": 95117,
+              "reason": null
+            },
+            "overhead_end_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "inapplicable: a buffered call has no final stream frame"
+            },
+            "overhead_max_ms": {
+              "value": 41.484287,
+              "above": 41.451519,
+              "samples": 95117,
+              "rank": 95117,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 4.374527,
+              "above": 4.370431,
+              "samples": 95117,
+              "rank": 94166,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 3.993599,
+              "above": 3.991551,
+              "samples": 95117,
+              "rank": 47559,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 6.942719,
+              "above": 6.938623,
+              "samples": 95117,
+              "rank": 90362,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 8.749055,
+              "above": 8.740863,
+              "samples": 95117,
+              "rank": 94166,
+              "reason": null
+            },
+            "rate": {
+              "value": 9499.29174736611,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 95053.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests_per_cpu_s": {
+              "value": 439.9787076467321,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests_per_s_per_vcpu": {
+              "value": 296.8528671051909,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "undrained": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "upstream_p99_ms": {
+              "value": 6.586367,
+              "above": 6.582271,
+              "samples": 95117,
+              "rank": 94166,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 95117 observations in 1 series, 0 scanned queries",
+            "capture saturated: 170060 items shed at the outbox limit (89.4% of outbox items); durable capture 1726 items/s, 124.6 MiB/s"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "gateway.buffered",
+              "outcome": "succeeded",
+              "case": "buffered-payload",
+              "phase": "repetition-1",
+              "expected": 95117,
+              "recorded": 95117
+            }
+          ]
+        },
+        {
+          "seconds": 10.008623885,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 216.94,
+          "peak_memory_bytes": 6726152192,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 47.69,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "arrivals": {
+              "value": 95452.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_bytes": {
+              "value": 1256388133.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_bytes_per_cpu_s": {
+              "value": 5791408.37558772,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_bytes_per_s_per_vcpu": {
+              "value": 3922829.912221244,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_dropped": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_lost": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_shed": {
+              "value": 170712.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_staged": {
+              "value": 95452.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_unstaged": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "client_p50_ms": {
+              "value": 6.385,
+              "above": null,
+              "samples": 95452,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 10.34,
+              "above": null,
+              "samples": 95452,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 12.521,
+              "above": null,
+              "samples": 95452,
+              "reason": null
+            },
+            "cores": {
+              "value": 21.675307464108986,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_request": {
+              "value": 2274.290267119554,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_s": {
+              "value": 0.317909118,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.024542318,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "first_event_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "inapplicable: a buffered call has no stream events"
+            },
+            "late_requests": {
+              "value": 64.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 35.028991,
+              "above": 34.996223,
+              "samples": 95452,
+              "rank": 95452,
+              "reason": null
+            },
+            "overhead_end_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "inapplicable: a buffered call has no final stream frame"
+            },
+            "overhead_max_ms": {
+              "value": 31.129599,
+              "above": 31.113215,
+              "samples": 95452,
+              "rank": 95452,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 4.435967,
+              "above": 4.431871,
+              "samples": 95452,
+              "rank": 94498,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 3.985407,
+              "above": 3.983359,
+              "samples": 95452,
+              "rank": 47726,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 6.926335,
+              "above": 6.922239,
+              "samples": 95452,
+              "rank": 90680,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 8.822783,
+              "above": 8.814591,
+              "samples": 95452,
+              "rank": 94498,
+              "reason": null
+            },
+            "rate": {
+              "value": 9530.580936601955,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 95388.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests_per_cpu_s": {
+              "value": 439.6976122430165,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests_per_s_per_vcpu": {
+              "value": 297.8306542688111,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "undrained": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "upstream_p99_ms": {
+              "value": 6.500351,
+              "above": 6.496255,
+              "samples": 95452,
+              "rank": 94498,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 95452 observations in 1 series, 0 scanned queries",
+            "capture saturated: 170712 items shed at the outbox limit (89.4% of outbox items); durable capture 1662 items/s, 119.7 MiB/s"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "gateway.buffered",
+              "outcome": "succeeded",
+              "case": "buffered-payload",
+              "phase": "repetition-2",
+              "expected": 95452,
+              "recorded": 95452
+            }
+          ]
+        },
+        {
+          "seconds": 10.008802957,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 218.97,
+          "peak_memory_bytes": 5637025792,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 47.05,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "arrivals": {
+              "value": 92840.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_bytes": {
+              "value": 1267494185.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_bytes_per_cpu_s": {
+              "value": 5788437.617025163,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_bytes_per_s_per_vcpu": {
+              "value": 3957435.614570467,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_dropped": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_lost": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_shed": {
+              "value": 165353.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_staged": {
+              "value": 92840.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "capture_unstaged": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "client_p50_ms": {
+              "value": 6.559,
+              "above": null,
+              "samples": 92840,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 10.608,
+              "above": null,
+              "samples": 92840,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 12.999,
+              "above": null,
+              "samples": 92840,
+              "reason": null
+            },
+            "cores": {
+              "value": 21.87774111856761,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "cpu_us_per_request": {
+              "value": 2360.2009140294904,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_s": {
+              "value": 0.532966991,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "drain_seconds": {
+              "value": 0.025618281,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "first_event_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "inapplicable: a buffered call has no stream events"
+            },
+            "late_requests": {
+              "value": 64.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "max_ms": {
+              "value": 31.244287,
+              "above": 31.227903,
+              "samples": 92840,
+              "rank": 92840,
+              "reason": null
+            },
+            "overhead_end_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "inapplicable: a buffered call has no final stream frame"
+            },
+            "overhead_max_ms": {
+              "value": 27.836415,
+              "above": 27.820031,
+              "samples": 92840,
+              "rank": 92840,
+              "reason": null
+            },
+            "overhead_p99_ms": {
+              "value": 4.538367,
+              "above": 4.534271,
+              "samples": 92840,
+              "rank": 91912,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 4.079615,
+              "above": 4.077567,
+              "samples": 92840,
+              "rank": 46420,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 7.139327,
+              "above": 7.135231,
+              "samples": 92840,
+              "rank": 88198,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 9.134079,
+              "above": 9.125887,
+              "samples": 92840,
+              "rank": 91912,
+              "reason": null
+            },
+            "rate": {
+              "value": 9269.440151693057,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 92776.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests_per_cpu_s": {
+              "value": 423.6927432981687,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests_per_s_per_vcpu": {
+              "value": 289.67000474040805,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "undrained": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "upstream_p99_ms": {
+              "value": 6.721535,
+              "above": 6.717439,
+              "samples": 92840,
+              "rank": 91912,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 92840 observations in 1 series, 0 scanned queries",
+            "capture saturated: 165353 items shed at the outbox limit (89.1% of outbox items); durable capture 1675 items/s, 120.8 MiB/s"
+          ],
+          "reconciliation": [
+            {
+              "boundary": "gateway.buffered",
+              "outcome": "succeeded",
+              "case": "buffered-payload",
+              "phase": "repetition-3",
+              "expected": 92840,
+              "recorded": 92840
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "arrivals": {
+          "unit": "requests",
+          "median": {
+            "value": 95117.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 92840.0,
+          "max": 95452.0,
+          "spread": 2612.0
+        },
+        "capture_bytes": {
+          "unit": "bytes",
+          "median": {
+            "value": 1267494185.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 1256388133.0,
+          "max": 1307196353.0,
+          "spread": 50808220.0
+        },
+        "capture_bytes_per_cpu_s": {
+          "unit": "B/cpu-s",
+          "median": {
+            "value": 5791408.37558772,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 5788437.617025163,
+          "max": 6050714.464913905,
+          "spread": 262276.84788874164
+        },
+        "capture_bytes_per_s_per_vcpu": {
+          "unit": "B/s/vCPU",
+          "median": {
+            "value": 3957435.614570467,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 3922829.912221244,
+          "max": 4082406.502240847,
+          "spread": 159576.5900196028
+        },
+        "capture_dropped": {
+          "unit": "captures",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "capture_lost": {
+          "unit": "items",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "capture_shed": {
+          "unit": "items",
+          "median": {
+            "value": 170060.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 165353.0,
+          "max": 170712.0,
+          "spread": 5359.0
+        },
+        "capture_staged": {
+          "unit": "captures",
+          "median": {
+            "value": 95117.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 92840.0,
+          "max": 95452.0,
+          "spread": 2612.0
+        },
+        "capture_unstaged": {
+          "unit": "captures",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "client_p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 6.408,
+            "above": null,
+            "samples": 92840,
+            "reason": null
+          },
+          "min": 6.385,
+          "max": 6.559,
+          "spread": 0.17400000000000038
+        },
+        "client_p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 10.34,
+            "above": null,
+            "samples": 92840,
+            "reason": null
+          },
+          "min": 10.316,
+          "max": 10.608,
+          "spread": 0.2919999999999998
+        },
+        "client_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 12.521,
+            "above": null,
+            "samples": 92840,
+            "reason": null
+          },
+          "min": 12.475,
+          "max": 12.999,
+          "spread": 0.5240000000000009
+        },
+        "cores": {
+          "unit": "cores",
+          "median": {
+            "value": 21.675307464108986,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 21.590344219550925,
+          "max": 21.87774111856761,
+          "spread": 0.2873968990166844
+        },
+        "cpu_us_per_request": {
+          "unit": "µs/request",
+          "median": {
+            "value": 2274.290267119554,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 2272.837259213281,
+          "max": 2360.2009140294904,
+          "spread": 87.36365481620942
+        },
+        "drain_s": {
+          "unit": "s",
+          "median": {
+            "value": 0.31816161,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.317909118,
+          "max": 0.532966991,
+          "spread": 0.215057873
+        },
+        "drain_seconds": {
+          "unit": "",
+          "median": {
+            "value": 0.025618281,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.024542318,
+          "max": 0.02765638,
+          "spread": 0.0031140620000000008
+        },
+        "errors": {
+          "unit": "requests",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "first_event_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "inapplicable: a buffered call has no stream events"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "late_requests": {
+          "unit": "",
+          "median": {
+            "value": 64.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 64.0,
+          "max": 64.0,
+          "spread": 0.0
+        },
+        "max_ms": {
+          "unit": "",
+          "median": {
+            "value": 35.028991,
+            "above": 34.996223,
+            "samples": 92840,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_end_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "inapplicable: a buffered call has no final stream frame"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_max_ms": {
+          "unit": "",
+          "median": {
+            "value": 31.129599,
+            "above": 31.113215,
+            "samples": 92840,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "overhead_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 4.435967,
+            "above": 4.431871,
+            "samples": 92840,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 3.993599,
+            "above": 3.991551,
+            "samples": 92840,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 6.942719,
+            "above": 6.938623,
+            "samples": 92840,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 8.822783,
+            "above": 8.814591,
+            "samples": 92840,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "rate": {
+          "unit": "requests/s",
+          "median": {
+            "value": 9499.29174736611,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 9269.440151693057,
+          "max": 9530.580936601955,
+          "spread": 261.14078490889733
+        },
+        "requests": {
+          "unit": "requests",
+          "median": {
+            "value": 95053.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 92776.0,
+          "max": 95388.0,
+          "spread": 2612.0
+        },
+        "requests_per_cpu_s": {
+          "unit": "requests/cpu-s",
+          "median": {
+            "value": 439.6976122430165,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 423.6927432981687,
+          "max": 439.9787076467321,
+          "spread": 16.285964348563425
+        },
+        "requests_per_s_per_vcpu": {
+          "unit": "requests/s/vCPU",
+          "median": {
+            "value": 296.8528671051909,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 289.67000474040805,
+          "max": 297.8306542688111,
+          "spread": 8.160649528403042
+        },
+        "server_failures": {
+          "unit": "requests",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "undrained": {
+          "unit": "items",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "upstream_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 6.586367,
+            "above": 6.582271,
+            "samples": 92840,
+            "reason": null
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        }
+      },
+      "criteria": [
+        {
+          "criterion": "overhead-p99",
+          "observed": {
+            "value": 4.435967,
+            "above": 4.431871,
+            "samples": 92840,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 4.374527,
+              "above": 4.370431,
+              "samples": 95117,
+              "rank": 94166,
+              "reason": null
+            },
+            {
+              "value": 4.435967,
+              "above": 4.431871,
+              "samples": 95452,
+              "rank": 94498,
+              "reason": null
+            },
+            {
+              "value": 4.538367,
+              "above": 4.534271,
+              "samples": 92840,
+              "rank": 91912,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "FAIL",
+          "reason": "median (4.432, 4.436] misses < 0.5",
+          "applicable": true
+        },
+        {
+          "criterion": "no-errors",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "PASS",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "capture-per-arrival",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "PASS",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "capture-dropped",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "PASS",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "capture-lost",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "PASS",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "capture-shed",
+          "observed": {
+            "value": 170060.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 170060.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 170712.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 165353.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "FAIL",
+          "reason": "repetition 1 read 170060, missing ≤ 0",
+          "applicable": true
+        },
+        {
+          "criterion": "drained",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "PASS",
+          "reason": null,
+          "applicable": true
+        },
+        {
+          "criterion": "reference.overhead.chat-capture.c64.overhead_p99_ms",
+          "observed": {
+            "value": 4.435967,
+            "above": 4.431871,
+            "samples": 92840,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 4.374527,
+              "above": 4.370431,
+              "samples": 95117,
+              "rank": 94166,
+              "reason": null
+            },
+            {
+              "value": 4.435967,
+              "above": 4.431871,
+              "samples": 95452,
+              "rank": 94498,
+              "reason": null
+            },
+            {
+              "value": 4.538367,
+              "above": 4.534271,
+              "samples": 92840,
+              "rank": 91912,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "baseline `reference.overhead.chat-capture.c64.overhead_p99_ms` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)",
+          "applicable": true
+        },
+        {
+          "criterion": "reference.overhead.chat-capture.c64.cpu_us_per_request",
+          "observed": {
+            "value": 2274.290267119554,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 2272.837259213281,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 2274.290267119554,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 2360.2009140294904,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "baseline `reference.overhead.chat-capture.c64.cpu_us_per_request` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)",
+          "applicable": true
+        },
+        {
+          "criterion": "reference.overhead.chat-capture.c64.requests_per_cpu_s",
+          "observed": {
+            "value": 439.6976122430165,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 439.9787076467321,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 439.6976122430165,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 423.6927432981687,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "baseline `reference.overhead.chat-capture.c64.requests_per_cpu_s` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)",
+          "applicable": true
+        },
+        {
+          "criterion": "reference.overhead.chat-capture.c64.requests_per_s_per_vcpu",
+          "observed": {
+            "value": 296.8528671051909,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 296.8528671051909,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 297.8306542688111,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 289.67000474040805,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "baseline `reference.overhead.chat-capture.c64.requests_per_s_per_vcpu` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)",
+          "applicable": true
+        },
+        {
+          "criterion": "reference.overhead.chat-capture.c64.capture_bytes_per_cpu_s",
+          "observed": {
+            "value": 5791408.37558772,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 6050714.464913905,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 5791408.37558772,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 5788437.617025163,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "baseline `reference.overhead.chat-capture.c64.capture_bytes_per_cpu_s` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)",
+          "applicable": true
+        },
+        {
+          "criterion": "reference.overhead.chat-capture.c64.capture_bytes_per_s_per_vcpu",
+          "observed": {
+            "value": 3957435.614570467,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 4082406.502240847,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 3922829.912221244,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 3957435.614570467,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "baseline `reference.overhead.chat-capture.c64.capture_bytes_per_s_per_vcpu` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)",
+          "applicable": true
+        }
+      ],
+      "verdict": "INVALID",
+      "reasons": [
+        {
+          "code": "criterion.failed",
+          "step": "chat-capture.c64",
+          "criterion": "overhead-p99",
+          "message": "median (4.432, 4.436] misses < 0.5"
+        },
+        {
+          "code": "criterion.failed",
+          "step": "chat-capture.c64",
+          "criterion": "capture-shed",
+          "message": "repetition 1 read 170060, missing ≤ 0"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "chat-capture.c64",
+          "criterion": "reference.overhead.chat-capture.c64.overhead_p99_ms",
+          "message": "baseline `reference.overhead.chat-capture.c64.overhead_p99_ms` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "chat-capture.c64",
+          "criterion": "reference.overhead.chat-capture.c64.cpu_us_per_request",
+          "message": "baseline `reference.overhead.chat-capture.c64.cpu_us_per_request` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "chat-capture.c64",
+          "criterion": "reference.overhead.chat-capture.c64.requests_per_cpu_s",
+          "message": "baseline `reference.overhead.chat-capture.c64.requests_per_cpu_s` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "chat-capture.c64",
+          "criterion": "reference.overhead.chat-capture.c64.requests_per_s_per_vcpu",
+          "message": "baseline `reference.overhead.chat-capture.c64.requests_per_s_per_vcpu` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "chat-capture.c64",
+          "criterion": "reference.overhead.chat-capture.c64.capture_bytes_per_cpu_s",
+          "message": "baseline `reference.overhead.chat-capture.c64.capture_bytes_per_cpu_s` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "chat-capture.c64",
+          "criterion": "reference.overhead.chat-capture.c64.capture_bytes_per_s_per_vcpu",
+          "message": "baseline `reference.overhead.chat-capture.c64.capture_bytes_per_s_per_vcpu` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+        }
+      ]
+    }
+  ],
+  "validity": {
+    "thresholds": {
+      "host_busy_fraction": 0.1,
+      "host_sample_seconds": 10,
+      "driver_cores": 8.0,
+      "driver_fraction": 0.8,
+      "lateness_p99_us": 5000.0,
+      "p99_samples": 1000,
+      "p95_samples": 200
+    },
+    "host_before": {
+      "logical_cpus": 32,
+      "seconds": 10.038545026,
+      "other_cores": 0.81841432660818,
+      "busiest": [
+        [
+          "qemu-system-x86",
+          0.22356683731079102
+        ],
+        [
+          "claude",
+          0.07385690689086914
+        ],
+        [
+          "qemu-system-x86",
+          0.057887840270996097
+        ],
+        [
+          "qemu-system-x86",
+          0.057887840270996097
+        ]
+      ]
+    },
+    "host_after": {
+      "logical_cpus": 32,
+      "seconds": 10.035336393,
+      "other_cores": 0.6994263035058985,
+      "busiest": [
+        [
+          "qemu-system-x86",
+          0.21850835800170898
+        ],
+        [
+          "qemu-system-x86",
+          0.05587428569793701
+        ],
+        [
+          "qemu-system-x86",
+          0.05487652778625488
+        ],
+        [
+          "qemu-system-x86",
+          0.053878774642944334
+        ]
+      ]
+    },
+    "budget_seconds": 900,
+    "minimum_seconds": 0,
+    "elapsed_seconds": 63.219600105,
+    "reasons": []
+  },
+  "verdict": "INVALID",
+  "reasons": [
+    {
+      "code": "criterion.failed",
+      "step": "chat-capture.c64",
+      "criterion": "overhead-p99",
+      "message": "median (4.432, 4.436] misses < 0.5"
+    },
+    {
+      "code": "criterion.failed",
+      "step": "chat-capture.c64",
+      "criterion": "capture-shed",
+      "message": "repetition 1 read 170060, missing ≤ 0"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "chat-capture.c64",
+      "criterion": "reference.overhead.chat-capture.c64.overhead_p99_ms",
+      "message": "baseline `reference.overhead.chat-capture.c64.overhead_p99_ms` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "chat-capture.c64",
+      "criterion": "reference.overhead.chat-capture.c64.cpu_us_per_request",
+      "message": "baseline `reference.overhead.chat-capture.c64.cpu_us_per_request` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "chat-capture.c64",
+      "criterion": "reference.overhead.chat-capture.c64.requests_per_cpu_s",
+      "message": "baseline `reference.overhead.chat-capture.c64.requests_per_cpu_s` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "chat-capture.c64",
+      "criterion": "reference.overhead.chat-capture.c64.requests_per_s_per_vcpu",
+      "message": "baseline `reference.overhead.chat-capture.c64.requests_per_s_per_vcpu` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "chat-capture.c64",
+      "criterion": "reference.overhead.chat-capture.c64.capture_bytes_per_cpu_s",
+      "message": "baseline `reference.overhead.chat-capture.c64.capture_bytes_per_cpu_s` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "chat-capture.c64",
+      "criterion": "reference.overhead.chat-capture.c64.capture_bytes_per_s_per_vcpu",
+      "message": "baseline `reference.overhead.chat-capture.c64.capture_bytes_per_s_per_vcpu` is unusable: no reviewed reference with this id: qualify two clean full suites with --qualify-baseline and promote their `capacity reference` output (benchmarks/README.md)"
+    }
+  ],
+  "artifacts": {
+    "directory": "/home/thorrester/Documents/GitHub/wyrd-worktrees/benchmark-experiments/target/benchmarks/gateway/overhead/20261026T095850Z",
+    "profile": {
+      "requested": true,
+      "complete": true,
+      "captures": [
+        "/home/thorrester/Documents/GitHub/wyrd-worktrees/benchmark-experiments/target/benchmarks/gateway/overhead/20261026T095850Z/profiles/profile-120552.json.gz"
+      ],
+      "notes": []
+    }
+  },
+  "mode": "full",
+  "prepass": {
+    "command": [
+      "l1",
+      "gateway",
+      "--steps",
+      "chat-capture.c64",
+      "--smoke"
+    ],
+    "budget_seconds": 600,
+    "elapsed_seconds": 34.469644512,
+    "exit_code": 0,
+    "records": "/home/thorrester/Documents/GitHub/wyrd-worktrees/benchmark-experiments/target/benchmarks/smoke/gateway/overhead"
+  },
+  "regression_coverage": "uncovered"
+}

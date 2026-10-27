@@ -1,0 +1,5062 @@
+{
+  "schema_version": 1,
+  "engine": "bifrost",
+  "experiment": "writes",
+  "level": 1,
+  "question": "What does each native, OTLP spans, and OTLP logs write cost the server per CPU-second at 1 and 64 closed-loop clients, with no error, and do the native and OTLP write peaks clear their sanity floors?",
+  "started_at": "2026-10-24T18:59:16.230220266Z",
+  "finished_at": "2026-10-24T19:05:27.146395500Z",
+  "elapsed_seconds": 370.916165705,
+  "commit": "7249e63dc3c169c7398289c5d03fcc030eba0f7c",
+  "dirty": false,
+  "dirty_override": false,
+  "diff_sha256": null,
+  "host": {
+    "os": "linux",
+    "os_version": "Linux (Pop!_OS 24.04)",
+    "arch": "x86_64",
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_cpus": 32,
+    "memory_bytes": 98742132736,
+    "storage": "file:// store in a temporary directory on the local filesystem",
+    "fingerprint": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux"
+  },
+  "build": {
+    "profile": "release",
+    "rustflags": "-C force-frame-pointers=yes",
+    "debug": "line-tables-only",
+    "compiler": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "server": {
+      "name": "wyrd-server",
+      "bytes": 1212856896,
+      "modified": "2026-10-24T16:01:22.503099729Z"
+    },
+    "driver": {
+      "name": "capacity",
+      "bytes": 992617120,
+      "modified": "2026-10-24T18:59:07.620264581Z"
+    }
+  },
+  "command": {
+    "args": [
+      "l1",
+      "bifrost",
+      "writes"
+    ],
+    "config": {
+      "WYRD_DATABASE_URL": "<set>",
+      "WYRD_DB_MAX_CONNECTIONS": "8",
+      "WYRD_DB_MAX_CONNECTIONS_VALA": "8",
+      "WYRD_LOG": "info",
+      "WYRD_PLATFORM_DATABASE_URL": "<set>",
+      "WYRD_TEST_DATABASE_ADMIN_URL": "<set>"
+    }
+  },
+  "variables": {
+    "clients": [
+      1,
+      64
+    ]
+  },
+  "controls": {
+    "timing": {
+      "warmup_seconds": 5,
+      "repetition_seconds": 10,
+      "repetitions": 3,
+      "budget_seconds": 360,
+      "minimum_seconds": 0
+    },
+    "validity": {
+      "host_busy_fraction": 0.1,
+      "host_sample_seconds": 10,
+      "driver_cores": 8.0,
+      "driver_fraction": 0.8,
+      "lateness_p99_us": 5000.0,
+      "p99_samples": 1000,
+      "p95_samples": 200
+    },
+    "values": {
+      "baselines": "247 entries loaded",
+      "fixture": {
+        "native": "native-2m: events rows into vala.datasets.events_ingest, 2000000 rows per day, fresh ids every window",
+        "spans": "spans-2m: GenAI/HTTP spans into vala.traces.spans, 2000000 spans per day, fresh ids every window",
+        "logs": "logs-2m: bulky Kubernetes logs into vala.logs.records, 2000000 records per day, fresh ids every window"
+      },
+      "limits": "server defaults on the whole host except WYRD_MAX_FILE_RETENTION_TIME=30; no resource quota",
+      "timing": {
+        "method": "server wyrd.timing spans: exact integer nanoseconds from the owning server boundary's std::time::Instant timers, exported through the operator OTLP/gRPC span exporter to a collector helper process the driver starts",
+        "clock": "std::time::Instant on the server: the OS monotonic clock",
+        "server_env": {
+          "WYRD_OTLP_SAMPLE_RATIO": "1.0",
+          "OTEL_BSP_MAX_QUEUE_SIZE": "1048576",
+          "OTEL_BSP_MAX_EXPORT_BATCH_SIZE": "8192",
+          "OTEL_BSP_SCHEDULE_DELAY": "100"
+        },
+        "cost": "the server's tracing and export CPU is in server CPU; the collector helper's CPU is reported separately, in neither server nor driver CPU",
+        "collector": {
+          "worker_threads": 2,
+          "max_export_bytes": 67108864,
+          "retained_timings": 2000000,
+          "kept_malformed": 16,
+          "host_checks": "excluded as a descendant of the driver"
+        },
+        "assignment": "a window takes the observations that ended after it opened, once its expected count arrived (and, for traced requests, each request's own observation by trace id); a missing, extra, duplicate, or malformed observation makes it invalid",
+        "timer_resolution_ns": 20
+      },
+      "workload": "closed-loop public-client clients, each sending its next request once the last is acknowledged: native `write_batch` of 16,384 rows; OTLP exports of 512 spans or log records with the client's exchanged bearer"
+    },
+    "selection": null
+  },
+  "criteria": {
+    "metrics": [
+      {
+        "id": "requests",
+        "unit": "requests",
+        "boundary": "successful requests in the window: answered queries or acknowledged write requests",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "errors",
+        "unit": "errors",
+        "boundary": "failed requests of every stable code",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "server_failures",
+        "unit": "requests",
+        "boundary": "server timings at the step's boundary whose outcome is not `success`, kept with their durations in timings.jsonl and never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "wrong_results",
+        "unit": "queries",
+        "boundary": "answered queries whose rows differ from the exact answer",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "p50_ms",
+        "unit": "ms",
+        "boundary": "server handler entry until the complete query result is handed off (`bifrost.query`), Gate's durable write acknowledgement (`bifrost.gate.write`), or the OTLP export response (`bifrost.otlp.traces`, `bifrost.otlp.logs`): successful requests' exact `wyrd.timing` nanoseconds, nearest rank",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "p95_ms",
+        "unit": "ms",
+        "boundary": "server handler entry until the complete query result is handed off (`bifrost.query`), Gate's durable write acknowledgement (`bifrost.gate.write`), or the OTLP export response (`bifrost.otlp.traces`, `bifrost.otlp.logs`): successful requests' exact `wyrd.timing` nanoseconds, nearest rank",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "p99_ms",
+        "unit": "ms",
+        "boundary": "server handler entry until the complete query result is handed off (`bifrost.query`), Gate's durable write acknowledgement (`bifrost.gate.write`), or the OTLP export response (`bifrost.otlp.traces`, `bifrost.otlp.logs`): successful requests' exact `wyrd.timing` nanoseconds, nearest rank",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p50_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: client send until its terminal or durable acknowledgement, never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p95_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: client send until its terminal or durable acknowledgement, never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "client_p99_ms",
+        "unit": "ms",
+        "boundary": "diagnostic only: client send until its terminal or durable acknowledgement, never judged",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "queries",
+        "unit": "queries",
+        "boundary": "exactly answered queries in the window; read steps only",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "scanned_rows_per_query",
+        "unit": "rows/query",
+        "boundary": "mean rows each successful query's own executed-plan file scans output (`bifrost.oracle.stream` `rows_scanned` on its trace); read steps only",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "scanned_bytes_per_query",
+        "unit": "B/query",
+        "boundary": "mean bytes each successful query's own executed plan scanned (`bifrost.oracle.stream` `bytes_scanned` on its trace); read steps only",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "rows",
+        "unit": "rows",
+        "boundary": "durably acknowledged rows in the window; write steps only",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "retained_mib",
+        "unit": "MiB",
+        "boundary": "uncompressed Arrow bytes Scribe inserted into memtables (`bifrost_scribe_memtable_bytes_inserted_total`), 2^20 bytes; write steps only",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "wire_bytes",
+        "unit": "B",
+        "boundary": "encoded OTLP protobuf bytes of acknowledged exports, before framing and compression; OTLP steps only",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "visibility_p99_ms",
+        "unit": "ms",
+        "boundary": "acknowledgement until the rows are queryable",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "storage_ratio",
+        "unit": "ratio",
+        "boundary": "the path's table growth in published Parquet bytes per retained Arrow byte inserted while one 200,000-row sample of the path loaded before the windows, settled with the read fixture; the inserted bytes include server-internal rows written meanwhile, and WAL, staging, and catalog bytes are excluded; write steps only",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "scaling",
+        "unit": "ratio",
+        "boundary": "Q_N/(N × Q_1) of `rate`",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "base_rate",
+        "unit": "requests/s",
+        "boundary": "the one-client step's `rate`",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "scaled_rate",
+        "unit": "requests/s",
+        "boundary": "the 64-client step's `rate`",
+        "direction": null,
+        "derive": null
+      },
+      {
+        "id": "rate",
+        "unit": "requests/s",
+        "boundary": "successful requests per wall second",
+        "direction": "higher",
+        "derive": {
+          "kind": "rate",
+          "work": "requests",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "queries_per_s_per_vcpu",
+        "unit": "queries/s/vCPU",
+        "boundary": "(W/T)/P: exactly answered queries per wall second per provisioned vCPU",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_vcpu",
+          "work": "queries",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "queries_per_cpu_s",
+        "unit": "queries/cpu-s",
+        "boundary": "W/C: exactly answered queries per server CPU-second used",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_cpu",
+          "work": "queries",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "cpu_ms_per_query",
+        "unit": "ms/query",
+        "boundary": "server CPU per exactly answered query",
+        "direction": "lower",
+        "derive": {
+          "kind": "cpu_per",
+          "work": "queries",
+          "scale": 1000.0
+        }
+      },
+      {
+        "id": "rows_per_s",
+        "unit": "rows/s",
+        "boundary": "durably acknowledged rows per wall second",
+        "direction": "higher",
+        "derive": {
+          "kind": "rate",
+          "work": "rows",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "rows_per_s_per_vcpu",
+        "unit": "rows/s/vCPU",
+        "boundary": "(W/T)/P: durably acknowledged rows per wall second per provisioned vCPU",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_vcpu",
+          "work": "rows",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "rows_per_cpu_s",
+        "unit": "rows/cpu-s",
+        "boundary": "W/C: durably acknowledged rows per server CPU-second used",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_cpu",
+          "work": "rows",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "cpu_us_per_row",
+        "unit": "µs/row",
+        "boundary": "server CPU per durably acknowledged row",
+        "direction": "lower",
+        "derive": {
+          "kind": "cpu_per",
+          "work": "rows",
+          "scale": 1000000.0
+        }
+      },
+      {
+        "id": "mib_per_s_per_vcpu",
+        "unit": "MiB/s/vCPU",
+        "boundary": "(W/T)/P: uncompressed retained Arrow MiB per wall second per provisioned vCPU",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_vcpu",
+          "work": "retained_mib",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "mib_per_cpu_s",
+        "unit": "MiB/cpu-s",
+        "boundary": "W/C: uncompressed retained Arrow MiB per server CPU-second used",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_cpu",
+          "work": "retained_mib",
+          "scale": 1.0
+        }
+      },
+      {
+        "id": "wire_mib_per_s_per_vcpu",
+        "unit": "MiB/s/vCPU",
+        "boundary": "(W/T)/P: encoded OTLP wire MiB per wall second per provisioned vCPU",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_vcpu",
+          "work": "wire_bytes",
+          "scale": 9.5367431640625e-7
+        }
+      },
+      {
+        "id": "wire_mib_per_cpu_s",
+        "unit": "MiB/cpu-s",
+        "boundary": "W/C: encoded OTLP wire MiB per server CPU-second used",
+        "direction": "higher",
+        "derive": {
+          "kind": "per_cpu",
+          "work": "wire_bytes",
+          "scale": 9.5367431640625e-7
+        }
+      }
+    ],
+    "criteria": [
+      {
+        "id": "no-errors",
+        "metric": "errors",
+        "steps": [
+          "native-write-c1",
+          "native-write-c64",
+          "otlp-spans-c1",
+          "otlp-spans-c64",
+          "otlp-logs-c1",
+          "otlp-logs-c64"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "le",
+          "limit": 0.0,
+          "over": "every"
+        },
+        "percentile": null
+      },
+      {
+        "id": "native-peak-floor",
+        "metric": "rows_per_s",
+        "steps": [
+          "native-write-peak"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "ge",
+          "limit": 200000.0,
+          "over": "median"
+        },
+        "percentile": null
+      },
+      {
+        "id": "otlp-spans-peak-floor",
+        "metric": "wire_mib_per_cpu_s",
+        "steps": [
+          "otlp-spans-peak"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "ge",
+          "limit": 30.0,
+          "over": "median"
+        },
+        "percentile": null
+      },
+      {
+        "id": "otlp-logs-peak-floor",
+        "metric": "wire_mib_per_cpu_s",
+        "steps": [
+          "otlp-logs-peak"
+        ],
+        "rule": {
+          "kind": "limit",
+          "op": "ge",
+          "limit": 30.0,
+          "over": "median"
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.native-writes.write.c1.rows-per-cpu-s",
+        "metric": "rows_per_cpu_s",
+        "steps": [
+          "native-write-c1"
+        ],
+        "rule": {
+          "kind": "advisory",
+          "baseline": {
+            "id": "native-writes.write.c1.rows-per-cpu-s",
+            "value": 815661.765,
+            "unit": "rows/cpu-s",
+            "converted": 815661.765,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-native.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "native-10m",
+            "operands": "≈815661.765 rows/CPU-s; ≈1.226 CPU µs/row (rate 554650, cores 0.68); 227.8 MB/CPU-s"
+          },
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.native-writes.write.c1.cpu-us-per-row",
+        "metric": "cpu_us_per_row",
+        "steps": [
+          "native-write-c1"
+        ],
+        "rule": {
+          "kind": "advisory",
+          "baseline": {
+            "id": "native-writes.write.c1.cpu-us-per-row",
+            "value": 1.226,
+            "unit": "µs/row",
+            "converted": 1.226,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-native.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "native-10m",
+            "operands": "≈815661.765 rows/CPU-s; ≈1.226 CPU µs/row (rate 554650, cores 0.68); 227.8 MB/CPU-s"
+          },
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.native-writes.write.c1.mb-per-cpu-s",
+        "metric": "mib_per_cpu_s",
+        "steps": [
+          "native-write-c1"
+        ],
+        "rule": {
+          "kind": "advisory",
+          "baseline": {
+            "id": "native-writes.write.c1.mb-per-cpu-s",
+            "value": 227.8,
+            "unit": "MB/cpu-s",
+            "converted": 217.24700927734375,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-native.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "native-10m",
+            "operands": "≈815661.765 rows/CPU-s; ≈1.226 CPU µs/row (rate 554650, cores 0.68); 227.8 MB/CPU-s"
+          },
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.native-writes.write.c64.rows-per-cpu-s",
+        "metric": "rows_per_cpu_s",
+        "steps": [
+          "native-write-c64"
+        ],
+        "rule": {
+          "kind": "advisory",
+          "baseline": {
+            "id": "native-writes.write.c64.rows-per-cpu-s",
+            "value": 1107400.0,
+            "unit": "rows/cpu-s",
+            "converted": 1107400.0,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-native.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "native-10m",
+            "operands": "≈1107400.000 rows/CPU-s; ≈0.903 CPU µs/row (rate 3311126, cores 2.99); 311.5 MB/CPU-s"
+          },
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.native-writes.write.c64.cpu-us-per-row",
+        "metric": "cpu_us_per_row",
+        "steps": [
+          "native-write-c64"
+        ],
+        "rule": {
+          "kind": "advisory",
+          "baseline": {
+            "id": "native-writes.write.c64.cpu-us-per-row",
+            "value": 0.903,
+            "unit": "µs/row",
+            "converted": 0.903,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-native.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "native-10m",
+            "operands": "≈1107400.000 rows/CPU-s; ≈0.903 CPU µs/row (rate 3311126, cores 2.99); 311.5 MB/CPU-s"
+          },
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.native-writes.write.c64.mb-per-cpu-s",
+        "metric": "mib_per_cpu_s",
+        "steps": [
+          "native-write-c64"
+        ],
+        "rule": {
+          "kind": "advisory",
+          "baseline": {
+            "id": "native-writes.write.c64.mb-per-cpu-s",
+            "value": 311.5,
+            "unit": "MB/cpu-s",
+            "converted": 297.0695495605469,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-native.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "native-10m",
+            "operands": "≈1107400.000 rows/CPU-s; ≈0.903 CPU µs/row (rate 3311126, cores 2.99); 311.5 MB/CPU-s"
+          },
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-spans-writes.otlp-spans.c1.rows-per-cpu-s",
+        "metric": "rows_per_cpu_s",
+        "steps": [
+          "otlp-spans-c1"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-spans-writes.otlp-spans.c1.rows-per-cpu-s",
+            "value": 49554.0,
+            "unit": "rows/cpu-s",
+            "converted": 49554.0,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-telemetry.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "spans-2m",
+            "operands": "≈49554.000 rows/CPU-s; ≈20.180 CPU µs/row (rate 22720, cores 0.46); 42.0 MB/CPU-s; 16.0 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-spans-writes.otlp-spans.c1.cpu-us-per-row",
+        "metric": "cpu_us_per_row",
+        "steps": [
+          "otlp-spans-c1"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-spans-writes.otlp-spans.c1.cpu-us-per-row",
+            "value": 20.18,
+            "unit": "µs/row",
+            "converted": 20.18,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-telemetry.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "spans-2m",
+            "operands": "≈49554.000 rows/CPU-s; ≈20.180 CPU µs/row (rate 22720, cores 0.46); 42.0 MB/CPU-s; 16.0 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-spans-writes.otlp-spans.c1.mb-per-cpu-s",
+        "metric": "mib_per_cpu_s",
+        "steps": [
+          "otlp-spans-c1"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-spans-writes.otlp-spans.c1.mb-per-cpu-s",
+            "value": 42.0,
+            "unit": "MB/cpu-s",
+            "converted": 40.0543212890625,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-telemetry.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "spans-2m",
+            "operands": "≈49554.000 rows/CPU-s; ≈20.180 CPU µs/row (rate 22720, cores 0.46); 42.0 MB/CPU-s; 16.0 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-spans-writes.otlp-spans.c1.otlp-wire-mib-per-cpu-s",
+        "metric": "wire_mib_per_cpu_s",
+        "steps": [
+          "otlp-spans-c1"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-spans-writes.otlp-spans.c1.otlp-wire-mib-per-cpu-s",
+            "value": 16.0,
+            "unit": "MiB/cpu-s",
+            "converted": 16.0,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-telemetry.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "spans-2m",
+            "operands": "≈49554.000 rows/CPU-s; ≈20.180 CPU µs/row (rate 22720, cores 0.46); 42.0 MB/CPU-s; 16.0 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-spans-writes.otlp-spans.c64.rows-per-cpu-s",
+        "metric": "rows_per_cpu_s",
+        "steps": [
+          "otlp-spans-c64"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-spans-writes.otlp-spans.c64.rows-per-cpu-s",
+            "value": 51177.0,
+            "unit": "rows/cpu-s",
+            "converted": 51177.0,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-telemetry.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "spans-2m",
+            "operands": "≈51177.000 rows/CPU-s; ≈19.540 CPU µs/row (rate 425901, cores 8.32); 43.4 MB/CPU-s; 16.5 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-spans-writes.otlp-spans.c64.cpu-us-per-row",
+        "metric": "cpu_us_per_row",
+        "steps": [
+          "otlp-spans-c64"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-spans-writes.otlp-spans.c64.cpu-us-per-row",
+            "value": 19.54,
+            "unit": "µs/row",
+            "converted": 19.54,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-telemetry.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "spans-2m",
+            "operands": "≈51177.000 rows/CPU-s; ≈19.540 CPU µs/row (rate 425901, cores 8.32); 43.4 MB/CPU-s; 16.5 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-spans-writes.otlp-spans.c64.mb-per-cpu-s",
+        "metric": "mib_per_cpu_s",
+        "steps": [
+          "otlp-spans-c64"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-spans-writes.otlp-spans.c64.mb-per-cpu-s",
+            "value": 43.4,
+            "unit": "MB/cpu-s",
+            "converted": 41.38946533203125,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-telemetry.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "spans-2m",
+            "operands": "≈51177.000 rows/CPU-s; ≈19.540 CPU µs/row (rate 425901, cores 8.32); 43.4 MB/CPU-s; 16.5 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-spans-writes.otlp-spans.c64.otlp-wire-mib-per-cpu-s",
+        "metric": "wire_mib_per_cpu_s",
+        "steps": [
+          "otlp-spans-c64"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-spans-writes.otlp-spans.c64.otlp-wire-mib-per-cpu-s",
+            "value": 16.5,
+            "unit": "MiB/cpu-s",
+            "converted": 16.5,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-telemetry.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "spans-2m",
+            "operands": "≈51177.000 rows/CPU-s; ≈19.540 CPU µs/row (rate 425901, cores 8.32); 43.4 MB/CPU-s; 16.5 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-logs-writes.otlp-logs.c1.rows-per-cpu-s",
+        "metric": "rows_per_cpu_s",
+        "steps": [
+          "otlp-logs-c1"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-logs-writes.otlp-logs.c1.rows-per-cpu-s",
+            "value": 33996.0,
+            "unit": "rows/cpu-s",
+            "converted": 33996.0,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-logs-run-37.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "logs-2m",
+            "operands": "≈33996.000 rows/CPU-s; ≈29.415 CPU µs/row (rate 11668, cores 0.34); 93.9 MB/CPU-s; 40.6 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-logs-writes.otlp-logs.c1.cpu-us-per-row",
+        "metric": "cpu_us_per_row",
+        "steps": [
+          "otlp-logs-c1"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-logs-writes.otlp-logs.c1.cpu-us-per-row",
+            "value": 29.415,
+            "unit": "µs/row",
+            "converted": 29.415,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-logs-run-37.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "logs-2m",
+            "operands": "≈33996.000 rows/CPU-s; ≈29.415 CPU µs/row (rate 11668, cores 0.34); 93.9 MB/CPU-s; 40.6 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-logs-writes.otlp-logs.c1.mb-per-cpu-s",
+        "metric": "mib_per_cpu_s",
+        "steps": [
+          "otlp-logs-c1"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-logs-writes.otlp-logs.c1.mb-per-cpu-s",
+            "value": 93.9,
+            "unit": "MB/cpu-s",
+            "converted": 89.55001831054688,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-logs-run-37.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "logs-2m",
+            "operands": "≈33996.000 rows/CPU-s; ≈29.415 CPU µs/row (rate 11668, cores 0.34); 93.9 MB/CPU-s; 40.6 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-logs-writes.otlp-logs.c1.otlp-wire-mib-per-cpu-s",
+        "metric": "wire_mib_per_cpu_s",
+        "steps": [
+          "otlp-logs-c1"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-logs-writes.otlp-logs.c1.otlp-wire-mib-per-cpu-s",
+            "value": 40.6,
+            "unit": "MiB/cpu-s",
+            "converted": 40.6,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-logs-run-37.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "logs-2m",
+            "operands": "≈33996.000 rows/CPU-s; ≈29.415 CPU µs/row (rate 11668, cores 0.34); 93.9 MB/CPU-s; 40.6 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-logs-writes.otlp-logs.c64.rows-per-cpu-s",
+        "metric": "rows_per_cpu_s",
+        "steps": [
+          "otlp-logs-c64"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-logs-writes.otlp-logs.c64.rows-per-cpu-s",
+            "value": 35670.0,
+            "unit": "rows/cpu-s",
+            "converted": 35670.0,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-logs-run-37.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "logs-2m",
+            "operands": "≈35670.000 rows/CPU-s; ≈28.035 CPU µs/row (rate 260475, cores 7.3); 98.5 MB/CPU-s; 42.6 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-logs-writes.otlp-logs.c64.cpu-us-per-row",
+        "metric": "cpu_us_per_row",
+        "steps": [
+          "otlp-logs-c64"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-logs-writes.otlp-logs.c64.cpu-us-per-row",
+            "value": 28.035,
+            "unit": "µs/row",
+            "converted": 28.035,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-logs-run-37.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "logs-2m",
+            "operands": "≈35670.000 rows/CPU-s; ≈28.035 CPU µs/row (rate 260475, cores 7.3); 98.5 MB/CPU-s; 42.6 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-logs-writes.otlp-logs.c64.mb-per-cpu-s",
+        "metric": "mib_per_cpu_s",
+        "steps": [
+          "otlp-logs-c64"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-logs-writes.otlp-logs.c64.mb-per-cpu-s",
+            "value": 98.5,
+            "unit": "MB/cpu-s",
+            "converted": 93.93692016601562,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-logs-run-37.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "logs-2m",
+            "operands": "≈35670.000 rows/CPU-s; ≈28.035 CPU µs/row (rate 260475, cores 7.3); 98.5 MB/CPU-s; 42.6 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      },
+      {
+        "id": "baseline.otlp-logs-writes.otlp-logs.c64.otlp-wire-mib-per-cpu-s",
+        "metric": "wire_mib_per_cpu_s",
+        "steps": [
+          "otlp-logs-c64"
+        ],
+        "rule": {
+          "kind": "regression",
+          "baseline": {
+            "id": "otlp-logs-writes.otlp-logs.c64.otlp-wire-mib-per-cpu-s",
+            "value": 42.6,
+            "unit": "MiB/cpu-s",
+            "converted": 42.6,
+            "source_report": "git show 888fc673ed9598a7dc218b27be67640e85e6242d:changes/active/bifrost-variant/benchmarks/pre-merge/write-logs-run-37.md",
+            "source_commit": "cfe21dc90",
+            "host": "AMD Ryzen 9 9950X 16-Core Processor, 32 CPU / 91 GiB, linux",
+            "fixture": "logs-2m",
+            "operands": "≈35670.000 rows/CPU-s; ≈28.035 CPU µs/row (rate 260475, cores 7.3); 98.5 MB/CPU-s; 42.6 OTLP wire MiB/CPU-s"
+          }
+        },
+        "percentile": null
+      }
+    ]
+  },
+  "steps": [
+    {
+      "id": "native-write-c1",
+      "params": {
+        "clients": 1,
+        "op": "native-write"
+      },
+      "status": "measured",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 360,
+        "minimum_seconds": 0
+      },
+      "repetitions": [
+        {
+          "seconds": 10.010944544000001,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 8.55,
+          "peak_memory_bytes": 1757032448,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 0.68,
+          "collector_cpu_seconds": 0.03,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 41.484,
+              "above": null,
+              "samples": 345,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 43.443,
+              "above": null,
+              "samples": 345,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 56.606,
+              "above": null,
+              "samples": 345,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 1.5126103940217392,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 220.4892021313048,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 5.884755273144185,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 11.644837,
+              "above": null,
+              "samples": 345,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 17.184786,
+              "above": null,
+              "samples": 345,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 30.706886,
+              "above": null,
+              "samples": 345,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 34.46228260317091,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 345.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 1885.1826782226562,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 5652480.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 661108.7719298245,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 564630.0381703522,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 17644.688692823507,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "native writes send Arrow IPC, not OTLP"
+            },
+            "wire_mib_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 345 observations assigned; the collector had received 2561 spans in 286 exports"
+          ]
+        },
+        {
+          "seconds": 10.102353545,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 8.25,
+          "peak_memory_bytes": 1914114048,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 0.6400000000000001,
+          "collector_cpu_seconds": 0.03,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 41.454,
+              "above": null,
+              "samples": 323,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 43.705,
+              "above": null,
+              "samples": 323,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 78.395,
+              "above": null,
+              "samples": 323,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 1.5589474893575852,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 213.9332460345644,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 5.459585704222762,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 12.637772,
+              "above": null,
+              "samples": 323,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 28.560491,
+              "above": null,
+              "samples": 323,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 76.742376,
+              "above": null,
+              "samples": 323,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 31.97274759403602,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 323.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 1764.9492797851562,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 5292032.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 641458.4242424242,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 523841.49658068613,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 16370.046768146442,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "native writes send Arrow IPC, not OTLP"
+            },
+            "wire_mib_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 323 observations assigned; the collector had received 3898 spans in 386 exports"
+          ]
+        },
+        {
+          "seconds": 10.028586795,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 6.71,
+          "peak_memory_bytes": 1747025920,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 0.6199999999999997,
+          "collector_cpu_seconds": 0.02,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 41.559,
+              "above": null,
+              "samples": 325,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 43.365,
+              "above": null,
+              "samples": 325,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 69.594,
+              "above": null,
+              "samples": 325,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 1.2601412259615383,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 264.65472293859443,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 5.533659761897341,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 12.293014,
+              "above": null,
+              "samples": 325,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 21.341187,
+              "above": null,
+              "samples": 325,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 67.484093,
+              "above": null,
+              "samples": 325,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 32.407357750748766,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 325.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 1775.8331909179688,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 5324800.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 793561.8479880776,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 530962.1493882678,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 16592.567168383368,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "native writes send Arrow IPC, not OTLP"
+            },
+            "wire_mib_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 325 observations assigned; the collector had received 5244 spans in 487 exports"
+          ]
+        }
+      ],
+      "summary": {
+        "client_p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 41.484,
+            "above": null,
+            "samples": 323,
+            "reason": null
+          },
+          "min": 41.454,
+          "max": 41.559,
+          "spread": 0.10499999999999687
+        },
+        "client_p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 43.443,
+            "above": null,
+            "samples": 323,
+            "reason": null
+          },
+          "min": 43.365,
+          "max": 43.705,
+          "spread": 0.3399999999999963
+        },
+        "client_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 69.594,
+            "above": null,
+            "samples": 323,
+            "reason": null
+          },
+          "min": 56.606,
+          "max": 78.395,
+          "spread": 21.788999999999994
+        },
+        "cpu_ms_per_query": {
+          "unit": "ms/query",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "cpu_us_per_row": {
+          "unit": "µs/row",
+          "median": {
+            "value": 1.5126103940217392,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 1.2601412259615383,
+          "max": 1.5589474893575852,
+          "spread": 0.2988062633960469
+        },
+        "errors": {
+          "unit": "errors",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "mib_per_cpu_s": {
+          "unit": "MiB/cpu-s",
+          "median": {
+            "value": 220.4892021313048,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 213.9332460345644,
+          "max": 264.65472293859443,
+          "spread": 50.72147690403003
+        },
+        "mib_per_s_per_vcpu": {
+          "unit": "MiB/s/vCPU",
+          "median": {
+            "value": 5.533659761897341,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 5.459585704222762,
+          "max": 5.884755273144185,
+          "spread": 0.4251695689214232
+        },
+        "p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 12.293014,
+            "above": null,
+            "samples": 323,
+            "reason": null
+          },
+          "min": 11.644837,
+          "max": 12.637772,
+          "spread": 0.9929349999999992
+        },
+        "p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 21.341187,
+            "above": null,
+            "samples": 323,
+            "reason": null
+          },
+          "min": 17.184786,
+          "max": 28.560491,
+          "spread": 11.375705
+        },
+        "p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 67.484093,
+            "above": null,
+            "samples": 323,
+            "reason": null
+          },
+          "min": 30.706886,
+          "max": 76.742376,
+          "spread": 46.035489999999996
+        },
+        "queries_per_cpu_s": {
+          "unit": "queries/cpu-s",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "queries_per_s_per_vcpu": {
+          "unit": "queries/s/vCPU",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "rate": {
+          "unit": "requests/s",
+          "median": {
+            "value": 32.407357750748766,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 31.97274759403602,
+          "max": 34.46228260317091,
+          "spread": 2.489535009134894
+        },
+        "requests": {
+          "unit": "requests",
+          "median": {
+            "value": 325.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 323.0,
+          "max": 345.0,
+          "spread": 22.0
+        },
+        "retained_mib": {
+          "unit": "MiB",
+          "median": {
+            "value": 1775.8331909179688,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 1764.9492797851562,
+          "max": 1885.1826782226562,
+          "spread": 120.2333984375
+        },
+        "rows": {
+          "unit": "rows",
+          "median": {
+            "value": 5324800.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 5292032.0,
+          "max": 5652480.0,
+          "spread": 360448.0
+        },
+        "rows_per_cpu_s": {
+          "unit": "rows/cpu-s",
+          "median": {
+            "value": 661108.7719298245,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 641458.4242424242,
+          "max": 793561.8479880776,
+          "spread": 152103.42374565336
+        },
+        "rows_per_s": {
+          "unit": "rows/s",
+          "median": {
+            "value": 530962.1493882678,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 523841.49658068613,
+          "max": 564630.0381703522,
+          "spread": 40788.5415896661
+        },
+        "rows_per_s_per_vcpu": {
+          "unit": "rows/s/vCPU",
+          "median": {
+            "value": 16592.567168383368,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 16370.046768146442,
+          "max": 17644.688692823507,
+          "spread": 1274.6419246770656
+        },
+        "server_failures": {
+          "unit": "requests",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "storage_ratio": {
+          "unit": "ratio",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "visibility_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wire_bytes": {
+          "unit": "B",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "native writes send Arrow IPC, not OTLP"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wire_mib_per_cpu_s": {
+          "unit": "MiB/cpu-s",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `wire_bytes` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wire_mib_per_s_per_vcpu": {
+          "unit": "MiB/s/vCPU",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `wire_bytes` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        }
+      },
+      "criteria": [
+        {
+          "criterion": "no-errors",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "PASS",
+          "reason": null
+        },
+        {
+          "criterion": "baseline.native-writes.write.c1.rows-per-cpu-s",
+          "observed": {
+            "value": 661108.7719298245,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 661108.7719298245,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 641458.4242424242,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 793561.8479880776,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": {
+            "baseline": 815661.765,
+            "median": 661108.7719298245,
+            "low": 641458.4242424242,
+            "high": 793561.8479880776,
+            "spread": 152103.42374565336,
+            "percentage_limit_missed": false,
+            "beyond_spread": true
+          },
+          "verdict": null,
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        },
+        {
+          "criterion": "baseline.native-writes.write.c1.cpu-us-per-row",
+          "observed": {
+            "value": 1.5126103940217392,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 1.5126103940217392,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 1.5589474893575852,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 1.2601412259615383,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": {
+            "baseline": 1.226,
+            "median": 1.5126103940217392,
+            "low": 1.2601412259615383,
+            "high": 1.5589474893575852,
+            "spread": 0.2988062633960469,
+            "percentage_limit_missed": false,
+            "beyond_spread": false
+          },
+          "verdict": null,
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        },
+        {
+          "criterion": "baseline.native-writes.write.c1.mb-per-cpu-s",
+          "observed": {
+            "value": 220.4892021313048,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 220.4892021313048,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 213.9332460345644,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 264.65472293859443,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": {
+            "baseline": 217.24700927734375,
+            "median": 220.4892021313048,
+            "low": 213.9332460345644,
+            "high": 264.65472293859443,
+            "spread": 50.72147690403003,
+            "percentage_limit_missed": false,
+            "beyond_spread": false
+          },
+          "verdict": null,
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        }
+      ],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "native-write-c64",
+      "params": {
+        "clients": 64,
+        "op": "native-write"
+      },
+      "status": "measured",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 360,
+        "minimum_seconds": 0
+      },
+      "repetitions": [
+        {
+          "seconds": 10.131381426,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 90.03,
+          "peak_memory_bytes": 25445535744,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 9.500000000000002,
+          "collector_cpu_seconds": 0.07,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 239.52,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 594.191,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 662.98,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 2.3880900118155153,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 139.51722267639846,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 38.74328382961719,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 176.247563,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 497.440818,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 624.328969,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 227.1161160801804,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 2301.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 12560.735557556152,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 37699584.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 418744.685104965,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 3721070.4458576757,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 116283.45143305237,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "native writes send Arrow IPC, not OTLP"
+            },
+            "wire_mib_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 2301 observations assigned; the collector had received 24907 spans in 746 exports"
+          ]
+        },
+        {
+          "seconds": 10.265758946,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 86.01,
+          "peak_memory_bytes": 35518533632,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 10.120000000000005,
+          "collector_cpu_seconds": 0.07,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 222.301,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 484.483,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 569.351,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 2.090654635229988,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 159.3632749839794,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 41.724981542624,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 171.579377,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 451.861948,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 536.393527,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 244.59954818814427,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 2511.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 13706.83528137207,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 41140224.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 478319.07917683985,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 4007518.9975145557,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 125234.96867232987,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "native writes send Arrow IPC, not OTLP"
+            },
+            "wire_mib_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 2511 observations assigned; the collector had received 35025 spans in 836 exports"
+          ]
+        },
+        {
+          "seconds": 10.234597357,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 80.54,
+          "peak_memory_bytes": 43431522304,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 7.979999999999997,
+          "collector_cpu_seconds": 0.06,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 281.077,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 569.661,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 736.271,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 2.4132407876165933,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 138.0601617222481,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 33.951523192753896,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 220.31519,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 527.444263,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 663.4877,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 199.03079026423882,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 2037.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 11119.365425109863,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 33374208.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 414380.5314129625,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 3260920.467689289,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 101903.76461529027,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "native writes send Arrow IPC, not OTLP"
+            },
+            "wire_mib_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 2037 observations assigned; the collector had received 43242 spans in 918 exports"
+          ]
+        }
+      ],
+      "summary": {
+        "client_p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 239.52,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 222.301,
+          "max": 281.077,
+          "spread": 58.77600000000001
+        },
+        "client_p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 569.661,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 484.483,
+          "max": 594.191,
+          "spread": 109.70800000000003
+        },
+        "client_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 662.98,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 569.351,
+          "max": 736.271,
+          "spread": 166.91999999999996
+        },
+        "cpu_ms_per_query": {
+          "unit": "ms/query",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "cpu_us_per_row": {
+          "unit": "µs/row",
+          "median": {
+            "value": 2.3880900118155153,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 2.090654635229988,
+          "max": 2.4132407876165933,
+          "spread": 0.3225861523866054
+        },
+        "errors": {
+          "unit": "errors",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "mib_per_cpu_s": {
+          "unit": "MiB/cpu-s",
+          "median": {
+            "value": 139.51722267639846,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 138.0601617222481,
+          "max": 159.3632749839794,
+          "spread": 21.303113261731312
+        },
+        "mib_per_s_per_vcpu": {
+          "unit": "MiB/s/vCPU",
+          "median": {
+            "value": 38.74328382961719,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 33.951523192753896,
+          "max": 41.724981542624,
+          "spread": 7.773458349870104
+        },
+        "p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 176.247563,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 171.579377,
+          "max": 220.31519,
+          "spread": 48.73581300000001
+        },
+        "p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 497.440818,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 451.861948,
+          "max": 527.444263,
+          "spread": 75.582315
+        },
+        "p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 624.328969,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 536.393527,
+          "max": 663.4877,
+          "spread": 127.09417300000007
+        },
+        "queries_per_cpu_s": {
+          "unit": "queries/cpu-s",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "queries_per_s_per_vcpu": {
+          "unit": "queries/s/vCPU",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "rate": {
+          "unit": "requests/s",
+          "median": {
+            "value": 227.1161160801804,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 199.03079026423882,
+          "max": 244.59954818814427,
+          "spread": 45.56875792390545
+        },
+        "requests": {
+          "unit": "requests",
+          "median": {
+            "value": 2301.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 2037.0,
+          "max": 2511.0,
+          "spread": 474.0
+        },
+        "retained_mib": {
+          "unit": "MiB",
+          "median": {
+            "value": 12560.735557556152,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 11119.365425109863,
+          "max": 13706.83528137207,
+          "spread": 2587.469856262207
+        },
+        "rows": {
+          "unit": "rows",
+          "median": {
+            "value": 37699584.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 33374208.0,
+          "max": 41140224.0,
+          "spread": 7766016.0
+        },
+        "rows_per_cpu_s": {
+          "unit": "rows/cpu-s",
+          "median": {
+            "value": 418744.685104965,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 414380.5314129625,
+          "max": 478319.07917683985,
+          "spread": 63938.547763877374
+        },
+        "rows_per_s": {
+          "unit": "rows/s",
+          "median": {
+            "value": 3721070.4458576757,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 3260920.467689289,
+          "max": 4007518.9975145557,
+          "spread": 746598.5298252669
+        },
+        "rows_per_s_per_vcpu": {
+          "unit": "rows/s/vCPU",
+          "median": {
+            "value": 116283.45143305237,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 101903.76461529027,
+          "max": 125234.96867232987,
+          "spread": 23331.20405703959
+        },
+        "server_failures": {
+          "unit": "requests",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "storage_ratio": {
+          "unit": "ratio",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "visibility_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wire_bytes": {
+          "unit": "B",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "native writes send Arrow IPC, not OTLP"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wire_mib_per_cpu_s": {
+          "unit": "MiB/cpu-s",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `wire_bytes` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wire_mib_per_s_per_vcpu": {
+          "unit": "MiB/s/vCPU",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `wire_bytes` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        }
+      },
+      "criteria": [
+        {
+          "criterion": "no-errors",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "PASS",
+          "reason": null
+        },
+        {
+          "criterion": "baseline.native-writes.write.c64.rows-per-cpu-s",
+          "observed": {
+            "value": 418744.685104965,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 418744.685104965,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 478319.07917683985,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 414380.5314129625,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": {
+            "baseline": 1107400.0,
+            "median": 418744.685104965,
+            "low": 414380.5314129625,
+            "high": 478319.07917683985,
+            "spread": 63938.547763877374,
+            "percentage_limit_missed": true,
+            "beyond_spread": true
+          },
+          "verdict": null,
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        },
+        {
+          "criterion": "baseline.native-writes.write.c64.cpu-us-per-row",
+          "observed": {
+            "value": 2.3880900118155153,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 2.3880900118155153,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 2.090654635229988,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 2.4132407876165933,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": {
+            "baseline": 0.903,
+            "median": 2.3880900118155153,
+            "low": 2.090654635229988,
+            "high": 2.4132407876165933,
+            "spread": 0.3225861523866054,
+            "percentage_limit_missed": false,
+            "beyond_spread": false
+          },
+          "verdict": null,
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        },
+        {
+          "criterion": "baseline.native-writes.write.c64.mb-per-cpu-s",
+          "observed": {
+            "value": 139.51722267639846,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 139.51722267639846,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 159.3632749839794,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 138.0601617222481,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": {
+            "baseline": 297.0695495605469,
+            "median": 139.51722267639846,
+            "low": 138.0601617222481,
+            "high": 159.3632749839794,
+            "spread": 21.303113261731312,
+            "percentage_limit_missed": true,
+            "beyond_spread": true
+          },
+          "verdict": null,
+          "reason": "fixture differs: baseline `native-10m`, this run `native-2m`"
+        }
+      ],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "native-write-peak",
+      "params": {
+        "clients": 64,
+        "op": "native-write",
+        "peak_of": "native-write-c64"
+      },
+      "status": "derived",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 360,
+        "minimum_seconds": 0
+      },
+      "repetitions": [
+        {
+          "seconds": 10.131381426,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 90.03,
+          "peak_memory_bytes": 25445535744,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 9.500000000000002,
+          "collector_cpu_seconds": 0.07,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 239.52,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 594.191,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 662.98,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 2.3880900118155153,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 139.51722267639846,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 38.74328382961719,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 176.247563,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 497.440818,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 624.328969,
+              "above": null,
+              "samples": 2301,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 227.1161160801804,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 2301.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 12560.735557556152,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 37699584.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 418744.685104965,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 3721070.4458576757,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 116283.45143305237,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "native writes send Arrow IPC, not OTLP"
+            },
+            "wire_mib_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 2301 observations assigned; the collector had received 24907 spans in 746 exports"
+          ]
+        },
+        {
+          "seconds": 10.265758946,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 86.01,
+          "peak_memory_bytes": 35518533632,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 10.120000000000005,
+          "collector_cpu_seconds": 0.07,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 222.301,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 484.483,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 569.351,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 2.090654635229988,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 159.3632749839794,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 41.724981542624,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 171.579377,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 451.861948,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 536.393527,
+              "above": null,
+              "samples": 2511,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 244.59954818814427,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 2511.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 13706.83528137207,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 41140224.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 478319.07917683985,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 4007518.9975145557,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 125234.96867232987,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "native writes send Arrow IPC, not OTLP"
+            },
+            "wire_mib_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 2511 observations assigned; the collector had received 35025 spans in 836 exports"
+          ]
+        },
+        {
+          "seconds": 10.234597357,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 80.54,
+          "peak_memory_bytes": 43431522304,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 7.979999999999997,
+          "collector_cpu_seconds": 0.06,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 281.077,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 569.661,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 736.271,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 2.4132407876165933,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 138.0601617222481,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 33.951523192753896,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 220.31519,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 527.444263,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 663.4877,
+              "above": null,
+              "samples": 2037,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 199.03079026423882,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 2037.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 11119.365425109863,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 33374208.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 414380.5314129625,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 3260920.467689289,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 101903.76461529027,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "native writes send Arrow IPC, not OTLP"
+            },
+            "wire_mib_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `wire_bytes` is missing"
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 2037 observations assigned; the collector had received 43242 spans in 918 exports"
+          ]
+        }
+      ],
+      "summary": {
+        "client_p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 239.52,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 222.301,
+          "max": 281.077,
+          "spread": 58.77600000000001
+        },
+        "client_p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 569.661,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 484.483,
+          "max": 594.191,
+          "spread": 109.70800000000003
+        },
+        "client_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 662.98,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 569.351,
+          "max": 736.271,
+          "spread": 166.91999999999996
+        },
+        "cpu_ms_per_query": {
+          "unit": "ms/query",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "cpu_us_per_row": {
+          "unit": "µs/row",
+          "median": {
+            "value": 2.3880900118155153,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 2.090654635229988,
+          "max": 2.4132407876165933,
+          "spread": 0.3225861523866054
+        },
+        "errors": {
+          "unit": "errors",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "mib_per_cpu_s": {
+          "unit": "MiB/cpu-s",
+          "median": {
+            "value": 139.51722267639846,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 138.0601617222481,
+          "max": 159.3632749839794,
+          "spread": 21.303113261731312
+        },
+        "mib_per_s_per_vcpu": {
+          "unit": "MiB/s/vCPU",
+          "median": {
+            "value": 38.74328382961719,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 33.951523192753896,
+          "max": 41.724981542624,
+          "spread": 7.773458349870104
+        },
+        "p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 176.247563,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 171.579377,
+          "max": 220.31519,
+          "spread": 48.73581300000001
+        },
+        "p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 497.440818,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 451.861948,
+          "max": 527.444263,
+          "spread": 75.582315
+        },
+        "p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 624.328969,
+            "above": null,
+            "samples": 2037,
+            "reason": null
+          },
+          "min": 536.393527,
+          "max": 663.4877,
+          "spread": 127.09417300000007
+        },
+        "queries_per_cpu_s": {
+          "unit": "queries/cpu-s",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "queries_per_s_per_vcpu": {
+          "unit": "queries/s/vCPU",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "rate": {
+          "unit": "requests/s",
+          "median": {
+            "value": 227.1161160801804,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 199.03079026423882,
+          "max": 244.59954818814427,
+          "spread": 45.56875792390545
+        },
+        "requests": {
+          "unit": "requests",
+          "median": {
+            "value": 2301.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 2037.0,
+          "max": 2511.0,
+          "spread": 474.0
+        },
+        "retained_mib": {
+          "unit": "MiB",
+          "median": {
+            "value": 12560.735557556152,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 11119.365425109863,
+          "max": 13706.83528137207,
+          "spread": 2587.469856262207
+        },
+        "rows": {
+          "unit": "rows",
+          "median": {
+            "value": 37699584.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 33374208.0,
+          "max": 41140224.0,
+          "spread": 7766016.0
+        },
+        "rows_per_cpu_s": {
+          "unit": "rows/cpu-s",
+          "median": {
+            "value": 418744.685104965,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 414380.5314129625,
+          "max": 478319.07917683985,
+          "spread": 63938.547763877374
+        },
+        "rows_per_s": {
+          "unit": "rows/s",
+          "median": {
+            "value": 3721070.4458576757,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 3260920.467689289,
+          "max": 4007518.9975145557,
+          "spread": 746598.5298252669
+        },
+        "rows_per_s_per_vcpu": {
+          "unit": "rows/s/vCPU",
+          "median": {
+            "value": 116283.45143305237,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 101903.76461529027,
+          "max": 125234.96867232987,
+          "spread": 23331.20405703959
+        },
+        "server_failures": {
+          "unit": "requests",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "storage_ratio": {
+          "unit": "ratio",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "visibility_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wire_bytes": {
+          "unit": "B",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "native writes send Arrow IPC, not OTLP"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wire_mib_per_cpu_s": {
+          "unit": "MiB/cpu-s",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `wire_bytes` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wire_mib_per_s_per_vcpu": {
+          "unit": "MiB/s/vCPU",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `wire_bytes` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        }
+      },
+      "criteria": [
+        {
+          "criterion": "native-peak-floor",
+          "observed": {
+            "value": 3721070.4458576757,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 3721070.4458576757,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 4007518.9975145557,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 3260920.467689289,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "PASS",
+          "reason": null
+        }
+      ],
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "id": "otlp-spans-c1",
+      "params": {
+        "clients": 1,
+        "op": "otlp-spans"
+      },
+      "status": "measured",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 360,
+        "minimum_seconds": 0
+      },
+      "repetitions": [
+        {
+          "seconds": 10.00581563,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 2.69,
+          "peak_memory_bytes": 1579839488,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 0.5799999999999983,
+          "collector_cpu_seconds": 0.02,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 16.909,
+              "above": null,
+              "samples": 369,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 42.737,
+              "above": null,
+              "samples": 369,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 44.989,
+              "above": null,
+              "samples": 369,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 14.238228319783198,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 62.14790202427974,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 0.5221271515589594,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 14.375076,
+              "above": null,
+              "samples": 369,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 15.610894,
+              "above": null,
+              "samples": 369,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 16.850069,
+              "above": null,
+              "samples": 369,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 36.87855279819902,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 369.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 167.1778564453125,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 188928.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 70233.45724907063,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 18881.819032677897,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 590.0568447711843,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": 63886259.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "wire_mib_per_cpu_s": {
+              "value": 22.649325048170127,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": 0.19028522583938526,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 369 observations assigned; the collector had received 46030 spans in 1458 exports"
+          ]
+        },
+        {
+          "seconds": 10.004679612,
+          "processes": [
+            "wyrd-server"
+          ],
+          "server_cpu_seconds": 2.82,
+          "peak_memory_bytes": 1811124224,
+          "memory_interval_ms": 10,
+          "driver_cpu_seconds": 0.6200000000000045,
+          "collector_cpu_seconds": 0.03,
+          "provisioned_vcpus": 32,
+          "metrics": {
+            "client_p50_ms": {
+              "value": 18.219,
+              "above": null,
+              "samples": 370,
+              "reason": null
+            },
+            "client_p95_ms": {
+              "value": 42.748,
+              "above": null,
+              "samples": 370,
+              "reason": null
+            },
+            "client_p99_ms": {
+              "value": 44.011,
+              "above": null,
+              "samples": 370,
+              "reason": null
+            },
+            "cpu_ms_per_query": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "cpu_us_per_row": {
+              "value": 14.885979729729728,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "errors": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_cpu_s": {
+              "value": 59.45733489719689,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "mib_per_s_per_vcpu": {
+              "value": 0.5237226818868645,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "p50_ms": {
+              "value": 14.985451,
+              "above": null,
+              "samples": 370,
+              "reason": null
+            },
+            "p95_ms": {
+              "value": 17.68418,
+              "above": null,
+              "samples": 370,
+              "reason": null
+            },
+            "p99_ms": {
+              "value": 19.282439,
+              "above": null,
+              "samples": 370,
+              "reason": null
+            },
+            "queries_per_cpu_s": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "queries_per_s_per_vcpu": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "work reading `queries` is missing"
+            },
+            "rate": {
+              "value": 36.98269353435443,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "requests": {
+              "value": 370.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "retained_mib": {
+              "value": 167.66968441009521,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows": {
+              "value": 189440.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_cpu_s": {
+              "value": 67177.30496453901,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s": {
+              "value": 18935.13908958947,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "rows_per_s_per_vcpu": {
+              "value": 591.7230965496709,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "server_failures": {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "storage_ratio": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+            },
+            "visibility_p99_ms": {
+              "value": null,
+              "above": null,
+              "samples": null,
+              "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+            },
+            "wire_bytes": {
+              "value": 64094570.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "wire_mib_per_cpu_s": {
+              "value": 21.675654336915795,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            "wire_mib_per_s_per_vcpu": {
+              "value": 0.19092735724885943,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          },
+          "arrivals": null,
+          "invalid": [],
+          "observations": [
+            "server timing: 370 observations assigned; the collector had received 47543 spans in 1559 exports"
+          ]
+        }
+      ],
+      "summary": {
+        "client_p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 18.219,
+            "above": null,
+            "samples": 369,
+            "reason": null
+          },
+          "min": 16.909,
+          "max": 18.219,
+          "spread": 1.3100000000000023
+        },
+        "client_p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 42.748,
+            "above": null,
+            "samples": 369,
+            "reason": null
+          },
+          "min": 42.737,
+          "max": 42.748,
+          "spread": 0.01099999999999568
+        },
+        "client_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 44.989,
+            "above": null,
+            "samples": 369,
+            "reason": null
+          },
+          "min": 44.011,
+          "max": 44.989,
+          "spread": 0.9779999999999944
+        },
+        "cpu_ms_per_query": {
+          "unit": "ms/query",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "cpu_us_per_row": {
+          "unit": "µs/row",
+          "median": {
+            "value": 14.885979729729728,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 14.238228319783198,
+          "max": 14.885979729729728,
+          "spread": 0.6477514099465296
+        },
+        "errors": {
+          "unit": "errors",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "mib_per_cpu_s": {
+          "unit": "MiB/cpu-s",
+          "median": {
+            "value": 62.14790202427974,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 59.45733489719689,
+          "max": 62.14790202427974,
+          "spread": 2.6905671270828506
+        },
+        "mib_per_s_per_vcpu": {
+          "unit": "MiB/s/vCPU",
+          "median": {
+            "value": 0.5237226818868645,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.5221271515589594,
+          "max": 0.5237226818868645,
+          "spread": 0.0015955303279051591
+        },
+        "p50_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 14.985451,
+            "above": null,
+            "samples": 369,
+            "reason": null
+          },
+          "min": 14.375076,
+          "max": 14.985451,
+          "spread": 0.6103749999999994
+        },
+        "p95_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 17.68418,
+            "above": null,
+            "samples": 369,
+            "reason": null
+          },
+          "min": 15.610894,
+          "max": 17.68418,
+          "spread": 2.0732860000000013
+        },
+        "p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": 19.282439,
+            "above": null,
+            "samples": 369,
+            "reason": null
+          },
+          "min": 16.850069,
+          "max": 19.282439,
+          "spread": 2.432369999999999
+        },
+        "queries_per_cpu_s": {
+          "unit": "queries/cpu-s",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "queries_per_s_per_vcpu": {
+          "unit": "queries/s/vCPU",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "work reading `queries` is missing"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "rate": {
+          "unit": "requests/s",
+          "median": {
+            "value": 36.98269353435443,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 36.87855279819902,
+          "max": 36.98269353435443,
+          "spread": 0.10414073615541497
+        },
+        "requests": {
+          "unit": "requests",
+          "median": {
+            "value": 370.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 369.0,
+          "max": 370.0,
+          "spread": 1.0
+        },
+        "retained_mib": {
+          "unit": "MiB",
+          "median": {
+            "value": 167.66968441009521,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 167.1778564453125,
+          "max": 167.66968441009521,
+          "spread": 0.49182796478271484
+        },
+        "rows": {
+          "unit": "rows",
+          "median": {
+            "value": 189440.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 188928.0,
+          "max": 189440.0,
+          "spread": 512.0
+        },
+        "rows_per_cpu_s": {
+          "unit": "rows/cpu-s",
+          "median": {
+            "value": 70233.45724907063,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 67177.30496453901,
+          "max": 70233.45724907063,
+          "spread": 3056.1522845316213
+        },
+        "rows_per_s": {
+          "unit": "rows/s",
+          "median": {
+            "value": 18935.13908958947,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 18881.819032677897,
+          "max": 18935.13908958947,
+          "spread": 53.320056911572465
+        },
+        "rows_per_s_per_vcpu": {
+          "unit": "rows/s/vCPU",
+          "median": {
+            "value": 591.7230965496709,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 590.0568447711843,
+          "max": 591.7230965496709,
+          "spread": 1.6662517784866395
+        },
+        "server_failures": {
+          "unit": "requests",
+          "median": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.0,
+          "max": 0.0,
+          "spread": 0.0
+        },
+        "storage_ratio": {
+          "unit": "ratio",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "measured by the `parquet` experiment after its settlement; `writes` never waits for publication"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "visibility_p99_ms": {
+          "unit": "ms",
+          "median": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "L1 measures closed-loop acknowledgement; visibility is judged at L2"
+          },
+          "min": null,
+          "max": null,
+          "spread": null
+        },
+        "wire_bytes": {
+          "unit": "B",
+          "median": {
+            "value": 64094570.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 63886259.0,
+          "max": 64094570.0,
+          "spread": 208311.0
+        },
+        "wire_mib_per_cpu_s": {
+          "unit": "MiB/cpu-s",
+          "median": {
+            "value": 22.649325048170127,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 21.675654336915795,
+          "max": 22.649325048170127,
+          "spread": 0.9736707112543321
+        },
+        "wire_mib_per_s_per_vcpu": {
+          "unit": "MiB/s/vCPU",
+          "median": {
+            "value": 0.19092735724885943,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "min": 0.19028522583938526,
+          "max": 0.19092735724885943,
+          "spread": 0.000642131409474167
+        }
+      },
+      "criteria": [
+        {
+          "criterion": "no-errors",
+          "observed": {
+            "value": 0.0,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 0.0,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "2 of 3 repetitions have evidence"
+        },
+        {
+          "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.rows-per-cpu-s",
+          "observed": {
+            "value": 70233.45724907063,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 70233.45724907063,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 67177.30496453901,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "2 of 3 repetitions have evidence"
+        },
+        {
+          "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.cpu-us-per-row",
+          "observed": {
+            "value": 14.885979729729728,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 14.238228319783198,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 14.885979729729728,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "2 of 3 repetitions have evidence"
+        },
+        {
+          "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.mb-per-cpu-s",
+          "observed": {
+            "value": 62.14790202427974,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 62.14790202427974,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 59.45733489719689,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "2 of 3 repetitions have evidence"
+        },
+        {
+          "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.otlp-wire-mib-per-cpu-s",
+          "observed": {
+            "value": 22.649325048170127,
+            "above": null,
+            "samples": null,
+            "reason": null
+          },
+          "values": [
+            {
+              "value": 22.649325048170127,
+              "above": null,
+              "samples": null,
+              "reason": null
+            },
+            {
+              "value": 21.675654336915795,
+              "above": null,
+              "samples": null,
+              "reason": null
+            }
+          ],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "2 of 3 repetitions have evidence"
+        }
+      ],
+      "verdict": "INVALID",
+      "reasons": [
+        {
+          "code": "repetition.missing",
+          "step": "otlp-spans-c1",
+          "criterion": null,
+          "message": "2 of 3 repetitions were measured"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "otlp-spans-c1",
+          "criterion": "no-errors",
+          "message": "2 of 3 repetitions have evidence"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "otlp-spans-c1",
+          "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.rows-per-cpu-s",
+          "message": "2 of 3 repetitions have evidence"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "otlp-spans-c1",
+          "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.cpu-us-per-row",
+          "message": "2 of 3 repetitions have evidence"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "otlp-spans-c1",
+          "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.mb-per-cpu-s",
+          "message": "2 of 3 repetitions have evidence"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "otlp-spans-c1",
+          "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.otlp-wire-mib-per-cpu-s",
+          "message": "2 of 3 repetitions have evidence"
+        }
+      ]
+    },
+    {
+      "id": "otlp-spans-c64",
+      "params": {
+        "clients": 64,
+        "op": "otlp-spans"
+      },
+      "status": "unmeasured",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 360,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "INVALID",
+      "reasons": [
+        {
+          "code": "step.unmeasured",
+          "step": "otlp-spans-c64",
+          "criterion": null,
+          "message": "the run stopped before this step measured a repetition"
+        }
+      ]
+    },
+    {
+      "id": "otlp-spans-peak",
+      "params": {},
+      "status": "derived",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 360,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [
+        {
+          "criterion": "otlp-spans-peak-floor",
+          "observed": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "no repetition was measured"
+          },
+          "values": [],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "0 of 3 repetitions have evidence"
+        }
+      ],
+      "verdict": "INVALID",
+      "reasons": [
+        {
+          "code": "step.unmeasured",
+          "step": "otlp-spans-peak",
+          "criterion": null,
+          "message": "no valid step of [\"otlp-spans-c1\", \"otlp-spans-c64\"] has a median `rows_per_s`"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "otlp-spans-peak",
+          "criterion": "otlp-spans-peak-floor",
+          "message": "0 of 3 repetitions have evidence"
+        }
+      ]
+    },
+    {
+      "id": "otlp-logs-c1",
+      "params": {
+        "clients": 1,
+        "op": "otlp-logs"
+      },
+      "status": "unmeasured",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 360,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "INVALID",
+      "reasons": [
+        {
+          "code": "step.unmeasured",
+          "step": "otlp-logs-c1",
+          "criterion": null,
+          "message": "the run stopped before this step measured a repetition"
+        }
+      ]
+    },
+    {
+      "id": "otlp-logs-c64",
+      "params": {
+        "clients": 64,
+        "op": "otlp-logs"
+      },
+      "status": "unmeasured",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 360,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [],
+      "verdict": "INVALID",
+      "reasons": [
+        {
+          "code": "step.unmeasured",
+          "step": "otlp-logs-c64",
+          "criterion": null,
+          "message": "the run stopped before this step measured a repetition"
+        }
+      ]
+    },
+    {
+      "id": "otlp-logs-peak",
+      "params": {},
+      "status": "derived",
+      "timing": {
+        "warmup_seconds": 5,
+        "repetition_seconds": 10,
+        "repetitions": 3,
+        "budget_seconds": 360,
+        "minimum_seconds": 0
+      },
+      "repetitions": [],
+      "summary": {},
+      "criteria": [
+        {
+          "criterion": "otlp-logs-peak-floor",
+          "observed": {
+            "value": null,
+            "above": null,
+            "samples": null,
+            "reason": "no repetition was measured"
+          },
+          "values": [],
+          "operands": null,
+          "verdict": "INVALID",
+          "reason": "0 of 3 repetitions have evidence"
+        }
+      ],
+      "verdict": "INVALID",
+      "reasons": [
+        {
+          "code": "step.unmeasured",
+          "step": "otlp-logs-peak",
+          "criterion": null,
+          "message": "no valid step of [\"otlp-logs-c1\", \"otlp-logs-c64\"] has a median `rows_per_s`"
+        },
+        {
+          "code": "criterion.invalid",
+          "step": "otlp-logs-peak",
+          "criterion": "otlp-logs-peak-floor",
+          "message": "0 of 3 repetitions have evidence"
+        }
+      ]
+    }
+  ],
+  "validity": {
+    "thresholds": {
+      "host_busy_fraction": 0.1,
+      "host_sample_seconds": 10,
+      "driver_cores": 8.0,
+      "driver_fraction": 0.8,
+      "lateness_p99_us": 5000.0,
+      "p99_samples": 1000,
+      "p95_samples": 200
+    },
+    "host_before": {
+      "logical_cpus": 32,
+      "seconds": 10.038548387,
+      "other_cores": 0.7793924997746937,
+      "busiest": [
+        [
+          "qemu-system-x86",
+          0.21455747604370118
+        ],
+        [
+          "qemu-system-x86",
+          0.0578806209564209
+        ],
+        [
+          "qemu-system-x86",
+          0.05588473796844482
+        ],
+        [
+          "qemu-system-x86",
+          0.04989708423614502
+        ]
+      ]
+    },
+    "host_after": {
+      "logical_cpus": 32,
+      "seconds": 10.037675068,
+      "other_cores": 0.9909870618581745,
+      "busiest": [
+        [
+          "qemu-system-x86",
+          0.20059255599975587
+        ],
+        [
+          "chrome",
+          0.056884450912475584
+        ],
+        [
+          "qemu-system-x86",
+          0.053890533447265625
+        ],
+        [
+          "qemu-system-x86",
+          0.04989864349365234
+        ]
+      ]
+    },
+    "budget_seconds": 360,
+    "minimum_seconds": 0,
+    "elapsed_seconds": 370.916165705,
+    "reasons": [
+      {
+        "code": "budget.exceeded",
+        "step": "otlp-spans-c1",
+        "criterion": null,
+        "message": "the budget ran out; admission stopped"
+      },
+      {
+        "code": "budget.exceeded",
+        "step": null,
+        "criterion": null,
+        "message": "the run took 370.9s, over its 360s budget"
+      }
+    ]
+  },
+  "verdict": "INVALID",
+  "reasons": [
+    {
+      "code": "budget.exceeded",
+      "step": "otlp-spans-c1",
+      "criterion": null,
+      "message": "the budget ran out; admission stopped"
+    },
+    {
+      "code": "budget.exceeded",
+      "step": null,
+      "criterion": null,
+      "message": "the run took 370.9s, over its 360s budget"
+    },
+    {
+      "code": "repetition.missing",
+      "step": "otlp-spans-c1",
+      "criterion": null,
+      "message": "2 of 3 repetitions were measured"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "otlp-spans-c1",
+      "criterion": "no-errors",
+      "message": "2 of 3 repetitions have evidence"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "otlp-spans-c1",
+      "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.rows-per-cpu-s",
+      "message": "2 of 3 repetitions have evidence"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "otlp-spans-c1",
+      "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.cpu-us-per-row",
+      "message": "2 of 3 repetitions have evidence"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "otlp-spans-c1",
+      "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.mb-per-cpu-s",
+      "message": "2 of 3 repetitions have evidence"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "otlp-spans-c1",
+      "criterion": "baseline.otlp-spans-writes.otlp-spans.c1.otlp-wire-mib-per-cpu-s",
+      "message": "2 of 3 repetitions have evidence"
+    },
+    {
+      "code": "step.unmeasured",
+      "step": "otlp-spans-c64",
+      "criterion": null,
+      "message": "the run stopped before this step measured a repetition"
+    },
+    {
+      "code": "step.unmeasured",
+      "step": "otlp-spans-peak",
+      "criterion": null,
+      "message": "no valid step of [\"otlp-spans-c1\", \"otlp-spans-c64\"] has a median `rows_per_s`"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "otlp-spans-peak",
+      "criterion": "otlp-spans-peak-floor",
+      "message": "0 of 3 repetitions have evidence"
+    },
+    {
+      "code": "step.unmeasured",
+      "step": "otlp-logs-c1",
+      "criterion": null,
+      "message": "the run stopped before this step measured a repetition"
+    },
+    {
+      "code": "step.unmeasured",
+      "step": "otlp-logs-c64",
+      "criterion": null,
+      "message": "the run stopped before this step measured a repetition"
+    },
+    {
+      "code": "step.unmeasured",
+      "step": "otlp-logs-peak",
+      "criterion": null,
+      "message": "no valid step of [\"otlp-logs-c1\", \"otlp-logs-c64\"] has a median `rows_per_s`"
+    },
+    {
+      "code": "criterion.invalid",
+      "step": "otlp-logs-peak",
+      "criterion": "otlp-logs-peak-floor",
+      "message": "0 of 3 repetitions have evidence"
+    }
+  ],
+  "artifacts": {
+    "directory": "/home/thorrester/Documents/GitHub/wyrd-worktrees/benchmark-experiments/target/benchmarks/bifrost/writes/20261024T185916Z",
+    "profile": {
+      "requested": false,
+      "complete": false,
+      "captures": [],
+      "notes": []
+    }
+  }
+}

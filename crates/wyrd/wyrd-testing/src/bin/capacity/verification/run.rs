@@ -45,7 +45,7 @@ use wyrd_testing::release_server::{LocalServer, Metrics};
 use crate::verification::workload::{ASSERT_VERIFIER, Tenant, context, failing};
 use crate::verification::{
     ADMISSION_REFUSAL, APPLICATIONS, BACKLOG_LIMIT_SECONDS, CLIENTS, OVERHEAD_LIMIT_MS,
-    RECOVERY_LIMIT, STAGES, Schedule,
+    OVERHEAD_TAILS, PHASE_TIMINGS, RECOVERY_LIMIT, STAGES, Schedule,
 };
 
 /// The declared server process whose CPU each repetition sums.
@@ -368,6 +368,8 @@ impl Bench {
             }),
         );
         repetition.set("verifier_mean_ms", mean_ms(verifier));
+        set_tails(&mut repetition, &population);
+        set_phases(&mut repetition, &population);
         repetition.set(
             "server_failures",
             Reading::count(population.others(DIRECT_TIMING, COMPLETED)),
@@ -1026,6 +1028,43 @@ fn set_client(repetition: &mut Repetition, measured: &Measured) {
         ("client_p99_ms", 0.99),
     ] {
         repetition.set(id, measured.percentile(q));
+    }
+}
+
+/// Sets each [`OVERHEAD_TAILS`] count of completed direct executions whose
+/// residual exceeds its threshold, as the bounds the histogram allows; each
+/// is missing when there is no residual.
+fn set_tails(repetition: &mut Repetition, population: &Population) {
+    let residuals = population.residuals(DIRECT_TIMING, COMPLETED);
+    for (id, nanos) in OVERHEAD_TAILS {
+        repetition.set(
+            id,
+            residuals
+                .as_ref()
+                .map_or_else(Reading::missing, |residuals| {
+                    let (certain, possible) = residuals.count_above(nanos);
+                    Reading::bounded(certain as f64, possible as f64, 1.0)
+                }),
+        );
+    }
+}
+
+/// Sets each [`PHASE_TIMINGS`] phase's p99 and maximum, milliseconds, over
+/// the completed direct executions. A phase the window did not time is
+/// missing with its reason; phases are diagnostic, so that never makes the
+/// repetition invalid.
+fn set_phases(repetition: &mut Repetition, population: &Population) {
+    for (phase, boundary) in PHASE_TIMINGS {
+        let distribution = population.elapsed(boundary, COMPLETED);
+        for (statistic, q) in [("p99", 0.99), ("max", 1.0)] {
+            repetition.set(
+                &format!("phase_{phase}_{statistic}_ms"),
+                distribution.as_ref().map_or_else(
+                    || Reading::missing(format!("no completed `{boundary}` time in the window")),
+                    |distribution| Reading::quantile(distribution, q, NANOS_PER_MS),
+                ),
+            );
+        }
     }
 }
 

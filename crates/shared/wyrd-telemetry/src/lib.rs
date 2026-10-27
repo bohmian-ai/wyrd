@@ -371,7 +371,26 @@ pub fn record_timing(
     elapsed: std::time::Duration,
     excluded: Option<std::time::Duration>,
 ) {
-    timing::record(parent, boundary, outcome, elapsed, excluded);
+    timing::record(parent, boundary, outcome, elapsed, excluded, &[]);
+}
+
+/// Records one request's server timing as [`record_timing`] does, plus each
+/// `(boundary, duration)` of `parts`: a component of the same request, such
+/// as one execution phase, recorded as an observation of its own boundary
+/// under the same outcome and classification.
+///
+/// The request and its parts are recorded under one lock acquisition, so a
+/// snapshot holds either all of them or none, and a part costs no more
+/// lock traffic than the request already pays.
+pub fn record_timing_parts(
+    parent: &tracing::Span,
+    boundary: &'static str,
+    outcome: &'static str,
+    elapsed: std::time::Duration,
+    excluded: Option<std::time::Duration>,
+    parts: &[(&'static str, std::time::Duration)],
+) {
+    timing::record(parent, boundary, outcome, elapsed, excluded, parts);
 }
 
 /// Resolve the effective log filter from multiple sources in priority order.
@@ -1195,7 +1214,8 @@ mod tests {
     }
 
     /// Concurrent observations under labelled requests land exactly once in
-    /// their own case and phase series; interval snapshots conserve counts,
+    /// their own case and phase series, as does each recorded part under
+    /// its own boundary; interval snapshots conserve counts,
     /// keep zero, bound each percentile by its bucket, and report
     /// out-of-range, negative, reset, and replaced-process evidence.
     ///
@@ -1285,6 +1305,18 @@ mod tests {
             Duration::from_secs(600),
             Some(Duration::ZERO),
         );
+        let verify = request("direct-verify", "repetition-1");
+        super::record_timing_parts(
+            &verify,
+            "verification.direct",
+            "success",
+            Duration::from_micros(300),
+            Some(Duration::from_micros(10)),
+            &[
+                ("verification.direct.engine", Duration::from_micros(100)),
+                ("verification.direct.stage", Duration::ZERO),
+            ],
+        );
         let _invalid = request("drop table", "repetition-1");
         let measured = timing::snapshot();
 
@@ -1305,6 +1337,19 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("no {case} {boundary} series"))
         };
+        let engine = series("direct-verify", "verification.direct.engine");
+        let at = engine.elapsed.quantile(1.0).expect("one part");
+        assert_eq!(
+            engine.count, 1,
+            "a part is one observation of its own boundary"
+        );
+        assert!(at.lowest <= 100_000 && 100_000 <= at.highest);
+        assert!(engine.excluded.is_none() && engine.problems().is_empty());
+        assert_eq!(
+            series("direct-verify", "verification.direct.stage").count,
+            1
+        );
+        assert_eq!(series("direct-verify", "verification.direct").count, 1);
         let point = series("point-lookup", "bifrost.query");
         assert_eq!(point.phase, "repetition-1");
         assert_eq!((point.count, point.elapsed.len()), (8_000, 8_000));
@@ -1330,7 +1375,11 @@ mod tests {
         assert!(p99.highest - p99.lowest <= 7_919 / 1_000);
         let whole = measured.since(&started).expect("same process");
         let total: u64 = whole.series.iter().map(|series| series.count).sum();
-        assert_eq!(total, 10 + 8_000 + 800 + 800 + 3, "each observation once");
+        assert_eq!(
+            total,
+            10 + 8_000 + 800 + 800 + 3 + 3,
+            "each observation and part once"
+        );
 
         let gateway = series("buffered-metadata", "gateway.buffered");
         assert_eq!(gateway.count, 3);

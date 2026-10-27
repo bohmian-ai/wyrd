@@ -51,6 +51,28 @@ pub const OBJECTIVE_CLIENTS: u64 = 64;
 /// Strict server-overhead p99 objective, milliseconds; equality fails.
 pub const OVERHEAD_LIMIT_MS: f64 = 0.5;
 
+/// Each direct execution phase the server times beside
+/// `verification.direct`, as the metric id segment it fills and its
+/// benchmark timing boundary. `outside` is the execution's time outside
+/// every phase: HTTP decode, middleware, and waits between phases.
+pub const PHASE_TIMINGS: [(&str, &str); 6] = [
+    ("admit", "verification.direct.admit"),
+    ("load", "verification.direct.load"),
+    ("prepare", "verification.direct.prepare"),
+    ("engine", "verification.direct.engine"),
+    ("stage", "verification.direct.stage"),
+    ("outside", "verification.direct.outside"),
+];
+
+/// The overhead thresholds each L1 repetition counts executions over, as
+/// the metric id and nanoseconds.
+pub const OVERHEAD_TAILS: [(&str, u64); 4] = [
+    ("overhead_over_500us", 500_000),
+    ("overhead_over_1ms", 1_000_000),
+    ("overhead_over_5ms", 5_000_000),
+    ("overhead_over_10ms", 10_000_000),
+];
+
 /// The L2 stateful step.
 pub const COMPETING: &str = "competing";
 
@@ -372,6 +394,11 @@ fn direct(mut base: Declaration) -> Declaration {
             "server: exact mean of the per-execution residuals",
         ),
         Metric::raw(
+            "overhead_max_ms",
+            "ms",
+            "server: the largest per-execution residual; its histogram bucket's bounds",
+        ),
+        Metric::raw(
             "verifier_p99_ms",
             "ms",
             "server: the union of an execution's own Verifier blocks; nearest-rank bucket bounds of the server's timing histograms",
@@ -387,6 +414,27 @@ fn direct(mut base: Declaration) -> Declaration {
             "server: `verification.direct` timings whose outcome is not `completed`, counted in their own outcome series and never judged",
         ),
     ]);
+    base.metrics.extend(OVERHEAD_TAILS.iter().map(|(id, nanos)| {
+        Metric::raw(
+            id,
+            "verifications",
+            &format!(
+                "server: executions whose residual exceeds {} ms, bounded by the one histogram bucket that straddles it",
+                *nanos as f64 / 1e6
+            ),
+        )
+    }));
+    for (phase, boundary) in PHASE_TIMINGS {
+        for (statistic, what) in [("p99", "nearest-rank p99"), ("max", "largest value")] {
+            base.metrics.push(Metric::raw(
+                &format!("phase_{phase}_{statistic}_ms"),
+                "ms",
+                &format!(
+                    "server diagnostic: the {what} of each execution's `{boundary}` time, its histogram bucket's bounds; phases overlap (engine holds prepare) and are never summed"
+                ),
+            ));
+        }
+    }
     let objective = format!("direct-verify-c{OBJECTIVE_CLIENTS}");
     base.criteria = vec![
         Criterion::limit(

@@ -209,24 +209,31 @@ fn labels_of(span: &tracing::Span) -> Labels {
     .unwrap_or(Labels::NONE)
 }
 
-/// Records one request's server timing under `parent`'s classification;
-/// see [`crate::record_timing`]. Nothing is recorded unless [`enable`]d.
+/// Records one request's server timing, and each of its `parts` as an
+/// observation of the part's own boundary, under `parent`'s
+/// classification and one lock acquisition; see
+/// [`crate::record_timing_parts`]. Nothing is recorded unless [`enable`]d.
 pub(crate) fn record(
     parent: &tracing::Span,
     boundary: &'static str,
     outcome: &'static str,
     elapsed: Duration,
     excluded: Option<Duration>,
+    parts: &[(&'static str, Duration)],
 ) {
     if !enabled() {
         return;
     }
     let labels = labels_of(parent);
-    lock().record(
+    let mut registry = lock();
+    registry.record(
         (boundary, outcome, labels.case, labels.phase),
         elapsed,
         excluded,
     );
+    for (part, duration) in parts {
+        registry.record((part, outcome, labels.case, labels.phase), *duration, None);
+    }
 }
 
 /// Records one query's executed-plan scan facts, rows and bytes when its
@@ -735,6 +742,24 @@ impl Distribution {
         })
     }
 
+    /// Observations above `threshold`, as the bounds a bucketed count
+    /// allows: those whose whole bucket lies above it, and those whose
+    /// bucket reaches above it, which adds the one bucket that straddles
+    /// `threshold`.
+    #[must_use]
+    pub fn count_above(&self, threshold: u64) -> (u64, u64) {
+        self.0
+            .iter_recorded()
+            .fold((0, 0), |(certain, possible), bucket| {
+                let value = bucket.value_iterated_to();
+                let count = bucket.count_at_value();
+                (
+                    certain + count * u64::from(self.0.lowest_equivalent(value) > threshold),
+                    possible + count * u64::from(self.0.highest_equivalent(value) > threshold),
+                )
+            })
+    }
+
     /// The nonzero buckets, for keeping the full interval distribution.
     #[must_use]
     pub fn buckets(&self) -> Buckets {
@@ -1127,5 +1152,25 @@ mod tests {
         observe(&mut registry, "bifrost.query", "full-scan", "none", 5, None);
         assert_eq!(registry.dropped, 1);
         assert_eq!(registry.series.len(), super::MAX_SERIES);
+    }
+
+    /// A count above a threshold is exact away from it and widens by only
+    /// the one bucket that straddles it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a count or its bounds are wrong.
+    #[test]
+    fn counts_above_a_threshold_bound_its_bucket() {
+        let samples = [100_000, 499_000, 500_100, 2_000_000, 12_000_000];
+        let distribution = super::Distribution::of_durations(&samples).expect("in range");
+        assert_eq!(distribution.count_above(1_000_000), (2, 2));
+        assert_eq!(distribution.count_above(0), (5, 5));
+        assert_eq!(distribution.count_above(20_000_000), (0, 0));
+        let (certain, possible) = distribution.count_above(500_000);
+        assert!(
+            certain <= 3 && 3 <= possible && possible - certain <= 1,
+            "{certain}..{possible}"
+        );
     }
 }

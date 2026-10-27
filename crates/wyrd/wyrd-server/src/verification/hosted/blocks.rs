@@ -324,11 +324,14 @@ mod tests {
     /// Two concurrent 50 ms actions of one real engine run land in the
     /// benchmark histograms as one `verification.direct` observation whose
     /// excluded wait counts their overlap once, about 50 ms rather than
-    /// 100, and whose residual is the execution less that union.
+    /// 100, and whose residual is the execution less that union; its
+    /// engine phase lands as one `verification.direct.engine` part holding
+    /// the run, and the time outside every phase as one
+    /// `verification.direct.outside` part.
     ///
     /// # Panics
-    /// Panics when the run fails or the histogram observation, wait, or
-    /// residual is wrong.
+    /// Panics when the run fails or the histogram observation, wait,
+    /// residual, or parts are wrong.
     #[tokio::test]
     async fn histogram_overhead_excludes_real_overlapping_blocks() {
         use wyrd_telemetry::timing;
@@ -350,27 +353,39 @@ mod tests {
             "requirements": [{"id": "done", "statement": "Work ran", "check": {"kind": "assert", "path": "steps.left.status", "operator": "equals", "expected": "succeeded"}}]
         }))
         .expect("Verifier");
-        engine
-            .run(
-                Arc::new(spec),
-                BTreeMap::new(),
-                tokio::time::Instant::now() + Duration::from_secs(5),
+        telemetry
+            .phase(
+                Phase::Engine,
+                engine.run(
+                    Arc::new(spec),
+                    BTreeMap::new(),
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                ),
             )
             .await
             .expect("outcome");
         telemetry.finish("completed", false);
         let interval = timing::snapshot().since(&before).expect("one process");
-        let [series] = interval.series.as_slice() else {
-            panic!("one series: {:?}", interval.series);
-        };
+        let boundaries: Vec<(&str, &str, u64)> = interval
+            .series
+            .iter()
+            .map(|series| {
+                (
+                    series.boundary.as_str(),
+                    series.outcome.as_str(),
+                    series.count,
+                )
+            })
+            .collect();
         assert_eq!(
-            (
-                series.boundary.as_str(),
-                series.outcome.as_str(),
-                series.count
-            ),
-            ("verification.direct", "completed", 1)
+            boundaries,
+            [
+                ("verification.direct", "completed", 1),
+                ("verification.direct.engine", "completed", 1),
+                ("verification.direct.outside", "completed", 1),
+            ]
         );
+        let series = &interval.series[0];
         assert!(series.problems().is_empty(), "{:?}", series.problems());
         let ms = |distribution: Option<&timing::Distribution>| {
             let bucket = distribution
@@ -391,5 +406,9 @@ mod tests {
         );
         let (elapsed, _) = ms(Some(&series.elapsed));
         assert!(elapsed >= lowest, "the execution holds its blocks");
+        let (phase, _) = ms(Some(&interval.series[1].elapsed));
+        assert!(phase >= lowest, "the engine phase holds the run");
+        let (_, outside) = ms(Some(&interval.series[2].elapsed));
+        assert!(outside < 25, "nothing ran outside the engine: {outside} ms");
     }
 }

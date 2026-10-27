@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 
+/// Counter of formatted log lines dropped because the writer thread's queue
+/// was full or the thread had stopped.
+pub const LOG_LINES_DROPPED_TOTAL: &str = "wyrd_log_lines_dropped_total";
+
 /// Most formatted lines queued for the writer thread before new lines drop.
 pub(crate) const QUEUED_LINES: usize = 128_000;
 
@@ -93,13 +97,15 @@ pub(crate) struct QueuedLines {
 }
 
 impl Write for QueuedLines {
-    /// Queues `buf`, one formatted event, or drops and counts it when the
-    /// queue is full or the writer thread has stopped; never fails or waits.
+    /// Queues `buf`, one formatted event, or drops it when the queue is full
+    /// or the writer thread has stopped, counting it in
+    /// [`LOG_LINES_DROPPED_TOTAL`]; never fails or waits.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self.sender.try_send(Some(buf.to_vec())) {
             Ok(()) => {}
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!(LOG_LINES_DROPPED_TOTAL).increment(1);
             }
         }
         Ok(buf.len())
@@ -165,21 +171,32 @@ mod tests {
 
     /// Logging onto a stdout that never accepts a byte returns at once and
     /// drops the lines past the queue instead of blocking the logging
-    /// thread; a blocking writer would hang here on the first line.
+    /// thread; a blocking writer would hang here on the first line. Every
+    /// dropped line is counted in [`super::LOG_LINES_DROPPED_TOTAL`].
     ///
     /// # Panics
     ///
-    /// Panics when a write fails or no line is dropped.
+    /// Panics when a write fails, the lines past the queue (and the one the
+    /// writer thread may hold) are not all dropped, or the metric disagrees.
     #[test]
     fn a_stalled_stdout_drops_lines_instead_of_blocking() {
+        let counted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let recorder =
+            crate::tests::CounterCell(super::LOG_LINES_DROPPED_TOTAL, Arc::clone(&counted));
         let (release, stalled) = std::sync::mpsc::channel();
         let (mut writer, log_writer) = LogWriter::start(Stalled(stalled), 4).expect("writer");
-        for _ in 0..16 {
-            writer
-                .write_all(b"line\n")
-                .expect("a queued write never fails");
-        }
-        assert!(log_writer.dropped_lines() > 0);
+        metrics::with_local_recorder(&recorder, || {
+            for _ in 0..16 {
+                writer
+                    .write_all(b"line\n")
+                    .expect("a queued write never fails");
+            }
+        });
+        let dropped = log_writer.dropped_lines();
+        // Four lines fill the queue and the writer thread may have taken one
+        // more off it before stalling.
+        assert!((11..=12).contains(&dropped), "dropped {dropped}");
+        assert_eq!(counted.load(std::sync::atomic::Ordering::Relaxed), dropped);
         drop(release);
     }
 

@@ -15,6 +15,7 @@ pub use export::{
     TRACE_EXPORT_FAILED_BATCHES_TOTAL, TenantSpanRoute, TenantSpanSink, bind_operation_route,
     bind_tenant_route,
 };
+pub use log_writer::LOG_LINES_DROPPED_TOTAL;
 
 #[cfg(feature = "test-support")]
 use std::collections::BTreeMap;
@@ -923,13 +924,15 @@ mod tests {
         }
     }
 
-    /// Counts increments of the failed-batch counter and nothing else.
-    struct FailedBatchCount(
-        /// The failed-batch counter's cell.
-        Arc<std::sync::atomic::AtomicU64>,
+    /// Counts increments of the counter named `.0` and nothing else.
+    pub(crate) struct CounterCell(
+        /// The counted counter's name.
+        pub(crate) &'static str,
+        /// The counted counter's cell.
+        pub(crate) Arc<std::sync::atomic::AtomicU64>,
     );
 
-    impl metrics::Recorder for FailedBatchCount {
+    impl metrics::Recorder for CounterCell {
         /// Descriptions are not recorded.
         fn describe_counter(
             &self,
@@ -957,14 +960,14 @@ mod tests {
         ) {
         }
 
-        /// The failed-batch counter shares one cell; any other is a no-op.
+        /// The counted counter shares one cell; any other is a no-op.
         fn register_counter(
             &self,
             key: &metrics::Key,
             _: &metrics::Metadata<'_>,
         ) -> metrics::Counter {
-            if key.name() == crate::TRACE_EXPORT_FAILED_BATCHES_TOTAL {
-                metrics::Counter::from_arc(Arc::clone(&self.0))
+            if key.name() == self.0 {
+                metrics::Counter::from_arc(Arc::clone(&self.1))
             } else {
                 metrics::Counter::noop()
             }
@@ -1009,8 +1012,11 @@ mod tests {
         use std::sync::mpsc::channel;
 
         let failed = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        metrics::set_global_recorder(FailedBatchCount(Arc::clone(&failed)))
-            .expect("the only recorder in this test process");
+        metrics::set_global_recorder(CounterCell(
+            crate::TRACE_EXPORT_FAILED_BATCHES_TOTAL,
+            Arc::clone(&failed),
+        ))
+        .expect("the only recorder in this test process");
         let (started, calls) = channel();
         let (release, results) = channel();
         let (shut, shutdowns) = channel();

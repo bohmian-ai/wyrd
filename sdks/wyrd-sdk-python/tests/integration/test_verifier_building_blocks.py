@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import secrets
-import subprocess
 import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -46,7 +45,7 @@ from wyrd.cards import CardKind, CardRef, Cards, VersionBump
 from wyrd.client import WyrdClient
 from wyrd.otel import span_exporter
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer
+from wyrd.testing import WyrdTestServer, cli
 
 from .support import (
     FIXTURES,
@@ -821,9 +820,6 @@ def test_typed_verdict_data_mismatch_keeps_original_result(
     assert scored_calls(receiver) == judged, "nothing is judged again"
 
 
-WYRD_CLI = FIXTURES.parent / "target/debug/wyrd"
-"""The real ``wyrd`` binary the upload journeys drive beside the SDK."""
-
 CORRUPT_PDF = b"%PDF-1.7\nnot a document"
 """Bytes a ``.pdf`` name claims but the extractor refuses."""
 
@@ -853,11 +849,6 @@ def snapshot(root: Path) -> dict[str, bytes]:
     return {
         str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()
     }
-
-
-def wyrd(*args: str) -> subprocess.CompletedProcess[str]:
-    """Run the real ``wyrd`` CLI against the session server the environment names."""
-    return subprocess.run([str(WYRD_CLI), *args], capture_output=True, text=True, check=False)
 
 
 INVALID = "WYRD_LOADER_400_INVALID_ENVELOPE"
@@ -1041,15 +1032,12 @@ def test_artifact_upload_extracts_before_registration(cards: Cards, tmp_path: Pa
     for name in ("corrupt-handbook", "reported-handbook", "colliding-handbook"):
         assert not cards.list(kind="Artifact", name=name).refs, name
 
-    pinned = ("--name", "cli-handbook", "--version", "1.0.0")
-    uploaded = wyrd("artifact", "upload", str(source), *pinned, "--extract")
-    assert uploaded.returncode == 0, uploaded.stderr
-    assert "extracted/handbook.md.json" in uploaded.stdout, uploaded.stdout
-    listed = wyrd("artifact", "files", *pinned, "--format", "json")
-    assert listed.returncode == 0, listed.stderr
-    assert {each["relative_path"] for each in json.loads(listed.stdout)["artifacts"]} == set(held)
-    raw = wyrd("artifact", "upload", str(source), *pinned, "--format", "json")
-    assert raw.returncode != 0, "the raw collection is not the extracted 1.0.0"
+    uploaded = cli.artifact_upload(source, name="cli-handbook", version="1.0.0", extract=True)
+    assert uploaded.version == "1.0.0"
+    listed = cli.artifact_files(name="cli-handbook", version="1.0.0")
+    assert {each["relative_path"] for each in listed["artifacts"]} == set(held)
+    raw = refusal(lambda: cli.artifact_upload(source, name="cli-handbook", version="1.0.0"))
+    assert raw[0] == "WYRD_REGISTRY_409_SPEC_DRIFT", "the raw collection is not the extracted 1.0.0"
 
 
 def test_uploaded_artifacts_are_reused_by_service_judges(

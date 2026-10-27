@@ -26,7 +26,7 @@ Set up a local server, then run one verification, in this order. A connected Wyr
 - [Bindings](/wyrd/build-and-verify/declare/bind-a-verifier/): Attach a Verifier to a Service or one of its components with verified_by, and choose whether your code or a schedule runs it.
 - [Runs and observations](/wyrd/build-and-verify/observe/record-a-run-and-observations/): Wrap each request in a Run, call your model through the gateway, record what happened, verify it, and read the whole Run back.
 - [Write a Verifier](/wyrd/build-and-verify/verify/author-a-verifier/): Write a Verifier, bind it to your Service, call it from your code, and read its verdict, then add a Python check and a model judge.
-- [Recipes](/wyrd/build-and-verify/verify/verifier-recipes/): Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, grouped sessions, and drift.
+- [Recipes](/wyrd/build-and-verify/verify/verifier-recipes/): Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
 
 ## Connect
 

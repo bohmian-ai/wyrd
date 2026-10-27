@@ -1303,7 +1303,7 @@ Copy a check for your own case from [Recipes](/wyrd/build-and-verify/verify/veri
 
 Page: /wyrd/build-and-verify/verify/verifier-recipes/
 
-> Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, grouped sessions, and drift.
+> Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
 
 Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in [Run your first verification](/wyrd/get-started/quickstart/).
 
@@ -1314,6 +1314,7 @@ Pick the check you need, bind its Verifier under `verified_by` to what it checks
 | Logic an operator cannot express | [Python check](#python-check) |
 | Meaning, tone, or policy | [Model judge](#model-judge) |
 | An answer against a document | [Multi-step](#multi-step) |
+| An answer against files you upload once | [Uploaded files](#uploaded-files) |
 | A whole conversation, not one reply | [Grouped session](#grouped-session) |
 | Inputs or outputs shifting over time | [Drift](#drift) |
 
@@ -1638,6 +1639,103 @@ for step in result.steps:  # each step's status, for debugging
 ```
 
 Steps can also be `agent` actions, which read files with built-in tools. [Actions](/wyrd/reference/verifier-card/#actions) lists each kind.
+
+## Uploaded files
+
+Upload a file or directory once as an Artifact Card, then mount the exact files a judge needs into its workspace.
+
+```bash
+wyrd artifact upload ./handbook --name staff-handbook --version 1.0.0 --extract
+```
+
+The command prints the exact Active reference, UID included. Each file keeps its path relative to `./handbook`, byte for byte. Nothing is parsed unless you pass `--extract`; then each supported document `P` is also published as `extracted/P.json` before the Card is declared, and `spec.metadata.extraction` records the report.
+
+The version follows the ordinary rules: uploading the same bytes to a pinned version returns the same Card, changed bytes under it are refused with `WYRD_REGISTRY_409_SPEC_DRIFT`, and `--bump patch` without `--version` publishes the next version. List what a version holds from the server:
+
+```bash
+wyrd artifact files --kind Artifact --name staff-handbook --version 1.0.0
+```
+
+The SDKs run the same upload:
+
+| Language | Upload | Inventory |
+| --- | --- | --- |
+| Python | `Cards().upload_artifact(source, {"name": ..., "version": ...}, version_bump=None, spec=None, extract=False)` | `Cards().list_artifacts(card_ref)` |
+| Rust | `Cards::upload_artifact(source, metadata, spec, extract)` | `Cards::list_artifacts(selector)` |
+| TypeScript | `cards.uploadArtifact(source, { metadata, spec, extract })` | `cards.listArtifacts(ref)` |
+
+`metadata` takes `labels` and `annotations` too, and `spec` defaults to `{artifact_kind: file}`.
+
+Mount the uploaded files by exact reference in an Agent's `workspace`, here the extraction of one handbook:
+
+**handbook-review.yaml**
+
+```yaml title="handbook-review.yaml"
+# Judges a question against the uploaded staff-handbook 1.0.0, mounted at a
+# path the judge's prompt names.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: handbook-review
+  version: 1.0.0
+spec:
+  description: The staff handbook answers the question, with a cited line.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  requirements:
+    - id: handbook-answers
+      statement: The handbook answers the question
+      check:
+        kind: agent
+        agent: ./handbook-judge.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/handbook.json:
+            artifact:
+              card: {kind: Artifact, name: staff-handbook, version: 1.0.0}
+              path: extracted/handbook.md.json
+
+```
+
+**handbook-judge.yaml**
+
+```yaml title="handbook-judge.yaml"
+# Reads the mounted handbook extraction and cites the line answering the question.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: handbook-judge
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [fs.read]
+  run_config: {max_iterations: 3}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "HANDBOOK JUDGE: read /inputs/handbook.json with fs.read and cite the line that answers: {{question}}"
+    response_format:
+      type: object
+      properties:
+        outcome: {type: string, enum: [passed, failed, inconclusive]}
+        reason: {type: string}
+        citations:
+          type: array
+          items:
+            type: object
+            properties:
+              slot: {type: string}
+              locator: {type: object}
+            required: [slot, locator]
+            additionalProperties: false
+      required: [outcome, reason, citations]
+      additionalProperties: false
+
+```
+
+Without `path`, every file of the version is mounted. The judge reads with `fs.read` and cites the `attachment_<n>` slot the tool reports. Uploading a new version never changes what this Verifier mounts. [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/) lists the file tools and the grants each call needs.
 
 ## Grouped session
 

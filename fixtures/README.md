@@ -23,7 +23,7 @@ A story uses the same file and test names in every SDK: `<story>.rs`,
 | `operator_connections` | no Cards | `admin_manages_redacted_connections`, `writer_is_refused`, `reader_cannot_disable_a_connection`, `other_tenant_sees_nothing` |
 | `principal_roles` | `observe_a_run/observed-model.yaml`, `observe_a_run/observed-service.yaml`, and its second release `observe_a_run/observed-service-2.yaml`, which shares the Agent and Model; `gateway_inference/ask-prompt.yaml` is the authored Card | `granted_editor_reaches_the_next_token_until_revoked`, `only_a_tenant_admin_assigns_roles`, `direct_and_idp_user_assignments_coexist`, `stable_accounts_preserve_execution_identity` |
 | `local_development` | `latency_baseline/latency-baseline.yaml`, `verify_in_real_time/latency-model.yaml`, `verify_in_real_time/assistant.yaml` | `admin_key_completes_the_local_workflow` |
-| `verifier_building_blocks` | `verifier_building_blocks/policy-desk.yaml`, which binds `policy-review`, `document-formats`, and `tool-review`; `samples/` holds one tracked sample per extractable format | see the coverage matrix below |
+| `verifier_building_blocks` | `verifier_building_blocks/policy-desk.yaml`, which binds `policy-review`, `document-formats`, `tool-review`, `scored-review`, and `whole-trace`; `samples/` holds one tracked sample per extractable format | see the coverage matrix below |
 | `signed_in_development` | the `local_development` Cards; alice's login comes from the test server's saved-login fixtures | `saved_login_completes_the_workflow_past_token_expiry` |
 | `otel_export` | no Cards | `stock_exporter_span_reads_back_through_bifrost` |
 | `saved_user_auth` | `gateway_inference/ask-prompt.yaml`; logins come from the test server's saved-login fixtures | `newest_saved_login_is_used_without_a_selector`, `saved_reader_login_is_denied_a_write`, `stale_login_refreshes_and_saves_the_renewal`, `revoked_login_is_refused`, `selector_naming_no_saved_login_is_refused`, `explicit_key_beside_a_tenant_selector_is_refused` |
@@ -58,6 +58,7 @@ name.
 | Malformed media never passes | `policy-review.yaml` (`policy` slot) | `malformed_policy_cannot_pass` |
 | Oversized media is refused locally | `policy-review.yaml` (`max_bytes`) | `oversized_policy_is_refused_locally` |
 | Background `submit` resumes by execution ID | `policy-review.yaml` | `submitted_review_is_judged_in_the_background` |
+| `trace` check over every span another workload or an untagged writer added; direct absence is inconclusive; a submitted absent trace retries until it lands | `whole-trace.yaml` | `trace_evidence_keeps_whole_trace_and_waits_when_submitted` (MCP) |
 | Every extractable format's locked output | `document-formats.yaml`, `samples/sample.*` | `every_format_extracts_its_locked_output` |
 | TypeScript positional input: a lone File fills the one slot; a multi-slot Verifier refuses a positional value; an object marked `{ positional: true }` is one value | `document-formats.yaml`, `policy-review.yaml`, `verify_in_real_time/answer-check.yaml` | TypeScript only: `document passed positionally fills the only slot`, `positional value for a multi slot verifier is refused locally`, `positional object is the one answer, not its slots` |
 | Immediate `verify` with an `assert` | `verify_in_real_time/answer-check.yaml` | `agent_answer_passes_its_verifier`, `agent_answer_fails_its_verifier` |

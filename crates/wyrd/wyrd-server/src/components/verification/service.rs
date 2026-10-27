@@ -576,7 +576,7 @@ impl<'a> VerificationControl<'a> {
                     run_id: request.run_id.clone(),
                     deployment_environment: request.deployment_environment.clone(),
                 },
-                accepted_at: started_at,
+                defer_unlanded_traces: false,
                 drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                 clock: telemetry.clock(),
             },

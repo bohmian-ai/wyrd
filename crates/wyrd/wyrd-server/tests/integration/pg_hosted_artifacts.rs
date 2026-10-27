@@ -1143,7 +1143,7 @@ async fn artifact_evidence_is_admitted_against_its_slot_and_the_combined_limit()
                         evidence: &evidence,
                         routes: &routes,
                         subject: GatewayCallContext::default(),
-                        accepted_at: chrono::Utc::now(),
+                        defer_unlanded_traces: false,
                         drift: DriftChecks::new(None, BTreeMap::new(), BTreeMap::new()),
                         clock: BlockClock::default(),
                     },

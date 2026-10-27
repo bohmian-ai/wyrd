@@ -64,6 +64,7 @@ use wyrd_spec::vala::api::{
     AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, VARIANT_MAX_DEPTH,
     VARIANT_MAX_ENCODED_BYTES,
 };
+use wyrd_spec::vala::ids::TraceId;
 use wyrd_spec::vala::managed_columns::{
     ACT_PRINCIPAL_ID, RUN_ID, SUB_PRINCIPAL_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID,
     WYRD_INGESTED_AT,
@@ -3254,10 +3255,11 @@ async fn queued_subject_authority_survives_restart() -> Result<(), ServerJourney
 ///
 /// Service B, acting for User A, enqueues a trace Verifier over the public
 /// route naming a trace that was never recorded. The real runtime reads the
-/// registered span table as the accepted caller. Every retained read
-/// decision of that execution is recorded for A with SYSTEM as actor and
-/// carries exactly the accepted chain `[B]`; the absent trace makes the
-/// requirement inconclusive, so the execution still completes.
+/// registered span table as the accepted caller on each of its three
+/// attempts: the absent trace defers the first two, and the last judges the
+/// requirement inconclusive and completes. Every retained read decision of
+/// that execution is recorded for A with SYSTEM as actor and carries exactly
+/// the accepted chain `[B]`.
 ///
 /// # Errors
 /// Returns server, exchange, route, runtime, or query errors, or a
@@ -3337,11 +3339,14 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("the trace execution never settled: {row:?}").into());
         }
+        if row.status == "retrying" {
+            seed.make_retry_due(execution).await?;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
-    if row.status != "completed" {
+    if (row.status.as_str(), row.attempts) != ("completed", 3) {
         return Err(format!("the delegated trace execution settled {row:?}").into());
     }
 
@@ -3354,8 +3359,8 @@ async fn delegated_input_reads_keep_history() -> Result<(), ServerJourneyError> 
             &format!("operation = 'bifrost.query.read_decision' AND sub_principal_id = '{a_id}'"),
         )
         .await?;
-    if reads.is_empty() {
-        return Err("the execution's trace read retained no decision for A".into());
+    if reads.len() < 3 {
+        return Err(format!("expected a decision for A per attempt, read {reads:?}").into());
     }
     let system = seed.system_principal().to_string();
     for read in &reads {
@@ -5667,6 +5672,441 @@ async fn native_signal_values_and_attribution_are_validated_before_ack()
             "request {request}"
         );
     }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// One span a trace journey writes: its span ID, name, and start time in
+/// Unix nanoseconds.
+type TraceSpan = (u64, &'static str, i64);
+
+/// `spans` of `trace` as one batch of the described span `schema`.
+///
+/// # Panics
+/// Panics when the described schema does not assemble the span rows, as
+/// [`canonical_signals::trace_spans`] does.
+fn trace_batch(schema: &SchemaRef, trace: TraceId, spans: &[TraceSpan]) -> RecordBatch {
+    canonical_signals::trace_spans(schema, trace.as_bytes(), spans)
+}
+
+/// A fresh random trace ID.
+///
+/// # Errors
+/// Never fails for a v7 UUID's bytes.
+fn fresh_trace() -> Result<TraceId, ServerJourneyError> {
+    Ok(TraceId::from_bytes(*uuid::Uuid::now_v7().as_bytes())?)
+}
+
+/// Now in Unix nanoseconds, shifted by `days`.
+fn nanos_from_now(days: i64) -> i64 {
+    (Utc::now() + chrono::Duration::days(days))
+        .timestamp_nanos_opt()
+        .unwrap_or_default()
+}
+
+/// A trace Verifier whose `requirements` judge the `trace` slot.
+fn trace_spec(requirements: &[(&str, &str, Value)]) -> Value {
+    let requirements: Vec<Value> = requirements
+        .iter()
+        .map(|(id, selector, expected)| {
+            json!({ "id": id, "statement": format!("the trace holds {id}"),
+                "check": { "kind": "trace", "on": "inputs.trace", "span_selector": selector,
+                    "operator": "equals", "expected": expected } })
+        })
+        .collect();
+    json!({ "inputs": { "trace": { "type": "trace" } }, "requirements": requirements })
+}
+
+/// The `POST /v1/verification/{route}` body judging `subject` with
+/// `verifier` over `trace`.
+fn trace_body(verifier: &CardUid, subject: &CardUid, trace: TraceId) -> Value {
+    enqueue_body(
+        verifier,
+        subject,
+        json!({ "trace": { "kind": "trace", "trace_id": trace.to_hex() } }),
+    )
+}
+
+/// Execute `verifier` over `trace` for `subject` now, as `client`.
+///
+/// # Errors
+/// Returns the route's refusal.
+async fn execute_trace(
+    client: &wyrd_client::WyrdClient,
+    verifier: &CardUid,
+    subject: &CardUid,
+    trace: TraceId,
+) -> Result<Value, ServerJourneyError> {
+    Ok(client
+        .request_json(
+            reqwest::Method::POST,
+            "/v1/verification/execute",
+            Some(&trace_body(verifier, subject, trace)),
+        )
+        .await?)
+}
+
+/// Each requirement's `(id, outcome)` of an execute response.
+fn requirement_outcomes(result: &Value) -> Vec<(String, String)> {
+    result["outcome"]["requirements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|requirement| {
+            (
+                requirement["id"].as_str().unwrap_or_default().to_owned(),
+                requirement["outcome"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The `(subject_card_uid, verdict)` of every published result of
+/// `execution`.
+///
+/// # Errors
+/// Returns the publication or query error.
+async fn published_results(
+    server: &WyrdTestServer,
+    execution: &str,
+) -> Result<Vec<Vec<Option<String>>>, ServerJourneyError> {
+    server.flush_bifrost().await?;
+    query_texts(
+        server,
+        server.data_tenant_id(),
+        format!(
+            "SELECT {SUBJECT_CARD_UID}, verdict FROM bifrost.verification.results \
+             WHERE CAST(execution_id AS VARCHAR) = '{execution}'"
+        ),
+    )
+    .await
+}
+
+/// An admin client of `server`'s fixture tenant, and the span schema it
+/// writes.
+///
+/// # Errors
+/// Returns bootstrap, client, or describe failures.
+async fn span_writer(
+    server: &WyrdTestServer,
+) -> Result<(wyrd_client::WyrdClient, SchemaRef), ServerJourneyError> {
+    let admin = server
+        .bootstrap_service(
+            &format!("trace-admin-{}", uuid::Uuid::now_v7().simple()),
+            &["admin"],
+        )
+        .await?;
+    let admin = native_client(
+        server,
+        admin
+            .api_key()
+            .ok_or("the admin has an API key")?
+            .expose_secret(),
+    )?;
+    let schema = Arc::clone(
+        TableConfig::describe_with(&admin, SPANS)
+            .await?
+            .user_schema(),
+    );
+    Ok((admin, schema))
+}
+
+/// Verification reads every retained span of the exact trace it names, and
+/// the result stays its own subject's (REQ-043/045, AC-017/019).
+///
+/// One trace's spans are written through native ingest by a checkout-rooted
+/// writer 30 days ago, a fraud-rooted writer now, and an untagged writer two
+/// days ahead, outside the former seven-days-before/one-day-after window;
+/// another trace and another tenant's spans of the same trace ID are written
+/// beside them. Checkout's direct verification judges all three spans, in
+/// start order with their own span IDs, and none of the others; its
+/// published result names checkout. A caller without query access gets an
+/// inconclusive requirement; a 10,000-span trace is judged in full and a
+/// 10,001-span trace is refused explicitly.
+///
+/// # Errors
+/// Returns server, fixture, ingest, route, or query failures.
+///
+/// # Panics
+/// Panics when a judgment, ownership, or refusal differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn visible_trace_spans_preserve_binding_ownership() -> Result<(), ServerJourneyError> {
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let tenant = server.data_tenant_id();
+    server
+        .ensure_builtin_table_for_test(tenant, "traces", "spans")
+        .await?;
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (checkout, _) = seed.service("checkout").await?;
+    let (fraud, _) = seed.service("fraud").await?;
+    let (admin, schema) = span_writer(&server).await?;
+    let trace = fresh_trace()?;
+    let spans: [(_, TraceSpan); 3] = [
+        (
+            admin.for_workload(checkout.clone()),
+            (1, "retrieve", nanos_from_now(-30)),
+        ),
+        (
+            admin.for_workload(fraud.clone()),
+            (2, "score", nanos_from_now(0)),
+        ),
+        (admin.clone(), (3, "rank", nanos_from_now(2))),
+    ];
+    for (writer, span) in &spans {
+        native_spans(
+            writer,
+            uuid::Uuid::now_v7(),
+            &trace_batch(&schema, trace, &[*span]),
+        )
+        .await?;
+    }
+    native_spans(
+        &admin,
+        uuid::Uuid::now_v7(),
+        &trace_batch(
+            &schema,
+            fresh_trace()?,
+            &[(4, "unrelated", nanos_from_now(0))],
+        ),
+    )
+    .await?;
+    let other = server.seed_tenant("trace-other").await?;
+    let intruder = server
+        .bootstrap_service_in_tenant(other, "trace-intruder", &["admin"])
+        .await?;
+    native_spans(
+        &native_client(
+            &server,
+            intruder
+                .api_key()
+                .ok_or("the intruder has an API key")?
+                .expose_secret(),
+        )?,
+        uuid::Uuid::now_v7(),
+        &trace_batch(&schema, trace, &[(5, "foreign", nanos_from_now(0))]),
+    )
+    .await?;
+    server.flush_bifrost().await?;
+    let workloads: Vec<Value> = Bifrost::query_only(&admin)
+        .sql_as(
+            &format!(
+                "SELECT CAST({WORKLOAD_CARD_UID} AS VARCHAR) AS workload FROM {SPANS} \
+                 WHERE trace_id = X'{}' ORDER BY start_time_unix_nano",
+                trace.to_hex()
+            ),
+            &[],
+        )
+        .await?;
+    assert_eq!(
+        workloads,
+        [
+            json!({ "workload": checkout.to_string() }),
+            json!({ "workload": fraud.to_string() }),
+            json!({})
+        ],
+        "the trace spans two workloads and an untagged writer"
+    );
+
+    let verifier = seed
+        .verifier(
+            "whole-trace",
+            &trace_spec(&[
+                (
+                    "names",
+                    "$.spans[*].name",
+                    json!(["retrieve", "score", "rank"]),
+                ),
+                (
+                    "identities",
+                    "$.spans[*].span_id",
+                    json!(
+                        spans
+                            .iter()
+                            .map(|(_, (id, ..))| format!("{id:016x}"))
+                            .collect::<Vec<_>>()
+                    ),
+                ),
+            ]),
+        )
+        .await?;
+    let judged = execute_trace(&admin, &verifier, &checkout, trace).await?;
+    assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+    assert_eq!(
+        judged["subject"]["uid"],
+        json!(checkout.to_string()),
+        "{judged}"
+    );
+    let execution = judged["execution_id"].as_str().ok_or("an execution ID")?;
+    assert_eq!(
+        published_results(&server, execution).await?,
+        [vec![Some(checkout.to_string()), Some("passed".to_owned())]],
+        "the published result is checkout's own"
+    );
+
+    server
+        .seed_role(
+            "trace_unqueried",
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await?;
+    let unqueried = server
+        .bootstrap_user("trace-unqueried", &["trace_unqueried"])
+        .await?;
+    let unqueried = native_client(&server, unqueried.jwt().ok_or("a user has a token")?)?;
+    let denied = execute_trace(&unqueried, &verifier, &checkout, trace).await?;
+    assert_eq!(
+        requirement_outcomes(&denied),
+        [
+            ("names".to_owned(), "inconclusive".to_owned()),
+            ("identities".to_owned(), "inconclusive".to_owned())
+        ],
+        "{denied}"
+    );
+    assert!(
+        denied["outcome"]["requirements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|requirement| requirement["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("lacks BifrostQuery/Read"))),
+        "the ordinary query refusal decides: {denied}"
+    );
+
+    let ceiling = seed
+        .verifier(
+            "trace-ceiling",
+            &trace_spec(&[("last", "$.spans[9999].name", json!("last"))]),
+        )
+        .await?;
+    for (count, verdict) in [(10_000_u64, "passed"), (10_001, "inconclusive")] {
+        let large = fresh_trace()?;
+        let start = nanos_from_now(0);
+        let spans: Vec<TraceSpan> = (1..=count)
+            .map(|id| {
+                let name = if id == 10_000 { "last" } else { "bulk" };
+                (id, name, start + i64::try_from(id).unwrap_or_default())
+            })
+            .collect();
+        native_spans(
+            &admin,
+            uuid::Uuid::now_v7(),
+            &trace_batch(&schema, large, &spans),
+        )
+        .await?;
+        server.flush_bifrost().await?;
+        let judged = execute_trace(&admin, &ceiling, &checkout, large).await?;
+        assert_eq!(
+            judged["outcome"]["verdict"], verdict,
+            "{count} spans: {judged}"
+        );
+        if count > 10_000 {
+            assert!(
+                judged.to_string().contains("exceeds 10000 spans"),
+                "{count} spans: {judged}"
+            );
+        }
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// A completed verification keeps its result when spans land later; only a
+/// new verification judges them (REQ-045, AC-019).
+///
+/// A queued checkout verification of a trace holding only `retrieve` is
+/// judged on its first attempt and fails, since nonempty evidence never
+/// waits. `rank` then lands. The execution stays completed after one
+/// attempt with its one failed result, and a new direct verification of the
+/// same trace passes.
+///
+/// # Errors
+/// Returns server, fixture, ingest, route, runtime, or query failures.
+///
+/// # Panics
+/// Panics when the first judgment waits or changes, or the new one differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn late_trace_spans_require_new_verification() -> Result<(), ServerJourneyError> {
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let tenant = server.data_tenant_id();
+    server
+        .ensure_builtin_table_for_test(tenant, "traces", "spans")
+        .await?;
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let (checkout, _) = seed.service("checkout").await?;
+    let (admin, schema) = span_writer(&server).await?;
+    let verifier = seed
+        .verifier(
+            "late-trace",
+            &trace_spec(&[("names", "$.spans[*].name", json!(["retrieve", "rank"]))]),
+        )
+        .await?;
+    let trace = fresh_trace()?;
+    let start = nanos_from_now(0);
+    native_spans(
+        &admin,
+        uuid::Uuid::now_v7(),
+        &trace_batch(&schema, trace, &[(1, "retrieve", start)]),
+    )
+    .await?;
+    server.flush_bifrost().await?;
+
+    let accepted: Value = admin
+        .request_json(
+            reqwest::Method::POST,
+            "/v1/verification/enqueue",
+            Some(&trace_body(&verifier, &checkout, trace)),
+        )
+        .await?;
+    let execution = await_queued(&seed, &accepted).await?;
+    let runtime = VerificationRuntime::builder(server.state())
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let first = loop {
+        let row = seed.execution(execution).await?;
+        if !["pending", "running"].contains(&row.status.as_str()) {
+            break row;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the trace execution never settled: {row:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        (first.status.as_str(), first.attempts),
+        ("completed", 1),
+        "{first:?}"
+    );
+    let id = execution.to_string();
+    let failed = vec![vec![Some(checkout.to_string()), Some("failed".to_owned())]];
+    assert_eq!(published_results(&server, &id).await?, failed);
+
+    native_spans(
+        &admin,
+        uuid::Uuid::now_v7(),
+        &trace_batch(&schema, trace, &[(2, "rank", start + 1)]),
+    )
+    .await?;
+    server.flush_bifrost().await?;
+    let again = execute_trace(&admin, &verifier, &checkout, trace).await?;
+    assert_eq!(again["outcome"]["verdict"], "passed", "{again}");
+    assert_ne!(again["execution_id"], json!(id), "a new execution judged");
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    assert_eq!(
+        seed.execution(execution).await?,
+        first,
+        "the completed execution is final"
+    );
+    assert_eq!(published_results(&server, &id).await?, failed);
     server.shutdown().await?;
     Ok(())
 }

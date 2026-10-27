@@ -573,3 +573,38 @@ unchanged by the deduplication).
 Result: no measurable improvement. Both moves sit inside the logs spread of
 the earlier records (c1 46.1k–51.6k rows/cpu-s; decode p50 0.97–1.05 ms).
 Span and native steps moved within their spreads.
+
+### Item 7(c) acceptance: two passes per OTLP message
+
+Every trace and log message (span, event, link, status, key/value, resource,
+entity reference, scope, resource and scope groups, log record) now takes one
+`Scanned` pass, which records each tag's length-delimited count and last body,
+and one fill pass that validates every known field's wire type. Before, each
+count, last-wins field and merged singular message rescanned the message
+(about 10 passes per span). A singular message that occurs once decodes from
+its one body; one split across occurrences keeps the existing merge path.
+The existing owner was the per-field helpers in `otlp_decode.rs`; the gap was
+the repeated scan, and `Scanned` replaces those calls in place.
+
+Before `writes-parquet/20261027T191939Z-916be62bb`, after
+`writes-parquet/20261027T194538Z-3adfc0c14` (VALID, unprofiled, commit
+3adfc0c14). Medians of three repetitions; every repetition of every step
+moved by more than the spread.
+
+| Step | otlp_decode p50 ms | rows/cpu-s | wire MiB/cpu-s |
+|---|---|---|---|
+| otlp-spans-c1 | 1.30 → 0.74 | 59.2k → 63.2k | 19.1 → 20.4 |
+| otlp-spans-c64 | 1.85 → 1.15 | 51.7k → 55.6k | 16.7 → 17.9 |
+| otlp-spans-1k-c1 | 3.67 → 2.44 | 31.3k → 34.0k | 31.4 → 34.2 |
+| otlp-spans-1k-c64 | 4.50 → 3.13 | 24.0k → 24.9k | 24.1 → 25.0 |
+| otlp-logs-c1 | 0.96 → 0.70 | 49.4k → 50.3k | 59.0 → 60.0 |
+| otlp-logs-c64 | 1.60 → 1.15 | 36.1k → 38.2k | 43.2 → 45.6 |
+
+Result: decode time fell 27–43% on every OTLP step. Rows per CPU-second
+rose 2–9%. Small spans still miss the 30 wire MiB/cpu-s floor. Native steps
+do not decode OTLP and moved within their spreads.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Two passes per message | `Scanned` in `otlp_decode.rs`; trace and log decoders | the table above | PASS |
+| Exact capacity, last-wins, merges and malformed refusals preserved | fill pass keeps every `wrong_wire` arm; split singulars use `decode_merged_*` | 56 `otlp` lib tests, including `otlp_decode::tests::trace_fixed_decode_keeps_last_strings_and_refuses_wrong_wire_types`, `trace_fixed_decode_has_no_spare_collection_capacity`, `trace_fixed_decode_merges_split_singular_messages`, `logs_fixed_decode_merges_duplicate_singular_fields`; fmt, lints, `git diff --check` | PASS |

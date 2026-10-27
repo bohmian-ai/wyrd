@@ -323,13 +323,21 @@ impl<'a> WireFields<'a> {
         Ok(Some((tag, value)))
     }
 
-    /// Reads one canonical protobuf varint from the current cursor.
+    /// Reads one canonical protobuf varint from the current cursor. A
+    /// single-byte varint, the common case for tags and short lengths,
+    /// returns before the general loop.
     ///
     /// # Errors
     ///
     /// Returns the stable malformed-request error for truncation or a value
     /// wider than ten bytes.
     fn read_varint(&mut self) -> Result<u64, IngestError> {
+        if let Some(&byte) = self.bytes.get(self.cursor)
+            && byte < 0x80
+        {
+            self.cursor += 1;
+            return Ok(u64::from(byte));
+        }
         let mut value = 0_u64;
         for shift in (0..70).step_by(7) {
             let byte = *self
@@ -1986,6 +1994,40 @@ mod tests {
             u64::try_from(message.len()).expect("invariant: encoded length fits u64"),
         );
         bytes.extend_from_slice(message);
+    }
+
+    /// Varints read the value prost encodes and advance past it at the one-
+    /// and multi-byte boundaries, and truncation, an eleventh byte, and a
+    /// tenth-byte overflow stay malformed.
+    ///
+    /// # Panics
+    /// Panics when a value, cursor, or refusal differs.
+    #[test]
+    fn varints_read_boundaries_and_refuse_malformed_input() {
+        for value in [
+            0,
+            1,
+            0x7f,
+            0x80,
+            0x3fff,
+            0x4000,
+            u64::from(u32::MAX),
+            u64::MAX,
+        ] {
+            let mut bytes = Vec::new();
+            push_varint(&mut bytes, value);
+            bytes.push(0x2a);
+            let mut fields = WireFields::new(&bytes);
+            assert_eq!(fields.read_varint().expect("canonical varint"), value);
+            assert_eq!(fields.cursor, bytes.len() - 1, "{value}");
+        }
+        let mut overflow = vec![0xff; 9];
+        overflow.push(0x02);
+        let mut eleven = vec![0x80; 10];
+        eleven.push(0x00);
+        for bytes in [&[][..], &[0x80][..], &overflow, &eleven] {
+            assert!(WireFields::new(bytes).read_varint().is_err(), "{bytes:?}");
+        }
     }
 
     /// Proves trace preflight derives typed capacity without decoding.

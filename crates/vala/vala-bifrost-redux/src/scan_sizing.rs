@@ -289,8 +289,12 @@ impl<'scope> ScanSizer<'scope> {
     /// groups of `footer` the filters cannot rule out, and how many row
     /// groups those are.
     ///
-    /// A footer whose schema does not convert to Arrow, or a scope with no
-    /// plannable filter, keeps every row group. A footer written under another
+    /// The filters prune against the footer's memoized Arrow schema
+    /// ([`parquet::file::metadata::ParquetMetaData::arrow_schema`]), the same
+    /// one the scan's reader opens the file with, so it is derived once per
+    /// footer rather than once per sizing. A footer whose schema does not
+    /// convert to Arrow, or a scope with no plannable filter, keeps every row
+    /// group. A footer written under another
     /// schema revision has the filters planned against its own columns, so a
     /// filter on a column it lacks drops out instead of misreading another. A column chunk counts when
     /// its top-level column is covered, so a Variant column counts every
@@ -305,11 +309,7 @@ impl<'scope> ScanSizer<'scope> {
         };
         let mut access =
             RowGroupAccessPlanFilter::new(ParquetAccessPlan::new_all(footer.num_row_groups()));
-        let file_schema = parquet::arrow::parquet_to_arrow_schema(
-            footer.file_metadata().schema_descr(),
-            footer.file_metadata().key_value_metadata(),
-        );
-        if let Ok(file_schema) = file_schema {
+        if let Ok(file_schema) = footer.arrow_schema() {
             let revised;
             let pruning = if file_schema
                 .fields()
@@ -319,7 +319,7 @@ impl<'scope> ScanSizer<'scope> {
             {
                 self.pruning.as_ref()
             } else {
-                revised = self.scope.pruning(&Arc::new(file_schema.clone()));
+                revised = self.scope.pruning(&file_schema);
                 revised.as_ref()
             };
             if let Some(pruning) = pruning {
@@ -787,13 +787,7 @@ mod tests {
     fn scan_sizer_counts_uncompressed_covered_kept_chunks() {
         use datafusion::logical_expr::{col, lit};
         let footer = two_row_group_footer();
-        let schema = Arc::new(
-            parquet::arrow::parquet_to_arrow_schema(
-                footer.file_metadata().schema_descr(),
-                footer.file_metadata().key_value_metadata(),
-            )
-            .expect("schema"),
-        );
+        let schema = footer.arrow_schema().expect("schema");
         let chunk = |group: usize, column: usize| {
             u64::try_from(footer.row_group(group).column(column).uncompressed_size()).expect("size")
         };

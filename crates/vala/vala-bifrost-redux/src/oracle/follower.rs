@@ -1370,7 +1370,7 @@ pub(crate) mod tests {
         ));
         let placeholder = Arc::new(RemoteSourcePlaceholderExec::new(
             "scan",
-            &super::super::assignment_schema_fingerprint(schema.as_ref()),
+            super::super::assignment_schema_fingerprint(schema.as_ref()),
             schema,
         ));
         let bytes = physical_plan_to_bytes_with_extension_codec(

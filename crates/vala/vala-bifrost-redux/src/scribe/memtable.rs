@@ -1965,7 +1965,8 @@ impl ReadableSource {
     /// `pruning` is planned over `required` and runs on the projected bounds
     /// of every captured batch before any batch is projected, so a batch the
     /// query's predicate rules out is never cast or assembled. `None` keeps
-    /// every batch.
+    /// every batch. Bounds are shared unchanged when the projection reads
+    /// every written column, in order and uncast.
     ///
     /// # Errors
     ///
@@ -1996,25 +1997,27 @@ impl ReadableSource {
                 source.filter(|column| self.schema.field(*column).data_type() == field.data_type())
             })
             .collect();
+        let whole = kept.len() == self.schema.fields().len()
+            && kept
+                .iter()
+                .enumerate()
+                .all(|(at, column)| *column == Some(at));
         let statistics: Vec<Arc<Statistics>> = (0..self.batches.len())
-            .map(|index| {
-                Arc::new(self.statistics.get(index).map_or_else(
-                    || Statistics::new_unknown(&schema),
-                    |bounds| {
-                        Statistics {
-                            num_rows: bounds.num_rows,
-                            total_byte_size: Precision::Absent,
-                            column_statistics: kept
-                                .iter()
-                                .map(|column| {
-                                    column.map_or_else(ColumnStatistics::new_unknown, |column| {
-                                        bounds.column_statistics[column].clone()
-                                    })
-                                })
-                                .collect(),
-                        }
-                    },
-                ))
+            .map(|index| match self.statistics.get(index) {
+                Some(bounds) if whole => Arc::clone(bounds),
+                Some(bounds) => Arc::new(Statistics {
+                    num_rows: bounds.num_rows,
+                    total_byte_size: Precision::Absent,
+                    column_statistics: kept
+                        .iter()
+                        .map(|column| {
+                            column.map_or_else(ColumnStatistics::new_unknown, |column| {
+                                bounds.column_statistics[column].clone()
+                            })
+                        })
+                        .collect(),
+                }),
+                None => Arc::new(Statistics::new_unknown(&schema)),
             })
             .collect();
         let keep = pruning.map(|pruning| pruning.keep(&statistics, self.batches.len()));
@@ -2289,6 +2292,53 @@ mod tests {
 
         assert_eq!(lsns(Some(&pruning)), vec![2]);
         assert_eq!(lsns(None), vec![1, 2]);
+    }
+
+    /// A capture read that projects every written column, in order and
+    /// uncast, shares each batch's recorded bounds instead of copying them,
+    /// and a narrower projection copies only its columns' bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the capture cannot be taken or read, or the whole read
+    /// does not share the recorded bounds.
+    #[test]
+    fn whole_schema_capture_read_shares_recorded_bounds() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("other", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(Int64Array::from(vec![2_i64])),
+            ],
+        )
+        .expect("two-column batch");
+        memtable
+            .insert(&key, make_test_meta(1), batch)
+            .expect("active insert");
+        let capture = LiveCapture::take([&memtable], key.tenant, &key.table, None)
+            .expect("locks")
+            .expect("no registry to wait on");
+        let partitions = key.partition.time()..=key.partition.time();
+        let recorded = Arc::clone(&capture.memory[0].statistics[0]);
+        let read = |fields: &[FieldRef]| {
+            capture
+                .read(&partitions, fields, None)
+                .expect("capture read")
+                .batches
+                .remove(0)
+                .statistics
+        };
+
+        assert!(Arc::ptr_eq(&read(schema.fields()), &recorded));
+        let narrow = read(&schema.fields()[..1]);
+        assert!(!Arc::ptr_eq(&narrow, &recorded));
+        assert_eq!(narrow.column_statistics.len(), 1);
     }
 
     /// An append batch's bounds are exact for a primitive column and unknown

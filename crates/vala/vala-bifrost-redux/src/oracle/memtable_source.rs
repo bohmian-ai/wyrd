@@ -54,6 +54,10 @@ pub(super) struct MemtableSource {
     /// Exact bounds of each batch in `inner`, partition by partition, column
     /// for column with the source schema.
     statistics: Vec<Vec<Arc<Statistics>>>,
+    /// `statistics` merged once per partition, then across partitions, so
+    /// the planner's repeated statistics requests read Scribe's recorded
+    /// bounds instead of re-walking the batches.
+    merged: Merged,
     /// The sizing that deals batches over partitions by their recorded column bytes.
     partitioning: crate::scan_sizing::OraclePartitioning,
     /// Accounting owners of the batches' Arrow buffers.
@@ -74,12 +78,14 @@ impl MemtableSource {
     /// The batches are already projected to the query's columns, so they are
     /// sized by [`ScanSizer`] with every column covered. `charges` are the
     /// accounting owners of the batches' buffers, held for the source's life.
-    /// The source holds no filter until filter pushdown offers it one.
+    /// The batches' bounds are merged into [`Merged`] here, once. The source
+    /// holds no filter until filter pushdown offers it one.
     ///
     /// # Errors
     ///
     /// Returns the `DataFusion` error raised when a batch does not match
-    /// `schema`.
+    /// `schema`, or when bounds do not merge because their column counts
+    /// differ.
     pub(super) fn try_new(
         batches: Vec<(RecordBatch, Arc<Statistics>)>,
         charges: Arc<[Arc<crate::scribe::memory::RetainedArrowCharge>]>,
@@ -97,6 +103,7 @@ impl MemtableSource {
             statistics.push(bounds);
         }
         let (batches, statistics): (Vec<Vec<_>>, Vec<Vec<_>>) = dealt.into_iter().unzip();
+        let merged = Merged::try_new(&statistics, &schema)?;
         Ok(Self {
             inner: MemorySourceConfig::try_new(&batches, schema, None)?,
             matched: statistics
@@ -104,6 +111,7 @@ impl MemtableSource {
                 .map(|bounds| vec![false; bounds.len()])
                 .collect(),
             statistics,
+            merged,
             partitioning,
             charges,
             filter: None,
@@ -123,6 +131,7 @@ impl MemtableSource {
             .map(|inner| Self {
                 inner: inner.clone(),
                 statistics: self.statistics.clone(),
+                merged: self.merged.clone(),
                 partitioning: self.partitioning,
                 charges: Arc::clone(&self.charges),
                 filter: None,
@@ -236,6 +245,54 @@ impl MemtableSource {
     }
 }
 
+/// A memtable source's recorded bounds, merged.
+#[derive(Debug, Clone)]
+struct Merged {
+    /// Each partition's batch bounds merged, in partition order.
+    partitions: Vec<Arc<Statistics>>,
+    /// Every partition's merged bounds merged again.
+    total: Arc<Statistics>,
+}
+
+impl Merged {
+    /// Merges `statistics`, one list of batch bounds per partition, with
+    /// `DataFusion`'s [`Statistics::try_merge_iter`]; an empty partition
+    /// reports unknown statistics over `schema`.
+    ///
+    /// The planner answers `MIN` and `MAX` from exact bounds, so a column
+    /// whose recorded bound is not of its `schema` type, as when the follower
+    /// cast the column to the query's closure, reports no bound at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns the merge error when two bounds differ in column count.
+    fn try_new(statistics: &[Vec<Arc<Statistics>>], schema: &SchemaRef) -> DataFusionResult<Self> {
+        let partitions = statistics
+            .iter()
+            .map(|bounds| {
+                let mut merged =
+                    Statistics::try_merge_iter(bounds.iter().map(AsRef::as_ref), schema)?;
+                for (column, field) in merged.column_statistics.iter_mut().zip(schema.fields()) {
+                    for bound in [&mut column.min_value, &mut column.max_value] {
+                        if bound
+                            .get_value()
+                            .is_some_and(|value| value.data_type() != *field.data_type())
+                        {
+                            *bound = datafusion::common::stats::Precision::Absent;
+                        }
+                    }
+                }
+                Ok(Arc::new(merged))
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let total = Arc::new(Statistics::try_merge_iter(
+            partitions.iter().map(AsRef::as_ref),
+            schema,
+        )?);
+        Ok(Self { partitions, total })
+    }
+}
+
 impl DataSource for MemtableSource {
     /// Streams one partition's kept batches, filtering each one its bounds
     /// do not prove fully matching by the filters this source took over, and
@@ -282,14 +339,30 @@ impl DataSource for MemtableSource {
         self.inner.eq_properties()
     }
 
-    /// Reports the wrapped source's statistics, inexact once this source
-    /// filters, because they count rows before the filter.
+    /// Reports the merged recorded bounds of one partition, or of all of
+    /// them, inexact once this source filters, because they count rows before
+    /// the filter.
+    ///
+    /// A source rewritten with a limit or projection, whose output the
+    /// recorded bounds no longer describe, and an out-of-range partition
+    /// report the wrapped source's statistics instead.
     ///
     /// # Errors
     ///
     /// Returns the wrapped source's error for an out-of-range partition.
     fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        let statistics = self.inner.partition_statistics(partition)?;
+        let recorded = if self.inner.fetch().is_some() || self.inner.projection().is_some() {
+            None
+        } else {
+            match partition {
+                None => Some(Arc::clone(&self.merged.total)),
+                Some(partition) => self.merged.partitions.get(partition).cloned(),
+            }
+        };
+        let statistics = match recorded {
+            Some(statistics) => statistics,
+            None => self.inner.partition_statistics(partition)?,
+        };
         Ok(if self.filter.is_some() {
             Arc::new(Arc::unwrap_or_clone(statistics).to_inexact())
         } else {
@@ -406,7 +479,7 @@ mod tests {
     use datafusion::common::stats::Precision;
     use datafusion::common::{ColumnStatistics, Statistics};
     use datafusion::config::ConfigOptions;
-    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::datasource::source::{DataSource as _, DataSourceExec};
     use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::expressions::{BinaryExpr, col, lit};
     use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
@@ -586,5 +659,73 @@ mod tests {
         assert_eq!(source.matched, vec![vec![false, true, false]]);
         assert_eq!(ids, vec![2, 10, 11, 12, 30]);
         assert_eq!(exact, Some(false));
+    }
+
+    /// The source reports Scribe's recorded bounds merged per partition and
+    /// in total, not statistics recomputed from the batches, a bound whose
+    /// type is not the source schema's column type is not reported, and a
+    /// limited source reports the wrapped source's statistics instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the source cannot be built or a merged statistic differs.
+    #[test]
+    fn statistics_merge_recorded_bounds() {
+        let partitioning = crate::scan_sizing::OraclePartitioning::new(
+            2,
+            crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let (first_batch, mut recorded) = bounded(&[4, 9]);
+        // A recorded bound wider than the rows: only Scribe's bound reports it.
+        Arc::make_mut(&mut recorded).column_statistics[0].min_value =
+            Precision::Exact(ScalarValue::Int64(Some(-7)));
+        let source = MemtableSource::try_new(
+            vec![(first_batch, recorded), bounded(&[-3, 2])],
+            Arc::from(Vec::new()),
+            partitioning,
+            1,
+            Arc::clone(&schema),
+        )
+        .expect("memtable source");
+        let total = source.partition_statistics(None).expect("total");
+        let first = source.partition_statistics(Some(0)).expect("partition");
+
+        assert_eq!(total.num_rows, Precision::Exact(4));
+        assert_eq!(
+            total.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int64(Some(-7)))
+        );
+        assert_eq!(
+            total.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(9)))
+        );
+        assert_eq!(first.num_rows, total.num_rows);
+        let limited = source
+            .with_fetch(Some(1))
+            .expect("limited source")
+            .partition_statistics(None)
+            .expect("limited statistics");
+        assert_ne!(
+            limited.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int64(Some(-7))),
+            "a limited source does not report the recorded bounds"
+        );
+
+        let cast = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let (batch, bounds) = bounded(&[1, 2]);
+        let batch = super::super::exec::project_batch(&batch, Arc::clone(&cast)).expect("cast");
+        let source = MemtableSource::try_new(
+            vec![(batch, bounds)],
+            Arc::from(Vec::new()),
+            partitioning,
+            1,
+            cast,
+        )
+        .expect("cast source");
+        let total = source.partition_statistics(None).expect("total");
+
+        assert_eq!(total.column_statistics[0].min_value, Precision::Absent);
+        assert_eq!(total.column_statistics[0].max_value, Precision::Absent);
     }
 }

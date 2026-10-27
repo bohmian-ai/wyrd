@@ -185,6 +185,12 @@ Flags:
 `bench:l1` accepts only `--profile`, `--allow-dirty`, and `--smoke`, and
 passes them to every engine.
 
+The Bifrost experiments' server inherits `WYRD_SCRIBE_SHARD_COUNT` from the
+command's environment (default 1 shard). A set value is named in the record's
+`limits` control, so L2 calibration reads only records run at the same shard
+count. For example,
+`WYRD_SCRIBE_SHARD_COUNT=4 mise run bench:l1:bifrost:writes -- --steps native-write-c64`.
+
 ## Verdicts
 
 Benchmarks are measurements, not CI: a slower result is evidence, never a

@@ -526,11 +526,26 @@ fn read_fixture(tier: &str) -> Value {
     })
 }
 
-/// The limits control of a server run with Scribe settings `settings`.
-fn limits(settings: &[(&str, &str)]) -> Value {
+/// The Scribe shard-count setting a server run inherits from the driver's
+/// environment, the one experiment variable an operator sets on the command.
+const SHARD_COUNT: &str = "WYRD_SCRIBE_SHARD_COUNT";
+
+/// The `WYRD_SCRIBE_SHARD_COUNT` this run's server inherits, when set.
+fn shard_override() -> Option<String> {
+    std::env::var(SHARD_COUNT).ok()
+}
+
+/// The limits control of a server run with Scribe settings `settings` and
+/// the inherited `shards` override.
+///
+/// An unset override leaves the text a default-shard record has always
+/// carried, so calibration and comparison select only records run at the
+/// same shard count.
+fn limits(settings: &[(&str, &str)], shards: Option<&str>) -> Value {
     let settings: Vec<String> = settings
         .iter()
         .map(|(name, value)| format!("{name}={value}"))
+        .chain(shards.map(|shards| format!("{SHARD_COUNT}={shards}")))
         .collect();
     json!(format!(
         "server defaults on the whole host except {}; no resource quota",
@@ -831,8 +846,10 @@ fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration 
             Experiment::Parquet => read_fixture("parquet"),
         },
     );
-    base.controls
-        .insert("limits".to_owned(), limits(experiment.env()));
+    base.controls.insert(
+        "limits".to_owned(),
+        limits(experiment.env(), shard_override().as_deref()),
+    );
     base.controls.insert(
         "workload".to_owned(),
         json!(match experiment {
@@ -1059,7 +1076,8 @@ pub fn calibrate(
                     .iter()
                     .all(|key| build(&record.build, key) == build(&base.build, key))
                 && record.controls.values.get("fixture") == Some(&write_fixture())
-                && record.controls.values.get("limits") == Some(&limits(&PARQUET_ENV))
+                && record.controls.values.get("limits")
+                    == Some(&limits(&PARQUET_ENV, shard_override().as_deref()))
                 && record.validity.reasons.is_empty()
                 && record.mode == Mode::Full
         })
@@ -1273,8 +1291,10 @@ fn competing_declaration(
             "client_queue": "one Service tenant emitting Drift observations of 100 features (100 rows each) through `WyrdState`",
         }),
     );
-    base.controls
-        .insert("limits".to_owned(), limits(&PARQUET_ENV));
+    base.controls.insert(
+        "limits".to_owned(),
+        limits(&PARQUET_ENV, shard_override().as_deref()),
+    );
     base.controls.insert(
         "workload".to_owned(),
         json!({
@@ -1601,6 +1621,26 @@ fn parquet(root: &Path) -> Vec<(std::path::PathBuf, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A default-shard run keeps the limits text earlier records carry, and
+    /// a shard override is named so it never matches a default record.
+    #[test]
+    fn limits_name_only_a_set_shard_override() {
+        assert_eq!(
+            limits(&PARQUET_ENV, None),
+            json!(
+                "server defaults on the whole host except WYRD_MAX_FILE_RETENTION_TIME=30; no resource quota"
+            )
+        );
+        let sharded = limits(&PARQUET_ENV, Some("4"));
+        assert_eq!(
+            sharded,
+            json!(
+                "server defaults on the whole host except WYRD_MAX_FILE_RETENTION_TIME=30, WYRD_SCRIBE_SHARD_COUNT=4; no resource quota"
+            )
+        );
+        assert_ne!(sharded, limits(&PARQUET_ENV, None));
+    }
 
     /// Every write path and read the experiments label is a benchmark case
     /// the server classifies, so no request is timed as an unknown case.

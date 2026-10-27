@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{GlobalConfig, WyrdClient};
 use wyrd_testing::experiment::{
-    Baselines, Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Mode, Op, Reason,
-    Record, Reference, Status, Step, Verdict, WINDOW_SECONDS,
+    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Mode, Op, Reason, Record,
+    Status, Step, Verdict, WINDOW_SECONDS,
 };
 use wyrd_testing::release_server::{LocalServer, SERVER_URL};
 
@@ -187,15 +187,6 @@ impl Experiment {
         matches!(self, Self::WritesParquet)
     }
 
-    /// The storage state its rows are held in: `hot` memtables or
-    /// published `parquet`.
-    const fn tier(self) -> &'static str {
-        match self {
-            Self::Hot => "hot",
-            Self::WritesParquet | Self::Parquet => "parquet",
-        }
-    }
-
     /// The Scribe settings the server runs with.
     const fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
@@ -317,15 +308,6 @@ impl WriteOp {
             Self::Logs => "bifrost.otlp.logs",
         }
     }
-
-    /// The baselines entry prefix and fixture this path compares against.
-    const fn baseline(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Native => ("native-writes.write", "native-2m"),
-            Self::Spans => ("otlp-spans-writes.otlp-spans", "spans-2m"),
-            Self::Logs => ("otlp-logs-writes.otlp-logs", "logs-2m"),
-        }
-    }
 }
 
 /// The read an `op` step parameter names.
@@ -406,8 +388,7 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
 
 /// The Bifrost declaration over `base`: the L1 `experiment`, or L2 when
 /// `None`, reading `--server-cores` and `--smoke` from `arguments` (program
-/// name first),
-/// the baselines under `root`, and, at L2, the L1 records under
+/// name first), and, at L2, the L1 records under
 /// `root/benchmarks/bifrost/writes-parquet/`. Pure otherwise: it starts
 /// nothing.
 ///
@@ -424,9 +405,8 @@ pub fn declare(
     base: Declaration,
     root: &Path,
 ) -> std::result::Result<Declaration, String> {
-    let baselines = Baselines::load(root, Engine::Bifrost);
-    let mut declaration = if let Some(experiment) = experiment {
-        l1_declaration(experiment, base, baselines.as_ref().ok())
+    let declaration = if let Some(experiment) = experiment {
+        l1_declaration(experiment, base)
     } else {
         let cores = server_cores(arguments)?;
         let records = if arguments.iter().any(|argument| argument == "--smoke") {
@@ -436,13 +416,6 @@ pub fn declare(
         };
         competing_declaration(base, cores, records.as_deref())
     };
-    let note = match &baselines {
-        Ok(baselines) => format!("{} entries loaded", baselines.baseline.len()),
-        Err(error) => format!("unavailable: {error}"),
-    };
-    declaration
-        .controls
-        .insert("baselines".to_owned(), Value::String(note));
     Ok(declaration)
 }
 
@@ -756,13 +729,9 @@ const STORAGE_RATIO: &str = "the path's table growth in published Parquet bytes 
 
 /// The L1 declaration of `experiment`: its read steps and their scaling,
 /// or the write sweeps and their peaks, the exactness, error, SLO,
-/// sanity-floor, scan-fact, and settled-check criteria, and every eligible
-/// baseline comparison, within the experiment's own budget.
-fn l1_declaration(
-    experiment: Experiment,
-    mut base: Declaration,
-    baselines: Option<&Baselines>,
-) -> Declaration {
+/// sanity-floor, scan-fact, and settled-check criteria, within the
+/// experiment's own budget.
+fn l1_declaration(experiment: Experiment, mut base: Declaration) -> Declaration {
     experiment.name().clone_into(&mut base.experiment);
     base.question = String::from(match experiment {
         Experiment::WritesParquet => {
@@ -925,86 +894,12 @@ fn l1_declaration(
             ),
         ]);
     }
-    let baselines = baselines.cloned().unwrap_or_default();
-    let host = base.host.fingerprint.clone();
-    let mut compare = |metric: &str, step: &str, entry: String, fixture: &str| {
-        if let Some(metric) = base.metrics.iter().find(|declared| declared.id == metric) {
-            let criterion = baselines.criterion(
-                &format!("baseline.{entry}"),
-                metric,
-                step,
-                &entry,
-                &host,
-                fixture,
-            );
-            base.criteria.push(criterion);
-        }
-    };
-    let tier = experiment.tier();
-    for (op, read, clients) in experiment.reads() {
-        let Read::Events(case) = read else {
-            continue;
-        };
-        for clients in *clients {
-            let step = format!("{op}-c{clients}");
-            let entry = format!("standard-{tier}.{}.c{clients}", case.name());
-            let fixture = format!("standard-10m-{tier}");
-            compare(
-                "queries_per_cpu_s",
-                &step,
-                format!("{entry}.queries-per-cpu-s"),
-                &fixture,
-            );
-            compare(
-                "cpu_ms_per_query",
-                &step,
-                format!("{entry}.cpu-us-per-query"),
-                &fixture,
-            );
-        }
-    }
-    if experiment.writes() {
-        for op in WriteOp::ALL {
-            let (prefix, fixture) = op.baseline();
-            for clients in PAIR {
-                let step = format!("{}-c{clients}", op.name());
-                let entry = format!("{prefix}.c{clients}");
-                compare(
-                    "rows_per_cpu_s",
-                    &step,
-                    format!("{entry}.rows-per-cpu-s"),
-                    fixture,
-                );
-                compare(
-                    "cpu_us_per_row",
-                    &step,
-                    format!("{entry}.cpu-us-per-row"),
-                    fixture,
-                );
-                compare(
-                    "mib_per_cpu_s",
-                    &step,
-                    format!("{entry}.mb-per-cpu-s"),
-                    fixture,
-                );
-                if op != WriteOp::Native {
-                    compare(
-                        "wire_mib_per_cpu_s",
-                        &step,
-                        format!("{entry}.otlp-wire-mib-per-cpu-s"),
-                        fixture,
-                    );
-                }
-            }
-        }
-    }
-    base.references = references(experiment);
     base
 }
 
 /// The measured step `id` of `experiment` with `params`, declaring the
 /// 10 s window of a step whose 5 s L1 window would leave under 1.25 times
-/// its latency reference's sample floor at TASK-005's observed rates:
+/// its latency percentile's sample floor at TASK-005's observed rates:
 /// Parquet c1 aggregates (~930 per 5 s against 1,000) and span trace
 /// lookups (~930), c1 native and OTLP spans writes (~150 and ~190 against
 /// 200), and c64 native writes (~1,090 against 1,000).
@@ -1020,73 +915,6 @@ fn windowed(experiment: Experiment, id: &str, mut params: Value) -> Step {
         params[WINDOW_SECONDS] = json!(10);
     }
     Step::measured(id, params)
-}
-
-/// Each measured step's relative comparisons: server latency at the
-/// highest percentile its window clears the sample floor for (p99 at 64
-/// clients and for point, trace and aggregate reads; p95 for a shredded
-/// Parquet filter and the c1 native and OTLP spans writes; p50 for the
-/// other attribute filters and c1 OTLP logs writes, which complete near or
-/// under 200 times per window), and CPU per work, work per
-/// CPU-second and throughput per provisioned vCPU in rows, uncompressed
-/// MiB and, for OTLP, wire MiB. Full-scan latency stays descriptive.
-fn references(experiment: Experiment) -> Vec<Reference> {
-    let mut references = Vec::new();
-    for (op, _, clients) in experiment.reads() {
-        for clients in *clients {
-            let step = format!("{op}-c{clients}");
-            let latency = match (*op, *clients, experiment) {
-                ("full-scan", _, _) => None,
-                (_, 64, _) | ("point" | "span-trace" | "small-aggregate", _, _) => Some(99),
-                ("span-shredded", _, Experiment::Parquet) => Some(95),
-                _ => Some(50),
-            };
-            references.extend(latency.map(|percentile| {
-                Reference::new(&step, &format!("p{percentile}_ms"), Some(percentile))
-            }));
-            references.extend(
-                [
-                    "cpu_ms_per_query",
-                    "queries_per_cpu_s",
-                    "queries_per_s_per_vcpu",
-                ]
-                .map(|metric| Reference::new(&step, metric, None)),
-            );
-        }
-    }
-    if experiment.writes() {
-        for op in WriteOp::ALL {
-            for clients in PAIR {
-                let step = format!("{}-c{clients}", op.name());
-                let percentile = match (op, clients) {
-                    (_, 64) => 99,
-                    (WriteOp::Logs, _) => 50,
-                    _ => 95,
-                };
-                references.push(Reference::new(
-                    &step,
-                    &format!("p{percentile}_ms"),
-                    Some(percentile),
-                ));
-                let mut metrics = vec![
-                    "cpu_us_per_row",
-                    "rows_per_cpu_s",
-                    "rows_per_s_per_vcpu",
-                    "mib_per_cpu_s",
-                    "mib_per_s_per_vcpu",
-                ];
-                if op != WriteOp::Native {
-                    metrics.extend(["wire_mib_per_cpu_s", "wire_mib_per_s_per_vcpu"]);
-                }
-                references.extend(
-                    metrics
-                        .into_iter()
-                        .map(|metric| Reference::new(&step, metric, None)),
-                );
-            }
-        }
-    }
-    references
 }
 
 /// The per-signal rows per server CPU-second an L2 rate is calibrated from,
@@ -1301,7 +1129,7 @@ fn phase_metrics(phase: &str, step: &[String]) -> (Vec<Metric>, Vec<Criterion>) 
             100.0,
         )
         .percentile(99),
-        Criterion::every(
+        Criterion::limit(
             &id("backlog-bounded"),
             &id("backlog_growth_s"),
             step,
@@ -1460,7 +1288,7 @@ fn competing_declaration(
         criteria.extend([
             Criterion::every(&id("no-refusals"), &id("refusals"), &step, Op::Le, 0.0),
             Criterion::every(&id("exactly-once"), &id("row_mismatch"), &step, Op::Le, 0.0),
-            Criterion::every(
+            Criterion::limit(
                 &id("bytes-bounded"),
                 &id("bytes_growth"),
                 &step,

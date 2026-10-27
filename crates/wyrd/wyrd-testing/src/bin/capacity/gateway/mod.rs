@@ -36,7 +36,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use wyrd_testing::experiment::{
-    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reference, Step,
+    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Step,
 };
 use wyrd_testing::release_server::LocalServer;
 
@@ -197,9 +197,7 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
 
 /// Fills `base` with the Gateway experiment at `level`: its id, question,
 /// sweep, controls, metrics, criteria, and steps. Pure: it reads only
-/// `arguments`, so tests judge the real declaration without a server. L1
-/// steps declare their relative comparisons as references, resolved
-/// against the reviewed baselines once the declaration is final.
+/// `arguments`, so tests judge the real declaration without a server.
 ///
 /// # Errors
 ///
@@ -286,52 +284,6 @@ fn overhead(mut base: Declaration) -> Declaration {
                     "request_bytes": shape.request_bytes,
                 }),
             ));
-        }
-    }
-    for case in Case::ALL {
-        for clients in CLIENTS {
-            let step = case.step(clients);
-            // A c1 stream completes about 120 times in a 5 s window, under
-            // the p99 and p95 sample floors, so its references judge p50.
-            let percentile = if case == Case::ChatStream && clients == 1 {
-                50
-            } else {
-                99
-            };
-            let mut metrics = vec![
-                (
-                    if percentile == 50 {
-                        "overhead_p50_ms"
-                    } else {
-                        "overhead_p99_ms"
-                    },
-                    Some(percentile),
-                ),
-                ("cpu_us_per_request", None),
-                ("requests_per_cpu_s", None),
-                ("requests_per_s_per_vcpu", None),
-            ];
-            if case == Case::ChatStream {
-                metrics.push((
-                    if percentile == 50 {
-                        "overhead_end_p50_ms"
-                    } else {
-                        "overhead_end_p99_ms"
-                    },
-                    Some(percentile),
-                ));
-            }
-            if case == Case::ChatCapture {
-                metrics.extend([
-                    ("capture_bytes_per_cpu_s", None),
-                    ("capture_bytes_per_s_per_vcpu", None),
-                ]);
-            }
-            base.references.extend(
-                metrics
-                    .into_iter()
-                    .map(|(metric, percentile)| Reference::new(&step, metric, percentile)),
-            );
         }
     }
     let every: Vec<String> = steps.iter().map(|step| step.id.clone()).collect();
@@ -942,8 +894,6 @@ mod tests {
             host: HostRecord::new(&host, "test"),
             refusals: Vec::new(),
             mode: Mode::Full,
-            references: Vec::new(),
-            qualify: false,
         }
     }
 
@@ -979,7 +929,7 @@ mod tests {
         assert_eq!(overhead.percentile, Some(99));
         assert!(matches!(
             overhead.rule,
-            Rule::Limit { op: Op::Lt, limit, .. } if (limit - 0.5).abs() < f64::EPSILON
+            Rule { op: Op::Lt, limit, .. } if (limit - 0.5).abs() < f64::EPSILON
         ));
         for id in ["no-errors", "capture-lost", "capture-shed", "drained"] {
             let criterion = declared
@@ -1024,10 +974,7 @@ mod tests {
                 .criteria
                 .iter()
                 .find(|criterion| criterion.id == id)
-                .and_then(|criterion| match criterion.rule {
-                    Rule::Limit { limit, .. } => Some(limit),
-                    _ => None,
-                })
+                .map(|criterion| criterion.rule.limit)
         };
         for (id, bound) in [
             ("capacity-completion", 200.0),

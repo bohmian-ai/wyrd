@@ -21,20 +21,15 @@
 //!   and background `submit` together; every verification stages its result
 //!   through Scribe into Bifrost, so evidence writes and the queued backlog
 //!   progress in the same window.
-//!
-//! No eligible Verification baseline exists, so neither level declares a
-//! baseline criterion; the declaration's `baselines` control says so.
 
 mod run;
 mod workload;
 
-use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use wyrd_testing::experiment::{
-    Baselines, Criterion, Declaration, Derive, Direction, Eligibility, Engine, Level, Metric, Op,
-    Reading, Reference, Step,
+    Criterion, Declaration, Derive, Direction, Engine, Level, Metric, Op, Reading, Step,
 };
 
 use crate::levels::{Context, Plan};
@@ -215,7 +210,7 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
         Level::Two => &RATE_FLAGS,
     };
     context.known(valued, &[])?;
-    let declaration = declare(context.level, context.arguments, base, context.root)?;
+    let declaration = declare(context.level, context.arguments, base)?;
     let logs = context.output(Engine::Verification, &declaration.experiment);
     Ok(Plan {
         declaration,
@@ -224,8 +219,7 @@ pub fn plan(context: &Context<'_>, base: Declaration) -> std::result::Result<Pla
 }
 
 /// The Verification declaration at `level` over `base`, reading the L2 rate
-/// flags from `arguments` (program name first) and the baselines under
-/// `root`. Pure: it starts nothing.
+/// flags from `arguments` (program name first). Pure: it starts nothing.
 ///
 /// # Errors
 ///
@@ -234,27 +228,11 @@ pub fn declare(
     level: Level,
     arguments: &[String],
     base: Declaration,
-    root: &Path,
 ) -> std::result::Result<Declaration, String> {
     let mut declaration = match level {
         Level::One => direct(base),
         Level::Two => competing(base, arguments)?,
     };
-    let baselines = match Baselines::load(root, Engine::Verification) {
-        Ok(baselines) => format!(
-            "{} entries loaded, {} eligible; L1 compares reviewed `reference.*` entries only",
-            baselines.baseline.len(),
-            baselines
-                .baseline
-                .iter()
-                .filter(|entry| entry.status == Eligibility::Eligible)
-                .count()
-        ),
-        Err(error) => format!("unavailable: {error}"),
-    };
-    declaration
-        .controls
-        .insert("baselines".to_owned(), Value::String(baselines));
     declaration.controls.insert(
         "fixture".to_owned(),
         json!("one tenant: an assertion Verifier of four `equals` checks over one 2 KiB `context` slot, a Model, and one Service per application with its own Card-bound family runtime key; every odd arrival answers check `d` wrong, so both verdicts stay in every window"),
@@ -362,17 +340,6 @@ fn direct(mut base: Declaration) -> Declaration {
         .iter()
         .zip(&steps)
         .map(|(clients, id)| Step::measured(id, json!({ "clients": clients, "op": "verify" })))
-        .collect();
-    base.references = steps
-        .iter()
-        .flat_map(|step| {
-            [
-                Reference::new(step, "overhead_p99_ms", Some(99)),
-                Reference::new(step, "cpu_us_per_verification", None),
-                Reference::new(step, "verifications_per_cpu_s", None),
-                Reference::new(step, "verifications_per_s_per_vcpu", None),
-            ]
-        })
         .collect();
     base.metrics = work_metrics();
     base.metrics
@@ -655,7 +622,6 @@ fn competing(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
     use std::time::Duration;
 
     use wyrd_testing::experiment::{
@@ -694,8 +660,6 @@ mod tests {
             },
             refusals: Vec::new(),
             mode: Mode::Full,
-            references: Vec::new(),
-            qualify: false,
         }
     }
 
@@ -707,23 +671,17 @@ mod tests {
             .collect()
     }
 
-    /// The repository root, whose `benchmarks/verification/baselines.toml`
-    /// holds only excluded entries.
-    pub(super) fn root() -> &'static Path {
-        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.."))
-    }
-
     /// L1 declares the full direct sweep, judges the strict overhead only at
     /// 64 clients with enough p99 samples, keeps correctness in every
-    /// repetition, declares no baseline criterion, and admits its workload.
+    /// repetition, and admits its workload.
     ///
     /// # Panics
     ///
     /// Panics when the declaration drifts from the approved L1 matrix.
     #[test]
     fn level_one_declares_direct_sweep_and_strict_objective() {
-        let declaration = declare(Level::One, &line(&[]), base(Level::One), root())
-            .expect("L1 declares without flags");
+        let declaration =
+            declare(Level::One, &line(&[]), base(Level::One)).expect("L1 declares without flags");
         let steps: Vec<&str> = declaration
             .steps
             .iter()
@@ -739,7 +697,7 @@ mod tests {
         assert_eq!(overhead.percentile, Some(99));
         assert!(matches!(
             overhead.rule,
-            Rule::Limit { op: wyrd_testing::experiment::Op::Lt, limit, .. } if (limit - OVERHEAD_LIMIT_MS).abs() < f64::EPSILON
+            Rule { op: wyrd_testing::experiment::Op::Lt, limit, .. } if (limit - OVERHEAD_LIMIT_MS).abs() < f64::EPSILON
         ));
         for id in ["no-errors", "correct-verdicts"] {
             let criterion = declaration
@@ -750,18 +708,12 @@ mod tests {
             assert_eq!(criterion.steps.len(), super::CLIENTS.len());
             assert!(matches!(
                 criterion.rule,
-                Rule::Limit {
+                Rule {
                     over: wyrd_testing::experiment::Over::Every,
                     ..
                 }
             ));
         }
-        assert!(
-            declaration
-                .criteria
-                .iter()
-                .all(|criterion| matches!(criterion.rule, Rule::Limit { .. }))
-        );
         for id in [
             "rate",
             "p50_ms",
@@ -773,8 +725,6 @@ mod tests {
         ] {
             assert!(declaration.metric(id).is_some(), "{id} is declared");
         }
-        let baselines = declaration.controls["baselines"].as_str().expect("noted");
-        assert!(baselines.contains(" 0 eligible"), "{baselines}");
         assert_eq!(declaration.refusals(), Vec::new());
     }
 
@@ -792,7 +742,6 @@ mod tests {
             Level::Two,
             &line(&["--direct-rate", "250", "--overload-factor", "3"]),
             base(Level::Two),
-            root(),
         )
         .expect("L2 declares with valid rates");
         assert_eq!(declaration.steps.len(), 1);
@@ -830,7 +779,7 @@ mod tests {
             &["--overload-factor", "NaN"],
         ] {
             assert!(
-                declare(Level::Two, &line(bad), base(Level::Two), root()).is_err(),
+                declare(Level::Two, &line(bad), base(Level::Two)).is_err(),
                 "{bad:?}"
             );
         }
@@ -844,8 +793,8 @@ mod tests {
     /// Panics when the phase arithmetic drifts.
     #[test]
     fn schedule_tiles_the_window_and_counts_backlog_in_offered_seconds() {
-        let declaration = declare(Level::Two, &line(&[]), base(Level::Two), root())
-            .expect("L2 declares by default");
+        let declaration =
+            declare(Level::Two, &line(&[]), base(Level::Two)).expect("L2 declares by default");
         for seconds in [120, 360] {
             let schedule = Schedule::of(&declaration.steps[0], Duration::from_secs(seconds))
                 .expect("the step declares its rates");

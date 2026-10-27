@@ -178,18 +178,6 @@ pub enum Case {
 }
 
 impl Case {
-    /// The case's name in `baselines.toml` entry ids.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Selective => "selective",
-            Self::SmallAggregate => "small-aggregate",
-            Self::MillionAggregate => "million-aggregate",
-            Self::TableAggregate => "table-aggregate",
-            Self::FullScan => "full-scan",
-        }
-    }
-
     /// The benchmark case label its requests carry, so a benchmark-mode
     /// server keeps each class's timings apart.
     #[must_use]

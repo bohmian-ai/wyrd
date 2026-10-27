@@ -10933,7 +10933,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "toml",
  "tower",
  "tracing",
  "tracing-subscriber",

@@ -55,10 +55,10 @@ tr.clickable:hover td { background: var(--grid); }
 tr.selected td { background: var(--grid); }
 code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
 .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: .03em; white-space: nowrap; }
-.PASS { color: var(--pass); background: var(--pass-bg); }
-.FAIL { color: var(--fail); background: var(--fail-bg); }
-.INVALID { color: var(--invalid); background: var(--invalid-bg); }
-.NONE { color: var(--none); background: var(--none-bg); }
+.VALID, .met { color: var(--pass); background: var(--pass-bg); }
+.missed { color: var(--fail); background: var(--fail-bg); }
+.INVALID, .invalid { color: var(--invalid); background: var(--invalid-bg); }
+.NONE, .unsettled { color: var(--none); background: var(--none-bg); }
 .better { color: var(--better); }
 .worse { color: var(--worse); }
 .controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin: 8px 0; }
@@ -76,14 +76,12 @@ svg .whisker { stroke: var(--muted); stroke-width: 1.5; }
 svg .limit { stroke: var(--limit); stroke-dasharray: 6 4; stroke-width: 1.5; }
 svg .limit-label { fill: var(--limit); }
 svg .pt { cursor: pointer; stroke-width: 2; }
-svg .pt.PASS { fill: var(--pass); stroke: var(--pass); }
-svg .pt.FAIL { fill: var(--fail); stroke: var(--fail); }
+svg .pt.VALID { fill: var(--pass); stroke: var(--pass); }
 svg .pt.INVALID { fill: var(--panel); stroke: var(--invalid); }
 svg .pt.sel { stroke: var(--accent); stroke-width: 3; }
 .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: var(--muted); margin-top: 4px; }
 .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; border: 2px solid; }
-.dot.PASS { background: var(--pass); border-color: var(--pass); }
-.dot.FAIL { background: var(--fail); border-color: var(--fail); }
+.dot.VALID { background: var(--pass); border-color: var(--pass); }
 .dot.INVALID { background: var(--panel); border-color: var(--invalid); }
 td.note { min-width: 180px; max-width: 320px; overflow-wrap: anywhere; }
 .empty { padding: 32px; text-align: center; color: var(--muted); }
@@ -107,11 +105,16 @@ td.note { min-width: 180px; max-width: 320px; overflow-wrap: anywhere; }
 <script>
 "use strict";
 const ENTRIES = JSON.parse(document.getElementById("records").textContent);
-const VERDICTS = { PASS: "Pass", FAIL: "Fail", INVALID: "Invalid" };
+const VERDICTS = { VALID: "Valid", INVALID: "Invalid" };
 const VERDICT_MEANING = {
-  PASS: "every applicable criterion held and the measurement was valid",
-  FAIL: "the measurement was valid and at least one criterion did not hold",
-  INVALID: "the measurement could not support a verdict; see the reasons",
+  VALID: "the measurement was trustworthy and complete and every correctness and integrity criterion held; targets are reported, never judged into the verdict",
+  INVALID: "the measurement could not support a result; see the reasons",
+};
+const OUTCOME_MEANING = {
+  met: "the median meets the target",
+  missed: "the median misses the target; the run stays valid",
+  unsettled: "the reading's precision cannot settle the target",
+  INVALID: "a correctness or integrity criterion failed in some repetition",
 };
 const OPS = { lt: "<", le: "≤", gt: ">", ge: "≥" };
 
@@ -152,7 +155,7 @@ const reading = (r, unit) => {
   return { text: sig(r.value) + unitText(unit), title };
 };
 const valueOf = (r) => (r && r.value != null ? r.value : null);
-const badge = (verdict) => el("span", { class: "badge " + (VERDICTS[verdict] ? verdict : "NONE"), title: VERDICT_MEANING[verdict] || "" }, verdict || "—");
+const badge = (label) => el("span", { class: "badge " + (VERDICTS[label] || OUTCOME_MEANING[label] ? label : "NONE"), title: VERDICT_MEANING[label] || OUTCOME_MEANING[label] || "" }, label || "—");
 const when = (iso) => (iso ? iso.replace("T", " ").replace(/\.\d+/, "").replace("Z", " UTC") : "unknown time");
 const shortWhen = (iso) => (iso ? iso.slice(5, 16).replace("T", " ") : "?");
 const short = (sha) => (sha ? sha.slice(0, 9) : "—");
@@ -169,7 +172,7 @@ for (const entry of ENTRIES) {
 for (const runs of groups.values()) runs.sort((a, b) => (a.record.started_at || a.path).localeCompare(b.record.started_at || b.path));
 const keys = [...groups.keys()].sort();
 
-const limitCriteria = (record) => ((record.criteria && record.criteria.criteria) || []).filter((c) => c.rule && c.rule.kind === "limit");
+const limitCriteria = (record) => (record.criteria && record.criteria.criteria) || [];
 const metricDecl = (record, id) => ((record.criteria && record.criteria.metrics) || []).find((m) => m.id === id);
 const stepOf = (record, id) => (record.steps || []).find((s) => s.id === id);
 const summaryOf = (record, step, metric) => {
@@ -194,7 +197,7 @@ const objectiveTally = (record) => {
     for (const j of step.criteria || []) {
       if (!limits.has(j.criterion) || j.applicable === false) continue;
       total += 1;
-      if (j.verdict === "PASS") pass += 1;
+      if (j.outcome === "met") pass += 1;
     }
   }
   return { pass, total };
@@ -257,8 +260,8 @@ function overview() {
     el("div", { class: "panel scroll" }, el("table", {},
       el("thead", {}, el("tr", {}, ...["Engine", "Experiment", "Level", "Runs", "Latest run", "Verdict", "Limits met", "Question"].map((h, i) => el("th", { class: [2, 3, 4, 6].includes(i) ? "num" : null }, h)))),
       el("tbody", {}, rows))),
-    el("p", { class: "small muted" }, "Verdicts: ", badge("PASS"), " " + VERDICT_MEANING.PASS + ". ", badge("FAIL"), " " + VERDICT_MEANING.FAIL + ". ",
-      badge("INVALID"), " " + VERDICT_MEANING.INVALID + ". \"Limits met\" counts the latest run's absolute limits (not reference comparisons)."),
+    el("p", { class: "small muted" }, "Verdicts: ", badge("VALID"), " " + VERDICT_MEANING.VALID + ". ",
+      badge("INVALID"), " " + VERDICT_MEANING.INVALID + ". \"Limits met\" counts the latest run's criteria whose outcome is met."),
   ];
 }
 
@@ -328,8 +331,7 @@ function chart(runs, metric, step, unit, limit) {
     svg.append(dot);
   }
   return el("div", {}, svg, el("div", { class: "legend" },
-    el("span", {}, el("span", { class: "dot PASS" }), "pass"), el("span", {}, el("span", { class: "dot FAIL" }), "fail"),
-    el("span", {}, el("span", { class: "dot INVALID" }), "invalid"),
+    el("span", {}, el("span", { class: "dot VALID" }), "valid"), el("span", {}, el("span", { class: "dot INVALID" }), "invalid"),
     el("span", {}, "dot = median of the repetitions; bar = lowest to highest repetition; click a dot to open that run")));
 }
 
@@ -442,7 +444,7 @@ function outcome(record) {
         el("td", {}, stepId),
         el("td", { class: "num", title: obs.title }, obs.text),
         el("td", { class: "num" }, (OPS[c.rule.op] || c.rule.op) + " " + sig(c.rule.limit) + unitText(unit) + (c.rule.over ? " (" + c.rule.over + ")" : "")),
-        el("td", {}, j.applicable === false ? badge("NONE") : badge(j.verdict)),
+        el("td", {}, j.applicable === false ? badge("NONE") : badge(j.outcome)),
         el("td", { class: "small muted" }, j.reason || "")));
     }
   }

@@ -5,8 +5,7 @@
 //! controls, metrics, criteria, steps) and the [`Workload`] that drives its
 //! production calls. This module fills the declaration's source, build, host,
 //! and invocation, applies `--steps`, `--allow-dirty`, `--profile`,
-//! `--smoke`, and `--qualify-baseline`, declares each step's relative
-//! comparisons against its reviewed references ([`compare`]), runs
+//! and `--smoke`, runs
 //! [`wyrd_testing::experiment::run`], publishes the record under
 //! `benchmarks/<engine>/<experiment>/` (a smoke's under
 //! [`SMOKE_DIRECTORY`]), prints the report, and returns the verdict's exit
@@ -22,8 +21,8 @@ use wyrd_testing::capacity::{
     binary_identity, release_binary, timer_resolution_ns, timing_declaration,
 };
 use wyrd_testing::experiment::{
-    Baselines, Declaration, Engine, HostRecord, Invocation, Level, Mode, Options, Reason, Record,
-    SMOKE_DIRECTORY, Source, Validity, Verdict, Workload, run,
+    Declaration, Engine, HostRecord, Invocation, Level, Mode, Options, Record, SMOKE_DIRECTORY,
+    Source, Validity, Verdict, Workload, run,
 };
 use wyrd_testing::profile::SAMPLY;
 use wyrd_testing::release_server::{Host, HostLoad};
@@ -31,12 +30,7 @@ use wyrd_testing::release_server::{Host, HostLoad};
 use crate::flags;
 
 /// Switches every level command accepts.
-pub const SWITCHES: [&str; 4] = [
-    "--profile",
-    "--allow-dirty",
-    "--smoke",
-    "--qualify-baseline",
-];
+pub const SWITCHES: [&str; 3] = ["--profile", "--allow-dirty", "--smoke"];
 
 /// Valued flags every level command accepts.
 pub const VALUED: [&str; 1] = ["--steps"];
@@ -147,9 +141,8 @@ pub fn base(engine: Engine, context: &Context<'_>) -> Result<Declaration, String
 /// validity thresholds, the server timing method with this host's measured
 /// timer resolution as the `timing` control, and the measured `source`,
 /// `build`, `host`, and invocation with its `WYRD_*` `config`. The engine fills the experiment
-/// id, question, sweep, controls, metrics, criteria, references, and steps;
+/// id, question, sweep, controls, metrics, criteria, and steps;
 /// a declaration it leaves incomplete is refused before any work.
-/// `--qualify-baseline` declares a reference qualification run.
 pub fn assemble(
     engine: Engine,
     context: &Context<'_>,
@@ -184,29 +177,6 @@ pub fn assemble(
         host,
         refusals: Vec::new(),
         mode: Mode::Full,
-        references: Vec::new(),
-        qualify: context
-            .arguments
-            .iter()
-            .any(|argument| argument == "--qualify-baseline"),
-    }
-}
-
-/// Declares `declaration`'s relative comparisons against the reviewed
-/// references in `root/benchmarks/<engine>/baselines.toml`
-/// ([`Declaration::compare`]) once its selection and mode are final. An
-/// unreadable baselines file is a declaration refusal, not a missing
-/// reference.
-pub fn compare(declaration: &mut Declaration, root: &Path) {
-    match Baselines::load(root, declaration.engine) {
-        Ok(baselines) => declaration.compare(&baselines),
-        Err(error) => {
-            if declaration.qualify || !declaration.references.is_empty() {
-                declaration
-                    .refusals
-                    .push(Reason::new("declaration.missing", error.to_string()));
-            }
-        }
     }
 }
 
@@ -300,9 +270,9 @@ pub async fn execute(plan: Plan, root: &Path, profile: bool) -> u8 {
 }
 
 /// Runs `l1` for every engine in order through `run_engine`, forwarding the
-/// shared arguments, and combines their exit codes by precedence (2 over 1
-/// over 0). A failed or invalid engine never stops the later engines, so each
-/// keeps its own record.
+/// shared arguments, and combines their exit codes ([`Verdict::combine`]).
+/// An invalid engine never stops the later engines, so each keeps its own
+/// record.
 pub fn aggregate(arguments: &[String], mut run_engine: impl FnMut(Engine, &[String]) -> u8) -> u8 {
     let forwarded: Vec<String> = arguments.iter().skip(1).cloned().collect();
     let codes: Vec<u8> = ENGINES
@@ -329,7 +299,7 @@ pub fn spawn_engine(root: &Path, engine: Engine, forwarded: &[String]) -> u8 {
 
 /// Runs each Bifrost L1 experiment of `experiments` in order as its own
 /// child under a fresh database ([`spawn`]) and combines their exit codes
-/// by precedence, never stopping early.
+/// ([`Verdict::combine`]), never stopping early.
 pub fn spawn_experiments(
     root: &Path,
     experiments: &[crate::query::Experiment],
@@ -470,26 +440,4 @@ fn children(path: &Path) -> Result<Vec<PathBuf>, String> {
         .map_err(|error| format!("{}: {error}", path.display()))?;
     entries.sort();
     Ok(entries)
-}
-
-/// Reads two or more `--qualify-baseline` records and returns the
-/// reviewed-reference TOML they establish ([`Baselines::promote`]), for an
-/// engineer to review and commit to the engine's `baselines.toml`. It
-/// writes nothing.
-///
-/// # Errors
-///
-/// Returns a message naming every unreadable record and every reason the
-/// records cannot establish references.
-pub fn references(paths: &[String]) -> Result<String, String> {
-    let records = paths
-        .iter()
-        .map(|path| {
-            Record::read(Path::new(path))
-                .map(|record| (path.clone(), record))
-                .map_err(|error| format!("{path}: {error}"))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let baselines = Baselines::promote(&records).map_err(|reasons| reasons.join("; "))?;
-    toml::to_string(&baselines).map_err(|error| error.to_string())
 }

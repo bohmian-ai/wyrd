@@ -19,8 +19,6 @@ mise run bench:l2:verification
 mise run bench:l2:gateway
 mise run bench:l1:gateway -- --profile --steps chat.c64
 mise run bench:l1:gateway -- --smoke # one plan at smoke scale
-mise run bench:l1:gateway -- --qualify-baseline   # a reference candidate
-target/profiling/release/capacity reference <a.json> <b.json>  # reviewed references
 mise run bench:results               # every record as one HTML page
 ```
 
@@ -29,9 +27,9 @@ publication waits, every selected step and phase, measured stop, drain,
 exact reconciliation, judgment, record, timing evidence and report) at
 smoke-scale fixtures with one short warmup and one repetition per step. It
 records `"mode": "smoke"` under `target/benchmarks/smoke/`, never here, and a
-smoke record is never a calibration or baseline wherever it is moved. A
+smoke record is never a calibration wherever it is moved. A
 smoke judges no criterion: every reading, errors and target misses included,
-is recorded beside an inapplicable criterion, so a smoke is PASS or INVALID.
+is recorded beside an inapplicable criterion, so a smoke is VALID or INVALID.
 It is INVALID only when the measurement itself is broken (a missing reading
 or counter, a mismatched population, zero CPU, a failed record); a busy
 driver does not invalidate a smoke. A full command never runs a smoke first:
@@ -174,20 +172,21 @@ Flags:
 | `--profile` | every command | Adds optional samply captures under `target/benchmarks/` (see [Profiling](#profiling)). |
 | `--allow-dirty` | every command | Records a dirty source (see [Source](#source)). |
 | `--steps a,b` | engine commands | Runs a declared subset; the record lists every omitted step and never claims full coverage. |
-| `--qualify-baseline` | L1 commands | Records a reference candidate judged only by its limits (see [References](#references)). |
 
-`bench:l1` accepts only `--profile`, `--allow-dirty`, `--smoke`, and
-`--qualify-baseline`, and passes them to every engine.
+`bench:l1` accepts only `--profile`, `--allow-dirty`, and `--smoke`, and
+passes them to every engine.
 
 ## Verdicts
 
-Every run ends with one verdict and exit code:
+Benchmarks are measurements, not CI: a slower result is evidence, never a
+failure. Every run ends with one verdict and exit code:
 
-- **PASS (0):** every applicable criterion holds.
-- **FAIL (1):** valid evidence missed a declared criterion: an SLO, a sanity
-  floor, a correctness or integrity check, or a reference regression.
+- **VALID (0):** the measurement is trustworthy and complete, and every
+  correctness and integrity criterion holds in every repetition.
 - **INVALID (2):** the evidence cannot answer the question, so the run does
   not count. Causes include:
+  - a correctness or integrity criterion (errors, wrong answers, lost or
+    duplicated rows, an undrained queue) failing in any repetition;
   - a busy host, or a driver above 80% of its 8-core budget;
   - an open-loop miss, or send lateness p99 above 5 ms;
   - too few samples: under 1,000 per repetition behind a p99, or 200 behind
@@ -196,22 +195,20 @@ Every run ends with one verdict and exit code:
     malformed;
   - a missing or reset CPU reading;
   - an overrun budget, an interruption, or a failed workload;
-  - a declared baseline that is missing or excluded;
-  - a full L1 case with no reviewed reference of the same method (see
-    [References](#references));
   - a dirty source without `--allow-dirty`.
 
-INVALID takes precedence over FAIL, and FAIL over PASS. A FAIL found in an
-otherwise invalid run still appears among the reasons. `bench:l1` runs every
-engine even after one fails, and exits with the worst code.
-
-Strict limits (`<`) fail on equality. Numeric criteria judge the median of the
-three repetitions. Correctness and integrity criteria judge every repetition.
+Nothing exits 1. A performance target (an SLO, a sanity floor, a backlog or
+byte bound) judges the median of the three repetitions and is reported as
+`met`, `missed`, or `unsettled` when a reading's precision cannot decide it;
+a target never changes the verdict or the exit code. Strict targets (`<`)
+are missed on equality. `bench:l1` and `bench:l1:bifrost` run every
+experiment even after one is INVALID, keep each record, and exit 0 only when
+every experiment exits 0, else 2.
 
 ## Records and reports
 
-Each run appends one JSON record, schema version 2 (version 1 records still
-read back):
+Each run appends one JSON record, schema version 3; a reader refuses any
+other version:
 
 ```text
 benchmarks/<engine>/<experiment>/YYYYMMDDTHHMMSSZ-<sha9>.json
@@ -222,13 +219,10 @@ a `-<n>` suffix. A record holds:
 
 - the command and non-secret configuration;
 - the host, build, and source;
-- the declared controls and criteria, with baseline snapshots;
+- the declared controls and criteria;
 - every repetition's metrics, units, sample counts, and server and driver
   CPU;
-- every reason, and the verdict;
-- for a full L1 run, its regression coverage: `covered` when every case was
-  judged against a same-method reference, `uncovered` otherwise, and
-  `baseline-unavailable` for a qualification run.
+- every criterion's outcome, every reason, and the verdict.
 
 Raw evidence stays under `target/benchmarks/<engine>/<experiment>/`:
 the server log sits beside any profiles. The next run of that experiment replaces
@@ -246,7 +240,7 @@ are compared over time.
 page, `target/benchmarks/results.html`, read from the records alone. For
 each experiment it shows the question, the method (host, build, timing,
 validity rules, workload), every step's results with each repetition, the
-criteria and why the verdict is what it is. Its history charts any metric of
+criteria outcomes and why the verdict is what it is. Its history charts any metric of
 any step across runs in chronological order against its limit, and ticking
 runs compares them side by side. A file that does not read as a current
 record is shown as stored and marked.
@@ -255,57 +249,7 @@ record is shown as stored and marked.
 
 A record names the measured commit. A dirty tracked tree refuses the run as
 INVALID. `--allow-dirty` measures it anyway and records the SHA-256 of
-`git diff HEAD`. Such a record is never eligible as a baseline.
-
-## Baselines
-
-`benchmarks/<engine>/baselines.toml` holds two kinds of entry that criteria
-name by `id`.
-
-Historical entries come from earlier reports. Each carries its value and
-unit, the original operands, its fixture, source report and commit, its host
-fingerprint, and its limitations. They predate method identity, so they
-never judge: an eligible one is advisory, and the record keeps both
-fingerprints. A missing, excluded, or unit-incompatible one makes the run
-INVALID. The Bifrost entries come from the clean pre-merge `cfe21dc90` runs
-on an AMD Ryzen 9 9950X Linux host; Verification and Gateway have none.
-
-## References
-
-Every full L1 case is judged against a reviewed reference
-`reference.<experiment>.<step>.<metric>` for its latency (the declared
-percentile; a full scan has none), CPU per unit of work, work per
-server CPU-second, and work per second per vCPU. A reference carries the
-median of six repetitions, the low and high bounds of a latency, and its
-method: a digest of the engine, experiment, level, mode, timing, validity,
-variables, controls, step, build, host, the `WYRD_*` configuration, and
-`--profile`. The commit and binaries are not part of it.
-
-- A reference of the same method judges with the noise-aware rule.
-  Higher-is-better fails when the upper repetition is below 90% of the
-  reference and the drop exceeds the spread; lower-is-better fails when the
-  lower repetition is above 115% and the rise exceeds the spread. A latency
-  compares bounds: it fails only when even its best bound fails against the
-  reference's worst, and an overlap that decides neither is INVALID.
-- A missing reference, or one of another method, makes the case INVALID.
-- A diagnostic run (`--profile`, an OTLP trace endpoint, sample ratio, or
-  export timeout, a trace filter, or `WYRD_LOG` other than `info`) only advises against a
-  reference of another method.
-
-To establish references for a host:
-
-1. From clean committed source, run the full suite twice with
-   `--qualify-baseline`. Such a run judges only its declared limits, records
-   `baseline-unavailable`, and is refused (INVALID) for L2, a smoke, `--steps`,
-   a dirty source, or a diagnostic configuration.
-2. Run `capacity reference` over both records of each experiment. It checks
-   that every record qualified, that they share engine, experiment, and
-   method, and that each metric has at least six bounded repetitions, then
-   prints the `[[entries]]` TOML. It writes nothing.
-3. Review the TOML and commit it to `baselines.toml`.
-
-A reference changes only by editing `baselines.toml` in review. No run
-promotes itself.
+`git diff HEAD`.
 
 ## Profiling
 
@@ -313,6 +257,4 @@ promotes itself.
 invocation on every platform, and saves the captures under the run's
 `target/benchmarks/` artifacts. A profile is diagnostic only. When samply is
 missing or a capture fails, the record carries a note instead, and the
-verdict is unchanged. A profiled run is a diagnostic configuration: it
-never qualifies as a reference, and it only advises against a reference of
-another method.
+verdict is unchanged.

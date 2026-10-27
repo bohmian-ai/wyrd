@@ -1328,7 +1328,7 @@ mod tests {
         use crate::tests::pg_tests::burn;
         use crate::verification::declare;
         use crate::verification::run::{Bench, SELECTION, drive};
-        use crate::verification::tests::{base, root};
+        use crate::verification::tests::base;
 
         /// The step calibrated: one closed-loop client.
         const STEP: &str = "direct-verify-c1";
@@ -1444,8 +1444,7 @@ mod tests {
         #[ignore = "needs the release server from `mise run bench:build`, the Postgres wrapper and a quiet host"]
         async fn the_measurement_path_agrees_with_independent_references() {
             let directory = tempfile::tempdir().expect("directory");
-            let mut declaration =
-                declare(Level::One, &[], base(Level::One), root()).expect("L1 declares");
+            let mut declaration = declare(Level::One, &[], base(Level::One)).expect("L1 declares");
             declaration.selection = Some(vec![STEP.to_owned()]);
             declaration.timing = Timing {
                 warmup_seconds: 1,
@@ -1472,7 +1471,7 @@ mod tests {
             let path = record.publish(directory.path()).expect("publish");
             let read = Record::read(&path).expect("read back");
             assert_eq!(read.render(), record.render());
-            assert_eq!(read.verdict, Verdict::Pass, "{:?}", read.reasons);
+            assert_eq!(read.verdict, Verdict::Valid, "{:?}", read.reasons);
             let step = read
                 .steps
                 .iter()

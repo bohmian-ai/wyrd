@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_testing::experiment::{
-    Baselines, Engine, ExperimentError, Level, Options, Phase, Record, Repetition, Status, Step,
-    StepRecord, Timing, Verdict, Workload, run,
+    Engine, ExperimentError, Level, Options, Phase, Record, Repetition, Status, Step, StepRecord,
+    Timing, Verdict, Workload, run,
 };
 use wyrd_testing::release_server::{HostLoad, METRICS_PORT, Metrics};
 
@@ -264,7 +264,7 @@ async fn fresh_database() {
 /// # Panics
 ///
 /// Panics when the plan cannot be declared, the record does not read back
-/// unchanged, or the smoke is not PASS.
+/// unchanged, or the smoke is not VALID.
 async fn measured(
     engine: Engine,
     level: Level,
@@ -321,7 +321,7 @@ async fn measured(
     let path = record.publish(directory).expect("publish");
     let read = Record::read(&path).expect("read back");
     assert_eq!(read.render(), record.render());
-    assert_eq!(read.verdict, Verdict::Pass, "{}", read.render());
+    assert_eq!(read.verdict, Verdict::Valid, "{}", read.render());
     let observed = observed
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -688,257 +688,4 @@ async fn engine_measurements_keep_boundaries_processes_and_windows() {
             "a window without the scrape loop"
         );
     }
-}
-
-/// Sequential `/metrics` scrape loops the perturbed run keeps over each of
-/// its windows: renders on the server's own runtime that compete with the
-/// measured requests for its workers and CPU without being its work.
-const STORM: usize = 32;
-
-/// The engine's real workload with [`STORM`] scrape loops over every window
-/// when `storm` holds, and untouched otherwise.
-struct Stormed {
-    /// The engine's production workload.
-    inner: Box<dyn Workload>,
-    /// Whether every window runs the scrape loops.
-    storm: bool,
-}
-
-#[async_trait]
-impl Workload for Stormed {
-    async fn prepare(&mut self) -> Result<(), ExperimentError> {
-        self.inner.prepare().await
-    }
-
-    fn processes(&self) -> Vec<u32> {
-        self.inner.processes()
-    }
-
-    async fn measure(
-        &mut self,
-        step: &Step,
-        phase: Phase,
-        window: Duration,
-    ) -> Result<Repetition, ExperimentError> {
-        let loops: Vec<_> = (0..if self.storm { STORM } else { 0 })
-            .map(|_| tokio::spawn(scrape_loop(window)))
-            .collect();
-        let repetition = self.inner.measure(step, phase, window).await;
-        for scraping in loops {
-            scraping.await.map_err(ExperimentError::workload)?;
-        }
-        repetition
-    }
-
-    async fn finish(&mut self) -> Result<(), ExperimentError> {
-        self.inner.finish().await
-    }
-}
-
-/// Runs `engine`'s ordinary full L1 plan from `rest` with `--qualify-baseline`
-/// when `qualify` holds, its declaration trimmed to measured step `step`,
-/// the criteria judging it narrowed to it, and its references, compared
-/// against `baselines` as a CLI run compares against its committed file,
-/// through the shared runner from a [`fresh_database`]; publishes the
-/// record under `directory` and reads it back with its path.
-///
-/// # Panics
-///
-/// Panics when the plan cannot be declared, does not declare `step`, refuses
-/// itself, or its record does not read back unchanged.
-async fn judged(
-    engine: Engine,
-    rest: &[&str],
-    step: &str,
-    qualify: bool,
-    baselines: &Baselines,
-    storm: bool,
-    directory: &std::path::Path,
-) -> (String, Record) {
-    fresh_database().await;
-    let root = repository();
-    let mut arguments = line(rest);
-    if qualify {
-        arguments.push("--qualify-baseline".to_owned());
-    }
-    let context = Context {
-        level: Level::One,
-        arguments: &arguments,
-        root: &root,
-    };
-    let base = levels::base(engine, &context).expect("base declaration");
-    let Plan {
-        mut declaration,
-        workload,
-    } = match engine {
-        Engine::Bifrost => query::plan(&context, base),
-        Engine::Verification => verification::plan(&context, base),
-        Engine::Gateway => gateway::plan(&context, base),
-    }
-    .expect("plan");
-    assert!(
-        declaration.steps.iter().any(|declared| declared.id == step),
-        "{step} is not declared"
-    );
-    declaration.steps.retain(|declared| declared.id == step);
-    declaration.criteria.retain_mut(|criterion| {
-        criterion.steps.retain(|judged| judged == step);
-        !criterion.steps.is_empty()
-    });
-    declaration
-        .references
-        .retain(|reference| reference.step == step);
-    declaration.compare(baselines);
-    assert_eq!(declaration.refusals(), Vec::new(), "{step} refuses itself");
-    let mut workload = Stormed {
-        inner: workload,
-        storm,
-    };
-    let options = Options {
-        artifacts: directory.join(format!(
-            "{}-{}-{}",
-            engine.name(),
-            declaration.experiment,
-            if storm { "storm" } else { "quiet" }
-        )),
-        profiler: None,
-        interrupt: CancellationToken::new(),
-    };
-    let record = run(
-        declaration.seal(),
-        &mut workload,
-        HostLoad::sample,
-        &options,
-    )
-    .await;
-    let path = record.publish(directory).expect("publish");
-    let read = Record::read(&path).expect("read back");
-    assert_eq!(read.render(), record.render());
-    (path.display().to_string(), read)
-}
-
-/// The judgment of reference `metric` on `step` in `record`, with its
-/// verdict.
-fn reference_verdict(record: &Record, step: &str, metric: &str) -> Option<Verdict> {
-    let id = format!("reference.{}.{step}.{metric}", record.experiment);
-    record
-        .steps
-        .iter()
-        .flat_map(|judged| &judged.criteria)
-        .find(|judgment| judgment.criterion == id)
-        .and_then(|judgment| judgment.verdict)
-}
-
-/// Each engine's ordinary full L1 measurement reaches the normal reference
-/// judge: two clean `--qualify-baseline` suites of one measured case
-/// promote same-method references, an unperturbed normal run against them
-/// PASSes every reference, and the same run with [`STORM`] server scrape
-/// loops over each window FAILs a reference by the noise-aware regression
-/// rule, exit code 1, in a record read back from disk; across the engines
-/// latency, server CPU per work, and throughput per vCPU each regress. No reading is edited and
-/// no limit changes; the perturbed record stays valid.
-///
-/// `RUSTFLAGS='-C force-frame-pointers=yes' CARGO_PROFILE_RELEASE_DEBUG=line-tables-only mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked --release --target-dir target/profiling -p wyrd-testing --bin capacity --run-ignored=only --no-capture -E 'test(=tests::pg_tests::measured_regressions_reach_normal_reference_judgment)'`
-/// after `mise run bench:build`, from a clean committed tree on a quiet
-/// host.
-///
-/// # Panics
-///
-/// Panics when a qualification suite cannot establish references, the
-/// control fails a reference, a perturbed run fails none, or a dimension
-/// regresses in no engine.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the release server from `mise run bench:build`, the Postgres wrapper, a clean committed tree and a quiet host"]
-async fn measured_regressions_reach_normal_reference_judgment() {
-    let directory = tempfile::tempdir().expect("directory");
-    let cases = [
-        (
-            Engine::Bifrost,
-            vec!["writes-parquet"],
-            "native-write-c1",
-            ["p95_ms", "cpu_us_per_row", "rows_per_s_per_vcpu"],
-        ),
-        (
-            Engine::Verification,
-            vec![],
-            "direct-verify-c1",
-            [
-                "overhead_p99_ms",
-                "cpu_us_per_verification",
-                "verifications_per_s_per_vcpu",
-            ],
-        ),
-        (
-            Engine::Gateway,
-            vec![],
-            "chat.c1",
-            [
-                "overhead_p99_ms",
-                "cpu_us_per_request",
-                "requests_per_s_per_vcpu",
-            ],
-        ),
-    ];
-    let none = Baselines::default();
-    let mut failed = [false; 3];
-    for (engine, rest, step, dimensions) in cases {
-        let mut suites = Vec::new();
-        for _ in 0..2 {
-            let suite = judged(engine, &rest, step, true, &none, false, directory.path()).await;
-            assert_eq!(
-                suite.1.qualification_refusals(),
-                Vec::<String>::new(),
-                "{}",
-                suite.1.render()
-            );
-            suites.push(suite);
-        }
-        let promoted = Baselines::promote(&suites).expect("references promote");
-        let control = judged(
-            engine,
-            &rest,
-            step,
-            false,
-            &promoted,
-            false,
-            directory.path(),
-        )
-        .await;
-        assert_eq!(control.1.verdict, Verdict::Pass, "{}", control.1.render());
-        let regressed = judged(
-            engine,
-            &rest,
-            step,
-            false,
-            &promoted,
-            true,
-            directory.path(),
-        )
-        .await;
-        let record = &regressed.1;
-        println!("{}\n{}", regressed.0, record.render());
-        assert_eq!(record.verdict, Verdict::Fail, "{}", record.render());
-        assert_eq!(record.exit_code(), 1);
-        let mut regressed = false;
-        for (dimension, metric) in dimensions.into_iter().enumerate() {
-            assert_eq!(
-                reference_verdict(&control.1, step, metric),
-                Some(Verdict::Pass),
-                "{step} control {metric}"
-            );
-            if reference_verdict(record, step, metric) == Some(Verdict::Fail) {
-                failed[dimension] = true;
-                regressed = true;
-            }
-        }
-        assert!(
-            regressed,
-            "{step}: no reference regressed: {}",
-            record.render()
-        );
-    }
-    assert_eq!(
-        failed, [true; 3],
-        "latency, CPU per work and throughput per vCPU each regress in some engine"
-    );
 }

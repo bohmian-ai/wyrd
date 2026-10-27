@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::{ArtifactManifestEntry, RelativeArtifactPath};
 
-use crate::{Diagnostic, LoadError};
+use crate::{Diagnostic, LoadError, Severity};
 
 /// A typed artifact manifest and its local source provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,8 +80,9 @@ pub(crate) fn manifest_of(
 /// Every regular file below `root`, recursively.
 ///
 /// # Errors
-/// Returns a diagnostic for an unreadable directory or a link or other
-/// non-regular entry.
+/// Returns an IO diagnostic for an unreadable directory, and a
+/// [`WyrdError::Validation`] diagnostic with rule [`NONREGULAR`] naming the
+/// entry for a link or other non-regular entry.
 pub(crate) fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), LoadError> {
     let entries = fs::read_dir(root)
         .map_err(|error| LoadError::single(Diagnostic::io(root.to_path_buf(), &error)))?;
@@ -96,13 +98,36 @@ pub(crate) fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(),
         } else if file_type.is_file() {
             files.push(path);
         } else {
-            return Err(LoadError::single(Diagnostic::invalid_envelope(
+            let refused = nonregular(&path);
+            return Err(LoadError::single(Diagnostic::from_wyrd_error(
                 path,
-                "registration directory contains a non-regular artifact".to_owned(),
+                Severity::Error,
+                None,
+                &refused,
             )));
         }
     }
     Ok(())
+}
+
+/// The validation rule of an artifact source that is not a regular file or a
+/// directory of regular files.
+pub(crate) const NONREGULAR: &str = "artifact_source_regular";
+
+/// The refusal of `path`, a link or other non-regular artifact source.
+pub(crate) fn nonregular(path: &Path) -> WyrdError {
+    WyrdError::Validation {
+        message: format!(
+            "source: {} is not a regular file or a directory of regular files",
+            path.display()
+        ),
+        details: serde_json::json!({
+            "rule": NONREGULAR,
+            "field": "source",
+            "source": path.display().to_string(),
+            "expected": "a regular file or a directory of regular files",
+        }),
+    }
 }
 
 fn hash_file(path: &Path) -> Result<(String, u64), LoadError> {
@@ -185,10 +210,16 @@ mod tests {
         let error = build_artifact_manifest(root.path(), "card.json")
             .expect_err("symlink should not be accepted");
 
-        assert!(
-            error.diagnostics[0]
-                .message
-                .contains("non-regular artifact")
+        let [refused] = error.diagnostics.as_slice() else {
+            panic!("one diagnostic: {error:?}");
+        };
+        assert_eq!(
+            (refused.code, refused.context.as_deref().map(|c| &c["rule"])),
+            (
+                "WYRD_SPEC_400_VALIDATION",
+                Some(&serde_json::json!(super::NONREGULAR))
+            )
         );
+        assert_eq!(refused.path, root.path().join("linked.bin"));
     }
 }

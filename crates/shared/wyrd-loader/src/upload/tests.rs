@@ -144,10 +144,12 @@ fn uploads_extract_supported_files_before_registration() {
 }
 
 /// Blank kinds, caller reports, output collisions, corrupt documents,
-/// links, and empty directories fail before any declaration.
+/// links, and empty directories fail before any declaration, each as a
+/// validation error whose rule names the repair.
 ///
 /// # Panics
-/// Panics when a refused upload prepares.
+/// Panics when a refused upload prepares or is refused under another code
+/// or rule.
 #[test]
 fn uploads_refuse_invalid_sources_and_reports() {
     let root = tree(&[("policy.md", b"# Refunds")]);
@@ -170,17 +172,34 @@ fn uploads_refuse_invalid_sources_and_reports() {
     let linked = tree(&[("a.txt", b"a")]);
     std::os::unix::fs::symlink(linked.path().join("a.txt"), linked.path().join("b.txt"))
         .expect("link");
-    for (source, extract) in [
-        (collides.path().to_path_buf(), true),
-        (corrupt.path().to_path_buf(), true),
-        (empty.path().to_path_buf(), false),
-        (linked.path().to_path_buf(), false),
-        (linked.path().join("b.txt"), false),
+    for (source, extract, rule) in [
+        (
+            collides.path().to_path_buf(),
+            true,
+            "extraction_output_collision",
+        ),
+        (corrupt.path().to_path_buf(), true, "extraction_refused"),
+        (empty.path().to_path_buf(), false, "artifact_source_empty"),
+        (
+            linked.path().to_path_buf(),
+            false,
+            "artifact_source_regular",
+        ),
+        (
+            linked.path().join("b.txt"),
+            false,
+            "artifact_source_regular",
+        ),
     ] {
-        assert!(
-            ArtifactUpload::prepare(&source, metadata(), spec(), extract).is_err(),
-            "{}",
+        let refused = ArtifactUpload::prepare(&source, metadata(), spec(), extract)
+            .expect_err("refused before declaring");
+        let problem = refused.as_problem_json();
+        assert_eq!(
+            (refused.code(), &problem["details"]["rule"]),
+            ("WYRD_SPEC_400_VALIDATION", &serde_json::json!(rule)),
+            "{}: {problem}",
             source.display()
         );
+        assert_eq!(problem["details"]["field"], "source", "{problem}");
     }
 }

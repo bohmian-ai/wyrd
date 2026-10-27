@@ -14,8 +14,22 @@ use wyrd_spec::envelope::{CardKind, Metadata};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::{ArtifactManifestEntry, CardSubmission, RelativeArtifactPath};
 
-use crate::manifest::{collect_files, manifest_of};
+use crate::manifest::{NONREGULAR, collect_files, manifest_of, nonregular};
 use crate::{DeclarationInput, Diagnostic, EXTRACT_VERSION, ExtractLimits, Extraction, LoadError};
+
+/// A [`WyrdError::Validation`] of the upload `source` under `rule`, whose
+/// `details` add `context`'s fields to the rule and field.
+fn invalid(rule: &str, message: String, context: serde_json::Value) -> WyrdError {
+    let mut details = serde_json::json!({ "rule": rule, "field": "source" });
+    if let (Some(details), serde_json::Value::Object(context)) = (details.as_object_mut(), context)
+    {
+        details.extend(context);
+    }
+    WyrdError::Validation {
+        message: format!("source: {message}"),
+        details,
+    }
+}
 
 /// The directory extraction outputs are written under, inside the Artifact.
 const EXTRACTED: &str = "extracted";
@@ -53,12 +67,17 @@ impl ArtifactUpload {
     /// source before submission, so a later change fails the upload too.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] for a blank `artifact_kind` or, with
-    /// `extract`, a caller-supplied `metadata.extraction`, and
-    /// [`WyrdError::LoaderInvalidEnvelope`] for a source that is not a
-    /// regular file or a directory of regular files, an empty directory, an
-    /// unreadable or changed file, a supported document the extractor
-    /// refuses, or an output path that collides with a source.
+    /// Returns [`WyrdError::Validation`] for a blank `artifact_kind`, with
+    /// `extract` a caller-supplied `metadata.extraction` (rule
+    /// `extraction_report`), and, with `field` `source`, a source that is
+    /// not a regular file or a directory of regular files
+    /// (`artifact_source_regular`), an empty directory
+    /// (`artifact_source_empty`), a supported document the extractor refuses
+    /// (`extraction_refused`), or an output path that collides with a source
+    /// (`extraction_output_collision`); `details` name the offending path
+    /// and what was expected. Returns [`WyrdError::LoaderInvalidEnvelope`]
+    /// carrying an IO diagnostic for an unreadable file, and one for a file
+    /// that changed while being prepared.
     pub fn prepare(
         source: &Path,
         metadata: Metadata,
@@ -87,15 +106,32 @@ impl ArtifactUpload {
             )
         } else if kind.is_dir() {
             let mut files = Vec::new();
-            collect_files(source, &mut files)?;
+            collect_files(source, &mut files).map_err(|error| {
+                match error.diagnostics.as_slice() {
+                    [entry]
+                        if entry
+                            .context
+                            .as_ref()
+                            .is_some_and(|context| context["rule"] == NONREGULAR) =>
+                    {
+                        nonregular(&entry.path)
+                    }
+                    _ => WyrdError::from(error),
+                }
+            })?;
             (source, files)
         } else {
-            return Err(refused(
-                "an Artifact upload source must be a regular file or a directory",
-            ));
+            return Err(nonregular(source));
         };
         if files.is_empty() {
-            return Err(refused("the directory holds no regular files to upload"));
+            return Err(invalid(
+                "artifact_source_empty",
+                format!("{} holds no regular files to upload", source.display()),
+                serde_json::json!({
+                    "source": source.display().to_string(),
+                    "expected": "at least one regular file",
+                }),
+            ));
         }
         let mut manifest = manifest_of(root, files)?;
         let mut upload = Self {
@@ -137,10 +173,19 @@ impl ArtifactUpload {
                         || other.starts_with(&format!("{output}/"))
                         || output.starts_with(&format!("{other}/"))
                 };
-                if originals.iter().any(collides) {
-                    return Err(refused(&format!(
-                        "the extraction output {output} collides with an uploaded file"
-                    )));
+                if let Some(other) = originals.iter().find(|other| collides(other)) {
+                    return Err(invalid(
+                        "extraction_output_collision",
+                        format!(
+                            "the extraction output {output} collides with the uploaded {other}"
+                        ),
+                        serde_json::json!({
+                            "source": path,
+                            "output": output,
+                            "collides_with": other,
+                            "expected": format!("no uploaded file at or around {output}"),
+                        }),
+                    ));
                 }
                 let bytes = fs::read(&local)
                     .map_err(|error| LoadError::single(Diagnostic::io(local.clone(), &error)))?;
@@ -151,7 +196,20 @@ impl ArtifactUpload {
                 }
                 let extraction = Extraction::new(&ExtractLimits::default())
                     .run(&bytes, format)
-                    .map_err(|error| refused(&format!("{path} cannot be extracted: {error}")))?;
+                    .map_err(|error| {
+                        invalid(
+                            "extraction_refused",
+                            format!("{path} cannot be extracted: {error}"),
+                            serde_json::json!({
+                                "source": path,
+                                "format": format,
+                                "expected": format!(
+                                    "a parseable {format} document within the extraction limits"
+                                ),
+                                "reason": error.0,
+                            }),
+                        )
+                    })?;
                 let json = serde_json::to_vec_pretty(&extraction)
                     .map_err(|error| refused(&format!("{path} extraction: {error}")))?;
                 let written = scratch.join(&output);

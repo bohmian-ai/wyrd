@@ -1,3 +1,4 @@
+import builtins
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
@@ -514,6 +515,73 @@ class Cards:
         Raises:
             WyrdError: If the bundle is invalid, its artifacts cannot be read,
                 or declaration does not complete.
+        """
+        ...
+
+    def upload_artifact(
+        self,
+        source: str | PathLike[str],
+        metadata: Mapping[str, object],
+        *,
+        version_bump: VersionBump | None = None,
+        spec: Mapping[str, object] | None = None,
+        extract: bool = False,
+    ) -> CardRef:
+        """Publish one file or directory as an Artifact Card.
+
+        A file keeps its basename; a directory keeps every regular file at
+        its relative path. Nothing is parsed unless ``extract`` is set: then
+        each supported document ``P`` (PDF, DOCX, XLSX, PPTX, CSV, JSON, text,
+        Markdown, HTML) is extracted locally and published beside its
+        original as ``extracted/P.json``, and ``spec.metadata.extraction``
+        records the extractor version, the source/output pairs, and the
+        skipped paths. The source tree is never written.
+
+        Example:
+            ```python
+            ref = cards.upload_artifact(
+                "policies/",
+                {"name": "refund-policies", "version": "1.0.0"},
+                spec={"artifact_kind": "policies"},
+                extract=True,
+            )
+            ```
+
+        Args:
+            source: The regular file or directory to publish.
+            metadata: The Card metadata: ``name``, an optional exact
+                ``version`` or version scope (omitted, the server assigns
+                one), and any ``labels`` or ``annotations``.
+            version_bump: How the server bumps the latest version; never
+                read from ``metadata``.
+            spec: The Artifact spec; defaults to ``{"artifact_kind": "file"}``.
+            extract: Prepare extraction outputs before declaring.
+
+        Returns:
+            The exact Active reference, UID included.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` naming the field for
+                invalid metadata, name, or spec, before anything is sent;
+                otherwise for a blank kind, an invalid source, a symlink, an
+                output path that collides with a source, an authored
+                extraction report, a document the extractor refuses, or a
+                failed declaration.
+        """
+        ...
+
+    def list_artifacts(self, card_ref: CardRef) -> builtins.list[dict[str, object]]:
+        """List the files a declared Card holds, from the server inventory.
+
+        Args:
+            card_ref: Exact reference of the Card.
+
+        Returns:
+            One dict per file with ``relative_path``, ``size_bytes``, base64
+            ``sha256``, and ``content_type``.
+
+        Raises:
+            WyrdError: When the Card is absent or unauthorized.
         """
         ...
 

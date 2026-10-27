@@ -1,0 +1,28 @@
+# Refused: one mount lies inside another.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: colliding-mounts-check
+  version: 1.0.0
+spec:
+  inputs:
+    script: {type: json, schema: {type: array}}
+  steps:
+    - id: probe
+      action:
+        kind: agent
+        agent: ./file-probe.yaml
+        inputs: {script: inputs.script}
+        workspace:
+          /inputs/docs:
+            artifact:
+              card: {kind: Artifact, name: guarded-docs, version: 1.0.0}
+              path: docs
+          /inputs/docs/guide.md:
+            artifact:
+              card: {kind: Artifact, name: guarded-docs, version: 1.0.0}
+              path: notes.txt
+  requirements:
+    - id: probed
+      statement: The probe played its script
+      check: {kind: assert, path: steps.probe.output.done, operator: equals, expected: true}

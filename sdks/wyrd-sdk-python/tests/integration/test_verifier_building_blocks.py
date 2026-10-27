@@ -9,13 +9,19 @@ locked output. Drift checks run on schedules in
 ``test_verify_in_real_time``.
 
 The session's local model provider stands in for the gateway's upstream: the
-refund reader first calls ``fs.read`` on its workspace copy of the policy and
+refund reader first calls ``fs.extract`` on its workspace copy of the policy and
 then answers a 100-dollar limit, the policy judge passes every answer with a
 citation unless the answer names a scripted case, and the ``tool-review``
 investigator calls the Card, Bifrost, and code tools at once and then
 finishes. Scripted answer texts also fail the reader's provider, schema, and
 deadline and the code step and check; scoped and delegated principals
 exercise every tool grant.
+
+Uploaded Artifacts are published as exact files, optionally extracted before
+registration, and mounted by selection: ``handbook-desk``'s two judges read
+the prepared handbook with ``fs.read`` and cite the line holding a fresh
+marker, and the file probe's scripted Agent plays real ``fs.*`` calls over
+selected mounts so each journey asserts exactly what the tools returned.
 """
 
 from __future__ import annotations
@@ -23,7 +29,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -35,11 +41,11 @@ from pydantic import BaseModel, RootModel
 from wyrd import WyrdError, verify
 from wyrd.auth import Principals
 from wyrd.bifrost import Bifrost
-from wyrd.cards import Cards
+from wyrd.cards import CardKind, CardRef, Cards, VersionBump
 from wyrd.client import WyrdClient
 from wyrd.otel import span_exporter
 from wyrd.state import WyrdState
-from wyrd.testing import WyrdTestServer
+from wyrd.testing import WyrdTestServer, cli
 
 from .support import (
     FIXTURES,
@@ -392,7 +398,7 @@ def test_policy_review_runs_every_action_and_check_kind(
     assert text["provenance"]["kind"] == "extract"
     rules = step(result, "refund-rules")
     assert (rules["status"], rules["output"]) == ("succeeded", {"max_refund": 100})
-    assert [call["tool"] for call in rules["tool_calls"]] == ["fs.read"]
+    assert [call["tool"] for call in rules["tool_calls"]] == ["fs.extract"]
     facts = step(result, "answer-facts")
     assert (facts["status"], facts["output"]) == ("succeeded", {"within_limit": True})
     assert facts["provenance"]["kind"] == "code"
@@ -812,3 +818,627 @@ def test_typed_verdict_data_mismatch_keeps_original_result(
     assert execution.status()["result"]["outcome"]["requirements"] == ordinary.requirements
     assert_scored(ordinary.requirements)
     assert scored_calls(receiver) == judged, "nothing is judged again"
+
+
+CORRUPT_PDF = b"%PDF-1.7\nnot a document"
+"""Bytes a ``.pdf`` name claims but the extractor refuses."""
+
+
+def tree(root: Path, files: dict[str, str | bytes]) -> Path:
+    """Write ``files`` under ``root`` by relative path and return ``root``."""
+    for relative, content in files.items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, str):
+            target.write_text(content)
+        else:
+            target.write_bytes(content)
+    return root
+
+
+def inventory(cards: Cards, ref: CardRef) -> dict[str, int]:
+    """Every file ``ref`` holds, by relative path, with its size."""
+    return {
+        str(each["relative_path"]): cast("int", each["size_bytes"])
+        for each in cards.list_artifacts(ref)
+    }
+
+
+def snapshot(root: Path) -> dict[str, bytes]:
+    """Every file under ``root`` with its bytes."""
+    return {
+        str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()
+    }
+
+
+INVALID = "WYRD_LOADER_400_INVALID_ENVELOPE"
+"""The stable code of an upload the loader refuses before declaring anything."""
+
+VALIDATION = "WYRD_SPEC_400_VALIDATION"
+"""The stable code of a refusal the caller repairs by the rule in its details."""
+
+HANDBOOK = {"type": "str", "value": "handbook"}
+"""An authored ``spec.metadata`` value, in its tagged non-secret form."""
+
+
+def pinned_upload(name: str) -> dict[str, str]:
+    """The metadata uploading ``name`` at version 1.0.0."""
+    return {"name": name, "version": "1.0.0"}
+
+
+def refusal(call: Callable[[], object]) -> tuple[str, object]:
+    """The code and details of the ``WyrdError`` ``call`` raises."""
+    with pytest.raises(WyrdError) as refused:
+        call()
+    return refused.value.code, refused.value.details
+
+
+def refused_upload(call: Callable[[], object]) -> tuple[str, str]:
+    """The code of the ``WyrdError`` an upload ``call`` raises, with its first diagnostic's code or its rule."""
+    code, details = refusal(call)
+    found = cast("dict[str, Any]", details)
+    return code, found["diagnostics"][0]["code"] if "diagnostics" in found else found["rule"]
+
+
+def test_artifact_upload_preserves_files_and_versions(cards: Cards, tmp_path: Path) -> None:
+    single = tree(tmp_path / "single", {"notes.txt": "one\n", "ignored.txt": "sibling\n"})
+
+    ref = cards.upload_artifact(single / "notes.txt", pinned_upload("upload-notes"))
+
+    assert (ref.kind, ref.name, ref.version) == (CardKind.Artifact, "upload-notes", "1.0.0")
+    assert ref.uid is not None
+    assert inventory(cards, ref) == {"notes.txt": 4}
+    card = cards.get(ref)
+    assert card.status is not None and card.status["phase"] == "active", card.status
+    assert card.spec["artifact_kind"] == "file"
+
+    files: dict[str, str | bytes] = {
+        "card.json": '{"not": "an envelope"}',
+        "nested/deep/data.bin": bytes(range(256)),
+        "policy.pdf": CORRUPT_PDF,
+    }
+    collection = tree(tmp_path / "collection", files)
+    authored = {
+        **pinned_upload("upload-collection"),
+        "labels": {"team": "support"},
+        "annotations": {"acme.com/owner": "refund-desk"},
+    }
+    spec = {"artifact_kind": "policies", "metadata": {"source": HANDBOOK}}
+    ref = cards.upload_artifact(collection, authored, spec=spec)
+    assert inventory(cards, ref) == {path: len(content) for path, content in files.items()}
+    held = cards.get(ref)
+    assert (held.spec["artifact_kind"], held.spec["metadata"]) == ("policies", spec["metadata"])
+    assert held.metadata["labels"] == {"team": "support"}, held.metadata
+    assert held.metadata["annotations"]["acme.com/owner"] == "refund-desk", held.metadata
+    pulled = cards.pull(ref, tmp_path / "pulled").destination
+    [data] = list(pulled.rglob("data.bin"))
+    assert snapshot(data.parents[2]) == {
+        path: (content.encode() if isinstance(content, str) else content)
+        for path, content in files.items()
+    }
+
+    again = cards.upload_artifact(collection, authored, spec=spec)
+    assert again == ref, "an unchanged upload of a pinned version is the same Card"
+    (collection / "policy.pdf").write_bytes(CORRUPT_PDF + b"!")
+    assert refusal(lambda: cards.upload_artifact(collection, authored, spec=spec))[0] == (
+        "WYRD_REGISTRY_409_SPEC_DRIFT"
+    )
+    bumped = cards.upload_artifact(
+        collection, {"name": "upload-collection"}, version_bump=VersionBump.Patch, spec=spec
+    )
+    assert bumped.version == "1.0.1"
+    assert inventory(cards, bumped)["policy.pdf"] == len(CORRUPT_PDF) + 1
+
+    (tmp_path / "link.txt").symlink_to(single / "notes.txt")
+    (tmp_path / "empty").mkdir()
+    refused = {
+        name: refused_upload(
+            lambda source=source, kind=kind, name=name: cards.upload_artifact(
+                source, pinned_upload(name), spec={"artifact_kind": kind}
+            )
+        )
+        for name, source, kind in (
+            ("blank-kind-upload", single / "notes.txt", " "),
+            ("linked-upload", tmp_path / "link.txt", "file"),
+            ("missing-upload", tmp_path / "missing.txt", "file"),
+            ("empty-upload", tmp_path / "empty", "file"),
+        )
+    }
+    assert refused == {
+        "blank-kind-upload": ("WYRD_SPEC_400_VALIDATION", "artifact_kind"),
+        "linked-upload": (VALIDATION, "artifact_source_regular"),
+        "missing-upload": (INVALID, "WYRD_LOADER_400_IO"),
+        "empty-upload": (VALIDATION, "artifact_source_empty"),
+    }
+    for name in refused:
+        assert not cards.list(kind="Artifact", name=name).refs, name
+
+    offline = Cards(WyrdClient(server_url="http://127.0.0.1:9", credential="unused"))
+    for metadata, field in (
+        ({"name": "Not A Name", "version": "1.0.0"}, "metadata.name"),
+        ({"name": "upload-bump", "bump": "patch"}, "metadata.bump"),
+        ({"name": "upload-extra", "colour": "red"}, "metadata"),
+    ):
+        code, details = refusal(lambda metadata=metadata: offline.upload_artifact(single, metadata))
+        assert (code, cast("dict[str, object]", details)["field"]) == (
+            "WYRD_SPEC_400_VALIDATION",
+            field,
+        ), "a caller mistake is refused before any request"
+
+
+def test_artifact_upload_extracts_before_registration(cards: Cards, tmp_path: Path) -> None:
+    files: dict[str, str | bytes] = {
+        "handbook.md": "# Handbook\nEscalate to the duty lead.\n",
+        "nested/rates.csv": "tier,days\nstandard,30\n",
+        "logo.bin": b"\x00\x01opaque",
+    }
+    source = tree(tmp_path / "source", files)
+    before = snapshot(source)
+    spec = {"artifact_kind": "file", "metadata": {"source": HANDBOOK}}
+
+    ref = cards.upload_artifact(
+        source, pinned_upload("extracted-handbook"), spec=spec, extract=True
+    )
+
+    assert snapshot(source) == before, "the source tree is never written"
+    held = inventory(cards, ref)
+    assert set(held) == {
+        "handbook.md",
+        "nested/rates.csv",
+        "logo.bin",
+        "extracted/handbook.md.json",
+        "extracted/nested/rates.csv.json",
+    }
+    metadata = cards.get(ref).spec["metadata"]
+    assert metadata["source"] == HANDBOOK, "authored spec metadata survives extraction"
+    report = metadata["extraction"]
+    assert "extracted/handbook.md.json" in json.dumps(report), report
+    assert "logo.bin" in json.dumps(report), "the unsupported file is reported skipped"
+    pulled = cards.pull(ref, tmp_path / "pulled").destination
+    [markdown] = list(pulled.rglob("handbook.md.json"))
+    assert json.loads(markdown.read_text()) == {
+        "format": "markdown",
+        "text": "# Handbook\nEscalate to the duty lead.\n",
+    }
+    plain = cards.upload_artifact(source, pinned_upload("raw-handbook"))
+    assert not any(path.startswith("extracted/") for path in inventory(cards, plain))
+
+    authored_report = {
+        "artifact_kind": "file",
+        "metadata": {"extraction": {"type": "object", "value": {}}},
+    }
+    (source / "policy.pdf").write_bytes(CORRUPT_PDF)
+    corrupt = refused_upload(
+        lambda: cards.upload_artifact(source, pinned_upload("corrupt-handbook"), extract=True)
+    )
+    (source / "policy.pdf").unlink()
+    reported = refused_upload(
+        lambda: cards.upload_artifact(
+            source, pinned_upload("reported-handbook"), spec=authored_report, extract=True
+        )
+    )
+    (source / "extracted").mkdir()
+    (source / "extracted/handbook.md.json").write_text("{}")
+    colliding = refused_upload(
+        lambda: cards.upload_artifact(source, pinned_upload("colliding-handbook"), extract=True)
+    )
+    (source / "extracted/handbook.md.json").unlink()
+    (source / "extracted").rmdir()
+    assert (corrupt, reported, colliding) == (
+        (VALIDATION, "extraction_refused"),
+        (VALIDATION, "extraction_report"),
+        (VALIDATION, "extraction_output_collision"),
+    )
+    for name in ("corrupt-handbook", "reported-handbook", "colliding-handbook"):
+        assert not cards.list(kind="Artifact", name=name).refs, name
+
+    uploaded = cli.artifact_upload(source, name="cli-handbook", version="1.0.0", extract=True)
+    assert uploaded.version == "1.0.0"
+    listed = cli.artifact_files(name="cli-handbook", version="1.0.0")
+    assert {each["relative_path"] for each in listed["artifacts"]} == set(held)
+    raw = refusal(lambda: cli.artifact_upload(source, name="cli-handbook", version="1.0.0"))
+    assert raw[0] == "WYRD_REGISTRY_409_SPEC_DRIFT", "the raw collection is not the extracted 1.0.0"
+
+
+def test_uploaded_artifacts_are_reused_by_service_judges(
+    cards: Cards, wyrd_server: WyrdTestServer, receiver: Receiver, tmp_path: Path
+) -> None:
+    marker = f"MARKER-{secrets.token_hex(8)}"
+    source = tree(
+        tmp_path / "handbook",
+        {
+            "handbook.md": f"# Staff handbook\nOutages escalate with code {marker}.\n",
+            "rota.txt": "never mounted\n",
+        },
+    )
+    handbook = cards.upload_artifact(source, pinned_upload("staff-handbook"), extract=True)
+    assert "extracted/handbook.md.json" in inventory(cards, handbook)
+    configure_gateway(WyrdClient())
+    declare(cards, "cards/uploaded_artifacts/handbook-desk.yaml")
+    bundle = pull(cards, "handbook-desk", tmp_path / "desk")
+    key = wyrd_server.scoped_api_key("handbook_judge", grants({"tool": "fs.read"}))
+    state = WyrdState.from_path(bundle, WyrdClient(credential=key))
+    asked = len(receiver.to("/v1/chat/completions"))
+    try:
+        results = [
+            state.run().observe.verify(verifier, question="How do outages escalate?")
+            for verifier in ("handbook-review", "handbook-audit")
+        ]
+    finally:
+        state.shutdown()
+
+    for result in results:
+        assert result.verdict == "passed", result.requirements
+        judged = requirement(result, "handbook-answers")
+        assert marker in judged["reason"]
+        [citation] = judged.get("citations", [])
+        assert citation["slot"].startswith("attachment_"), citation
+        assert "lines" in citation["locator"], citation
+    judges = [
+        each.body
+        for each in receiver.to("/v1/chat/completions")[asked:]
+        if "HANDBOOK JUDGE" in json.dumps(each.body)
+    ]
+    assert len(judges) == 4, "each judge reads once and then answers"
+    for body in judges:
+        assert [tool["function"]["name"] for tool in body["tools"]] == ["fs_read"]
+        assert marker not in json.dumps(body["messages"][0]), "only fs.read shows the marker"
+    assert not any("rota" in json.dumps(body) for body in judges), "unselected files stay out"
+
+
+class Probe:
+    """A checked-in Service whose ``<service>-check`` Verifier's Agent plays a scripted list of file tool calls.
+
+    The local model makes one scripted call per turn and answers every tool
+    result, so each journey reads exactly what the real tools returned.
+    """
+
+    def __init__(
+        self,
+        cards: Cards,
+        server: WyrdTestServer,
+        home: Path,
+        service: str,
+        granted: str | dict[str, object] = "all",
+    ) -> None:
+        """Register ``cards/artifact_workspaces/<service>.yaml`` and run it as a key granted ``granted`` tools."""
+        configure_gateway(WyrdClient())
+        declare(cards, f"cards/artifact_workspaces/{service}.yaml")
+        bundle = pull(cards, service, home)
+        key = server.scoped_api_key(service.replace("-", "_"), grants(granted))
+        self.verifier = f"{service}-check"
+        self.state = WyrdState.from_path(bundle, WyrdClient(credential=key))
+
+    def play(self, *script: tuple[str, dict[str, object]]) -> tuple[list[Any], StepResult]:
+        """Run ``script`` and return each call's tool result beside the step record."""
+        calls = [{"tool": tool, "arguments": arguments} for tool, arguments in script]
+        result = self.state.run().observe.verify(self.verifier, script=calls)
+        probe = step(result, "probe")
+        assert probe["status"] == "succeeded", probe
+        output = cast("dict[str, Any]", probe.get("output"))
+        return output["results"], probe
+
+
+def lines(read: dict[str, Any]) -> list[tuple[int, str]]:
+    """Each unit of an ``fs.read`` result as its line number and text."""
+    return [(unit["locator"]["lines"]["start"], unit["text"]) for unit in read["units"]]
+
+
+def hits(found: dict[str, Any]) -> list[tuple[str, int]]:
+    """Each ``fs.search`` match as its path and line number."""
+    return [(hit["path"], hit["locator"]["lines"]["start"]) for hit in found["matches"]]
+
+
+def tools_called(record: StepResult) -> list[str]:
+    """The tools ``record``'s Agent called, in call order."""
+    return [call["tool"] for call in record.get("tool_calls", [])]
+
+
+def recorded_codes(record: StepResult) -> list[str]:
+    """The error codes ``record`` keeps for its failed tool calls, in call order."""
+    return [call["error"].split(":")[0] for call in record.get("tool_calls", []) if "error" in call]
+
+
+def test_artifact_workspace_selects_files_and_directories(
+    cards: Cards, wyrd_server: WyrdTestServer, tmp_path: Path
+) -> None:
+    source = tree(
+        tmp_path / "source",
+        {
+            "docs/guide.md": "# Guide\nfirst release\n",
+            "docs/deep/notes.txt": "nested\n",
+            "docs-old/stale.txt": "sibling prefix\n",
+            "policy.pdf": CORRUPT_PDF,
+            "blob.bin": bytes(range(256)),
+            "unselected.txt": "x" * 100_000,
+        },
+    )
+    cards.upload_artifact(source, pinned_upload("workspace-library"))
+    probe = Probe(cards, wyrd_server, tmp_path / "probe", "library-desk")
+
+    [listed, read, nested] = probe.play(
+        ("fs.list", {"path": "/inputs"}),
+        ("fs.read", {"path": "/inputs/guide.md"}),
+        ("fs.read", {"path": "/inputs/docs/deep/notes.txt"}),
+    )[0]
+
+    assert {each["path"]: each["size_bytes"] for each in listed["files"]} == {
+        "/inputs/guide.md": 22,
+        "/inputs/docs/guide.md": 22,
+        "/inputs/docs/deep/notes.txt": 7,
+        "/inputs/policy.pdf": len(CORRUPT_PDF),
+        "/inputs/blob.bin": 256,
+    }
+    assert lines(read) == [(1, "# Guide"), (2, "first release")]
+    assert lines(nested) == [(1, "nested")]
+    assert [len(each["sources"]) for each in listed["files"]] == [1] * 5
+
+    (source / "docs/guide.md").write_text("# Guide\nsecond release\n")
+    cards.upload_artifact(source, {"name": "workspace-library", "version": "1.0.1"})
+    [read] = probe.play(("fs.read", {"path": "/inputs/guide.md"}))[0]
+    assert lines(read)[1] == (2, "first release"), "a new version never retargets the pin"
+
+
+def tool_refusal(result: dict[str, Any]) -> tuple[object, object]:
+    """The code and repair rule of a tool call the tool refused, carried in its result."""
+    return result.get("code"), result.get("details", {}).get("rule")
+
+
+OPAQUE = b"\xff\xfe\x00LIMIT"
+"""Bytes no text tool reads, which ``code.run`` still reads from the mount."""
+
+OPAQUE_HEX = "from pathlib import Path\nPath('/inputs/data/blob.bin').read_bytes().hex()"
+"""``code.run`` source returning the mounted opaque file's bytes as hex."""
+
+
+def test_agent_file_tools_read_without_extraction(
+    cards: Cards, wyrd_server: WyrdTestServer, tmp_path: Path
+) -> None:
+    raw = '{\n  "limit": 100,\n  "tiers": ["standard"]\n}\n'
+    body = "".join(f"line {number}\n" for number in range(1, 2001))
+    source = tree(
+        tmp_path / "source",
+        {"policy.json": raw, "long.txt": body, "policy.pdf": CORRUPT_PDF, "blob.bin": OPAQUE},
+    )
+    cards.upload_artifact(source, pinned_upload("raw-records"))
+    probe = Probe(cards, wyrd_server, tmp_path / "probe", "raw-desk")
+
+    results, record = probe.play(
+        ("fs.read", {"path": "/inputs/data/policy.json"}),
+        ("fs.read", {"path": "/inputs/data/long.txt"}),
+        ("fs.read", {"path": "/inputs/data"}),
+        ("fs.read", {"path": "/inputs/data/blob.bin"}),
+        ("fs.read", {"path": "/inputs/data/policy.pdf"}),
+        ("fs.search", {"query": "LIMIT"}),
+        ("code.run", {"source": OPAQUE_HEX}),
+    )
+    [policy, first_page, directory, blob, pdf, found, ran] = results
+
+    assert lines(policy) == list(enumerate(raw.splitlines(), start=1))
+    assert policy["next"] is None, policy
+    page = lines(first_page)
+    assert page[0] == (1, "line 1") and 0 < len(page) < 2000, len(page)
+    [resumed] = probe.play(
+        ("fs.read", {"path": "/inputs/data/long.txt", "start": first_page["next"]})
+    )[0]
+    assert lines(resumed)[0] == (len(page) + 1, f"line {len(page) + 1}")
+    assert [tool_refusal(directory), tool_refusal(blob)] == [
+        (VALIDATION, "regular_file"),
+        (VALIDATION, "utf8_text"),
+    ]
+    assert "fs.list" in directory["error"] and "fs.extract" in blob["error"], (directory, blob)
+    assert recorded_codes(record) == [VALIDATION, VALIDATION], "the record keeps the model's code"
+    assert lines(pdf) == [(1, "%PDF-1.7"), (2, "not a document")], "reading never extracts"
+    assert hits(found) == [("/inputs/data/policy.json", 2)], "binary bytes are never searched"
+    assert ran["value"] == repr(OPAQUE.hex()), "code.run reads the opaque mounted bytes"
+    assert tools_called(record)[-1] == "code.run"
+
+
+def test_agent_file_search_supports_regex_across_files(
+    cards: Cards, wyrd_server: WyrdTestServer, tmp_path: Path
+) -> None:
+    source = tree(
+        tmp_path / "source",
+        {
+            "src/refunds.py": "def refund():\n    return REFUND_LIMIT\nrefund refund\n",
+            "src/deep/rules.txt": "Refund(x) applies\n",
+            "src-old/stale.txt": "refund outside the selection\n",
+            ".hidden/notes.txt": "refund hidden\n",
+            "blob.bin": b"\xff\xfe refund",
+            "many.txt": "match\n" * 4000,
+        },
+    )
+    cards.upload_artifact(source, pinned_upload("code-tree"))
+    probe = Probe(cards, wyrd_server, tmp_path / "probe", "search-desk")
+
+    results, record = probe.play(
+        ("fs.search", {"query": "refund"}),
+        ("fs.search", {"query": "refund", "case_sensitive": True}),
+        ("fs.search", {"query": "Refund(x)"}),
+        ("fs.search", {"query": r"^def \w+\(", "regex": True}),
+        ("fs.search", {"query": "refund", "path": "/inputs/src/deep"}),
+        ("fs.search", {"query": "refund", "path": "/inputs/src/refunds.py"}),
+        ("fs.search", {"query": "refund", "glob": "*.py"}),
+        ("fs.search", {"query": "refund", "glob": "inputs/src/**/*.txt"}),
+        ("fs.search", {"query": "(", "regex": True}),
+        ("fs.search", {"query": "refund", "glob": "["}),
+        ("fs.search", {"query": "refund", "path": "/inputs/missing"}),
+        ("fs.search", {"query": "no such text"}),
+        ("fs.search", {"query": "match"}),
+        ("fs.extract", {"path": "/inputs/src/deep/rules.txt", "output_path": "/work/rules.json"}),
+        ("fs.search", {"query": "Refund(x)", "path": "/work"}),
+        ("fs.read", {"path": "/inputs/src/refunds.py"}),
+    )
+    [
+        insensitive,
+        sensitive,
+        literal,
+        regex,
+        subtree,
+        single,
+        basename,
+        recursive,
+        bad_regex,
+        bad_glob,
+        bad_scope,
+        none,
+        many,
+        _,
+        scratch,
+        context,
+    ] = results
+
+    py, txt, hidden = (
+        "/inputs/src/refunds.py",
+        "/inputs/src/deep/rules.txt",
+        "/inputs/.hidden/notes.txt",
+    )
+    assert hits(insensitive) == [(hidden, 1), (txt, 1), (py, 1), (py, 2), (py, 3)]
+    assert hits(sensitive) == [(hidden, 1), (py, 1), (py, 3)]
+    assert hits(literal) == [(txt, 1)]
+    assert hits(regex) == [(py, 1)]
+    assert hits(subtree) == [(txt, 1)]
+    assert hits(single) == [(py, 1), (py, 2), (py, 3)]
+    assert hits(basename) == [(py, 1), (py, 2), (py, 3)]
+    assert hits(recursive) == [(txt, 1)]
+    assert [tool_refusal(each) for each in (bad_regex, bad_glob, bad_scope)] == [
+        (VALIDATION, "search_pattern"),
+        (VALIDATION, "search_glob"),
+        (VALIDATION, "workspace_missing"),
+    ]
+    assert recorded_codes(record) == [VALIDATION] * 3, "the record keeps the model's code"
+    assert none == {"matches": [], "truncated": False}
+    assert many["truncated"] is True and 0 < len(many["matches"]) < 4000, len(many["matches"])
+    [(path, _)] = hits(scratch)
+    assert path == "/work/rules.json" and scratch["matches"][0]["sources"] == []
+    assert lines(context)[1] == (2, "    return REFUND_LIMIT")
+    assert tools_called(record)[-3:] == ["fs.extract", "fs.search", "fs.read"]
+
+    wyrd_server.flush_bifrost()
+    query: dict[str, object] = {
+        "sql": "SELECT count(*) AS judged FROM bifrost.verification.results "
+        "WHERE service_name = 'search-desk'",
+        "max_rows": 1,
+    }
+    [found, read, queried], record = probe.play(
+        ("fs.search", {"query": "REFUND_LIMIT"}),
+        ("fs.read", {"path": "/inputs/src/refunds.py", "start": 1}),
+        ("bifrost.query", query),
+    )
+    assert hits(found) == [(py, 2)]
+    assert lines(read)[0] == (2, "    return REFUND_LIMIT"), "the read starts at the hit"
+    assert (queried["columns"][0]["name"], queried["rows"]) == ("judged", [[1]]), (
+        "the earlier probe is retained and queryable"
+    )
+    assert tools_called(record) == ["fs.search", "fs.read", "bifrost.query"]
+
+
+def test_agent_extract_tool_writes_explicit_output(
+    cards: Cards, wyrd_server: WyrdTestServer, tmp_path: Path
+) -> None:
+    source = tree(
+        tmp_path / "source",
+        {"handbook.md": "# Handbook\nEscalate.\n", "policy.pdf": CORRUPT_PDF, "blob.bin": b"\x00"},
+    )
+    cards.upload_artifact(source, pinned_upload("extractable-docs"))
+    probe = Probe(cards, wyrd_server, tmp_path / "probe", "extract-desk")
+
+    results, record = probe.play(
+        ("fs.extract", {"path": "/inputs/docs/handbook.md", "output_path": "/work/handbook.json"}),
+        ("fs.read", {"path": "/work/handbook.json"}),
+        ("fs.extract", {"path": "/inputs/docs/handbook.md", "output_path": "/work/handbook.json"}),
+        ("fs.extract", {"path": "/inputs/docs/policy.pdf", "output_path": "/work/policy.json"}),
+        ("fs.extract", {"path": "/inputs/docs/blob.bin", "output_path": "/work/blob.json"}),
+        ("fs.extract", {"path": "/inputs/docs", "output_path": "/work/docs.json"}),
+        ("fs.extract", {"path": "/inputs/docs/handbook.md", "output_path": "/inputs/x.json"}),
+        ("fs.extract", {"path": "/inputs/docs/handbook.md", "output_path": "/work/../x.json"}),
+        ("fs.list", {"path": "/work"}),
+    )
+    [extracted, read, *refused, listed] = results
+
+    assert extracted["output_path"] == "/work/handbook.json"
+    assert len(extracted["sources"]) == 1 and extracted["extractor_version"], extracted
+    text = "\n".join(text for _, text in lines(read))
+    assert json.loads(text) == {"format": "markdown", "text": "# Handbook\nEscalate.\n"}
+    assert all(not unit.get("sources") for unit in read["units"]), "scratch is no citation source"
+    assert [tool_refusal(each) for each in refused] == [
+        (VALIDATION, "output_exists"),
+        (VALIDATION, "extraction_refused"),
+        (VALIDATION, "extractable_document"),
+        (VALIDATION, "regular_file"),
+        (VALIDATION, "output_path"),
+        (VALIDATION, "output_path"),
+    ]
+    assert recorded_codes(record) == [VALIDATION] * 6, "the record keeps the model's code"
+    assert [each["path"] for each in listed["files"]] == ["/work/handbook.json"]
+
+
+def test_artifact_workspace_refusals_preserve_authority(
+    cards: Cards,
+    wyrd_server: WyrdTestServer,
+    receiver: Receiver,
+    other_tenant: str,
+    tmp_path: Path,
+) -> None:
+    secret = f"SECRET-{secrets.token_hex(8)}"
+    source = tree(tmp_path / "source", {"docs/guide.md": f"{secret}\n", "notes.txt": "n\n"})
+    ref = cards.upload_artifact(source, pinned_upload("guarded-docs"))
+    asked = len(receiver.to("/v1/chat/completions"))
+
+    refused = {
+        case: refusal(lambda case=case: declare(cards, f"cards/artifact_workspaces/{case}.yaml"))[0]
+        for case in (
+            "wrong-kind-check",
+            "missing-card-check",
+            "outside-inputs-check",
+            "colliding-mounts-check",
+            "unknown-field-check",
+        )
+    }
+    assert refused == {
+        "wrong-kind-check": "WYRD_LOADER_400_INVALID_ENVELOPE",
+        "missing-card-check": "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY",
+        "outside-inputs-check": "WYRD_LOADER_400_INVALID_ENVELOPE",
+        "colliding-mounts-check": "WYRD_LOADER_400_INVALID_ENVELOPE",
+        "unknown-field-check": "WYRD_LOADER_400_INVALID_ENVELOPE",
+    }
+    for case in refused:
+        assert not cards.list(kind="Verifier", name=case).refs, case
+    foreign = Cards(
+        WyrdClient(
+            credential=wyrd_server.bootstrap_service_in_tenant(
+                other_tenant, ["admin"], name="artifact-foreigner"
+            )
+        )
+    )
+    assert {
+        "declare": refusal(
+            lambda: declare(foreign, "cards/artifact_workspaces/denied-desk-check.yaml")
+        )[0],
+        "inventory": refusal(lambda: foreign.list_artifacts(ref))[0],
+    } == {
+        "declare": "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY",
+        "inventory": "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+    }
+
+    probe = Probe(cards, wyrd_server, tmp_path / "prefix", "prefix-desk")
+    code, _ = refusal(lambda: probe.play(("fs.read", {"path": "/inputs/x"})))
+    assert code == "WYRD_VERIFICATION_400_INPUT_INVALID", "a prefix stops at a / boundary"
+
+    probe = Probe(cards, wyrd_server, tmp_path / "denied", "denied-desk", {"tool": "fs.search"})
+    [read, found, ungranted], record = probe.play(
+        ("fs.read", {"path": "/inputs/guide.md"}),
+        ("fs.search", {"query": "nothing"}),
+        ("fs.extract", {"path": "/inputs/guide.md", "output_path": "/inputs/guide.md"}),
+    )
+    assert read.get("code") == DENIED, read
+    assert found == {"matches": [], "truncated": False}
+    assert ungranted.get("code") == DENIED, "a declared tool still needs its grant"
+    undeclared = probe.state.run().observe.verify(
+        probe.verifier, script=[{"tool": "fs.list", "arguments": {"path": "/inputs"}}]
+    )
+    assert "is not attached" in step(undeclared, "probe").get("reason", ""), undeclared.steps
+    assert all(
+        secret not in json.dumps(each.body) for each in receiver.to("/v1/chat/completions")[asked:]
+    ), "no refused path hands the protected line to the model"
+    assert tools_called(record)[:2] == ["fs.read", "fs.search"]

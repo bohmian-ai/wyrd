@@ -286,6 +286,33 @@ export declare class NativeCards {
    */
   declareFromPath(path: string): Promise<NativeLifecycleResult>
   /**
+   * Publishes one file or directory as an Artifact Card through the shared
+   * `Cards::upload_artifact`, resolving its exact Active reference.
+   *
+   * # Arguments
+   *
+   * * `source` - The regular file or directory to publish.
+   * * `metadata_json` - The serialized Card `Metadata`.
+   * * `spec_json` - The serialized `ArtifactSpec`.
+   * * `extract` - Prepare extraction outputs before declaring.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the reference cannot be serialized;
+   * malformed metadata or spec (`WYRD_SPEC_400_VALIDATION`), preparation,
+   * and registry failures are returned in the result.
+   */
+  uploadArtifact(source: string, metadataJson: string, specJson: string, extract: boolean): Promise<NativeLifecycleResult>
+  /**
+   * Lists the server inventory of one Card by exact reference.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the inventory cannot be serialized; an
+   * invalid reference or registry failure is returned in the result.
+   */
+  listArtifacts(cardRef: string): Promise<NativeLifecycleResult>
+  /**
    * Fetches one Card envelope by exact reference.
    *
    * # Errors

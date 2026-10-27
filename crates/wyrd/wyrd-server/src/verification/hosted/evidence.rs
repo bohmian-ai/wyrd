@@ -13,6 +13,7 @@
 //! action's [`ActionExecutor`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -20,18 +21,19 @@ use skald_spec::{MediaFormat, MediaRef, MediaSource};
 use vala_verify::blocks::{
     ActionExecutor, ActionOutput, BlockCall, BlockError, CallValue, EngineError, EvidenceReader,
 };
+use wyrd_loader::{EXTRACT_VERSION, Extraction, lines, locates, units};
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::card::verifier::{Action, InputSlot};
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::ids::SlotName;
+use wyrd_spec::ids::{CardUid, SlotName};
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::registry::StoredArtifactEntry;
 use wyrd_spec::verification::execution::{CallProvenance, Citation, InputDeclaration, Locator};
 use wyrd_storage::error::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 
-use super::HostedLimits;
-use super::extract::{EXTRACT_VERSION, Extraction, locates, units};
 use super::registry::refusal;
+use super::{HostedLimits, extract_refused};
 use crate::components::auth::Caller;
 use crate::components::cards::routes::get_card_by_ref_for;
 use crate::components::cards::service::list_card_artifacts;
@@ -45,8 +47,9 @@ pub struct TenantEvidence {
     /// The authority every Artifact read is authorized and audited under;
     /// its tenant is the evidence namespace.
     caller: Caller,
-    /// The execution's pinned input declarations, the only citable sources.
-    slots: BTreeMap<SlotName, InputDeclaration>,
+    /// The execution's pinned input declarations, the only citable sources;
+    /// [`EvidenceReader::admit`] adds the engine's fixed attachment slots.
+    slots: Mutex<BTreeMap<SlotName, InputDeclaration>>,
     /// File limits in force.
     limits: HostedLimits,
 }
@@ -64,14 +67,17 @@ impl TenantEvidence {
         Self {
             state,
             caller,
-            slots,
+            slots: Mutex::new(slots),
             limits,
         }
     }
 
     /// The located units of pinned slot `declaration`, or `None` when it
-    /// has none: inline JSON leaves, extracted file units, or for a native
-    /// image the single page a region may cite.
+    /// has none: inline JSON leaves, extracted file units, for a native
+    /// image the single page a region may cite, and for UTF-8 bytes their
+    /// actual lines, the lines `fs.read` and `fs.search` serve. Artifact
+    /// files are read raw, so a file with no supported content type is still
+    /// citable by line.
     ///
     /// # Errors
     /// Returns [`BlockError::Retryable`] when the evidence cannot be read
@@ -81,32 +87,51 @@ impl TenantEvidence {
         declaration: &InputDeclaration,
     ) -> Result<Option<Vec<(Locator, String)>>, BlockError> {
         if let InputDeclaration::Json { value } = declaration {
-            return Ok(Some(units(
+            let mut found = units(
                 &wyrd_spec::card::verifier::extract::ExtractOutput::Json {
                     value: value.clone(),
                 },
                 b"",
-            )));
+            );
+            found.extend(lines(
+                &serde_json::to_string_pretty(value).unwrap_or_default(),
+            ));
+            return Ok(Some(found));
         }
-        let (bytes, format) = match self.read(declaration).await {
+        let read = match declaration {
+            InputDeclaration::Artifact { artifact, path } => {
+                self.artifact(artifact, path.as_deref()).await
+            }
+            declaration => self
+                .read(declaration)
+                .await
+                .map(|(bytes, format)| (bytes, Some(format))),
+        };
+        let (bytes, format) = match read {
             Ok(read) => read,
             Err(BlockError::Terminal { .. }) => return Ok(None),
             Err(error) => return Err(error),
         };
-        if format.native_kind() == Some(skald_spec::MediaKind::Image) {
+        if format.and_then(MediaFormat::native_kind) == Some(skald_spec::MediaKind::Image) {
             return Ok(Some(vec![(Locator::Page(1), String::new())]));
         }
-        let limits = self.limits;
-        let extracted = tokio::task::spawn_blocking(move || {
-            Extraction::new(&limits)
-                .run(&bytes, format)
+        let limits = self.limits.extract();
+        let found = tokio::task::spawn_blocking(move || {
+            let mut found = format
+                .filter(|format| format.is_extractable())
+                .and_then(|format| Extraction::new(&limits).run(&bytes, format).ok())
                 .map(|output| units(&output, &bytes))
+                .unwrap_or_default();
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                found.extend(lines(text));
+            }
+            found
         })
         .await
         .map_err(|error| BlockError::Retryable {
             reason: format!("citation extraction stopped: {error}"),
         })?;
-        Ok(extracted.ok())
+        Ok((!found.is_empty()).then_some(found))
     }
 
     /// The verified bytes and format of file or Artifact `evidence`.
@@ -194,21 +219,7 @@ impl TenantEvidence {
         card: &CardRef,
         path: Option<&str>,
     ) -> Result<ArtifactFile, BlockError> {
-        if card.kind != CardKind::Artifact {
-            return Err(terminal("the reference does not name an Artifact Card"));
-        }
-        let resolved = get_card_by_ref_for(&self.state, &self.caller, card)
-            .await
-            .map_err(|error| refusal(&error))?;
-        let uid = resolved
-            .card
-            .metadata
-            .uid
-            .ok_or_else(|| terminal("the Artifact Card has no UID"))?;
-        let inventory = list_card_artifacts(&self.state, &self.caller, &uid)
-            .await
-            .map_err(|error| refusal(&error))?
-            .artifacts;
+        let (uid, inventory) = self.inventory(card).await?;
         let entry = match (path, inventory.as_slice()) {
             (Some(path), entries) => entries
                 .iter()
@@ -239,6 +250,36 @@ impl TenantEvidence {
                 .as_deref()
                 .and_then(|mime| mime.parse().ok()),
         })
+    }
+
+    /// The UID and server-authoritative file inventory of exact Artifact
+    /// `card`, resolved through the registry's own authorized, audited Card
+    /// read, so a mismatched UID is refused.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for a non-Artifact reference or a
+    /// refused or missing Card, and [`BlockError::Retryable`] when the
+    /// registry is unavailable.
+    async fn inventory(
+        &self,
+        card: &CardRef,
+    ) -> Result<(CardUid, Vec<StoredArtifactEntry>), BlockError> {
+        if card.kind != CardKind::Artifact {
+            return Err(terminal("the reference does not name an Artifact Card"));
+        }
+        let resolved = get_card_by_ref_for(&self.state, &self.caller, card)
+            .await
+            .map_err(|error| refusal(&error))?;
+        let uid = resolved
+            .card
+            .metadata
+            .uid
+            .ok_or_else(|| terminal("the Artifact Card has no UID"))?;
+        let inventory = list_card_artifacts(&self.state, &self.caller, &uid)
+            .await
+            .map_err(|error| refusal(&error))?
+            .artifacts;
+        Ok((uid, inventory))
     }
 
     /// The bytes of stored object `path`, which must be `size` bytes long
@@ -314,6 +355,36 @@ struct ArtifactFile {
 
 #[async_trait]
 impl EvidenceReader for TenantEvidence {
+    /// The inventory paths of exact Artifact `card` that `path` selects, in
+    /// path order, under the caller's audited `card:read`.
+    ///
+    /// # Errors
+    /// Returns [`Self::inventory`]'s errors and [`BlockError::Terminal`] for
+    /// a selection matching no file.
+    async fn select(&self, card: &CardRef, path: Option<&str>) -> Result<Vec<String>, BlockError> {
+        let (_, inventory) = self.inventory(card).await?;
+        let mut selected: Vec<String> = inventory
+            .into_iter()
+            .map(|entry| entry.relative_path.as_str().to_owned())
+            .filter(|file| {
+                path.is_none_or(|path| {
+                    let dir = path.trim_end_matches('/');
+                    file == path
+                        || file
+                            .strip_prefix(dir)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+            })
+            .collect();
+        selected.sort();
+        if selected.is_empty() {
+            return Err(terminal(
+                "the Artifact holds no file at the selected path; name one of its files or directories",
+            ));
+        }
+        Ok(selected)
+    }
+
     /// Admit the execution's original input files before any block runs.
     ///
     /// Each selected Artifact file's metadata is resolved through
@@ -325,6 +396,8 @@ impl EvidenceReader for TenantEvidence {
     /// their declared lengths must fit its combined input-file limit
     /// together. Each original input counts once, whatever later
     /// reads, workspaces, or retries do with it; no bytes are read here.
+    /// Admitted declarations the execution did not pin, the engine's fixed
+    /// attachments, become citable slots.
     ///
     /// # Errors
     /// Returns [`EngineError::InputTooLarge`] past a slot, individual, or
@@ -386,6 +459,12 @@ impl EvidenceReader for TenantEvidence {
                     ))
                 })?;
         }
+        let mut pinned = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        for (name, declaration) in evidence {
+            pinned
+                .entry(name.clone())
+                .or_insert_with(|| declaration.clone());
+        }
         Ok(())
     }
 
@@ -427,13 +506,16 @@ impl EvidenceReader for TenantEvidence {
         for citation in citations {
             let Some(declaration) = self
                 .slots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .get(&citation.slot)
                 .filter(|_| reachable.contains(&citation.slot))
+                .cloned()
             else {
                 continue;
             };
             if !located.contains_key(&citation.slot) {
-                let units = self.located(declaration).await?;
+                let units = self.located(&declaration).await?;
                 located.insert(citation.slot.clone(), units);
             }
             if let Some(Some(units)) = located.get(&citation.slot)
@@ -465,13 +547,14 @@ impl ActionExecutor for TenantEvidence {
             return Err(terminal("extract reads only media evidence"));
         };
         let (bytes, format) = self.read(declaration).await?;
-        let limits = self.limits;
+        let limits = self.limits.extract();
         let output =
             tokio::task::spawn_blocking(move || Extraction::new(&limits).run(&bytes, format))
                 .await
                 .map_err(|error| BlockError::Retryable {
                     reason: format!("extraction stopped: {error}"),
-                })??;
+                })?
+                .map_err(extract_refused)?;
         Ok(ActionOutput {
             output: serde_json::to_value(output).map_err(|error| BlockError::Terminal {
                 reason: format!("extraction output does not serialize: {error}"),
@@ -745,12 +828,20 @@ mod pg_tests {
             for (slot, bytes, format) in [
                 (
                     "deck",
-                    super::super::extract::tests::pdf(&["one", "two"]),
+                    include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../../fixtures/cards/verifier_building_blocks/samples/sample.pdf"
+                    ))
+                    .to_vec(),
                     MediaFormat::Pdf,
                 ),
                 (
                     "memo",
-                    super::super::extract::tests::docx(),
+                    include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../../fixtures/cards/verifier_building_blocks/samples/sample.docx"
+                    ))
+                    .to_vec(),
                     MediaFormat::Docx,
                 ),
                 ("notes", b"alpha\nbeta\ngamma".to_vec(), MediaFormat::Text),
@@ -773,7 +864,7 @@ mod pg_tests {
                 locator,
             };
             let valid = vec![
-                cite("deck", Locator::Page(2)),
+                cite("deck", Locator::Page(1)),
                 cite(
                     "deck",
                     Locator::Region {
@@ -790,7 +881,7 @@ mod pg_tests {
                 cite("memo", Locator::JsonPointer("/blocks/0/text".to_owned())),
             ];
             let invalid = vec![
-                cite("deck", Locator::Page(3)),
+                cite("deck", Locator::Page(2)),
                 cite("deck", Locator::Slide(1)),
                 cite("notes", Locator::Lines { start: 3, end: 4 }),
                 cite("notes", Locator::Lines { start: 0, end: 1 }),

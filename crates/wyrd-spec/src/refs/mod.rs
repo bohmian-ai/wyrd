@@ -17,6 +17,7 @@ use crate::card::service::ServiceSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::card::verifier::{
     Action, AgentCall, Check, CodeCall, CodeSource, Requirement, VerificationBinding, VerifierSpec,
+    WorkspaceSource,
 };
 use crate::envelope::Spec;
 use crate::reference::{CardRef, InlineableRef, Ref};
@@ -333,6 +334,14 @@ where
     });
     if let InlineableRef::Inline(agent) = &mut call.agent {
         visit_agent(agent, &path, f);
+    }
+    for (destination, source) in &mut call.workspace {
+        if let WorkspaceSource::Artifact { artifact } = source {
+            f(SlotEntry {
+                path: format!("{prefix}.workspace[{destination}].artifact.card"),
+                value: SlotValue::Durable(&mut artifact.card),
+            });
+        }
     }
 }
 

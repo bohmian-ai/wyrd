@@ -1,0 +1,9 @@
+# A Service whose one Verifier plays a file probe; see raw-desk-check.yaml.
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: raw-desk
+  version: 1.0.0
+spec:
+  verified_by:
+    - verifier: ./raw-desk-check.yaml

@@ -20,10 +20,12 @@ pub use pull::{
     BundleArtifactManifest, BundleCardManifest, BundleManifest, BundleMode, CardGraphPuller,
     PullSummary,
 };
-pub use wyrd_spec::envelope::CardKind;
+pub use wyrd_spec::card::artifact::ArtifactSpec;
+pub use wyrd_spec::envelope::{CardKind, Metadata};
 pub use wyrd_spec::reference::CardRef;
 pub use wyrd_spec::registry::{
-    CardSummary, DeclarationReceipt, ListCardsRequest, ListCardsResponse,
+    ArtifactInventoryResponse, CardSummary, DeclarationReceipt, ListCardsRequest,
+    ListCardsResponse, StoredArtifactEntry,
 };
 
 /// Public surface shape of the `cards` module.

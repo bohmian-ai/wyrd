@@ -1303,7 +1303,7 @@ Copy a check for your own case from [Recipes](/wyrd/build-and-verify/verify/veri
 
 Page: /wyrd/build-and-verify/verify/verifier-recipes/
 
-> Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, grouped sessions, and drift.
+> Copyable Verifiers for common checks, each with its YAML and the Python that calls it - assertions, traces, Python checks, model judges, multi-step, uploaded files, grouped sessions, and drift.
 
 Pick the check you need, bind its Verifier under `verified_by` to what it checks (a Service, one of its Agents, Models, or Data, or a standalone Agent), and call it from your code. Each recipe's Python declares `support-reply.yaml`, a Service that binds the recipe's Verifier, as in [Run your first verification](/wyrd/get-started/quickstart/).
 
@@ -1314,6 +1314,7 @@ Pick the check you need, bind its Verifier under `verified_by` to what it checks
 | Logic an operator cannot express | [Python check](#python-check) |
 | Meaning, tone, or policy | [Model judge](#model-judge) |
 | An answer against a document | [Multi-step](#multi-step) |
+| An answer against files you upload once | [Uploaded files](#uploaded-files) |
 | A whole conversation, not one reply | [Grouped session](#grouped-session) |
 | Inputs or outputs shifting over time | [Drift](#drift) |
 
@@ -1638,6 +1639,88 @@ for step in result.steps:  # each step's status, for debugging
 ```
 
 Steps can also be `agent` actions, which read files with built-in tools. [Actions](/wyrd/reference/verifier-card/#actions) lists each kind.
+
+## Uploaded files
+
+Upload a file or directory once as an Artifact Card, then mount the exact files a judge needs into its workspace.
+
+```bash
+wyrd artifact upload ./handbook --name staff-handbook --version 1.0.0 --extract
+```
+
+The command prints the exact Active reference, UID included. Each file keeps its path relative to `./handbook`, byte for byte. Nothing is parsed unless you pass `--extract`; then each supported document `P` is also published as `extracted/P.json` before the Card is declared, and `spec.metadata.extraction` records the report.
+
+The version follows the ordinary rules: uploading the same bytes to a pinned version returns the same Card, changed bytes under it are refused with `WYRD_REGISTRY_409_SPEC_DRIFT`, and `--bump patch` without `--version` publishes the next version. List what a version holds from the server:
+
+```bash
+wyrd artifact files --kind Artifact --name staff-handbook --version 1.0.0
+```
+
+The SDKs run the same upload:
+
+| Language | Upload | Inventory |
+| --- | --- | --- |
+| Python | `Cards().upload_artifact(source, {"name": ..., "version": ...}, version_bump=None, spec=None, extract=False)` | `Cards().list_artifacts(card_ref)` |
+| Rust | `Cards::upload_artifact(source, metadata, spec, extract)` | `Cards::list_artifacts(selector)` |
+| TypeScript | `cards.uploadArtifact(source, { metadata, spec, extract })` | `cards.listArtifacts(ref)` |
+
+`metadata` takes `labels` and `annotations` too, and `spec` defaults to `{artifact_kind: file}`.
+
+Mount the uploaded files by exact reference in an Agent's `workspace`, here the extraction of one handbook:
+
+**handbook-review.yaml**
+
+```yaml title="handbook-review.yaml"
+# Judges a question against the uploaded staff-handbook 1.0.0, mounted at a
+# path the judge's prompt names.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: handbook-review
+  version: 1.0.0
+spec:
+  description: The staff handbook answers the question, with a cited line.
+  inputs:
+    question: {type: json, schema: {type: string}}
+  requirements:
+    - id: handbook-answers
+      statement: The handbook answers the question
+      check:
+        kind: agent
+        agent: ./handbook-judge.yaml
+        inputs: {question: inputs.question}
+        workspace:
+          /inputs/handbook.json:
+            artifact:
+              card: {kind: Artifact, name: staff-handbook, version: 1.0.0}
+              path: extracted/handbook.md.json
+
+```
+
+**handbook-judge.yaml**
+
+```yaml title="handbook-judge.yaml"
+# Reads the mounted handbook extraction and cites the line answering the question.
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: handbook-judge
+  version: 1.0.0
+spec:
+  execution_route: {kind: wyrd_gateway, deployment: openai}
+  tool_names: [fs.read]
+  run_config: {max_iterations: 3}
+  prompt:
+    provider: openai
+    model: gpt-4o
+    messages:
+      - role: user
+        content: "HANDBOOK JUDGE: read /inputs/handbook.json with fs.read and cite the line that answers: {{question}}"
+    response_format: verdict
+
+```
+
+Without `path`, every file of the version is mounted. The judge reads with `fs.read` and cites the `attachment_<n>` slot the tool reports. Uploading a new version never changes what this Verifier mounts. [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/) lists the file tools and the grants each call needs.
 
 ## Grouped session
 
@@ -2610,7 +2693,7 @@ A step's result is `steps.<id>.output`.
 | `code` | `runtime` (`python`, default), `entrypoint`, `source`, `inputs` | The function's return value, as JSON |
 
 - `extract` reads `pdf`, `text`, `markdown`, `csv`, `json`, `html`, `docx`, `xlsx`, and `pptx`, choosing the extractor by format.
-- `agent` is a path such as `./reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference; a placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps paths under `/inputs/` to references. Tools are in [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/).
+- `agent` is a path such as `./reader.yaml` or a CardRef. `inputs` maps each Prompt placeholder to a reference; a placeholder takes text, so a `media` slot goes through `extract` first. `workspace` maps paths under `/inputs/` to a reference such as `inputs.policy`, or to `{artifact: {card: {kind: Artifact, name, version}, path}}`, which mounts one file, a directory, or (without `path`) every file of an uploaded Artifact version, unchanged and pinned with the Verifier. Tools are in [Agent tools and authorization](/wyrd/reference/agent-tools-and-authorization/).
 - `code` calls the function `entrypoint` with `inputs` as keyword arguments. `source` is `{inline: "<python>"}` or `{artifact: {card, path?}}`, where `card` names an Artifact Card.
 
 ## Requirements
@@ -2629,7 +2712,7 @@ A requirement ends `passed`, `failed`, `inconclusive`, or `not_applicable`.
 | --- | --- | --- |
 | `assert` | `path` or `each`, `operator`, `expected` | Comparing a value; `each` with `[*]` requires every item to pass |
 | `trace` | `on`, `span_selector`, `operator`, `expected` | Comparing values selected from trace spans |
-| `agent` | `agent`, `inputs` | An Agent with no workspace and no tool but `bifrost.query`, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema |
+| `agent` | `agent`, `inputs`, `workspace` | An Agent, with its declared tools and optional workspace as in a step, whose Prompt `response_format` is `verdict` or a closed [verdict](#verdicts-and-citations) schema |
 | `code` | `runtime`, `source`, `entrypoint`, `inputs`, optional `response_format` | A Python function that returns a verdict |
 | `drift` | `on`, `method`, `signal`, `condition`, `profile` | Comparing a window of samples with a baseline |
 
@@ -2704,7 +2787,7 @@ An `agent` or `code` check returns a verdict:
 | `{json_pointer: "/path"}` | JSON inputs and DOCX or XLSX extraction output |
 | `{region: {page, x, y, width, height}}` | A rectangle on a page, in page coordinates |
 
-A citation names the original slot, never an extract step. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/wyrd/reference/extraction-output/#citations).
+A citation names the original slot, or the `attachment_<n>` slot a fixed workspace file reports in `sources`, never an extract step or `/work` file. An invalid citation is dropped, and a `passed` verdict left without one is recorded as `inconclusive`. For JSON pointers into extracted files, see [Extraction output](/wyrd/reference/extraction-output/#citations).
 
 ### Custom data
 
@@ -2855,7 +2938,7 @@ A `json_pointer` locator addresses this extracted JSON for DOCX and XLSX, such a
 | --- | --- |
 | `png`, `jpeg`, `gif`, `webp` | No OCR or rendering; give the file to an Agent as `media` |
 | `doc`, `xls`, `ppt` | Convert to `docx`, `xlsx`, or `pptx` |
-| `zip`, `tar_gz` | Put them in a step Agent's `workspace` |
+| `zip`, `tar_gz` | Put them in an Agent's `workspace` |
 
 ## Failures
 
@@ -2890,8 +2973,9 @@ A Verifier's Agent calls server built-in tools, named in its `tool_names`. There
 | `bifrost.describe_table` | Reads one table's schema | `bifrost_table:read` |
 | `bifrost.query` | Runs one read-only SQL query | `bifrost_query:read` on every table it reads |
 | `fs.list` | Lists workspace files | Workspace only |
-| `fs.read` | Reads a bounded span of a workspace file, with locators | Workspace only |
-| `fs.search` | Finds matching locations in workspace files | Workspace only |
+| `fs.read` | Reads a UTF-8 workspace file's actual lines, with `lines` locators and a resumable `next` | Workspace only |
+| `fs.search` | Finds matching lines: literal and case-insensitive by default, or `regex`, `case_sensitive`, a `path` file or directory scope, and a filename `glob` | Workspace only |
+| `fs.extract` | Extracts one supported `/inputs` document to a new `/work` `output_path` as extraction JSON | Workspace only |
 | `code.run` | Runs sandboxed Python against the workspace | Workspace only |
 
 Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/wyrd/reference/verification-runtime-limits/)). Each call is recorded in the step's `tool_calls` as `tool`, `arguments`, `output_sha256` (absent when nothing was returned), `returned_bytes`, and `error` (present when the call failed).
@@ -2899,7 +2983,8 @@ Results are capped by `WYRD_VERIFICATION_TOOL_RESULT_MAX_KIB` ([limits](/wyrd/re
 ## Rules
 
 - A step Agent with `fs.*` or `code.run` needs a `workspace`, and a `workspace` needs one of them.
-- A check Agent may declare only `bifrost.query` and has no workspace.
+- Step and check Agents follow the same rules: a check Agent may declare any tool and a `workspace`, and each call still needs its grants.
+- Nothing is parsed unless the Agent calls `fs.extract`; `fs.read` and `fs.search` serve raw text and refuse or skip binary files.
 
 ## Permissions
 
@@ -2918,9 +3003,8 @@ The scope is `all` or one exact tool name, never a pattern. A call runs as the p
 | --- | --- |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | The principal lacks `tool:invoke` or the resource permission; the call returns no data |
 | `WYRD_SPEC_400_VALIDATION`, rule `agent_tools` | Unknown tool name, `fs.*` without a workspace, or a workspace without `fs.*` or `code.run` |
-| `WYRD_SPEC_400_VALIDATION`, rule `check_agent_tools` | A check Agent declares a tool other than `bifrost.query` |
-| `WYRD_SPEC_400_VALIDATION`, rule `check_agent_workspace` | A check Agent has a workspace |
-| `WYRD_SPEC_400_VALIDATION`, rule `workspace_path` | A `workspace` key is not `/inputs/<name>[/<name>...]`, or contains `.` or `..` |
+| `WYRD_SPEC_400_VALIDATION`, rule `workspace_path` | A `workspace` key is not `/inputs/<name>[/<name>...]`, contains `.` or `..`, or overlaps another mount |
+| `WYRD_SPEC_400_VALIDATION`, rule `workspace_artifact` | A workspace `artifact` selection does not reference an Artifact Card |
 
 # Runtime limits
 

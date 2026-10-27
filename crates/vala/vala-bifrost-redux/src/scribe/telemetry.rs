@@ -32,8 +32,14 @@ pub struct ScribeInspectionSnapshot {
     pub immutable_bucket_count: usize,
     /// Category totals in [`MemoryCategory`](crate::scribe::memory::MemoryCategory) order.
     pub memory_by_category: [usize; MEMORY_CATEGORY_COUNT],
-    /// Memory totals distributed across the shard owners, indexed by shard.
+    /// Memory totals distributed across the shard owners, indexed by shard:
+    /// each shard's bucket ownership plus its [`Self::transient_memory_by_shard`].
     pub memory_by_shard: Vec<usize>,
+    /// Bytes each shard holds for ingest no bucket owns yet, indexed by shard.
+    ///
+    /// A live pod can accept a write at any instant, so this is how a harness
+    /// tells in-flight ingest from bucket ownership without a quiescent pod.
+    pub transient_memory_by_shard: Vec<usize>,
     /// Exact bucket-level memory ownership.
     pub memory_by_bucket: Vec<ScribeBucketMemorySnapshot>,
     /// Sum of all governor category totals.

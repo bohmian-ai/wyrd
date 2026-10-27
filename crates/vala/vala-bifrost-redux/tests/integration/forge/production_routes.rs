@@ -27,7 +27,9 @@ use wyrd_bench::BenchmarkMetricSnapshot;
 
 use super::rewrite_support::PromotedRewriteFixture;
 use super::snapshot_expiration::object_exists;
-use super::snapshot_expiration::{ExpirableTable, expirable_table, head_watermark, maintain_once};
+use super::snapshot_expiration::{
+    ExpirableTable, expirable_table, head_watermark, maintain_once, snapshot_count,
+};
 use super::support::{
     CountingObjectStore, ForgeTelemetryCheckpoint, PromotionCatalogSeam,
     PromotionIntegrationFixture, SupervisedPromotion, manual_clock, remove_table_properties,
@@ -1946,23 +1948,6 @@ async fn dispatch_shutdown_before_episode_closes_and_reports_not_started() {
         "one NotStarted report clears the dispatch and keeps every commit"
     );
     supervisor.shutdown().await;
-}
-
-/// Counts the fixture table's Iceberg snapshots.
-///
-/// # Panics
-///
-/// Panics when the table cannot be loaded.
-async fn snapshot_count(fixture: &PromotionIntegrationFixture) -> usize {
-    fixture
-        .catalog
-        .iceberg_catalog()
-        .load_table(&fixture.binding.table_ident())
-        .await
-        .expect("fixture table")
-        .metadata()
-        .snapshots()
-        .count()
 }
 
 /// Reads the leader's view of the fixture table's compaction track.

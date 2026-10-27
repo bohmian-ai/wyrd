@@ -4,8 +4,8 @@
 //! call's explicit inputs to the Prompt placeholders, applies the per-call
 //! execution route, attaches only the declared built-in tools, and runs
 //! [`Agent::run_prompt`]. A step Agent returns data shaped by its Prompt's
-//! response schema; a check Agent has no tools or workspace and returns the
-//! closed [`Verdict`]. Nothing is cached between calls, so one executor runs
+//! response schema; a check Agent gets the same declared tools and
+//! workspace and returns the closed [`Verdict`]. Nothing is cached between calls, so one executor runs
 //! any number of distinct Agents, and no call can see another's media,
 //! tools, or workspace.
 
@@ -86,8 +86,31 @@ pub trait EvidenceReader: Send + Sync {
         citations: Vec<Citation>,
     ) -> Result<Vec<Citation>, BlockError>;
 
+    /// The inventory paths of exact Artifact `card` that `path` selects:
+    /// that file, every file beneath that directory on `/` boundaries, or
+    /// with `None` every file, in path order.
+    ///
+    /// [`VerificationEngine::run`](super::VerificationEngine::run) calls it
+    /// for each fixed workspace attachment before admission. The default
+    /// mounts no Artifact files.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for an unreadable Card or a selection
+    /// matching no file and [`BlockError::Retryable`] when the registry is
+    /// unavailable.
+    async fn select(
+        &self,
+        _card: &CardRef,
+        _path: Option<&str>,
+    ) -> Result<Vec<String>, BlockError> {
+        Err(terminal("this host mounts no Artifact files"))
+    }
+
     /// Admit an execution's whole pinned `evidence` against its declared
     /// `slots` before any block runs.
+    ///
+    /// `evidence` holds the caller's slots plus one undeclared slot per
+    /// fixed Artifact attachment file; every admitted slot is citable.
     ///
     /// [`VerificationEngine::run`](super::VerificationEngine::run) calls it
     /// once, after its own slot validation, for checks only the host can
@@ -123,7 +146,7 @@ pub struct AgentExecutor {
     evidence: Option<Arc<dyn EvidenceReader>>,
     /// Governed gateway; when set, native routes are refused.
     gateway: Option<Arc<dyn WyrdGatewayCaller>>,
-    /// Built-in tools for step Agents; `None` refuses declared tools.
+    /// Built-in tools for Agent calls; `None` refuses declared tools.
     toolset: Option<Arc<dyn AgentToolset>>,
     /// Whole-route replacements keyed by step or requirement ID.
     routes: BTreeMap<TaskId, ExecutionRoute>,
@@ -164,7 +187,7 @@ impl AgentExecutor {
         self
     }
 
-    /// Bind step Agents' declared built-ins through `toolset`.
+    /// Bind Agent calls' declared built-ins through `toolset`.
     #[must_use]
     pub fn with_toolset(mut self, toolset: Arc<dyn AgentToolset>) -> Self {
         self.toolset = Some(toolset);
@@ -287,10 +310,7 @@ impl AgentExecutor {
 
     /// Run one Agent call and return its raw run plus provenance.
     ///
-    /// A `check` call may declare only the `bifrost.query` built-in and no
-    /// workspace, so a check reads live evidence through the ordinary tool
-    /// authorization and never edits files or runs code. Calls get exactly
-    /// their declared built-ins from the toolset, which holds the
+    /// Steps and checks get exactly their declared built-ins from the toolset, which holds the
     /// invocation's workspace until the run ends. The first tool refused
     /// process capacity ends the invocation busy at once: the loop is raced
     /// against the session's refusal and dropped with any sibling tool calls
@@ -311,7 +331,6 @@ impl AgentExecutor {
         inputs: &BTreeMap<String, CallInput>,
         workspace: &BTreeMap<String, CallInput>,
         deadline: Instant,
-        check: bool,
     ) -> Result<Invoked, BlockError> {
         let resolved = self.resolve(&call.agent).await?;
         let route = self.route(id, &resolved.spec.execution_route)?;
@@ -327,16 +346,6 @@ impl AgentExecutor {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let records = Arc::new(Mutex::new(Vec::new()));
-        if check
-            && (!call.workspace.is_empty()
-                || declared
-                    .iter()
-                    .any(|tool| *tool != BuiltinTool::BifrostQuery))
-        {
-            return Err(terminal(
-                "check Agents may declare only bifrost.query and no workspace",
-            ));
-        }
         if declared.is_empty() && !call.workspace.is_empty() {
             return Err(terminal("a workspace needs a filesystem or code tool"));
         }
@@ -415,14 +424,7 @@ impl ActionExecutor for AgentExecutor {
             return Err(terminal("the Agent executor runs only Agent actions"));
         };
         let invoked = self
-            .invoke(
-                call.id,
-                agent,
-                &call.inputs,
-                &call.workspace,
-                call.deadline,
-                false,
-            )
+            .invoke(call.id, agent, &call.inputs, &call.workspace, call.deadline)
             .await?;
         let output = match (&invoked.prompt.native().response_type, invoked.structured) {
             (ResponseType::JsonSchema { schema, .. }, Some(map)) => {
@@ -443,7 +445,7 @@ impl ActionExecutor for AgentExecutor {
 
 #[async_trait]
 impl CheckExecutor for AgentExecutor {
-    /// Run a tool-less Agent check and return its Verdict.
+    /// Run an Agent check and return its Verdict.
     ///
     /// Only citations into original evidence reachable through the call's
     /// bindings survive; a pass left without one becomes inconclusive.
@@ -460,14 +462,7 @@ impl CheckExecutor for AgentExecutor {
             return Err(terminal("an Agent check cannot run in step position"));
         }
         let invoked = self
-            .invoke(
-                call.id,
-                agent,
-                &call.inputs,
-                &call.workspace,
-                call.deadline,
-                true,
-            )
+            .invoke(call.id, agent, &call.inputs, &call.workspace, call.deadline)
             .await?;
         let answer = invoked
             .structured
@@ -481,6 +476,7 @@ impl CheckExecutor for AgentExecutor {
         let reachable: BTreeSet<SlotName> = call
             .inputs
             .values()
+            .chain(call.workspace.values())
             .flat_map(|input| input.sources.iter().cloned())
             .collect();
         let citations = std::mem::take(&mut verdict.citations);

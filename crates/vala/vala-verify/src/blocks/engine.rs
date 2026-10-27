@@ -27,7 +27,8 @@ use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 
 use wyrd_spec::card::verifier::{
-    Action, Check, Decide, InputSlot, Requirement, Step, TraceCheck, VerifierSpec,
+    Action, AgentCall, ArtifactSelection, Check, Decide, InputSlot, Requirement, Step, TraceCheck,
+    VerifierSpec, WorkspaceSource,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::SlotName;
@@ -230,7 +231,15 @@ pub struct VerificationEngine {
     /// run with none, so every check naming one trace in that run judges the
     /// same read and a later run reads afresh.
     reads: TraceReads,
+    /// The current run's fixed workspace attachments; [`Self::run`] selects
+    /// them afresh each run.
+    attached: Arc<Attached>,
 }
+
+/// Each fixed Artifact selection of a run with its selected files: the path
+/// relative to the selection, the synthetic evidence slot, and its pinned
+/// declaration.
+type Attached = Vec<(ArtifactSelection, Vec<(String, SlotName, InputDeclaration)>)>;
 
 /// One run's read of each trace it names, shared by every check of that run.
 type TraceReads = Arc<
@@ -265,6 +274,7 @@ impl VerificationEngine {
             clock: BlockClock::default(),
             defer_unlanded: false,
             reads: TraceReads::default(),
+            attached: Arc::default(),
         }
     }
 
@@ -346,15 +356,18 @@ impl VerificationEngine {
         }
         conform(&spec, &evidence)?;
         let plan = spec.plan().map_err(EngineError::Plan)?;
-        let attempt = Self {
-            reads: TraceReads::default(),
-            ..self.clone()
-        };
-        let ledger = timeout_at(deadline, async {
-            if let Some(reader) = &attempt.evidence {
+        let (ledger, evidence) = timeout_at(deadline, async {
+            let (evidence, attached) = self.attach(&spec, evidence).await?;
+            if let Some(reader) = &self.evidence {
                 reader.admit(&spec.inputs, &evidence).await?;
             }
-            attempt.drive(&spec, &plan, &evidence, deadline).await
+            let attempt = Self {
+                reads: TraceReads::default(),
+                attached: Arc::new(attached),
+                ..self.clone()
+            };
+            let ledger = attempt.drive(&spec, &plan, &evidence, deadline).await?;
+            Ok::<_, EngineError>((ledger, evidence))
         })
         .await
         .map_err(|_| EngineError::DeadlineExceeded)??;
@@ -378,6 +391,96 @@ impl VerificationEngine {
             steps,
             evidence,
         })
+    }
+
+    /// Select every fixed Artifact attachment's files through the evidence
+    /// reader and pin each file as one undeclared evidence slot, so it is
+    /// admitted, counted, and citable like any original input.
+    ///
+    /// A file selected twice, by repeated or overlapping selections, keeps
+    /// one slot. Synthetic slot names never reuse a declared name.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::InputInvalid`] for an unpinned Artifact
+    /// reference, a host without an evidence reader, or a selection the host
+    /// refuses, and [`EngineError::EvidenceUnavailable`] when the host cannot
+    /// select now.
+    async fn attach(
+        &self,
+        spec: &VerifierSpec,
+        mut evidence: BTreeMap<SlotName, InputDeclaration>,
+    ) -> Result<(BTreeMap<SlotName, InputDeclaration>, Attached), EngineError> {
+        let mut attached: Attached = Vec::new();
+        let mut next = 0_usize;
+        for selection in fixed_selections(spec) {
+            if attached.iter().any(|(seen, _)| seen == selection) {
+                continue;
+            }
+            let card = selection.card.as_card_ref().ok_or_else(|| {
+                EngineError::InputInvalid(
+                    "a workspace Artifact is not pinned to an exact Card".to_owned(),
+                )
+            })?;
+            let reader = self.evidence.as_ref().ok_or_else(|| {
+                EngineError::InputInvalid("this host mounts no Artifact files".to_owned())
+            })?;
+            let files = reader
+                .select(card, selection.path.as_deref())
+                .await
+                .map_err(|error| {
+                    let reason = format!("workspace Artifact {}: {error}", card.name);
+                    match error {
+                        BlockError::Terminal { .. } => EngineError::InputInvalid(reason),
+                        _ => EngineError::EvidenceUnavailable(reason),
+                    }
+                })?;
+            let mut mounted = Vec::with_capacity(files.len());
+            for file in files {
+                let relative = match selection.path.as_deref() {
+                    None => file.clone(),
+                    Some(path) if path == file => String::new(),
+                    Some(path) => file
+                        .strip_prefix(path)
+                        .and_then(|rest| rest.strip_prefix('/'))
+                        .ok_or_else(|| {
+                            EngineError::InputInvalid(format!(
+                                "workspace Artifact {}: {file} is outside the selected {path}",
+                                card.name
+                            ))
+                        })?
+                        .to_owned(),
+                };
+                let declaration = InputDeclaration::Artifact {
+                    artifact: card.clone(),
+                    path: Some(file),
+                };
+                let existing = evidence
+                    .iter()
+                    .find(|(name, pinned)| {
+                        !spec.inputs.contains_key(*name) && **pinned == declaration
+                    })
+                    .map(|(name, _)| name.clone());
+                let slot = if let Some(slot) = existing {
+                    slot
+                } else {
+                    let slot = loop {
+                        let candidate = SlotName::new(format!("attachment_{next}"))
+                            .map_err(|error| EngineError::InputInvalid(error.to_string()))?;
+                        next += 1;
+                        if !evidence.contains_key(&candidate)
+                            && !spec.inputs.contains_key(&candidate)
+                        {
+                            break candidate;
+                        }
+                    };
+                    evidence.insert(slot.clone(), declaration.clone());
+                    slot
+                };
+                mounted.push((relative, slot, declaration));
+            }
+            attached.push((selection.clone(), mounted));
+        }
+        Ok((evidence, attached))
     }
 
     /// Walk every plan stage's steps, then that stage's step requirements,
@@ -457,7 +560,7 @@ impl VerificationEngine {
         deadline: Instant,
     ) -> Prepared<Done, EngineError> {
         let step = &spec.steps[index];
-        match prepare(scope, step) {
+        match prepare(scope, &self.attached, step) {
             Err(gap) => Prepared::Settled(skipped(step, gap)),
             Ok(bindings) => {
                 let engine = self.clone();
@@ -500,7 +603,7 @@ impl VerificationEngine {
                 Some(Settled::NoOutput { gap, .. }) => Some(gap.clone()),
                 _ => None,
             });
-        let (gap, inputs) = match check_bindings(scope, requirement) {
+        let (gap, inputs) = match check_bindings(scope, &self.attached, requirement) {
             Ok(inputs) => (owner, Some(inputs)),
             Err(gap) => (Missing::strongest(owner.into_iter().chain([gap])), None),
         };
@@ -620,10 +723,12 @@ impl VerificationEngine {
         &self,
         requirement: &Requirement,
         step: Option<&TaskId>,
-        inputs: BTreeMap<String, CallInput>,
+        bindings: Bindings,
         deadline: Instant,
     ) -> Result<Judged, EngineError> {
         let _permit = self.permits.acquire().await;
+        let sources = bindings.sources();
+        let Bindings { inputs, workspace } = bindings;
         let timer = BlockTimer::start(&self.clock, "check", check_kind(&requirement.check));
         let (judged, ok) = match &requirement.check {
             Check::Assert {
@@ -656,17 +761,13 @@ impl VerificationEngine {
                 }
             }
             Check::Agent(_) | Check::Code(_) => {
-                let sources: BTreeSet<SlotName> = inputs
-                    .values()
-                    .flat_map(|input| input.sources.iter().cloned())
-                    .collect();
                 let call = BlockCall {
                     id: &requirement.id,
                     position: step
                         .map_or(Position::VerifierCheck, |step| Position::StepCheck { step }),
                     block: &requirement.check,
                     inputs,
-                    workspace: BTreeMap::new(),
+                    workspace,
                     deadline,
                 };
                 match self.checks.execute(call).await {
@@ -781,7 +882,7 @@ impl Bindings {
 /// Returns the strongest gap among the `when` and action bindings; when every
 /// value resolves, a false `when` is an intentional skip, an unevaluable
 /// `when` or an extract source without evidence is a failure.
-fn prepare(scope: &Scope<'_>, step: &Step) -> Result<Bindings, Missing> {
+fn prepare(scope: &Scope<'_>, attached: &Attached, step: &Step) -> Result<Bindings, Missing> {
     let when = step
         .when
         .as_ref()
@@ -792,7 +893,7 @@ fn prepare(scope: &Scope<'_>, step: &Step) -> Result<Bindings, Missing> {
         Action::Extract { from } => (scope.resolve_all([("from", from)], None), empty()),
         Action::Agent(call) => (
             scope.resolve_all(&call.inputs, None),
-            scope.resolve_all(&call.workspace, None),
+            mount(scope, attached, &call.workspace, None),
         ),
         Action::Code(call) => (scope.resolve_all(&call.inputs, None), empty()),
     };
@@ -838,24 +939,114 @@ fn prepare(scope: &Scope<'_>, step: &Step) -> Result<Bindings, Missing> {
     Ok(Bindings { inputs, workspace })
 }
 
-/// Resolve the bindings a check reads; drift reads its executor's window.
+/// Resolve the bindings a check reads, with an Agent check's workspace;
+/// drift reads its executor's window.
 ///
 /// # Errors
 /// Returns the strongest gap among the bindings.
 fn check_bindings(
     scope: &Scope<'_>,
+    attached: &Attached,
     requirement: &Requirement,
-) -> Result<BTreeMap<String, CallInput>, Missing> {
+) -> Result<Bindings, Missing> {
     let current = Some(requirement);
-    match &requirement.check {
+    let inputs = match &requirement.check {
         Check::Assert { path, each, .. } => {
             scope.resolve_all(path.iter().chain(each).map(|path| ("value", path)), current)
         }
         Check::Trace(trace) => scope.resolve_all([("on", &trace.on)], current),
-        Check::Agent(call) => scope.resolve_all(&call.inputs, current),
+        Check::Agent(call) => {
+            let (inputs, workspace) = (
+                scope.resolve_all(&call.inputs, current),
+                mount(scope, attached, &call.workspace, current),
+            );
+            return match (inputs, workspace) {
+                (Ok(inputs), Ok(workspace)) => Ok(Bindings { inputs, workspace }),
+                (inputs, workspace) => Err(Missing::strongest(
+                    [inputs.err(), workspace.err()].into_iter().flatten(),
+                )
+                .unwrap_or_else(|| Missing::failed("a binding did not resolve"))),
+            };
+        }
         Check::Code(check) => scope.resolve_all(&check.call.inputs, current),
         Check::Drift(_) => Ok(BTreeMap::new()),
+    }?;
+    Ok(Bindings {
+        inputs,
+        workspace: BTreeMap::new(),
+    })
+}
+
+/// Resolve an Agent workspace: scope references per call, and each fixed
+/// Artifact selection's files at their selected-relative paths beneath the
+/// destination, each sourced from its attachment slot.
+///
+/// # Errors
+/// Returns the strongest gap among the scope references, or a failure for
+/// a selection the run did not attach.
+fn mount(
+    scope: &Scope<'_>,
+    attached: &Attached,
+    workspace: &BTreeMap<String, WorkspaceSource>,
+    requirement: Option<&Requirement>,
+) -> Result<BTreeMap<String, CallInput>, Missing> {
+    let mut files = scope.resolve_all(
+        workspace
+            .iter()
+            .filter_map(|(destination, source)| Some((destination, source.reference()?))),
+        requirement,
+    )?;
+    for (destination, source) in workspace {
+        let WorkspaceSource::Artifact { artifact } = source else {
+            continue;
+        };
+        let (_, mounted) = attached
+            .iter()
+            .find(|(selection, _)| selection == artifact)
+            .ok_or_else(|| Missing::failed(format!("{destination} was not attached")))?;
+        for (relative, slot, declaration) in mounted {
+            let path = if relative.is_empty() {
+                destination.clone()
+            } else {
+                format!("{destination}/{relative}")
+            };
+            files.insert(
+                path,
+                CallInput {
+                    value: CallValue::Evidence(declaration.clone()),
+                    sources: BTreeSet::from([slot.clone()]),
+                },
+            );
+        }
     }
+    Ok(files)
+}
+
+/// Every fixed Artifact selection of `spec`'s Agent steps and checks, in
+/// declaration order.
+fn fixed_selections(spec: &VerifierSpec) -> impl Iterator<Item = &ArtifactSelection> {
+    let mut calls: Vec<&AgentCall> = Vec::new();
+    let requirements = spec
+        .steps
+        .iter()
+        .flat_map(|step| &step.requirements)
+        .chain(&spec.requirements);
+    for step in &spec.steps {
+        if let Action::Agent(call) = &step.action {
+            calls.push(call);
+        }
+    }
+    for requirement in requirements {
+        if let Check::Agent(call) = &requirement.check {
+            calls.push(call);
+        }
+    }
+    calls.into_iter().flat_map(|call| {
+        call.workspace.values().filter_map(|source| match source {
+            WorkspaceSource::Artifact { artifact } => Some(artifact),
+            WorkspaceSource::Scope(_) => None,
+        })
+    })
 }
 
 /// Where a Verifier block is declared.

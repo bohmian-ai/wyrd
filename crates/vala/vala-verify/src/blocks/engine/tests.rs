@@ -103,6 +103,8 @@ struct Script {
     log: Mutex<Vec<String>>,
     /// Attempts made per step.
     attempts: Mutex<HashMap<String, usize>>,
+    /// Each call's workspace paths and their sources, by block ID.
+    mounts: Mutex<HashMap<String, BTreeMap<String, BTreeSet<SlotName>>>>,
 }
 
 impl Script {
@@ -121,6 +123,21 @@ impl Script {
     /// lock.
     fn record(&self, entry: String) {
         self.log.lock().expect("log").push(entry);
+    }
+
+    /// Record one call's workspace.
+    ///
+    /// # Panics
+    /// Panics when another recording call panicked while holding the
+    /// mounts lock.
+    fn mount(&self, id: &TaskId, workspace: &BTreeMap<String, CallInput>) {
+        self.mounts.lock().expect("mounts").insert(
+            id.as_str().to_owned(),
+            workspace
+                .iter()
+                .map(|(path, input)| (path.clone(), input.sources.clone()))
+                .collect(),
+        );
     }
 }
 
@@ -142,6 +159,7 @@ impl ActionExecutor for Script {
     async fn execute(&self, call: BlockCall<'_, Action>) -> Result<ActionOutput, BlockError> {
         let id = call.id.as_str().to_owned();
         self.record(format!("action:{id}"));
+        self.mount(call.id, &call.workspace);
         let attempt = {
             let mut attempts = self.attempts.lock().expect("attempts");
             let count = attempts.entry(id.clone()).or_default();
@@ -182,6 +200,7 @@ impl CheckExecutor for Script {
     /// Panics when another call panicked while holding the log lock.
     async fn execute(&self, call: BlockCall<'_, Check>) -> Result<CheckOutput, BlockError> {
         self.record(format!("check:{}", call.id.as_str()));
+        self.mount(call.id, &call.workspace);
         self.checks
             .get(call.id.as_str())
             .cloned()
@@ -1913,4 +1932,164 @@ async fn unlanded_traces_defer_only_a_deferring_engine() {
         .await
         .expect("another read failure is judged, never deferred");
     assert_eq!(failed.verdict, VerificationVerdict::Inconclusive);
+}
+
+/// One Artifact holding `docs/a.txt`, `docs/b.txt`, and `docsx/c.txt`,
+/// selected by exact file, `/`-bounded directory, or whole collection.
+struct Kit;
+
+#[async_trait]
+impl EvidenceReader for Kit {
+    /// No native media.
+    ///
+    /// # Errors
+    /// Always [`BlockError::Terminal`].
+    async fn media(
+        &self,
+        _evidence: &InputDeclaration,
+    ) -> Result<skald_spec::MediaRef, BlockError> {
+        Err(BlockError::Terminal {
+            reason: "no media".to_owned(),
+        })
+    }
+
+    /// Keep every reachable citation.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn cited(
+        &self,
+        reachable: &BTreeSet<SlotName>,
+        citations: Vec<Citation>,
+    ) -> Result<Vec<Citation>, BlockError> {
+        Ok(citations
+            .into_iter()
+            .filter(|citation| reachable.contains(&citation.slot))
+            .collect())
+    }
+
+    /// Select the kit's files.
+    ///
+    /// # Errors
+    /// Returns [`BlockError::Terminal`] for a selection matching nothing.
+    async fn select(
+        &self,
+        _card: &wyrd_spec::reference::CardRef,
+        path: Option<&str>,
+    ) -> Result<Vec<String>, BlockError> {
+        let files = ["docs/a.txt", "docs/b.txt", "docsx/c.txt"];
+        let selected: Vec<String> = files
+            .iter()
+            .filter(|file| {
+                path.is_none_or(|path| {
+                    **file == path
+                        || file
+                            .strip_prefix(path)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+            })
+            .map(|file| (*file).to_owned())
+            .collect();
+        if selected.is_empty() {
+            return Err(BlockError::Terminal {
+                reason: "no such file".to_owned(),
+            });
+        }
+        Ok(selected)
+    }
+}
+
+/// An inline Agent declaring `fs.read` over `workspace`.
+fn reader_agent(workspace: Value) -> Value {
+    json!({
+        "kind": "agent",
+        "agent": {
+            "prompt": {"provider": "openai", "model": "gpt-4o", "messages": [{"role": "user", "content": "Judge"}], "response_format": "verdict"},
+            "execution_route": {"kind": "wyrd_gateway", "deployment": "openai-primary"},
+            "tool_names": ["fs.read"],
+        },
+        "workspace": workspace,
+    })
+}
+
+/// Fixed Artifact selections mount exactly their files at selected-relative
+/// paths for steps and checks alike; each file is one pinned evidence slot
+/// shared by every selection reaching it, and a citation into it survives.
+/// Without a reader, or for a selection matching nothing, the run is refused.
+///
+/// # Panics
+/// Panics when a mount, slot, or refusal differs.
+#[tokio::test(start_paused = true)]
+async fn fixed_attachments_mount_selected_files_as_pinned_slots() {
+    let kit = |path: Option<&str>| {
+        let mut artifact = json!({"card": {"kind": "Artifact", "name": "kit", "version": "1.0.0"}});
+        if let Some(path) = path {
+            artifact["path"] = json!(path);
+        }
+        json!({"artifact": artifact})
+    };
+    let spec = verifier(json!({
+        "inputs": {"answer": {"type": "json"}},
+        "steps": [{"id": "read", "action": reader_agent(json!({
+            "/inputs/kit": kit(Some("docs")),
+            "/inputs/one.txt": kit(Some("docs/a.txt")),
+            "/inputs/answer.json": "inputs.answer",
+        }))}],
+        "requirements": [{"id": "judged", "statement": "s", "check": reader_agent(json!({"/inputs/all": kit(None)}))}],
+    }));
+    let cited = json!([{"slot": "attachment_2", "locator": {"lines": {"start": 1, "end": 1}}}]);
+    let script = Arc::new(Script {
+        checks: HashMap::from([("judged", Ok(verdict(VerificationVerdict::Passed, cited)))]),
+        ..Script::default()
+    });
+    let hosted = engine(&script, InMemoryTraceSource::new(), 2).with_evidence(Arc::new(Kit));
+    let outcome = run(&hosted, &spec, json!({"answer": {}}))
+        .await
+        .expect("outcome");
+    let slot = |name: &str| BTreeSet::from([SlotName::new(name).expect("slot")]);
+    let mounts = script.mounts.lock().expect("mounts").clone();
+    assert_eq!(
+        mounts["read"],
+        BTreeMap::from([
+            ("/inputs/answer.json".to_owned(), slot("answer")),
+            ("/inputs/kit/a.txt".to_owned(), slot("attachment_0")),
+            ("/inputs/kit/b.txt".to_owned(), slot("attachment_1")),
+            ("/inputs/one.txt".to_owned(), slot("attachment_0")),
+        ])
+    );
+    assert_eq!(
+        mounts["judged"],
+        BTreeMap::from([
+            ("/inputs/all/docs/a.txt".to_owned(), slot("attachment_0")),
+            ("/inputs/all/docs/b.txt".to_owned(), slot("attachment_1")),
+            ("/inputs/all/docsx/c.txt".to_owned(), slot("attachment_2")),
+        ])
+    );
+    assert_eq!(
+        outcome.evidence[&SlotName::new("attachment_2").expect("slot")],
+        InputDeclaration::Artifact {
+            artifact: serde_json::from_value(
+                json!({"kind": "Artifact", "name": "kit", "version": "1.0.0"})
+            )
+            .expect("card"),
+            path: Some("docsx/c.txt".to_owned()),
+        }
+    );
+    assert_eq!(
+        requirement(&outcome, "judged").outcome,
+        RequirementOutcome::Passed
+    );
+
+    let readerless = engine(&script, InMemoryTraceSource::new(), 2);
+    assert!(matches!(
+        run(&readerless, &spec, json!({"answer": {}})).await,
+        Err(EngineError::InputInvalid(_))
+    ));
+    let missing = verifier(json!({
+        "requirements": [{"id": "judged", "statement": "s", "check": reader_agent(json!({"/inputs/x": kit(Some("doc"))}))}],
+    }));
+    assert!(matches!(
+        run(&hosted, &missing, json!({})).await,
+        Err(EngineError::InputInvalid(_))
+    ));
 }

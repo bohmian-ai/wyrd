@@ -105,7 +105,7 @@ A `json_pointer` locator addresses this extracted JSON for DOCX and XLSX, such a
 | --- | --- |
 | `png`, `jpeg`, `gif`, `webp` | No OCR or rendering; give the file to an Agent as `media` |
 | `doc`, `xls`, `ppt` | Convert to `docx`, `xlsx`, or `pptx` |
-| `zip`, `tar_gz` | Put them in a step Agent's `workspace` |
+| `zip`, `tar_gz` | Put them in an Agent's `workspace` |
 
 ## Failures
 

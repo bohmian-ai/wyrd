@@ -194,9 +194,9 @@ pub(crate) fn xlsx() -> Vec<u8> {
 /// Extract under default limits.
 ///
 /// # Errors
-/// Returns the extractor's [`BlockError`] for refused or malformed input.
-fn extract(bytes: &[u8], format: MediaFormat) -> Result<ExtractOutput, BlockError> {
-    Extraction::new(&HostedLimits::default()).run(bytes, format)
+/// Returns the extractor's [`ExtractError`] for refused or malformed input.
+fn extract(bytes: &[u8], format: MediaFormat) -> Result<ExtractOutput, ExtractError> {
+    Extraction::new(&ExtractLimits::default()).run(bytes, format)
 }
 
 /// The JSON of a successful extraction.
@@ -396,11 +396,7 @@ fn docx_refuses_impossible_spans() {
                 r#"<w:document xmlns:w="w"><w:body><w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val="{span}"/></w:tcPr><w:p/></w:tc></w:tr></w:tbl></w:body></w:document>"#
             ),
         )]);
-        let error = extract(&bytes, MediaFormat::Docx).expect_err("refused");
-        assert!(
-            matches!(error, BlockError::Terminal { .. }),
-            "{span}: {error}"
-        );
+        assert!(extract(&bytes, MediaFormat::Docx).is_err(), "{span}");
     }
     let row: String = (0..2)
         .map(|_| r#"<w:tc><w:tcPr><w:gridSpan w:val="32"/></w:tcPr><w:p/></w:tc>"#)
@@ -430,11 +426,7 @@ fn unsupported_and_wrong_formats_are_refused() {
         (b"{", MediaFormat::Json),
         (b"\xff", MediaFormat::Text),
     ] {
-        let error = extract(bytes, format).expect_err("refused");
-        assert!(
-            matches!(error, BlockError::Terminal { .. }),
-            "{format}: {error}"
-        );
+        assert!(extract(bytes, format).is_err(), "{format}");
     }
 }
 
@@ -444,9 +436,9 @@ fn unsupported_and_wrong_formats_are_refused() {
 /// Panics when a document over a limit is extracted.
 #[test]
 fn limits_refuse_extraction() {
-    let pages = HostedLimits {
+    let pages = ExtractLimits {
         extract_max_pages: 1,
-        ..HostedLimits::default()
+        ..ExtractLimits::default()
     };
     assert!(
         Extraction::new(&pages)
@@ -458,18 +450,18 @@ fn limits_refuse_extraction() {
             .run(&pptx(), MediaFormat::Pptx)
             .is_err()
     );
-    let text = HostedLimits {
+    let text = ExtractLimits {
         extract_text_max_bytes: 3,
-        ..HostedLimits::default()
+        ..ExtractLimits::default()
     };
     assert!(
         Extraction::new(&text)
             .run(b"four", MediaFormat::Text)
             .is_err()
     );
-    let entries = HostedLimits {
+    let entries = ExtractLimits {
         archive_max_entries: 2,
-        ..HostedLimits::default()
+        ..ExtractLimits::default()
     };
     assert!(
         Extraction::new(&entries)

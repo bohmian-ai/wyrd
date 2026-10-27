@@ -2385,8 +2385,8 @@ impl ScribeImpl {
                 });
             }
         }
-        for (shard, bytes) in transient_by_shard.into_iter().enumerate() {
-            memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
+        for (shard, bytes) in transient_by_shard.iter().enumerate() {
+            memory_by_shard[shard] = memory_by_shard[shard].saturating_add(*bytes);
         }
         Ok(ScribeInspectionSnapshot {
             shard_task_count: self.shards.shard_count(),
@@ -2397,6 +2397,7 @@ impl ScribeImpl {
             immutable_bucket_count: stats.immutable_buckets,
             memory_by_category: memory.categories,
             memory_by_shard,
+            transient_memory_by_shard: transient_by_shard,
             memory_by_bucket,
             total_accounted_memory: memory.total_bytes(),
             parent_used_memory: memory.bifrost_total_bytes,

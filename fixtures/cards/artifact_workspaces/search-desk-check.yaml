@@ -1,0 +1,36 @@
+# Mounts code-tree 1.0.0's sources, a hidden directory, opaque bytes, and a many-line file.
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: search-desk-check
+  version: 1.0.0
+spec:
+  inputs:
+    script: {type: json, schema: {type: array}}
+  steps:
+    - id: probe
+      action:
+        kind: agent
+        agent: ./file-probe.yaml
+        inputs: {script: inputs.script}
+        workspace:
+          /inputs/src:
+            artifact:
+              card: {kind: Artifact, name: code-tree, version: 1.0.0}
+              path: src
+          /inputs/.hidden:
+            artifact:
+              card: {kind: Artifact, name: code-tree, version: 1.0.0}
+              path: .hidden
+          /inputs/blob.bin:
+            artifact:
+              card: {kind: Artifact, name: code-tree, version: 1.0.0}
+              path: blob.bin
+          /inputs/many.txt:
+            artifact:
+              card: {kind: Artifact, name: code-tree, version: 1.0.0}
+              path: many.txt
+  requirements:
+    - id: probed
+      statement: The probe played its script
+      check: {kind: assert, path: steps.probe.output.done, operator: equals, expected: true}

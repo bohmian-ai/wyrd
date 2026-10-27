@@ -7,13 +7,14 @@
 //! `verify_in_real_time`.
 //!
 //! The local upstream stands in for the model provider: the refund reader
-//! first calls `fs.read` on its workspace copy of the policy and then answers
+//! first calls `fs.extract` on its workspace copy of the policy and then answers
 //! a 100-dollar limit, the judge passes every answer with a citation unless
 //! the answer names a scripted case, and the `tool-review` investigator
 //! calls the Card, Bifrost, and code tools at once and then finishes. Scripted
 //! answer texts also fail the reader's provider, schema, and deadline and the
 //! code step and check; scoped and delegated principals exercise every tool
-//! grant.
+//! grant. `handbook-desk`'s judges mount an uploaded, extracted Artifact
+//! and cite the line `fs.read` returned.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -307,8 +308,8 @@ impl PolicyDesk {
                     "id": "call-read-policy",
                     "type": "function",
                     "function": {
-                        "name": "fs_read",
-                        "arguments": "{\"path\":\"/inputs/policy.pdf\"}",
+                        "name": "fs_extract",
+                        "arguments": "{\"path\":\"/inputs/policy.pdf\",\"output_path\":\"/work/policy.json\"}",
                     },
                 }],
             })))
@@ -555,7 +556,7 @@ async fn policy_review_runs_every_action_and_check_kind() {
         .iter()
         .map(|call| serde_json::to_value(call.tool).expect("the tool serializes"))
         .collect();
-    assert_eq!(tools, [json!("fs.read")]);
+    assert_eq!(tools, [json!("fs.extract")]);
     let facts = step(&result, "answer-facts");
     assert_eq!(
         (facts.status, facts.output.as_ref()),
@@ -1739,4 +1740,177 @@ fn grants(tool_scope: Value) -> [Value; 5] {
         json!({ "resource": "cards", "action": "read", "scope": "all" }),
         json!({ "resource": "bifrost_query", "action": "read", "scope": "all" }),
     ]
+}
+
+/// The handbook judge's reply to `request`: first a `fs.read` of its mount,
+/// then, once that read is back, a pass citing the one read line that holds
+/// a `MARKER-` on the slot the read named. A missing or failed read, a wrong
+/// call ID or path, or no single marked line answers no Verdict.
+fn judge_handbook(request: &wiremock::Request) -> ResponseTemplate {
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or_default();
+    let messages = body["messages"].as_array().cloned().unwrap_or_default();
+    let Some(read) = messages.iter().find(|message| message["role"] == "tool") else {
+        let call = tool_call(
+            "call-handbook",
+            "fs.read",
+            &json!({ "path": "/inputs/handbook.json" }),
+        );
+        return completion(json!({ "role": "assistant", "content": null, "tool_calls": [call] }));
+    };
+    let output: Value = read["content"]
+        .as_str()
+        .and_then(|content| serde_json::from_str(content).ok())
+        .unwrap_or_default();
+    let units = output["units"].as_array().cloned().unwrap_or_default();
+    let marked: Vec<&Value> = units
+        .iter()
+        .filter(|unit| {
+            unit["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("MARKER-"))
+        })
+        .collect();
+    let content = match (
+        read["tool_call_id"].as_str(),
+        output["path"].as_str(),
+        &marked[..],
+    ) {
+        (Some("call-handbook"), Some("/inputs/handbook.json"), [unit]) => {
+            let text = unit["text"].as_str().unwrap_or_default();
+            let marker = text[text.find("MARKER-").unwrap_or_default()..]
+                .trim_end_matches('.')
+                .to_owned();
+            json!({
+                "outcome": "passed",
+                "reason": format!("the handbook names {marker}"),
+                "citations": [{ "slot": output["sources"][0], "locator": unit["locator"] }],
+            })
+            .to_string()
+        }
+        _ => "not a verdict".to_owned(),
+    };
+    completion(json!({ "role": "assistant", "content": content }))
+}
+
+/// Python's uploaded-Artifact Service journey, from Rust: an extracted
+/// `staff-handbook` upload holds a fresh marker only in its file; both
+/// `handbook-desk` judges mount the prepared extraction, read it with
+/// `fs.read`, and pass citing the marked line on its attachment slot, with no
+/// other tool offered and the unselected file never reaching the model.
+///
+/// # Panics
+/// Panics when the upload, registration, or a verification fails, or a judge
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn uploaded_artifacts_are_reused_by_service_judges() {
+    use std::hash::{BuildHasher as _, RandomState};
+    use wyrd_ai::cards::{ArtifactSpec, Metadata};
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("HANDBOOK JUDGE"))
+        .respond_with(judge_handbook)
+        .mount(&upstream)
+        .await;
+    let deployment = Deployment::start_with(
+        WyrdTestServer::builder()
+            .with_verification_runtime_for_test()
+            .with_gateway_provider_root_for_test(
+                upstream.uri().parse().expect("upstream URL parses"),
+            ),
+    )
+    .await;
+    configure_gateway(&deployment.admin()).await;
+    let cards = deployment.cards().await;
+    let marker = format!("MARKER-{:016x}", RandomState::new().hash_one(0_u8));
+    let source = TempDir::new().expect("source directory creates");
+    std::fs::write(
+        source.path().join("handbook.md"),
+        format!("# Staff handbook\nOutages escalate with code {marker}.\n"),
+    )
+    .expect("handbook writes");
+    std::fs::write(source.path().join("rota.txt"), "never mounted\n").expect("rota writes");
+    let metadata: Metadata =
+        serde_json::from_value(json!({ "name": "staff-handbook", "version": "1.0.0" }))
+            .expect("metadata parses");
+    let spec = ArtifactSpec {
+        artifact_kind: "file".to_owned(),
+        ..ArtifactSpec::default()
+    };
+    let handbook = cards
+        .upload_artifact(source.path(), metadata, spec, true)
+        .await
+        .expect("the handbook uploads");
+    let files = cards
+        .list_artifacts(wyrd_ai::cards::CardSelector::exact(handbook))
+        .await
+        .expect("the inventory reads");
+    assert!(
+        files
+            .artifacts
+            .iter()
+            .any(|file| file.relative_path.as_str() == "extracted/handbook.md.json"),
+        "{files:?}"
+    );
+    let desk = declare(&cards, "cards/uploaded_artifacts/handbook-desk.yaml").await;
+    let bundle = pull(&cards, &desk.root).await;
+    let key = deployment
+        .granted_key("handbook_judge", &grants(json!({ "tool": "fs.read" })))
+        .await;
+    let state = WyrdState::from_path_with(bundle.path().join("bundle"), deployment.client(&key))
+        .expect("bundle loads offline");
+
+    for verifier in ["handbook-review", "handbook-audit"] {
+        let result = state
+            .run()
+            .observe()
+            .verify(verifier, json!("How do outages escalate?"))
+            .await
+            .expect("the judge runs");
+        assert_eq!(
+            result.outcome.verdict,
+            VerificationVerdict::Passed,
+            "{result:?}"
+        );
+        let [judged] = &result.outcome.requirements[..] else {
+            panic!("one requirement: {result:?}");
+        };
+        assert!(judged.reason.contains(&marker), "{judged:?}");
+        let [citation] = &judged.citations[..] else {
+            panic!("one citation: {judged:?}");
+        };
+        assert!(
+            citation.slot.as_str().starts_with("attachment_"),
+            "{citation:?}"
+        );
+        assert!(
+            matches!(citation.locator, Locator::Lines { .. }),
+            "{citation:?}"
+        );
+    }
+    let judges: Vec<Value> = upstream
+        .received_requests()
+        .await
+        .expect("the upstream records requests")
+        .iter()
+        .filter_map(|request| serde_json::from_slice(&request.body).ok())
+        .collect();
+    assert_eq!(judges.len(), 4, "each judge reads once and then answers");
+    for body in &judges {
+        let tools: Vec<&str> = body["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert_eq!(tools, ["fs_read"]);
+        assert!(!body["messages"][0].to_string().contains(&marker));
+        assert!(
+            !body.to_string().contains("rota"),
+            "unselected files stay out"
+        );
+    }
+    deployment.shutdown().await;
 }

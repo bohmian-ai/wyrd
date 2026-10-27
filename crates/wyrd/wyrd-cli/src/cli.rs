@@ -3,7 +3,9 @@
 use clap::{Parser, Subcommand};
 
 use crate::auth::AuthCommand;
-use crate::card::{DeclareArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, PullArgs};
+use crate::card::{
+    ArtifactCommand, DeclareArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, PullArgs,
+};
 use crate::gateway::GatewayCommand;
 use crate::init::InitArgs;
 use crate::mcp::McpCommand;
@@ -46,6 +48,9 @@ impl Cli {
             Command::Latest(args) => crate::card::dispatch_latest(args).await.map_err(Into::into),
             Command::List(args) => crate::card::dispatch_list(args).await.map_err(Into::into),
             Command::Delete(args) => crate::card::dispatch_delete(args).await.map_err(Into::into),
+            Command::Artifact(command) => crate::card::dispatch_artifact(command)
+                .await
+                .map_err(Into::into),
             Command::Auth(command) => crate::auth::dispatch(command).await.map_err(Into::into),
             Command::Platform(command) => {
                 crate::platform::dispatch(command).await.map_err(Into::into)
@@ -83,6 +88,9 @@ pub enum Command {
     List(ListArgs),
     /// Soft-delete one exact card.
     Delete(DeleteArgs),
+    /// Publish files as an Artifact Card and list a Card's files.
+    #[command(subcommand)]
+    Artifact(ArtifactCommand),
     /// Authenticate with a Wyrd server (login, refresh, trusted issuers, workload bindings).
     #[command(subcommand)]
     Auth(AuthCommand),

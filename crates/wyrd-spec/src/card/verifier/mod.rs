@@ -437,9 +437,81 @@ pub struct AgentCall {
     /// Injected values keyed by the Prompt's text and media placeholders.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<ParameterName, Reference>,
-    /// Files under `/inputs/...` for the Agent's tools; step position only.
+    /// Files under `/inputs/...` for the Agent's tools, keyed by mount
+    /// destination, in step and check position alike.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub workspace: BTreeMap<String, Reference>,
+    pub workspace: BTreeMap<String, WorkspaceSource>,
+}
+
+/// What one Agent workspace destination mounts.
+///
+/// A string is an execution-scope [`Reference`], resolved per call like any
+/// other binding. An `artifact` object mounts fixed files of an exact
+/// Artifact Card version, pinned by the Verifier version itself: callers
+/// cannot replace them through execution input.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(untagged, deny_unknown_fields)]
+pub enum WorkspaceSource {
+    /// An execution-scope value, such as `inputs.policy`.
+    Scope(Reference),
+    /// Fixed files of an Artifact Card version.
+    Artifact {
+        /// The selected files.
+        artifact: ArtifactSelection,
+    },
+}
+
+impl WorkspaceSource {
+    /// The execution-scope reference, when this source is one.
+    #[must_use]
+    pub const fn reference(&self) -> Option<&Reference> {
+        match self {
+            Self::Scope(reference) => Some(reference),
+            Self::Artifact { .. } => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceSource {
+    /// Reads a reference string or an `{artifact: ...}` object, keeping each
+    /// form's own diagnostic.
+    ///
+    /// # Errors
+    /// Returns a custom error for an invalid reference or a malformed or
+    /// unknown-field `artifact` object.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// The object form, refusing unknown fields.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fixed {
+            /// The selected files.
+            artifact: ArtifactSelection,
+        }
+        match Value::deserialize(deserializer)? {
+            Value::String(text) => Reference::parse(&text)
+                .map(Self::Scope)
+                .map_err(D::Error::custom),
+            value => serde_json::from_value::<Fixed>(value)
+                .map(|fixed| Self::Artifact {
+                    artifact: fixed.artifact,
+                })
+                .map_err(D::Error::custom),
+        }
+    }
+}
+
+/// Files of one Artifact Card version mounted into a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactSelection {
+    /// The Artifact Card; registration pins it to an exact version and UID.
+    pub card: Ref,
+    /// An inventory file, or a directory prefix matched on `/` boundaries;
+    /// omitted, the whole collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// One sandboxed code invocation in a step or check position.

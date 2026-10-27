@@ -1,4 +1,4 @@
-# Reads the refund policy from its workspace and lists each rule with the
+# Extracts and reads the refund policy in its workspace and lists each rule with the
 # page it is on, so later checks can cite the original policy.
 apiVersion: wyrd/v1
 kind: Agent
@@ -7,14 +7,14 @@ metadata:
   version: 1.0.0
 spec:
   execution_route: {kind: wyrd_gateway, deployment: openai}
-  tool_names: [fs.read]
+  tool_names: [fs.extract, fs.read]
   run_config: {max_iterations: 4}
   prompt:
     provider: openai
     model: gpt-4o
     messages:
       - role: user
-        content: Read /inputs/policy.pdf with fs.read and list its refund rules, each with the page it is on.
+        content: Extract /inputs/policy.pdf to /work/policy.json with fs.extract, read /work/policy.json with fs.read, and list its refund rules, each with the page it is on.
     response_format:
       type: object
       properties:

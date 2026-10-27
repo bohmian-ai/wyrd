@@ -294,6 +294,31 @@ impl EncodedVariant {
         })
     }
 
+    /// Finish a Variant this process built and check it under the Bifrost
+    /// limits.
+    ///
+    /// A [`VariantBuilder`] writes canonical encoding, so its bytes skip the
+    /// upstream re-validation and the copies of [`Self::from_bytes`]. They
+    /// still pass the size check and the same bounded [`scan_encoded`] walk,
+    /// so size, numeric-domain, and depth refusals, their paths, and their
+    /// order are exactly those of [`Self::from_bytes`]. Taking the builder,
+    /// not bytes, keeps external input on [`Self::from_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VariantViolation::TooLarge`] past the size limit, then
+    /// [`VariantViolation::NumericOutOfRange`] for a number outside the exact
+    /// domain, and [`VariantViolation::TooDeep`] for a container past the
+    /// depth limit.
+    pub fn from_builder(builder: VariantBuilder) -> Result<Self, VariantViolation> {
+        let (metadata, value) = builder.finish();
+        Self::within_size_limit(metadata.len() + value.len())?;
+        let parsed =
+            VariantMetadata::try_new(&metadata).map_err(|_| invalid(&JsonPointer::default()))?;
+        scan_encoded(parsed, &value).finish()?;
+        Ok(Self { metadata, value })
+    }
+
     /// Check already-encoded Variant bytes after full validation, keeping no
     /// copy of them.
     ///
@@ -1345,6 +1370,72 @@ mod tests {
     use arrow_schema::{Field, Fields, Schema};
     use serde_json::json;
     use wyrd_types::variant::{variant_field, variant_storage_type};
+
+    /// A built Variant is accepted or refused exactly as its finished bytes
+    /// are by [`EncodedVariant::from_bytes`]: the same value, or the same
+    /// numeric (NaN in a list, a root infinity), size, or depth violation and
+    /// path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the two constructors disagree on any case.
+    #[test]
+    fn built_variants_match_full_byte_validation() {
+        let cases: [fn(&mut VariantBuilder); 5] = [
+            |builder| {
+                let mut object = builder.new_object();
+                object.insert("text", "v");
+                object.insert("count", 7_i64);
+                object.insert("ratio", 0.5_f64);
+                object.finish();
+            },
+            |builder| {
+                let mut object = builder.new_object();
+                let mut list = object.new_list("values");
+                list.append_value(1_i64);
+                list.append_value(f64::NAN);
+                list.finish();
+                object.finish();
+            },
+            |builder| builder.append_value(f64::INFINITY),
+            |builder| {
+                let size = usize::try_from(VARIANT_MAX_ENCODED_BYTES).expect("fits");
+                builder.append_value("x".repeat(size).as_str());
+            },
+            |builder| {
+                fn nest(
+                    list: &mut parquet_variant::ListBuilder<
+                        '_,
+                        impl parquet_variant::BuilderSpecificState,
+                    >,
+                    depth: u32,
+                ) {
+                    let mut inner = list.new_list();
+                    if depth > 0 {
+                        nest(&mut inner, depth - 1);
+                    }
+                    inner.finish();
+                }
+                let mut list = builder.new_list();
+                nest(&mut list, VARIANT_MAX_DEPTH + 1);
+                list.finish();
+            },
+        ];
+        for (index, build) in cases.iter().enumerate() {
+            let mut built = VariantBuilder::new();
+            build(&mut built);
+            let mut finished = VariantBuilder::new();
+            build(&mut finished);
+            let (metadata, value) = finished.finish();
+            let accepted = EncodedVariant::from_builder(built);
+            assert_eq!(accepted.is_ok(), index == 0, "case {index}: {accepted:?}");
+            assert_eq!(
+                accepted,
+                EncodedVariant::from_bytes(&metadata, &value),
+                "case {index}"
+            );
+        }
+    }
 
     /// JSON converts with exact integers, null-vs-missing, and limits.
     ///

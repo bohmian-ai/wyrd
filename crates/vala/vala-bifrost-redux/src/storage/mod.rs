@@ -1,12 +1,12 @@
 //! The node's one Bifrost storage owner.
 
 mod error;
+mod footer_cache;
 mod policy;
 
 use std::sync::Arc;
 
 use datafusion::execution::cache::cache_manager::FileMetadataCache;
-use datafusion::execution::cache::default_cache::DefaultCache;
 use object_store::ObjectStore;
 use object_store::limit::LimitStore;
 use object_store::local::LocalFileSystem;
@@ -15,6 +15,7 @@ use wyrd_storage::BackendConfig;
 use wyrd_storage::CloudStore;
 
 use crate::resources::{BifrostResourceError, MetadataReservation, OracleMetadataResources};
+use crate::storage::footer_cache::FooterCache;
 
 pub use crate::storage::error::BifrostStorageError;
 pub(crate) use crate::storage::error::error_chain_contains_not_found;
@@ -126,12 +127,12 @@ impl BifrostStorage {
         }
     }
 
-    /// Gives this owner `DataFusion`'s node-wide Parquet footer cache.
+    /// Gives this owner its node-wide Parquet footer cache, a [`FooterCache`].
     ///
     /// Called once at composition on an Oracle-serving node. The cache's
     /// whole byte limit, `metadata_cache_bytes`, is charged to the Oracle
-    /// memory root up front and held for the owner's life, because
-    /// `DataFusion`'s cache reports no per-entry charge. A zero budget leaves
+    /// memory root up front and held for the owner's life, because the
+    /// cache reports no per-entry charge. A zero budget leaves
     /// the owner without a cache and charges nothing.
     ///
     /// # Errors
@@ -151,7 +152,7 @@ impl BifrostStorage {
             }
         })?;
         self.metadata_charge = Some(resources.try_reserve_metadata(bytes)?);
-        self.metadata_cache = Some(Arc::new(DefaultCache::new(bytes)));
+        self.metadata_cache = Some(Arc::new(FooterCache::new(bytes)));
         Ok(self)
     }
 

@@ -617,7 +617,7 @@ impl Workspace {
                 let hit = json!({
                     "path": path,
                     "locator": locator,
-                    "snippet": snippet(&line, found.start(), found.len()),
+                    "snippet": snippet(&line, found.start()),
                     "sources": sources,
                 });
                 if !matches.push(hit) {
@@ -932,10 +932,12 @@ impl Collected {
     }
 }
 
-/// About 80 bytes of `text` around the match at byte `at`.
-fn snippet(text: &str, at: usize, len: usize) -> String {
+/// At most 160 bytes of `text` from 40 before the match at byte `at`,
+/// cut on UTF-8 boundaries and independent of the match's length, so a
+/// regex spanning a long line still yields a hit that fits the result.
+fn snippet(text: &str, at: usize) -> String {
     let text = &text[text.floor_char_boundary(at.saturating_sub(40))..];
-    text[..text.floor_char_boundary(80 + len)].to_owned()
+    text[..text.floor_char_boundary(160)].to_owned()
 }
 
 /// A terminal error with `reason`.

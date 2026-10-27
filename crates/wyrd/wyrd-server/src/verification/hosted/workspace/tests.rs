@@ -204,7 +204,8 @@ fn workspace_reads_lines_and_extracts_on_request() {
 
 /// `fs.search` returns one hit per matching line in path then line order,
 /// literal and case-insensitive by default, with regex, case, path, and
-/// glob controls; hidden files are searched and binary ones skipped.
+/// glob controls; hidden files are searched and binary ones skipped. A
+/// regex spanning a long line still yields its hit with a bounded snippet.
 ///
 /// # Panics
 /// Panics when a hit is missing, extra, misordered, or a bad pattern is
@@ -316,6 +317,26 @@ fn workspace_search_matches_lines() {
     ] {
         assert!(workspace.search(&refused).is_err(), "{refused:?}");
     }
+    let record = format!("lead\nREFUND {}\n", "é".repeat(35_000));
+    let wide = open(vec![staged(
+        "/inputs/record.txt",
+        record.into_bytes(),
+        MediaFormat::Text,
+    )])
+    .expect("materializes");
+    let found = wide
+        .search(&Search {
+            regex: true,
+            ..query("REFUND.*")
+        })
+        .expect("search");
+    let [hit] = found["matches"].as_array().expect("matches").as_slice() else {
+        panic!("one bounded hit: {found}");
+    };
+    assert_eq!(hit["locator"], loc(Locator::Lines { start: 2, end: 2 }));
+    assert_eq!(hit["sources"], json!(["evidence"]));
+    assert!(hit["snippet"].as_str().expect("snippet").starts_with("REFUND é"));
+    assert!(found.to_string().len() <= HostedLimits::default().tool_result_max_bytes);
 }
 
 /// Tool output names the original slot behind an `/inputs` file even when

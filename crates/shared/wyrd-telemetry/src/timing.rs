@@ -81,6 +81,7 @@ pub const CASES: &[&str] = &[
     "long-tail-filter",
     "native-write",
     "otlp-spans",
+    "otlp-spans-1k",
     "otlp-logs",
     "direct-verify",
     "queued-verify",

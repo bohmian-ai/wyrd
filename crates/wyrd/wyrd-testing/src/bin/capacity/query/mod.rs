@@ -1544,6 +1544,23 @@ fn parquet(root: &Path) -> Vec<(std::path::PathBuf, u64)> {
 mod tests {
     use super::*;
 
+    /// Every write path and read the experiments label is a benchmark case
+    /// the server classifies, so no request is timed as an unknown case.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a case is missing from the server's closed set.
+    #[test]
+    fn every_benchmark_case_is_declared_to_the_server() {
+        let reads = PARQUET_READS
+            .iter()
+            .chain(&HOT_READS)
+            .map(|(_, read, _)| read.case());
+        for case in WriteOp::ALL.map(WriteOp::name).into_iter().chain(reads) {
+            assert!(wyrd_telemetry::timing::CASES.contains(&case), "{case}");
+        }
+    }
+
     /// A table's stored bytes sum only its own Parquet objects, never a
     /// sibling table's or a non-Parquet object.
     ///

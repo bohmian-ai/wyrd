@@ -614,15 +614,16 @@ do not decode OTLP and moved within their spreads.
 The 2026-10-27 profile's binary had been rebuilt, so it could not be
 symbolized. A new profiled run on 3adfc0c14 code
 (`target/benchmarks/bifrost/writes-parquet/20261027T200319Z`, VALID, build id
-matched) was symbolized with `addr2line`, and samples were bucketed into 5 s
-windows.
+matched) was symbolized with `addr2line` (5 of 49,244 addresses unresolved).
+On-CPU samples were bucketed into 5 s windows; the table gives the range over
+each step's busy 64-client windows.
 
-| Window | `prepare_slice` → `logical_data_identity` | Gate `LogicalIdentity::of` | share of window CPU (slice digest) |
-|---|---|---|---|
-| otlp spans c64 | 935 | 786 | 2.1% |
-| otlp 1 KiB spans c64 | 857 | 816 | 2.2% |
-| otlp logs c64 | 1,570 | 1,564 | 4.4% |
-| native writes c64 | 3,166 | 0 | 7.9% |
+| Window | `prepare_slice` → `logical_data_identity` | Gate `LogicalIdentity::of` |
+|---|---|---|
+| otlp spans c64 | 1.8–2.2% | 1.6–1.8% |
+| otlp 1 KiB spans c64 | 2.0–2.2% | 1.9–2.1% |
+| otlp logs c64 | 4.1–4.5% | 4.0–4.4% |
+| native writes c64 | 6.0–7.9% | 0% |
 
 The caller is `scribe::preprocess::prepare_slice`. It recomputes
 `logical_data_identity` for every OTLP slice even though the Gate computed one,
@@ -647,3 +648,22 @@ and `for_rows` could never match. Gate keeps `logical_data_identity` for the
 OTLP batch id, and each slice computes its own digest, as it already did.
 148 `vala-bifrost-redux` lib tests (preprocess, gate, ingress, shards,
 execution lanes, under the repository Postgres) pass. Lints are clean.
+
+### Item 8 attribution: the four costs are below measurable
+
+Same profile and method as 7(d), restricted to busy 5 s windows (sample
+count, inclusive). Highest share in any 64-client window:
+
+| Cost | Revision 19 figure (f96c23fa2 profile) | 3adfc0c14 profile |
+|---|---|---|
+| `scribe::memory::unshared_arrow_bytes` (including its `to_data`) | 4.7% | 0.95% (spans), 0.62% (logs), 0.06% (native) |
+| `execution_lanes::record_lane_enqueued` | 1.1% | 0.04% |
+| `mkdir` under `encode_runs` | 0.8% | 0.02% |
+| rayon `sched_yield` | 3.9% | 0.55% |
+
+No commit since f96c23fa2 changes these functions or their callers. The
+f96c23fa2 profile has no embedded symbols, and its binary was rebuilt, so the
+revision 19 figures cannot be reproduced. Every current share is below the
+~3% run-to-run spread of a before/after record, so no change could produce a
+comparable measurement. With the maintainer's agreement, item 8 makes no code
+change and records no measured improvement.

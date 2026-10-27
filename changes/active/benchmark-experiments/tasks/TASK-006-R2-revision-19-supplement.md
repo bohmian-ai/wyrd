@@ -407,3 +407,21 @@ these changes and measure subsequent work separately.
 | 3. History only for clean full runs | 7d639b0b1 | V7 publish-destination test; the three records published to `benchmarks/history` and committed on `benchmark-records` (d7426b338) | PASS |
 | 4. Small and ~1 KiB spans at 1 and 64 clients with wire B/row, rows and wire MiB per core | 5dc650807, 4bab4d7ff | `wide_spans_carry_about_one_kib_with_distinct_ids`; `every_benchmark_case_is_declared_to_the_server`; the eaa8ad209 record reports `otlp-spans` and `otlp-spans-1k` c1/c64 with `wire_bytes_per_row`, `rows_per_cpu_s` and `wire_mib_per_cpu_s` | PASS |
 | 5. Records self-contained; no reference reason | 466805448, 80167c4ed | hot `20261027T171701Z-434aaf5c1` and parquet records VALID with no reference reason; `reports_regenerate_from_persisted_records` checks server and client latency in each row | PASS |
+
+### Item 6 phase population diagnosis
+
+- **Symptom:** the first item 6 run (`20261027T180214Z-074033fa1`, VALID)
+  reported 856 `bifrost.scribe.write` samples in `native-write-c1`
+  against 524 requests (logs c1: 516 against 330).
+- **Evidence:** the window's timing snapshots
+  (`target/benchmarks/bifrost/writes-parquet/20261027T180214Z/timings/native-write-c1/repetition-1.json`)
+  hold 525 `native-write`/`repetition-1` observations (reconciled 525 = 525)
+  and 331 more labelled `none`/`none`.
+- **Cause:** `set_write_phases` read `Population::elapsed`, which merges
+  every case and phase, so the server's own unlabelled Scribe appends were
+  mixed into the step's phases.
+- **Fix site:** `set_write_phases` (`query/isolated.rs`) now reads
+  `Population::only(case, phase)`, the existing filter that L2 uses; the test
+  `write_phases_read_back_with_populations_and_labelled_gaps` records an
+  unlabelled append and proves it is excluded. Gate and OTLP boundary readings
+  are reconciled by cohort and were unaffected.

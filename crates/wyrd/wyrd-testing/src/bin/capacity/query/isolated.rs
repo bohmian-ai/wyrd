@@ -300,6 +300,13 @@ impl Isolated {
             let published = grew(PUBLISHED_FILES);
             repetition.set("published_files", Reading::exact(published));
             repetition.set("published_mib", Reading::exact(grew(PUBLISHED_BYTES) / MIB));
+            let per_row =
+                |family: &str| Reading::exact(grew(family) / rows.max(1).to_f64().unwrap_or(1.0));
+            repetition.set("wal_bytes_per_row", per_row(WAL_BYTES));
+            repetition.set("staged_bytes_per_row", per_row(STAGED_BYTES));
+            repetition.set("published_bytes_per_row", per_row(PUBLISHED_BYTES));
+            repetition.set("wal_syncs", Reading::exact(grew(WAL_SYNCS)));
+            repetition.set("stage_syncs", Reading::exact(grew(STAGE_SYNCS)));
             repetition.set(
                 "memtable_backlog_mib",
                 Reading::exact(
@@ -328,6 +335,19 @@ const PUBLISHED_FILES: &str = "bifrost_scribe_publication_files_total";
 
 /// Scribe's counter of Parquet bytes published.
 const PUBLISHED_BYTES: &str = "bifrost_scribe_publication_bytes_total";
+
+/// Scribe's counter of WAL record bytes appended.
+const WAL_BYTES: &str = "bifrost_scribe_wal_append_bytes_total";
+
+/// Scribe's counter of encoded staged-run bytes written.
+const STAGED_BYTES: &str = "bifrost_scribe_persistence_encoded_bytes_total";
+
+/// Scribe's counter of WAL `fdatasync` calls; a sync an earlier one covered
+/// is not counted.
+const WAL_SYNCS: &str = "bifrost_scribe_wal_fsync_total";
+
+/// Scribe's counter of staged file and directory fsyncs.
+const STAGE_SYNCS: &str = "bifrost_scribe_stage_fsyncs_total";
 
 /// Bytes per MiB.
 pub const MIB: f64 = 1_048_576.0;

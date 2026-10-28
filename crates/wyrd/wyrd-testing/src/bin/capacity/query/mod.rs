@@ -630,6 +630,31 @@ fn isolated_metrics() -> Vec<Metric> {
             "Parquet MiB Scribe published (`bifrost_scribe_publication_bytes_total`) between the window open and its measured stop, 2^20 bytes; write steps only",
         ),
         Metric::raw(
+            "wal_bytes_per_row",
+            "B/row",
+            "WAL record bytes Scribe appended (`bifrost_scribe_wal_append_bytes_total`) between the window open and its measured stop, per acknowledged row of the window; write steps only",
+        ),
+        Metric::raw(
+            "staged_bytes_per_row",
+            "B/row",
+            "encoded staged-run bytes Scribe wrote (`bifrost_scribe_persistence_encoded_bytes_total`) between the window open and its measured stop, per acknowledged row of the window; staging lags acknowledgement, so the bytes may stage earlier rows; write steps only",
+        ),
+        Metric::raw(
+            "published_bytes_per_row",
+            "B/row",
+            "Parquet bytes Scribe published (`bifrost_scribe_publication_bytes_total`) between the window open and its measured stop, per acknowledged row of the window; publication lags acknowledgement; write steps only",
+        ),
+        Metric::raw(
+            "wal_syncs",
+            "syncs",
+            "WAL `fdatasync` calls (`bifrost_scribe_wal_fsync_total`) between the window open and its measured stop; a sync an earlier one already covered is not counted; write steps only",
+        ),
+        Metric::raw(
+            "stage_syncs",
+            "syncs",
+            "staged file and directory fsyncs (`bifrost_scribe_stage_fsyncs_total`) between the window open and its measured stop; write steps only",
+        ),
+        Metric::raw(
             "memtable_backlog_mib",
             "MiB",
             "Arrow MiB still in active and immutable memtables (`bifrost_scribe_active_memtable_bytes`, `bifrost_scribe_immutable_memtable_bytes`) at the measured stop, 2^20 bytes; write steps only",

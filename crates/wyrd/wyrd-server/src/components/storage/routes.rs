@@ -176,7 +176,18 @@ async fn part_url(
 ///
 /// The optional `Idempotency-Key` is forwarded to the storage service so a
 /// retried client completion keeps the same request context. The service
-/// verifies the backend object before persisting its artifact metadata.
+/// verifies the backend object and commits the upload's completion; the
+/// handler then records the completed object in `bifrost.storage.objects`
+/// and responds only once that row is acknowledged. An unacknowledged
+/// record leaves the completion committed with its outcome unknown, and a
+/// retried completion records the same object again.
+///
+/// # Errors
+/// Returns the idempotency, upload-id, and authorization refusals, the
+/// storage service's completion errors, an internal error when the stored
+/// path or size cannot be recorded, and
+/// `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` when the inventory does not
+/// acknowledge the completed object in time.
 #[utoipa::path(
     post,
     path = "/cards/upload/{id}/complete",
@@ -214,6 +225,10 @@ async fn part_url(
           WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Storage"
+)]
+#[tracing::instrument(
+    skip(state, caller, headers, body),
+    fields(operation = "storage.upload.complete")
 )]
 async fn complete(
     State(state): State<AppState>,
@@ -399,6 +414,14 @@ async fn local_blob(
 }
 
 /// Create a signed or local download plan for a stored artifact.
+///
+/// The artifact must be the Card's completed file in the object inventory
+/// after card-read authorization.
+///
+/// # Errors
+/// Returns the authorization refusal, the Card and inventory lookup errors —
+/// including `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` while a completed
+/// file is not visible yet — and the storage service's planning errors.
 #[utoipa::path(
     post,
     path = "/cards/download/init",
@@ -428,6 +451,7 @@ async fn local_blob(
     ),
     tag = "Storage"
 )]
+#[tracing::instrument(skip(state, caller, body), fields(operation = "storage.download.init"))]
 async fn download_init(
     State(state): State<AppState>,
     caller: Caller,

@@ -2485,6 +2485,11 @@ mod tests {
         /// # Errors
         ///
         /// Returns the recording Scribe's scripted refusal.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the release semaphore is closed while an object frame
+        /// waits.
         async fn ingest_frame(
             &self,
             frame: ScribeIngressFrame,

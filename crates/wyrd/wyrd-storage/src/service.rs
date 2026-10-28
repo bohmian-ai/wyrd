@@ -858,6 +858,11 @@ fn compute_download_ttl(body: &DownloadInitRequest, default_ttl_secs: u32) -> u3
     body.ttl_secs.unwrap_or(default_ttl_secs).clamp(60, 3600)
 }
 
+/// Mint the download URL for one validated object: the local backend's
+/// root-relative route, or a backend-presigned GET valid for `ttl_secs`.
+///
+/// # Errors
+/// Returns the mapped storage error when the backend cannot presign the GET.
 async fn download_url(
     storage: &StorageHandle,
     validated: &ValidatedPath,
@@ -1295,6 +1300,14 @@ async fn verified_object_head(
     }
 }
 
+/// Mark `upload_uuid` completed and, for a Card upload, its manifest entry
+/// verified, inside the caller's transaction.
+///
+/// Nothing is durable until the caller commits `conn`, so a failure here or
+/// before that commit leaves the upload pending for a retried completion.
+///
+/// # Errors
+/// Returns the mapped SQL error when either update fails.
 async fn persist_completed_upload(
     conn: &mut TenantConn<'_>,
     upload_uuid: Uuid,

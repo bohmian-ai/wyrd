@@ -4976,11 +4976,17 @@ async fn flat_card_http_contract() {
 
 /// A declared single-artifact Prompt on a bound server over local storage.
 struct ArtifactPrompt {
+    /// The bound server the Prompt was declared on.
     server: WyrdTestServer,
+    /// The local storage root holding its stored objects.
     storage_root: tempfile::TempDir,
+    /// The writer's access token.
     jwt: String,
+    /// The writer's Card handle.
     cards: Cards,
+    /// The declared Prompt's UID.
     card_uid: CardUid,
+    /// The bytes of its one `prompt.txt` artifact.
     artifact: &'static [u8],
 }
 
@@ -5072,6 +5078,9 @@ async fn completed_upload(server: &WyrdTestServer, card_uid: &CardUid) -> (Uuid,
 }
 
 /// Send one authenticated request and return its status and JSON body.
+///
+/// # Panics
+/// Panics when the request does not respond or its body is not JSON.
 async fn send_json(
     server: &WyrdTestServer,
     jwt: &str,
@@ -5086,6 +5095,9 @@ async fn send_json(
 }
 
 /// Build a single-PUT completion request for `upload_id`.
+///
+/// # Panics
+/// Panics when the request does not build.
 fn complete_request(upload_id: Uuid) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
@@ -5102,6 +5114,9 @@ fn complete_request(upload_id: Uuid) -> Request<Body> {
 }
 
 /// Build the artifact-listing request for `card_uid`.
+///
+/// # Panics
+/// Panics when the request does not build.
 fn list_artifacts_request(card_uid: &CardUid) -> Request<Body> {
     Request::builder()
         .method(Method::GET)
@@ -5111,6 +5126,9 @@ fn list_artifacts_request(card_uid: &CardUid) -> Request<Body> {
 }
 
 /// Build the download-init request for `card_uid`'s `prompt.txt`.
+///
+/// # Panics
+/// Panics when the request does not build.
 fn download_init_request(card_uid: &CardUid) -> Request<Body> {
     Request::builder()
         .method(Method::POST)

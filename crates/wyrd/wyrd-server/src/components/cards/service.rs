@@ -1940,6 +1940,16 @@ pub async fn complete_card(
 }
 
 /// Execute completion for a reconciler claim without changing its durable lease.
+///
+/// A manifest that can no longer complete abandons the declaration instead:
+/// physical cleanup runs, the Card is failed, and cleanup finishes only once
+/// its deletion is recorded (see [`commit_card_failure`]).
+///
+/// # Errors
+/// Returns the registry errors of the reads and transitions,
+/// `WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED` when abandonment cleanup
+/// remains incomplete, the inventory's retryable write failure when the
+/// deletion is not acknowledged, and the completion errors otherwise.
 pub(crate) async fn reconcile_card_claim(
     state: &AppState,
     caller: &Caller,
@@ -1988,6 +1998,17 @@ pub(crate) async fn reconcile_card_claim(
 }
 
 /// Retry cleanup for a claimed deleted or failed Card.
+///
+/// Re-runs physical cleanup, records the Card's deletion in the object
+/// inventory, and only then marks cleanup finished under the claim's lease.
+/// Any failure leaves cleanup pending for the next claim, and a lease lost
+/// meanwhile leaves the newer owner's state untouched.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED` when physical cleanup
+/// remains incomplete, the inventory's retryable write failure when the
+/// deletion is not acknowledged, and the registry errors of the reads and
+/// the lease-fenced success update.
 pub(crate) async fn reconcile_cleanup_claim(
     state: &AppState,
     caller: &Caller,
@@ -2241,6 +2262,17 @@ pub async fn delete_card_by_ref(
     finish_card_delete(state, caller, delete_state).await
 }
 
+/// Clean up a soft-deleted Card's objects and finish its cleanup.
+///
+/// Runs only when this request deleted the Card or found it already
+/// deleted: physical cleanup runs, the deletion is recorded in the object
+/// inventory, and only then is cleanup reconciliation marked finished. Any
+/// failure leaves the Card deleted with cleanup pending for the reconciler.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED` when physical cleanup
+/// is incomplete, the inventory's retryable write failure when the deletion
+/// is not acknowledged, and the registry errors of the success update.
 async fn finish_card_delete(
     state: &AppState,
     caller: &Caller,
@@ -2284,8 +2316,17 @@ async fn finish_card_delete(
 ///
 /// This is an internal lifecycle cleanup seam. It is intentionally not exposed
 /// as a method on the public `Cards` handle. Cleanup is best-effort, while the
-/// Pending→Failed transition commits atomically as registry lineage; it
-/// evaluates no permission and appends no canonical audit event.
+/// Pending→Failed transition commits atomically as registry lineage and
+/// cleanup finishes only once its deletion is recorded (see
+/// [`commit_card_failure`]); it evaluates no permission and appends no
+/// canonical audit event.
+///
+/// # Errors
+/// Returns the registry errors of the reads and transition,
+/// `WYRD_SPEC_409_CONFLICT` when the Card is not abortable,
+/// `WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED` when cleanup
+/// is incomplete, and the inventory's retryable write failure when the
+/// deletion is not acknowledged.
 #[tracing::instrument(
     skip(state, caller, idempotency_key),
     fields(
@@ -2612,6 +2653,12 @@ async fn record_card_deletion(
 }
 
 /// Remove the deterministic blob written before a declaration failure.
+///
+/// An already absent blob counts as removed, so a retried cleanup succeeds.
+///
+/// # Errors
+/// Returns the failure text when the blob path fails tenant validation or
+/// the backend delete fails; the caller counts it as incomplete cleanup.
 async fn cleanup_card_blob(
     state: &AppState,
     caller: &Caller,
@@ -2812,6 +2859,19 @@ fn immutable_card_blob_bytes(card: Card) -> Result<Vec<u8>, WyrdError> {
 }
 
 /// Persist the immutable resolved Card envelope and return its stable URI.
+///
+/// Writes the deterministic envelope bytes, then records the envelope in
+/// `bifrost.storage.objects` and returns only after that row is
+/// acknowledged. A failed write records the blob failure on the Card row.
+/// An unacknowledged record leaves the bytes written but no URI returned;
+/// rewriting the same deterministic path and recording again is safe.
+///
+/// # Errors
+/// Returns an internal error when the blob path, stored spec hash, or size is
+/// invalid or the envelope cannot be serialized, the registry errors of
+/// recording a blob failure, the mapped storage error when the write fails,
+/// and `WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE` when the envelope's
+/// inventory row is not acknowledged in time.
 async fn write_card_blob(
     state: &AppState,
     caller: &Caller,

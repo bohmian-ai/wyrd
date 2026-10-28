@@ -14,6 +14,7 @@ pub mod geometry;
 pub mod hot_source;
 pub mod hot_stage;
 mod ingress;
+pub(crate) mod layout_cache;
 pub mod manifest;
 pub(crate) mod material_plan;
 pub mod member_stager;
@@ -1199,6 +1200,8 @@ impl ScribeImpl {
                 seal_max_age,
                 wal: Arc::clone(&wal),
                 persistence_cpu: persistence_cpu.clone(),
+                ingress_cpu: ingress_cpu.clone(),
+                variant_layouts: Arc::clone(memory.variant_layouts()),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
                 control_postgres: control_postgres.clone(),
@@ -1589,6 +1592,38 @@ impl ScribeImpl {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn flush_writable_for_test(&self) -> Result<(), ScribeError> {
         self.shards.flush_all().await
+    }
+
+    /// Returns the physical schema of the Variant layout this process learned
+    /// for `tenant`'s `table` at any version, or `None` while it stays cold.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn learned_variant_layout_for_test(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Option<arrow::datatypes::SchemaRef> {
+        self.memory
+            .variant_layouts()
+            .physical_for_test(tenant, table)
+    }
+
+    /// Reports, per writable generation of `tenant`'s `table`, whether it pinned a learned layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the runtime is closed or a bucket lock is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn writable_variant_layouts_for_test(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<bool>, ScribeError> {
+        let mut pinned = Vec::new();
+        for memtable in self.shards.memtables()? {
+            pinned.extend(memtable.writable_layouts_for_test(tenant, table)?);
+        }
+        Ok(pinned)
     }
 
     /// Return the bounded persistence queue depth for test-tier drain checks.

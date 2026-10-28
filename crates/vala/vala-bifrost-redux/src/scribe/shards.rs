@@ -17,7 +17,8 @@ use wyrd_spec::ids::DataTenantId;
 use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
 use crate::scribe::execution_lanes::{
-    ScribePersistenceCpuPool, ScribeWalIoOp, ScribeWalIoPool, ScribeWalIoResult,
+    ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoOp, ScribeWalIoPool,
+    ScribeWalIoResult,
 };
 use crate::scribe::memory::{MemoryCategory, ScribeOwnership};
 use crate::scribe::memtable::{
@@ -815,6 +816,10 @@ struct ShardOwner {
     memtable: Arc<Memtable>,
     /// Bounded CPU lane for replay and persistence preparation.
     persistence_cpu: ScribePersistenceCpuPool,
+    /// Admitted request-path CPU lane that shreds rows into a generation's layout before WAL.
+    ingress_cpu: ScribeIngressCpuPool,
+    /// Process-local learned Variant layouts a new generation pins when it opens.
+    variant_layouts: Arc<crate::scribe::layout_cache::VariantLayoutCache>,
     /// Bounded WAL IO lane for append, sync, manifest, and retirement work.
     wal_io: ScribeWalIoPool,
     /// Optional immutable-generation persistence runtime.
@@ -906,6 +911,10 @@ pub(crate) struct ScribeShardStartConfig {
     pub(crate) wal: Arc<WalWriter>,
     /// Bounded CPU lane for replay and persistence preparation.
     pub(crate) persistence_cpu: ScribePersistenceCpuPool,
+    /// Admitted request-path CPU lane that shreds rows into a generation's layout.
+    pub(crate) ingress_cpu: ScribeIngressCpuPool,
+    /// Process-local learned Variant layouts new generations pin.
+    pub(crate) variant_layouts: Arc<crate::scribe::layout_cache::VariantLayoutCache>,
     /// Bounded WAL IO lane for append and retirement operations.
     pub(crate) wal_io: ScribeWalIoPool,
     /// Optional immutable-generation persistence runtime.
@@ -1005,6 +1014,8 @@ impl ScribeShardRuntime {
             seal_max_age,
             wal,
             persistence_cpu,
+            ingress_cpu,
+            variant_layouts,
             wal_io,
             persistence,
             control_postgres,
@@ -1066,6 +1077,8 @@ impl ScribeShardRuntime {
                 retained_commit_ambiguity: None,
                 memtable: Arc::clone(&memtable),
                 persistence_cpu: persistence_cpu.clone(),
+                ingress_cpu: ingress_cpu.clone(),
+                variant_layouts: Arc::clone(&variant_layouts),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
                 control_postgres: control_postgres.clone(),
@@ -3072,6 +3085,8 @@ struct DurableSlice {
     rows: Option<arrow::record_batch::RecordBatch>,
     /// Active-memory bytes reserved for this slice.
     memtable_bytes: usize,
+    /// Variant layout of `rows`, pinned by the generation they enter; `None` is canonical.
+    layout: Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
     /// Whether active admission and ownership have already transferred.
     active_reserved: bool,
     /// Batch identity used for retry deduplication.
@@ -4094,6 +4109,7 @@ impl ShardOwner {
         let mut records = Vec::new();
         let mut owners = Vec::<usize>::new();
         let mut leases = Vec::new();
+        let mut layouts = HashMap::new();
         for (append_index, append) in prepared.iter_mut().enumerate() {
             if let Some(memory) = append.memory.as_mut() {
                 memory.transfer_category(MemoryCategory::Prepared)?;
@@ -4120,6 +4136,19 @@ impl ShardOwner {
                         return Err(error);
                     }
                 }
+                let (slice, layout) = match self
+                    .bind_slice_layout(append, slice, &mut layouts)
+                    .await
+                {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                            tracing::error!(error = %cleanup_error, "active cleanup failed after layout conversion error");
+                        }
+                        Self::notify_prepared_error(&mut prepared, &error);
+                        return Err(error);
+                    }
+                };
                 let slice_id = slice.id.clone();
                 let staged_slice =
                     if let Some(previous) = self.synced_not_inserted.get(&slice_id).copied() {
@@ -4129,7 +4158,7 @@ impl ShardOwner {
                         self.stage_ingress_slice(append, slice)
                             .map(|(slice, record)| (slice, Some(record)))
                     };
-                let (slice, record) = match staged_slice {
+                let (mut slice, record) = match staged_slice {
                     Ok(value) => value,
                     Err(error) => {
                         if let Err(cleanup_error) = self.release_active_reservations(&durable) {
@@ -4139,6 +4168,7 @@ impl ShardOwner {
                         return Err(error);
                     }
                 };
+                slice.layout = layout;
                 if let Some(record) = record {
                     staged.push(durable.len());
                     records.push(record);
@@ -4225,6 +4255,92 @@ impl ShardOwner {
         })
     }
 
+    /// Retains one slice's rows in the Variant layout of the generation they enter.
+    ///
+    /// The generation open for the slice's seal key keeps the layout it pinned
+    /// when it opened — canonical or learned. With no open generation, the
+    /// slice takes the process's learned layout for its exact tenant, table,
+    /// and table version, which the generation then pins. `chosen` remembers
+    /// the choice per seal key for the rest of the group, so every slice of one
+    /// generation agrees even before the first is inserted.
+    ///
+    /// Shredding runs on the admitted ingress CPU lane with no memtable lock
+    /// held. Before it starts, the append's root grows by the conversion's
+    /// upper bound, so the original and shredded copies never coexist
+    /// unaccounted; afterwards the originals are released and the root keeps
+    /// exactly the shredded rows' bytes. The WAL record built in preprocessing
+    /// is untouched: canonical IPC, logical fingerprint, and digest stay the
+    /// WAL identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] or a capacity refusal when the lane
+    /// or the root cannot admit the conversion, and [`ScribeError::Internal`]
+    /// when the open generation's layout does not fit the rows or shredding
+    /// fails. Every error happens before WAL submission.
+    async fn bind_slice_layout(
+        &self,
+        append: &mut PreparedAppend,
+        mut slice: PreparedSlice,
+        chosen: &mut HashMap<
+            crate::scribe::seal_key::SealKey,
+            Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+        >,
+    ) -> Result<
+        (
+            PreparedSlice,
+            Option<Arc<crate::scribe::layout_cache::LearnedLayout>>,
+        ),
+        ScribeError,
+    > {
+        let layout = if let Some(layout) = chosen.get(&slice.seal_key) {
+            layout.clone()
+        } else {
+            let key = &slice.seal_key;
+            let layout = self.memtable.generation_layout(key, || {
+                self.variant_layouts
+                    .get(key.tenant, &key.table, key.table_version)
+                    .filter(|layout| layout.applies_to(slice.rows.schema_ref()))
+            })?;
+            chosen.insert(key.clone(), layout.clone());
+            layout
+        };
+        let Some(layout) = layout else {
+            return Ok((slice, None));
+        };
+        let root = append
+            .memory
+            .as_mut()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared append lost its memory reservation".to_owned(),
+            })?;
+        let reserved = layout.conversion_bytes(&slice.rows);
+        let held = root.bytes();
+        root.resize_ingress(held.saturating_add(reserved))?;
+        let rows = slice.rows.clone();
+        let job = Arc::clone(&layout);
+        let physical = match self.ingress_cpu.run(move || job.shred(&rows)).await {
+            Ok(physical) => physical,
+            Err(error) => {
+                if let Err(release) = root.resize_ingress(held) {
+                    tracing::error!(error = %release, "conversion reservation release failed");
+                }
+                return Err(error);
+            }
+        };
+        let physical_bytes = crate::scribe::memory::retained_arrow_bytes(&physical);
+        slice.rows = physical;
+        let retained = held
+            .checked_sub(slice.memtable_bytes)
+            .and_then(|rest| rest.checked_add(physical_bytes))
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared append root does not hold its slice's rows".to_owned(),
+            })?;
+        root.resize_ingress(retained)?;
+        slice.memtable_bytes = physical_bytes;
+        Ok((slice, Some(layout)))
+    }
+
     /// Takes the next prepared slice of one append, in order.
     ///
     /// Slices are fully materialized before the append reaches the shard, so
@@ -4271,6 +4387,7 @@ impl ShardOwner {
                 request_id,
                 rows: Some(rows),
                 memtable_bytes,
+                layout: None,
                 active_reserved: true,
                 batch_id: *append.batch_id.as_bytes(),
                 schema_fingerprint: wal_append.schema_fingerprint,
@@ -4319,6 +4436,7 @@ impl ShardOwner {
                 request_id,
                 rows: retain_rows.then_some(rows),
                 memtable_bytes,
+                layout: None,
                 active_reserved: retain_rows,
                 batch_id: *append.batch_id.as_bytes(),
                 schema_fingerprint: wal_append.schema_fingerprint,
@@ -4461,7 +4579,7 @@ impl ShardOwner {
                 detail: "WAL payload length does not fit shard accounting".to_owned(),
             })?;
         self.memtable
-            .insert(
+            .insert_with_layout(
                 &slice.seal_key,
                 crate::scribe::wal::ScribeAppendMeta {
                     batch_id: slice.batch_id,
@@ -4478,6 +4596,7 @@ impl ShardOwner {
                     seal_key: slice.seal_key.canonical_key(),
                 },
                 rows,
+                slice.layout.take(),
             )
             .map_err(|error| {
                 self.preserve_primary_after_active_cleanup(error, slice.memtable_bytes, true)
@@ -6882,6 +7001,8 @@ mod tests {
             retained_commit_ambiguity: None,
             memtable: Arc::new(memtable),
             persistence_cpu: ScribePersistenceCpuPool::new(1),
+            ingress_cpu: ScribeIngressCpuPool::new(1),
+            variant_layouts: Arc::clone(budget.variant_layouts()),
             wal_io: ScribeWalIoPool::new(1),
             persistence: None,
             control_postgres: None,
@@ -6936,6 +7057,7 @@ mod tests {
                     request_id: uuid::Uuid::now_v7(),
                     rows: Some(next_batch),
                     memtable_bytes: rotation_bytes,
+                    layout: None,
                     active_reserved: true,
                     batch_id: next_id,
                     schema_fingerprint: [0; 32],
@@ -7099,6 +7221,21 @@ mod tests {
         key: SealKey,
         batch_id: uuid::Uuid,
     ) -> PreparedAppend {
+        prepared_append_with_rows(budget, key, batch_id, owner_prepared_batch())
+    }
+
+    /// Builds one real prepared append of `rows` for an exact key and batch identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `budget` cannot reserve the item or the prepared bytes, or
+    /// preprocessing rejects `rows`.
+    fn prepared_append_with_rows(
+        budget: &crate::resources::ScribeResources,
+        key: SealKey,
+        batch_id: uuid::Uuid,
+        rows: RecordBatch,
+    ) -> PreparedAppend {
         let initial_bytes = 1024 * 1024;
         let reservation = crate::scribe::admission::AdmissionController::with_config_and_memory(
             crate::scribe::admission::AdmissionConfig::default(),
@@ -7114,7 +7251,7 @@ mod tests {
                 batch_id,
                 request_id: uuid::Uuid::now_v7(),
                 ingested_at_micros: 0,
-                rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
+                rows: crate::scribe::preprocess::AdmittedRows::Projected(rows),
                 measured_wire_bytes: initial_bytes,
                 reservation,
                 memory,
@@ -7492,6 +7629,241 @@ mod tests {
                 .pending_generations,
             0
         );
+    }
+
+    /// Owner rows on July `day`, 2026, with one Variant column `attrs` parsed from `json`.
+    fn owner_variant_batch(day: u32, json: &[&str]) -> RecordBatch {
+        let event_micros = NaiveDate::from_ymd_opt(2026, 7, day)
+            .and_then(|date| date.and_hms_opt(12, 0, 0))
+            .expect("valid event timestamp")
+            .and_utc()
+            .timestamp_micros();
+        let text: arrow::array::ArrayRef = Arc::new(arrow::array::StringArray::from(json.to_vec()));
+        let attrs: arrow::array::ArrayRef = parquet_variant_compute::json_to_variant(&text)
+            .expect("valid JSON")
+            .into();
+        let attrs = arrow::compute::cast(&attrs, &wyrd_types::variant::variant_storage_type())
+            .expect("Variant storage casts to the stored shape");
+        let rows = i64::try_from(json.len()).expect("test row count fits i64");
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(
+                    "event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+                wyrd_types::variant::variant_field("attrs", true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..rows)),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![event_micros; json.len()])
+                        .with_timezone("UTC"),
+                ),
+                attrs,
+            ],
+        )
+        .expect("owner Variant batch")
+    }
+
+    /// The `attrs` values of every readable row of `key`'s table, as JSON, and whether any
+    /// retained batch of the table holds `attrs` shredded.
+    fn readable_attrs(memtable: &Memtable, key: &SealKey) -> Vec<String> {
+        let mut values = Vec::new();
+        for readable in memtable
+            .readable_batches(key.tenant, &key.table)
+            .expect("readable rows")
+        {
+            if readable.partition_day != key.partition.time() {
+                continue;
+            }
+            let attrs = readable.batch.column_by_name("attrs").expect("attrs");
+            assert_eq!(
+                attrs.data_type(),
+                &wyrd_types::variant::variant_storage_type(),
+                "capture reads the logical Variant storage"
+            );
+            let json = parquet_variant_compute::variant_to_json(attrs).expect("Variant JSON");
+            values.extend(json.iter().map(|value| value.expect("non-null").to_owned()));
+        }
+        values
+    }
+
+    /// A generation keeps the layout it opened with; only a later generation
+    /// is shredded, while the WAL keeps canonical identity and memory settles.
+    ///
+    /// The cold generation opens canonical. Installing a learned layout does
+    /// not change it: a later append to the same seal key stays canonical. A
+    /// new seal key of the same table definition opens a generation that pins
+    /// the learned layout, so its retained rows are shredded, yet every WAL
+    /// slice keeps the canonical fingerprint and digest preprocessing
+    /// computed. Capture reads exact logical values from both generations,
+    /// and once each group settles the only Scribe memory left is the active
+    /// rows the memtable retains.
+    #[tokio::test]
+    async fn generation_layout_binding_keeps_canonical_wal_and_bounded_memory() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        let cold = owner_key();
+        let json = [r#"{"a":1}"#, r#"{"a":2,"b":"x"}"#];
+        let rows = owner_variant_batch(24, &json);
+        let logical = rows.schema();
+        let wal_identity = |append: &PreparedAppend| {
+            let PreparedSliceSet::Materialized(slices) = &append.slices;
+            slices
+                .iter()
+                .map(|slice| {
+                    (
+                        slice.wal_append.schema_fingerprint,
+                        slice.wal_append.logical_data_digest,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let settle = |owner: &ShardOwner, budget: &crate::resources::ScribeResources| {
+            assert_eq!(budget.category_bytes(MemoryCategory::Prepared), 0);
+            assert_eq!(budget.category_bytes(MemoryCategory::Raw), 0);
+            assert_eq!(
+                owner.memory_ownership.active_bytes(),
+                budget.category_bytes(MemoryCategory::Active),
+            );
+        };
+
+        let append =
+            prepared_append_with_rows(&budget, cold.clone(), uuid::Uuid::now_v7(), rows.clone());
+        owner.process_group(vec![append]).await.expect("cold group");
+        let open = || unreachable!("the cold generation is open");
+        assert!(
+            owner
+                .memtable
+                .generation_layout(&cold, open)
+                .expect("bucket lookup")
+                .is_none(),
+            "a cold process opens a canonical generation"
+        );
+        settle(&owner, &budget);
+
+        let mut sampler = iceberg::writer::file_writer::variant_shredding::VariantSampler::new(
+            &logical,
+            crate::parquet::writer_properties::BIFROST_VARIANT_SHREDDING,
+            0,
+            &[rows.num_rows()],
+        );
+        sampler.offer(&rows, &[0, 0], 0).expect("sample offer");
+        let learned = sampler.layout();
+        assert!(!learned.is_unshredded(), "the sample shreds `attrs`");
+        budget.variant_layouts().install(
+            &budget,
+            (cold.tenant, cold.table.clone(), cold.table_version),
+            Arc::clone(&logical),
+            learned,
+        );
+
+        let late =
+            prepared_append_with_rows(&budget, cold.clone(), uuid::Uuid::now_v7(), rows.clone());
+        let late_wal = wal_identity(&late);
+        owner.process_group(vec![late]).await.expect("late group");
+        assert!(
+            owner
+                .memtable
+                .generation_layout(&cold, open)
+                .expect("bucket lookup")
+                .is_none(),
+            "a refresh never changes an open generation"
+        );
+        settle(&owner, &budget);
+
+        let fresh = SealKey::new(
+            cold.tenant,
+            cold.table.clone(),
+            crate::test_support::day_partition(2026, 7, 25),
+        );
+        let next = prepared_append_with_rows(
+            &budget,
+            fresh.clone(),
+            uuid::Uuid::now_v7(),
+            owner_variant_batch(25, &json),
+        );
+        let next_wal = wal_identity(&next);
+        assert_eq!(
+            next_wal
+                .iter()
+                .map(|(schema, _)| *schema)
+                .collect::<Vec<_>>(),
+            late_wal
+                .iter()
+                .map(|(schema, _)| *schema)
+                .collect::<Vec<_>>(),
+            "both generations' WAL slices carry one logical fingerprint"
+        );
+        owner
+            .process_group(vec![next])
+            .await
+            .expect("learned group");
+        let pinned = owner
+            .memtable
+            .generation_layout(&fresh, || None)
+            .expect("bucket lookup")
+            .expect("the open new generation pins the learned layout");
+        let cached = budget
+            .variant_layouts()
+            .get(fresh.tenant, &fresh.table, fresh.table_version)
+            .expect("cached layout");
+        assert!(Arc::ptr_eq(&pinned, &cached));
+        settle(&owner, &budget);
+
+        assert_eq!(readable_attrs(&owner.memtable, &fresh), json);
+        assert_eq!(
+            readable_attrs(&owner.memtable, &cold),
+            [json.as_slice(), json.as_slice()].concat()
+        );
+
+        let retained = owner.memtable.freeze(&fresh).expect("freeze fresh");
+        assert_eq!(
+            retained.schema, logical,
+            "the generation's schema is logical"
+        );
+        for batch in retained.batches.iter() {
+            assert_ne!(
+                batch
+                    .schema()
+                    .field_with_name("attrs")
+                    .expect("attrs")
+                    .data_type(),
+                &wyrd_types::variant::variant_storage_type(),
+                "the new generation retains shredded rows"
+            );
+        }
+        for meta in &retained.metas {
+            assert!(
+                next_wal.iter().any(|(schema, digest)| {
+                    *schema == meta.schema_fingerprint && *digest == meta.data_digest
+                }),
+                "the retained slice keeps its canonical WAL identity"
+            );
+        }
+        let canonical = owner.memtable.freeze(&cold).expect("freeze cold");
+        for batch in canonical.batches.iter() {
+            assert_eq!(
+                batch.schema(),
+                logical,
+                "the cold generation stays canonical"
+            );
+        }
     }
 
     /// An injected failure after WAL/SQL durability retains the same material

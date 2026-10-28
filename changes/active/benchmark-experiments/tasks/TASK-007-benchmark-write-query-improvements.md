@@ -862,3 +862,85 @@ references, per-record-shard manifests, v8 upgrade and unsupported
 downgrade), `operations/deployment-and-release.md` (v9 rollback boundary),
 and `operations/reliability-and-recovery.md` (restart routing, shared
 retirement).
+
+## Task 10 implementation evidence
+
+Status: PARTIAL. The correctness lifecycle (S10A, S10B, S10C) is done. The
+Variant-aware memory filter and the `--learned-layout` diagnostic are not.
+
+Implemented:
+
+- `scribe/layout_cache.rs`: a process-local advisory cache.
+  - Keyed by exact tenant, table and table version; holds at most 256 entries.
+  - Each entry is charged to the governed root (`Metadata`).
+  - Installed from `StagingRuntime::assemble` when a claim succeeds, in
+    completion order. An unshredded layout removes the hint; a failed charge
+    drops it.
+- Shard (`ShardOwner::bind_slice_layout`):
+  - Each slice takes the open generation's pinned layout. With no generation
+    open, it takes the cached layout, and only when that layout's logical
+    fingerprint matches the rows.
+  - A memo per group keeps every slice of one generation in agreement.
+  - Shredding runs on `ScribeIngressCpuPool` before WAL submission, with no
+    memtable lock held.
+  - Before conversion, the root grows by an upper bound: twice the rewritten
+    Variant bytes plus 40 bytes per slot per shredded node, counting list
+    elements. After conversion it is resized to the exact retained bytes.
+  - WAL IPC bytes, logical fingerprint and digest are untouched.
+- Memtable:
+  - A bucket pins its layout and keeps the logical schema.
+  - Captures reconstruct logical Variant storage
+    (`schema::logical_column`) before rows leave `ReadableSource::project`.
+- Rolling writer (`VariantPlan::Staged`/`Final`):
+  - Staging writes native input as is, with logical footer identity.
+  - Final objects shred logical batches.
+- Claim sample and merge:
+  - Both reconstruct complete values (`unshred_variants`, then a cast to
+    canonical storage only inside Variant storage).
+  - The merge accepts a physical difference only after the footer's logical
+    fingerprint and tenant match.
+- Recovery: `restore_context` reconstructs a run's logical schema
+  (`schema::logical_schema`) before the key fingerprint check. The S10C
+  journey found this gap: a restart over shredded staging failed WAL recovery.
+- Compaction: unchanged.
+- `architecture/bifrost-design.md` § Variant shredding: updated.
+
+Tests (all passing):
+
+- S10A: `cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::shards::tests::generation_layout_binding_keeps_canonical_wal_and_bounded_memory)'`
+- S10B: `... -E 'test(=scribe::parquet_writer::tests::mixed_staged_layouts_preserve_values_and_fresh_discovery)'`
+- S10C: `scripts/postgres/with-test-postgres.sh -- ... cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'test(=telemetry::variant_layouts_survive_memory_stage_publication_and_restart)'`
+- Regressions: `recovery::variant_staging_restores_and_publishes_once`,
+  `telemetry::staged_backlog_survives_abrupt_restart` and
+  `source_boundary_recovery::scribe_failure_retry_replay_remain_atomic`.
+- Full `vala-bifrost-redux` lib suite under test Postgres: 897/897.
+- `mise run fmt` and `mise run lints`: clean.
+
+Not done:
+
+- Variant-aware memory filtering. Memory captures reconstruct canonical rows
+  at projection, so predicates run on logical rows. This is correct, but
+  learned memory generations do not yet filter on typed leaves. A
+  learned-layout memory read pays reconstruction and gains no filter speedup.
+- The `--learned-layout` Bifrost L1 hot diagnostic, its `span-shredded-c64`
+  case, and the guard test
+  `tests::learned_layout_diagnostic_scopes_residence_and_deadline`. Global
+  `Residence` gauges cannot scope evidence to the measured partition, and the
+  separate server process exposes no learned-layout signal. This needs a
+  server metric and harness orchestration that could not be validated without
+  running a bench.
+- S10A does not interleave a conversion failure or a capture held during
+  conversion. S10C holds no capture or lease across publication and makes no
+  tenant-negative read. Both journeys check exact values and layout evidence
+  only.
+
+Open risks:
+
+- Item 9 integration. `bind_slice_layout` assumes one serial group per shard
+  (write → sync → fence → insert). If item 9 overlaps the next group's
+  `write_group` with the previous group's insert, a generation's layout could
+  disagree with a slice chosen before the insert. That fails after commit
+  (`insert_with_layout` refuses the mismatch) and poisons memory.
+- The conversion bound is conservative. For large list-heavy batches it can
+  exceed the ingress sublimit and refuse appends (backpressure) for as long
+  as a learned generation stays open.

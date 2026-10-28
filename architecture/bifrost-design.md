@@ -415,7 +415,8 @@ that do not fit the layout stay in the residual `value`,
 so the layout changes performance only, never a result. Both readers unshred
 at any depth before rows leave the scan.
 
-- **Scribe** recovery-stage runs stay unshredded. Each final hot object's
+- **Scribe** keeps one logical schema per table version and may retain rows
+  in a physical layout. Each final hot object's
   layout is chosen before its writer opens, from one seeded, stratified sample
   of the claim: strata are `sub_principal_id` values, subjects with fewer than 30
   rows share one stratum, and each stratum samples Cochran's size for 99%
@@ -423,7 +424,27 @@ at any depth before rows leave the scan.
   stratum's sampled non-null values hold it with one compatible type. The seed
   is the claim, so a re-run claim writes the same objects. Each element of a
   Variant inside a List counts as one observation, and one layout covers every
-  element. The sample holds counters, never rows.
+  element. The sample holds counters, never rows. The sample and the claim
+  merge read complete values — typed leaves plus residual reconstructed by the
+  recursive `unshred_variants` — so a key a staged run kept only in its
+  residual stays discoverable; runs of different layouts merge only after
+  their footers name the claim's logical schema and tenant.
+- **Learned layouts.** A successful claim assembly installs its layout in a
+  process-local advisory cache keyed by exact tenant, table, and table
+  version, in completion order; entries are bounded in count and charged to
+  the Scribe governed root, and eviction releases only the cache's ownership.
+  A shard pins the cached layout when it opens a generation for a seal key and
+  keeps it until the generation closes; a generation opened cold stays
+  canonical. Rows are shredded on the admitted ingress CPU lane before WAL
+  submission, with an upper bound for the conversion reserved first and the
+  originals released after; the WAL keeps canonical IPC, logical fingerprint,
+  and digest. A failed reservation or conversion refuses the append before
+  WAL. Staging writes the frozen generation's rows as is; recovery
+  reconstructs the run's logical schema from its layout. Memory reads
+  reconstruct logical Variant storage before rows leave the capture, so unions
+  and remote output never expose a physical layout. A restart or eviction only
+  returns new generations to canonical until a claim teaches the process
+  again; no hint crosses processes, tenants, or table versions.
 - **Forge** samples nothing. It sums each source footer's shredded-leaf
   non-null counts, keeps keys covering at least 10% of the combined rows,
   gives a type conflict to the type covering more rows, and writes every output

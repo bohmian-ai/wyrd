@@ -215,7 +215,7 @@ mod tests {
             ("{\"a\": \"secret\"}", "/properties/a/enum"),
             ("{\"secret\": 1}", "/additionalProperties"),
         ] {
-            let rejection = output.check(reply).err().expect("refused");
+            let rejection = output.check(reply).expect_err("refused");
             assert_eq!(rejection.violations, vec![violation.to_owned()], "{reply}");
             assert!(rejection.correction.starts_with(CORRECTION_OPENING));
         }

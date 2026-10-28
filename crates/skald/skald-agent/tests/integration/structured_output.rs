@@ -81,8 +81,8 @@ fn verdict_like() -> Value {
     })
 }
 
-fn format(schema: Value) -> Option<ResponseFormat> {
-    Some(ResponseFormat::json_schema("test", schema).expect("schema is an object"))
+fn format(schema: Value) -> ResponseFormat {
+    ResponseFormat::json_schema("test", schema).expect("schema is an object")
 }
 
 fn chat_prompt(schema: Value) -> skald_prompt::Prompt {
@@ -90,7 +90,7 @@ fn chat_prompt(schema: Value) -> skald_prompt::Prompt {
         "gpt-test",
         OpenAiChatOptions {
             messages: vec!["Say hi.".into()],
-            output: format(schema),
+            output: Some(format(schema)),
             ..OpenAiChatOptions::default()
         },
     )
@@ -125,13 +125,17 @@ fn responses_text(text: &str) -> ProviderResponse {
     )])
 }
 
-/// A structured Prompt and an answer builder for each conversation encoding.
-fn encodings() -> Vec<(
+/// One conversation encoding: its name, a structured Prompt, its provider,
+/// and a builder for that provider's text answer.
+type Encoding = (
     &'static str,
     skald_prompt::Prompt,
     ProviderName,
     fn(&str) -> ProviderResponse,
-)> {
+);
+
+/// A structured Prompt and an answer builder for each conversation encoding.
+fn encodings() -> Vec<Encoding> {
     vec![
         (
             "chat",
@@ -145,7 +149,7 @@ fn encodings() -> Vec<(
                 "gpt-test",
                 OpenAiResponsesOptions {
                     messages: vec!["Say hi.".into()],
-                    output: format(foo_bar()),
+                    output: Some(format(foo_bar())),
                     ..OpenAiResponsesOptions::default()
                 },
             )
@@ -159,7 +163,7 @@ fn encodings() -> Vec<(
                 "claude-test",
                 AnthropicOptions {
                     messages: vec!["Say hi.".into()],
-                    output: format(foo_bar()),
+                    output: Some(format(foo_bar())),
                     ..AnthropicOptions::default()
                 },
             )
@@ -173,7 +177,7 @@ fn encodings() -> Vec<(
                 "gemini-test",
                 GeminiOptions {
                     messages: vec!["Say hi.".into()],
-                    output: format(foo_bar()),
+                    output: Some(format(foo_bar())),
                     ..GeminiOptions::default()
                 },
             )

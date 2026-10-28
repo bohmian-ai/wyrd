@@ -1097,7 +1097,8 @@ alias. `run.observe.verify(verifier, inputs)` and
 resolves the named Verifier among those bound in `verified_by` to that subject
 in the hydrated graph, validates named inputs against its slots, hashes
 files, obtains plans for missing ones from `POST /v1/verification/evidence`
-and sends each missing body to its plan's target, and calls
+sends each missing body to its plan's target and completes it through
+`POST /v1/cards/upload/{upload_id}/complete`, and calls
 `POST /v1/verification/execute` (once, without replay, returning the typed
 `VerificationResult`) or `POST /v1/verification/enqueue` (returning a
 `VerificationExecution` handle). `submit` on a Window Verifier records its
@@ -1686,32 +1687,40 @@ execution; scheduled executions have no `run_id`.
 
 | Route | Contract |
 |---|---|
-| `POST /v1/verification/evidence` | Declare files by digest, length, and format; receive single-PUT plans for missing ones under the tenant's `evidence/sha256/<digest>` namespace |
-| `PUT /v1/verification/evidence/local/{sha256}` | Local storage backend only: store one evidence body under the caller's tenant → `204` |
+| `POST /v1/verification/evidence` | Declare files by digest and length; receive an `upload_id` and shared upload plan for each one with no completed File record, under the tenant's `evidence/sha256/<digest>` namespace |
 | `POST /v1/verification/execute` | Exact Verifier and subject, optional Run and `group_id`, named input declarations, optional route overrides → `200 VerificationResult` |
 | `POST /v1/verification/enqueue` | The same Run evidence with `Idempotency-Key` → `202 { execution_id }` |
 | `GET /v1/verification/executions/{execution_id}` | Status, terminal error, result when visible, and a group execution's `group_id`, owner, and source selection once its input record is visible; a direct execution's completed status once its records are visible |
 | `GET /v1/verification/bindings/{binding_id}` | Readiness, cadence, `last_execution_id`, and a `group_end` binding's frozen settings and source bindings |
 
 File contents never pass through Postgres or a verification request body; an
-uploaded file does not become a Card. Remote storage backends return direct
-single-PUT plans to tenant object storage and do not mount the local route.
-The local filesystem backend has no presigned target, so its plans point at
-`PUT /v1/verification/evidence/local/{sha256}`: the server takes the tenant
-from the authenticated caller, never the path; refuses a body over
-`WYRD_VERIFICATION_FILE_MAX_MIB` or one that hashes to another digest before
-the object becomes readable; and writes the same tenant-qualified
-`evidence/sha256/<digest>` key with no metadata row. A repeated upload of one
-digest is idempotent. `ArtifactRef` selects a declared Artifact under its
-own authorization.
+uploaded file does not become a Card. A File upload is a Card-less record in
+the shared storage upload lifecycle: it plans with the same planner policy as
+a Card file (single PUT, multipart, Azure block blob, or the local upload
+capability), transfers through the same client, and is ready only once
+`POST /v1/cards/upload/{upload_id}/complete` verifies its stored digest and
+length and records a `file_upload` fact in `bifrost.storage.objects`. That
+completion returns only after the fact is acknowledged; it is the one
+completion guarantee for Card files and Files alike. Planning reuses a File
+only when a completed, undeleted same-tenant `file_upload` fact matches its
+digest and length; object presence, a Card file, or another tenant's record
+never stands in for one. Verification reads a File from its recorded storage
+location and re-checks its length and digest. Per-file and aggregate limits
+(`WYRD_VERIFICATION_FILE_MAX_MIB`, `WYRD_VERIFICATION_FILES_MAX_MIB`) are
+enforced at planning. `ArtifactRef` selects a declared Artifact under its own
+authorization.
 
 Public invocation checks `verifier:run` against the selected Verifier's exact
 Card UID. `PermissionScope::Verifier(CardUid)` names one UID; `All` covers
 every Verifier in the tenant. Permission is checked before execution and the
 decision is audited. A binding does not replace the invocation permission.
-Both evidence routes stage bytes and select no Verifier, so they require only
-operation-level `verifier:run` admission: any `verifier:run` grant, exact or
-`All`, admits them, and the decision is audited the same way.
+Planning and every follow-up operation on a File upload (part URL, local
+transfer, completion, abort) stage bytes and select no Verifier, so they
+require only operation-level `verifier:run` admission: any `verifier:run`
+grant, exact or `All`, admits them, and the decision is audited the same way.
+A follow-up operation derives its permission from the upload's persisted
+owner, never the request: a Card upload requires `cards:write`, a File
+upload `verifier:run`, and an upload of another tenant is not found.
 
 Neither Run entry point writes Postgres on the request path. `verify` runs
 inline and stages its pinned inputs and result on the process Scribe outbox.

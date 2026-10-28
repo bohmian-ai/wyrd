@@ -8,7 +8,7 @@
 //! [`VerificationExecutionState`]. Execution status stays separate from the
 //! verdict: a failed requirement is a normal result, never a transport error.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -648,6 +648,26 @@ impl Verdict {
         Ok(schema)
     }
 
+    /// Narrows a resolved Verdict schema's citation slots to `slots`, the
+    /// bare slot names one check invocation can reach.
+    ///
+    /// Hosts apply it to a per-call copy before the model runs, so the
+    /// provider request and local validation admit the same slots and a
+    /// wrong slot is repaired rather than judged. An empty set, or a schema
+    /// without the generated `SlotName` definition, is left unchanged;
+    /// final evidence validation still decides every citation.
+    pub fn restrict_slots(schema: &mut Value, slots: &BTreeSet<SlotName>) {
+        if slots.is_empty() {
+            return;
+        }
+        if let Some(slot) = schema.pointer_mut("/$defs/SlotName") {
+            *slot = serde_json::json!({
+                "type": "string",
+                "enum": slots.iter().map(SlotName::as_str).collect::<Vec<_>>(),
+            });
+        }
+    }
+
     /// Refuses custom `data` beyond the fixed size and depth bounds.
     ///
     /// Size is the compact UTF-8 JSON encoding of `data` alone, with only
@@ -1067,6 +1087,20 @@ mod tests {
     /// on the wrong side.
     #[test]
     fn plain_verdict_schema_is_portable() {
+        /// Refuses a non-portable keyword or a `$ref` sibling anywhere.
+        fn portable(value: &Value) {
+            match value {
+                Value::Object(map) => {
+                    assert!(!map.contains_key("$ref") || map.len() == 1, "{map:?}");
+                    for keyword in ["oneOf", "const", "minimum", "format"] {
+                        assert!(!map.contains_key(keyword), "{keyword} in {map:?}");
+                    }
+                    map.values().for_each(portable);
+                }
+                Value::Array(items) => items.iter().for_each(portable),
+                _ => {}
+            }
+        }
         /// The schema with every `title` and `description` removed.
         fn structure(value: &Value) -> Value {
             match value {
@@ -1132,20 +1166,6 @@ mod tests {
             }
         });
         assert_eq!(structure(&schema), target, "{schema:#}");
-        /// Refuses a non-portable keyword or a `$ref` sibling anywhere.
-        fn portable(value: &Value) {
-            match value {
-                Value::Object(map) => {
-                    assert!(!map.contains_key("$ref") || map.len() == 1, "{map:?}");
-                    for keyword in ["oneOf", "const", "minimum", "format"] {
-                        assert!(!map.contains_key(keyword), "{keyword} in {map:?}");
-                    }
-                    map.values().for_each(portable);
-                }
-                Value::Array(items) => items.iter().for_each(portable),
-                _ => {}
-            }
-        }
         portable(&schema);
         let validator = jsonschema::validator_for(&schema).expect("valid schema");
         let verdict = |outcome: Value, locator: Value| json!({"outcome": outcome, "reason": "r", "citations": [{"slot": "order", "locator": locator}]});
@@ -1224,6 +1244,30 @@ mod tests {
             json!({}),
         ] {
             assert!(!validator.is_valid(&verdict(data.clone())), "{data}");
+        }
+    }
+
+    /// Restriction admits exactly the reachable bare slots, and an empty set
+    /// leaves the schema unchanged.
+    ///
+    /// # Panics
+    /// Panics when a slot outside the set, or a prefixed slot, is admitted.
+    #[test]
+    fn restrict_slots_admits_only_reachable_slots() {
+        let plain = Value::Object(
+            Verdict::response_format(&NamedResponseFormat::Name(VERDICT_FORMAT.to_owned()))
+                .expect("resolves"),
+        );
+        let mut unchanged = plain.clone();
+        Verdict::restrict_slots(&mut unchanged, &BTreeSet::new());
+        assert_eq!(unchanged, plain);
+        let mut schema = plain;
+        let slots = ["order", "receipt"].map(|slot| SlotName::new(slot).expect(slot));
+        Verdict::restrict_slots(&mut schema, &slots.into_iter().collect());
+        let slot = jsonschema::validator_for(&schema["$defs"]["SlotName"]).expect("valid");
+        assert!(slot.is_valid(&json!("order")) && slot.is_valid(&json!("receipt")));
+        for wrong in ["inputs.order", "other", ""] {
+            assert!(!slot.is_valid(&json!(wrong)), "{wrong}");
         }
     }
 

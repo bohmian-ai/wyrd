@@ -1991,7 +1991,7 @@ impl ShardOwner {
             })?,
             wal_node_id: replayed.stream.node_id.as_uuid(),
             wal_writer_epoch: replayed.stream.writer_epoch.as_i64(),
-            wal_shard_id: i16::from(replayed.wal_lane),
+            wal_shard_id: i16::from(replayed.shard_id),
             wal_segment_sequence: i64::try_from(commit.segment_sequence).map_err(|_| {
                 ScribeError::Internal {
                     detail: "WAL replay segment sequence exceeds SQL bigint range".to_owned(),
@@ -2358,6 +2358,17 @@ impl ShardOwner {
             Err(PersistenceSubmitError::Closed(job)) => Some((job, true)),
         };
         let Some((mut job, closed)) = refused else {
+            let active_paths = self
+                .wal_segments
+                .values()
+                .flat_map(|segments| segments.keys().cloned())
+                .collect::<HashSet<_>>();
+            if let Err(error) = self
+                .wal_handle
+                .close_segments_if_unowned(&generation.wal_segments, &active_paths)
+            {
+                tracing::warn!(error = %error, "closed WAL segment could not be detached after bucket rotation");
+            }
             return true;
         };
         if let Some(previous) = index
@@ -2613,21 +2624,7 @@ impl ShardOwner {
             // another owner still reaches the segment. The last member to
             // commit after every active bucket, pending or retained member,
             // and cohort has let go is its sole remaining retirement owner.
-            // With no active bucket left, every record of the open WAL
-            // generation belongs to a sealed member, so the generation lets
-            // go of its segments too and this member may retire them.
-            if self.wal_segments.is_empty() {
-                retained
-                    .wal_segments
-                    .extend(self.wal_handle.release_sealed_generation()?);
-                retained
-                    .wal_segments
-                    .sort_by(|left, right| left.path.cmp(&right.path));
-                retained
-                    .wal_segments
-                    .dedup_by(|left, right| left.path == right.path);
-            }
-            let referenced = self.referenced_wal_paths()?;
+            let referenced = self.referenced_wal_paths();
             retained
                 .wal_segments
                 .retain(|segment| !referenced.contains(&segment.path));
@@ -2637,28 +2634,15 @@ impl ShardOwner {
 
     /// Collects every WAL path still reachable from this shard's owners.
     ///
-    /// Active buckets, the active WAL generation, queued and retained
-    /// generations, and rotation cohorts each keep replay bytes alive. A
-    /// committed selective member may retire a segment only when it is absent
-    /// from this set; segments still current are additionally skipped by the
-    /// WAL itself. The active generation's segments are retained by it until
-    /// rotation hands them to a cohort or the last active bucket seals, so a
-    /// member never releases them while the generation is open.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the WAL state lock is poisoned.
-    fn referenced_wal_paths(&self) -> Result<HashSet<std::path::PathBuf>, ScribeError> {
+    /// Active buckets, queued and retained generations, and rotation cohorts
+    /// each keep replay bytes alive. A committed selective member may retire a
+    /// segment only when it is absent from this set; segments still current
+    /// are additionally skipped by the WAL itself.
+    fn referenced_wal_paths(&self) -> HashSet<std::path::PathBuf> {
         let active = self
             .wal_segments
             .values()
-            .flat_map(|segments| segments.keys().cloned())
-            .chain(
-                self.wal_handle
-                    .active_generation_segments()?
-                    .into_iter()
-                    .map(|segment| segment.path),
-            );
+            .flat_map(|segments| segments.keys().cloned());
         let pending = self.pending_generations.values().flat_map(|queue| {
             queue.iter().flat_map(|pending| {
                 pending
@@ -2680,11 +2664,11 @@ impl ShardOwner {
                 .iter()
                 .map(|segment| segment.path.clone())
         });
-        Ok(active
+        active
             .chain(pending)
             .chain(retained)
             .chain(cohorts)
-            .collect())
+            .collect()
     }
 
     /// Reconciles one persistence result with this owner's FIFO generation queue.
@@ -3540,14 +3524,16 @@ impl ShardOwner {
             .values()
             .flat_map(|segments| segments.values().map(|segment| segment.reference()))
             .collect::<Vec<_>>();
-        let closed = self.wal_handle.close_active_generation()?;
-        segment_refs.extend(closed.iter().cloned());
+        if let Some(closed) = self.wal_handle.close_active_generation()?
+            && !segment_refs
+                .iter()
+                .any(|segment| segment.path == closed.path)
+        {
+            segment_refs.push(closed);
+        }
         segment_refs.sort_by(|left, right| left.path.cmp(&right.path));
         segment_refs.dedup_by(|left, right| left.path == right.path);
         self.wal_handle.retain_segments(&segment_refs)?;
-        // The cohort now holds every closed segment, so the generation's own
-        // references, taken at its first append to each, are released.
-        self.wal_handle.retire_segments(&closed)?;
         let frozen = self.memtable.freeze_all_nonempty()?;
         let frozen_bytes = frozen.iter().try_fold(0_usize, |total, member| {
             total
@@ -5523,7 +5509,6 @@ mod tests {
             stream,
             seal_key: owner_bad_binding_key(),
             shard_id: 0,
-            wal_lane: 0,
             data_records: Vec::new(),
             append_metas: Vec::new(),
             wal_segments: Vec::new(),
@@ -5665,7 +5650,6 @@ mod tests {
                     stream,
                     seal_key,
                     shard_id: 0,
-                    wal_lane: 0,
                     data_records: Vec::new(),
                     append_metas: Vec::new(),
                     wal_segments: Vec::new(),
@@ -6709,7 +6693,6 @@ mod tests {
             ),
             seal_key: key.clone(),
             shard_id: 0,
-            wal_lane: 0,
             data_records: vec![vec![1], vec![2], vec![3]],
             append_metas: vec![meta(canonical, 1), meta(retry, 3), meta(canonical, 5)],
             wal_segments: Vec::new(),
@@ -6861,7 +6844,6 @@ mod tests {
             stream,
             seal_key: key,
             shard_id: 0,
-            wal_lane: 0,
             data_records: Vec::new(),
             append_metas,
             wal_segments: Vec::new(),
@@ -7984,212 +7966,6 @@ mod tests {
 
         assert_eq!(owner.wal_io.write_submissions_for_test(), 2);
         assert_eq!(owner.wal_io.sync_submissions_for_test(), 1);
-    }
-
-    /// Two shards share one WAL segment and one physical sync; a failed shared
-    /// sync acknowledges and publishes neither shard's rows.
-    ///
-    /// Shards 0 and 7 append their SLICE and COMMIT records to the one process
-    /// stream. The first shard's sync makes both shards' records durable, so
-    /// the second shard's sync finds nothing unsynced: one physical `fdatasync`
-    /// covers the cycle. When a rollover separates the shards' records, each
-    /// touched segment syncs. Through real shard owners, each group's rows are
-    /// visible and acknowledged only after its sync, in submission order. Once
-    /// one shard's sync fails, the WAL faults: neither shard acknowledges or
-    /// publishes another row, and their ingress reservations are released.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the shared cycle takes more than one physical sync, a
-    /// rollover leaves a touched segment unsynced, a group fails before the
-    /// fault, or a group after the fault acknowledges, publishes, or retains
-    /// ingress memory.
-    #[tokio::test]
-    async fn shared_wal_cycle_preserves_fair_durable_completion() {
-        fn slice(key: &SealKey, batch: u8) -> crate::scribe::wal::PreparedWalAppend {
-            crate::scribe::wal::PreparedWalAppend::new(
-                WalLsn::ZERO,
-                [batch; 16],
-                bytes::Bytes::from_static(b"rows"),
-            )
-            .for_slice(key.clone(), [7; 32])
-        }
-        let synced = |recorder: &wyrd_bench::BenchmarkRecorder| {
-            recorder
-                .snapshot()
-                .counters
-                .get("bifrost_scribe_wal_fsync_total{outcome=\"success\"}")
-                .copied()
-                .unwrap_or_default()
-        };
-        let key = owner_key();
-        let node = crate::scribe::stream_identity::NodeId::generate();
-        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
-        let segment_files = |root: &std::path::Path| {
-            std::fs::read_dir(
-                root.join(node.as_uuid().simple().to_string())
-                    .join("1")
-                    .join("shard-00"),
-            )
-            .expect("shared stream directory")
-            .filter(|entry| {
-                entry
-                    .as_ref()
-                    .expect("stream entry")
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "wal")
-            })
-            .count()
-        };
-
-        // One cycle: both shards append, then each syncs what it touched.
-        for (segment_bytes, expected_segments) in [(u64::MAX, 1_usize), (1, 2)] {
-            let wal_root = tempfile::tempdir().expect("WAL directory");
-            let wal = WalWriter::new(
-                wal_root.path(),
-                *node.as_bytes(),
-                1,
-                crate::scribe::wal::WalConfig::new(segment_bytes).expect("WAL config"),
-            )
-            .expect("WAL writer");
-            let (first, second) = (
-                wal.handle_for_shard(0).expect("shard 0"),
-                wal.handle_for_shard(7).expect("shard 7"),
-            );
-            let recorder = wyrd_bench::BenchmarkRecorder::default();
-            metrics::with_local_recorder(&recorder, || {
-                let first_touched = first
-                    .append_prepared(slice(&key, 1))
-                    .expect("shard 0 append")
-                    .touched_segments;
-                let second_touched = second
-                    .append_prepared(slice(&key, 2))
-                    .expect("shard 7 append")
-                    .touched_segments;
-                first.sync_segments(&first_touched).expect("shard 0 sync");
-                second.sync_segments(&second_touched).expect("shard 7 sync");
-            });
-            assert_eq!(
-                synced(&recorder),
-                u64::try_from(expected_segments).expect("segment count fits u64"),
-                "one physical sync per touched segment, however many shards share it"
-            );
-            assert_eq!(segment_files(wal_root.path()), expected_segments);
-            let reader = crate::scribe::wal::WalReader::open_directory_unfiltered(wal_root.path())
-                .expect("reader");
-            let shards = reader
-                .read_all_records()
-                .expect("durable records")
-                .iter()
-                .map(|record| record.shard_id)
-                .collect::<Vec<_>>();
-            assert_eq!(shards, [0, 7], "each record names the shard that wrote it");
-        }
-
-        // Real owners: durable completion first, then a shared sync fault.
-        let wal_root = tempfile::tempdir().expect("WAL directory");
-        let wal = Arc::new(
-            WalWriter::new(
-                wal_root.path(),
-                *node.as_bytes(),
-                1,
-                crate::scribe::wal::WalConfig::default(),
-            )
-            .expect("WAL writer"),
-        );
-        let (mut first, budget) = owner_for_completion_test_with_budget(
-            Memtable::new(),
-            &wal,
-            wal.handle_for_shard(0).expect("shard 0"),
-            stream,
-        );
-        let (mut second, second_budget) = owner_for_completion_test_with_budget(
-            Memtable::new(),
-            &wal,
-            wal.handle_for_shard(7).expect("shard 7"),
-            stream,
-        );
-        second.id = 7;
-        let visible_rows = |owner: &ShardOwner| {
-            let stats = owner.memtable.stats().expect("query-visible rows");
-            stats.writable_rows + stats.immutable_rows
-        };
-        let ids = |count| (0..count).map(|_| uuid::Uuid::now_v7()).collect::<Vec<_>>();
-        let (first_group, first_acks) = acked_group_for_key(&budget, &key, &ids(2));
-        let (second_group, second_acks) = acked_group_for_key(&second_budget, &key, &ids(2));
-        let (first_result, second_result) = tokio::join!(
-            first.process_group(first_group),
-            second.process_group(second_group)
-        );
-        first_result.expect("shard 0 group commits");
-        second_result.expect("shard 7 group commits");
-        let mut acknowledged_rows = Vec::new();
-        for ack in first_acks.into_iter().chain(second_acks) {
-            acknowledged_rows.push(ack.await.expect("ACK delivered").expect("durable").rows);
-        }
-        assert_eq!(
-            u64::try_from(visible_rows(&first) + visible_rows(&second))
-                .expect("row count fits u64"),
-            acknowledged_rows.iter().sum::<u64>(),
-            "every acknowledged row is visible on its own shard"
-        );
-        assert_eq!(
-            segment_files(wal_root.path()),
-            1,
-            "both shards share one segment"
-        );
-        let reader = crate::scribe::wal::WalReader::open_directory_unfiltered(wal_root.path())
-            .expect("reader");
-        let mut writers = reader
-            .read_all_records()
-            .expect("durable records")
-            .iter()
-            .map(|record| record.shard_id)
-            .collect::<Vec<_>>();
-        writers.sort_unstable();
-        writers.dedup();
-        assert_eq!(writers, [0, 7]);
-
-        let before = (visible_rows(&first), visible_rows(&second));
-        wal.trip_sync_failure_for_test();
-        let (first_group, first_acks) = acked_group_for_key(&budget, &key, &ids(1));
-        first
-            .process_group(first_group)
-            .await
-            .expect_err("a failed sync never acknowledges");
-        assert!(wal.is_faulted(), "a sync failure faults the shared WAL");
-        let (second_group, second_acks) = acked_group_for_key(&second_budget, &key, &ids(1));
-        second
-            .process_group(second_group)
-            .await
-            .expect_err("no shard commits after the shared fault");
-        for ack in first_acks.into_iter().chain(second_acks) {
-            assert!(
-                !matches!(ack.await, Ok(Ok(_))),
-                "no batch acknowledges after a failed shared sync"
-            );
-        }
-        assert_eq!(
-            (visible_rows(&first), visible_rows(&second)),
-            before,
-            "no row becomes visible after a failed shared sync"
-        );
-        for (budget, category) in [&budget, &second_budget].into_iter().flat_map(|budget| {
-            [
-                MemoryCategory::Raw,
-                MemoryCategory::Decode,
-                MemoryCategory::Prepared,
-                MemoryCategory::Queued,
-            ]
-            .map(|category| (budget, category))
-        }) {
-            assert_eq!(
-                budget.category_bytes(category),
-                0,
-                "refused groups release their {category:?} reservation"
-            );
-        }
     }
 
     /// A batch resent while its original is still queued commits once.
@@ -9696,53 +9472,6 @@ mod tests {
             .expect("last retirement")
             .expect("last member retained");
         assert_eq!(last.wal_segments, vec![shared]);
-    }
-
-    /// A selectively sealed shard that stays quiet still retires its WAL: the
-    /// open generation's reference on the shared current segment must not
-    /// outlive the last committed member once no active bucket remains.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the generation keeps its reference or the segment survives
-    /// the last member's retirement.
-    #[test]
-    fn last_selective_member_retires_the_open_generation_segment() {
-        let (mut owner, generation_id, _wal, _root, _budget) =
-            committed_retirement_owner_for_test();
-        let append = crate::scribe::wal::PreparedWalAppend::new(
-            WalLsn::ZERO,
-            [5_u8; 16],
-            bytes::Bytes::from_static(b"row"),
-        )
-        .for_slice(owner_key(), [7_u8; 32]);
-        let result = owner
-            .wal_handle
-            .append_prepared(append)
-            .expect("generation append");
-        owner
-            .wal_handle
-            .sync_segments(&result.touched_segments)
-            .expect("generation sync");
-        let segment = result.touched_segments[0].reference();
-        owner
-            .retained_generations
-            .get_mut(&generation_id)
-            .expect("fixture generation")
-            .wal_segments = vec![segment.clone()];
-        assert!(owner.wal_segments.is_empty(), "every bucket is sealed");
-
-        let retained = owner
-            .retire_committed_generation(generation_id)
-            .expect("retirement")
-            .expect("member retained");
-        assert_eq!(retained.wal_segments, vec![segment.clone()]);
-        assert!(!owner.wal_handle.has_active_records().expect("generation"));
-        owner
-            .wal_handle
-            .retire_segments(&retained.wal_segments)
-            .expect("member retires its segments");
-        assert!(!segment.path.exists(), "the quiet shard's WAL retires");
     }
 
     /// Test and periodic retirement callers both retain the generation on an error path.

@@ -166,10 +166,8 @@ fabricate task completion to make health checks pass.
   validated, query-registered staged run.
 - Staged runs are authoritative live-tail inputs until publication and pinned-
   reader release make deletion safe.
-- Restart dispatches WAL by recorded shard identity (the record's shard in v9,
-  the segment header's in v8) and reconstructs dedup, cohort, stage, claim, and
-  publication state before admission. Shards share v9 segments, so a segment
-  retires only after every shard holding it has released it.
+- Restart dispatches WAL by recorded shard identity and reconstructs dedup,
+  cohort, stage, claim, and publication state before admission.
 - Object PUT followed by uncertain SQL settlement is reconciled from
   deterministic claim identity and object evidence. It is not blindly retried
   under a new identity.

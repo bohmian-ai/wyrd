@@ -3609,7 +3609,6 @@ mod tests {
             ),
             seal_key: idle_seal_key(),
             shard_id: 0,
-            wal_lane: 0,
             data_records: Vec::new(),
             append_metas: Vec::new(),
             wal_segments: Vec::new(),

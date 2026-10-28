@@ -31,9 +31,9 @@ use crate::scribe::wal::{
 const REPLAY_RECORD_OVERHEAD_BYTES: usize = 1024;
 /// Replayed state for one seal-key.
 ///
-/// The `shard_id` field carries the pod-local shard recorded in the WAL
-/// record. Replay dispatch MUST use this value rather than recomputing a
-/// shard via `shard_for`, because the routing key now includes the client
+/// The `shard_id` field carries the pod-local shard lane recorded in the WAL
+/// segment header. Replay dispatch MUST use this value rather than recomputing
+/// a shard via `shard_for`, because the routing key now includes the client
 /// `batch_id` and a re-derived key would produce the wrong lane.
 #[derive(Debug, Clone)]
 pub struct ReplayedSealKey {
@@ -41,16 +41,12 @@ pub struct ReplayedSealKey {
     pub stream: StreamIdentity,
     /// The seal-key this state belongs to.
     pub seal_key: SealKey,
-    /// Recorded pod-local shard that wrote the records.
+    /// Recorded pod-local shard lane from the WAL segment header.
     ///
     /// Dispatch MUST use this field for replay routing so that per-shard
     /// `synced_not_inserted` and pending-FIFO dedup state rebuild exactly
     /// where the original writes lived.
     pub shard_id: u8,
-    /// Shard named by the records' segment header, which the batch fence
-    /// stores as its WAL shard: the writing shard in v8, zero for the v9
-    /// process stream.
-    pub wal_lane: u8,
     /// Ordered list of data record payloads (Arrow IPC bytes).
     pub data_records: Vec<Vec<u8>>,
     /// Per-append metadata derived from WAL record headers.
@@ -309,16 +305,15 @@ pub(crate) fn replay_wal_directory_stream_accounted(
     } else {
         WalReader::open_directory_unfiltered(wal_dir)?
     };
-    // Key is (stream, record shard) so that each shard's records accumulate
-    // independently, even where shards share one v9 segment, with the
-    // correct shard threaded to ReplayedSealKey.
+    // Key is (stream, shard_id) so that each shard's records accumulate
+    // independently with the correct shard_id threaded to ReplayedSealKey.
     let mut accumulators: HashMap<(StreamIdentity, u8), ReplayAccumulator<'_>> = HashMap::new();
 
     reader.for_each_stream_record_accounted(
         governor,
         wal,
         fences,
-        |stream, wal_lane, accounted| {
+        |stream, shard_id, accounted| {
             let (segment_path, record, payload_memory) = accounted.into_parts();
             if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
                 return Err(ScribeError::Internal {
@@ -330,13 +325,11 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             }) {
                 return Ok(false);
             }
-            let shard_id = record.shard_id;
             let key = (stream, shard_id);
             if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(key) {
                 entry.insert(ReplayAccumulator::new(
                     stream,
                     shard_id,
-                    wal_lane,
                     sealed_lsn_map(&shard_manifest_path(wal_dir, stream, shard_id))?,
                     governor,
                 )?);
@@ -367,7 +360,7 @@ pub(crate) fn replay_wal_directory_stream_accounted(
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "replay accumulator disappeared before append".to_owned(),
                 })?
-                .append(segment_path.clone(), &record, payload_memory)?;
+                .append(segment_path, &record, payload_memory)?;
             if completed_unit {
                 let accumulator =
                     accumulators
@@ -382,15 +375,9 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             }
             // A completely cursor-suppressed segment has no cohort member and can
             // retire at EOF. Any pending/visible state remains pinned for handoff.
-            // Shards share a v9 segment, so it is safe only when every shard
-            // still reading it is.
             Ok(accumulators
-                .values()
-                .filter(|accumulator| {
-                    accumulator.stream == stream
-                        && accumulator.current_segment_path.as_ref() == Some(&segment_path)
-                })
-                .all(ReplayAccumulator::segment_retirement_safe))
+                .get(&key)
+                .is_some_and(ReplayAccumulator::segment_retirement_safe))
         },
     )?;
 
@@ -423,14 +410,13 @@ pub(crate) fn stream_directory(wal_dir: &Path, stream: StreamIdentity) -> std::p
         .join(stream.writer_epoch.as_i64().to_string())
 }
 
-/// Returns the manifest holding one recorded shard's replay watermarks.
+/// Returns the manifest holding one recorded shard lane's replay watermarks.
 ///
 /// Every shard draws LSNs from the stream's one shared counter but stages its
 /// own generations, so a seal key's watermark is only meaningful for the shard
 /// that staged it: one watermark per stream would let a shard that staged a
 /// later generation hide another shard's unstaged, acknowledged records from
-/// replay. The manifest therefore lives in that shard's directory, keyed by
-/// the record's shard even where v9 segments of every shard share `shard-00`.
+/// replay. The manifest therefore lives beside that shard's WAL segments.
 #[must_use]
 pub(crate) fn shard_manifest_path(
     wal_dir: &Path,
@@ -464,16 +450,15 @@ fn sealed_lsn_map(manifest_path: &Path) -> Result<HashMap<String, WalLsn>, Scrib
 /// Owns the dedupe index and one bounded replay batch while the WAL reader
 /// advances. The index survives batch boundaries; decoded state does not.
 ///
-/// The `shard_id` field is the record-recorded shard for this stream. It is
-/// threaded into every [`ReplayedSealKey`] so that replay dispatch can route
-/// back to the exact original lane without recomputing the routing key.
+/// The `shard_id` field is the segment-header-recorded shard lane for this
+/// stream. It is threaded into every [`ReplayedSealKey`] so that replay
+/// dispatch can route back to the exact original lane without recomputing
+/// the routing key.
 struct ReplayAccumulator<'a> {
     /// WAL stream identity for the records in this accumulator.
     stream: StreamIdentity,
-    /// Recorded pod-local shard that wrote these records.
+    /// Recorded pod-local shard lane from the WAL segment header.
     shard_id: u8,
-    /// Segment-header shard of these records, which their fences store.
-    wal_lane: u8,
     /// Per-seal-key manifest watermarks below which records are skipped.
     sealed_lsn_map: HashMap<String, WalLsn>,
     /// Incomplete v8 batches retained until their terminal COMMIT is read.
@@ -501,16 +486,15 @@ struct ReplayAccumulator<'a> {
 impl<'a> ReplayAccumulator<'a> {
     /// Create an empty bounded replay batch with a zero-sized reservation.
     ///
-    /// The `shard_id` is taken from the WAL record and threaded, with the
-    /// segment-header `wal_lane`, into every [`ReplayedSealKey`] so that the
-    /// caller can dispatch each replayed append back to its recorded lane.
+    /// The `shard_id` is taken from the WAL segment header and threaded into
+    /// every [`ReplayedSealKey`] so that the caller can dispatch each replayed
+    /// append back to its recorded lane.
     ///
     /// # Errors
     /// Returns [`ScribeError`] when the initial memory reservation fails.
     fn new(
         stream: StreamIdentity,
         shard_id: u8,
-        wal_lane: u8,
         sealed_lsn_map: HashMap<String, WalLsn>,
         governor: Option<&'a ScribeResources>,
     ) -> Result<Self, ScribeError> {
@@ -526,7 +510,6 @@ impl<'a> ReplayAccumulator<'a> {
         Ok(Self {
             stream,
             shard_id,
-            wal_lane,
             sealed_lsn_map,
             pending_batches: HashMap::new(),
             pending_memory,
@@ -824,7 +807,6 @@ impl<'a> ReplayAccumulator<'a> {
                 stream: self.stream,
                 seal_key: seal_key.clone(),
                 shard_id: self.shard_id,
-                wal_lane: self.wal_lane,
                 data_records: Vec::new(),
                 append_metas: Vec::new(),
                 wal_segments: Vec::new(),
@@ -1330,9 +1312,8 @@ mod tests {
             crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let baseline = resources.snapshot().expect("baseline snapshot");
         let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
-        let mut accumulator =
-            ReplayAccumulator::new(stream, 0, 0, HashMap::new(), Some(&resources))
-                .expect("replay accumulator");
+        let mut accumulator = ReplayAccumulator::new(stream, 0, HashMap::new(), Some(&resources))
+            .expect("replay accumulator");
         let payload = resources
             .try_reserve_maintenance(MemoryCategory::Decode, 3)
             .expect("payload lease");

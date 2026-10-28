@@ -112,29 +112,16 @@ fn wal_segments(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// them on its lifecycle tick and deletes a segment only once it is closed, so
 /// this polls the production outcome rather than assuming a schedule.
 ///
-/// Every shard shares the process WAL, so records appended after the
-/// acknowledgement — the append's own permission audit among them — land in
-/// the same segment and keep it until they stage too. Each poll therefore
-/// flushes again and waits for that staging.
-///
 /// # Panics
 ///
 /// Panics when any segment remains after the case deadline.
-async fn await_wal_retired(
-    scribe: &vala_bifrost_redux::scribe::ScribeImpl,
-    acknowledged: &[std::path::PathBuf],
-) {
+async fn await_wal_retired(acknowledged: &[std::path::PathBuf]) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let retained: Vec<_> = acknowledged.iter().filter(|path| path.exists()).collect();
         if retained.is_empty() {
             return;
         }
-        scribe
-            .flush_writable_for_test()
-            .await
-            .expect("every writable bucket freezes");
-        await_persistence_drained(scribe).await;
         assert!(
             tokio::time::Instant::now() < deadline,
             "staged durability retires the WAL that backed the run: {retained:?}"
@@ -208,7 +195,7 @@ async fn variant_staging_restores_and_publishes_once() {
             .await
             .expect("every writable bucket freezes");
         await_persistence_drained(&scribe).await;
-        await_wal_retired(&scribe, &acknowledged).await;
+        await_wal_retired(&acknowledged).await;
     }
     assert_eq!(
         published_rows(&server, tenant, &name).await,

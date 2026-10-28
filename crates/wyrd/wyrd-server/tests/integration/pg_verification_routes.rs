@@ -7,7 +7,9 @@
 //! and conflict, every refusal before staging, the audited allow and deny
 //! decisions, and tenant isolation. No runtime claims the queue, so every
 //! accepted execution stays `pending`; direct executions judge inline and never
-//! enqueue. It also proves the tenant's internal SYSTEM result writer is
+//! enqueue. Verification Files travel the shared `/v1/cards/upload/*`
+//! lifecycle under their persisted File ownership and are reused only from a
+//! completed File inventory record. It also proves the tenant's internal SYSTEM result writer is
 //! unreachable through the public principal and credential routes.
 
 use std::time::Duration;
@@ -15,9 +17,13 @@ use std::time::Duration;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
+use sha2::Digest as _;
 use uuid::Uuid;
 use wyrd_runtime::Permission;
-use wyrd_spec::auth::TokenAudience;
+use wyrd_server::components::storage::inventory::{
+    ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
+};
+use wyrd_spec::auth::{Attribution, PrincipalId, Sha256Hex, TokenAudience};
 use wyrd_spec::ids::{BindingId, CardUid, DataTenantId, ExecutionId};
 use wyrd_spec::reference::CardRef;
 use wyrd_testing::verification::VerificationFixture;
@@ -764,42 +770,356 @@ fn document_answer_is_one() -> Value {
     })
 }
 
-/// PUT `body` to the local evidence route for `sha256` as `jwt`.
+/// The JSON document a File test uploads; the document Verifier passes it.
+const DOCUMENT: &[u8] = br#"{"answer":1}"#;
+
+/// The shared single-PUT completion body every local upload completes with.
+fn single_put() -> Value {
+    json!({ "protocol": "single_put", "data": {} })
+}
+
+/// Plan `bytes` as one verification File as `jwt`.
 ///
 /// # Panics
 /// Panics when the request cannot be built or the route fails to respond.
-async fn put_evidence(
-    server: &WyrdTestServer,
-    jwt: &str,
-    sha256: &str,
-    body: &'static [u8],
-) -> StatusCode {
-    let request = Request::builder()
-        .method(Method::PUT)
-        .uri(format!("/v1/verification/evidence/local/{sha256}"))
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from(body))
-        .expect("request builds");
-    server
-        .oneshot_authenticated(jwt, request)
-        .await
-        .expect("request responds")
-        .status()
+async fn plan_file(server: &WyrdTestServer, jwt: &str, bytes: &[u8]) -> (StatusCode, Value) {
+    let sha256 = Sha256Hex::digest(bytes).to_string();
+    let plan = json!({ "files": [{ "sha256": sha256, "size_bytes": bytes.len() }] });
+    send(
+        server,
+        jwt,
+        Method::POST,
+        "/v1/verification/evidence",
+        Some(&plan),
+    )
+    .await
 }
 
-/// Evidence staging is admitted by any `verifier:run` grant: a caller holding
-/// it for exactly one Verifier plans and uploads a missing local file, sees it
-/// held on a second plan, then verifies and submits it with that Verifier,
-/// while another Verifier stays refused. A caller with no `verifier:run`
-/// grant is refused with one audited denial on each staging route, and a body
-/// of another digest is refused.
+/// PUT `body` to the local blob route of `upload_id` as `jwt`.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn put_local(
+    server: &WyrdTestServer,
+    jwt: &str,
+    upload_id: &str,
+    body: &[u8],
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("/v1/cards/upload/local/{upload_id}"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(body.to_vec()))
+        .expect("request builds");
+    let response = server
+        .oneshot_authenticated(jwt, request)
+        .await
+        .expect("request responds");
+    decoded(response).await
+}
+
+/// POST `action` (`complete`, `abort`, or `part-url?part_number=1`) on
+/// `upload_id` as `jwt`.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn upload_op(
+    server: &WyrdTestServer,
+    jwt: &str,
+    upload_id: &str,
+    action: &str,
+) -> (StatusCode, Value) {
+    let body = action.starts_with("complete").then(single_put);
+    send(
+        server,
+        jwt,
+        Method::POST,
+        &format!("/v1/cards/upload/{upload_id}/{action}"),
+        body.as_ref(),
+    )
+    .await
+}
+
+/// The one planned upload of a File plan.
+///
+/// # Panics
+/// Panics when the plan holds no single upload.
+#[track_caller]
+fn planned_upload(planned: &Value) -> String {
+    let uploads = planned["uploads"].as_array().expect("uploads is a list");
+    assert_eq!(uploads.len(), 1, "{planned}");
+    uploads[0]["upload_id"]
+        .as_str()
+        .expect("the upload has an id")
+        .to_owned()
+}
+
+/// Upload `bytes` as one verification File through the shared lifecycle as
+/// `jwt`: plan, local PUT, and completion.
+///
+/// # Panics
+/// Panics when any step answers other than success.
+pub(crate) async fn upload_file(server: &WyrdTestServer, jwt: &str, bytes: &[u8]) {
+    let (status, planned) = plan_file(server, jwt, bytes).await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    let upload_id = planned_upload(&planned);
+    let (status, stored) = put_local(server, jwt, &upload_id, bytes).await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    let (status, completed) = upload_op(server, jwt, &upload_id, "complete").await;
+    assert_eq!(status, StatusCode::OK, "{completed}");
+}
+
+/// A direct execution judging the Service with `verifier` over `bytes` as
+/// its JSON `doc` File.
+fn document_request(fixture: &Fixture, verifier: &CardUid, bytes: &[u8]) -> String {
+    json!({
+        "verifier_card_uid": verifier,
+        "card_uid": fixture.service,
+        "inputs": { "doc": { "kind": "file", "sha256": Sha256Hex::digest(bytes).to_string(),
+                             "size_bytes": bytes.len(), "format": "json" } }
+    })
+    .to_string()
+}
+
+/// A new File is planned as a shared upload session, transferred, and
+/// completed through the shared storage completion, which records it in the
+/// object inventory: the completion reports the tenant's digest-addressed
+/// File object, a repeated completion replays it, the next plan reuses the
+/// record, and the Verifier reads the recorded bytes and passes.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, plan, path, or verdict expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn file_upload_uses_shared_completion() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let document = fixture
+        .seed
+        .verifier("vf-document", &document_answer_is_one())
+        .await
+        .expect("document Verifier registers");
+    let (_, jwt) = user(&server, "vf-writer", &["editor"]).await;
+    let sha256 = Sha256Hex::digest(DOCUMENT);
+
+    let (status, planned) = plan_file(&server, &jwt, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    let upload_id = planned_upload(&planned);
+    assert_eq!(planned["uploads"][0]["sha256"], sha256.to_string());
+    assert_eq!(
+        planned["uploads"][0]["plan"]["protocol"], "local_fs",
+        "{planned}"
+    );
+    let (status, stored) = put_local(&server, &jwt, &upload_id, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    let (status, completed) = upload_op(&server, &jwt, &upload_id, "complete").await;
+    assert_eq!(status, StatusCode::OK, "{completed}");
+    assert_eq!(
+        completed["stored"]["storage_path"],
+        format!("{}/evidence/sha256/{sha256}", server.data_tenant_id()),
+        "{completed}"
+    );
+    let (status, replayed) = upload_op(&server, &jwt, &upload_id, "complete").await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    for field in ["storage_path", "sha256", "size_bytes"] {
+        assert_eq!(
+            replayed["stored"][field], completed["stored"][field],
+            "{field}"
+        );
+    }
+
+    let (status, held) = plan_file(&server, &jwt, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    assert_eq!(held["uploads"], json!([]), "the completed File is reused");
+    let (status, judged) = execute(
+        &server,
+        &jwt,
+        document_request(&fixture, &document, DOCUMENT),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Assert a direct execution stayed inconclusive because its File has no
+/// completed upload record, rather than reading a guessed path.
+///
+/// # Panics
+/// Panics when the execution answered otherwise.
+#[track_caller]
+fn assert_not_ready(status: StatusCode, judged: &Value) {
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    assert_eq!(judged["outcome"]["verdict"], "inconclusive", "{judged}");
+    assert_eq!(
+        judged["outcome"]["steps"][0]["reason"],
+        "the evidence file has no completed upload record yet",
+        "{judged}"
+    );
+}
+
+/// Only a completed File upload record of this tenant with the declared
+/// digest and size is reused. Stored bytes whose upload never completed, a
+/// Card file or envelope of identical content, the same File completed in
+/// another tenant, a deleted record, and another declared size are planned
+/// again, and a Verifier over a File with no
+/// completed record is not judged from a guessed path.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, plan, or verdict expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn file_reuse_requires_completed_file_inventory() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let document = fixture
+        .seed
+        .verifier("vf-reuse-document", &document_answer_is_one())
+        .await
+        .expect("document Verifier registers");
+    let (writer, jwt) = user(&server, "vf-reuse-writer", &["editor"]).await;
+
+    let (status, planned) = plan_file(&server, &jwt, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    let upload_id = planned_upload(&planned);
+    let (status, stored) = put_local(&server, &jwt, &upload_id, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    let (status, replanned) = plan_file(&server, &jwt, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{replanned}");
+    planned_upload(&replanned);
+    let (status, unready) = execute(
+        &server,
+        &jwt,
+        document_request(&fixture, &document, DOCUMENT),
+    )
+    .await;
+    assert_not_ready(status, &unready);
+
+    let state = server.state();
+    let tenant = server.data_tenant_id();
+    let fact =
+        |storage_path: String, origin, card_uid: Option<CardUid>, object: ObjectState| ObjectFact {
+            storage_path,
+            upload_id: None,
+            backend: state.storage.backend().to_string(),
+            sha256: (object == ObjectState::Completed).then(|| {
+                base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    sha2::Sha256::digest(DOCUMENT),
+                )
+            }),
+            size_bytes: i64::try_from(DOCUMENT.len()).expect("the document size fits"),
+            content_type: None,
+            sse_marker: None,
+            origin,
+            relative_path: card_uid.as_ref().map(|_| "doc.json".to_owned()),
+            card_uid,
+            state: object,
+        };
+    let card_path = format!("{tenant}/cards/{}/doc.json", fixture.service);
+    ObjectInventory::new(state)
+        .record(
+            tenant,
+            Attribution::direct(PrincipalId::new(writer)),
+            &[
+                fact(
+                    card_path.clone(),
+                    ObjectOrigin::CardFile,
+                    Some(fixture.service.clone()),
+                    ObjectState::Completed,
+                ),
+                fact(
+                    card_path,
+                    ObjectOrigin::CardEnvelope,
+                    Some(fixture.service.clone()),
+                    ObjectState::Completed,
+                ),
+            ],
+        )
+        .await
+        .expect("the Card objects record");
+    let (status, card_only) = plan_file(&server, &jwt, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{card_only}");
+    planned_upload(&card_only);
+
+    let other: DataTenantId = server.seed_tenant("vf-other").await.expect("tenant seeds");
+    let foreign = server
+        .bootstrap_service_in_tenant(other, "vf-other-editor", &["editor"])
+        .await
+        .expect("foreign editor bootstraps");
+    let foreign_jwt = server
+        .exchange_api_key(foreign.api_key().expect("foreign editor has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
+    upload_file(&server, &foreign_jwt, DOCUMENT).await;
+    let (status, home) = plan_file(&server, &jwt, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{home}");
+    planned_upload(&home);
+
+    upload_file(&server, &jwt, DOCUMENT).await;
+    let (status, held) = plan_file(&server, &jwt, DOCUMENT).await;
+    assert_eq!(
+        (status, &held["uploads"]),
+        (StatusCode::OK, &json!([])),
+        "{held}"
+    );
+    let sha256 = Sha256Hex::digest(DOCUMENT).to_string();
+    let resized = json!({ "files": [{ "sha256": sha256, "size_bytes": DOCUMENT.len() + 1 }] });
+    let (status, resized) = send(
+        &server,
+        &jwt,
+        Method::POST,
+        "/v1/verification/evidence",
+        Some(&resized),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resized}");
+    planned_upload(&resized);
+
+    ObjectInventory::new(state)
+        .record(
+            tenant,
+            Attribution::direct(PrincipalId::new(writer)),
+            &[fact(
+                format!("{tenant}/evidence/sha256/{sha256}"),
+                ObjectOrigin::FileUpload,
+                None,
+                ObjectState::Deleted,
+            )],
+        )
+        .await
+        .expect("the deletion records");
+    let (status, deleted) = plan_file(&server, &jwt, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    planned_upload(&deleted);
+    let (status, gone) = execute(
+        &server,
+        &jwt,
+        document_request(&fixture, &document, DOCUMENT),
+    )
+    .await;
+    assert_not_ready(status, &gone);
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// File upload operations are admitted by any `verifier:run` grant and
+/// selected by the upload's persisted owner: a caller holding it for exactly
+/// one Verifier plans, transfers, completes, and aborts its File uploads and
+/// judges with that Verifier, but cannot write a Card, continue a Card's
+/// upload, or invoke another Verifier. Malformed and foreign upload IDs,
+/// bodies that disagree with the declaration, and files over the limits are
+/// refused with their catalog codes, and a caller with no `verifier:run`
+/// grant is refused with one audited denial on each operation.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
 /// to respond, or any status, code, plan, verdict, or audit expectation fails.
 #[tokio::test(flavor = "current_thread")]
-async fn exact_verifier_grant_stages_local_evidence() {
-    const DOCUMENT: &[u8] = br#"{"answer":1}"#;
+async fn file_upload_authority_and_validation_are_preserved() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -820,97 +1140,230 @@ async fn exact_verifier_grant_stages_local_evidence() {
         .await
         .expect("role seeds");
     let (exact, exact_jwt) = user(&server, "ve-exact", &["ve_exact_verifier"]).await;
-    let sha256 = wyrd_spec::auth::Sha256Hex::digest(DOCUMENT).to_string();
-    let plan = json!({ "files": [{ "sha256": sha256, "size_bytes": DOCUMENT.len() }] });
+    let (_, editor_jwt) = user(&server, "ve-editor", &["editor"]).await;
+    let code = |problem: &Value| problem["code"].as_str().map(str::to_owned);
 
-    let (status, planned) = send(
-        &server,
-        &exact_jwt,
-        Method::POST,
-        "/v1/verification/evidence",
-        Some(&plan),
-    )
-    .await;
+    let (status, planned) = plan_file(&server, &exact_jwt, DOCUMENT).await;
     assert_eq!(status, StatusCode::OK, "{planned}");
-    assert_eq!(
-        planned["uploads"].as_array().map(Vec::len),
-        Some(1),
-        "{planned}"
+    let upload_id = planned_upload(&planned);
+    let (status, problem) =
+        upload_op(&server, &exact_jwt, &upload_id, "part-url?part_number=1").await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "part URLs are authorized: {problem}"
     );
-    assert_eq!(
-        put_evidence(&server, &exact_jwt, &sha256, br#"{"answer":2}"#).await,
-        StatusCode::BAD_REQUEST,
-        "a body of another digest is refused"
-    );
-    assert_eq!(
-        put_evidence(&server, &exact_jwt, &sha256, DOCUMENT).await,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        put_evidence(&server, &exact_jwt, &sha256, DOCUMENT).await,
-        StatusCode::NO_CONTENT
-    );
-    let (status, held) = send(
+    for (body, status, expected) in [
+        (
+            &br#"{"answer":2}"#[..],
+            StatusCode::BAD_REQUEST,
+            "WYRD_STORAGE_400_SHA256_MISMATCH",
+        ),
+        (
+            &b"{}"[..],
+            StatusCode::BAD_REQUEST,
+            "WYRD_STORAGE_400_SIZE_MISMATCH",
+        ),
+        (
+            &br#"{"answer":1}  "#[..],
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_SPEC_413_PAYLOAD_TOO_LARGE",
+        ),
+    ] {
+        let (actual, problem) = put_local(&server, &exact_jwt, &upload_id, body).await;
+        assert_eq!(
+            (actual, code(&problem)),
+            (status, Some(expected.to_owned())),
+            "{problem}"
+        );
+    }
+    let (status, stored) = put_local(&server, &exact_jwt, &upload_id, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    let (status, completed) = upload_op(&server, &exact_jwt, &upload_id, "complete").await;
+    assert_eq!(status, StatusCode::OK, "{completed}");
+    let (status, judged) = execute(
         &server,
         &exact_jwt,
-        Method::POST,
-        "/v1/verification/evidence",
-        Some(&plan),
+        document_request(&fixture, &document, DOCUMENT),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{held}");
-    assert_eq!(held["uploads"], json!([]), "the uploaded file is held");
-
-    let request = |verifier: &CardUid| {
-        json!({
-            "verifier_card_uid": verifier,
-            "card_uid": fixture.service,
-            "inputs": { "doc": { "kind": "file", "sha256": sha256,
-                                 "size_bytes": DOCUMENT.len(), "format": "json" } }
-        })
-    };
-    let (status, judged) = execute(&server, &exact_jwt, request(&document).to_string()).await;
     assert_eq!(status, StatusCode::OK, "{judged}");
     assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
-    let (status, accepted) = enqueue(&server, &exact_jwt, &request(&document), None).await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
-    let (status, problem) =
-        execute(&server, &exact_jwt, request(&fixture.assertion).to_string()).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
-    let allowed = vec![run_decision("allowed"); 2];
-    assert_eq!(
-        decisions(&server, "verification.evidence", exact).await,
-        allowed
-    );
-    assert_eq!(
-        decisions(&server, "verification.evidence.upload", exact).await,
-        vec![run_decision("allowed"); 3]
-    );
-
-    let (outsider, outsider_jwt) = user(&server, "ve-outsider", &["viewer"]).await;
-    let (status, problem) = send(
+    let (status, problem) = execute(
         &server,
-        &outsider_jwt,
-        Method::POST,
-        "/v1/verification/evidence",
-        Some(&plan),
+        &exact_jwt,
+        document_request(&fixture, &fixture.assertion, DOCUMENT),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
-    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    const ABANDONED: &[u8] = br#"{"answer":3}"#;
+    let (status, planned) = plan_file(&server, &exact_jwt, ABANDONED).await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    let abandoned = planned_upload(&planned);
+    let (status, aborted) = upload_op(&server, &exact_jwt, &abandoned, "abort").await;
+    assert_eq!(status, StatusCode::OK, "{aborted}");
+
+    let card_init = json!({
+        "card_uid": fixture.service, "relative_path": "notes.json",
+        "expected_sha256": base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            sha2::Sha256::digest(DOCUMENT)
+        ),
+        "expected_size_bytes": DOCUMENT.len(), "content_type": "application/json"
+    });
+    let (status, problem) = send(
+        &server,
+        &exact_jwt,
+        Method::POST,
+        "/v1/cards/upload/init",
+        Some(&card_init),
+    )
+    .await;
     assert_eq!(
-        put_evidence(&server, &outsider_jwt, &sha256, DOCUMENT).await,
-        StatusCode::FORBIDDEN
+        (status, code(&problem)),
+        (
+            StatusCode::FORBIDDEN,
+            Some("WYRD_PERMISSION_403_DENIED_RBAC".to_owned())
+        )
     );
+    let (status, card_upload) = send(
+        &server,
+        &editor_jwt,
+        Method::POST,
+        "/v1/cards/upload/init",
+        Some(&card_init),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{card_upload}");
+    let card_upload = card_upload["upload_id"]
+        .as_str()
+        .expect("upload id")
+        .to_owned();
+    for action in ["complete", "abort"] {
+        let (status, problem) = upload_op(&server, &exact_jwt, &card_upload, action).await;
+        assert_eq!(
+            (status, code(&problem)),
+            (
+                StatusCode::FORBIDDEN,
+                Some("WYRD_PERMISSION_403_DENIED_RBAC".to_owned())
+            ),
+            "a File grant never continues a Card upload: {action}"
+        );
+    }
+
+    let other: DataTenantId = server.seed_tenant("ve-other").await.expect("tenant seeds");
+    let foreign = server
+        .bootstrap_service_in_tenant(other, "ve-other-editor", &["editor"])
+        .await
+        .expect("foreign editor bootstraps");
+    let foreign_jwt = server
+        .exchange_api_key(foreign.api_key().expect("foreign editor has an API key"))
+        .await
+        .expect("rootless exchange succeeds");
+    const FOREIGN: &[u8] = br#"{"answer":4}"#;
+    let (status, planned) = plan_file(&server, &foreign_jwt, FOREIGN).await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    let foreign_upload = planned_upload(&planned);
+    for (upload, status, expected) in [
+        (
+            foreign_upload.as_str(),
+            StatusCode::NOT_FOUND,
+            "WYRD_STORAGE_404_UPLOAD_NOT_FOUND",
+        ),
+        (
+            "not-an-upload",
+            StatusCode::BAD_REQUEST,
+            "WYRD_STORAGE_400_INVALID_UPLOAD_ID",
+        ),
+    ] {
+        let (actual, problem) = upload_op(&server, &exact_jwt, upload, "complete").await;
+        assert_eq!(
+            (actual, code(&problem)),
+            (status, Some(expected.to_owned())),
+            "{problem}"
+        );
+    }
+
+    let mib = 1024 * 1024;
+    let sha256 = Sha256Hex::digest(DOCUMENT).to_string();
+    for files in [
+        json!([{ "sha256": sha256, "size_bytes": 21 * mib }]),
+        json!([{ "sha256": sha256, "size_bytes": 20 * mib },
+               { "sha256": "ab".repeat(32), "size_bytes": 20 * mib },
+               { "sha256": "cd".repeat(32), "size_bytes": 20 * mib },
+               { "sha256": "ef".repeat(32), "size_bytes": 20 * mib },
+               { "sha256": "01".repeat(32), "size_bytes": 20 * mib },
+               { "sha256": "23".repeat(32), "size_bytes": 20 * mib }]),
+    ] {
+        let (status, problem) = send(
+            &server,
+            &exact_jwt,
+            Method::POST,
+            "/v1/verification/evidence",
+            Some(&json!({ "files": files })),
+        )
+        .await;
+        assert_eq!(
+            (status, code(&problem)),
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Some("WYRD_VERIFICATION_413_INPUT_TOO_LARGE".to_owned())
+            ),
+            "{problem}"
+        );
+    }
+
+    assert_eq!(
+        decisions(&server, "storage.upload.part_url", exact).await,
+        vec![run_decision("allowed")]
+    );
+    let card_denied = ("cards:write".to_owned(), "denied".to_owned());
+    assert_eq!(
+        decisions(&server, "storage.upload.abort", exact).await,
+        vec![run_decision("allowed"), card_denied.clone()]
+    );
+    assert_eq!(
+        decisions(&server, "storage.upload.complete", exact).await,
+        vec![run_decision("allowed"), card_denied]
+    );
+    assert_eq!(
+        decisions(&server, "storage.upload.local_blob", exact).await,
+        vec![run_decision("allowed"); 4]
+    );
+
+    let (status, planned) = plan_file(&server, &editor_jwt, ABANDONED).await;
+    assert_eq!(status, StatusCode::OK, "{planned}");
+    let pending = planned_upload(&planned);
+    let (outsider, outsider_jwt) = user(&server, "ve-outsider", &["viewer"]).await;
+    let (status, problem) = plan_file(&server, &outsider_jwt, ABANDONED).await;
+    assert_eq!(
+        (status, code(&problem)),
+        (
+            StatusCode::FORBIDDEN,
+            Some("WYRD_PERMISSION_403_DENIED_RBAC".to_owned())
+        )
+    );
+    let (status, _) = put_local(&server, &outsider_jwt, &pending, ABANDONED).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for action in ["part-url?part_number=1", "complete", "abort"] {
+        let (status, _) = upload_op(&server, &outsider_jwt, &pending, action).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{action}");
+    }
     let denied = vec![run_decision("denied")];
-    assert_eq!(
-        decisions(&server, "verification.evidence", outsider).await,
-        denied
-    );
-    assert_eq!(
-        decisions(&server, "verification.evidence.upload", outsider).await,
-        denied
-    );
+    for operation in [
+        "verification.evidence",
+        "storage.upload.local_blob",
+        "storage.upload.part_url",
+        "storage.upload.complete",
+        "storage.upload.abort",
+    ] {
+        assert_eq!(
+            decisions(&server, operation, outsider).await,
+            denied,
+            "{operation}"
+        );
+    }
     server.shutdown().await.expect("test server shuts down");
 }
 

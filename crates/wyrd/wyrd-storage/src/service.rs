@@ -105,7 +105,8 @@ pub enum UploadOwner {
     File,
 }
 
-/// Read the owner of `upload_id` in the caller's tenant.
+/// Read the owner and declared byte length of `upload_id` in the caller's
+/// tenant.
 ///
 /// The read runs under the caller's tenant, so another tenant's upload is
 /// indistinguishable from an absent one.
@@ -114,27 +115,33 @@ pub enum UploadOwner {
 /// Returns `WYRD_STORAGE_400_INVALID_UPLOAD_ID` for an identifier this
 /// server never minted, `WYRD_STORAGE_404_UPLOAD_NOT_FOUND` for an upload
 /// absent from the caller's tenant, an internal error for a stored Card UID
-/// that does not parse, and the mapped SQL error of a failed read.
+/// that does not parse or a negative stored size, and the mapped SQL error of a failed read.
 #[instrument(skip(postgres, caller), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
 pub async fn upload_owner(
     postgres: &WyrdPostgres,
     caller: &StorageCaller,
     upload_id: &UploadId,
-) -> Result<UploadOwner, WyrdError> {
+) -> Result<(UploadOwner, u64), WyrdError> {
     let mut conn = postgres
         .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(|error| map_sql_error(&error))?;
     let row = load_upload(&mut conn, upload_id_uuid(upload_id)?).await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
-    row.card_uid.map_or(Ok(UploadOwner::File), |uid| {
-        CardUid::new(&uid).map(UploadOwner::Card).map_err(|error| {
-            internal_error(
-                "stored upload Card UID is invalid",
-                serde_json::json!({ "upload_id": upload_id, "error": error.to_string() }),
-            )
-        })
-    })
+    let invalid = |what: &str, error: String| {
+        internal_error(
+            what,
+            serde_json::json!({ "upload_id": upload_id, "error": error }),
+        )
+    };
+    let size = u64::try_from(row.expected_size_bytes)
+        .map_err(|error| invalid("stored expected_size_bytes is negative", error.to_string()))?;
+    let owner = row.card_uid.map_or(Ok(UploadOwner::File), |uid| {
+        CardUid::new(&uid)
+            .map(UploadOwner::Card)
+            .map_err(|error| invalid("stored upload Card UID is invalid", error.to_string()))
+    })?;
+    Ok((owner, size))
 }
 
 /// What one upload session stores: its owner, object path, and declared
@@ -373,7 +380,9 @@ async fn claim_upload_init<'a>(
         .await
         .map_err(|error| map_sql_error(&error))?;
     let replay = match idempotency {
-        Some((key, body_sha)) => try_replay_idempotent_init(caller, &mut conn, key, body_sha).await?,
+        Some((key, body_sha)) => {
+            try_replay_idempotent_init(caller, &mut conn, key, body_sha).await?
+        }
         None => None,
     };
     Ok((conn, replay))

@@ -143,9 +143,7 @@ pub fn validate_evidence(
     caller_data_tenant_id: DataTenantId,
 ) -> Result<ValidatedPath, TenantPathError> {
     let shape = || TenantPathError::ShapeMismatch(path.to_owned());
-    let (tenant, digest) = path
-        .split_once("/evidence/sha256/")
-        .ok_or_else(shape)?;
+    let (tenant, digest) = path.split_once("/evidence/sha256/").ok_or_else(shape)?;
     let tenant = parse_prefix(tenant)?;
     if tenant != caller_data_tenant_id {
         return Err(TenantPathError::TenantMismatch {
@@ -242,10 +240,17 @@ mod tests {
         let sha256 = wyrd_spec::auth::Sha256Hex::digest(b"evidence");
         let path = super::evidence(tenant, &sha256);
 
-        assert_eq!(super::validate_evidence(&path.full, tenant).ok(), Some(path.clone()));
+        assert_eq!(
+            super::validate_evidence(&path.full, tenant).ok(),
+            Some(path.clone())
+        );
         assert!(super::validate_evidence(&path.full, DataTenantId::new_v7()).is_err());
         assert!(super::validate_evidence(&path.full.to_uppercase(), tenant).is_err());
-        let card = build(tenant, &uuid::Uuid::now_v7().to_string(), "evidence/sha256/x");
+        let card = build(
+            tenant,
+            &uuid::Uuid::now_v7().to_string(),
+            "evidence/sha256/x",
+        );
         assert!(super::validate_evidence(&card, tenant).is_err());
         assert!(super::validate_evidence(&format!("{}/x", path.full), tenant).is_err());
     }

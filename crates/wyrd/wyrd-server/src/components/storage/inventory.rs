@@ -276,10 +276,15 @@ impl<'s> ObjectInventory<'s> {
         let batches = self
             .rows(
                 tenant,
+                // A deletion row carries no digest, so every File deletion
+                // is read to exclude its path.
+                // ponytail: scans all File deletions; filter by path once
+                // Files are deleted in volume.
                 &format!(
-                    "origin = {} AND sha256 = {}",
+                    "origin = {} AND (sha256 = {} OR state = {})",
                     ObservationWindow::text(ObjectOrigin::FileUpload.as_str()),
-                    ObservationWindow::text(&sha256.to_string())
+                    ObservationWindow::text(&sha256.to_string()),
+                    ObservationWindow::text(ObjectState::Deleted.as_str())
                 ),
             )
             .await?;
@@ -387,8 +392,7 @@ impl<'s> ObjectInventory<'s> {
             .into_iter()
             .find(|path| !deleted.contains(path))
             .map(|path| {
-                tenant_path::validate_evidence(&path, tenant)
-                    .map_err(|_| invalid("storage_path"))
+                tenant_path::validate_evidence(&path, tenant).map_err(|_| invalid("storage_path"))
             })
             .transpose()
     }

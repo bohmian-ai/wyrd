@@ -36,9 +36,9 @@ use wyrd_sql::{ParsedCardRow, TenantConn};
 
 use crate::audit;
 use crate::components::auth::Caller;
+use crate::components::gateway::GatewayCallContext;
 use crate::components::storage::inventory::ObjectInventory;
 use crate::components::storage::routes::storage_caller;
-use crate::components::gateway::GatewayCallContext;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::http::middleware::metrics::RequestArrival;

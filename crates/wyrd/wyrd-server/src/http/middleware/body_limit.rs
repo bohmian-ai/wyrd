@@ -3,9 +3,9 @@
 //! Returns `WyrdError::PayloadTooLarge` rendered as `application/problem+json`
 //! when the body exceeds `max_bytes`. Audio transcription and translation
 //! uploads pass through unbuffered: their handlers stream them under
-//! `limits.audio_upload_bytes`. Verification execute, enqueue, evidence, and
-//! local evidence upload requests pass through too: their handlers read under
-//! their own contract bound and refuse with the verification error code. Uses bounded buffering: `to_bytes` reads
+//! `limits.audio_upload_bytes`. Verification execute, enqueue, and evidence
+//! requests and local storage uploads pass through too: their handlers read
+//! under their own contract bound (a local upload under its declared size). Uses bounded buffering: `to_bytes` reads
 //! the full body into memory up to `max_bytes + 1`; the worst-case process
 //! footprint is `max_bytes * concurrency`.
 
@@ -102,7 +102,7 @@ where
                 | "/v1/verification/execute"
                 | "/v1/verification/enqueue"
                 | "/v1/verification/evidence"
-        ) || path.starts_with("/v1/verification/evidence/local/")
+        ) || path.starts_with("/v1/cards/upload/local/")
         {
             let mut inner = self.inner.clone();
             return Box::pin(async move { inner.call(request).await.map_err(Into::into) });
@@ -461,10 +461,7 @@ mod tests {
             ("/v1/verification/execute", axum::http::StatusCode::OK),
             ("/v1/verification/enqueue", axum::http::StatusCode::OK),
             ("/v1/verification/evidence", axum::http::StatusCode::OK),
-            (
-                "/v1/verification/evidence/local/00",
-                axum::http::StatusCode::OK,
-            ),
+            ("/v1/cards/upload/local/00", axum::http::StatusCode::OK),
             (
                 "/v1/audio/speech",
                 axum::http::StatusCode::PAYLOAD_TOO_LARGE,

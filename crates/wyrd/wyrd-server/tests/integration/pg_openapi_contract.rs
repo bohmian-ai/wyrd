@@ -1556,7 +1556,6 @@ async fn verification_contract_publishes_five_typed_operations_and_the_local_upl
             ("/v1/verification/bindings/{binding_id}", "get"),
             ("/v1/verification/enqueue", "post"),
             ("/v1/verification/evidence", "post"),
-            ("/v1/verification/evidence/local/{sha256}", "put"),
             ("/v1/verification/execute", "post"),
             ("/v1/verification/executions/{execution_id}", "get"),
         ])

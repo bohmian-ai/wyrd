@@ -881,10 +881,12 @@ async fn execute_pins_files_and_completes_shared_uploads() {
     };
     Mock::given(method("POST"))
         .and(path("/v1/verification/evidence"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "uploads": [
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "uploads": [
             { "sha256": policy_sha, "upload_id": policy_upload, "plan": policy_plan },
             { "sha256": deck_sha, "upload_id": deck_upload, "plan": deck_plan },
-        ] })))
+        ] })),
+        )
         .expect(1)
         .mount(&server)
         .await;

@@ -1,7 +1,7 @@
 ---
 id: SPEC-agent-verdict-portability
 revision: 2
-status: draft
+status: approved
 ---
 
 # Portable Verdicts and bounded structured-output repair
@@ -222,11 +222,9 @@ authorization or persistence boundary is introduced.
 
 ## Approval and revision history
 
-The maintainer explicitly accepted the 16 KiB diagnostic bound, error name and
-tool-only exhaustion rule. Approval of revision 2 as a whole remains pending;
-no open material decision is deferred to implementation. The companion task
-is proposed at the user's explicit request; it is not ready or authorized for
-implementation until this spec is explicitly approved.
+The maintainer explicitly approved revision 2 as a whole on 2026-10-28,
+including the 16 KiB diagnostic bound, error name and tool-only exhaustion rule.
+No open material decision is deferred to implementation.
 
 - Revision 2, 2026-10-28: leave the citation schema unchanged for checks with no
   reachable source; add supplied Luna portability, optional-data strict-mode

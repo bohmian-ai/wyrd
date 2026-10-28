@@ -22,9 +22,9 @@ For example, `outcome: FAIL` receives a correction and may become a valid
 
 This is one end-to-end task at the user's request. It owns the schema,
 compiler, Agent loop, Vala consumers, public error projections, documentation
-and necessary test closure. **Proposed only:** the spec is revision 2 draft;
-explicit approval is required before implementation. The user requested both
-artifacts together, overriding the ordinary spec-first task-creation sequence.
+and necessary test closure. The maintainer approved spec revision 2 on
+2026-10-28. The user originally requested both artifacts together, overriding
+the ordinary spec-first task-creation sequence.
 
 ## What changes and what must stay true
 
@@ -251,17 +251,17 @@ requires evidence and renewed design, not silent author-schema rewriting.
 Missing live credentials block compatibility evidence, not deterministic work.
 Routine private implementation choices remain implementer-owned.
 
-Authority: [spec revision 2 (draft)](../spec.md),
+Authority: [spec revision 2 (approved)](../spec.md),
 [workflow](../../../spec-driven-development.md),
 [implementation discipline](../../../implementation-execution.md),
 [testing](../../../../TESTING.md), and the spec's owning architecture links.
 
 ## Completion evidence
 
-Status: `IMPLEMENTED`. Anthropic live evidence is missing, so AC-007 is not
-verified (see Remaining limits). Spec revision 2 is still `draft`. The
-maintainer's direct instruction to implement this task is the only authority
-for proceeding, and approval stays with human review.
+Status: `IMPLEMENTED`. At implementation time, spec revision 2 was
+still `draft`; the maintainer's direct instruction authorized implementation.
+The maintainer subsequently approved revision 2 on 2026-10-28. Task acceptance
+remains subject to independent review.
 
 Commits: `834c4b609` (Scenario 1), `58c16749d` (Scenario 2), `d778881d2`
 (Scenario 3), `474c9f303` (Scenarios 4–5), `020c2eb68` (Scenario 6 journeys),
@@ -289,7 +289,7 @@ and reference docs), `ff5ac7345` (clippy).
 | AC-004 per-invocation slots | `skald-spec/src/prompt.rs::Prompt::edit_response_schema_mut`; `Verdict::restrict_slots`; `vala-verify/src/blocks/agent.rs::{bind,invoke,execute}` | `response_schema_edit::edit_response_schema_reaches_request_and_type`; `restrict_slots_admits_only_reachable_slots`; `blocks_agent::check_agent_narrows_citation_slots_per_call`, which checks that the recorded provider request carries `enum: ["deck"]` on both turns, that a `inputs.deck` cite is repaired, that concurrent calls keep `["deck"]` and `["deck","policy"]` while an unsourced call stays open, and that the Card is unchanged | PASS |
 | AC-005 safe errors, guards kept | `block_error` maps `StructuredOutputInvalid` to `WYRD_AGENT_422_STRUCTURED_INVALID: <schema locations>` and is terminal; `conforms` removed; `verdict_from` and the hosted sandbox untouched | `blocks_agent::{step_agent_rejects_schema_violation,check_agent_rejects_non_verdict}` check the code and the absence of `s3cr3t` across nested keys; `check_agent_validates_custom_data` keeps every typed and data-bound refusal at a one-iteration budget; `structured_output_exhaustion_is_safe` covers the error, problem JSON, and journal; the `wyrd-server` `verification::hosted` lib tests pass 23/23 | PASS |
 | AC-006 real client/server journeys | `policy-judge` and `judge-agent` fixtures at `max_iterations: 2`; `JUDGE-REPAIRED` scripted on every surface | Rust `verifier_building_blocks::{judge_repairs_an_invalid_verdict,invalid_judge_verdicts_are_inconclusive}`; Python `test_judge_repairs_an_invalid_verdict` and `test_invalid_judge_verdicts_are_inconclusive`; TypeScript `judge repairs an invalid verdict` and `invalid judge verdicts are inconclusive`; MCP `verification::pg_tests::invalid_judge_answers_are_repaired_or_inconclusive`. Each checks two judge requests, the correction on the second, and on exhaustion the code without reply text | PASS |
-| AC-007 live providers | `tests/smoke/test_gateway_live_providers.py`: the schema comes from `Prompt.load` of a `verdict` Prompt, compiled at runtime | `test_live_providers_accept_the_generated_verdict_schema[openai]` (strict) passed on `gpt-6-luna`; `[gemini]` (`response_json_schema`) passed on `gemini-3.8-flash`; `test_openai_chat_accepts_the_named_verdict_format` (non-strict) passed on `gpt-6-luna`; `[anthropic]` **skipped, no `ANTHROPIC_API_KEY`** | PARTIAL |
+| AC-007 live providers | `tests/smoke/test_gateway_live_providers.py`: the schema comes from `Prompt.load` of a `verdict` Prompt, compiled at runtime | `test_live_providers_accept_the_generated_verdict_schema[openai]` (strict) passed on `gpt-6-luna`; `[gemini]` (`response_json_schema`) passed on `gemini-3.8-flash`; `test_openai_chat_accepts_the_named_verdict_format` (non-strict) passed on `gpt-6-luna`; `[anthropic]` (`output_config`) passed on `claude-haiku-5-5` | PASS |
 
 ### RED and GREEN per scenario
 
@@ -312,7 +312,7 @@ scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inne
 scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-ai --test integration -P journey --run-ignored=all -E "test(/verifier_building_blocks::(judge_repairs_an_invalid_verdict|invalid_judge_verdicts_are_inconclusive)/)"'
 scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q tests/integration/test_verifier_building_blocks.py -k "judge_repairs or invalid_judge_verdicts"'
 scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/verifier-building-blocks.test.ts -t "judge"'   # 7 passed
-scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -rs -m smoke tests/smoke/test_gateway_live_providers.py -k verdict'   # 3 passed, 1 skipped (anthropic)
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cd sdks/wyrd-sdk-python && uv run python -m pytest -q -rs -m smoke tests/smoke/test_gateway_live_providers.py -k verdict'   # 4 passed; provider keys from pass via a local mise.local.toml task
 mise run fmt:check && mise run lints && mise run check:deps && mise run codegen:check   # pass
 mise run py:format:check && mise run py:lints && mise run py:typecheck && mise run ts:format:check && mise run ts:lints   # pass
 mise run docs:check   # pass, including example journeys and a11y
@@ -329,8 +329,6 @@ untouched. Generated projections (`error-codes.ts`, `card-types.ts`,
 
 ### Remaining limits and reviewer flags
 
-- **Anthropic live evidence is missing.** Run `mise run test:gateway:smoke:live`
-  with `ANTHROPIC_API_KEY` set before completion.
 - **Public code removed.** `WYRD_AGENT_422_STRUCTURED_DECODE`
   (`AgentStructuredDecode`) became unreachable and was replaced by
   `WYRD_AGENT_422_STRUCTURED_INVALID`, per the spec.

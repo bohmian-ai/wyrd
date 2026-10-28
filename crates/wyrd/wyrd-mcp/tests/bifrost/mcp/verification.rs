@@ -1148,6 +1148,154 @@ mod pg_tests {
         Ok(())
     }
 
+    /// Send `bytes` for every upload `planned` by `verification.evidence`
+    /// and complete each through the shared storage route, as `http`'s
+    /// caller on the server at `base_url`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a plan-shape, token, or transport failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the transfer or completion answers a non-success status.
+    async fn upload_planned(
+        http: &wyrd_client::WyrdClient,
+        base_url: &str,
+        planned: &JsonValue,
+        bytes: &[u8],
+    ) -> Result<(), McpJourneyError> {
+        let token = format!("Bearer {}", http.access_token().await?.expose());
+        let absolute = |url: &str| {
+            if url.starts_with('/') {
+                format!("{base_url}{url}")
+            } else {
+                url.to_owned()
+            }
+        };
+        for upload in planned["uploads"].as_array().ok_or("uploads is a list")? {
+            let status = reqwest::Client::new()
+                .put(absolute(text(upload, "/plan/data/put_url")?))
+                .header("x-wyrd-access-token", &token)
+                .header("content-type", "application/octet-stream")
+                .body(bytes.to_vec())
+                .send()
+                .await?
+                .status();
+            assert!(
+                status.is_success(),
+                "the planned upload is accepted: {status}"
+            );
+            let upload_id = text(upload, "/upload_id")?;
+            let status = reqwest::Client::new()
+                .post(absolute(&format!("/v1/cards/upload/{upload_id}/complete")))
+                .header("x-wyrd-access-token", &token)
+                .json(&serde_json::json!({ "protocol": "single_put", "data": {} }))
+                .send()
+                .await?
+                .status();
+            assert!(status.is_success(), "the upload completes: {status}");
+        }
+        Ok(())
+    }
+
+    /// A Verifier judging one uploaded JSON document: its extracted `answer`
+    /// must equal `1`.
+    const DOCUMENT_VERIFIER: &str = "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: mcp-file-document\n  version: 1.0.0\nspec:\n  inputs:\n    doc: {type: media, formats: [json]}\n  steps:\n    - id: read\n      action: {kind: extract, from: inputs.doc}\n      requirements:\n        - id: answer-is-one\n          statement: The document's answer is one.\n          check: {kind: assert, path: steps.read.output.value.answer, operator: equals, expected: 1}\n";
+
+    /// An agent holding `verifier:run` on exactly one Verifier plans a File
+    /// through `verification.evidence`, uploads and completes it through the
+    /// shared storage routes, and judges it with that Verifier over MCP. The
+    /// completed File is reused by the next plan, while another Verifier
+    /// stays refused for the same File.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport,
+    /// upload, or tool-call failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a plan, verdict, or refusal expectation fails.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn file_inputs_use_shared_uploads() -> Result<(), McpJourneyError> {
+        use sha2::Digest as _;
+        const DOCUMENT: &[u8] = br#"{"answer":1}"#;
+        let server = Box::pin(WyrdTestServer::start_bound()).await?;
+        let admin = server
+            .bootstrap_service("mcp-file-admin", &["admin"])
+            .await?;
+        let cards = Cards::connect_with(&client(&server, api_key(&admin)?)?).await?;
+        let fixture = register_fixture(&cards).await?;
+        let root = std::env::temp_dir().join(format!("wyrd-mcp-file-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("verifier.yaml"), DOCUMENT_VERIFIER)?;
+        let document = Box::pin(cards.declare_from_path(&root.join("verifier.yaml"))).await?;
+        std::fs::remove_dir_all(&root)?;
+        let document_uid = document.root.uid.ok_or("a registered Card has a UID")?;
+        let document = document_uid.to_string();
+        server
+            .seed_role(
+                "mcp_file_exact",
+                &[
+                    Permission::card_read(),
+                    Permission::verifier_run(document_uid),
+                ],
+            )
+            .await?;
+        let agent = server
+            .credential_registered_service(&fixture.service_ref, &["mcp_file_exact"])
+            .await?;
+        let agent_client = connect_rooted(&server, &agent).await?;
+        let http = rooted_client(&server, &agent)?;
+        let base_url = server.base_url().ok_or("a bound server has a URL")?;
+
+        let sha256 = format!("{:x}", sha2::Sha256::digest(DOCUMENT));
+        let files =
+            serde_json::json!({ "files": [{ "sha256": sha256, "size_bytes": DOCUMENT.len() }] });
+        let planned = structured(
+            agent_client
+                .call_tool(call(EVIDENCE, files.clone())?)
+                .await?,
+        )?;
+        text(&planned, "/uploads/0/upload_id")?;
+        upload_planned(&http, base_url, &planned, DOCUMENT).await?;
+        let held = structured(agent_client.call_tool(call(EVIDENCE, files)?).await?)?;
+        assert_eq!(
+            held["uploads"],
+            serde_json::json!([]),
+            "the completed File is reused"
+        );
+
+        let request = |verifier: &str| {
+            serde_json::json!({
+                "verifier_card_uid": verifier,
+                "card_uid": fixture.service_uid,
+                "inputs": { "doc": { "kind": "file", "sha256": sha256,
+                                     "size_bytes": DOCUMENT.len(), "format": "json" } },
+            })
+        };
+        let judged = structured(
+            agent_client
+                .call_tool(call(EXECUTE, request(&document))?)
+                .await?,
+        )?;
+        assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+        let denied = refusal(
+            agent_client
+                .call_tool(call(EXECUTE, request(&fixture.assert_uid))?)
+                .await,
+        )?;
+        assert!(
+            denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "another Verifier stays refused: {denied}"
+        );
+        agent_client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
     /// A bound Service judges inline inputs with a Verifier over MCP.
     ///
     /// The tool result carries the exact Verifier and subject and the
@@ -1944,7 +2092,7 @@ mod pg_tests {
     impl FrameAgent {
         /// Upload the PNG frame carrying the nine-byte `label` after its
         /// signature and a newline, planning through `verification.evidence`
-        /// and PUTting the bytes where the plan says, and enqueue it to the
+        /// and uploading it with [`upload_planned`], and enqueue it to the
         /// frame Verifier under `group`, returning its execution.
         ///
         /// # Errors
@@ -1953,7 +2101,7 @@ mod pg_tests {
         ///
         /// # Panics
         ///
-        /// Panics when the storage PUT answers a non-success status.
+        /// Panics when the upload answers a non-success status.
         async fn submit(&self, group: &str, label: &str) -> Result<String, McpJourneyError> {
             use sha2::Digest as _;
             let bytes = [b"\x89PNG\r\n\x1a\n\n".as_slice(), label.as_bytes()].concat();
@@ -1966,29 +2114,7 @@ mod pg_tests {
                     )?)
                     .await?,
             )?;
-            for upload in planned["uploads"].as_array().ok_or("uploads is a list")? {
-                let url = text(upload, "/plan/data/put_url")?;
-                let url = if url.starts_with('/') {
-                    format!("{}{url}", self.base_url)
-                } else {
-                    url.to_owned()
-                };
-                let status = reqwest::Client::new()
-                    .put(url)
-                    .header(
-                        "x-wyrd-access-token",
-                        format!("Bearer {}", self.http.access_token().await?.expose()),
-                    )
-                    .header("content-type", "application/octet-stream")
-                    .body(bytes.clone())
-                    .send()
-                    .await?
-                    .status();
-                assert!(
-                    status.is_success(),
-                    "the planned upload is accepted: {status}"
-                );
-            }
+            upload_planned(&self.http, &self.base_url, &planned, &bytes).await?;
             let queued = structured(
                 self.client
                     .call_tool(call(

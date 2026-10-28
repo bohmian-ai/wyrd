@@ -118,11 +118,7 @@ impl DomainTable for ObjectsTable {
     /// binding, and the storage identity and declared digest a lookup selects
     /// by.
     fn physical_layout() -> PhysicalLayoutWire {
-        attributed_layout(
-            daily_layout,
-            "recorded_at",
-            &["storage_path", "sha256"],
-        )
+        attributed_layout(daily_layout, "recorded_at", &["storage_path", "sha256"])
     }
 }
 

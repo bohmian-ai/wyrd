@@ -1503,6 +1503,11 @@ mod tests {
                         PartitionTransformWire::Day,
                         &["result_id", "execution_id"],
                     ),
+                    ("storage", "objects") => (
+                        "recorded_at",
+                        PartitionTransformWire::Day,
+                        &["storage_path", "sha256"],
+                    ),
                     ("system", "audit_log") => ("created_at", PartitionTransformWire::Day, &[]),
                     _ => panic!("{fqn} declares no pinned time column"),
                 };

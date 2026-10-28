@@ -372,15 +372,7 @@ pub async fn upload_complete(
         row.block_count_planned,
     )?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
-    finish_upload(
-        &state,
-        caller,
-        upload_uuid,
-        validated,
-        row,
-        (!replay).then_some(payload),
-    )
-    .await
+    finish_upload(&state, caller, upload_uuid, validated, row, replay, payload).await
 }
 
 /// Complete an upload on the server's behalf, without a client payload.
@@ -408,24 +400,24 @@ pub async fn reconcile_upload(
     let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
     let row = load_upload(&mut conn, upload_uuid).await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
-    let commit = match (row.status, row.wire_protocol, row.backend) {
-        (UploadStatus::Completed, _, _) => None,
-        (UploadStatus::Pending, WireProtocol::SinglePutV1, _) => Some(None),
+    let (replay, payload) = match (row.status, row.wire_protocol, row.backend) {
+        (UploadStatus::Completed, _, _) => (true, None),
+        (UploadStatus::Pending, WireProtocol::SinglePutV1, _) => (false, None),
         (UploadStatus::Pending, WireProtocol::LocalFsV1, StorageBackendKind::Local) => {
-            Some(Some(CompletePayload::Local))
+            (false, Some(CompletePayload::Local))
         }
         _ => return Err(WyrdStorageError::UploadNotPending.into()),
     };
     let validated =
         tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
-    finish_upload(&state, caller, upload_uuid, validated, row, commit).await
+    finish_upload(&state, caller, upload_uuid, validated, row, replay, payload).await
 }
 
 /// Commit, verify, and record one upload's completion.
 ///
-/// `commit` is `None` for a replay of an already completed upload, which
-/// re-verifies the stored object without a backend commit; otherwise it is
-/// the backend commit payload, `None` when the protocol needs none.
+/// `replay` marks an already completed upload, which re-verifies the stored
+/// object without a backend commit; otherwise `payload` is the backend
+/// commit payload, `None` when the protocol needs none.
 ///
 /// # Errors
 /// Returns the backend commit, head, size, encryption, or persistence
@@ -436,9 +428,10 @@ async fn finish_upload(
     upload_uuid: Uuid,
     validated: ValidatedPath,
     row: MultipartUploadRow,
-    commit: Option<Option<CompletePayload>>,
+    replay: bool,
+    payload: Option<CompletePayload>,
 ) -> Result<UploadCompleteResponse, WyrdError> {
-    if let Some(payload) = commit {
+    if !replay {
         complete_backend_upload(state, caller, upload_uuid, &validated, &row, payload).await?;
     }
     let head = verified_object_head(state, caller, upload_uuid, &validated, &row).await?;

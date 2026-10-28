@@ -10,6 +10,15 @@ mod pg_tests {
     use wyrd_storage::sweeper::{SWEEPER_LEADER_LOCK_KEY, Sweeper, SweeperConfig};
     use wyrd_storage::{StorageHandle, tenant_path};
 
+    /// Only the sweeper leader reclaims: a tick while another session holds
+    /// the leader lock leaves an expired Card upload pending, and the next
+    /// leader tick aborts it with an expired pending and an orphaned
+    /// initiating upload, keeps a live pending upload, and reaps only the
+    /// expired idempotency row.
+    ///
+    /// # Panics
+    /// Panics when the fixture, leader lock, insert, tick, or status or count
+    /// query fails, or a row ends in another state.
     #[tokio::test]
     async fn tick_sweeps_expired_uploads_and_reaps_idempotency_rows() {
         let fixture = PgFixture::start().await.expect("fixture starts");

@@ -183,10 +183,12 @@ struct UploadSubject<'a> {
 /// initialization failure, and mapped SQL errors.
 ///
 /// # Cancellation
-/// The initiating row commits before the backend upload is created, so a
-/// failure or cancellation after that point leaves an initiating row (or a
-/// row marked failed) that the storage sweeper reclaims after its grace
-/// period; a retry with the same idempotency key replays a completed
+/// The steps commit separately (see [`init_upload`]), so a failure or
+/// cancellation after the initiating commit leaves the row initiating,
+/// pending, or — after a failed backend initialization — failed. Only an
+/// open (initiating or pending) row is reclaimed by the storage sweeper,
+/// after its grace period or expiry; a failed row is terminal and is not
+/// swept. A retry with the same idempotency key replays a completed
 /// initialization, and any other retry starts a new session.
 #[instrument(skip(storage, postgres, caller, body), fields(tenant = %caller.data_tenant_id))]
 pub async fn upload_init(
@@ -231,8 +233,9 @@ pub async fn upload_init(
 ///
 /// # Cancellation
 /// A failure or cancellation after the initiating row commits leaves that
-/// session for the storage sweeper to reclaim; a retry initializes a new,
-/// independent session and never resumes or revokes the abandoned one.
+/// session initiating, pending, or failed, as for [`upload_init`]; the
+/// storage sweeper reclaims it only while it is open. A retry initializes a
+/// new, independent session and never resumes or revokes the abandoned one.
 #[instrument(skip(storage, postgres, caller), fields(tenant = %caller.data_tenant_id, %sha256))]
 pub async fn file_upload_init(
     storage: &StorageHandle,
@@ -278,11 +281,14 @@ pub async fn file_upload_init(
 /// initialization failure, and the mapped SQL errors.
 ///
 /// # Cancellation
-/// Stopping after the initiating commit leaves an initiating row that the
-/// sweeper reclaims after its grace period. A prior Card session already
-/// marked aborted stays aborted, and its best-effort backend abort may not
-/// have run; a backend upload created before a failed pending transition is
-/// left to the provider's own expiry.
+/// Stopping after the initiating commit leaves the row initiating (before or
+/// during backend initialization, or when the pending transition fails),
+/// failed (when backend initialization fails and that is recorded), or
+/// pending. The sweeper reclaims initiating rows after their grace period
+/// and pending rows after expiry; a failed row is terminal and not swept. A
+/// prior Card session already marked aborted stays aborted, and its
+/// best-effort backend abort may not have run; a backend upload created
+/// before a failed pending transition is left to the provider's own expiry.
 async fn init_upload(
     state: &StorageServiceState<'_>,
     caller: &StorageCaller,

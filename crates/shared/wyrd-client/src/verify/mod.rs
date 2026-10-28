@@ -482,11 +482,16 @@ impl RunEvidence {
     /// upload.
     ///
     /// # Cancellation
-    /// Uploads run one at a time, so a failure or cancellation leaves every
-    /// earlier File completed and reusable, the failing File's session open
-    /// until the storage sweeper reclaims it, and later Files unplanned.
-    /// Retrying replans: completed Files are skipped and each remaining one
-    /// gets a new, independent session.
+    /// Every missing File is planned in one request, which opens a session
+    /// for each before any transfer; the transfers then run one at a time.
+    /// A failure or cancellation during planning can leave sessions opened
+    /// whose plans were never returned. During transfer, earlier
+    /// acknowledged completions stay completed; untransferred sessions stay
+    /// open until their expiry, when the storage sweeper reclaims them; and
+    /// the interrupted session may still be open, may be failed, or may
+    /// already be completed if only its response was lost. Nothing is rolled
+    /// back. A fresh call plans again against the completed File inventory
+    /// and opens new, independent sessions for the Files still missing.
     async fn pin(
         mut self,
         client: &WyrdClient,

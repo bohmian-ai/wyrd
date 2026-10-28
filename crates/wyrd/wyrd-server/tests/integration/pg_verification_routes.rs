@@ -1197,8 +1197,8 @@ async fn file_upload_authority_and_validation_are_preserved() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
 
-    const ABANDONED: &[u8] = br#"{"answer":3}"#;
-    let (status, planned) = plan_file(&server, &exact_jwt, ABANDONED).await;
+    let abandoned_bytes: &[u8] = br#"{"answer":3}"#;
+    let (status, planned) = plan_file(&server, &exact_jwt, abandoned_bytes).await;
     assert_eq!(status, StatusCode::OK, "{planned}");
     let abandoned = planned_upload(&planned);
     let (status, aborted) = upload_op(&server, &exact_jwt, &abandoned, "abort").await;
@@ -1261,8 +1261,8 @@ async fn file_upload_authority_and_validation_are_preserved() {
         .exchange_api_key(foreign.api_key().expect("foreign editor has an API key"))
         .await
         .expect("rootless exchange succeeds");
-    const FOREIGN: &[u8] = br#"{"answer":4}"#;
-    let (status, planned) = plan_file(&server, &foreign_jwt, FOREIGN).await;
+    let foreign_bytes: &[u8] = br#"{"answer":4}"#;
+    let (status, planned) = plan_file(&server, &foreign_jwt, foreign_bytes).await;
     assert_eq!(status, StatusCode::OK, "{planned}");
     let foreign_upload = planned_upload(&planned);
     for (upload, status, expected) in [
@@ -1332,11 +1332,11 @@ async fn file_upload_authority_and_validation_are_preserved() {
         vec![run_decision("allowed"); 4]
     );
 
-    let (status, planned) = plan_file(&server, &editor_jwt, ABANDONED).await;
+    let (status, planned) = plan_file(&server, &editor_jwt, abandoned_bytes).await;
     assert_eq!(status, StatusCode::OK, "{planned}");
     let pending = planned_upload(&planned);
     let (outsider, outsider_jwt) = user(&server, "ve-outsider", &["viewer"]).await;
-    let (status, problem) = plan_file(&server, &outsider_jwt, ABANDONED).await;
+    let (status, problem) = plan_file(&server, &outsider_jwt, abandoned_bytes).await;
     assert_eq!(
         (status, code(&problem)),
         (
@@ -1344,7 +1344,7 @@ async fn file_upload_authority_and_validation_are_preserved() {
             Some("WYRD_PERMISSION_403_DENIED_RBAC".to_owned())
         )
     );
-    let (status, _) = put_local(&server, &outsider_jwt, &pending, ABANDONED).await;
+    let (status, _) = put_local(&server, &outsider_jwt, &pending, abandoned_bytes).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     for action in ["part-url?part_number=1", "complete", "abort"] {
         let (status, _) = upload_op(&server, &outsider_jwt, &pending, action).await;

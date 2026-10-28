@@ -446,7 +446,7 @@ pub(crate) struct PreparedSlice {
 /// length, offset, the validity bitmap, every data buffer, and every child
 /// recursively, so two batches agree only when their Arrow representation
 /// agrees byte-for-byte. `bytes` accumulates the contributed buffer length the
-/// WAL-v7 metadata records alongside the digest.
+/// WAL-v8 metadata records alongside the digest.
 ///
 /// # Errors
 ///
@@ -505,7 +505,7 @@ fn is_volatile_column(name: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an internal error when the stable buffer length exceeds its WAL-v7
+/// Returns an internal error when the stable buffer length exceeds its WAL-v8
 /// metadata representation.
 pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32), ScribeError> {
     let mut digest = Sha256::new();
@@ -605,12 +605,12 @@ fn prepare_rows(
                 &rows,
             )?;
             let slice_count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
-                detail: "Scribe batch exceeds the v7 WAL slice-count bound".to_owned(),
+                detail: "Scribe batch exceeds the v8 WAL slice-count bound".to_owned(),
             })?;
             for (slice_index, slice) in slices.iter_mut().enumerate() {
                 let slice_index =
                     u32::try_from(slice_index).map_err(|_| ScribeError::Internal {
-                        detail: "Scribe batch slice index exceeds the v7 WAL bound".to_owned(),
+                        detail: "Scribe batch slice index exceeds the v8 WAL bound".to_owned(),
                     })?;
                 slice
                     .wal_append
@@ -641,14 +641,14 @@ fn prepare_rows(
 ///
 /// # Errors
 ///
-/// Returns an internal error when the slice set exceeds WAL v7 integer bounds.
+/// Returns an internal error when the slice set exceeds WAL v8 integer bounds.
 fn assign_slice_ordinals(slices: &mut [PreparedSlice]) -> Result<(), ScribeError> {
     let count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
-        detail: "Scribe batch exceeds the v7 WAL slice-count bound".to_owned(),
+        detail: "Scribe batch exceeds the v8 WAL slice-count bound".to_owned(),
     })?;
     for (index, slice) in slices.iter_mut().enumerate() {
         let index = u32::try_from(index).map_err(|_| ScribeError::Internal {
-            detail: "Scribe batch slice index exceeds the v7 WAL bound".to_owned(),
+            detail: "Scribe batch slice index exceeds the v8 WAL bound".to_owned(),
         })?;
         slice.wal_append.assign_slice_ordinal(index, count);
         slice.id.slice_index = index;
@@ -908,9 +908,9 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 /// carry fresh per-request timestamps on every attempt and would therefore
 /// make an honest client retry look like a contradiction.
 ///
-/// This is not the WAL v7 `wal_digest`. That digest binds exact payload bytes so
+/// This is not the WAL v8 `wal_digest`. That digest binds exact payload bytes so
 /// a substituted slice cannot be authorized by a valid terminal record. The two
-/// answer different questions, are computed apart, and the v7 COMMIT record
+/// answer different questions, are computed apart, and the v8 COMMIT record
 /// persists both — see [`crate::scribe::wal::WalCommitIdentity`].
 ///
 /// The owner exists so there is one layout for this durable identity. It is

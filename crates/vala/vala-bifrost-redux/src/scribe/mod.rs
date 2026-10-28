@@ -234,8 +234,6 @@ struct PersistenceDependencies {
     wal: Arc<wal::WalWriter>,
     /// Bounded CPU lane used to encode and merge.
     persistence_cpu: crate::scribe::execution_lanes::ScribePersistenceCpuPool,
-    /// Bounded WAL lane used to advance manifests.
-    wal_io: crate::scribe::execution_lanes::ScribeWalIoPool,
     /// Typed pod stream identity authorizing publication.
     stream: stream_identity::StreamIdentity,
     /// Scribe child budget used for per-job workspace reservations.
@@ -1109,7 +1107,6 @@ impl ScribeImpl {
             operator,
             wal,
             persistence_cpu,
-            wal_io,
             stream,
             memory,
             staging_file_publisher,
@@ -1123,7 +1120,6 @@ impl ScribeImpl {
                 operator,
                 wal,
                 persistence_cpu,
-                wal_io,
                 actor_stream: stream,
                 memory,
                 staging_file_publisher,
@@ -1187,7 +1183,6 @@ impl ScribeImpl {
                     operator: Arc::clone(&operator),
                     wal: Arc::clone(&wal),
                     persistence_cpu: persistence_cpu.clone(),
-                    wal_io: wal_io.clone(),
                     stream,
                     memory: memory.clone(),
                     staging_file_publisher: staging_file_publisher.clone(),

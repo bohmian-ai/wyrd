@@ -24,6 +24,15 @@ pub struct AdmissionConfig {
     /// Server deployments pass the resolved shared Bifrost cap; admission
     /// itself enforces no byte ceiling against it.
     pub memory_limit_bytes: usize,
+    /// Unstaged backlog bound: once the frozen generations still waiting for
+    /// staging hold this many Immutable bytes, new requests are refused as
+    /// retryable busy until staging drains them.
+    ///
+    /// Acknowledged rows are never revoked; this stops acceptance from
+    /// running ahead of staging, the way a write stall bounds an LSM's
+    /// immutable memtables, so the backlog cannot grow until it exhausts the
+    /// shared memory that queries also draw on.
+    pub immutable_limit_bytes: usize,
 }
 
 /// Default pod memory budget for embedded and test Scribe construction.
@@ -33,6 +42,7 @@ impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
             memory_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES,
+            immutable_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES / 2,
         }
     }
 }
@@ -91,8 +101,10 @@ impl AdmissionController {
     /// # Errors
     ///
     /// Returns [`ScribeError::IngestBusy`] naming `table` when the pod already
-    /// holds [`GLOBAL_INFLIGHT_ITEMS`] requests, and [`ScribeError::Internal`]
-    /// when the shared memory root is poisoned or the item lock is poisoned.
+    /// holds [`GLOBAL_INFLIGHT_ITEMS`] requests or the unstaged backlog has
+    /// reached [`AdmissionConfig::immutable_limit_bytes`], and
+    /// [`ScribeError::Internal`] when the shared memory root is poisoned or
+    /// the item lock is poisoned.
     pub fn try_reserve(
         &self,
         table: impl Into<String>,
@@ -100,6 +112,17 @@ impl AdmissionController {
         if self.inner.memory.is_poisoned() {
             return Err(ScribeError::Internal {
                 detail: "memory accounting poisoned; restart required".to_owned(),
+            });
+        }
+        if self
+            .inner
+            .memory
+            .category_bytes(crate::scribe::memory::MemoryCategory::Immutable)
+            >= self.inner.config.immutable_limit_bytes
+        {
+            super::record_scribe_rejection("unstaged");
+            return Err(ScribeError::IngestBusy {
+                table: table.into(),
             });
         }
         let mut items = self
@@ -278,6 +301,37 @@ mod tests {
         admission
             .try_reserve("wyrd.items")
             .expect("released item admits");
+    }
+
+    /// An unstaged backlog at its bound refuses new requests as retryable
+    /// busy before any item moves, and staging it away admits again.
+    #[test]
+    fn unstaged_backlog_at_its_bound_refuses_as_busy() {
+        let admission = AdmissionController::with_config(super::AdmissionConfig {
+            immutable_limit_bytes: 1024,
+            ..super::AdmissionConfig::default()
+        });
+        let memory = admission.inner.memory.clone();
+        let below = memory
+            .try_reserve_maintenance(ScribeMemoryCategory::Immutable, 1023)
+            .expect("backlog below the bound");
+        drop(
+            admission
+                .try_reserve("wyrd.unstaged")
+                .expect("a backlog below the bound admits"),
+        );
+        let at = memory
+            .try_reserve_maintenance(ScribeMemoryCategory::Immutable, 1)
+            .expect("backlog reaches the bound");
+        assert!(matches!(
+            admission.try_reserve("wyrd.unstaged"),
+            Err(ScribeError::IngestBusy { .. })
+        ));
+        assert_eq!(admission.snapshot().items, 0);
+        drop((below, at));
+        admission
+            .try_reserve("wyrd.unstaged")
+            .expect("a staged backlog admits again");
     }
 
     /// A poisoned shared root refuses new admission before any item moves.

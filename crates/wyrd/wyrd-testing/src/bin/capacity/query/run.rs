@@ -26,6 +26,7 @@ use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic::Request;
 use wyrd_tonic::tonic::transport::Channel;
+use wyrd_tonic::tonic_types::StatusExt as _;
 
 use crate::query::Result;
 use crate::query::logs::{self, Logs};
@@ -105,6 +106,9 @@ pub struct Outcome {
     /// before transport framing and without compression; zero for native
     /// writes. Late ones included.
     pub wire_bytes: u64,
+    /// Busy refusals retried after the server's retry delay; each wrote
+    /// nothing and its rows were sent again.
+    pub busy: u64,
     /// Successful requests that completed after the admission stop.
     pub late: u64,
     /// Rows of the late requests.
@@ -149,6 +153,7 @@ impl Outcome {
         self.latencies_us.extend(other.latencies_us);
         self.rows += other.rows;
         self.wire_bytes += other.wire_bytes;
+        self.busy += other.busy;
         self.late += other.late;
         self.late_rows += other.late_rows;
         self.late_wire_bytes += other.late_wire_bytes;
@@ -264,10 +269,10 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Returns the stable code the failure is counted by: the client error
-    /// code, the gRPC status code, or `partial-success` when an export
-    /// dropped rows.
-    pub async fn send(&self, first: i64, last: i64) -> std::result::Result<u64, String> {
+    /// Returns the refusal: its stable code (the client error code, the gRPC
+    /// status code, or `partial-success` when an export dropped rows) and,
+    /// for a retryable busy refusal, the delay the server asked for.
+    pub async fn send(&self, first: i64, last: i64) -> std::result::Result<u64, Refused> {
         match self {
             Self::Native {
                 writer,
@@ -276,11 +281,11 @@ impl Sender {
             } => {
                 let batch = fixture
                     .batch(first, last)
-                    .map_err(|_| "fixture".to_owned())?;
+                    .map_err(|_| Refused::from("fixture".to_owned()))?;
                 writer
                     .write_batch(table, &batch)
                     .await
-                    .map_err(|error| code(&error))?;
+                    .map_err(|error| Refused::native(code(&error)))?;
                 Ok(0)
             }
             Self::Spans(otlp, fixture) => {
@@ -290,12 +295,12 @@ impl Sender {
                 let response = TraceServiceClient::new(otlp.channel.clone())
                     .export(authorized(body, &token)?)
                     .await
-                    .map_err(|status| format!("{:?}", status.code()))?;
+                    .map_err(|status| Refused::otlp(&status))?;
                 let rejected = response
                     .into_inner()
                     .partial_success
                     .map_or(0, |partial| partial.rejected_spans);
-                accepted(encoded, rejected)
+                Ok(accepted(encoded, rejected)?)
             }
             Self::Logs(otlp, fixture) => {
                 let body = fixture.request(first, last);
@@ -304,12 +309,12 @@ impl Sender {
                 let response = LogsServiceClient::new(otlp.channel.clone())
                     .export(authorized(body, &token)?)
                     .await
-                    .map_err(|status| format!("{:?}", status.code()))?;
+                    .map_err(|status| Refused::otlp(&status))?;
                 let rejected = response
                     .into_inner()
                     .partial_success
                     .map_or(0, |partial| partial.rejected_log_records);
-                accepted(encoded, rejected)
+                Ok(accepted(encoded, rejected)?)
             }
         }
     }
@@ -321,7 +326,10 @@ impl Sender {
     /// stop is late.
     ///
     /// The cursor only grows, so every request carries fresh identities and
-    /// a later loop never repeats an earlier one's rows as a retry.
+    /// a later loop never repeats an earlier one's rows as a retry. A busy
+    /// refusal wrote nothing, so the sender waits the server's retry delay
+    /// and sends the same rows again, as an OTLP exporter or an application
+    /// does; it is counted in [`Outcome::busy`], never as an error.
     pub async fn closed_loop(
         &self,
         cursor: &Arc<AtomicI64>,
@@ -341,21 +349,86 @@ impl Sender {
                         break;
                     }
                     let last = (first + chunk).min(end);
-                    let sent = Instant::now();
-                    match admission.labelled(sender.send(first, last)).await {
-                        Ok(wire) => outcome.succeeded(
-                            &admission,
-                            sent,
-                            (last - first).cast_unsigned(),
-                            wire,
-                        ),
-                        Err(code) => *outcome.errors.entry(code).or_default() += 1,
+                    loop {
+                        let sent = Instant::now();
+                        match admission.labelled(sender.send(first, last)).await {
+                            Ok(wire) => outcome.succeeded(
+                                &admission,
+                                sent,
+                                (last - first).cast_unsigned(),
+                                wire,
+                            ),
+                            Err(Refused {
+                                retry_after: Some(delay),
+                                ..
+                            }) if admission.open() => {
+                                outcome.busy += 1;
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                            Err(refused) => {
+                                *outcome.errors.entry(refused.code).or_default() += 1;
+                            }
+                        }
+                        break;
                     }
                 }
                 outcome
             });
         }
         join(tasks).await
+    }
+}
+
+/// The delay the server advertises for a busy ingest refusal (`Retry-After`
+/// and `retry-after-ms`), used once the native client's own bounded busy
+/// retries are spent.
+const BUSY_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// The stable code of a busy ingest refusal.
+const INGEST_BUSY: &str = "WYRD_VALA_429_INGEST_BUSY";
+
+/// One request the server refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// The stable code the refusal is counted by.
+    pub code: String,
+    /// The delay the server asked the client to wait before resending the
+    /// same rows; `None` when the refusal is not a retryable busy one.
+    pub retry_after: Option<Duration>,
+}
+
+impl Refused {
+    /// A native client refusal; busy carries the server's advertised delay.
+    fn native(code: String) -> Self {
+        let retry_after = (code == INGEST_BUSY).then_some(BUSY_RETRY_DELAY);
+        Self { code, retry_after }
+    }
+
+    /// An OTLP export refusal, retryable exactly when the status carries
+    /// `google.rpc.RetryInfo`, as the OTLP exporter specification reads it.
+    fn otlp(status: &wyrd_tonic::tonic::Status) -> Self {
+        Self {
+            code: format!("{:?}", status.code()),
+            retry_after: status
+                .get_details_retry_info()
+                .and_then(|retry| retry.retry_delay),
+        }
+    }
+}
+
+impl From<String> for Refused {
+    fn from(code: String) -> Self {
+        Self {
+            code,
+            retry_after: None,
+        }
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.code)
     }
 }
 
@@ -813,5 +886,39 @@ mod tests {
         );
         assert_eq!(accepted(64, 0), Ok(64));
         assert_eq!(accepted(64, 1), Err("partial-success".to_owned()));
+    }
+
+    /// Busy refusals are retried after the server's delay and nothing else
+    /// is: OTLP only with `RetryInfo`, native on the busy code once the
+    /// client's own retries are spent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a refusal is classified against the server's contract.
+    #[test]
+    fn only_busy_refusals_carry_a_retry_delay() {
+        use std::time::Duration;
+
+        use super::{BUSY_RETRY_DELAY, INGEST_BUSY, Refused};
+        use wyrd_tonic::tonic::{Code, Status};
+        use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt as _};
+
+        let mut details = ErrorDetails::new();
+        details.set_retry_info(Some(Duration::from_secs(1)));
+        let busy = Status::with_error_details(Code::ResourceExhausted, "busy", details);
+        assert_eq!(
+            Refused::otlp(&busy).retry_after,
+            Some(Duration::from_secs(1))
+        );
+        let full = Status::resource_exhausted("payload too large");
+        assert_eq!(Refused::otlp(&full).retry_after, None);
+        assert_eq!(
+            Refused::native(INGEST_BUSY.to_owned()).retry_after,
+            Some(BUSY_RETRY_DELAY)
+        );
+        assert_eq!(
+            Refused::native("WYRD_VALA_413_PAYLOAD_TOO_LARGE".to_owned()).retry_after,
+            None
+        );
     }
 }

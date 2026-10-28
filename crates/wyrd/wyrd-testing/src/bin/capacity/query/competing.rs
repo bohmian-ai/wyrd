@@ -510,7 +510,7 @@ async fn offer(
             let sent =
                 with_benchmark_labels(op.name(), phase, sender.send(first, first + chunk)).await;
             let wire = *sent.as_ref().unwrap_or(&0);
-            let result = sent.map(|_| ());
+            let result = sent.map(|_| ()).map_err(|refused| refused.code);
             outstanding.fetch_sub(chunk, Ordering::Relaxed);
             let at = Instant::now();
             if let (Ok(()), Some(probe)) = (&result, probe) {

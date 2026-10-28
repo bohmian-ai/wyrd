@@ -52,6 +52,10 @@ struct PendingGeneration {
     >,
     /// Whether this generation belongs to the shard's synchronous replay owner.
     replay_owned: bool,
+    /// Ordering link the key's next generation waits on before its staged
+    /// record; held while this generation is in flight until a later
+    /// submission takes it (see [`crate::scribe::persistence::StagingOrder`]).
+    successor: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 /// One reconstructed generation waiting behind the sole replay identity owner.
@@ -1799,9 +1803,10 @@ impl ShardOwner {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: true,
+                successor: None,
             });
         self.replay_chunk = Some(owner);
-        self.submit_front(&seal_key);
+        self.submit_ready(&seal_key);
         Ok(())
     }
 
@@ -2039,9 +2044,8 @@ impl ShardOwner {
     ///
     /// Generations a failed stage attempt left retryable are resubmitted first,
     /// so an explicit flush or shutdown drain re-drives them rather than
-    /// waiting for the next age tick; `submit_front` only ever submits an
-    /// unsubmitted queue front, which keeps FIFO order and never double-submits
-    /// an in-flight generation.
+    /// waiting for the next age tick; `submit_ready` submits unsubmitted
+    /// generations in FIFO order and never double-submits an in-flight one.
     ///
     /// # Errors
     ///
@@ -2233,7 +2237,6 @@ impl ShardOwner {
             .pending_generations
             .entry(seal_key.clone())
             .or_default();
-        let should_submit = queue.is_empty();
         queue.push_back(PendingGeneration {
             generation,
             binding,
@@ -2241,91 +2244,160 @@ impl ShardOwner {
             retry_scheduled: false,
             replay_response: None,
             replay_owned: false,
+            successor: None,
         });
-        if should_submit {
-            self.submit_front(seal_key);
-        }
+        self.submit_ready(seal_key);
         Ok(())
     }
 
-    /// Attempts to submit the oldest pending generation for one seal key.
-    /// Attempts a non-blocking submission of the oldest generation for one key.
+    /// Submits every generation of one seal key that can stage now, oldest first.
     ///
-    /// A full persistence queue leaves the generation unsubmitted so a later
-    /// flush or completion event can retry it without changing FIFO order.
-    fn submit_front(&mut self, seal_key: &crate::scribe::seal_key::SealKey) {
+    /// A key's live generations stage concurrently: each submission behind an
+    /// in-flight generation takes that generation's ordering link, so the
+    /// encodes and fsyncs overlap while staged records and manifest advances
+    /// still land in FIFO order (see
+    /// [`crate::scribe::persistence::StagingOrder`]). The walk stops at a full
+    /// persistence queue, so no generation is submitted ahead of an older
+    /// unsubmitted one, and at an in-flight generation whose link a failed
+    /// submission already consumed; that generation's completion re-drives the
+    /// key. Replay generations stage alone: one is submitted only as the queue
+    /// front, and nothing is submitted behind it.
+    fn submit_ready(&mut self, seal_key: &crate::scribe::seal_key::SealKey) {
+        let mut index = 0;
+        loop {
+            let Some(queue) = self.pending_generations.get_mut(seal_key) else {
+                return;
+            };
+            let Some(entry) = queue.get(index) else {
+                return;
+            };
+            let replay = entry.replay_owned || entry.replay_response.is_some();
+            if replay && index > 0 {
+                return;
+            }
+            if entry.submitted {
+                if replay {
+                    return;
+                }
+                index += 1;
+                continue;
+            }
+            let predecessor = match index.checked_sub(1) {
+                None => None,
+                Some(previous) => {
+                    let Some(link) = queue
+                        .get_mut(previous)
+                        .and_then(|previous| previous.successor.take())
+                    else {
+                        return;
+                    };
+                    Some(link)
+                }
+            };
+            if !self.submit_at(seal_key, index, predecessor) || replay {
+                return;
+            }
+            index += 1;
+        }
+    }
+
+    /// Attempts a non-blocking submission of one queued generation.
+    ///
+    /// Returns whether the generation entered the persistence queue. A full
+    /// queue hands `predecessor` back to the previous generation and leaves
+    /// this one unsubmitted, so a later flush or completion event retries it
+    /// without changing FIFO order.
+    fn submit_at(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        index: usize,
+        predecessor: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> bool {
         let Some(persistence) = &self.persistence else {
-            return;
+            return false;
         };
         let Some(queue) = self.pending_generations.get_mut(seal_key) else {
-            return;
+            return false;
         };
-        let Some(front) = queue.front_mut() else {
-            return;
+        let Some(front) = queue.get_mut(index) else {
+            return false;
         };
-        if front.submitted {
-            return;
-        }
         let generation = Arc::clone(&front.generation);
         let binding = front.binding.clone();
+        let (successor_tx, successor_rx) = tokio::sync::oneshot::channel();
         let result = persistence.try_submit(PersistenceJob {
             generation: Arc::clone(&generation),
             binding,
             completion_tx: self.completion_tx.clone(),
             completion_waiter: None,
-            defer_manifest_advance: front.replay_response.is_some() || front.replay_owned,
+            order: crate::scribe::persistence::StagingOrder {
+                predecessor,
+                successor: Some(successor_tx),
+            },
         });
-        match result {
-            Ok(()) => front.submitted = true,
-            Err(PersistenceSubmitError::Full(job)) if front.replay_owned => {
-                drop(job);
-                if !front.retry_scheduled {
-                    front.retry_scheduled = true;
-                    let persistence = Arc::clone(persistence);
-                    let completion_tx = self.completion_tx.clone();
-                    let seal_key = seal_key.clone();
-                    let generation_id = generation.generation_id.0;
-                    Handle::current().spawn(async move {
-                        let progress = persistence.wait_for_submission_progress().await;
-                        let _ = completion_tx
-                            .send(ShardCommand::RetryReplayPersistence {
-                                seal_key: Box::new(seal_key),
-                                generation_id,
-                                progress,
-                            })
-                            .await;
-                    });
-                }
-                return;
+        let refused = match result {
+            Ok(()) => {
+                front.submitted = true;
+                front.successor = Some(successor_rx);
+                None
             }
-            Err(PersistenceSubmitError::Closed(job)) if front.replay_owned => {
-                drop(job);
-                let generation_id = generation.generation_id.0;
-                self.fail_active_replay_submission(
-                    seal_key,
-                    generation_id,
-                    ScribeError::Internal {
-                        detail: "Scribe persistence queue closed during replay".to_owned(),
-                    },
-                );
-                return;
+            Err(PersistenceSubmitError::Full(job)) => Some((job, false)),
+            Err(PersistenceSubmitError::Closed(job)) => Some((job, true)),
+        };
+        let Some((mut job, closed)) = refused else {
+            let active_paths = self
+                .wal_segments
+                .values()
+                .flat_map(|segments| segments.keys().cloned())
+                .collect::<HashSet<_>>();
+            if let Err(error) = self
+                .wal_handle
+                .close_segments_if_unowned(&generation.wal_segments, &active_paths)
+            {
+                tracing::warn!(error = %error, "closed WAL segment could not be detached after bucket rotation");
             }
-            Err(PersistenceSubmitError::Full(job) | PersistenceSubmitError::Closed(job)) => {
-                drop(job);
-                return;
-            }
-        }
-        let active_paths = self
-            .wal_segments
-            .values()
-            .flat_map(|segments| segments.keys().cloned())
-            .collect::<HashSet<_>>();
-        if let Err(error) = self
-            .wal_handle
-            .close_segments_if_unowned(&generation.wal_segments, &active_paths)
+            return true;
+        };
+        if let Some(previous) = index
+            .checked_sub(1)
+            .and_then(|previous| queue.get_mut(previous))
         {
-            tracing::warn!(error = %error, "closed WAL segment could not be detached after bucket rotation");
+            previous.successor = job.order.predecessor.take();
         }
+        let Some(front) = queue.get_mut(index) else {
+            return false;
+        };
+        if !front.replay_owned {
+            return false;
+        }
+        let generation_id = generation.generation_id.0;
+        if closed {
+            self.fail_active_replay_submission(
+                seal_key,
+                generation_id,
+                ScribeError::Internal {
+                    detail: "Scribe persistence queue closed during replay".to_owned(),
+                },
+            );
+            return false;
+        }
+        if !front.retry_scheduled {
+            front.retry_scheduled = true;
+            let persistence = Arc::clone(persistence);
+            let completion_tx = self.completion_tx.clone();
+            let seal_key = seal_key.clone();
+            Handle::current().spawn(async move {
+                let progress = persistence.wait_for_submission_progress().await;
+                let _ = completion_tx
+                    .send(ShardCommand::RetryReplayPersistence {
+                        seal_key: Box::new(seal_key),
+                        generation_id,
+                        progress,
+                    })
+                    .await;
+            });
+        }
+        false
     }
 
     /// Re-drives the active replay generation after bounded queue progress.
@@ -2350,7 +2422,7 @@ impl ShardOwner {
             self.fail_active_replay_submission(seal_key, generation_id, error);
             return;
         }
-        self.submit_front(seal_key);
+        self.submit_ready(seal_key);
     }
 
     /// Rolls back a replay generation that could not enter persistence.
@@ -2394,15 +2466,16 @@ impl ShardOwner {
     fn retry_pending(&mut self) {
         let keys = self.pending_generations.keys().cloned().collect::<Vec<_>>();
         for key in keys {
-            self.submit_front(&key);
+            self.submit_ready(&key);
         }
     }
 
     /// Retires all committed generations on the current lifecycle sweep.
     ///
     /// A generation is eligible the moment its state is
-    /// `ImmutableState::Committed`, which is only reached after the fenced
-    /// `vala.file_list` transaction commits. Retirement ordering is
+    /// `ImmutableState::Durable`, which is reached once its rows are a staged
+    /// member; the staged record is the replay watermark for its WAL range.
+    /// Retirement ordering is
     /// preserved: the generation's memory ownership is settled before `ScribeWalIoOp::RetireWal` is submitted, so WAL
     /// segment refcounts are released last.
     ///
@@ -2587,9 +2660,10 @@ impl ShardOwner {
 
     /// Reconciles one persistence result with this owner's FIFO generation queue.
     ///
-    /// Successful publication moves the generation to retained state and
-    /// submits the next generation for the same key. Failures mark only the
-    /// front generation retryable and deliver the error to its waiter.
+    /// Successful publication moves the generation, wherever it sits in its
+    /// key's queue, to retained state and submits the key's ready
+    /// generations. Failures mark only that generation retryable and deliver
+    /// the error to its waiter.
     ///
     /// # Errors
     ///
@@ -2602,22 +2676,24 @@ impl ShardOwner {
     ) -> Result<(), String> {
         let mut replay_identity = completion.replay_identity.take();
         let generation_id = completion.generation_id.0;
-        let seal_key = self.pending_generations.iter().find_map(|(key, queue)| {
+        let owner = self.pending_generations.iter().find_map(|(key, queue)| {
             queue
-                .front()
-                .filter(|front| front.generation.generation_id.0 == generation_id)
-                .map(|_| key.clone())
+                .iter()
+                .find(|pending| {
+                    pending.submitted && pending.generation.generation_id.0 == generation_id
+                })
+                .map(|pending| (key.clone(), pending.replay_owned))
         });
-        let Some(seal_key) = seal_key else {
+        let Some((seal_key, replay_owned)) = owner else {
             return self.handle_unowned_completion(completion, waiter);
         };
         self.trace_persistence_settlement(&seal_key, generation_id, completion.error.is_some());
-        let replay_owned = self.front_is_replay_owned(&seal_key);
         if let Some(error) = completion.error.as_ref() {
             let detail = error.clone();
             tracing::warn!(error = %error, generation_id, "shard persistence failed; retaining immutable generation");
             return self.fail_persistence_completion(
                 &seal_key,
+                generation_id,
                 replay_owned,
                 &mut replay_identity,
                 detail,
@@ -2628,6 +2704,7 @@ impl ShardOwner {
             let detail = "persistence completion omitted its staged member".to_owned();
             return self.fail_persistence_completion(
                 &seal_key,
+                generation_id,
                 replay_owned,
                 &mut replay_identity,
                 detail,
@@ -2639,6 +2716,7 @@ impl ShardOwner {
             tracing::warn!(error = %error, generation_id, "shard persistence completion could not publish generation");
             return self.fail_persistence_completion(
                 &seal_key,
+                generation_id,
                 replay_owned,
                 &mut replay_identity,
                 detail,
@@ -2648,13 +2726,13 @@ impl ShardOwner {
         let Some(queue) = self.pending_generations.get_mut(&seal_key) else {
             return Err("persistence completion queue disappeared".to_owned());
         };
-        let Some(mut front) = queue.pop_front() else {
-            return Err("persistence completion queue is empty".to_owned());
+        let Some(mut front) = queue
+            .iter()
+            .position(|pending| pending.generation.generation_id.0 == generation_id)
+            .and_then(|position| queue.remove(position))
+        else {
+            return Err("persistence completion generation left its queue".to_owned());
         };
-        if front.generation.generation_id.0 != generation_id {
-            queue.push_front(front);
-            return Err("persistence completion generation is not queue front".to_owned());
-        }
         self.retained_generations.insert(
             generation_id,
             RetainedGeneration {
@@ -2681,12 +2759,12 @@ impl ShardOwner {
         }
         Self::send_waiter_success(waiter);
         if self.persistence.is_some() {
-            self.submit_front(&seal_key);
+            self.submit_ready(&seal_key);
         }
         Ok(())
     }
 
-    /// Retains one failed FIFO front and propagates its terminal replay result.
+    /// Retains one failed generation and propagates its terminal replay result.
     ///
     /// Replay identity returns to the active chunk before failure settlement so
     /// its sole root lease remains owned until the replay waiter observes the error.
@@ -2698,12 +2776,13 @@ impl ShardOwner {
     fn fail_persistence_completion(
         &mut self,
         seal_key: &crate::scribe::seal_key::SealKey,
+        generation_id: u64,
         replay_owned: bool,
         replay_identity: &mut Option<crate::scribe::memory::ReplayIdentityOwnership>,
         detail: String,
         waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), String> {
-        self.mark_front_retryable(seal_key);
+        self.mark_retryable(seal_key, generation_id);
         if replay_owned {
             if let Some(owner) = self.replay_chunk.as_mut() {
                 owner.identity = replay_identity.take();
@@ -2712,7 +2791,7 @@ impl ShardOwner {
                 detail: detail.clone(),
             });
         }
-        self.send_replay_error(seal_key, &detail);
+        self.send_replay_error(seal_key, generation_id, &detail);
         Self::send_waiter_error(waiter, detail.clone());
         Err(detail)
     }
@@ -2745,14 +2824,6 @@ impl ShardOwner {
             outcome = if failed { "failed" } else { "committed" },
             "Scribe shard persistence settlement received"
         );
-    }
-
-    /// Reports whether one key's FIFO front belongs to the active replay chunk.
-    fn front_is_replay_owned(&self, seal_key: &crate::scribe::seal_key::SealKey) -> bool {
-        self.pending_generations
-            .get(seal_key)
-            .and_then(|queue| queue.front())
-            .is_some_and(|front| front.replay_owned)
     }
 
     /// Delivers a successful completion to an optional persistence waiter.
@@ -2897,24 +2968,39 @@ impl ShardOwner {
         detail.map_or(Ok(()), Err)
     }
 
-    /// Marks a key's front generation for a later persistence retry.
-    fn mark_front_retryable(&mut self, seal_key: &crate::scribe::seal_key::SealKey) {
-        if let Some(front) = self
-            .pending_generations
-            .get_mut(seal_key)
-            .and_then(VecDeque::front_mut)
-        {
-            front.submitted = false;
+    /// Returns one queued generation of a seal key by generation id.
+    fn pending_mut(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        generation_id: u64,
+    ) -> Option<&mut PendingGeneration> {
+        self.pending_generations
+            .get_mut(seal_key)?
+            .iter_mut()
+            .find(|pending| pending.generation.generation_id.0 == generation_id)
+    }
+
+    /// Marks one queued generation for a later persistence retry.
+    ///
+    /// Its ordering link is dropped with the failed attempt, so the key's
+    /// later in-flight generations fail and are retried behind it.
+    fn mark_retryable(&mut self, seal_key: &crate::scribe::seal_key::SealKey, generation_id: u64) {
+        if let Some(pending) = self.pending_mut(seal_key, generation_id) {
+            pending.submitted = false;
+            pending.successor = None;
         }
     }
 
-    /// Fails and detaches the replay waiter owned by one retryable FIFO front.
-    fn send_replay_error(&mut self, seal_key: &crate::scribe::seal_key::SealKey, detail: &str) {
+    /// Fails and detaches the replay waiter owned by one retryable generation.
+    fn send_replay_error(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        generation_id: u64,
+        detail: &str,
+    ) {
         let response = self
-            .pending_generations
-            .get_mut(seal_key)
-            .and_then(VecDeque::front_mut)
-            .and_then(|front| front.replay_response.take());
+            .pending_mut(seal_key, generation_id)
+            .and_then(|pending| pending.replay_response.take());
         if let Some(response) = response {
             let _ = response.send(Err(ScribeError::Internal {
                 detail: detail.to_owned(),
@@ -3036,7 +3122,7 @@ struct BatchCommitIdentity {
     first_index: usize,
     /// Validated cardinality of the closed slice set.
     slice_count: u32,
-    /// Digest over exact WAL payload bytes, carried by the v7 COMMIT record.
+    /// Digest over exact WAL payload bytes, carried by the v8 COMMIT record.
     ///
     /// This is a WAL integrity fact: it authorizes exactly the slices that were
     /// fsynced, so a substituted or reordered slice cannot be closed by a valid
@@ -3404,7 +3490,7 @@ impl ShardOwner {
             // Once WAL close begins, retrying as a normal active generation
             // could duplicate cohort ownership. Preserve every durable file
             // and frozen member, fail-stop admission, and let startup replay
-            // reconstruct the sole owner from WAL v7.
+            // reconstruct the sole owner from WAL v8.
             self.memory_ownership.poison();
         }
         result
@@ -3533,7 +3619,6 @@ impl ShardOwner {
             .pending_generations
             .entry(seal_key.clone())
             .or_default();
-        let should_submit = queue.is_empty();
         queue.push_back(PendingGeneration {
             generation,
             binding,
@@ -3541,10 +3626,9 @@ impl ShardOwner {
             retry_scheduled: false,
             replay_response: None,
             replay_owned: false,
+            successor: None,
         });
-        if should_submit {
-            self.submit_front(seal_key);
-        }
+        self.submit_ready(seal_key);
         Ok(())
     }
 
@@ -3626,7 +3710,7 @@ impl ShardOwner {
         }))
     }
 
-    /// Appends one v7 COMMIT record per complete batch, syncs once, then fences.
+    /// Appends one v8 COMMIT record per complete batch, syncs once, then fences.
     ///
     /// The group's SLICE records are written but not yet synced when this
     /// method starts. Every complete batch's COMMIT is appended after them; one
@@ -3657,24 +3741,30 @@ impl ShardOwner {
         let commit = stages.commit.timer();
         let mut commits = Vec::with_capacity(state.prepared.len());
         let mut group_segments = std::mem::take(&mut state.touched);
+        let mut identities = Vec::with_capacity(state.prepared.len());
+        let mut records = Vec::with_capacity(state.prepared.len());
         for (index, append) in state.prepared.iter().enumerate() {
             let Some(identity) = Self::batch_commit_identity(state, append)? else {
                 continue;
             };
-            let ScribeWalIoResult::WalWritten { result } = self
+            records.push(crate::scribe::wal::PreparedWalAppend::commit(
+                *append.batch_id.as_bytes(),
+                *append.tenant.as_uuid().as_bytes(),
+                identity.slice_count,
+                crate::scribe::wal::WalCommitIdentity {
+                    wal_digest: identity.wal_digest,
+                    logical_digest: identity.logical_digest,
+                    request_id: *state.durable[identity.first_index].request_id.as_bytes(),
+                },
+            ));
+            identities.push((index, identity));
+        }
+        if !records.is_empty() {
+            let ScribeWalIoResult::WalWritten { results } = self
                 .wal_io
                 .submit(ScribeWalIoOp::WritePrepared {
                     wal: self.wal_handle.clone(),
-                    append: crate::scribe::wal::PreparedWalAppend::commit(
-                        *append.batch_id.as_bytes(),
-                        *append.tenant.as_uuid().as_bytes(),
-                        identity.slice_count,
-                        crate::scribe::wal::WalCommitIdentity {
-                            wal_digest: identity.wal_digest,
-                            logical_digest: identity.logical_digest,
-                            request_id: *state.durable[identity.first_index].request_id.as_bytes(),
-                        },
-                    ),
+                    appends: records,
                 })
                 .await?
             else {
@@ -3682,18 +3772,26 @@ impl ShardOwner {
                     detail: "WAL IO lane returned the wrong batch commit result".to_owned(),
                 });
             };
-            let header = result
-                .touched_segments
-                .first()
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "WAL v7 batch commit did not retain its segment identity".to_owned(),
-                })?
-                .header()
-                .clone();
-            for segment in result.touched_segments {
-                group_segments.insert(segment.path().to_path_buf(), segment);
+            if results.len() != identities.len() {
+                return Err(ScribeError::Internal {
+                    detail: "WAL IO lane returned the wrong batch commit count".to_owned(),
+                });
             }
-            commits.push((index, identity, header, result.lsn));
+            for ((index, identity), result) in identities.into_iter().zip(results) {
+                let header = result
+                    .touched_segments
+                    .first()
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "WAL v8 batch commit did not retain its segment identity"
+                            .to_owned(),
+                    })?
+                    .header()
+                    .clone();
+                for segment in result.touched_segments {
+                    group_segments.insert(segment.path().to_path_buf(), segment);
+                }
+                commits.push((index, identity, header, result.lsn));
+            }
         }
         commit.done();
         let sync = stages.sync.timer();
@@ -3868,7 +3966,7 @@ impl ShardOwner {
             slice_set_digest: identity.logical_digest,
             slice_count: i32::try_from(identity.slice_count).map_err(|_| {
                 ScribeError::Internal {
-                    detail: "WAL v7 slice count exceeds SQL integer range".to_owned(),
+                    detail: "WAL v8 slice count exceeds SQL integer range".to_owned(),
                 }
             })?,
             wal_node_id: uuid::Uuid::from_bytes(header.node_id),
@@ -3993,11 +4091,16 @@ impl ShardOwner {
         let fixed_durable_capacity = durable.capacity();
         let mut touched = HashMap::<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>::new();
         let mut rows_by_append = HashMap::<[u8; 16], u64>::new();
-        for append in &mut prepared {
+        let mut staged = Vec::<usize>::new();
+        let mut records = Vec::new();
+        let mut owners = Vec::<usize>::new();
+        let mut leases = Vec::new();
+        for (append_index, append) in prepared.iter_mut().enumerate() {
             if let Some(memory) = append.memory.as_mut() {
                 memory.transfer_category(MemoryCategory::Prepared)?;
             }
             let batch_id = *append.batch_id.as_bytes();
+            let mut writes_records = false;
             loop {
                 let Some(slice) = Self::next_prepared_slice(append) else {
                     break;
@@ -4019,13 +4122,15 @@ impl ShardOwner {
                     }
                 }
                 let slice_id = slice.id.clone();
-                let (slice, result) = match if let Some(previous) =
-                    self.synced_not_inserted.get(&slice_id).copied()
-                {
-                    self.reuse_synced_slice(append, slice, &previous)
-                } else {
-                    self.write_prepared_slice(append, slice).await
-                } {
+                let staged_slice =
+                    if let Some(previous) = self.synced_not_inserted.get(&slice_id).copied() {
+                        self.reuse_synced_slice(append, slice, &previous)
+                            .map(|(slice, _)| (slice, None))
+                    } else {
+                        self.stage_ingress_slice(append, slice)
+                            .map(|(slice, record)| (slice, Some(record)))
+                    };
+                let (slice, record) = match staged_slice {
                     Ok(value) => value,
                     Err(error) => {
                         if let Err(cleanup_error) = self.release_active_reservations(&durable) {
@@ -4035,18 +4140,77 @@ impl ShardOwner {
                         return Err(error);
                     }
                 };
-                for segment in &result.touched_segments {
-                    touched.insert(segment.path().to_path_buf(), Arc::clone(segment));
-                    self.wal_segments
-                        .entry(slice.seal_key.clone())
-                        .or_default()
-                        .insert(segment.path().to_path_buf(), Arc::clone(segment));
+                if let Some(record) = record {
+                    staged.push(durable.len());
+                    records.push(record);
+                    writes_records = true;
                 }
                 durable.push(slice);
                 if durable.capacity() != fixed_durable_capacity {
                     return Err(ScribeError::Internal {
                         detail: "WAL durable slice metadata exceeded its exact capacity".to_owned(),
                     });
+                }
+            }
+            if writes_records {
+                let Some(memory) = append.memory.take() else {
+                    let error = ScribeError::Internal {
+                        detail: "ingress root owner missing before WAL dispatch".to_owned(),
+                    };
+                    if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                        tracing::error!(error = %cleanup_error, "active cleanup failed after WAL error");
+                    }
+                    Self::notify_prepared_error(&mut prepared, &error);
+                    return Err(error);
+                };
+                owners.push(append_index);
+                leases.push(memory);
+            }
+        }
+        if !records.is_empty() {
+            let written = match self
+                .wal_io
+                .submit(ScribeWalIoOp::WriteIngressSlices {
+                    wal: self.wal_handle.clone(),
+                    appends: records,
+                    memory: leases,
+                })
+                .await
+            {
+                Ok(ScribeWalIoResult::IngressSlicesWritten { results, memory })
+                    if results.len() == staged.len() && memory.len() == owners.len() =>
+                {
+                    for (index, memory) in owners.into_iter().zip(memory) {
+                        prepared[index].memory = Some(memory);
+                    }
+                    Ok(results)
+                }
+                Ok(_) => Err(ScribeError::Internal {
+                    detail: "WAL IO lane returned the wrong shard append result".to_owned(),
+                }),
+                Err(error) => Err(error),
+            };
+            let results = match written {
+                Ok(results) => results,
+                Err(error) => {
+                    if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                        tracing::error!(error = %cleanup_error, "active cleanup failed after WAL error");
+                    }
+                    Self::notify_prepared_error(&mut prepared, &error);
+                    return Err(error);
+                }
+            };
+            for (index, result) in staged.into_iter().zip(results) {
+                let slice = &mut durable[index];
+                slice.lsn = result.lsn;
+                slice.payload_digest = result.payload_digest;
+                slice.payload_len = result.payload_len;
+                for segment in result.touched_segments {
+                    self.wal_segments
+                        .entry(slice.seal_key.clone())
+                        .or_default()
+                        .insert(segment.path().to_path_buf(), Arc::clone(&segment));
+                    touched.insert(segment.path().to_path_buf(), segment);
                 }
             }
         }
@@ -4078,17 +4242,21 @@ impl ShardOwner {
         }
     }
 
-    /// Reserves active memory and appends one prepared slice to the shard WAL lane.
+    /// Reserves active memory for one prepared slice and stages its WAL record.
+    ///
+    /// The returned slice carries no WAL coordinates yet: `write_group`
+    /// writes every staged record of the group in one WAL IO operation and
+    /// fills each slice's LSN and payload identity from that result.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when memory accounting or WAL append fails; all acquired active reservations are released on failure.
-    async fn write_prepared_slice(
+    /// Returns [`ScribeError`] when active memory accounting fails; the
+    /// reservation helper releases what it acquired.
+    fn stage_ingress_slice(
         &mut self,
         append: &mut PreparedAppend,
         slice: PreparedSlice,
-    ) -> Result<(DurableSlice, crate::scribe::wal::WalAppendResult), ScribeError> {
-        let retain_rows = true;
+    ) -> Result<(DurableSlice, crate::scribe::wal::PreparedWalAppend), ScribeError> {
         let PreparedSlice {
             seal_key,
             request_id,
@@ -4097,67 +4265,26 @@ impl ShardOwner {
             memtable_bytes,
             ..
         } = slice;
-        let slice_index = wal_append.slice_index;
-        let slice_count = wal_append.slice_count;
-        let schema_fingerprint = wal_append.schema_fingerprint;
-        let data_digest = wal_append.logical_data_digest;
-        let data_len = wal_append.logical_data_len;
-        if retain_rows {
-            self.reserve_slice_active(append, memtable_bytes)?;
-        }
-        let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
-            detail: "ingress root owner missing before WAL dispatch".to_owned(),
-        })?;
-        let wal_result = self
-            .wal_io
-            .submit(ScribeWalIoOp::WriteIngressSlice {
-                wal: self.wal_handle.clone(),
-                append: wal_append,
-                memory,
-            })
-            .await;
-        let result = match wal_result {
-            Ok(ScribeWalIoResult::IngressSliceWritten { result, memory }) => {
-                append.memory = Some(memory);
-                result
-            }
-            Ok(_) => {
-                let error = ScribeError::Internal {
-                    detail: "WAL IO lane returned the wrong shard append result".to_owned(),
-                };
-                return Err(if retain_rows {
-                    self.preserve_primary_after_active_cleanup(error, memtable_bytes, true)
-                } else {
-                    error
-                });
-            }
-            Err(error) => {
-                return Err(if retain_rows {
-                    self.preserve_primary_after_active_cleanup(error, memtable_bytes, true)
-                } else {
-                    error
-                });
-            }
-        };
+        self.reserve_slice_active(append, memtable_bytes)?;
         Ok((
             DurableSlice {
                 seal_key,
                 request_id,
-                rows: retain_rows.then_some(rows),
+                rows: Some(rows),
                 memtable_bytes,
-                active_reserved: retain_rows,
+                active_reserved: true,
                 batch_id: *append.batch_id.as_bytes(),
-                schema_fingerprint,
-                data_digest,
-                data_len,
-                lsn: result.lsn,
-                payload_digest: result.payload_digest,
-                payload_len: result.payload_len,
-                slice_index,
-                slice_count,
+                schema_fingerprint: wal_append.schema_fingerprint,
+                data_digest: wal_append.logical_data_digest,
+                data_len: wal_append.logical_data_len,
+                lsn: crate::scribe::wal::WalLsn::ZERO,
+                payload_digest: [0; 32],
+                payload_len: 0,
+                slice_index: wal_append.slice_index,
+                slice_count: wal_append.slice_count,
                 commit_already_synced: false,
             },
-            result,
+            wal_append,
         ))
     }
 
@@ -5291,7 +5418,7 @@ mod tests {
     /// Drives one replay generation through queue backpressure and back.
     ///
     /// The one-slot persistence runtime is deliberately full at entry, so
-    /// `submit_front` must record a scheduled retry rather than a submission.
+    /// `submit_ready` must record a scheduled retry rather than a submission.
     /// Completing the blocker then has to wake the replay waiter with the exact
     /// generation-keyed retry command — not an age tick — which flips the front
     /// entry to submitted. The sequence is then re-armed by refilling the slot
@@ -5311,7 +5438,7 @@ mod tests {
         completion_rx: &mut mpsc::Receiver<ShardCommand>,
         generation: &Arc<ImmutableGeneration>,
     ) {
-        owner.submit_front(key);
+        owner.submit_ready(key);
         assert!(
             owner
                 .pending_generations
@@ -5352,10 +5479,10 @@ mod tests {
                 .expect("blocker binding"),
                 completion_tx: owner.completion_tx.clone(),
                 completion_waiter: None,
-                defer_manifest_advance: true,
+                order: crate::scribe::persistence::StagingOrder::default(),
             })
             .expect("refill one-slot queue");
-        owner.submit_front(key);
+        owner.submit_ready(key);
         assert!(
             owner
                 .pending_generations
@@ -5458,7 +5585,7 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
         let generation = owner_generation(&key, &frozen, stream, wal_handle.clone());
         let mut owner = owner_for_completion_test(memtable, &wal, wal_handle, stream);
-        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test(1);
         owner.persistence = Some(Arc::new(persistence));
         let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
             .expect("test binding");
@@ -5471,6 +5598,7 @@ mod tests {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: false,
+                successor: None,
             }]),
         );
 
@@ -5484,6 +5612,141 @@ mod tests {
         assert!(front.submitted, "the flush resubmits the retained front");
         let job = persistence_rx.recv().await.expect("resubmitted job");
         assert_eq!(job.generation.generation_id, generation.generation_id);
+    }
+
+    /// A seal key's generations stage concurrently but publish in order.
+    ///
+    /// Three queued generations of one key are all submitted at once, each
+    /// behind the previous one's ordering link. A dropped link (a failed
+    /// generation) fails the generation behind it instead of letting it publish
+    /// its staged record first, and a later generation's completion settles
+    /// while an earlier one is still in flight.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any generation is not submitted, a link does not chain to the
+    /// previous submission, or the out-of-order completion is refused or
+    /// removes the wrong generation.
+    #[tokio::test]
+    async fn one_seal_key_pipelines_generations_in_order() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        let frozen = (0..3)
+            .map(|_| {
+                memtable
+                    .insert(&key, owner_meta(&key), owner_batch())
+                    .expect("owner insert");
+                memtable.freeze(&key).expect("owner freeze")
+            })
+            .collect::<Vec<_>>();
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let generations = frozen
+            .iter()
+            .map(|frozen| owner_generation(&key, frozen, stream, wal_handle.clone()))
+            .collect::<Vec<_>>();
+        let mut owner = owner_for_completion_test(memtable, &wal, wal_handle, stream);
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test(3);
+        owner.persistence = Some(Arc::new(persistence));
+        let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
+            .expect("test binding");
+        owner.pending_generations.insert(
+            key.clone(),
+            generations
+                .iter()
+                .map(|generation| PendingGeneration {
+                    generation: Arc::clone(generation),
+                    binding: binding.clone(),
+                    submitted: false,
+                    retry_scheduled: false,
+                    replay_response: None,
+                    replay_owned: false,
+                    successor: None,
+                })
+                .collect(),
+        );
+
+        owner.submit_ready(&key);
+
+        let mut jobs = Vec::new();
+        for _ in 0..3 {
+            jobs.push(persistence_rx.recv().await.expect("pipelined job"));
+        }
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.generation.generation_id)
+                .collect::<Vec<_>>(),
+            generations
+                .iter()
+                .map(|generation| generation.generation_id)
+                .collect::<Vec<_>>(),
+            "every generation of the key is submitted, oldest first"
+        );
+        assert!(
+            jobs[0].order.predecessor.is_none(),
+            "the front waits on nothing"
+        );
+        jobs[0]
+            .order
+            .successor
+            .take()
+            .expect("first link")
+            .send(())
+            .expect("second generation holds the first link");
+        jobs[1]
+            .order
+            .predecessor
+            .take()
+            .expect("second waits on the first")
+            .await
+            .expect("first published its staged record");
+        drop(jobs[1].order.successor.take());
+        assert!(
+            jobs[2]
+                .order
+                .predecessor
+                .take()
+                .expect("third waits on the second")
+                .await
+                .is_err(),
+            "a failed generation fails the one behind it"
+        );
+
+        owner
+            .handle_persistence_completion(
+                PersistenceCompletion {
+                    generation_id: generations[1].generation_id,
+                    staged: Some(owner_staged_member(2)),
+                    wal_segments: Vec::new(),
+                    wal: generations[1].wal.clone(),
+                    arrow_bytes: generations[1].arrow_bytes,
+                    replay_identity: None,
+                    error: None,
+                },
+                None,
+            )
+            .expect("a later generation settles before an earlier one");
+        assert_eq!(
+            owner
+                .pending_generations
+                .get(&key)
+                .expect("earlier and later generations stay queued")
+                .iter()
+                .map(|pending| pending.generation.generation_id)
+                .collect::<Vec<_>>(),
+            vec![generations[0].generation_id, generations[2].generation_id]
+        );
     }
 
     /// Replay owns its own retries across persistence-queue backpressure.
@@ -5529,7 +5792,7 @@ mod tests {
             .expect("replay immutable ownership");
         let (completion_tx, mut completion_rx) = mpsc::channel(1);
         owner.completion_tx = completion_tx.clone();
-        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test(1);
         let persistence = Arc::new(persistence);
         let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
             .expect("test binding");
@@ -5539,7 +5802,7 @@ mod tests {
                 binding: binding.clone(),
                 completion_tx,
                 completion_waiter: None,
-                defer_manifest_advance: true,
+                order: crate::scribe::persistence::StagingOrder::default(),
             })
             .expect("fill one-slot queue");
         owner.persistence = Some(Arc::clone(&persistence));
@@ -5552,6 +5815,7 @@ mod tests {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: true,
+                successor: None,
             }]),
         );
         let (response, response_rx) = tokio::sync::oneshot::channel();
@@ -5642,6 +5906,7 @@ mod tests {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: true,
+                successor: None,
             }]),
         );
         let (response, response_rx) = tokio::sync::oneshot::channel();
@@ -6061,6 +6326,7 @@ mod tests {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: true,
+                successor: None,
             }]),
         );
         let (retirement_response, retirement_rx) = tokio::sync::oneshot::channel();
@@ -7191,6 +7457,7 @@ mod tests {
                 retry_scheduled: false,
                 replay_response: None,
                 replay_owned: false,
+                successor: None,
             }]),
         );
         let (waiter_tx, waiter_rx) = tokio::sync::oneshot::channel();
@@ -7291,18 +7558,19 @@ mod tests {
         assert!(!owner.memory_ownership.is_poisoned());
     }
 
-    /// One multi-batch group submits exactly one sync.
+    /// One multi-batch group submits two record writes and one sync.
     ///
-    /// Every batch's SLICE and COMMIT records are appended before the single
-    /// distinct-segment sync, so the WAL lane sees one sync submission per
-    /// group no matter how many complete batches the group carries.
+    /// Every batch's SLICE records reach the WAL lane in one operation and
+    /// every COMMIT record in a second, both before the single distinct-segment
+    /// sync, so the WAL lane sees the same three submissions per group no
+    /// matter how many batches the group carries.
     ///
     /// # Panics
     ///
     /// Panics if the isolated owner cannot be built, the group fails, or the
-    /// WAL lane observes any sync count other than one.
+    /// WAL lane observes any other write or sync count.
     #[tokio::test]
-    async fn group_commit_syncs_once() {
+    async fn group_commit_writes_and_syncs_once() {
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node = crate::scribe::stream_identity::NodeId::generate();
         let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
@@ -7324,6 +7592,7 @@ mod tests {
 
         owner.process_group(group).await.expect("group commits");
 
+        assert_eq!(owner.wal_io.write_submissions_for_test(), 2);
         assert_eq!(owner.wal_io.sync_submissions_for_test(), 1);
     }
 
@@ -7860,7 +8129,7 @@ mod tests {
             .memory_ownership
             .reserve_active(active_bytes)
             .expect("active memory ownership");
-        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test(1);
         owner.persistence = Some(Arc::new(persistence.clone()));
         owner.generation_started_at = std::time::Instant::now()
             .checked_sub(owner.generation_max_age)

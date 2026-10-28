@@ -704,7 +704,6 @@ ImmutableArrow
   -> Ready
   -> Claimed
   -> Publishing
-  -> Published
   -> CleanupPending
   -> Retired
 ```
@@ -788,6 +787,19 @@ fence. Contradictions at canonical coordinates still fail closed, and missing
 fence authority never permits speculative suppression. Preserve genuinely
 unfenced complete-commit recovery under its recorded version. No abort record,
 truncation workaround or second replay ledger is introduced.
+
+A shard keeps up to two retired WAL files and overwrites them as its next
+segments, so appends reuse allocated blocks rather than growing a file. Every
+record carries its segment's sequence tag; a record left from a file's earlier
+use therefore reads as the end of the segment, and an acknowledged COMMIT
+beyond it fails replay closed. Each shard's WAL directory holds a manifest of
+per-seal-key watermarks at or below which replay skips that shard's records.
+Staging does not write it, because a live staged record is itself the evidence
+for its WAL range: the range is folded into its own shard's manifest before
+retirement removes the record and once at startup before replay, and a replay
+retirement folds its watermark before its segments retire. A watermark never
+spans shards: every shard draws LSNs from the stream's one counter and
+`file_list` rows carry no shard.
 Because SLICE and COMMIT records share one sync, a crash may leave a complete
 but invalid record in a shard's unsynced tail. Replay ends that shard's chain
 at the first such record in its last segment, as it does a torn tail, only

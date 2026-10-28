@@ -1338,6 +1338,20 @@ impl ScribeResources {
         OracleExecution::issue(None, memory_pool, ceiling_bytes, target_partitions, 0)
     }
 
+    /// Bytes one Scribe memory category holds now.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the root state lock is poisoned, as every root reader does.
+    pub(crate) fn category_bytes(&self, category: crate::scribe::memory::MemoryCategory) -> usize {
+        self.governor
+            .inner
+            .state
+            .lock()
+            .expect("Scribe root state lock")
+            .scribe_category_bytes[category as usize]
+    }
+
     /// Captures the Scribe-compatible projection of authoritative root state.
     pub(crate) fn memory_snapshot(&self) -> crate::scribe::memory::MemorySnapshot {
         let state = self

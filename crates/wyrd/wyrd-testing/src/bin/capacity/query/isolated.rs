@@ -420,6 +420,7 @@ fn read_outcome(repetition: &mut Repetition, outcome: &Outcome, read: Option<Rea
     repetition.set("requests", Reading::count(requests));
     repetition.set("late_requests", Reading::count(outcome.late));
     repetition.set("errors", Reading::count(outcome.error_count()));
+    repetition.set("busy_retries", Reading::count(outcome.busy));
     for (id, q) in [
         ("client_p50_ms", 0.5),
         ("client_p95_ms", 0.95),

@@ -28,6 +28,68 @@ optimization. The maintainer approved items 1, 3 and 10 explicitly; item 10's
 design is shown to the maintainer before its code. Existing
 requirements own changed behavior; new IDs below cover additional outcomes.
 
+## Current status (2026-10-28)
+
+The work is handed to a new implementer. The work since `64ca466fb` is committed in `895c007d6` (RetryInfo) and `e8e8342b9` (Scribe changes); see "Work since 64ca466fb". Independent Codex reviews of items 9 and 10, with the exact prompts they were given, are in `changes/active/benchmark-experiments/codex-reviews/`.
+
+| Item | Status | Evidence |
+|---|---|---|
+| 1. Valid or invalid only | Done | Acceptance evidence, items 1–5 |
+| 2. Writes budget | Done (budget 480 s) | Acceptance evidence, items 1–5 |
+| 3. History location | Done | Acceptance evidence, items 1–5 |
+| 4. Realistic span fixture | Done | Acceptance evidence, items 1–5 |
+| 5. Self-contained records | Done | Acceptance evidence, items 1–5 |
+| 6. Per-phase write timing | Done | Item 6 acceptance (REQ-024) |
+| 7. Span decode CPU, (a)–(d) | Done | (a) `76bcfa75a`; (b) `a8cf9e95a`; (c) `3adfc0c14`; (d) attributed, with the Gate identity hand-off deleted in `dc34bacbe` |
+| 8. Write CPU from the profile | Done: all four costs are below measurable on 3adfc0c14 code, so nothing was changed | Item 8 attribution |
+| 9. Throughput and shard scaling | **Open.** Acceptance not met: at steady state, 16 shards do not beat 1 shard | Items 9(a)–9(d); `codex-reviews/item-9-diagnosis.md` |
+| 10. Memtable Variant shredding | **Open.** Design not approved; no code | `codex-reviews/item-10-recommendation.md`. The "Item 10 design" section below is superseded. |
+| 11. Parquet tails at 64 clients | **Open.** Profile analysed (CPU saturation; page decompression is the largest cost); no change made or measured | Item 11: profile analysis |
+| 12. Cross-query plan reuse | **Open, parked.** Item 11 puts planning at about 10–13% of CPU, a subtraction estimate. Reopening needs the exact breakdown and a stated scope | Item 11: profile analysis |
+
+### Item 9: where it stands
+
+- (a) The shard sweep was done, the shard-count variable exists (`WYRD_SCRIBE_SHARD_COUNT`), and the decrease at 8–16 shards was diagnosed (9(a)).
+- (b) Change 1 (`ffee347ee`, one WAL IO operation per group) gave no measurable improvement.
+- Flush cuts are recorded under 9(c) and 9(d):
+  - kept: WAL segment recycling, staging writing no manifest, and the removal of the `Published` member state;
+  - reverted: no interval syncs, one file per member, and no syncs on merge scratch.
+- Sustained 3 × 120 s rates: 2.13M rows/s at 1 shard and 2.07M at 16 (`20261028T101743Z` and `20261028T102420Z`). After the `Published` removal: 2.06M and 2.23M (`20261028T105850Z` and `20261028T110528Z`). Under 10 s windows, 16 shards looked faster only because acknowledged rows were buffered in memory ahead of staging.
+- Remaining work, from the Codex diagnosis (not yet verified by an implementer):
+  1. Pipeline the WAL group commit: start the next group while earlier groups sync and fence, and batch durability across shards. The diagnosis measured, from 1 to 16 shards, WAL syncs rising from 6.3/s to 50.8/s for the same work, and the 4-thread WAL IO pool (`config.rs:1464`) moving from 0.84 busy to all 4 busy with 11.1 jobs queued.
+  2. Cut the remaining staging and publication durability writes.
+  3. Only then tune the WAL lane's concurrency.
+
+  Its open question is whether interference between flushes is the cause. One timestamped trace splitting WAL enqueue, append, sync, staging sync and Postgres commit would settle it.
+- (c) Repeating the sweep on the optimized single shard has not been done.
+
+### Item 10: where it stands
+
+- No implementation. The maintainer rejected the duplicate-copy design that was in progress.
+- The Codex recommendation is to store memtable Variant columns shredded instead of unshredded, with no duplicate copy. Keys would come from a bounded sample of recent memtable data, and the layout would stay fixed per frozen generation. Unshredding would happen only where a query returns the whole Variant column, and staged runs are unchanged.
+- Open for the maintainer: how representative the key sample must be. Today the sampler runs once per claim, over the claim's staged runs. In the sustained 1-shard run a claim averaged 3.9 members, about 750 MiB of raw Arrow, giving about 56 MiB of uploaded Parquet (`claim_assembly.rs:254`, `claim_sample.rs:121`). Per user group, the sample size is 4,147 / (1 + 4,146 / N), capped at N.
+- The design needs maintainer approval before any code.
+
+### Work since 64ca466fb
+
+The 894 `vala-bifrost-redux` lib tests pass under the test Postgres, and clippy is clean.
+
+| Change | Files | Measured and recorded here? |
+|---|---|---|
+| WAL v8 segment recycling, the segment tag, and the recycling race fix (9(c) 1a) | `scribe/wal.rs`, `preprocess.rs`, `bench_support.rs` | yes, 9(c) |
+| Staging writes no manifest; per-shard manifest folded from staged records (9(c) 4) | `scribe/manifest.rs`, `hot_stage.rs`, `persistence.rs`, `execution_lanes.rs`, `replay.rs`, `shards.rs`, `mod.rs`, `architecture/bifrost-design.md` | yes, 9(c) |
+| No `Published` member state (9(d)) | `hot_stage.rs`, `claim_publication.rs`, `staging_runtime.rs`, `architecture/bifrost-design.md` | yes, 9(d) |
+| Concurrent staging per seal key, ordered by `StagingOrder` | `scribe/shards.rs`, `persistence.rs` | no: no separate before/after recorded |
+| One staging worker per `persistence_cpu_threads` (was `wal_io_threads`) | `wyrd-server/src/boot/mod.rs` | no |
+| Unstaged backlog admission bound (`immutable_limit_bytes`, refused as retryable busy) | `scribe/admission.rs`, `resources.rs`, `wyrd-server/src/boot/mod.rs` | no |
+| `google.rpc.RetryInfo` on busy ingest refusals; the capacity client retries them | `gate/error.rs`, `wyrd-testing/src/bin/capacity/query/{run,competing,isolated}.rs` | no |
+| Crash-injection and time-partition test updates | `scribe/tests/pg_scribe_crash_injection.rs`, `scribe/tests/time_partition.rs` | n/a |
+
+Also outstanding:
+- The VALID records for 9(c) and 9(d) are not committed to `benchmarks/history`; ask the maintainer first.
+- The exit-70 shutdown failure, diagnosed under 9(c), is unfixed and needs a `pg_locks` capture.
+- Apple `F_FULLFSYNC` durability on macOS has not been checked.
+
 ## 1. Valid or invalid only
 
 **Intent and evidence.** A slower result is useful evidence, not a broken
@@ -298,6 +360,62 @@ hot/Parquet equivalence and accounting, then measures the filter and write cost.
 
 **Order/dependency.** After item 9. The written design is a dependency for
 this implementation only.
+
+### Item 10 design (superseded; the maintainer rejected it; see `codex-reviews/item-10-recommendation.md`)
+
+**Cause of the gap.**
+- A memtable batch holds every Variant in the unshredded wire layout (`MemtableBucket::append`, `scribe/memtable.rs:1379`).
+- `batch_statistics` (`memtable.rs:2221`) records only a null count and a byte size for a Variant Struct, so no batch is ever pruned.
+- `MemtableSource::filtered` (`oracle/memtable_source.rs:215`) calls `batch_filter` on every batch. For `attributes ->> 'region' = 'eu-west'`, `variant_get_text` finds no `typed_value`, so `decoded_text` decodes every row (`get.rs:272-295`).
+- A shredded Parquet file instead takes `shredded_text` (`get.rs:308-332`): when the path's residual is all null and its typed leaf is a string, the result is a cast of the typed column, with no per-row decode.
+- The design gives the memtable that same input.
+
+**What is shredded, and with which policy.**
+- What: every Variant column of each sealed `AppendRun` (64 appends, `memtable.rs:1955`). The active tail is not shredded.
+- Layout: chosen by `VariantSampler` with `BIFROST_VARIANT_SHREDDING`, the policy and sampler Scribe already uses for hot objects (`scribe/claim_sample.rs`).
+  - It uses the same strata (`sub_principal_id`, small strata merged) and the same thresholds.
+  - The seed is derived from the run's shard, generation and first WAL LSN, so a run always gets the same layout.
+- Encoding: arrow-rs `shred_variant` through `VariantLayout::shred`, the same call the Parquet writer makes (`parquet_writer.rs:694-702`).
+- No new selection policy, no Wyrd Variant logic, no persisted format.
+- Residual, missing, null, nested, list and mixed-type values stay exact because they are exactly what `shred_variant` puts in the residual `value`; the same code makes Parquet exact today.
+
+**When it is built.**
+- Off the acknowledgement path, after the run is sealed. Sealing pushes the run onto a bounded queue on the existing persistence CPU pool, which builds the shredded run and publishes it once through `AppendRun::shredded: OnceLock<Arc<[RecordBatch]>>`.
+- A read that captures the run before the build finishes reads the unshredded batches. That is exact, just slower.
+- Freezing a generation keeps the runs it already holds, so an immutable generation keeps its shredded runs.
+- Write acknowledgement gains no work. Query latency gains none either, because nothing is built on demand.
+- If the queue is full, or the memory reservation below is refused, the run stays unshredded.
+
+**How memory is charged.**
+- The shredded copy is not part of the shard's `arrow_bytes`. That keeps the retirement equality check (`shards.rs:2543-2548`) untouched.
+- A separate reservation is taken from the shared Scribe memory governor before the build, sized with `retained_arrow_bytes` over the shredded batches. The shredded `metadata` buffers are the original ones shared by reference, and `retained_arrow_bytes` counts each allocation once, so they are not charged twice.
+- The reservation is a `RetainedArrowCharge` held by the run's `Arc`. Every capture and every `MemtableSource` stream that shares the run keeps it alive.
+- Memory is released when the last holder drops: retirement, or the end of the last read. This is the same release rule the original batches follow.
+- Cost: about one more copy of each Variant column's bytes for the hot window. Typed leaves plus residual are close to the original size. It is bounded by existing admission, because a refused reservation means the run is not shredded.
+
+**How reads use it.**
+- `MemtableSource` receives each batch together with its optional shredded twin.
+- `filtered` evaluates the pushed-down filter on the twin when one exists. It is the same `PhysicalExpr`, and only the Variant column's physical layout differs.
+- It applies the resulting mask to the original batch with `filter_record_batch`. Output rows are always the original canonical wire batches.
+- Unchanged: the scan's schema, projection by field id, whole-column results, and the DataFusion Variant functions.
+- Filters that are not pushed down, and projections, read the originals unchanged.
+- Remote live reads go through the same `MemtableSource` from `live_leaf` (`oracle/follower.rs:432-500`), so they get the same path.
+- No new planner, adapter, UDF or persisted format. The pruning work in DataFusion's `stored_value`/`PruningPredicate` is not reused, because memtable batches have no Parquet statistics. Batch pruning for Variant paths is left out; the decode-free filter is the measured gap.
+
+**Architecture amendment required (Storage format and Variant, after line 426).** "Scribe may hold a shredded twin of a sealed memtable run, chosen by the hot-object sampling policy and charged to the Scribe memory governor. It is used only to evaluate pushed-down filters inside the memtable scan, and rows always leave the scan in the canonical wire layout. A run without a twin reads exactly the same rows."
+
+**Equivalence proof.**
+- One test, inline in `oracle/memtable_source.rs`, runs the same queries over three things: the original batches, their shredded twins, and a Parquet file written from the same rows through `encode_ordered_claim`. It asserts equal results.
+- The queries cover `->`, `->>`, a typed match, a type mismatch held in the residual, a missing path, Variant null, a nested object, a list, a mixed-type key, a tail key that is not shredded, and a run that has no twin.
+- A tenant-negative case asserts that a twin never holds rows from outside its run's seal key. The twin is built from the run's own batches only.
+- A journey assertion in the capacity benchmark compares the hot and Parquet `span-shredded` counts with each other, not only with the generator's count.
+
+**Measurement.**
+- The `span-shredded` hot p99 filter latency against the 50.4 ms baseline and Parquet's 17.7 ms.
+- `native-write-c64` rows/s, server CPU and peak memory at 1 shard, to show that write cost does not move.
+- New gauges: shredded bytes held, and runs left unshredded (queue full or reservation refused).
+
+**Precondition to verify first.** A `variant_get`/`variant_get_text` physical expression planned against the unshredded column type has to evaluate correctly when its runtime input is the shredded Struct. Parquet relies on the same property, but it rewrites expressions per file, so I have not confirmed that the memtable path gets it unaided. If it does not hold, the twin path needs the per-file rewrite DataFusion already applies to Parquet. That is reuse of DataFusion's adapter, not a new one. I will write that one check before any other code.
 
 ## 11. Parquet tails at 64 clients
 
@@ -737,3 +855,70 @@ Median rows/s at 64 clients, before (`1b4f52795` sweep) and after (`20261028T010
 No measurable improvement; every change is within the run-to-run spread recorded under 9(a). At 16 shards `wal_append` p50 is still 23–87 ms with one submission per group, so the queueing is not per submission. A group's single write still waits behind the syncs that hold the pool's 4 threads (`wal_sync` p50 20–72 ms). Change 2, which takes the sync off the write path, addresses that.
 
 Peak server memory grows with shard count: native 37.3 GB at 4 shards, 47.2 GB at 8 and 56.2 GB at 16, with a 26.8, 31.4 and 38.6 GB memtable backlog. The server's managed memory is the host limit minus the 1 GiB minimum. On this shared 91 GiB host, the first 8-shard run was stopped by the session's memory-pressure guard. That was not a kernel OOM: no OOM appears in the journal.
+
+### Item 9(c): flush reduction, changes 1–4
+
+Each change was measured once, unprofiled, with `bench:l1:bifrost:writes --steps otlp-logs-c64,native-write-c64` at `WYRD_SCRIBE_SHARD_COUNT` 1 and 16. In the table, native rows/s is the record's rows/s/vCPU × 32 vCPU. Each change is compared with the row it was applied on. Every record is VALID unless marked otherwise.
+
+| Change | Records (1 / 16) | 1 shard | 16 shards | Kept |
+|---|---|---|---|---|
+| baseline | `031615Z` / `031408Z` | 1.14M | 1.36M | — |
+| 1a: WAL segment recycling (WAL v8 segment tag) | `033709Z` / `033838Z` | 1.51M | 2.24M | yes |
+| 1b: no 8 MiB `SyncingFile` syncs on staged runs | `035026Z` / `035156Z` | 1.81M | 1.68M | no |
+| 2: one Parquet file per member, one row group per candidate | `040517Z` (INVALID) / `040721Z` | 1.25M | 1.82M | no |
+| 3: no syncs on claim-merge output | `042115Z` / `042245Z` | 1.94M | 1.88M | no |
+| 4: staging writes no manifest | `043737Z` / `043908Z` | 1.66M | 3.03M | yes |
+
+- **1a.** A retired segment is renamed to `.free`, at most two per shard, and overwritten by the shard's next segment. Appends then overwrite blocks that are already allocated, so a WAL `fdatasync` no longer forces an ext4 journal commit that flushes other files' dirty data. Each record carries the low 32 bits of its segment's sequence. Replay therefore reads a stale record left in a recycled file as a bad record, and fails closed when an acknowledged COMMIT lies beyond it (`scribe::wal::tests::retired_segment_is_recycled_and_its_stale_tail_ends_replay`).
+- **1b and 3.** Both raised 1-shard throughput and dropped 16 shards below 1 shard. The bounded syncs keep each shard's WAL `fdatasync` from waiting behind another file's dirty backlog, so shard scaling needs them. Both were reverted.
+- **2.** Slower at both shard counts. It was reverted. The 1-shard run is INVALID: the server exited with status 70 during shutdown (diagnosis below).
+- **4.** Writing the manifest cost 18.1 s of staging-worker time across 306 members at 1 shard in `033709Z` (about 59 ms per member, p95 340 ms). Staging now writes no manifest:
+  - `ScribeHotStage` folds a record's WAL range into its own shard's manifest before `retire_all` unlinks the record, and folds every surviving record once in `recover`, before WAL replay.
+  - Replay is unchanged.
+  - Staging per seal key and shard is ordered (`StagingOrder`), so a record's range maximum covers every earlier generation of that key on that shard.
+  - Removed: `advance_manifest`, `manifest_guards`, `defer_manifest_advance`, `ScribeWalIoOp::AdvanceManifest`, the dead `ReplaceManifest`, the manifest fault hook, and the WAL IO lane in the persistence context.
+  - `scribe::manifest::advance` is the one locked read-modify-write; the replay retirement settlement also uses it.
+  - `scribe::hot_stage::tests::staged_wal_ranges_fold_into_their_shard_manifest` pins three facts: the fold at startup, the fold before removal, and that another shard's manifest is left alone.
+  - All 895 `vala-bifrost-redux` lib tests pass under the test Postgres.
+- **Design correction to 4.** The approved design took the published watermark from the file list's maximum `wal_lsn_max` per seal key, node and epoch. `vala.file_list` has no shard column, and every shard draws LSNs from the stream's one counter. That maximum would therefore suppress another shard's acknowledged, unstaged records at lower LSNs. The manifest stays per shard, but it is written only from staged records.
+
+**Diagnosis: exit status 70 in `040517Z`.**
+- **Symptom:** shutdown failed with "Bifrost shutdown deadline elapsed before role drain; shutdown was triggered by: hosted Verifier sandbox did not settle before the shutdown deadline".
+- **Evidence:**
+  - "drain deadline exceeded" (`supervise.rs:314`) came 35 s after `bifrost gate closed`.
+  - The only slow statement in any of the runs, the Forge lease renewal (`forge_tasks.rs:591`), had been in flight for 34.99 s when the abort dropped it.
+  - sqlx starts that timer after acquiring the connection, so the wait was inside Postgres.
+- **Cause, in part:**
+  - `ForgeLease::renew` has no timeout and no cancellation, and the Forge worker waits for in-flight plans with no deadline (`worker.rs:2416-2433`). One stuck statement therefore consumes the whole `shutdown.drain_ms` (35 000).
+  - The Verifier-sandbox text is a misattribution. `close_hosted` runs with the deadline already passed, and `pool.close()` cannot reap its idle workers in zero time (`server.rs:784-801`).
+  - What Postgres waited on is not identified. No Forge path holds the task row across non-SQL IO. Only a `pg_locks`/`pg_stat_activity` capture during shutdown can decide.
+- **Fix site:** `ForgeLease::renew` and the Forge drain (`worker.rs:5047-5065`, `scheduler.rs:295-316`); the attribution belongs to `server.rs:784-801`. It is not fixed: there is no stated cause, and it occurred once.
+
+**Diagnosis: "WAL segment recycling failed: No such file or directory" at 16 shards.**
+- **Symptom:** `recycle`, `onefile`, `scratch` and `nomanifest` logged it 9–12 times each, as "WAL segment deletion deferred for retry".
+- **Cause:** `retire_segment_file` checked `path.exists()` before taking the free-pool lock. Two retirements of one segment both passed the check, and the loser's `rename` found the file gone.
+- **Fix site:** `retire_segment_file` and `delete_segment_file`. A missing source now means the segment was already retired. This is not separately benchmarked: it removes a warning and a retry, not a sync.
+
+### Item 9(d): sustained rate and staging flush cuts
+
+Steady state was measured with `native-write-c64` at 3 × 120 s windows, using a temporary window override (since reverted), at `WYRD_SCRIBE_SHARD_COUNT` 1 and 16. Every record is VALID with 0 errors. In the table, native rows/s is the record's rows/s/vCPU × 32.
+
+| Change | Records (1 / 16) | 1 shard | 16 shards | Stage fsyncs per member (1 / 16) | Kept |
+|---|---|---|---|---|---|
+| after item 4 | `101743Z` / `102420Z` | 2.13M | 2.07M | 10.99 / 10.73 | — |
+| no `Published` member state | `105850Z` / `110528Z` | 2.06M | 2.23M | 9.08 / 8.85 | yes |
+
+- **Sustained rate.** Over 120 s, 16 shards do not beat 1 shard. The 10 s figure of 3.03M at 16 shards was writes acknowledged into memory ahead of staging. Per-second scrapes show the memtable backlog oscillating around a flat level rather than growing: about 1–3.5 GB at 1 shard and 0.5–5.8 GB at 16. The server uses about 4–5 of 32 cores. The WAL group-commit `fdatasync` averages 85 ms at 1 shard and 53–59 ms at 16, against 14–23 ms in the 10 s windows. The acknowledgement path is therefore bounded by the latency of WAL device flushes on a device that staging and publication keep busy with their own flushes.
+- **Re-diagnosis of item 2.** Its premise was wrong.
+  - Members average 14.6 MiB encoded (4.4 GiB over 309 members in `033709Z`), so about four 100k-row runs each, not eleven.
+  - `bifrost_scribe_stage_fsyncs_total` counts only staged-record and directory syncs, not run syncs.
+  - In `040517Z`, one file per member cut `sync_runs` from 218 to 82 ms per member. The interval syncs on the larger file raised `encode` from 335 to 430 ms. Net `stage_member` went from 560 to 513 ms at 1 shard and from 193 to 209 ms at 16.
+  - Staging time therefore does not explain the lower throughput, and no other cause was identified. Not retried.
+- **No `Published` member state.** `Published` and `CleanupPending` carried identical facts. Every reader (`finish_committed`, `TerminalPublicationFacts`, `restore_authorities`, `StagedMember::recovered`) treated them the same, so the extra durable step cost two fsyncs per member and bought nothing.
+  - A committed claim now moves its members straight from `Publishing` to `CleanupPending`.
+  - Recovery moves a `Publishing` member that has a committed sibling straight to `CleanupPending`.
+  - The test `a_claim_crashed_after_its_published_step_retires_on_restart` was deleted because its crash boundary no longer exists. The mixed-state fixture now strands one `Publishing` member and three `CleanupPending` members.
+  - The lifecycle in `architecture/bifrost-design.md` was updated.
+  - All 894 `vala-bifrost-redux` lib tests pass under the test Postgres.
+  - The result is −3% at 1 shard and +8% at 16 shards from one run each: no measurable improvement at 1 shard. It is kept because it deletes a lifecycle state and two fsyncs per member without a regression beyond that spread.
+- **Persistence worker count.** Already changed in the uncommitted tree: `wyrd-server/src/boot/mod.rs` starts one staging worker per `persistence_cpu_threads` (20) instead of per `wal_io_threads` (4). No separate before/after is recorded for it.

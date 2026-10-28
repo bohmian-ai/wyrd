@@ -1446,28 +1446,6 @@ mod pg_tests {
                 .await
                 .expect("storage completion accepts the already completed upload");
 
-            storage::artifact_metadata::insert(
-                &mut conn,
-                storage::artifact_metadata::NewArtifactMetadata {
-                    storage_path: &storage_path,
-                    card_uid: &card_uid,
-                    size_bytes: 5_242_880,
-                    sha256: &sha,
-                    content_type: Some("application/octet-stream"),
-                    sse_marker: Some("aws:kms"),
-                    backend: StorageBackendKind::S3,
-                },
-            )
-            .await
-            .expect("artifact metadata inserts");
-
-            let metadata = storage::artifact_metadata::get(&mut conn, &storage_path)
-                .await
-                .expect("artifact metadata query succeeds")
-                .expect("artifact metadata row exists");
-            assert_eq!(metadata.backend, StorageBackendKind::S3);
-            assert_eq!(metadata.sha256, sha);
-
             storage::idempotency::store(
                 &mut conn,
                 "idem-key",
@@ -1505,65 +1483,34 @@ mod pg_tests {
             .expect("storage test rows clean up");
     }
 
+    /// A fresh installation keeps upload sessions and Card manifests in
+    /// Postgres but no completed-object inventory: that lives only in
+    /// `bifrost.storage.objects`.
+    ///
+    /// # Panics
+    /// Panics when migrations fail, the removed inventory table exists, or a
+    /// coordination table is missing.
     #[tokio::test]
-    async fn storage_rls_hides_artifact_metadata_across_tenants() {
-        let Some(migrator_url) = database_url() else {
+    async fn fresh_install_has_no_postgres_object_inventory() {
+        let Some(url) = database_url() else {
             return;
         };
-        let Some(app_url) = app_database_url() else {
-            return;
-        };
-
-        let store = owner_pool(&migrator_url).await.expect("migrator connects");
+        let store = owner_pool(&url).await.expect("migrator connects");
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
-
-        let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
-        let tenant_a = DataTenantId::new_v7();
-        let tenant_b = DataTenantId::new_v7();
-        let suffix = tenant_a.as_uuid().to_string();
-        insert_tenant(store.pool(), tenant_a, &format!("stor-a-{suffix}")).await;
-        insert_tenant(store.pool(), tenant_b, &format!("stor-b-{suffix}")).await;
-
-        let card_uid = DataTenantId::new_v7().as_uuid().to_string();
-        let sha = "B".repeat(43) + "=";
-        let storage_path = format!("{tenant_a}/cards/{card_uid}/x.bin");
-
-        {
-            let mut conn = TenantConn::acquire(&app_pool, tenant_a)
+        for (table, present) in [
+            ("wyrd.storage_artifact_metadata", false),
+            ("wyrd.storage_multipart_uploads", true),
+            ("wyrd.card_artifact_manifest", true),
+        ] {
+            let found: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+                .bind(table)
+                .fetch_one(store.pool())
                 .await
-                .expect("tenant_a conn acquired");
-            storage::artifact_metadata::insert(
-                &mut conn,
-                storage::artifact_metadata::NewArtifactMetadata {
-                    storage_path: &storage_path,
-                    card_uid: &card_uid,
-                    size_bytes: 4,
-                    sha256: &sha,
-                    content_type: None,
-                    sse_marker: None,
-                    backend: StorageBackendKind::Local,
-                },
-            )
-            .await
-            .expect("tenant_a artifact metadata inserts");
-            conn.commit().await.expect("tenant_a commit succeeds");
+                .expect("catalog lookup succeeds");
+            assert_eq!(found.is_some(), present, "{table} presence");
         }
-
-        {
-            let mut conn = TenantConn::acquire(&app_pool, tenant_b)
-                .await
-                .expect("tenant_b conn acquired");
-            let hidden = storage::artifact_metadata::get(&mut conn, &storage_path)
-                .await
-                .expect("tenant_b artifact lookup succeeds");
-            assert!(hidden.is_none(), "RLS must hide tenant_a storage rows");
-        }
-
-        cleanup_storage_test_rows(store.pool(), &[tenant_a, tenant_b])
-            .await
-            .expect("storage RLS test rows clean up");
     }
 
     #[tokio::test]
@@ -2627,10 +2574,6 @@ mod pg_tests {
             .collect::<Vec<_>>();
 
         sqlx::query("DELETE FROM wyrd.storage_idempotency_keys WHERE data_tenant_id = ANY($1)")
-            .bind(&tenant_ids)
-            .execute(pool)
-            .await?;
-        sqlx::query("DELETE FROM wyrd.storage_artifact_metadata WHERE data_tenant_id = ANY($1)")
             .bind(&tenant_ids)
             .execute(pool)
             .await?;

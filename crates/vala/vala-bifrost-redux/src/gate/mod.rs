@@ -42,7 +42,8 @@ use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecy
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::logical_data_identity;
 use crate::tables::{
-    CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable, TableError,
+    CallsTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ObjectsTable, ResultsTable,
+    TableError,
 };
 use wyrd_runtime::principal::CardAttribution;
 use wyrd_spec::auth::Attribution;
@@ -614,6 +615,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         }
         if is_verification_result_table(table)
             || (table.namespace == BifrostNamespace::Gateway && table.name == CallsTable::NAME)
+            || (table.namespace == BifrostNamespace::Storage && table.name == ObjectsTable::NAME)
         {
             return Ok(Err(IngestError::ReservedBuiltinWriteDenied {
                 table: table.fqn(),

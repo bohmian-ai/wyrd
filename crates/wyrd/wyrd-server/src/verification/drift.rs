@@ -178,7 +178,7 @@ impl ObservationWindow {
     }
 
     /// Render `value` as an escaped SQL string literal.
-    pub(super) fn text(value: &str) -> String {
+    pub(crate) fn text(value: &str) -> String {
         Value::SingleQuotedString(value.to_owned()).to_string()
     }
 

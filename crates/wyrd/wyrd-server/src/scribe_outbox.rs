@@ -59,7 +59,7 @@ use chrono::Utc;
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
@@ -72,6 +72,7 @@ use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::tables::audit::projection::stage_audit_event;
 use vala_bifrost_redux::tables::gateway::CallsTable;
 use vala_bifrost_redux::tables::staged::StagedRow;
+use vala_bifrost_redux::tables::storage::ObjectsTable;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
 use vala_bifrost_redux::tables::{
     AuditLogTable, DomainTable, ExecutionInputsTable, ExecutionOutputsTable, ResultsTable,
@@ -215,6 +216,21 @@ pub enum ScribeWrite {
         /// is staged or retried and released once it is written, consumed,
         /// or abandoned.
         permit: OwnedSemaphorePermit,
+    },
+    /// One storage object's completion or deletion fact, staged as its
+    /// `bifrost.storage.objects` row.
+    Object {
+        /// The `bifrost.storage.objects` row.
+        row: StagedRow,
+        /// The object's Card subject and the acting caller, which Scribe
+        /// stamps on the row.
+        attribution: Attribution,
+        /// Fired once Scribe acknowledges the frame holding this row, and
+        /// only then: a rejected, unprojectable, or dropped write drops the
+        /// sender instead. Firing never blocks, so the waiting caller holds
+        /// no other write. Taken under its lock because the sink sees the
+        /// slice by reference.
+        acked: Mutex<Option<oneshot::Sender<()>>>,
     },
 }
 
@@ -382,6 +398,13 @@ impl ScribeWrite {
                 attribution: *attribution,
                 part: Part::Batch(project_spans(spans).ok_or("projection")?),
             }]),
+            Self::Object {
+                row, attribution, ..
+            } => Ok(vec![Rows {
+                table: ScribeTable::Objects,
+                attribution: *attribution,
+                part: Part::Row(row.clone()),
+            }]),
         }
     }
 
@@ -403,7 +426,9 @@ impl ScribeWrite {
                 .iter()
                 .find(|row| ScribeTable::from_fqn(row.table) == Some(ScribeTable::Results))
                 .map(|row| &row.row)?,
-            Self::Audit(_) | Self::Capture(_) | Self::ServerSpans { .. } => return None,
+            Self::Audit(_) | Self::Capture(_) | Self::ServerSpans { .. } | Self::Object { .. } => {
+                return None;
+            }
         };
         let cell = |name: &str| row.text(name);
         let group_id = GroupId::new(cell("group_id")?).ok()?;
@@ -417,7 +442,8 @@ impl ScribeWrite {
 }
 
 /// The destinations the Scribe outbox writes: retained audit history, the two
-/// gateway capture tables, and the three Verifier tables.
+/// gateway capture tables, the three Verifier tables, and the storage object
+/// inventory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScribeTable {
     /// `bifrost.system.audit_log`, one row per authorization decision.
@@ -433,17 +459,20 @@ pub enum ScribeTable {
     ExecutionOutputs,
     /// `bifrost.verification.execution_inputs`, one row per execution's inputs.
     ExecutionInputs,
+    /// `bifrost.storage.objects`, one row per completed or deleted object.
+    Objects,
 }
 
 impl ScribeTable {
     /// Every destination, in a fixed order.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::AuditLog,
         Self::Calls,
         Self::Spans,
         Self::Results,
         Self::ExecutionOutputs,
         Self::ExecutionInputs,
+        Self::Objects,
     ];
 
     /// Fully qualified table name, which the peer RPC carries.
@@ -456,6 +485,7 @@ impl ScribeTable {
             Self::Results => "bifrost.verification.results",
             Self::ExecutionOutputs => "bifrost.verification.execution_outputs",
             Self::ExecutionInputs => "bifrost.verification.execution_inputs",
+            Self::Objects => "bifrost.storage.objects",
         }
     }
 
@@ -483,6 +513,7 @@ impl ScribeTable {
             Self::ExecutionInputs => {
                 TableRef::new(BifrostNamespace::Verification, ExecutionInputsTable::NAME)
             }
+            Self::Objects => TableRef::new(BifrostNamespace::Storage, ObjectsTable::NAME),
         }
     }
 }
@@ -1399,8 +1430,9 @@ impl ScribeSink {
     /// frees, so the slice's encoding runs in parallel and at most
     /// [`FRAMES_IN_FLIGHT`] chunks' streams are held at once. Writes whose
     /// rows cannot be encoded, or whose stream Scribe rejects terminally,
-    /// are added to `lost`. After a retryable refusal no further chunk is
-    /// started; those in flight still finish.
+    /// are added to `lost`. Each storage object write of `items` is notified
+    /// as its own frame is acknowledged. After a retryable refusal no further
+    /// chunk is started; those in flight still finish.
     ///
     /// # Errors
     ///
@@ -1416,6 +1448,7 @@ impl ScribeSink {
         &self,
         route: &ScribeRoute,
         tenant: DataTenantId,
+        items: &[ScribeWrite],
         frames: &[Frame],
         attempt: usize,
         lost: &mut BTreeSet<usize>,
@@ -1427,7 +1460,7 @@ impl ScribeSink {
             if in_flight.len() == FRAMES_IN_FLIGHT
                 && let Some(done) = in_flight.next().await
             {
-                Self::tally(tenant, done, lost, &mut refused);
+                Self::tally(tenant, items, done, lost, &mut refused);
             }
             if refused.is_some() {
                 break;
@@ -1435,7 +1468,7 @@ impl ScribeSink {
             in_flight.push(Self::deliver(route, tenant, chunk, budget, attempt));
         }
         while let Some(done) = in_flight.next().await {
-            Self::tally(tenant, done, lost, &mut refused);
+            Self::tally(tenant, items, done, lost, &mut refused);
         }
         refused.map_or(Ok(()), Err)
     }
@@ -1494,11 +1527,13 @@ impl ScribeSink {
     }
 
     /// Records one delivered chunk: writes that could not be encoded or
-    /// whose stream was rejected terminally are added to `lost`, and the
-    /// first retryable refusal is kept in `refused` unless an earlier one
-    /// already is.
+    /// whose stream was rejected terminally are added to `lost`, the first
+    /// retryable refusal is kept in `refused` unless an earlier one already
+    /// is, and each storage object write of `items` in an acknowledged stream
+    /// is notified.
     fn tally(
         tenant: DataTenantId,
+        items: &[ScribeWrite],
         (submitted, unencodable): (Vec<Submitted>, Vec<usize>),
         lost: &mut BTreeSet<usize>,
         refused: &mut Option<ScribeRefusal>,
@@ -1506,7 +1541,19 @@ impl ScribeSink {
         lost.extend(unencodable);
         for (result, batch, owners) in submitted {
             match result {
-                Ok(()) => {}
+                Ok(()) => {
+                    for position in owners {
+                        if let Some(ScribeWrite::Object { acked, .. }) = items.get(position)
+                            && let Some(sender) = acked
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take()
+                        {
+                            // The waiter may have given up; nothing else is owed.
+                            let _ = sender.send(());
+                        }
+                    }
+                }
                 Err(ScribeRefusal::Rejected) => {
                     tracing::error!(outbox = Self::NAME, %tenant, table = batch.table.fqn(), batch_id = %batch.batch_id, writes = owners.len(), "Scribe rejected a frame terminally; its writes are dropped");
                     lost.extend(owners);
@@ -1539,7 +1586,9 @@ impl OutboxSink for ScribeSink {
     /// queued submission's inputs record lanes as [`SubmissionSink::lane`]
     /// does, so requests sharing an idempotency key are acknowledged, and
     /// handed to that outbox, in arrival order; its result is staged only
-    /// after the submission was accepted. Server spans take lane 0. No reader relies on cross-batch commit
+    /// after the submission was accepted. A storage object write lanes by its
+    /// `storage_path`, so one object's completion and deletion keep their
+    /// order. Server spans take lane 0. No reader relies on cross-batch commit
     /// order: group lists order by the recorded input time or a declared key.
     fn lane(item: &ScribeWrite) -> u64 {
         let key = match item {
@@ -1554,6 +1603,7 @@ impl OutboxSink for ScribeSink {
                 ..
             } => return SubmissionSink::lane(submission),
             ScribeWrite::ExecutionInputs { row, .. } => row.row.text("execution_id"),
+            ScribeWrite::Object { row, .. } => row.text("storage_path"),
             ScribeWrite::Audit(None) | ScribeWrite::ServerSpans { .. } => None,
         };
         key.map_or(0, |key| {
@@ -1564,7 +1614,8 @@ impl OutboxSink for ScribeSink {
     }
 
     /// Captured content bytes for a capture, the encoded size of a server
-    /// span, and the memory a staged audit or Verifier row holds, as
+    /// span, and the memory a staged audit, Verifier, or storage object row
+    /// holds, as
     /// [`StagedRow::owned_bytes`].
     fn weight(item: &ScribeWrite) -> usize {
         match item {
@@ -1574,6 +1625,7 @@ impl OutboxSink for ScribeSink {
                 payload.rows().iter().map(ResultRow::owned_bytes).sum()
             }
             ScribeWrite::ExecutionInputs { row, .. } => row.owned_bytes(),
+            ScribeWrite::Object { row, .. } => row.owned_bytes(),
             ScribeWrite::ServerSpans { spans, .. } => spans.encoded_len(),
         }
     }
@@ -1623,7 +1675,7 @@ impl OutboxSink for ScribeSink {
         let (details, summaries) =
             frames.split_at(frames.partition_point(|frame| frame.table != ScribeTable::Results));
         for phase in [details, summaries] {
-            self.submit(route, tenant, phase, attempt, &mut lost)
+            self.submit(route, tenant, items, phase, attempt, &mut lost)
                 .await?;
         }
         self.schedule_groups(tenant, items, &lost).await?;

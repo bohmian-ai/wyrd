@@ -28,6 +28,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wyrd_runtime::{Permission, PermissionSet};
+use wyrd_server::components::storage::inventory::{
+    ObjectFact, ObjectInventory, ObjectOrigin, ObjectState,
+};
 use wyrd_server::verification::drift::DRIFT_INVALID;
 use wyrd_server::verification::engines::EngineOutcome;
 use wyrd_server::verification::fault::{PublicationFault, SentBatch};
@@ -36,6 +39,7 @@ use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::runner::{EngineScript, VERIFIER_UNAVAILABLE};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Attribution;
 use wyrd_spec::card::drift::DriftMethod;
 use wyrd_spec::card::verifier::{Check, DriftBaselineState};
 use wyrd_spec::ids::{BindingId, CardUid, ExecutionId, FeatureName, SlotName};
@@ -49,7 +53,6 @@ use wyrd_spec::verification::{
     DriftReport, DriftVerdict, FeatureDriftReport, VerificationError, VerificationVerdict,
 };
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
-use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
 use wyrd_sql::queries::verification::{BindingActivity, InactivityTimeout, binding_activity};
 use wyrd_sql::queries::verifier_executions::TerminalStatus;
 use wyrd_testing::WyrdTestServer;
@@ -2541,12 +2544,13 @@ async fn claim_committed_after_cancellation_is_released_unexecuted() {
         .expect("hold function drops");
 }
 
-/// Write a small Parquet artifact for `data` and register its metadata, so a
+/// Write a small Parquet artifact for `data` and record it in the object
+/// inventory, so a
 /// fit of a baseline pinned to `data` decodes and settles `ready`.
 ///
 /// # Panics
-/// Panics when the Parquet encode, the storage write, or the metadata insert
-/// fails.
+/// Panics when the Parquet encode, the storage write, or the inventory
+/// record fails.
 async fn baseline_artifact(server: &WyrdTestServer, seed: &VerificationFixture, data: &CardUid) {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "latency_ms",
@@ -2571,28 +2575,23 @@ async fn baseline_artifact(server: &WyrdTestServer, seed: &VerificationFixture, 
         .put_object(&object, bytes.clone())
         .await
         .expect("artifact writes");
-    let mut conn = server
-        .state()
-        .postgres
-        .wyrd()
-        .tenant_conn(seed.tenant())
+    let fact = ObjectFact {
+        storage_path: path,
+        upload_id: None,
+        backend: storage.backend().to_string(),
+        sha256: Some(sha256),
+        size_bytes: i64::try_from(bytes.len()).expect("artifact size fits"),
+        content_type: Some("application/vnd.apache.parquet".to_owned()),
+        sse_marker: None,
+        origin: ObjectOrigin::CardFile,
+        card_uid: Some(data.clone()),
+        relative_path: Some("data/data.parquet".to_owned()),
+        state: ObjectState::Completed,
+    };
+    ObjectInventory::new(server.state())
+        .record(seed.tenant(), Attribution::unresolved(), &[fact])
         .await
-        .expect("tenant connection opens");
-    artifact_metadata::insert(
-        &mut conn,
-        NewArtifactMetadata {
-            storage_path: &path,
-            card_uid: data.as_str(),
-            size_bytes: i64::try_from(bytes.len()).expect("artifact size fits"),
-            sha256: &sha256,
-            content_type: Some("application/vnd.apache.parquet"),
-            sse_marker: None,
-            backend: storage.backend(),
-        },
-    )
-    .await
-    .expect("artifact metadata inserts");
-    conn.commit().await.expect("artifact metadata commits");
+        .expect("the artifact is recorded in the object inventory");
 }
 
 /// Read `(state, attempts)` of `verifier`'s baseline row.
@@ -2628,7 +2627,7 @@ fn fitter(harness: &Harness, drain_grace: Duration, gate: &FitGate) -> Arc<Basel
                 .postgres
                 .operator_pool()
                 .expect("server has an operator pool"),
-            Arc::clone(&state.storage),
+            state.clone(),
             &limits,
         )
         .with_fit_gate(gate.clone()),

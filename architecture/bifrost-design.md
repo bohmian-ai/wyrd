@@ -609,10 +609,12 @@ touched segments, fence, insert and publish, acknowledge) with at most one
 unresolved cycle; a failed shared sync faults the WAL and acknowledges no shard
 that waited on it. Each shard's active generation holds one retirement
 reference on every segment it appended to. Rotation hands those segments to
-the rotated cohort and then drops the generation's references. A segment is
-deleted only when it is no longer current and no generation, cohort, or replay
-pin holds it; a released segment retained again before its deferred deletion
-runs is kept.
+the rotated cohort and then drops the generation's references; once a
+shard's last active bucket seals, its generation drops them to its sealed
+members instead. A segment is deleted only when no generation, cohort,
+member, or replay pin holds it; a released current segment is closed first,
+so a quiet stream still retires its WAL, and a released segment retained
+again before its deferred deletion runs is kept.
 
 Shard owners, reconciliation, staging, assembly, and persistence run on one
 dedicated Scribe Tokio runtime separated from request serving. One non-cloneable

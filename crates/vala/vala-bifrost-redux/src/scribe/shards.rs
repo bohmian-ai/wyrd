@@ -2613,6 +2613,20 @@ impl ShardOwner {
             // another owner still reaches the segment. The last member to
             // commit after every active bucket, pending or retained member,
             // and cohort has let go is its sole remaining retirement owner.
+            // With no active bucket left, every record of the open WAL
+            // generation belongs to a sealed member, so the generation lets
+            // go of its segments too and this member may retire them.
+            if self.wal_segments.is_empty() {
+                retained
+                    .wal_segments
+                    .extend(self.wal_handle.release_sealed_generation()?);
+                retained
+                    .wal_segments
+                    .sort_by(|left, right| left.path.cmp(&right.path));
+                retained
+                    .wal_segments
+                    .dedup_by(|left, right| left.path == right.path);
+            }
             let referenced = self.referenced_wal_paths()?;
             retained
                 .wal_segments
@@ -2628,7 +2642,8 @@ impl ShardOwner {
     /// committed selective member may retire a segment only when it is absent
     /// from this set; segments still current are additionally skipped by the
     /// WAL itself. The active generation's segments are retained by it until
-    /// rotation hands them to a cohort, so a member never releases them.
+    /// rotation hands them to a cohort or the last active bucket seals, so a
+    /// member never releases them while the generation is open.
     ///
     /// # Errors
     ///
@@ -9681,6 +9696,53 @@ mod tests {
             .expect("last retirement")
             .expect("last member retained");
         assert_eq!(last.wal_segments, vec![shared]);
+    }
+
+    /// A selectively sealed shard that stays quiet still retires its WAL: the
+    /// open generation's reference on the shared current segment must not
+    /// outlive the last committed member once no active bucket remains.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the generation keeps its reference or the segment survives
+    /// the last member's retirement.
+    #[test]
+    fn last_selective_member_retires_the_open_generation_segment() {
+        let (mut owner, generation_id, _wal, _root, _budget) =
+            committed_retirement_owner_for_test();
+        let append = crate::scribe::wal::PreparedWalAppend::new(
+            WalLsn::ZERO,
+            [5_u8; 16],
+            bytes::Bytes::from_static(b"row"),
+        )
+        .for_slice(owner_key(), [7_u8; 32]);
+        let result = owner
+            .wal_handle
+            .append_prepared(append)
+            .expect("generation append");
+        owner
+            .wal_handle
+            .sync_segments(&result.touched_segments)
+            .expect("generation sync");
+        let segment = result.touched_segments[0].reference();
+        owner
+            .retained_generations
+            .get_mut(&generation_id)
+            .expect("fixture generation")
+            .wal_segments = vec![segment.clone()];
+        assert!(owner.wal_segments.is_empty(), "every bucket is sealed");
+
+        let retained = owner
+            .retire_committed_generation(generation_id)
+            .expect("retirement")
+            .expect("member retained");
+        assert_eq!(retained.wal_segments, vec![segment.clone()]);
+        assert!(!owner.wal_handle.has_active_records().expect("generation"));
+        owner
+            .wal_handle
+            .retire_segments(&retained.wal_segments)
+            .expect("member retires its segments");
+        assert!(!segment.path.exists(), "the quiet shard's WAL retires");
     }
 
     /// Test and periodic retirement callers both retain the generation on an error path.

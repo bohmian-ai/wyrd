@@ -2180,7 +2180,8 @@ impl WalHandle {
     /// each still holding the one retirement reference the generation took.
     /// The caller retains them for the rotated cohort and then releases these
     /// generation references. The shared current segment stays open for the
-    /// other shards; it is never deleted while current. An empty generation
+    /// other shards; it is deleted while current only once no shard
+    /// references it. An empty generation
     /// returns no segments and creates no retirement owner.
     ///
     /// # Errors
@@ -2202,6 +2203,26 @@ impl WalHandle {
             segment.sync_data()?;
         }
         Ok(std::mem::take(&mut state.generations[shard]).segments)
+    }
+
+    /// Closes an active generation whose every record a sealed member owns.
+    ///
+    /// Selective seals hand each key's records to an immutable member but
+    /// leave the generation open, so once no active bucket remains its
+    /// retirement references would outlive every member. This drops them
+    /// without deleting anything and returns the segments, which the
+    /// committing member then retires once no other owner reaches them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stream state-lock, segment-sync, or retirement-reference
+    /// lock error. The generation is left open when the sync fails.
+    pub(crate) fn release_sealed_generation(&self) -> Result<Vec<WalSegmentRef>, ScribeError> {
+        let closed = self.close_active_generation()?;
+        for segment in &closed {
+            self.release_replay_pin(segment, false)?;
+        }
+        Ok(closed)
     }
 
     pub(crate) fn sync_segments(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
@@ -2985,18 +3006,21 @@ impl WalWriter {
     /// Deletes released segments plus every earlier deferred deletion.
     ///
     /// The released paths join the shared deferred set before any file is
-    /// touched. Each pass then removes every deferred path that is no longer
-    /// the current segment and that no owner has retained again since its
-    /// release; a still-current or re-retained path or a failed removal stays
-    /// deferred for the next pass, so partial progress never loses a pending
-    /// deletion. A shared current segment can be released by one shard and
-    /// then retained by another shard's next append, which this check keeps.
+    /// touched. A released current segment that no owner references is closed
+    /// first, so a quiet stream retires without waiting for a rollover. Each
+    /// pass then removes every deferred path that is no longer the current
+    /// segment and that no owner has retained again since its release; a
+    /// re-retained path or a failed removal stays deferred for the next pass,
+    /// so partial progress never loses a pending deletion.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when a state or deferral lock is
-    /// poisoned, or the first removal or directory-sync failure after every
-    /// other deferred path has been attempted.
+    /// poisoned, the closing segment cannot be trimmed or synced, or the
+    /// first removal or directory-sync failure after every other deferred
+    /// path has been attempted.
+    ///
+    /// Lock order: stream state, then retirement references.
     fn delete_closed_segments(&self, segments: &[PathBuf]) -> Result<(), ScribeError> {
         if self.is_faulted() {
             // A faulted WAL keeps every file for the restart replay that
@@ -3019,11 +3043,7 @@ impl WalWriter {
             deferred.extend(segments.iter().cloned());
             deferred.iter().cloned().collect::<Vec<_>>()
         };
-        let current = self
-            .lock_state("retire_segments")?
-            .current_segment
-            .as_ref()
-            .map(|segment| segment.path().to_path_buf());
+        let mut state = self.lock_state("retire_segments")?;
         let retained = self
             .retirement_refs
             .lock()
@@ -3034,6 +3054,26 @@ impl WalWriter {
             .filter(|path| pending.contains(path))
             .cloned()
             .collect::<HashSet<_>>();
+        // A released current segment nobody references holds no record any
+        // owner still needs: every generation that appended to it took a
+        // reference under this lock. Closing it here lets a low-volume stream
+        // retire without waiting for a size rollover; the next append opens
+        // a fresh segment.
+        if let Some(segment) = state.current_segment.as_ref()
+            && pending.iter().any(|path| path == segment.path())
+            && !retained.contains(segment.path())
+        {
+            segment.trim(state.current_segment_size)?;
+            segment.sync_data()?;
+            state.current_segment = None;
+            state.current_segment_size = 0;
+            state.current_segment_records = 0;
+        }
+        let current = state
+            .current_segment
+            .as_ref()
+            .map(|segment| segment.path().to_path_buf());
+        drop(state);
         let mut first_error = None;
         for path in pending {
             if current.as_ref() == Some(&path) || retained.contains(&path) {
@@ -4704,11 +4744,22 @@ mod tests {
         assert!(reader.segments.len() > 1);
         let first = reader.segments[0].reference();
         let current = reader.segments.last().expect("current segment").reference();
+        // A second owner still holds the current segment.
+        writer
+            .retain_segments(&[current.clone(), current.clone()])
+            .expect("two owners retain the current segment");
         writer
             .retire_segments(&[first.clone(), current.clone()])
             .expect("retire closed segment");
         assert!(!first.path.exists());
         assert!(current.path.exists());
+        writer
+            .retire_segments(std::slice::from_ref(&current))
+            .expect("last owner releases the current segment");
+        assert!(
+            !current.path.exists(),
+            "an unreferenced current segment closes and retires"
+        );
     }
 
     /// A retired segment is recycled into the next one; its stale records end
@@ -5238,15 +5289,14 @@ mod tests {
         seven
             .retire_segments(&seven_cohort)
             .expect("seven cohort publishes");
-        assert!(shared.exists(), "a released current segment is deferred");
+        assert!(
+            !shared.exists(),
+            "the last release closes and retires even the current segment"
+        );
         append(&zero, 3);
-        live.close_all_streams().expect("detach shared segment");
-        live.retire_segments(&[]).expect("deferred pass");
-        assert!(shared.exists(), "a re-retained deferred segment is kept");
-        let last_cohort = rotate(&zero);
-        zero.retire_segments(&last_cohort)
-            .expect("last cohort publishes");
-        assert!(!shared.exists(), "the last release retires the segment");
+        let next = rotate(&zero);
+        assert_ne!(next[0].path, shared, "the next append opens a new segment");
+        assert!(next[0].path.exists(), "the new segment's cohort holds it");
     }
 
     /// A filesystem retirement failure preserves the source path for a later retry.
@@ -5396,13 +5446,13 @@ mod tests {
         }
     }
 
-    /// A released segment survives a skipped or failed deletion and is
-    /// removed by the next retirement pass.
+    /// A released segment survives a failed deletion and is removed by the
+    /// next retirement pass.
     ///
     /// # Panics
     ///
-    /// Panics if releasing the current segment deletes it, if a failed
-    /// removal forgets the path, or if a later empty pass leaves it on disk.
+    /// Panics if a failed removal forgets the path, or if a later empty pass
+    /// leaves it on disk.
     #[test]
     fn released_segment_deletion_retries_until_it_succeeds() {
         use std::os::unix::fs::PermissionsExt;
@@ -5419,18 +5469,11 @@ mod tests {
             .first()
             .expect("segment")
             .reference();
-        writer
-            .retire_segments(std::slice::from_ref(&segment))
-            .expect("current segment release");
-        assert!(
-            segment.path.exists(),
-            "the current segment is never deleted"
-        );
         writer.close_all_streams().expect("close");
         let shard_dir = segment.path.parent().expect("shard directory");
         std::fs::set_permissions(shard_dir, std::fs::Permissions::from_mode(0o500))
             .expect("read-only shard directory");
-        let refused = writer.retire_segments(&[]);
+        let refused = writer.retire_segments(std::slice::from_ref(&segment));
         std::fs::set_permissions(shard_dir, std::fs::Permissions::from_mode(0o700))
             .expect("writable shard directory");
         refused.expect_err("removal from a read-only directory fails");

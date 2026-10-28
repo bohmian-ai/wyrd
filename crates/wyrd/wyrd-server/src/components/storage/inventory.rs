@@ -36,6 +36,7 @@ use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::managed_columns::{RUN_ID, SUBJECT_CARD_UID, WORKLOAD_CARD_UID};
 use wyrd_sql::queries::auth::service_accounts::system_principal_id;
+use wyrd_storage::tenant_path;
 
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::scribe_outbox::ScribeWrite;
@@ -110,7 +111,7 @@ impl ObjectFact {
     /// # Errors
     /// Returns an internal error when the digest is not base64 or a value
     /// does not fit its column.
-    fn row(&self) -> Result<StagedRow, WyrdError> {
+    pub(crate) fn row(&self) -> Result<StagedRow, WyrdError> {
         let sha256 = self
             .sha256
             .as_deref()
@@ -257,7 +258,7 @@ impl<'s> ObjectInventory<'s> {
         );
         let mut batches = Vec::new();
         let sql = format!(
-            "SELECT sha256, size_bytes, content_type, origin, relative_path, state \
+            "SELECT storage_path, sha256, size_bytes, content_type, origin, relative_path, state \
              FROM {OBJECTS} WHERE card_uid = {}",
             ObservationWindow::text(card_uid.as_str())
         );
@@ -277,15 +278,23 @@ impl<'s> ObjectInventory<'s> {
             Err(error) => return Err(error),
             Ok(_) => {}
         }
-        Self::fold(&batches)
+        Self::fold(tenant, card_uid, &batches)
     }
 
-    /// Fold inventory rows into one object per path, a deletion dominating.
+    /// Fold `card_uid`'s inventory rows into one object per path, a deletion
+    /// dominating.
     ///
     /// # Errors
-    /// Returns an internal error when a row is malformed.
-    fn fold(batches: &[RecordBatch]) -> Result<CardObjects, WyrdError> {
-        let invalid = |what: &str| WyrdError::internal(format!("stored object row is invalid: {what}"));
+    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a row is malformed
+    /// or its stored path is not `card_uid`'s file in `tenant`.
+    fn fold(
+        tenant: DataTenantId,
+        card_uid: &CardUid,
+        batches: &[RecordBatch],
+    ) -> Result<CardObjects, WyrdError> {
+        let invalid = |what: &str| {
+            WyrdError::registry_invalid_card_spec(format!("stored object row is invalid: {what}"))
+        };
         let mut objects = CardObjects::default();
         for batch in batches {
             let text = |name: &str| {
@@ -294,7 +303,11 @@ impl<'s> ObjectInventory<'s> {
                     .and_then(|column| column.as_string_opt::<i32>())
                     .ok_or_else(|| invalid(name))
             };
-            let (digests, types) = (text("sha256")?, text("content_type")?);
+            let (paths, digests, types) = (
+                text("storage_path")?,
+                text("sha256")?,
+                text("content_type")?,
+            );
             let (origins, relatives, states) = (text("origin")?, text("relative_path")?, text("state")?);
             let sizes = batch
                 .column_by_name("size_bytes")
@@ -312,6 +325,12 @@ impl<'s> ObjectInventory<'s> {
                     continue;
                 }
                 let relative = cell(relatives).ok_or_else(|| invalid("relative_path"))?;
+                let bound = tenant_path::validate(paths.value(row), tenant).is_ok_and(|path| {
+                    path.card_uid == card_uid.as_str() && path.relative_path == relative
+                });
+                if !bound {
+                    return Err(invalid("storage_path is not bound to its Card"));
+                }
                 let digest = cell(digests).ok_or_else(|| invalid("sha256"))?;
                 let digest = hex::decode(&digest).map_err(|_| invalid("sha256"))?;
                 objects.files.insert(

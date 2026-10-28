@@ -1745,8 +1745,11 @@ mod tests {
         ScribeRoute, ScribeSink, ScribeTable, ScribeWrite, ServerSpanSink, StagedRow,
         TENANT_SPAN_PERMITS, concat_batches, frame_budget, payload_ipc,
     };
+    use base64::Engine as _;
+
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
+    use crate::components::storage::inventory::{ObjectFact, ObjectOrigin, ObjectState};
     use crate::components::gateway::recording::{Received, RecordingScribe};
     use crate::grpc::capture_peer::ScribeCapturePeerGrpc;
     use crate::verification::results::{InputRecord, ResultPayloadBuilder, ResultRun};
@@ -2456,6 +2459,218 @@ mod tests {
             "the replay is identical"
         );
         assert_eq!(summaries(&scribe.inner.received()), 3);
+    }
+
+    /// A Scribe that admits every frame through `inner`, holding each storage
+    /// object frame until `release` has a permit.
+    struct ObjectGate {
+        /// Records every admitted frame and answers scripted refusals.
+        inner: Arc<RecordingScribe>,
+        /// Permits the held object frames wait for.
+        release: tokio::sync::Semaphore,
+        /// Signalled when an object frame arrives.
+        arrived: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Scribe for ObjectGate {
+        /// Always ready.
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        /// Admits `frame` through the recording Scribe, after a release
+        /// permit when it names the object inventory.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's scripted refusal.
+        async fn ingest_frame(
+            &self,
+            frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            if frame.table == ScribeTable::Objects.table_ref() {
+                self.arrived.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .expect("the release stays open")
+                    .forget();
+            }
+            self.inner.ingest_frame(frame).await
+        }
+
+        /// Resolves through the recording Scribe.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's resolution error.
+        async fn resolve_write_table(
+            &self,
+            tenant: DataTenantId,
+            table: &TableRef,
+        ) -> Result<TableUid, ScribeError> {
+            self.inner.resolve_write_table(tenant, table).await
+        }
+    }
+
+    /// One completed storage object write at `path`, and the receiver its
+    /// acknowledgement fires.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fact does not project.
+    fn object(path: &str) -> (ScribeWrite, tokio::sync::oneshot::Receiver<()>) {
+        let fact = ObjectFact {
+            storage_path: path.to_owned(),
+            upload_id: None,
+            backend: "local".to_owned(),
+            sha256: Some(base64::engine::general_purpose::STANDARD.encode([7; 32])),
+            size_bytes: 1,
+            content_type: None,
+            sse_marker: None,
+            origin: ObjectOrigin::CardFile,
+            card_uid: Some(uid()),
+            relative_path: Some("a.txt".to_owned()),
+            state: ObjectState::Completed,
+        };
+        let (sender, acked) = tokio::sync::oneshot::channel();
+        let write = ScribeWrite::Object {
+            row: fact.row().expect("the fact projects"),
+            attribution: background(),
+            acked: Mutex::new(Some(sender)),
+        };
+        (write, acked)
+    }
+
+    /// Whether `acked` has not fired yet.
+    fn pending(acked: &mut tokio::sync::oneshot::Receiver<()>) -> bool {
+        matches!(
+            acked.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        )
+    }
+
+    /// Proves an inventory write's acknowledgement is its own and isolated.
+    ///
+    /// While an object frame is held in Scribe its waiter is not notified,
+    /// so a caller's bounded wait times out, and audit, capture, a server
+    /// span copy, and a direct execution's inputs and result in other lanes
+    /// are written meanwhile; a lost ACK is not success, and the waiter is
+    /// notified only once the replayed frame is acknowledged. A terminal
+    /// rejection and a process that reaches no Scribe drop the waiter's
+    /// sender instead, an unknown outcome, never success.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a waiter is notified without its own acknowledgement,
+    /// another producer waits for the held write, or a lost write notifies.
+    #[tokio::test]
+    async fn inventory_ack_is_isolated() {
+        let lane = |write: &ScribeWrite| ScribeSink::lane(write) % SCRIBE_LANES as u64;
+        let path = (0..64)
+            .map(|index| format!("held-{index}"))
+            .find(|path| lane(&object(path).0) != 0)
+            .expect("some path takes a lane other than the span lane");
+        let held_lane = lane(&object(&path).0);
+        let elsewhere = |make: &dyn Fn() -> ScribeWrite| {
+            std::iter::repeat_with(make)
+                .take(256)
+                .find(|write| lane(write) != held_lane)
+                .expect("some write takes another lane")
+        };
+        let scribe = Arc::new(ObjectGate {
+            inner: Arc::default(),
+            release: tokio::sync::Semaphore::new(0),
+            arrived: tokio::sync::Notify::new(),
+        });
+        let outbox = route_outbox(
+            ScribeRoute::Local(Arc::clone(&scribe) as _, None),
+            BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+        );
+        let tenant = DataTenantId::new_v7();
+        let (write, mut acked) = object(&path);
+        outbox.stage(tenant, write);
+        tokio::time::timeout(Duration::from_secs(10), scribe.arrived.notified())
+            .await
+            .expect("the object frame reaches Scribe");
+
+        outbox.stage(tenant, elsewhere(&|| decision("bifrost.record.write").into()));
+        outbox.stage(tenant, elsewhere(&|| capture(tenant).into()));
+        let (route, span) = span_copy(tenant);
+        ServerSpanSink::new(Arc::clone(&outbox)).stage(route, span);
+        let execution = std::iter::repeat_with(ExecutionId::new_v7)
+            .take(256)
+            .find(|execution| lane(&direct_inputs(*execution, background())) != held_lane)
+            .expect("some execution takes another lane");
+        outbox.stage(tenant, direct_inputs(execution, background()));
+        outbox.stage(tenant, execution_result(execution, &uid(), background(), 0, 0));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let tables: HashSet<_> = scribe
+                .inner
+                .received()
+                .into_iter()
+                .map(|frame| frame.table)
+                .collect();
+            let written = [
+                "bifrost.gateway.calls",
+                "bifrost.traces.spans",
+                "bifrost.verification.execution_inputs",
+                "bifrost.verification.results",
+            ]
+            .iter()
+            .all(|table| tables.contains(*table));
+            if written && !scribe.inner.audit_frames().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "other producers wait: {tables:?}");
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut acked)
+                .await
+                .is_err(),
+            "a held write's bounded wait times out"
+        );
+
+        scribe.inner.refuse_next(ScribeError::IngressClosed);
+        scribe.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), scribe.arrived.notified())
+            .await
+            .expect("the refused frame is replayed");
+        assert!(pending(&mut acked), "a lost ACK is not success");
+        scribe.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), acked)
+            .await
+            .expect("the acknowledgement arrives")
+            .expect("its own acknowledgement notifies the waiter");
+
+        scribe
+            .release
+            .add_permits(tokio::sync::Semaphore::MAX_PERMITS);
+        settle(&outbox).await;
+        scribe.inner.refuse_next(ScribeError::InvalidFrame);
+        let (write, rejected) = object(&path);
+        outbox.stage(tenant, write);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), rejected)
+                .await
+                .expect("the rejection settles")
+                .is_err(),
+            "a rejected write never notifies success"
+        );
+
+        let unreachable = ScribeSink::outbox(None, BIFROST_INGEST_REQUEST_LIMIT_BYTES);
+        let (write, dropped) = object(&path);
+        unreachable.stage(tenant, write);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), dropped)
+                .await
+                .expect("the drop settles")
+                .is_err(),
+            "a dropped write never notifies success"
+        );
     }
 
     /// Proves audit decisions stage through the [`AuditStage`] seam and frame

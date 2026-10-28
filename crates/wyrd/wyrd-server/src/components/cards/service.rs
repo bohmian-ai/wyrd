@@ -351,15 +351,18 @@ async fn card_files(
 
 /// Rebuild the served Card from its immutable blob and live registry state.
 ///
-/// Verifies the blob against the registry row and artifact inventory, then
-/// overlays server-derived state: inbound relationships and `status`, whose
-/// `verification.binding_ids` lists the owner's projected bindings and is
-/// omitted when the Card owns none.
+/// Reads the blob only once the object inventory records an envelope at the
+/// registry's retained pointer, verifies it against the registry row and
+/// artifact inventory, then overlays server-derived state: inbound
+/// relationships and `status`, whose `verification.binding_ids` lists the
+/// owner's projected bindings and is omitted when the Card owns none.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` before the blob is active,
 /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the blob URI, identity, or
-/// integrity check fails, and the mapped storage error when the read fails.
+/// integrity check fails, `WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE` when
+/// no envelope is recorded at the pointer yet, and the mapped storage error
+/// when the read fails.
 async fn hydrate_card(
     state: &AppState,
     caller: &Caller,
@@ -382,6 +385,14 @@ async fn hydrate_card(
         return Err(WyrdError::registry_invalid_card_spec(
             "stored Card blob is not bound to its registry row",
         ));
+    }
+    if inventory
+        .envelope
+        .as_ref()
+        .is_none_or(|(recorded, _)| recorded != path)
+    {
+        tracing::info!(card_uid = %row.card_uid, "the Card envelope is not visible in the object inventory yet");
+        return Err(wyrd_spec::vala::BifrostError::QueryVisibilityUnavailable.into());
     }
     let bytes = state
         .storage

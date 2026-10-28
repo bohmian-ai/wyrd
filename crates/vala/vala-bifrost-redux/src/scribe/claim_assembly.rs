@@ -72,7 +72,8 @@ impl ClaimRuns {
 pub struct AssembleClaimRequest<'a> {
     /// Validated runs gathered for the claim.
     pub runs: &'a ClaimRuns,
-    /// Physical schema shared by every run and every emitted object.
+    /// Logical schema of every run and every emitted object; runs may hold it
+    /// in another Variant layout.
     pub schema: SchemaRef,
     /// Registered physical write recipe the merge and writer obey.
     pub layout: &'a PhysicalLayout,
@@ -257,6 +258,7 @@ impl ClaimAssembler {
         let merge = StagedRunMerge::open(
             request.runs.runs(),
             request.schema,
+            request.tenant,
             request.layout,
             MERGE_BATCH_ROWS,
         )?;

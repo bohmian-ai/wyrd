@@ -914,7 +914,7 @@ async fn execute_pins_files_and_completes_shared_uploads() {
         Mock::given(method("POST"))
             .and(path(format!("/v1/cards/upload/{upload}/complete")))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "stored": {
-                "storage_path": format!("t/evidence/sha256/{sha}"), "size_bytes": 1,
+                "storage_path": format!("t/evidence/sha256/{sha}/{upload}"), "size_bytes": 1,
                 "sha256": "", "content_type": null, "sse_marker": null,
                 "created_at": "2026-10-28T00:00:00Z"
             } })))

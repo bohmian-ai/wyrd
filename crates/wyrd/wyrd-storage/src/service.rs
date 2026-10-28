@@ -182,7 +182,7 @@ pub async fn upload_init(
         caller,
         idempotency_key.as_ref().map(|key| (key, &body_sha)),
         &subject,
-        validated,
+        (UploadId::new(), validated),
     )
     .await
 }
@@ -190,11 +190,12 @@ pub async fn upload_init(
 /// Initialize the upload of one verification File of `sha256` and
 /// `size_bytes`.
 ///
-/// The File is stored at `<tenant>/evidence/sha256/<digest>`, outside every
-/// Card, and planned, transferred, and completed exactly like a Card file:
-/// the same size limit, planner, and backend protocols apply, and its
-/// session is owned by no Card. A re-initialized File aborts its prior
-/// pending session.
+/// The File is stored at `<tenant>/evidence/sha256/<digest>/<upload_id>`,
+/// outside every Card, and planned, transferred, and completed exactly like a
+/// Card file: the same size limit, planner, and backend protocols apply, and
+/// its session is owned by no Card. Each session owns its final location, so
+/// independent initializations of one File never replace or abort one
+/// another; only a Card re-initialization replaces a prior pending session.
 ///
 /// # Errors
 /// Returns the errors of [`upload_init`].
@@ -206,7 +207,8 @@ pub async fn file_upload_init(
     sha256: &wyrd_spec::auth::Sha256Hex,
     size_bytes: u64,
 ) -> Result<UploadInitResponse, WyrdError> {
-    let validated = tenant_path::evidence(caller.data_tenant_id, sha256);
+    let upload_id = UploadId::new();
+    let validated = tenant_path::evidence(caller.data_tenant_id, sha256, &upload_id);
     let expected_sha256 = base64::engine::general_purpose::STANDARD.encode(sha256.as_bytes());
     let relative_path = validated.relative_path.clone();
     let subject = UploadSubject {
@@ -221,7 +223,7 @@ pub async fn file_upload_init(
         caller,
         None,
         &subject,
-        validated,
+        (upload_id, validated),
     )
     .await
 }
@@ -239,7 +241,7 @@ async fn init_upload(
     caller: &StorageCaller,
     idempotency: Option<(&IdempotencyKey, &[u8; 32])>,
     subject: &UploadSubject<'_>,
-    validated: ValidatedPath,
+    (upload_id, validated): (UploadId, ValidatedPath),
 ) -> Result<UploadInitResponse, WyrdError> {
     let backend = state.storage.backend();
     let planned = plan_upload(
@@ -268,7 +270,6 @@ async fn init_upload(
     let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
     let prior_abort = find_and_mark_prior_pending(&mut conn, caller, subject).await?;
 
-    let upload_id = UploadId::new();
     let upload_uuid = upload_id_uuid(&upload_id)?;
     let counts = upload_row_counts(planned, subject.expected_size_bytes, wire_protocol);
     insert_initiating_upload(

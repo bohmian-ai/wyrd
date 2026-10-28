@@ -855,11 +855,12 @@ fn planned_upload(planned: &Value) -> String {
 }
 
 /// Upload `bytes` as one verification File through the shared lifecycle as
-/// `jwt`: plan, local PUT, and completion.
+/// `jwt`: plan, local PUT, and completion. Returns the completed object's
+/// recorded storage path.
 ///
 /// # Panics
 /// Panics when any step answers other than success.
-pub(crate) async fn upload_file(server: &WyrdTestServer, jwt: &str, bytes: &[u8]) {
+pub(crate) async fn upload_file(server: &WyrdTestServer, jwt: &str, bytes: &[u8]) -> String {
     let (status, planned) = plan_file(server, jwt, bytes).await;
     assert_eq!(status, StatusCode::OK, "{planned}");
     let upload_id = planned_upload(&planned);
@@ -867,6 +868,10 @@ pub(crate) async fn upload_file(server: &WyrdTestServer, jwt: &str, bytes: &[u8]
     assert_eq!(status, StatusCode::OK, "{stored}");
     let (status, completed) = upload_op(server, jwt, &upload_id, "complete").await;
     assert_eq!(status, StatusCode::OK, "{completed}");
+    completed["stored"]["storage_path"]
+        .as_str()
+        .expect("the completion reports its storage path")
+        .to_owned()
 }
 
 /// A direct execution judging the Service with `verifier` over `bytes` as
@@ -883,8 +888,8 @@ fn document_request(fixture: &Fixture, verifier: &CardUid, bytes: &[u8]) -> Stri
 
 /// A new File is planned as a shared upload session, transferred, and
 /// completed through the shared storage completion, which records it in the
-/// object inventory: the completion reports the tenant's digest-addressed
-/// File object, a repeated completion replays it, the next plan reuses the
+/// object inventory: the completion reports the session's object in the
+/// tenant's digest namespace, a repeated completion replays it, the next plan reuses the
 /// record, and the Verifier reads the recorded bytes and passes.
 ///
 /// # Panics
@@ -918,7 +923,10 @@ async fn file_upload_uses_shared_completion() {
     assert_eq!(status, StatusCode::OK, "{completed}");
     assert_eq!(
         completed["stored"]["storage_path"],
-        format!("{}/evidence/sha256/{sha256}", server.data_tenant_id()),
+        format!(
+            "{}/evidence/sha256/{sha256}/{upload_id}",
+            server.data_tenant_id()
+        ),
         "{completed}"
     );
     let (status, replayed) = upload_op(&server, &jwt, &upload_id, "complete").await;
@@ -941,6 +949,111 @@ async fn file_upload_uses_shared_completion() {
     .await;
     assert_eq!(status, StatusCode::OK, "{judged}");
     assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Independently planned sessions of the same File never revoke one
+/// another: two plans obtained before either completes each transfer and
+/// complete at their own object location, a replayed completion keeps its
+/// session's location, and the Verifier reads a completed object. Aborting
+/// one of two live sessions leaves the other to complete, while a Card
+/// file's re-initialization still replaces its prior pending session.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, path, or verdict expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn file_sessions_are_independent() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let fixture = Fixture::seed(&server).await;
+    let document = fixture
+        .seed
+        .verifier("vf-overlap-document", &document_answer_is_one())
+        .await
+        .expect("document Verifier registers");
+    let (_, jwt) = user(&server, "vf-overlap-writer", &["editor"]).await;
+
+    let (status, first) = plan_file(&server, &jwt, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = plan_file(&server, &jwt, DOCUMENT).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let (first, second) = (planned_upload(&first), planned_upload(&second));
+    assert_ne!(first, second);
+    let mut paths = Vec::new();
+    for upload_id in [&first, &second] {
+        let (status, stored) = put_local(&server, &jwt, upload_id, DOCUMENT).await;
+        assert_eq!(status, StatusCode::OK, "{stored}");
+        let (status, completed) = upload_op(&server, &jwt, upload_id, "complete").await;
+        assert_eq!(status, StatusCode::OK, "{completed}");
+        paths.push(completed["stored"]["storage_path"].clone());
+    }
+    assert_ne!(paths[0], paths[1]);
+    let (status, replayed) = upload_op(&server, &jwt, &first, "complete").await;
+    assert_eq!(
+        (status, &replayed["stored"]["storage_path"]),
+        (StatusCode::OK, &paths[0]),
+        "{replayed}"
+    );
+    let (status, judged) = execute(
+        &server,
+        &jwt,
+        document_request(&fixture, &document, DOCUMENT),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+
+    let spaced = br#"{"answer": 1}"#;
+    let (status, aborted) = plan_file(&server, &jwt, spaced).await;
+    assert_eq!(status, StatusCode::OK, "{aborted}");
+    let (status, kept) = plan_file(&server, &jwt, spaced).await;
+    assert_eq!(status, StatusCode::OK, "{kept}");
+    let (aborted, kept) = (planned_upload(&aborted), planned_upload(&kept));
+    let (status, response) = upload_op(&server, &jwt, &aborted, "abort").await;
+    assert_eq!(
+        (status, &response["aborted"]),
+        (StatusCode::OK, &json!(true)),
+        "{response}"
+    );
+    let (status, stored) = put_local(&server, &jwt, &kept, spaced).await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    let (status, completed) = upload_op(&server, &jwt, &kept, "complete").await;
+    assert_eq!(status, StatusCode::OK, "{completed}");
+    let (status, judged) =
+        execute(&server, &jwt, document_request(&fixture, &document, spaced)).await;
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    assert_eq!(judged["outcome"]["verdict"], "passed", "{judged}");
+
+    let card_init = json!({
+        "card_uid": fixture.service,
+        "relative_path": "doc.json",
+        "expected_sha256": base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            sha2::Sha256::digest(DOCUMENT),
+        ),
+        "expected_size_bytes": DOCUMENT.len(),
+    });
+    let mut card_uploads = Vec::new();
+    for _ in 0..2 {
+        let (status, planned) = send(
+            &server,
+            &jwt,
+            Method::POST,
+            "/v1/cards/upload/init",
+            Some(&card_init),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{planned}");
+        card_uploads.push(planned["upload_id"].as_str().expect("an upload id").to_owned());
+    }
+    let (status, replaced) = put_local(&server, &jwt, &card_uploads[0], DOCUMENT).await;
+    assert_eq!(
+        (status, &replaced["code"]),
+        (StatusCode::CONFLICT, &json!("WYRD_STORAGE_409_UPLOAD_NOT_PENDING")),
+        "{replaced}"
+    );
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -1060,7 +1173,7 @@ async fn file_reuse_requires_completed_file_inventory() {
     assert_eq!(status, StatusCode::OK, "{home}");
     planned_upload(&home);
 
-    upload_file(&server, &jwt, DOCUMENT).await;
+    let completed = upload_file(&server, &jwt, DOCUMENT).await;
     let (status, held) = plan_file(&server, &jwt, DOCUMENT).await;
     assert_eq!(
         (status, &held["uploads"]),
@@ -1085,7 +1198,7 @@ async fn file_reuse_requires_completed_file_inventory() {
             tenant,
             Attribution::direct(PrincipalId::new(writer)),
             &[fact(
-                format!("{tenant}/evidence/sha256/{sha256}"),
+                completed,
                 ObjectOrigin::FileUpload,
                 None,
                 ObjectState::Deleted,

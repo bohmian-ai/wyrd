@@ -130,12 +130,14 @@ async fn evidence_reads_only_matching_files() {
 #[tokio::test(flavor = "current_thread")]
 async fn evidence_refuses_tampered_body() {
     let uploads = Uploads::start().await;
-    let sha256 = uploads.put(b"hello").await;
+    let stored = upload_file(&uploads.server, &uploads.jwt, b"hello").await;
+    let sha256 = Sha256Hex::digest(b"hello");
     let state = uploads.server.state();
     state
         .storage
         .put_object(
-            &wyrd_storage::tenant_path::evidence(uploads.server.data_tenant_id(), &sha256),
+            &wyrd_storage::tenant_path::validate_evidence(&stored, uploads.server.data_tenant_id())
+                .expect("the recorded File location validates"),
             b"jello".to_vec(),
         )
         .await

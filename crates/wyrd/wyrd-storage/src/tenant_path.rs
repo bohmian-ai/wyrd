@@ -110,17 +110,21 @@ pub fn build(data_tenant_id: DataTenantId, card_uid: &str, relative_path: &str) 
     format!("{data_tenant_id}/cards/{card_uid}/{relative_path}")
 }
 
-/// The tenant-qualified object of pinned verification evidence `sha256`.
+/// The tenant-qualified object of upload session `upload_id` of pinned
+/// verification evidence `sha256`.
 ///
-/// Evidence lives at `<tenant>/evidence/sha256/<digest>`, outside any Card,
-/// so the path carries an empty `card_uid`. The canonical lowercase digest
-/// is the only variable segment, so the path is valid by construction.
+/// Evidence lives at `<tenant>/evidence/sha256/<digest>/<upload_id>`, outside
+/// any Card, so the path carries an empty `card_uid`. Each session owns its
+/// final location, so independent uploads of one digest never share an
+/// object. The canonical lowercase digest and the server-generated upload id
+/// are the only variable segments, so the path is valid by construction.
 #[must_use]
 pub fn evidence(
     data_tenant_id: DataTenantId,
     sha256: &wyrd_spec::auth::Sha256Hex,
+    upload_id: &wyrd_spec::storage::UploadId,
 ) -> ValidatedPath {
-    let relative_path = format!("evidence/sha256/{sha256}");
+    let relative_path = format!("evidence/sha256/{sha256}/{upload_id}");
     ValidatedPath {
         full: format!("{data_tenant_id}/{relative_path}"),
         data_tenant_id,
@@ -131,7 +135,7 @@ pub fn evidence(
 
 /// Validate a stored verification File object path.
 ///
-/// Accepts exactly `<tenant>/evidence/sha256/<digest>` for
+/// Accepts exactly `<tenant>/evidence/sha256/<digest>/<upload_id>` for
 /// `caller_data_tenant_id`, the path [`evidence`] builds. Card paths are
 /// refused, so a File upload never names a Card object.
 ///
@@ -143,7 +147,8 @@ pub fn validate_evidence(
     caller_data_tenant_id: DataTenantId,
 ) -> Result<ValidatedPath, TenantPathError> {
     let shape = || TenantPathError::ShapeMismatch(path.to_owned());
-    let (tenant, digest) = path.split_once("/evidence/sha256/").ok_or_else(shape)?;
+    let (tenant, session) = path.split_once("/evidence/sha256/").ok_or_else(shape)?;
+    let (digest, upload_id) = session.split_once('/').ok_or_else(shape)?;
     let tenant = parse_prefix(tenant)?;
     if tenant != caller_data_tenant_id {
         return Err(TenantPathError::TenantMismatch {
@@ -152,7 +157,12 @@ pub fn validate_evidence(
         });
     }
     let sha256 = wyrd_spec::auth::Sha256Hex::new(digest).map_err(|_| shape())?;
-    let validated = evidence(tenant, &sha256);
+    let upload_id = upload_id
+        .parse::<wyrd_spec::storage::UploadId>()
+        .and_then(|upload_id| upload_id.as_uuid())
+        .map(wyrd_spec::storage::UploadId::from_uuid)
+        .map_err(|_| shape())?;
+    let validated = evidence(tenant, &sha256, &upload_id);
     if validated.full != path {
         return Err(shape());
     }
@@ -232,13 +242,19 @@ mod tests {
         assert_eq!(validated.relative_path, "models/model.bin");
     }
 
-    /// Only the exact evidence shape of the caller's tenant validates as a
-    /// File object path.
+    /// Only the exact session-qualified evidence shape of the caller's
+    /// tenant validates as a File object path: another tenant, a
+    /// non-canonical digest or upload id, a missing or extra session
+    /// segment, and a Card path are refused.
+    ///
+    /// # Panics
+    /// Panics when a refused shape validates or the built path does not.
     #[test]
     fn validate_evidence_accepts_only_own_tenant_digest_paths() {
         let tenant = DataTenantId::new_v7();
         let sha256 = wyrd_spec::auth::Sha256Hex::digest(b"evidence");
-        let path = super::evidence(tenant, &sha256);
+        let upload_id = wyrd_spec::storage::UploadId::new();
+        let path = super::evidence(tenant, &sha256, &upload_id);
 
         assert_eq!(
             super::validate_evidence(&path.full, tenant).ok(),
@@ -253,6 +269,12 @@ mod tests {
         );
         assert!(super::validate_evidence(&card, tenant).is_err());
         assert!(super::validate_evidence(&format!("{}/x", path.full), tenant).is_err());
+        let digest_only = format!("{tenant}/evidence/sha256/{sha256}");
+        assert!(super::validate_evidence(&digest_only, tenant).is_err());
+        assert!(super::validate_evidence(&format!("{digest_only}/x"), tenant).is_err());
+        let uuid = upload_id.as_uuid().expect("a generated upload id parses");
+        let upper_session = format!("{digest_only}/wyu_{}", uuid.to_string().to_uppercase());
+        assert!(super::validate_evidence(&upper_session, tenant).is_err());
     }
 
     #[test]

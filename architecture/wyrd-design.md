@@ -1699,7 +1699,10 @@ the shared storage upload lifecycle: it plans with the same planner policy as
 a Card file (single PUT, multipart, Azure block blob, or the local upload
 capability), transfers through the same client, and is ready only once
 `POST /v1/cards/upload/{upload_id}/complete` verifies its stored digest and
-length and records a `file_upload` fact in `bifrost.storage.objects`. That
+length and records a `file_upload` fact in `bifrost.storage.objects`. Each
+upload session owns its own object, `evidence/sha256/<digest>/<upload_id>`,
+so concurrent uploads of one File never revoke one another, and an abandoned
+File session expires through the same storage sweeper as a Card upload. That
 completion returns only after the fact is acknowledged; it is the one
 completion guarantee for Card files and Files alike. Planning reuses a File
 only when a completed, undeleted same-tenant `file_upload` fact matches its

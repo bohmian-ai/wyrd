@@ -1462,6 +1462,12 @@ pub struct WalSegment {
     /// Whether this file was recycled from a retired segment, so bytes past
     /// the logical end are an older segment's records until [`Self::trim`].
     recycled: bool,
+    /// Whether an append wrote bytes since the last successful data sync.
+    ///
+    /// Read and written only under `file`, so a sync that finds it clear
+    /// knows every earlier append, by any shard, is already durable and
+    /// skips its own `fdatasync`. This is the WAL's group commit.
+    unsynced: std::sync::atomic::AtomicBool,
 }
 
 /// Stable filesystem identity for one closed WAL segment.
@@ -1539,6 +1545,7 @@ impl WalSegment {
             file: Mutex::new(file),
             header,
             recycled: false,
+            unsynced: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1583,6 +1590,7 @@ impl WalSegment {
             file: Mutex::new(file),
             header,
             recycled: true,
+            unsynced: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1634,6 +1642,7 @@ impl WalSegment {
             file: Mutex::new(file),
             header,
             recycled: false,
+            unsynced: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1654,6 +1663,7 @@ impl WalSegment {
         })?;
 
         let started = Instant::now();
+        self.unsynced.store(true, Ordering::Relaxed);
         let result = file.write_all(&encoded).map_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
                 ScribeError::WalDiskFull
@@ -1691,6 +1701,7 @@ impl WalSegment {
         })?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|error| wal_io_error("WAL record seek failed", &error))?;
+        self.unsynced.store(true, Ordering::Relaxed);
         #[cfg(test)]
         if WAL_PARTIAL_WRITE.with(|flag| flag.replace(false)) {
             let started = Instant::now();
@@ -1739,6 +1750,10 @@ impl WalSegment {
     }
 
     /// Force all appended data for this segment to stable storage.
+    ///
+    /// A sync that finds no append since the last successful sync returns
+    /// without an `fdatasync`: an earlier sync, possibly another shard's,
+    /// already made every appended byte durable.
     pub fn sync_data(&self) -> Result<(), ScribeError> {
         let span =
             tracing::debug_span!("bifrost.scribe.wal.fsync", outcome = tracing::field::Empty);
@@ -1746,6 +1761,10 @@ impl WalSegment {
         let file = self.file.lock().map_err(|_| ScribeError::Internal {
             detail: "WAL segment file lock poisoned (sync_data)".to_string(),
         })?;
+        if !self.unsynced.load(Ordering::Relaxed) {
+            span.record("outcome", "covered");
+            return Ok(());
+        }
         let started = Instant::now();
         let result = file.sync_data().map_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
@@ -1757,6 +1776,9 @@ impl WalSegment {
             }
         });
         record_wal_fsync(&result, started);
+        if result.is_ok() {
+            self.unsynced.store(false, Ordering::Relaxed);
+        }
         span.record("outcome", if result.is_ok() { "success" } else { "failed" });
         result
     }
@@ -2522,11 +2544,18 @@ impl WalWriter {
     ///
     /// A failed sync leaves written record bytes whose durability the writer
     /// cannot state, so the WAL is faulted rather than retried in process.
+    /// A faulted writer refuses every later sync: a retried `fdatasync` can
+    /// report success for pages the failed one already dropped, so no shard
+    /// may treat a sync after the fault as proof of durability.
     ///
     /// # Errors
     ///
-    /// Returns the segment sync error, or the injected sync failure.
+    /// Returns [`ScribeError::IngressClosed`] once the writer is faulted, the
+    /// segment sync error, or the injected sync failure.
     fn sync_segments_with_fault(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
+        if self.is_faulted() {
+            return Err(ScribeError::IngressClosed);
+        }
         #[cfg(any(test, feature = "test-support"))]
         if self.faults.sync_failure.swap(false, Ordering::AcqRel) {
             let result = Err(ScribeError::Internal {

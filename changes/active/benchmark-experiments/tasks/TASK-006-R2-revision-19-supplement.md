@@ -709,13 +709,13 @@ Median rows/s across 3 repetitions at 64 clients, with `WYRD_SCRIBE_SHARD_COUNT`
 - **Confirmation:** with `wal_io_threads = 16` (`212910Z`, `220802Z`), `wal_append` p50 falls to 0.2–3.9 ms. 16 shards then match or beat 1 shard: spans 534k and 532k against 477–494k.
 - **Fix site:** the pool size in the Scribe lane config. It must be no smaller than the shard count.
 
-**Why the rise is sublinear (the named limit).** Every shard's WAL is on one ext4 filesystem (`/dev/mapper/data-root`, which is dm-crypt on `nvme1n1`). On ext4, an `fdatasync` of an appended file completes through the single jbd2 journal commit of that filesystem, and each commit ends in one device flush. Sampling `/sys/block/nvme1n1/stat` during `220635Z` (1 shard) and `220802Z` (16 shards), both with `wal_io_threads = 16`:
+**Why the rise is sublinear (the named limit).** Every shard's WAL is on one device (`/dev/mapper/data-root`, which is ext4 on dm-crypt on `nvme1n1`, a consumer drive with a write-back cache). Every `fdatasync` ends in a device cache flush. Sampling `/sys/block/nvme1n1/stat` during `220635Z` (1 shard) and `220802Z` (16 shards), both with `wal_io_threads = 16`:
 
 | Shards | device flushes/s | ms per flush | peak device write MiB/s | mean MiB/s, busy seconds |
 |---|---|---|---|---|
 | 1 | 20–53 | 4–10 | 277 | 189 |
 | 16 | 25–79 | 3–26 | 353 | 238 |
 
-The flush rate does not grow with shard count, so shards parallelize the CPU work and the group cycles but share one journal commit stream. That commit stream is the limit on this host. The server uses 4–14 of 32 cores. The PostgreSQL fence (`visibility`) p50 is 2–8 ms and falls as shards are added.
+The flush rate barely grows with shard count, and each flush is slower. A `write(256 KiB)` + `fdatasync` loop on this volume reaches 71, 135 and 155 MiB/s with 1, 4 and 16 files. Over zero-filled, preallocated files, which leave ext4 no metadata to journal, it reaches 74, 125 and 181 MiB/s. Journal commits are therefore not the cost; the device flush is. The limit on this host is the flush rate of the drive. The server uses 4–14 of 32 cores. The PostgreSQL fence (`visibility`) p50 is 2–8 ms and falls as shards are added.
 
 **Variance.** The same configuration ranges widely between repetitions. For native at 16 shards with `wal_io_threads = 16`, rows/s is 4.25–6.47M, and 1-shard native `wal_sync` p50 is 61 ms in `211631Z` and 93 ms in `220635Z`. The disk's latency moves between runs, so a single before/after native comparison needs a gap larger than this spread before it can be called an improvement.

@@ -1561,12 +1561,17 @@ pub struct WalSegment {
     /// Whether this file was recycled from a retired segment, so bytes past
     /// the logical end are an older segment's records until [`Self::trim`].
     recycled: bool,
-    /// Whether an append wrote bytes since the last successful data sync.
-    ///
-    /// Read and written only under `file`, so a sync that finds it clear
-    /// knows every earlier append, by any shard, is already durable and
-    /// skips its own `fdatasync`. This is the WAL's group commit.
-    unsynced: std::sync::atomic::AtomicBool,
+    /// Second descriptor for the same open file, so `fdatasync` runs without
+    /// holding `file` and appends continue while a sync is in flight.
+    sync_file: File,
+    /// Count of appends whose bytes are fully written, bumped under `file`
+    /// after the write returns.
+    appended: AtomicU64,
+    /// Highest `appended` count a successful `fdatasync` covered. Holding
+    /// this lock serializes syncs, not appends: a sync that finds its own
+    /// append already covered by a finished sync, possibly another shard's,
+    /// skips its `fdatasync`. This is the WAL's group commit.
+    synced: Mutex<u64>,
 }
 
 /// Stable filesystem identity for one closed WAL segment.
@@ -1639,13 +1644,7 @@ impl WalSegment {
         file.seek(SeekFrom::End(0))
             .map_err(|error| wal_io_error("failed to position WAL segment for append", &error))?;
 
-        Ok(Self {
-            path: path.to_path_buf(),
-            file: Mutex::new(file),
-            header,
-            recycled: false,
-            unsynced: std::sync::atomic::AtomicBool::new(false),
-        })
+        Self::from_file(path, file, header, false)
     }
 
     /// Turns a retired segment file at `free` into the new segment `path`.
@@ -1684,13 +1683,7 @@ impl WalSegment {
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| wal_io_error("failed to fsync WAL segment parent dir", &error))?;
         }
-        Ok(Self {
-            path: path.to_path_buf(),
-            file: Mutex::new(file),
-            header,
-            recycled: true,
-            unsynced: std::sync::atomic::AtomicBool::new(false),
-        })
+        Self::from_file(path, file, header, true)
     }
 
     /// Cuts a recycled segment's stale bytes off at `logical_len` and syncs it.
@@ -1717,6 +1710,31 @@ impl WalSegment {
             .map_err(|error| wal_io_error("failed to sync trimmed WAL segment", &error))
     }
 
+    /// Wraps an open segment file with the second descriptor its syncs use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the descriptor cannot be cloned.
+    fn from_file(
+        path: &Path,
+        file: File,
+        header: SegmentHeader,
+        recycled: bool,
+    ) -> Result<Self, ScribeError> {
+        let sync_file = file
+            .try_clone()
+            .map_err(|error| wal_io_error("failed to clone WAL segment descriptor", &error))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Mutex::new(file),
+            header,
+            recycled,
+            sync_file,
+            appended: AtomicU64::new(0),
+            synced: Mutex::new(0),
+        })
+    }
+
     /// Open an existing WAL segment for reading.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ScribeError> {
         let path = path.as_ref();
@@ -1736,13 +1754,7 @@ impl WalSegment {
 
         let header = SegmentHeader::decode(&header_buf)?;
 
-        Ok(Self {
-            path: path.to_path_buf(),
-            file: Mutex::new(file),
-            header,
-            recycled: false,
-            unsynced: std::sync::atomic::AtomicBool::new(false),
-        })
+        Self::from_file(path, file, header, false)
     }
 
     /// Append a record to the segment without forcing it to stable storage.
@@ -1762,7 +1774,6 @@ impl WalSegment {
         })?;
 
         let started = Instant::now();
-        self.unsynced.store(true, Ordering::Relaxed);
         let result = file.write_all(&encoded).map_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
                 ScribeError::WalDiskFull
@@ -1772,6 +1783,7 @@ impl WalSegment {
                 }
             }
         });
+        self.appended.fetch_add(1, Ordering::Release);
         record_wal_append(&result, encoded.len(), started);
         span.record("outcome", if result.is_ok() { "success" } else { "failed" });
         result
@@ -1800,7 +1812,6 @@ impl WalSegment {
         })?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|error| wal_io_error("WAL record seek failed", &error))?;
-        self.unsynced.store(true, Ordering::Relaxed);
         #[cfg(test)]
         if WAL_PARTIAL_WRITE.with(|flag| flag.replace(false)) {
             let started = Instant::now();
@@ -1828,6 +1839,7 @@ impl WalSegment {
             file.write_all(&crc)
                 .map_err(|error| wal_io_error("WAL record CRC write failed", &error))
         })();
+        self.appended.fetch_add(1, Ordering::Release);
         record_wal_append(&result, encoded_len, started);
         span.record("outcome", if result.is_ok() { "success" } else { "failed" });
         result
@@ -1850,22 +1862,30 @@ impl WalSegment {
 
     /// Force all appended data for this segment to stable storage.
     ///
-    /// A sync that finds no append since the last successful sync returns
-    /// without an `fdatasync`: an earlier sync, possibly another shard's,
-    /// already made every appended byte durable.
+    /// The sync covers every append whose write finished before it started;
+    /// appends that land during the `fdatasync` wait for the next sync. A
+    /// sync that finds its caller's appends already covered by a finished
+    /// sync returns without an `fdatasync`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::WalDiskFull`] or [`ScribeError::Internal`] when
+    /// the data sync fails or the sync lock is poisoned.
     pub fn sync_data(&self) -> Result<(), ScribeError> {
         let span =
             tracing::debug_span!("bifrost.scribe.wal.fsync", outcome = tracing::field::Empty);
         let _entered = span.enter();
-        let file = self.file.lock().map_err(|_| ScribeError::Internal {
-            detail: "WAL segment file lock poisoned (sync_data)".to_string(),
+        let target = self.appended.load(Ordering::Acquire);
+        let mut synced = self.synced.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL segment sync lock poisoned (sync_data)".to_string(),
         })?;
-        if !self.unsynced.load(Ordering::Relaxed) {
+        if *synced >= target {
             span.record("outcome", "covered");
             return Ok(());
         }
+        let covered = self.appended.load(Ordering::Acquire);
         let started = Instant::now();
-        let result = file.sync_data().map_err(|e| {
+        let result = self.sync_file.sync_data().map_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
                 ScribeError::WalDiskFull
             } else {
@@ -1876,7 +1896,7 @@ impl WalSegment {
         });
         record_wal_fsync(&result, started);
         if result.is_ok() {
-            self.unsynced.store(false, Ordering::Relaxed);
+            *synced = covered;
         }
         span.record("outcome", if result.is_ok() { "success" } else { "failed" });
         result
@@ -4604,6 +4624,38 @@ mod tests {
                 .counters
                 .get("bifrost_scribe_wal_append_bytes_total")
                 .is_some_and(|bytes| *bytes > 0)
+        );
+    }
+
+    /// Appends proceed while a sync holds the sync lock, and a sync covers
+    /// only appends finished before it, so a covered sync skips its fsync.
+    #[test]
+    fn appends_proceed_during_sync_and_syncs_coalesce() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let directory = TempDir::new().expect("temporary WAL directory");
+            let segment = WalSegment::create(
+                directory.path().join("0.wal"),
+                SegmentHeader::new([34_u8; 16], 1, 0),
+            )
+            .expect("WAL segment");
+            let record = |lsn| WalRecord::new(WalLsn::new(lsn), 0, [3_u8; 16], vec![3_u8]);
+            let in_flight_sync = segment.synced.lock().expect("sync lock");
+            segment
+                .append(&record(0))
+                .expect("append while a sync is in flight");
+            drop(in_flight_sync);
+            segment.sync_data().expect("first sync");
+            segment.sync_data().expect("covered sync");
+            segment.append(&record(1)).expect("later append");
+            segment.sync_data().expect("later sync");
+        });
+        assert_eq!(
+            recorder
+                .snapshot()
+                .counters
+                .get("bifrost_scribe_wal_fsync_total{outcome=\"success\"}"),
+            Some(&2)
         );
     }
 

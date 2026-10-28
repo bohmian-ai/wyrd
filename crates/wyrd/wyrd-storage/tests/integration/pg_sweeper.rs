@@ -33,8 +33,7 @@ mod pg_tests {
 
         let blocked_upload = insert_upload(
             fixture.app_pool(),
-            tenant,
-            "blocked.bin",
+            card(tenant, "blocked.bin"),
             "pending",
             -3600,
             -60,
@@ -57,8 +56,7 @@ mod pg_tests {
 
         let expired_pending = insert_upload(
             fixture.app_pool(),
-            tenant,
-            "expired.bin",
+            card(tenant, "expired.bin"),
             "pending",
             -3600,
             -60,
@@ -66,15 +64,14 @@ mod pg_tests {
         .await;
         let orphan_initiating = insert_upload(
             fixture.app_pool(),
-            tenant,
-            "orphan.bin",
+            card(tenant, "orphan.bin"),
             "initiating",
             3600,
             -300,
         )
         .await;
         let live_pending =
-            insert_upload(fixture.app_pool(), tenant, "live.bin", "pending", 3600, -60).await;
+            insert_upload(fixture.app_pool(), card(tenant, "live.bin"), "pending", 3600, -60).await;
         insert_idempotency_key(fixture.app_pool(), tenant, "expired-key", -3600).await;
         insert_idempotency_key(fixture.app_pool(), tenant, "live-key", 3600).await;
 
@@ -118,8 +115,7 @@ mod pg_tests {
 
         let upload_id = insert_upload(
             fixture.app_pool(),
-            tenant,
-            "completed.bin",
+            card(tenant, "completed.bin"),
             "pending",
             -3600,
             -60,
@@ -137,6 +133,81 @@ mod pg_tests {
         assert_upload_status(operator_pool.pool(), upload_id, "completed").await;
     }
 
+    /// Abandoned File sessions are reclaimed by the shared sweeper beside
+    /// Card uploads: with a batch of one, an older expired File session, then
+    /// an orphaned initiating File session, then an expired Card upload are
+    /// each aborted by successive ticks, and the File plans again afterwards.
+    /// A row whose path disagrees with its persisted owner or tenant is never
+    /// reclaimed.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, a tick or replan fails, or a row
+    /// ends in another status.
+    #[tokio::test]
+    async fn tick_reclaims_file_sessions_without_starving_card_uploads() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let operator_pool = fixture.operator_pool().clone();
+        let tenant = fixture.data_tenant_id();
+        let handle = local_storage_handle().await;
+        let sweeper = |batch_size| {
+            Sweeper::new(
+                handle.clone(),
+                operator_pool.clone(),
+                fixture.wyrd_postgres().clone(),
+                SweeperConfig {
+                    enabled: true,
+                    tick: Duration::from_mins(1),
+                    batch_size,
+                    init_grace: Duration::from_secs(30),
+                    idempotency_batch_size: 10,
+                },
+                CancellationToken::new(),
+            )
+        };
+
+        let pool = fixture.app_pool();
+        let expired_file = insert_upload(pool, file(tenant, b"doc"), "pending", -7200, -7260).await;
+        let orphan_file = insert_upload(pool, file(tenant, b"doc"), "initiating", 3600, -600).await;
+        let expired_card = insert_upload(pool, card(tenant, "card.bin"), "pending", -60, -120).await;
+        let bounded = sweeper(1);
+        for _ in 0..3 {
+            bounded.tick().await.expect("bounded tick sweeps");
+        }
+        for upload in [expired_file, orphan_file, expired_card] {
+            assert_upload_status(operator_pool.pool(), upload, "aborted").await;
+        }
+        let caller = wyrd_storage::service::StorageCaller {
+            data_tenant_id: tenant,
+        };
+        wyrd_storage::service::file_upload_init(
+            &handle,
+            fixture.wyrd_postgres(),
+            &caller,
+            &wyrd_spec::auth::Sha256Hex::digest(b"doc"),
+            3,
+        )
+        .await
+        .expect("the reclaimed File plans again");
+
+        let (_, card_uid, relative_path, card_path) = card(tenant, "owned.bin");
+        let (_, _, file_relative, file_path) = file(tenant, b"owned");
+        let (_, _, foreign_relative, foreign_path) =
+            file(wyrd_spec::DataTenantId::new_v7(), b"foreign");
+        let refused = [
+            (tenant, None, relative_path, card_path),
+            (tenant, card_uid, file_relative, file_path),
+            (tenant, None, foreign_relative, foreign_path),
+        ];
+        let mut refused_ids = Vec::new();
+        for owner in refused {
+            refused_ids.push(insert_upload(pool, owner, "pending", -60, -120).await);
+        }
+        sweeper(10).tick().await.expect("tick runs");
+        for upload in refused_ids {
+            assert_upload_status(operator_pool.pool(), upload, "pending").await;
+        }
+    }
+
     async fn local_storage_handle() -> std::sync::Arc<StorageHandle> {
         let root = tempfile::tempdir().expect("temp dir").keep();
         StorageHandle::from_settings(StorageSettings {
@@ -150,10 +221,35 @@ mod pg_tests {
         .expect("storage handle")
     }
 
+    /// The owner of one inserted upload row: its tenant, nullable owning
+    /// Card, relative path, and full storage path.
+    type Owner = (wyrd_spec::DataTenantId, Option<String>, String, String);
+
+    /// A Card file upload of `relative_path` owned by a fresh Card.
+    fn card(tenant: wyrd_spec::DataTenantId, relative_path: &str) -> Owner {
+        let card_uid = sqlx::types::Uuid::now_v7().to_string();
+        let storage_path = tenant_path::build(tenant, &card_uid, relative_path);
+        (tenant, Some(card_uid), relative_path.to_owned(), storage_path)
+    }
+
+    /// A verification File upload session of `bytes`, owned by no Card.
+    fn file(tenant: wyrd_spec::DataTenantId, bytes: &[u8]) -> Owner {
+        let path = tenant_path::evidence(
+            tenant,
+            &wyrd_spec::auth::Sha256Hex::digest(bytes),
+            &wyrd_spec::storage::UploadId::new(),
+        );
+        (tenant, None, path.relative_path, path.full)
+    }
+
+    /// Insert one local upload row of `owner` with `status`, expiring and
+    /// created at the given offsets from now.
+    ///
+    /// # Panics
+    /// Panics when the tenant connection, insert, or commit fails.
     async fn insert_upload(
         app_pool: &sqlx::PgPool,
-        tenant: wyrd_spec::DataTenantId,
-        relative_path: &str,
+        (tenant, card_uid, relative_path, storage_path): Owner,
         status: &str,
         expires_offset_secs: i64,
         created_offset_secs: i64,
@@ -162,8 +258,6 @@ mod pg_tests {
             .await
             .expect("tenant conn");
         let upload_id = sqlx::types::Uuid::now_v7();
-        let card_uid = sqlx::types::Uuid::now_v7().to_string();
-        let storage_path = tenant_path::build(tenant, &card_uid, relative_path);
 
         sqlx::query(
             r"

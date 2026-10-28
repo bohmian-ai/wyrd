@@ -1,13 +1,17 @@
 //! Write-Ahead Log (WAL) for Scribe — crash-consistent framed records.
 //!
-//! Every prepared partition slice emits one self-describing v8 `SLICE` record.
+//! Every prepared partition slice emits one self-describing `SLICE` record.
 //! After
 //! all ordered slices are durable, one `COMMIT` record authenticates their
 //! complete digest before replay may restore any of them.
 //!
+//! One process stream carries every shard's records: shards share its
+//! segments and its syncs, and each v9 record names its own shard.
+//!
 //! Segment format per `scribe/00-architecture.md §Crash-consistent WAL format`:
 //! - Fixed 64-byte header with magic, version, `node_id`, `writer_epoch`, CRC
-//! - Fixed 72-byte framed-record headers plus payload and CRC32C trailers
+//! - Fixed 80-byte v9 framed-record headers (72-byte in v8) plus payload and
+//!   CRC32C trailers
 //! - `SLICE` records carrying tenant/batch/ordinal identity and payload
 //! - `COMMIT` records carrying the closed slice-set digest
 //! - Atomic segment rollover: write-fsync-rename-fsync-parent; a retired
@@ -17,8 +21,9 @@
 //! - Torn-tail truncation only for incomplete final writes; CRC, structure, and
 //!   monotonicity failures in a committed prefix fail closed
 //!
-//! Version 8 is the only accepted format. Earlier segment versions are rejected
-//! before replay.
+//! New segments are version 9. Version 8 segments, one stream per shard, are
+//! still read so an upgraded Scribe recovers them; earlier versions are
+//! rejected before replay.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -135,7 +140,7 @@ impl std::fmt::Display for WalLsn {
 pub struct SegmentHeader {
     /// Magic bytes: 0x57415257 ("WRAW" — Wyrd Redux Arrow Wal).
     pub magic: u32,
-    /// Format version (8 is the only accepted implementation).
+    /// Format version: 9 for every new segment, 8 for read-only recovery.
     pub version: u16,
     /// Reserved field (must be zero).
     pub reserved: u16,
@@ -145,24 +150,35 @@ pub struct SegmentHeader {
     pub writer_epoch: i64,
     /// Monotonic segment sequence number per stream.
     pub seg_seq: u64,
-    /// Fixed pod-local shard that owns this segment.
+    /// Shard whose v8 stream owns this segment; always zero in v9, whose
+    /// one process stream holds every shard's records.
     pub shard_id: u8,
     /// CRC32C over the preceding 60 bytes.
     pub crc32c: u32,
 }
 
 const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
-/// The only persisted WAL version accepted by this Scribe.
-const WAL_VERSION: u16 = 8;
+/// The WAL version every new segment is written in.
+const WAL_VERSION: u16 = 9;
+/// The per-shard WAL version still read, never written, so an upgrade
+/// recovers it.
+const WAL_VERSION_V8: u16 = 8;
 const SEGMENT_HEADER_SIZE: usize = 64;
 #[cfg(test)]
 const APPEND_FRAME_MAGIC_V3: [u8; 4] = *b"SWF3";
-/// Fixed byte length of every v8 record header before its payload and CRC.
-const RECORD_HEADER_SIZE: usize = 72;
-/// `u16` wire encoding of the immutable v8 record-header length.
-const RECORD_HEADER_SIZE_U16: u16 = 72;
+/// Fixed byte length of every v9 record header before its payload and CRC.
+///
+/// The v8 layout followed by the record's shard id at byte 72 and seven
+/// zero bytes, all covered by the record CRC.
+const RECORD_HEADER_SIZE: usize = 80;
+/// `u16` wire encoding of the immutable v9 record-header length.
+const RECORD_HEADER_SIZE_U16: u16 = 80;
+/// Fixed byte length of every v8 record header, which names no shard.
+const RECORD_HEADER_SIZE_V8: usize = 72;
+/// Exact v9 record magic.
+const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL9";
 /// Exact v8 record magic.
-const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL8";
+const RECORD_MAGIC_V8: [u8; 8] = *b"WYRDWAL8";
 /// Exact magic prefixing every v8 COMMIT payload.
 const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S7CM";
 /// Exact encoded width of a v8 COMMIT payload.
@@ -275,12 +291,32 @@ impl SegmentHeader {
         u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     }
 
-    /// Construct a new segment header.
+    /// Construct a new v9 process-stream segment header.
     #[must_use]
-    pub fn new(node_id: [u8; 16], writer_epoch: i64, seg_seq: u64, shard_id: u8) -> Self {
+    pub fn new(node_id: [u8; 16], writer_epoch: i64, seg_seq: u64) -> Self {
+        Self::with_version(WAL_VERSION, node_id, writer_epoch, seg_seq, 0)
+    }
+
+    /// Construct the header of a v8 shard segment, as an older Scribe wrote.
+    ///
+    /// Only fixtures write v8; production reads it to recover an upgrade.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn new_v8(node_id: [u8; 16], writer_epoch: i64, seg_seq: u64, shard_id: u8) -> Self {
+        Self::with_version(WAL_VERSION_V8, node_id, writer_epoch, seg_seq, shard_id)
+    }
+
+    /// Builds a header of `version` with its checksum.
+    fn with_version(
+        version: u16,
+        node_id: [u8; 16],
+        writer_epoch: i64,
+        seg_seq: u64,
+        shard_id: u8,
+    ) -> Self {
         let mut header = Self {
             magic: WAL_MAGIC,
-            version: WAL_VERSION,
+            version,
             reserved: 0,
             node_id,
             writer_epoch,
@@ -290,6 +326,15 @@ impl SegmentHeader {
         };
         header.crc32c = header.compute_crc();
         header
+    }
+
+    /// Byte length of each record header in this segment's version.
+    fn record_header_len(&self) -> usize {
+        if self.version == WAL_VERSION_V8 {
+            RECORD_HEADER_SIZE_V8
+        } else {
+            RECORD_HEADER_SIZE
+        }
     }
 
     /// Encode the header to bytes (64 bytes).
@@ -311,8 +356,9 @@ impl SegmentHeader {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the magic, version, reserved
-    /// fields, or header checksum violates WAL v8 framing.
+    /// Returns [`ScribeError::UnsupportedWalVersion`] for a version other
+    /// than 8 or 9, or [`ScribeError::Internal`] when the magic, reserved
+    /// fields, checksum, or a v9 header naming a shard violates the framing.
     pub fn decode(buf: &[u8; SEGMENT_HEADER_SIZE]) -> Result<Self, ScribeError> {
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != WAL_MAGIC {
@@ -358,8 +404,13 @@ impl SegmentHeader {
             });
         }
 
-        if version != WAL_VERSION {
+        if version != WAL_VERSION && version != WAL_VERSION_V8 {
             return Err(ScribeError::UnsupportedWalVersion { version });
+        }
+        if version == WAL_VERSION && shard_id != 0 {
+            return Err(ScribeError::Internal {
+                detail: "WAL v9 segment header names a shard".to_owned(),
+            });
         }
 
         if reserved != 0 {
@@ -386,15 +437,19 @@ impl SegmentHeader {
     }
 }
 
-/// WAL record — a v8 slice or commit framed entry.
+/// WAL record — a slice or commit framed entry.
 ///
-/// Its fixed 72-byte little-endian header is followed by its declared payload
-/// and a CRC32C trailer over both. A record never carries a mixed flag set.
+/// Its fixed little-endian header (80 bytes in v9, 72 in v8) is followed by
+/// its declared payload and a CRC32C trailer over both. A record never
+/// carries a mixed flag set.
 ///
 #[derive(Debug, Clone)]
 pub struct WalRecord {
     /// LSN for this record (monotonic per stream).
     pub lsn: WalLsn,
+    /// Shard that wrote the record: its v9 header byte, or the v8 segment's
+    /// shard, since a v8 segment holds one shard's records.
+    pub shard_id: u8,
     /// Exactly one of `RECORD_FLAG_SLICE` or `RECORD_FLAG_COMMIT`.
     pub flags: u32,
     /// Authenticated tenant owning the record.
@@ -409,17 +464,22 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
-/// Validated fixed v8 record header retained while replay selects the next LSN.
+/// Validated fixed record header retained while replay selects the next LSN.
 ///
 /// The header contains no scalable payload allocation. Replay can therefore
 /// peek across the fixed shard set, choose the stream-wide next record, and
 /// allocate only that record's declared payload.
 #[derive(Debug)]
 struct DecodedWalRecordHeader {
-    /// Exact header bytes included in the frame CRC.
+    /// Header bytes included in the frame CRC; a v8 header uses the first
+    /// [`RECORD_HEADER_SIZE_V8`].
     encoded: [u8; RECORD_HEADER_SIZE],
+    /// Byte length of the header within `encoded`.
+    encoded_len: usize,
     /// Stream-wide log sequence number.
     lsn: WalLsn,
+    /// Shard that wrote the record.
+    shard_id: u8,
     /// Validated SLICE or COMMIT flag.
     flags: u32,
     /// Authenticated tenant identity.
@@ -749,6 +809,7 @@ fn append_prepared_borrowed(
         payload_len,
     );
     header[68..72].copy_from_slice(&segment.header.record_tag().to_le_bytes());
+    header[72] = prepared.shard_id.unwrap_or(0);
     let write_parts = |parts: &[&[u8]]| -> Result<[u8; 32], ScribeError> {
         let mut digest = Sha256::new();
         let mut crc = crc32c::crc32c(&header);
@@ -1090,7 +1151,7 @@ pub(crate) fn decode_slice_payload(payload: &[u8]) -> Result<DecodedSlicePayload
 }
 
 impl WalRecord {
-    /// Construct a one-slice v8 record for a test or low-level caller.
+    /// Construct a one-slice shard-zero record for a test or low-level caller.
     ///
     /// Production writers use [`Self::slice`] with the authenticated tenant.
     #[must_use]
@@ -1110,6 +1171,7 @@ impl WalRecord {
     ) -> Self {
         Self {
             lsn,
+            shard_id: 0,
             flags: RECORD_FLAG_SLICE,
             tenant_id,
             batch_id,
@@ -1130,6 +1192,7 @@ impl WalRecord {
     ) -> Self {
         Self {
             lsn,
+            shard_id: 0,
             flags: RECORD_FLAG_COMMIT,
             tenant_id,
             batch_id,
@@ -1166,20 +1229,29 @@ impl WalRecord {
         self.flags == RECORD_FLAG_COMMIT
     }
 
-    /// Encode the record to bytes (including frame header and CRC).
+    /// Encode the record to bytes (including frame header and CRC) in the
+    /// version and segment tag of `segment`.
+    ///
+    /// A v8 frame has no shard byte: its segment names the shard.
     ///
     /// # Panics
     ///
     /// Panics only if an internal caller violates the configured `u32` WAL
     /// payload bound before this record is encoded.
     #[must_use]
-    pub fn encode(&self, segment_tag: u32) -> Vec<u8> {
+    pub fn encode(&self, segment: &SegmentHeader) -> Vec<u8> {
         let payload_len = u32::try_from(self.payload.len())
             .expect("invariant: WAL payload is bounded by the configured Scribe request ceiling");
-        let mut buf = Vec::with_capacity(RECORD_HEADER_SIZE + self.payload.len() + 4);
-        buf.extend_from_slice(&RECORD_MAGIC);
-        buf.extend_from_slice(&WAL_VERSION.to_le_bytes());
-        buf.extend_from_slice(&RECORD_HEADER_SIZE_U16.to_le_bytes());
+        let v8 = segment.version == WAL_VERSION_V8;
+        let header_len = segment.record_header_len();
+        let mut buf = Vec::with_capacity(header_len + self.payload.len() + 4);
+        buf.extend_from_slice(if v8 { &RECORD_MAGIC_V8 } else { &RECORD_MAGIC });
+        buf.extend_from_slice(&segment.version.to_le_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(header_len)
+                .expect("record header length fits u16")
+                .to_le_bytes(),
+        );
         buf.extend_from_slice(&self.flags.to_le_bytes());
         buf.extend_from_slice(&self.lsn.as_u64().to_le_bytes());
         buf.extend_from_slice(&self.tenant_id);
@@ -1187,10 +1259,14 @@ impl WalRecord {
         buf.extend_from_slice(&self.slice_index.to_le_bytes());
         buf.extend_from_slice(&self.slice_count.to_le_bytes());
         buf.extend_from_slice(&payload_len.to_le_bytes());
-        buf.extend_from_slice(&segment_tag.to_le_bytes());
+        buf.extend_from_slice(&segment.record_tag().to_le_bytes());
+        if !v8 {
+            buf.push(self.shard_id);
+            buf.extend_from_slice(&[0; RECORD_HEADER_SIZE - RECORD_HEADER_SIZE_V8 - 1]);
+        }
         buf.extend_from_slice(&self.payload);
 
-        // Compute CRC over the complete v8 header followed by payload.
+        // Compute CRC over the complete header followed by payload.
         let crc = crc32c_hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
 
@@ -1204,17 +1280,17 @@ impl WalRecord {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] for a torn final write, a CRC mismatch, an
-    /// unsupported version, or any invalid v8 header or payload bound.
+    /// Returns [`ScribeError`] for a torn final write, a CRC mismatch, a
+    /// version other than `segment`'s, or any invalid header or payload bound.
     ///
     /// # Panics
     ///
     /// Panics only if the fixed-size local header slicing invariant is broken.
     pub fn decode_from<R: Read>(
         reader: &mut R,
-        segment_tag: u32,
+        segment: &SegmentHeader,
     ) -> Result<Option<Self>, ScribeError> {
-        let Some(header) = Self::decode_header_from(reader, segment_tag)? else {
+        let Some(header) = Self::decode_header_from(reader, segment)? else {
             return Ok(None);
         };
         Self::decode_payload_from(reader, &header).map(Some)
@@ -1222,27 +1298,32 @@ impl WalRecord {
 
     /// Reads and validates one fixed record header without allocating payload memory.
     ///
+    /// The header layout is `segment`'s version: a record of another version
+    /// in it is refused, so one segment never mixes formats. A v8 record takes
+    /// its shard from `segment`; a v9 record carries its own.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] for a torn header, unsupported version, invalid
-    /// flags, a segment tag other than `segment_tag`, or inconsistent slice
-    /// bounds.
+    /// Returns [`ScribeError`] for a torn header, a version other than
+    /// `segment`'s, invalid flags, a segment tag other than `segment`'s,
+    /// non-zero v9 reserved bytes, or inconsistent slice bounds.
     ///
     /// # Panics
     ///
     /// Panics only if the fixed-size local header slicing invariant is broken.
     fn decode_header_from<R: Read>(
         reader: &mut R,
-        segment_tag: u32,
+        segment: &SegmentHeader,
     ) -> Result<Option<DecodedWalRecordHeader>, ScribeError> {
+        let encoded_len = segment.record_header_len();
         let mut header = [0_u8; RECORD_HEADER_SIZE];
         match reader.read(&mut header[..1]) {
             Ok(0) => return Ok(None),
             Ok(1) => {
                 reader
-                    .read_exact(&mut header[1..])
+                    .read_exact(&mut header[1..encoded_len])
                     .map_err(|error| ScribeError::Internal {
-                        detail: format!("WAL torn v8 record header: {error}"),
+                        detail: format!("WAL torn record header: {error}"),
                     })?;
             }
             Ok(_) => {
@@ -1256,27 +1337,40 @@ impl WalRecord {
                 });
             }
         }
-        if header[..8] != RECORD_MAGIC {
+        let v8 = segment.version == WAL_VERSION_V8;
+        if header[..8] != *(if v8 { &RECORD_MAGIC_V8 } else { &RECORD_MAGIC }) {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v8 record magic".to_owned(),
+                detail: "invalid WAL record magic".to_owned(),
             });
         }
         let version = u16::from_le_bytes([header[8], header[9]]);
-        if version != WAL_VERSION {
-            return Err(ScribeError::UnsupportedWalVersion { version });
+        if version != segment.version {
+            return Err(ScribeError::Internal {
+                detail: "invalid WAL record version for its segment".to_owned(),
+            });
         }
         let header_len = u16::from_le_bytes([header[10], header[11]]);
-        if usize::from(header_len) != RECORD_HEADER_SIZE {
+        if usize::from(header_len) != encoded_len {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v8 record header length".to_owned(),
+                detail: "invalid WAL record header length".to_owned(),
             });
         }
         let flags = u32::from_le_bytes(header[12..16].try_into().expect("fixed record header"));
         if !matches!(flags, RECORD_FLAG_SLICE | RECORD_FLAG_COMMIT) {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v8 record flags".to_owned(),
+                detail: "invalid WAL record flags".to_owned(),
             });
         }
+        let shard_id = if v8 {
+            segment.shard_id
+        } else {
+            if header[73..RECORD_HEADER_SIZE].iter().any(|byte| *byte != 0) {
+                return Err(ScribeError::Internal {
+                    detail: "invalid WAL record reserved bytes".to_owned(),
+                });
+            }
+            header[72]
+        };
         let lsn = WalLsn::new(u64::from_le_bytes(
             header[16..24].try_into().expect("fixed record header"),
         ));
@@ -1291,9 +1385,9 @@ impl WalRecord {
         let payload_len =
             u32::from_le_bytes(header[64..68].try_into().expect("fixed record header"));
         let tag = u32::from_le_bytes(header[68..72].try_into().expect("fixed record header"));
-        if tag != segment_tag {
+        if tag != segment.record_tag() {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v8 record segment tag".to_owned(),
+                detail: "invalid WAL record segment tag".to_owned(),
             });
         }
         if slice_count == 0
@@ -1304,12 +1398,14 @@ impl WalRecord {
                     || usize::try_from(payload_len).ok() != Some(COMMIT_PAYLOAD_BYTES)))
         {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v8 record bounds".to_owned(),
+                detail: "invalid WAL record bounds".to_owned(),
             });
         }
         Ok(Some(DecodedWalRecordHeader {
             encoded: header,
+            encoded_len,
             lsn,
+            shard_id,
             flags,
             tenant_id,
             batch_id,
@@ -1342,7 +1438,7 @@ impl WalRecord {
         reader
             .read_exact(&mut payload)
             .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL torn v8 record payload: {e}"),
+                detail: format!("WAL torn record payload: {e}"),
             })?;
 
         // Read CRC
@@ -1350,11 +1446,12 @@ impl WalRecord {
         reader
             .read_exact(&mut crc_buf)
             .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL torn v8 record CRC: {e}"),
+                detail: format!("WAL torn record CRC: {e}"),
             })?;
         let expected_crc = u32::from_le_bytes(crc_buf);
 
-        let computed_crc = crc32c::crc32c_append(crc32c_hash(&header.encoded), &payload);
+        let computed_crc =
+            crc32c::crc32c_append(crc32c_hash(&header.encoded[..header.encoded_len]), &payload);
         if computed_crc != expected_crc {
             return Err(ScribeError::Internal {
                 detail: format!(
@@ -1365,6 +1462,7 @@ impl WalRecord {
 
         Ok(Self {
             lsn: header.lsn,
+            shard_id: header.shard_id,
             flags: header.flags,
             tenant_id: header.tenant_id,
             batch_id: header.batch_id,
@@ -1375,8 +1473,9 @@ impl WalRecord {
     }
 }
 
-/// Encodes the fixed WAL record header into caller-owned stack storage; the
-/// appending segment writes its record tag into bytes 68..72.
+/// Encodes the fixed v9 WAL record header into caller-owned stack storage;
+/// the appending segment writes its record tag into bytes 68..72 and the
+/// record's shard into byte 72.
 fn encode_record_header(
     lsn: WalLsn,
     flags: u32,
@@ -1657,7 +1756,7 @@ impl WalSegment {
         let span =
             tracing::debug_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
         let _entered = span.enter();
-        let encoded = record.encode(self.header.record_tag());
+        let encoded = record.encode(&self.header);
         let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
             detail: "WAL segment file lock poisoned (append)".to_string(),
         })?;
@@ -1834,11 +1933,11 @@ impl WalSegment {
                 .map_err(|error| ScribeError::Internal {
                     detail: format!("WAL record position failed: {error}"),
                 })?;
-            match WalRecord::decode_from(&mut *file, self.header.record_tag()) {
+            match WalRecord::decode_from(&mut *file, &self.header) {
                 Ok(Some(record)) => {
                     if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
                         return Err(ScribeError::Internal {
-                            detail: "WAL v8 contains non-monotonic committed LSNs".to_owned(),
+                            detail: "WAL contains non-monotonic committed LSNs".to_owned(),
                         });
                     }
                     previous_lsn = Some(record.lsn);
@@ -1914,26 +2013,34 @@ pub(crate) type FenceLookup<'a> =
 /// corruption.
 fn is_bad_record_error(error: &ScribeError) -> bool {
     matches!(error, ScribeError::Internal { detail }
-        if detail.starts_with("invalid WAL v8 record") || detail.starts_with("WAL record CRC mismatch"))
+        if detail.starts_with("invalid WAL record") || detail.starts_with("WAL record CRC mismatch"))
 }
 
 /// A partially written final header, payload, or CRC is a recoverable torn
 /// tail. Structural violations and CRC mismatches in a complete frame are
 /// durable corruption and must fail-stop rather than silently discard data.
 fn is_torn_tail_error(error: &ScribeError) -> bool {
-    matches!(error, ScribeError::Internal { detail } if detail.starts_with("WAL torn v8"))
+    matches!(error, ScribeError::Internal { detail } if detail.starts_with("WAL torn record"))
 }
 
-/// WAL writer — owns one fixed set of shard streams with automatic rollover.
+/// WAL writer — owns the one process stream every shard appends to, with
+/// automatic rollover.
+///
+/// Shards share its segments, so one segment sync makes every shard's
+/// appends before it durable. Each shard's active generation holds a
+/// retirement reference on every segment it appended to, so retiring one
+/// shard's records never removes a segment another shard still needs.
 #[derive(Debug)]
 pub struct WalWriter {
     base_dir: PathBuf,
     node_id: [u8; 16],
     writer_epoch: i64,
-    shard_id: u8,
     next_lsn: Arc<AtomicU64>,
     segment_bytes: u64,
-    states: Arc<Vec<Mutex<WalState>>>,
+    /// The stream's append position and every shard's active generation.
+    ///
+    /// Lock order: this state, then `retirement_refs`.
+    state: Arc<Mutex<WalState>>,
     /// Test-only sync fault injections shared across handles.
     #[cfg(any(test, feature = "test-support"))]
     faults: Arc<WalFaults>,
@@ -1954,15 +2061,46 @@ pub struct WalWriter {
     fault: tokio_util::sync::CancellationToken,
 }
 
-#[derive(Debug, Default)]
+/// Append position of the process stream plus each shard's generation.
+#[derive(Debug)]
 struct WalState {
     current_segment: Option<Arc<WalSegment>>,
     seg_seq: u64,
     current_segment_size: u64,
     current_segment_records: u64,
+    /// Each shard's active generation, indexed by shard id.
+    generations: Vec<ShardGeneration>,
 }
 
-/// A WAL handle bound to one fixed shard owner.
+impl Default for WalState {
+    fn default() -> Self {
+        Self {
+            current_segment: None,
+            seg_seq: 0,
+            current_segment_size: 0,
+            current_segment_records: 0,
+            generations: (0..=u8::MAX).map(|_| ShardGeneration::default()).collect(),
+        }
+    }
+}
+
+/// One shard's share of the stream since its last rotation.
+///
+/// Rotation thresholds use only this shard's bytes and records, never the
+/// shared segment's size. Each listed segment carries one retirement
+/// reference owned by this generation, released when rotation hands the
+/// segments to the rotated cohort.
+#[derive(Debug, Default)]
+struct ShardGeneration {
+    /// Encoded record bytes this shard appended in the generation.
+    bytes: u64,
+    /// Records this shard appended in the generation.
+    records: u64,
+    /// Distinct segments this shard appended to, each retained once.
+    segments: Vec<WalSegmentRef>,
+}
+
+/// A WAL handle bound to one fixed shard owner of the shared stream.
 #[derive(Debug, Clone)]
 pub struct WalHandle {
     writer: Arc<WalWriter>,
@@ -1975,6 +2113,9 @@ impl WalHandle {
     }
 
     /// Appends one prepared record through this handle's fixed shard identity.
+    ///
+    /// The record joins this shard's active generation, which retains its
+    /// segment until rotation.
     ///
     /// # Errors
     ///
@@ -1991,21 +2132,32 @@ impl WalHandle {
             });
         }
         append.shard_id = Some(self.shard_id);
-        self.writer.append_prepared(append)
+        self.writer.append_record(append, true)
     }
 
-    /// Returns this shard generation's current encoded WAL occupancy.
+    /// Returns the encoded WAL bytes this shard appended in its generation.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the fixed shard state is poisoned.
+    /// Returns [`ScribeError::Internal`] when the stream state is poisoned.
     pub(crate) fn current_segment_bytes(&self) -> Result<u64, ScribeError> {
-        let state = self.writer.states[usize::from(self.shard_id)]
-            .lock()
-            .map_err(|_| ScribeError::Internal {
-                detail: "WAL state lock poisoned (current segment bytes)".to_owned(),
-            })?;
-        Ok(state.current_segment_size)
+        let state = self.writer.lock_state("current segment bytes")?;
+        Ok(state.generations[usize::from(self.shard_id)].bytes)
+    }
+
+    /// Returns every segment this shard's active generation appended to.
+    ///
+    /// These stay retained by the generation until rotation, so a member
+    /// sealed out of it must leave them to the rotated cohort.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the stream state is poisoned.
+    pub(crate) fn active_generation_segments(&self) -> Result<Vec<WalSegmentRef>, ScribeError> {
+        let state = self.writer.lock_state("active generation segments")?;
+        Ok(state.generations[usize::from(self.shard_id)]
+            .segments
+            .clone())
     }
 
     /// Reports whether the current shard generation contains accepted WAL records.
@@ -2016,45 +2168,40 @@ impl WalHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the fixed shard state is poisoned.
+    /// Returns [`ScribeError::Internal`] when the stream state is poisoned.
     pub(crate) fn has_active_records(&self) -> Result<bool, ScribeError> {
-        let state = self.writer.states[usize::from(self.shard_id)]
-            .lock()
-            .map_err(|_| ScribeError::Internal {
-                detail: "WAL state lock poisoned (active record check)".to_owned(),
-            })?;
-        Ok(state.current_segment_records > 0)
+        let state = self.writer.lock_state("active record check")?;
+        Ok(state.generations[usize::from(self.shard_id)].records > 0)
     }
 
-    /// Fsyncs and closes this shard's non-empty active WAL generation.
+    /// Syncs and closes this shard's non-empty active WAL generation.
     ///
-    /// The returned segment is detached from the append stream but remains on
-    /// disk until the shard rotation cohort releases its sole retirement ref.
-    /// Empty streams return `None` and create no retirement owner.
+    /// The returned segments are every segment the generation appended to,
+    /// each still holding the one retirement reference the generation took.
+    /// The caller retains them for the rotated cohort and then releases these
+    /// generation references. The shared current segment stays open for the
+    /// other shards; it is never deleted while current. An empty generation
+    /// returns no segments and creates no retirement owner.
     ///
     /// # Errors
     ///
-    /// Returns the fixed-shard state-lock or segment-fsync error. The stream is
-    /// left open when fsync fails.
-    pub(crate) fn close_active_generation(&self) -> Result<Option<WalSegmentRef>, ScribeError> {
-        let mut state = self.writer.states[usize::from(self.shard_id)]
-            .lock()
-            .map_err(|_| ScribeError::Internal {
-                detail: "WAL state lock poisoned (close active generation)".to_owned(),
-            })?;
-        let Some(segment) = state.current_segment.as_ref() else {
-            return Ok(None);
-        };
-        if state.current_segment_records == 0 {
-            return Ok(None);
+    /// Returns the stream state-lock or segment-sync error. The generation is
+    /// left open when the sync fails.
+    pub(crate) fn close_active_generation(&self) -> Result<Vec<WalSegmentRef>, ScribeError> {
+        let mut state = self.writer.lock_state("close active generation")?;
+        let shard = usize::from(self.shard_id);
+        if state.generations[shard].records == 0 {
+            return Ok(Vec::new());
         }
-        segment.trim(state.current_segment_size)?;
-        segment.sync_data()?;
-        let reference = segment.reference();
-        state.current_segment = None;
-        state.current_segment_size = 0;
-        state.current_segment_records = 0;
-        Ok(Some(reference))
+        if let Some(segment) = state.current_segment.as_ref()
+            && state.generations[shard]
+                .segments
+                .iter()
+                .any(|member| member.path == segment.path())
+        {
+            segment.sync_data()?;
+        }
+        Ok(std::mem::take(&mut state.generations[shard]).segments)
     }
 
     pub(crate) fn sync_segments(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
@@ -2099,20 +2246,6 @@ impl WalHandle {
     ) -> Result<(), ScribeError> {
         self.writer
             .release_replay_pin(segment, delete_if_unreferenced)
-    }
-
-    /// Closes this shard's current segment when no active bucket owns it.
-    ///
-    /// # Errors
-    ///
-    /// Returns the writer state-lock or segment synchronization error.
-    pub(crate) fn close_segments_if_unowned(
-        &self,
-        segments: &[WalSegmentRef],
-        active_paths: &HashSet<PathBuf>,
-    ) -> Result<(), ScribeError> {
-        self.writer
-            .close_segments_if_unowned(segments, active_paths)
     }
 }
 
@@ -2191,31 +2324,15 @@ impl WalWriter {
         writer_epoch: i64,
         config: WalConfig,
     ) -> Result<Self, ScribeError> {
-        Self::new_with_shard_id(base_dir, node_id, writer_epoch, 0, config)
-    }
-
-    /// Create one fixed-shard WAL stream.
-    pub fn new_with_shard_id(
-        base_dir: impl AsRef<Path>,
-        node_id: [u8; 16],
-        writer_epoch: i64,
-        shard_id: u8,
-        config: WalConfig,
-    ) -> Result<Self, ScribeError> {
         let config = WalConfig::new(config.segment_bytes)?;
         let base_dir = base_dir.as_ref().to_path_buf();
         let writer = Self {
             base_dir,
             node_id,
             writer_epoch,
-            shard_id,
             next_lsn: Arc::new(AtomicU64::new(0)),
             segment_bytes: config.segment_bytes,
-            states: Arc::new(
-                (0..=u8::MAX)
-                    .map(|_| Mutex::new(WalState::default()))
-                    .collect(),
-            ),
+            state: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             faults: Arc::default(),
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
@@ -2233,11 +2350,26 @@ impl WalWriter {
     }
 
     /// The one directory holding this `(node_id, writer_epoch)` stream's
-    /// shard segments; every segment this writer creates lives beneath it.
+    /// segments and shard manifests; everything this writer creates lives
+    /// beneath it.
     fn stream_dir(&self) -> PathBuf {
         self.base_dir
             .join(Uuid::from_bytes(self.node_id).simple().to_string())
             .join(self.writer_epoch.to_string())
+    }
+
+    /// Locks the stream state, naming `operation` if the lock is poisoned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the state lock is poisoned.
+    fn lock_state(
+        &self,
+        operation: &str,
+    ) -> Result<std::sync::MutexGuard<'_, WalState>, ScribeError> {
+        self.state.lock().map_err(|_| ScribeError::Internal {
+            detail: format!("WAL state lock poisoned ({operation})"),
+        })
     }
 
     /// Recover the next segment and LSN counters for the current stream.
@@ -2266,12 +2398,7 @@ impl WalWriter {
             if header.node_id != self.node_id || header.writer_epoch != self.writer_epoch {
                 continue;
             }
-            let shard = usize::from(header.shard_id);
-            let mut state = self.states[shard]
-                .lock()
-                .map_err(|_| ScribeError::Internal {
-                    detail: "WAL state lock poisoned during stream recovery".to_owned(),
-                })?;
+            let mut state = self.lock_state("stream recovery")?;
             state.seg_seq = state.seg_seq.max(header.seg_seq.saturating_add(1));
             drop(state);
             for record in segment.read_records()? {
@@ -2331,10 +2458,9 @@ impl WalWriter {
             base_dir: self.base_dir.clone(),
             node_id: self.node_id,
             writer_epoch: self.writer_epoch,
-            shard_id: self.shard_id,
             next_lsn: Arc::clone(&self.next_lsn),
             segment_bytes: self.segment_bytes,
-            states: Arc::clone(&self.states),
+            state: Arc::clone(&self.state),
             #[cfg(any(test, feature = "test-support"))]
             faults: Arc::clone(&self.faults),
             retirement_refs: Arc::clone(&self.retirement_refs),
@@ -2344,7 +2470,7 @@ impl WalWriter {
         }
     }
 
-    /// Append one self-describing v8 slice record for test-tier probes.
+    /// Append one self-describing slice record for test-tier probes.
     #[cfg(any(test, feature = "test-support"))]
     pub fn append_and_fsync_for_test(
         &self,
@@ -2355,10 +2481,11 @@ impl WalWriter {
         self.append_and_fsync_for_key(seal_key, batch_id, data_payload)
     }
 
-    /// Append, commit, and fsync one one-slice v8 batch for replay tests.
+    /// Append, commit, and fsync one one-slice batch for replay tests.
     ///
     /// This test-only helper deliberately models the production `SLICE` then
-    /// `COMMIT` ordering without changing lower-level WAL tests that need to
+    /// `COMMIT` ordering, including joining the routed shard's active
+    /// generation, without changing lower-level WAL tests that need to
     /// observe an individual record.
     ///
     /// # Errors
@@ -2406,7 +2533,7 @@ impl WalWriter {
             prepared.logical_data_len,
         );
         let logical_digest = logical.finish();
-        let slice = self.append_prepared(prepared)?;
+        let slice = self.append_record(prepared, true)?;
         let mut digest = Sha256::new();
         digest.update(0_u32.to_le_bytes());
         digest.update(slice.payload_len.to_le_bytes());
@@ -2422,7 +2549,7 @@ impl WalWriter {
             },
         );
         commit.shard_id = shard_id;
-        let terminal = self.append_prepared(commit)?;
+        let terminal = self.append_record(commit, true)?;
         let mut touched = slice.touched_segments;
         touched.extend(terminal.touched_segments);
         self.sync_segments_with_fault(&touched)?;
@@ -2444,16 +2571,39 @@ impl WalWriter {
         self.append_and_commit_for_replay_test(seal_key, decoded.batch_id, decoded.data)
     }
 
-    /// Append one prepared v8 record without syncing it.
+    /// Append one prepared v9 record without syncing it, outside any shard
+    /// generation.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] for invalid record identity or length,
     /// poisoned writer state, WAL capacity/disk refusal, segment creation or
     /// append failure, or rollback/accounting divergence.
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     pub(crate) fn append_prepared(
         &self,
+        prepared: PreparedWalAppend,
+    ) -> Result<WalAppendResult, ScribeError> {
+        self.append_record(prepared, false)
+    }
+
+    /// Appends one prepared v9 record to the shared stream without syncing it.
+    ///
+    /// The record carries `prepared.shard_id`. With `in_generation`, it also
+    /// joins that shard's active generation: the shard's bytes and records
+    /// grow, and the first record of the generation in a segment retains
+    /// that segment and creates the shard's manifest directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for invalid record identity or length,
+    /// poisoned writer state, WAL capacity/disk refusal, segment creation or
+    /// append failure, rollback/accounting divergence, or a failed
+    /// generation retention or manifest directory, which faults the writer.
+    fn append_record(
+        &self,
         mut prepared: PreparedWalAppend,
+        in_generation: bool,
     ) -> Result<WalAppendResult, ScribeError> {
         if self.is_faulted() {
             return Err(ScribeError::IngressClosed);
@@ -2462,12 +2612,8 @@ impl WalWriter {
             u64::try_from(prepared.encoded_len()?).map_err(|_| ScribeError::Internal {
                 detail: "encoded WAL record length does not fit accounting".to_owned(),
             })?;
-        let shard_id = usize::from(prepared.shard_id.unwrap_or(0));
-        let mut state = self.states[shard_id]
-            .lock()
-            .map_err(|_| ScribeError::Internal {
-                detail: "WAL state lock poisoned (append_prepared)".to_owned(),
-            })?;
+        let shard_id = prepared.shard_id.unwrap_or(0);
+        let mut state = self.lock_state("append")?;
         let rolls_segment = state.current_segment.is_some()
             && state.current_segment_records > 0
             && state.current_segment_size.saturating_add(encoded_bytes) > self.segment_bytes();
@@ -2490,12 +2636,7 @@ impl WalWriter {
             state.current_segment_size = 0;
             state.current_segment_records = 0;
         }
-        let segment = self.ensure_segment_locked(
-            &mut state,
-            u8::try_from(shard_id).map_err(|_| ScribeError::Internal {
-                detail: "invalid WAL shard index".to_owned(),
-            })?,
-        )?;
+        let segment = self.ensure_segment_locked(&mut state)?;
         // The logical end, not the file length: a recycled file is longer.
         let prior_file_len = state.current_segment_size;
         let encoded_len = usize::try_from(encoded_bytes).map_err(|_| ScribeError::Internal {
@@ -2517,6 +2658,10 @@ impl WalWriter {
         };
         state.current_segment_size = state.current_segment_size.saturating_add(encoded_bytes);
         state.current_segment_records = state.current_segment_records.saturating_add(1);
+        if in_generation {
+            self.join_generation(&mut state, shard_id, &segment, encoded_bytes)
+                .inspect_err(|error| self.mark_faulted(error))?;
+        }
         Ok(WalAppendResult {
             lsn,
             #[cfg(feature = "bench-support")]
@@ -2576,38 +2721,66 @@ impl WalWriter {
         self.segment_bytes
     }
 
-    /// Return the number of currently open fixed-shard WAL streams.
-    #[must_use]
-    pub fn open_stream_count(&self) -> usize {
-        self.states
+    /// Adds one just-appended record to `shard_id`'s active generation.
+    ///
+    /// The generation's first record in `segment` retains it, so no other
+    /// shard's retirement can remove it, and creates the shard's manifest
+    /// directory beside the stream's segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the retirement-reference lock
+    /// is poisoned or the shard directory cannot be created.
+    fn join_generation(
+        &self,
+        state: &mut WalState,
+        shard_id: u8,
+        segment: &WalSegment,
+        encoded_bytes: u64,
+    ) -> Result<(), ScribeError> {
+        let generation = &mut state.generations[usize::from(shard_id)];
+        if !generation
+            .segments
             .iter()
-            .filter_map(|state| state.lock().ok())
-            .filter(|state| state.current_segment.is_some())
-            .count()
+            .any(|member| member.path == segment.path())
+        {
+            std::fs::create_dir_all(self.stream_dir().join(format!("shard-{shard_id:02}")))
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("failed to create WAL shard directory: {error}"),
+                })?;
+            self.add_references(std::slice::from_ref(&segment.reference()))?;
+            generation.segments.push(segment.reference());
+        }
+        generation.bytes = generation.bytes.saturating_add(encoded_bytes);
+        generation.records = generation.records.saturating_add(1);
+        Ok(())
     }
 
-    /// Close every fixed-shard active segment after Scribe has stopped WAL IO.
+    /// Return the number of currently open WAL streams: one or none.
+    #[must_use]
+    pub fn open_stream_count(&self) -> usize {
+        self.state
+            .lock()
+            .map_or(0, |state| usize::from(state.current_segment.is_some()))
+    }
+
+    /// Close the active segment after Scribe has stopped WAL IO.
     ///
-    /// Shutdown retains segment files for normal replay but must release every
+    /// Shutdown retains segment files for normal replay but must release the
     /// in-memory active-stream owner. A later process recovery, rather than the
     /// stopped Scribe instance, decides which segment to reopen.
     ///
     /// # Errors
-    /// Returns [`ScribeError::Internal`] when a shard WAL-state lock is
-    /// poisoned or a recycled segment cannot be trimmed. States closed before
-    /// the failing shard remain closed.
+    /// Returns [`ScribeError::Internal`] when the WAL-state lock is poisoned
+    /// or a recycled segment cannot be trimmed.
     pub(crate) fn close_all_streams(&self) -> Result<(), ScribeError> {
-        for state in self.states.iter() {
-            let mut state = state.lock().map_err(|_| ScribeError::Internal {
-                detail: "WAL state lock poisoned (shutdown close)".to_owned(),
-            })?;
-            if let Some(segment) = &state.current_segment {
-                segment.trim(state.current_segment_size)?;
-            }
-            state.current_segment = None;
-            state.current_segment_size = 0;
-            state.current_segment_records = 0;
+        let mut state = self.lock_state("shutdown close")?;
+        if let Some(segment) = &state.current_segment {
+            segment.trim(state.current_segment_size)?;
         }
+        state.current_segment = None;
+        state.current_segment_size = 0;
+        state.current_segment_records = 0;
         Ok(())
     }
 
@@ -2641,25 +2814,15 @@ impl WalWriter {
         Ok(self.append_prepared(prepared)?.lsn)
     }
 
-    /// Sync the WAL segment for one seal-key's shard to disk.
+    /// Sync the stream's current WAL segment to disk.
     ///
-    /// The shard is derived from a zero-UUID placeholder because this
-    /// test helper is used only for WAL durability probes; the exact
-    /// shard is not significant.
+    /// Every shard shares the segment, so the seal key does not choose it.
     ///
     /// # Errors
     /// Returns [`ScribeError`] when the sync fails.
     #[cfg(test)]
-    pub(crate) fn sync_data_for_test(&self, seal_key: &SealKey) -> Result<(), ScribeError> {
-        // Attribution-only shard for WAL sync probing; placeholder batch_id.
-        let shard_id = u8::try_from(crate::scribe::routing::shard_for(
-            seal_key.tenant,
-            &seal_key.table,
-            uuid::Uuid::nil(),
-            crate::scribe::routing::TEST_SHARD_COUNT,
-        ))
-        .expect("fixed shard count fits in u8");
-        self.sync_data_for_shard(shard_id)
+    pub(crate) fn sync_data_for_test(&self, _seal_key: &SealKey) -> Result<(), ScribeError> {
+        self.sync_current_segment()
     }
 
     /// Append one WAL record and fsync, routing by the provided batch id.
@@ -2698,18 +2861,17 @@ impl WalWriter {
 
     #[cfg(feature = "bench-support")]
     pub(crate) fn sync_data(&self) -> Result<(), ScribeError> {
-        self.sync_data_for_shard(0)
+        self.sync_current_segment()
     }
 
+    /// Syncs the stream's current segment, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns the state-lock or segment-sync error.
     #[cfg(any(test, feature = "bench-support"))]
-    fn sync_data_for_shard(&self, shard_id: u8) -> Result<(), ScribeError> {
-        let segment = self.states[usize::from(shard_id)]
-            .lock()
-            .map_err(|_| ScribeError::Internal {
-                detail: "segment lock poisoned (sync_data)".to_string(),
-            })?
-            .current_segment
-            .clone();
+    fn sync_current_segment(&self) -> Result<(), ScribeError> {
+        let segment = self.lock_state("sync_data")?.current_segment.clone();
         if let Some(segment) = segment {
             segment.sync_data()?;
         }
@@ -2762,6 +2924,16 @@ impl WalWriter {
                 detail: "forced WAL retention failure (test seam)".to_owned(),
             });
         }
+        self.add_references(segments)
+    }
+
+    /// Adds one retirement reference to each of `segments`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the retirement-reference lock is
+    /// poisoned.
+    fn add_references(&self, segments: &[WalSegmentRef]) -> Result<(), ScribeError> {
         let mut references = self
             .retirement_refs
             .lock()
@@ -2810,55 +2982,15 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Close a current segment after its final active bucket is detached.
-    ///
-    /// The segment remains on disk while its immutable generation is pending;
-    /// the normal grace-period retirement then removes it. Closing here avoids
-    /// retaining a low-volume current file forever when no later append causes
-    /// a size rollover.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when a shard state lock is poisoned or
-    /// returns the segment synchronization error before ownership is cleared.
-    pub(crate) fn close_segments_if_unowned(
-        &self,
-        segments: &[WalSegmentRef],
-        active_paths: &HashSet<PathBuf>,
-    ) -> Result<(), ScribeError> {
-        let candidates = segments
-            .iter()
-            .map(|segment| segment.path.clone())
-            .filter(|path| !active_paths.contains(path))
-            .collect::<HashSet<_>>();
-        if candidates.is_empty() {
-            return Ok(());
-        }
-        for state in self.states.iter() {
-            let mut state = state.lock().map_err(|_| ScribeError::Internal {
-                detail: "WAL state lock poisoned (close segment)".to_owned(),
-            })?;
-            let Some(segment) = state.current_segment.as_ref() else {
-                continue;
-            };
-            if candidates.contains(segment.path()) {
-                segment.trim(state.current_segment_size)?;
-                segment.sync_data()?;
-                state.current_segment = None;
-                state.current_segment_size = 0;
-                state.current_segment_records = 0;
-            }
-        }
-        Ok(())
-    }
-
     /// Deletes released segments plus every earlier deferred deletion.
     ///
     /// The released paths join the shared deferred set before any file is
-    /// touched. Each pass then removes every deferred path that is no longer a
-    /// current segment; a still-current path or a failed removal stays
+    /// touched. Each pass then removes every deferred path that is no longer
+    /// the current segment and that no owner has retained again since its
+    /// release; a still-current or re-retained path or a failed removal stays
     /// deferred for the next pass, so partial progress never loses a pending
-    /// deletion.
+    /// deletion. A shared current segment can be released by one shard and
+    /// then retained by another shard's next append, which this check keeps.
     ///
     /// # Errors
     ///
@@ -2887,18 +3019,24 @@ impl WalWriter {
             deferred.extend(segments.iter().cloned());
             deferred.iter().cloned().collect::<Vec<_>>()
         };
-        let mut active = Vec::new();
-        for state in self.states.iter() {
-            let state = state.lock().map_err(|_| ScribeError::Internal {
-                detail: "WAL state lock poisoned (retire_segments)".to_owned(),
-            })?;
-            if let Some(segment) = &state.current_segment {
-                active.push(segment.path().to_path_buf());
-            }
-        }
+        let current = self
+            .lock_state("retire_segments")?
+            .current_segment
+            .as_ref()
+            .map(|segment| segment.path().to_path_buf());
+        let retained = self
+            .retirement_refs
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL retirement reference lock poisoned".to_owned(),
+            })?
+            .keys()
+            .filter(|path| pending.contains(path))
+            .cloned()
+            .collect::<HashSet<_>>();
         let mut first_error = None;
         for path in pending {
-            if active.iter().any(|active_path| active_path == &path) {
+            if current.as_ref() == Some(&path) || retained.contains(&path) {
                 continue;
             }
             match self.retire_segment_file(&path) {
@@ -2921,7 +3059,7 @@ impl WalWriter {
 
     /// Keeps one closed segment of this stream for reuse, or deletes it.
     ///
-    /// A shard keeps at most [`FREE_SEGMENTS_PER_SHARD`] files; a segment of
+    /// A directory keeps at most [`FREE_SEGMENTS_PER_SHARD`] files; a segment of
     /// an older stream, which this writer never appends to, is deleted. A
     /// segment already gone was retired by a concurrent caller, which is
     /// success.
@@ -2989,29 +3127,29 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Returns the current shard segment or creates its next ordered segment.
+    /// Returns the current stream segment or creates its next ordered segment.
+    ///
+    /// v9 segments live in the `shard-00` directory under the v8 naming, so
+    /// a v8 Scribe discovers them and refuses their version instead of
+    /// overlooking live data. The location assigns no record to shard 0.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the shard directory or segment
+    /// Returns [`ScribeError::Internal`] when the segment directory or segment
     /// cannot be created, or propagates segment-header persistence failures.
-    fn ensure_segment_locked(
-        &self,
-        state: &mut WalState,
-        shard_id: u8,
-    ) -> Result<Arc<WalSegment>, ScribeError> {
+    fn ensure_segment_locked(&self, state: &mut WalState) -> Result<Arc<WalSegment>, ScribeError> {
         if let Some(ref segment) = state.current_segment {
             return Ok(Arc::clone(segment));
         }
 
         let seq = state.seg_seq;
         state.seg_seq = state.seg_seq.saturating_add(1);
-        let shard_dir = self.stream_dir().join(format!("shard-{shard_id:02}"));
+        let shard_dir = self.stream_dir().join("shard-00");
         std::fs::create_dir_all(&shard_dir).map_err(|error| ScribeError::Internal {
             detail: format!("failed to create WAL shard directory: {error}"),
         })?;
         let path = shard_dir.join(format!("{seq}.wal"));
-        let header = SegmentHeader::new(self.node_id, self.writer_epoch, seq, shard_id);
+        let header = SegmentHeader::new(self.node_id, self.writer_epoch, seq);
         let free = self
             .free_segments
             .lock()
@@ -3077,8 +3215,9 @@ struct ShardRecordCursor {
     path: Option<PathBuf>,
     /// Byte offset at which the peeked record begins.
     record_offset: u64,
-    /// Record tag of the current segment; a record carrying another is stale.
-    segment_tag: u32,
+    /// Header of the current segment, whose version and record tag every
+    /// record in it must carry; a record with another tag is stale.
+    segment_header: Option<SegmentHeader>,
     /// Validated header waiting for stream-wide LSN selection.
     header: Option<DecodedWalRecordHeader>,
     /// Last consumed LSN, spanning every ordered segment in this shard chain.
@@ -3144,7 +3283,7 @@ impl ShardRecordCursor {
             file: None,
             path: None,
             record_offset: SEGMENT_HEADER_SIZE as u64,
-            segment_tag: 0,
+            segment_header: None,
             header: None,
             previous_lsn: None,
             pin_wal: wal,
@@ -3220,7 +3359,7 @@ impl ShardRecordCursor {
             .is_some_and(|previous| record.lsn <= previous)
         {
             return Err(ScribeError::Internal {
-                detail: "WAL v8 contains non-monotonic committed LSNs across ordered segments"
+                detail: "WAL contains non-monotonic committed LSNs across ordered segments"
                     .to_owned(),
             });
         }
@@ -3250,7 +3389,13 @@ impl ShardRecordCursor {
                 .map_err(|error| ScribeError::Internal {
                     detail: format!("WAL record position failed: {error}"),
                 })?;
-            match WalRecord::decode_header_from(file, self.segment_tag) {
+            let segment = self
+                .segment_header
+                .as_ref()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "WAL replay cursor lost its segment header".to_owned(),
+                })?;
+            match WalRecord::decode_header_from(file, segment) {
                 Ok(Some(header)) => self.header = Some(header),
                 Ok(None) => {
                     self.file = None;
@@ -3313,7 +3458,7 @@ impl ShardRecordCursor {
         if let Some(fence) = acknowledged {
             return Err(ScribeError::Internal {
                 detail: format!(
-                    "WAL v8 bad record precedes acknowledged COMMIT LSN {} in segment {}: {error}",
+                    "WAL bad record precedes acknowledged COMMIT LSN {} in segment {}: {error}",
                     fence.lsn, fence.segment_sequence
                 ),
             });
@@ -3340,7 +3485,7 @@ impl ShardRecordCursor {
         };
         self.next_segment = self.next_segment.saturating_add(1);
         self.segment_retirement_safe = false;
-        self.segment_tag = segment.header().record_tag();
+        self.segment_header = Some(segment.header().clone());
         if let Some(wal) = self.pin_wal.as_ref() {
             self.segment_pin = Some(ReplaySegmentPin::acquire(wal.clone(), segment.reference())?);
         }
@@ -3365,7 +3510,7 @@ impl ShardRecordCursor {
     fn repair_torn_tail(&mut self) -> Result<(), ScribeError> {
         if self.next_segment < self.segments.len() {
             return Err(ScribeError::Internal {
-                detail: "WAL v8 contains a torn record before a later shard segment".to_owned(),
+                detail: "WAL contains a torn record before a later segment".to_owned(),
             });
         }
         let file = self.file.as_mut().ok_or_else(|| ScribeError::Internal {
@@ -3685,8 +3830,7 @@ impl WalReader {
                 };
                 if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
                     return Err(ScribeError::Internal {
-                        detail: "WAL v8 contains non-monotonic stream-wide committed LSNs"
-                            .to_owned(),
+                        detail: "WAL contains non-monotonic stream-wide committed LSNs".to_owned(),
                     });
                 }
                 previous_lsn = Some(record.lsn);
@@ -4034,7 +4178,7 @@ mod tests {
             std::fs::create_dir_all(&shard_dir).expect("shard directory");
             let segment = WalSegment::create(
                 shard_dir.join("0.wal"),
-                SegmentHeader::new([32_u8; 16], 1, 0, shard_id),
+                SegmentHeader::new_v8([32_u8; 16], 1, 0, shard_id),
             )
             .expect("WAL segment");
             segment
@@ -4054,7 +4198,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v8 contains non-monotonic stream-wide committed LSNs"
+                if detail == "WAL contains non-monotonic stream-wide committed LSNs"
         ));
     }
 
@@ -4065,7 +4209,7 @@ mod tests {
         let shard_dir = directory.path().join("shard-00");
         std::fs::create_dir_all(&shard_dir).expect("shard directory");
         let first_path = shard_dir.join("0.wal");
-        let first = WalSegment::create(&first_path, SegmentHeader::new([33_u8; 16], 1, 0, 0))
+        let first = WalSegment::create(&first_path, SegmentHeader::new([33_u8; 16], 1, 0))
             .expect("first WAL segment");
         first
             .append_and_fsync(&WalRecord::new(WalLsn::new(0), 0, [1_u8; 16], vec![1_u8]))
@@ -4083,7 +4227,7 @@ mod tests {
 
         let second = WalSegment::create(
             shard_dir.join("1.wal"),
-            SegmentHeader::new([33_u8; 16], 1, 1, 0),
+            SegmentHeader::new([33_u8; 16], 1, 1),
         )
         .expect("second WAL segment");
         second
@@ -4097,7 +4241,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v8 contains a torn record before a later shard segment"
+                if detail == "WAL contains a torn record before a later segment"
         ));
         assert_eq!(
             std::fs::metadata(first_path)
@@ -4129,7 +4273,7 @@ mod tests {
     #[test]
     fn segment_header_roundtrip() {
         let node_id = [1u8; 16];
-        let header = SegmentHeader::new(node_id, 42, 7, 3);
+        let header = SegmentHeader::new_v8(node_id, 42, 7, 3);
 
         let mut encoded = header.encode();
         encoded[60..64].copy_from_slice(&header.crc32c.to_le_bytes());
@@ -4145,7 +4289,7 @@ mod tests {
     #[test]
     fn segment_header_rejects_nonzero_reserved_byte_ranges() {
         for reserved_index in [33_usize, 39, 48, 59] {
-            let header = SegmentHeader::new([1_u8; 16], 42, 7, 3);
+            let header = SegmentHeader::new_v8([1_u8; 16], 42, 7, 3);
             let mut encoded = header.encode();
             encoded[reserved_index] = 1;
             let crc = crc32c_hash(&encoded[..60]);
@@ -4163,7 +4307,7 @@ mod tests {
 
     #[test]
     fn wal_v2_header_is_rejected_with_typed_error() {
-        let mut header = SegmentHeader::new([1_u8; 16], 42, 7, 3);
+        let mut header = SegmentHeader::new([1_u8; 16], 42, 7);
         header.version = 2;
         let mut encoded = header.encode();
         let crc = crc32c_hash(&encoded[..60]);
@@ -4181,10 +4325,10 @@ mod tests {
     fn wal_record_roundtrip() {
         let batch_id = [42u8; 16];
         let record = WalRecord::new(WalLsn::new(5), 2, batch_id, b"test data".to_vec());
-        let encoded = record.encode(0);
+        let encoded = record.encode(&SegmentHeader::new([0; 16], 0, 0));
 
         let mut cursor = std::io::Cursor::new(encoded);
-        let decoded = WalRecord::decode_from(&mut cursor, 0)
+        let decoded = WalRecord::decode_from(&mut cursor, &SegmentHeader::new([0; 16], 0, 0))
             .expect("decode record")
             .expect("non-empty");
 
@@ -4207,13 +4351,16 @@ mod tests {
             request_id: [13; 16],
         };
         let record = WalRecord::commit(WalLsn::new(9), [7; 16], [8; 16], 3, identity);
-        let encoded = record.encode(0);
+        let encoded = record.encode(&SegmentHeader::new([0; 16], 0, 0));
 
-        assert_eq!(&encoded[..8], b"WYRDWAL8");
+        assert_eq!(&encoded[..8], b"WYRDWAL9");
         assert_eq!(encoded.len(), RECORD_HEADER_SIZE + COMMIT_PAYLOAD_BYTES + 4);
-        let decoded = WalRecord::decode_from(&mut std::io::Cursor::new(encoded), 0)
-            .expect("decode terminal record")
-            .expect("terminal record exists");
+        let decoded = WalRecord::decode_from(
+            &mut std::io::Cursor::new(encoded),
+            &SegmentHeader::new([0; 16], 0, 0),
+        )
+        .expect("decode terminal record")
+        .expect("terminal record exists");
         assert!(decoded.is_commit());
         assert_eq!(decoded.slice_index, 3);
         assert_eq!(decoded.slice_count, 3);
@@ -4637,42 +4784,6 @@ mod tests {
     }
 
     #[test]
-    fn low_volume_current_segment_closes_when_last_bucket_detaches() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let writer =
-            WalWriter::new(temp_dir.path(), [12_u8; 16], 1, WalConfig::default()).expect("writer");
-        let seal_key = test_seal_key(crate::test_support::tenant());
-        writer
-            .append_and_fsync_for_test(&seal_key, [1_u8; 16], b"data")
-            .expect("append");
-
-        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
-        assert_eq!(reader.segments.len(), 1);
-        let current = reader
-            .segments
-            .first()
-            .expect("one current segment")
-            .reference();
-        writer
-            .close_segments_if_unowned(
-                std::slice::from_ref(&current),
-                &std::collections::HashSet::new(),
-            )
-            .expect("close current segment");
-        assert!(current.path.exists(), "grace retirement owns deletion");
-
-        writer
-            .append_and_fsync_for_test(&seal_key, [2_u8; 16], b"data")
-            .expect("append after close");
-        let reopened = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
-        assert_eq!(reopened.read_all_records().expect("records").len(), 2);
-        assert!(
-            reopened.segments.len() >= 2,
-            "closed segment must not be reused"
-        );
-    }
-
-    #[test]
     fn segment_retirement_waits_for_every_generation_reference() {
         let temp_dir = TempDir::new().expect("temp dir");
         let writer = WalWriter::new(
@@ -4770,12 +4881,7 @@ mod tests {
         let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
         assert_eq!(reader.segments.len(), 1, "both groups share one segment");
         let segment = reader.segments[0].reference();
-        writer
-            .close_segments_if_unowned(
-                std::slice::from_ref(&segment),
-                &std::collections::HashSet::new(),
-            )
-            .expect("close shared segment");
+        writer.close_all_streams().expect("close shared segment");
         writer
             .retain_segments(&[segment.clone(), segment.clone()])
             .expect("retain both generation references");
@@ -4865,7 +4971,7 @@ mod tests {
             WalConfig::new(16 * 1024 * 1024).expect("single-segment config"),
         )
         .expect("first writer");
-        let (first_batch, second_batch, _shard) = co_sharded_batch_pair(&seal_key, 3);
+        let (first_batch, second_batch, shard) = co_sharded_batch_pair(&seal_key, 3);
         for batch_id in [first_batch, second_batch] {
             writer
                 .append_and_commit_for_replay_test(&seal_key, batch_id, b"payload")
@@ -4888,19 +4994,19 @@ mod tests {
             .map(|record| record.lsn)
             .max()
             .expect("terminal commit LSN");
-        writer
-            .close_segments_if_unowned(
-                std::slice::from_ref(&segment),
-                &std::collections::HashSet::new(),
-            )
-            .expect("close shared segment");
+        writer.close_all_streams().expect("close shared segment");
         let stream = crate::scribe::stream_identity::StreamIdentity::new(
             node,
             crate::scribe::stream_identity::WriterEpoch::new(1),
         );
         let mut manifest = crate::scribe::manifest::Manifest::new(stream);
         manifest.update_sealed_lsn(&seal_key, sealed_lsn);
-        let manifest_path = segment.path.with_file_name("manifest");
+        // The watermark belongs to the writing shard, not the shared segment.
+        let manifest_path = crate::scribe::replay::shard_manifest_path(
+            temp_dir.path(),
+            stream,
+            u8::try_from(shard).expect("fixed shard count fits in u8"),
+        );
         crate::scribe::manifest::write_atomic(&manifest_path, &manifest).expect("sealed manifest");
         assert_eq!(
             crate::scribe::manifest::read_manifest(&manifest_path)
@@ -5030,7 +5136,7 @@ mod tests {
         let foreign_segment_path = temp_dir.path().join("foreign.wal");
         let foreign_segment = WalSegment::create(
             &foreign_segment_path,
-            SegmentHeader::new(foreign_node, 9, 0, 0),
+            SegmentHeader::new(foreign_node, 9, 0),
         )
         .expect("foreign segment");
         foreign_segment
@@ -5081,7 +5187,11 @@ mod tests {
             let prepared =
                 PreparedWalAppend::new(WalLsn::ZERO, [7; 16], Bytes::from(vec![2; size]))
                     .for_slice(key.clone(), [3; 32]);
-            let actual = prepared.record().expect("record").encode(0).len();
+            let actual = prepared
+                .record()
+                .expect("record")
+                .encode(&SegmentHeader::new([0; 16], 0, 0))
+                .len();
             assert_eq!(prepared.encoded_len().expect("encoded len"), actual);
         }
     }
@@ -5116,9 +5226,7 @@ mod tests {
             segment.path.exists(),
             "the current segment is never deleted"
         );
-        writer
-            .close_segments_if_unowned(std::slice::from_ref(&segment), &HashSet::new())
-            .expect("close");
+        writer.close_all_streams().expect("close");
         let shard_dir = segment.path.parent().expect("shard directory");
         std::fs::set_permissions(shard_dir, std::fs::Permissions::from_mode(0o500))
             .expect("read-only shard directory");

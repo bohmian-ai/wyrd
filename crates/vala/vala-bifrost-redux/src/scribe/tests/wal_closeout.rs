@@ -500,7 +500,7 @@ async fn cancelled_shutdown_owner_is_recovered_by_abort_finalizer() {
 #[test]
 /// A future WAL header version fails with its typed compatibility error.
 fn wal_v2_header_fails_with_typed_unsupported_version() {
-    let mut header = SegmentHeader::new([3_u8; 16], 1, 0, 0);
+    let mut header = SegmentHeader::new([3_u8; 16], 1, 0);
     header.version = 2;
     let mut encoded = header.encode();
     let crc = crc32c::crc32c(&encoded[..60]);

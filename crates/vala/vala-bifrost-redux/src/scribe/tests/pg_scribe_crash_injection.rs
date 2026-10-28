@@ -61,21 +61,12 @@ fn torn_wal_tail_is_truncated_and_prior_records_replay() {
     writer
         .append_and_commit_for_replay_test(&key, [1_u8; 16], &data_bytes(1))
         .expect("append");
-    // The shard for this WAL path is determined by the batch_id [1u8; 16]
-    // used in the append above.
+    // Every shard's records share the one process stream in `shard-00`.
     let path = temp_dir
         .path()
         .join(node.as_uuid().simple().to_string())
         .join("1")
-        .join(format!(
-            "shard-{:02}",
-            crate::scribe::routing::shard_for(
-                key.tenant,
-                &key.table,
-                uuid::Uuid::from_bytes([1_u8; 16]),
-                crate::scribe::routing::TEST_SHARD_COUNT,
-            )
-        ))
+        .join("shard-00")
         .join("0.wal");
     let valid_len = std::fs::metadata(&path).expect("WAL metadata").len();
     let mut file = OpenOptions::new()
@@ -104,24 +95,16 @@ fn partial_frame_leaves_only_the_prior_acknowledged_prefix() {
     writer
         .append_and_commit_for_replay_test(&key, [1_u8; 16], &data_bytes(1))
         .expect("acknowledged prefix append");
-    // The shard for this WAL path is determined by the batch_id [1u8; 16]
-    // used in the append above.
+    // Every shard's records share the one process stream in `shard-00`.
     let path = temp_dir
         .path()
         .join(node.as_uuid().simple().to_string())
         .join("1")
-        .join(format!(
-            "shard-{:02}",
-            crate::scribe::routing::shard_for(
-                key.tenant,
-                &key.table,
-                uuid::Uuid::from_bytes([1_u8; 16]),
-                crate::scribe::routing::TEST_SHARD_COUNT,
-            )
-        ))
+        .join("shard-00")
         .join("0.wal");
     let valid_len = std::fs::metadata(&path).expect("WAL metadata").len();
-    let partial = WalRecord::new(WalLsn::new(2), 2, [2_u8; 16], vec![1, 2, 3]).encode(0);
+    let partial = WalRecord::new(WalLsn::new(2), 2, [2_u8; 16], vec![1, 2, 3])
+        .encode(&crate::scribe::wal::SegmentHeader::new([0; 16], 0, 0));
     let mut file = OpenOptions::new()
         .append(true)
         .open(&path)
@@ -299,15 +282,7 @@ fn acknowledged_prefix_then(
         .path()
         .join(node.as_uuid().simple().to_string())
         .join("1")
-        .join(format!(
-            "shard-{:02}",
-            shard_for(
-                key.tenant,
-                &key.table,
-                Uuid::from_bytes([1_u8; 16]),
-                crate::scribe::routing::TEST_SHARD_COUNT,
-            )
-        ))
+        .join("shard-00")
         .join("0.wal");
     let valid_len = std::fs::metadata(&path).expect("WAL metadata").len();
     let mut file = OpenOptions::new()
@@ -382,7 +357,8 @@ fn zeroed_block_after_the_newest_fence_ends_the_chain() {
 fn corrupt_record_in_an_unacknowledged_stream_ends_the_chain() {
     let temp_dir = TempDir::new().expect("WAL directory");
     let key = key();
-    let mut corrupt = WalRecord::new(WalLsn::new(9), 2, [2_u8; 16], vec![1, 2, 3]).encode(0);
+    let mut corrupt = WalRecord::new(WalLsn::new(9), 2, [2_u8; 16], vec![1, 2, 3])
+        .encode(&crate::scribe::wal::SegmentHeader::new([0; 16], 0, 0));
     let last = corrupt.len() - 1;
     corrupt[last] ^= 0xff;
     let (path, valid_len, _) = acknowledged_prefix_then(&temp_dir, &key, &corrupt);

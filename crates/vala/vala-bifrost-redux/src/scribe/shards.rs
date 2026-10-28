@@ -1978,7 +1978,7 @@ impl ShardOwner {
             })?,
             wal_node_id: replayed.stream.node_id.as_uuid(),
             wal_writer_epoch: replayed.stream.writer_epoch.as_i64(),
-            wal_shard_id: i16::from(replayed.shard_id),
+            wal_shard_id: i16::from(replayed.wal_lane),
             wal_segment_sequence: i64::try_from(commit.segment_sequence).map_err(|_| {
                 ScribeError::Internal {
                     detail: "WAL replay segment sequence exceeds SQL bigint range".to_owned(),
@@ -2345,17 +2345,6 @@ impl ShardOwner {
             Err(PersistenceSubmitError::Closed(job)) => Some((job, true)),
         };
         let Some((mut job, closed)) = refused else {
-            let active_paths = self
-                .wal_segments
-                .values()
-                .flat_map(|segments| segments.keys().cloned())
-                .collect::<HashSet<_>>();
-            if let Err(error) = self
-                .wal_handle
-                .close_segments_if_unowned(&generation.wal_segments, &active_paths)
-            {
-                tracing::warn!(error = %error, "closed WAL segment could not be detached after bucket rotation");
-            }
             return true;
         };
         if let Some(previous) = index
@@ -2611,7 +2600,7 @@ impl ShardOwner {
             // another owner still reaches the segment. The last member to
             // commit after every active bucket, pending or retained member,
             // and cohort has let go is its sole remaining retirement owner.
-            let referenced = self.referenced_wal_paths();
+            let referenced = self.referenced_wal_paths()?;
             retained
                 .wal_segments
                 .retain(|segment| !referenced.contains(&segment.path));
@@ -2621,15 +2610,27 @@ impl ShardOwner {
 
     /// Collects every WAL path still reachable from this shard's owners.
     ///
-    /// Active buckets, queued and retained generations, and rotation cohorts
-    /// each keep replay bytes alive. A committed selective member may retire a
-    /// segment only when it is absent from this set; segments still current
-    /// are additionally skipped by the WAL itself.
-    fn referenced_wal_paths(&self) -> HashSet<std::path::PathBuf> {
+    /// Active buckets, the active WAL generation, queued and retained
+    /// generations, and rotation cohorts each keep replay bytes alive. A
+    /// committed selective member may retire a segment only when it is absent
+    /// from this set; segments still current are additionally skipped by the
+    /// WAL itself. The active generation's segments are retained by it until
+    /// rotation hands them to a cohort, so a member never releases them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the WAL state lock is poisoned.
+    fn referenced_wal_paths(&self) -> Result<HashSet<std::path::PathBuf>, ScribeError> {
         let active = self
             .wal_segments
             .values()
-            .flat_map(|segments| segments.keys().cloned());
+            .flat_map(|segments| segments.keys().cloned())
+            .chain(
+                self.wal_handle
+                    .active_generation_segments()?
+                    .into_iter()
+                    .map(|segment| segment.path),
+            );
         let pending = self.pending_generations.values().flat_map(|queue| {
             queue.iter().flat_map(|pending| {
                 pending
@@ -2651,11 +2652,11 @@ impl ShardOwner {
                 .iter()
                 .map(|segment| segment.path.clone())
         });
-        active
+        Ok(active
             .chain(pending)
             .chain(retained)
             .chain(cohorts)
-            .collect()
+            .collect())
     }
 
     /// Reconciles one persistence result with this owner's FIFO generation queue.
@@ -3509,16 +3510,14 @@ impl ShardOwner {
             .values()
             .flat_map(|segments| segments.values().map(|segment| segment.reference()))
             .collect::<Vec<_>>();
-        if let Some(closed) = self.wal_handle.close_active_generation()?
-            && !segment_refs
-                .iter()
-                .any(|segment| segment.path == closed.path)
-        {
-            segment_refs.push(closed);
-        }
+        let closed = self.wal_handle.close_active_generation()?;
+        segment_refs.extend(closed.iter().cloned());
         segment_refs.sort_by(|left, right| left.path.cmp(&right.path));
         segment_refs.dedup_by(|left, right| left.path == right.path);
         self.wal_handle.retain_segments(&segment_refs)?;
+        // The cohort now holds every closed segment, so the generation's own
+        // references, taken at its first append to each, are released.
+        self.wal_handle.retire_segments(&closed)?;
         let frozen = self.memtable.freeze_all_nonempty()?;
         let frozen_bytes = frozen.iter().try_fold(0_usize, |total, member| {
             total
@@ -5390,6 +5389,7 @@ mod tests {
             stream,
             seal_key: owner_bad_binding_key(),
             shard_id: 0,
+            wal_lane: 0,
             data_records: Vec::new(),
             append_metas: Vec::new(),
             wal_segments: Vec::new(),
@@ -5531,6 +5531,7 @@ mod tests {
                     stream,
                     seal_key,
                     shard_id: 0,
+                    wal_lane: 0,
                     data_records: Vec::new(),
                     append_metas: Vec::new(),
                     wal_segments: Vec::new(),
@@ -6574,6 +6575,7 @@ mod tests {
             ),
             seal_key: key.clone(),
             shard_id: 0,
+            wal_lane: 0,
             data_records: vec![vec![1], vec![2], vec![3]],
             append_metas: vec![meta(canonical, 1), meta(retry, 3), meta(canonical, 5)],
             wal_segments: Vec::new(),
@@ -6725,6 +6727,7 @@ mod tests {
             stream,
             seal_key: key,
             shard_id: 0,
+            wal_lane: 0,
             data_records: Vec::new(),
             append_metas,
             wal_segments: Vec::new(),

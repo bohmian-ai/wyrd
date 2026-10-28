@@ -3657,24 +3657,30 @@ impl ShardOwner {
         let commit = stages.commit.timer();
         let mut commits = Vec::with_capacity(state.prepared.len());
         let mut group_segments = std::mem::take(&mut state.touched);
+        let mut identities = Vec::with_capacity(state.prepared.len());
+        let mut records = Vec::with_capacity(state.prepared.len());
         for (index, append) in state.prepared.iter().enumerate() {
             let Some(identity) = Self::batch_commit_identity(state, append)? else {
                 continue;
             };
-            let ScribeWalIoResult::WalWritten { result } = self
+            records.push(crate::scribe::wal::PreparedWalAppend::commit(
+                *append.batch_id.as_bytes(),
+                *append.tenant.as_uuid().as_bytes(),
+                identity.slice_count,
+                crate::scribe::wal::WalCommitIdentity {
+                    wal_digest: identity.wal_digest,
+                    logical_digest: identity.logical_digest,
+                    request_id: *state.durable[identity.first_index].request_id.as_bytes(),
+                },
+            ));
+            identities.push((index, identity));
+        }
+        if !records.is_empty() {
+            let ScribeWalIoResult::WalWritten { results } = self
                 .wal_io
                 .submit(ScribeWalIoOp::WritePrepared {
                     wal: self.wal_handle.clone(),
-                    append: crate::scribe::wal::PreparedWalAppend::commit(
-                        *append.batch_id.as_bytes(),
-                        *append.tenant.as_uuid().as_bytes(),
-                        identity.slice_count,
-                        crate::scribe::wal::WalCommitIdentity {
-                            wal_digest: identity.wal_digest,
-                            logical_digest: identity.logical_digest,
-                            request_id: *state.durable[identity.first_index].request_id.as_bytes(),
-                        },
-                    ),
+                    appends: records,
                 })
                 .await?
             else {
@@ -3682,18 +3688,26 @@ impl ShardOwner {
                     detail: "WAL IO lane returned the wrong batch commit result".to_owned(),
                 });
             };
-            let header = result
-                .touched_segments
-                .first()
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "WAL v7 batch commit did not retain its segment identity".to_owned(),
-                })?
-                .header()
-                .clone();
-            for segment in result.touched_segments {
-                group_segments.insert(segment.path().to_path_buf(), segment);
+            if results.len() != identities.len() {
+                return Err(ScribeError::Internal {
+                    detail: "WAL IO lane returned the wrong batch commit count".to_owned(),
+                });
             }
-            commits.push((index, identity, header, result.lsn));
+            for ((index, identity), result) in identities.into_iter().zip(results) {
+                let header = result
+                    .touched_segments
+                    .first()
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "WAL v7 batch commit did not retain its segment identity"
+                            .to_owned(),
+                    })?
+                    .header()
+                    .clone();
+                for segment in result.touched_segments {
+                    group_segments.insert(segment.path().to_path_buf(), segment);
+                }
+                commits.push((index, identity, header, result.lsn));
+            }
         }
         commit.done();
         let sync = stages.sync.timer();
@@ -3993,11 +4007,16 @@ impl ShardOwner {
         let fixed_durable_capacity = durable.capacity();
         let mut touched = HashMap::<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>::new();
         let mut rows_by_append = HashMap::<[u8; 16], u64>::new();
-        for append in &mut prepared {
+        let mut staged = Vec::<usize>::new();
+        let mut records = Vec::new();
+        let mut owners = Vec::<usize>::new();
+        let mut leases = Vec::new();
+        for (append_index, append) in prepared.iter_mut().enumerate() {
             if let Some(memory) = append.memory.as_mut() {
                 memory.transfer_category(MemoryCategory::Prepared)?;
             }
             let batch_id = *append.batch_id.as_bytes();
+            let mut writes_records = false;
             loop {
                 let Some(slice) = Self::next_prepared_slice(append) else {
                     break;
@@ -4019,13 +4038,15 @@ impl ShardOwner {
                     }
                 }
                 let slice_id = slice.id.clone();
-                let (slice, result) = match if let Some(previous) =
-                    self.synced_not_inserted.get(&slice_id).copied()
-                {
-                    self.reuse_synced_slice(append, slice, &previous)
-                } else {
-                    self.write_prepared_slice(append, slice).await
-                } {
+                let staged_slice =
+                    if let Some(previous) = self.synced_not_inserted.get(&slice_id).copied() {
+                        self.reuse_synced_slice(append, slice, &previous)
+                            .map(|(slice, _)| (slice, None))
+                    } else {
+                        self.stage_ingress_slice(append, slice)
+                            .map(|(slice, record)| (slice, Some(record)))
+                    };
+                let (slice, record) = match staged_slice {
                     Ok(value) => value,
                     Err(error) => {
                         if let Err(cleanup_error) = self.release_active_reservations(&durable) {
@@ -4035,18 +4056,77 @@ impl ShardOwner {
                         return Err(error);
                     }
                 };
-                for segment in &result.touched_segments {
-                    touched.insert(segment.path().to_path_buf(), Arc::clone(segment));
-                    self.wal_segments
-                        .entry(slice.seal_key.clone())
-                        .or_default()
-                        .insert(segment.path().to_path_buf(), Arc::clone(segment));
+                if let Some(record) = record {
+                    staged.push(durable.len());
+                    records.push(record);
+                    writes_records = true;
                 }
                 durable.push(slice);
                 if durable.capacity() != fixed_durable_capacity {
                     return Err(ScribeError::Internal {
                         detail: "WAL durable slice metadata exceeded its exact capacity".to_owned(),
                     });
+                }
+            }
+            if writes_records {
+                let Some(memory) = append.memory.take() else {
+                    let error = ScribeError::Internal {
+                        detail: "ingress root owner missing before WAL dispatch".to_owned(),
+                    };
+                    if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                        tracing::error!(error = %cleanup_error, "active cleanup failed after WAL error");
+                    }
+                    Self::notify_prepared_error(&mut prepared, &error);
+                    return Err(error);
+                };
+                owners.push(append_index);
+                leases.push(memory);
+            }
+        }
+        if !records.is_empty() {
+            let written = match self
+                .wal_io
+                .submit(ScribeWalIoOp::WriteIngressSlices {
+                    wal: self.wal_handle.clone(),
+                    appends: records,
+                    memory: leases,
+                })
+                .await
+            {
+                Ok(ScribeWalIoResult::IngressSlicesWritten { results, memory })
+                    if results.len() == staged.len() && memory.len() == owners.len() =>
+                {
+                    for (index, memory) in owners.into_iter().zip(memory) {
+                        prepared[index].memory = Some(memory);
+                    }
+                    Ok(results)
+                }
+                Ok(_) => Err(ScribeError::Internal {
+                    detail: "WAL IO lane returned the wrong shard append result".to_owned(),
+                }),
+                Err(error) => Err(error),
+            };
+            let results = match written {
+                Ok(results) => results,
+                Err(error) => {
+                    if let Err(cleanup_error) = self.release_active_reservations(&durable) {
+                        tracing::error!(error = %cleanup_error, "active cleanup failed after WAL error");
+                    }
+                    Self::notify_prepared_error(&mut prepared, &error);
+                    return Err(error);
+                }
+            };
+            for (index, result) in staged.into_iter().zip(results) {
+                let slice = &mut durable[index];
+                slice.lsn = result.lsn;
+                slice.payload_digest = result.payload_digest;
+                slice.payload_len = result.payload_len;
+                for segment in result.touched_segments {
+                    self.wal_segments
+                        .entry(slice.seal_key.clone())
+                        .or_default()
+                        .insert(segment.path().to_path_buf(), Arc::clone(&segment));
+                    touched.insert(segment.path().to_path_buf(), segment);
                 }
             }
         }
@@ -4078,17 +4158,21 @@ impl ShardOwner {
         }
     }
 
-    /// Reserves active memory and appends one prepared slice to the shard WAL lane.
+    /// Reserves active memory for one prepared slice and stages its WAL record.
+    ///
+    /// The returned slice carries no WAL coordinates yet: `write_group`
+    /// writes every staged record of the group in one WAL IO operation and
+    /// fills each slice's LSN and payload identity from that result.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when memory accounting or WAL append fails; all acquired active reservations are released on failure.
-    async fn write_prepared_slice(
+    /// Returns [`ScribeError`] when active memory accounting fails; the
+    /// reservation helper releases what it acquired.
+    fn stage_ingress_slice(
         &mut self,
         append: &mut PreparedAppend,
         slice: PreparedSlice,
-    ) -> Result<(DurableSlice, crate::scribe::wal::WalAppendResult), ScribeError> {
-        let retain_rows = true;
+    ) -> Result<(DurableSlice, crate::scribe::wal::PreparedWalAppend), ScribeError> {
         let PreparedSlice {
             seal_key,
             request_id,
@@ -4097,67 +4181,26 @@ impl ShardOwner {
             memtable_bytes,
             ..
         } = slice;
-        let slice_index = wal_append.slice_index;
-        let slice_count = wal_append.slice_count;
-        let schema_fingerprint = wal_append.schema_fingerprint;
-        let data_digest = wal_append.logical_data_digest;
-        let data_len = wal_append.logical_data_len;
-        if retain_rows {
-            self.reserve_slice_active(append, memtable_bytes)?;
-        }
-        let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
-            detail: "ingress root owner missing before WAL dispatch".to_owned(),
-        })?;
-        let wal_result = self
-            .wal_io
-            .submit(ScribeWalIoOp::WriteIngressSlice {
-                wal: self.wal_handle.clone(),
-                append: wal_append,
-                memory,
-            })
-            .await;
-        let result = match wal_result {
-            Ok(ScribeWalIoResult::IngressSliceWritten { result, memory }) => {
-                append.memory = Some(memory);
-                result
-            }
-            Ok(_) => {
-                let error = ScribeError::Internal {
-                    detail: "WAL IO lane returned the wrong shard append result".to_owned(),
-                };
-                return Err(if retain_rows {
-                    self.preserve_primary_after_active_cleanup(error, memtable_bytes, true)
-                } else {
-                    error
-                });
-            }
-            Err(error) => {
-                return Err(if retain_rows {
-                    self.preserve_primary_after_active_cleanup(error, memtable_bytes, true)
-                } else {
-                    error
-                });
-            }
-        };
+        self.reserve_slice_active(append, memtable_bytes)?;
         Ok((
             DurableSlice {
                 seal_key,
                 request_id,
-                rows: retain_rows.then_some(rows),
+                rows: Some(rows),
                 memtable_bytes,
-                active_reserved: retain_rows,
+                active_reserved: true,
                 batch_id: *append.batch_id.as_bytes(),
-                schema_fingerprint,
-                data_digest,
-                data_len,
-                lsn: result.lsn,
-                payload_digest: result.payload_digest,
-                payload_len: result.payload_len,
-                slice_index,
-                slice_count,
+                schema_fingerprint: wal_append.schema_fingerprint,
+                data_digest: wal_append.logical_data_digest,
+                data_len: wal_append.logical_data_len,
+                lsn: crate::scribe::wal::WalLsn::ZERO,
+                payload_digest: [0; 32],
+                payload_len: 0,
+                slice_index: wal_append.slice_index,
+                slice_count: wal_append.slice_count,
                 commit_already_synced: false,
             },
-            result,
+            wal_append,
         ))
     }
 
@@ -7291,18 +7334,19 @@ mod tests {
         assert!(!owner.memory_ownership.is_poisoned());
     }
 
-    /// One multi-batch group submits exactly one sync.
+    /// One multi-batch group submits two record writes and one sync.
     ///
-    /// Every batch's SLICE and COMMIT records are appended before the single
-    /// distinct-segment sync, so the WAL lane sees one sync submission per
-    /// group no matter how many complete batches the group carries.
+    /// Every batch's SLICE records reach the WAL lane in one operation and
+    /// every COMMIT record in a second, both before the single distinct-segment
+    /// sync, so the WAL lane sees the same three submissions per group no
+    /// matter how many batches the group carries.
     ///
     /// # Panics
     ///
     /// Panics if the isolated owner cannot be built, the group fails, or the
-    /// WAL lane observes any sync count other than one.
+    /// WAL lane observes any other write or sync count.
     #[tokio::test]
-    async fn group_commit_syncs_once() {
+    async fn group_commit_writes_and_syncs_once() {
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node = crate::scribe::stream_identity::NodeId::generate();
         let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
@@ -7324,6 +7368,7 @@ mod tests {
 
         owner.process_group(group).await.expect("group commits");
 
+        assert_eq!(owner.wal_io.write_submissions_for_test(), 2);
         assert_eq!(owner.wal_io.sync_submissions_for_test(), 1);
     }
 

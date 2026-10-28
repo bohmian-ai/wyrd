@@ -1955,18 +1955,22 @@ impl ScribePersistenceCpuPool {
 /// Closed set of filesystem work permitted on the WAL IO lane.
 #[derive(Debug)]
 pub(crate) enum ScribeWalIoOp {
-    /// Writes one current ingress slice while retaining its complete root owner.
-    WriteIngressSlice {
-        /// Fixed shard WAL handle receiving the prepared slice.
+    /// Writes one group's ingress slices, in order, in one WAL IO operation
+    /// while retaining every root owner whose payloads it holds.
+    WriteIngressSlices {
+        /// Fixed shard WAL handle receiving the prepared slices.
         wal: WalHandle,
-        /// Move-only current IPC payload and framing facts.
-        append: PreparedWalAppend,
-        /// Root lease retained until the detached WAL write returns.
-        memory: crate::resources::ScribeMemoryLease,
+        /// Move-only current IPC payloads and framing facts, in WAL order.
+        appends: Vec<PreparedWalAppend>,
+        /// Root leases retained until the detached WAL writes return.
+        memory: Vec<crate::resources::ScribeMemoryLease>,
     },
+    /// Writes one group's prepared records, in order, in one WAL IO operation.
     WritePrepared {
+        /// Fixed shard WAL handle receiving the records.
         wal: WalHandle,
-        append: PreparedWalAppend,
+        /// Prepared records in WAL order.
+        appends: Vec<PreparedWalAppend>,
     },
     SyncWal {
         wal: WalHandle,
@@ -2008,15 +2012,17 @@ pub(crate) enum ScribeWalIoOp {
 /// Results produced by [`ScribeWalIoPool`].
 #[derive(Debug)]
 pub(crate) enum ScribeWalIoResult {
-    /// One ingress slice was accepted by its WAL owner.
-    IngressSliceWritten {
-        /// Durable WAL append identity.
-        result: WalAppendResult,
-        /// Root lease returned after detached WAL work completed.
-        memory: crate::resources::ScribeMemoryLease,
+    /// Every ingress slice of one group was accepted by its WAL owner.
+    IngressSlicesWritten {
+        /// WAL append identities, in the submitted order.
+        results: Vec<WalAppendResult>,
+        /// Root leases returned after detached WAL work completed.
+        memory: Vec<crate::resources::ScribeMemoryLease>,
     },
+    /// Every prepared record of one operation was written, in submitted order.
     WalWritten {
-        result: WalAppendResult,
+        /// WAL append identities, in the submitted order.
+        results: Vec<WalAppendResult>,
     },
     WalSynced,
     Completed,
@@ -2061,6 +2067,9 @@ pub struct ScribeWalIoPool {
     /// Sync operations submitted through the production lane in unit tests.
     #[cfg(test)]
     sync_submissions: Arc<AtomicU64>,
+    /// Record write operations submitted through the production lane in unit tests.
+    #[cfg(test)]
+    write_submissions: Arc<AtomicU64>,
 }
 
 impl ScribeWalIoPool {
@@ -2121,6 +2130,8 @@ impl ScribeWalIoPool {
             retire_submissions: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             sync_submissions: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            write_submissions: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -2135,6 +2146,13 @@ impl ScribeWalIoPool {
         #[cfg(test)]
         if matches!(&operation, ScribeWalIoOp::SyncWal { .. }) {
             self.sync_submissions.fetch_add(1, Ordering::AcqRel);
+        }
+        #[cfg(test)]
+        if matches!(
+            &operation,
+            ScribeWalIoOp::WriteIngressSlices { .. } | ScribeWalIoOp::WritePrepared { .. }
+        ) {
+            self.write_submissions.fetch_add(1, Ordering::AcqRel);
         }
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -2236,6 +2254,12 @@ impl ScribeWalIoPool {
     pub(crate) fn sync_submissions_for_test(&self) -> u64 {
         self.sync_submissions.load(Ordering::Acquire)
     }
+
+    /// Returns record write submissions observed at the production WAL lane boundary.
+    #[cfg(test)]
+    pub(crate) fn write_submissions_for_test(&self) -> u64 {
+        self.write_submissions.load(Ordering::Acquire)
+    }
 }
 
 /// Executes one detached WAL operation while retaining its admitted owners.
@@ -2249,17 +2273,23 @@ fn execute_wal_io(
     delay: std::time::Duration,
 ) -> Result<ScribeWalIoResult, ScribeError> {
     match operation {
-        ScribeWalIoOp::WriteIngressSlice {
+        ScribeWalIoOp::WriteIngressSlices {
             wal,
-            append,
+            appends,
             memory,
         } => {
-            let result = wal.append_prepared(append)?;
-            Ok(ScribeWalIoResult::IngressSliceWritten { result, memory })
+            let results = appends
+                .into_iter()
+                .map(|append| wal.append_prepared(append))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ScribeWalIoResult::IngressSlicesWritten { results, memory })
         }
-        ScribeWalIoOp::WritePrepared { wal, append } => {
-            let result = wal.append_prepared(append)?;
-            Ok(ScribeWalIoResult::WalWritten { result })
+        ScribeWalIoOp::WritePrepared { wal, appends } => {
+            let results = appends
+                .into_iter()
+                .map(|append| wal.append_prepared(append))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ScribeWalIoResult::WalWritten { results })
         }
         ScribeWalIoOp::SyncWal { wal, segments } => {
             if !delay.is_zero() {

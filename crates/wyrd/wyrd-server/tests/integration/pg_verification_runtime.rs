@@ -888,6 +888,7 @@ async fn attempts_record_queue_wait_phases_terminal_latency_and_one_trace() {
                 span.name == "verification.attempt"
                     && span.attributes.get("execution_id") == Some(&execution.to_string())
                     && span.attributes.get("attempt").map(String::as_str) == Some(attempt)
+                    && span.attributes.get("outcome").map(String::as_str) != Some("deferred")
             })
             .unwrap_or_else(|| panic!("attempt {attempt} of {execution} is traced: {spans:#?}"))
     };
